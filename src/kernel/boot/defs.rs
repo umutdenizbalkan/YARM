@@ -483,7 +483,9 @@ pub(crate) struct DelegatedCapRef {
 pub(crate) fn map_scheduler_error(err: SchedulerError) -> KernelError {
     match err {
         SchedulerError::QueueFull => KernelError::SchedulerFull,
-        SchedulerError::InvalidCpu | SchedulerError::CpuOffline => KernelError::WrongObject,
+        SchedulerError::InvalidCpu | SchedulerError::CpuOffline | SchedulerError::WakeOnly => {
+            KernelError::WrongObject
+        }
         SchedulerError::AlreadyQueued => KernelError::WouldBlock,
     }
 }

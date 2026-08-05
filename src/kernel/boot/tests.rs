@@ -77001,6 +77001,7 @@ mod stage199a2b2d_direct_request_txn {
         let sg = TXN_SRC
             .split("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
             .nth(1)
+            .and_then(|arm| arm.split("\n            }").next())
             .expect("ServerGone arm present");
         assert!(sg.contains("sr_revoke_split"));
         assert!(sg.contains("cancel_direct_reply_record_split"));
@@ -77010,6 +77011,226 @@ mod stage199a2b2d_direct_request_txn {
             "a vanished server's claimed waiter must not be restored"
         );
         assert!(TXN_SRC.contains("IpcCallDirectError::RecordCommitFailed"));
+        // Stage 199D: the LIVE (not defensive) post-commit rollback — a refused rank-1 placement
+        // — is the opposite case: the server is alive and exactly ours, so its waiter MUST be
+        // restored, and the shared helper is the only thing that does it.
+        let rb = TXN_SRC
+            .split("fn rollback_direct_request_after_commit(")
+            .nth(1)
+            .expect("the post-commit rollback helper");
+        for step in [
+            "unregister_server_reply_link_split",
+            "cancel_direct_reply_record_split",
+            "sr_revoke_split",
+            "sr_uncommit_blocked_receiver_split",
+            "sr_restore_endpoint_waiter_split",
+        ] {
+            assert!(rb.contains(step), "the rollback must undo `{step}`");
+        }
+        // The receiver must be returned to Blocked BEFORE its waiter is reinstalled — the
+        // restore prevalidates that the task is exactly blocked.
+        assert!(
+            rb.find("sr_uncommit_blocked_receiver_split").unwrap()
+                < rb.find("sr_restore_endpoint_waiter_split").unwrap(),
+            "uncommit must precede the waiter restore"
+        );
+    }
+
+    /// **NR6 failure accounting + rollback, driven end-to-end.** The server is pinned to an
+    /// ONLINE WAKE-ONLY CPU, so the final rank-1 placement is refused after the publication has
+    /// already committed (record Available, cap minted, link registered, waiter claimed, server
+    /// Runnable). Every one of those must be undone.
+    #[test]
+    fn a_refused_placement_rolls_the_whole_nr6_publication_back() {
+        let fx = blocked_server_fixture();
+        fx.k.with(|s| {
+            s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+            s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+            s.set_task_home_cpu(2, CpuId(1))
+                .expect("pin the server to cpu 1");
+        });
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(77);
+
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 77);
+
+        // (10) no success object exists, so no wake target and no wake work can be derived.
+        assert_eq!(
+            out,
+            Err(IpcCallDirectError::EnqueueRejected(
+                crate::kernel::scheduler::SchedulerError::WakeOnly
+            ))
+        );
+        assert!(out.is_err(), "no IpcCallDirectSuccess may be produced");
+        // The failure invariants.
+        fx.k.with(|s| {
+            assert!(
+                matches!(s.task_status(2), Some(TaskStatus::Blocked(_))),
+                "the server is Blocked again — never Runnable-but-unqueued"
+            );
+            assert!(
+                !s.task_present_in_any_runqueue(2),
+                "and it is in no run queue on any CPU"
+            );
+        });
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(
+                fx.endpoint_index,
+                fx.endpoint_generation,
+                fx.server
+            ),
+            "the claimed waiter was reinstalled, not silently removed"
+        );
+        assert!(
+            lease.is_available(),
+            "the exact server is retryable, so the ack lease is restored — not leaked, not consumed"
+        );
+
+        // Balance, proved end-to-end: with the refusal removed, the SAME transaction now
+        // succeeds. That can only happen if the record slot, the reverse link, the server's
+        // CNode slot and the waiter were all genuinely returned.
+        fx.k.with(|s| s.mark_cpu_wake_only(CpuId(1), false).expect("dispatching"));
+        let mut lease2 = claimed_lease(78);
+        let retry =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease2, 78)
+                .expect("the rolled-back transaction is genuinely retryable");
+        assert_eq!(
+            retry.wake_target_cpu,
+            CpuId(1),
+            "and now a real placement yields a real wake target"
+        );
+        fx.k.with(|s| {
+            assert!(
+                s.task_present_in_any_runqueue(2),
+                "the retry actually queued the server"
+            );
+        });
+    }
+
+    /// Assert the failure invariants the repair promises after a RECOVERABLE rejection.
+    fn assert_nr6_fully_restored(fx: &Fixture, expected_cap: CapId) {
+        fx.k.with(|s| {
+            assert_eq!(
+                s.task_status(2),
+                Some(TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(expected_cap)
+                )),
+                "Blocked on the EXACT original recv cap"
+            );
+            assert!(
+                !s.task_present_in_any_runqueue(2),
+                "neither queued nor current on any CPU"
+            );
+        });
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(
+                fx.endpoint_index,
+                fx.endpoint_generation,
+                fx.server
+            ),
+            "the exact waiter restored once"
+        );
+    }
+
+    /// **Every rejection reason reachable through the real NR6 transaction**, each carrying the
+    /// scheduler's own reason and each leaving the server fully restored.
+    #[test]
+    fn each_nr6_rejection_reason_preserves_its_scheduler_error_and_restores_the_server() {
+        use crate::kernel::scheduler::SchedulerError;
+        for (reason, prepare) in [
+            (
+                SchedulerError::WakeOnly,
+                (|k: &SharedKernel| {
+                    k.with(|s| {
+                        s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+                        s.bring_up_cpu(CpuId(1)).expect("online");
+                        s.set_task_home_cpu(2, CpuId(1)).expect("pin");
+                    })
+                }) as fn(&SharedKernel),
+            ),
+            (SchedulerError::CpuOffline, |k: &SharedKernel| {
+                // CPU 1 present but never brought online.
+                k.with(|s| s.set_task_home_cpu(2, CpuId(1)).expect("pin"));
+            }),
+            (SchedulerError::InvalidCpu, |k: &SharedKernel| {
+                let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8);
+                k.with(|s| s.set_task_home_cpu(2, bogus).expect("pin"));
+            }),
+            (SchedulerError::QueueFull, |k: &SharedKernel| {
+                // Fill the local queue the unpinned enqueue would use.
+                let here = k.current_cpu_split_read();
+                k.with(|s| {
+                    for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+                        s.register_task(tid).expect("filler");
+                    }
+                });
+                for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+                    let _ = k.sr_enqueue_committed_receiver_split(tid, Some(here));
+                }
+            }),
+        ] {
+            let fx = blocked_server_fixture();
+            let recv_cap =
+                fx.k.blocked_recv_cap_split_read(2, fx.server_aspace_asid)
+                    .expect("the server's original recv cap");
+            prepare(&fx.k);
+            let snap = snapshot_for(&fx, b"request!");
+            let ack = ack_for(&fx);
+            let mut lease = claimed_lease(200);
+            let out =
+                fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 200);
+            assert_eq!(
+                out,
+                Err(IpcCallDirectError::EnqueueRejected(reason)),
+                "{reason:?} must survive to the transaction error"
+            );
+            assert_nr6_fully_restored(&fx, recv_cap);
+            assert!(lease.is_available(), "{reason:?} is retryable");
+        }
+    }
+
+    /// **Pre-existing membership is declined BEFORE any mutation.** A `Blocked` server that
+    /// already holds scheduler membership is an invariant violation; the transaction refuses it
+    /// at the preflight rather than publishing and then discovering the collision.
+    #[test]
+    fn a_server_with_pre_existing_membership_is_declined_before_mutation() {
+        let fx = blocked_server_fixture();
+        let recv_cap =
+            fx.k.blocked_recv_cap_split_read(2, fx.server_aspace_asid)
+                .expect("recv cap");
+        // Force the pathological state: Blocked AND queued.
+        let here = fx.k.current_cpu_split_read();
+        assert!(matches!(
+            fx.k.sr_enqueue_committed_receiver_split(2, Some(here)),
+            crate::runtime::ReceiverEnqueue::Enqueued { .. }
+        ));
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(201);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 201),
+            Err(IpcCallDirectError::WouldBlock),
+            "declined before mutation, not after publication"
+        );
+        fx.k.with(|s| {
+            assert_eq!(
+                s.task_status(2),
+                Some(TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(recv_cap)
+                )),
+                "no TCB mutation happened at all"
+            );
+        });
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(
+                fx.endpoint_index,
+                fx.endpoint_generation,
+                fx.server
+            ),
+            "the waiter is intact"
+        );
     }
 }
 
@@ -78021,8 +78242,8 @@ mod stage199a2b3_direct_reply_txn {
     fn defensive_rollback_branches_present() {
         const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
         let cg = TXN_SRC
-            .split("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
-            .nth(1)
+            .rsplit("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
+            .next()
             .expect("CallerGone arm present");
         assert!(cg.contains("discard_reply_record_split"));
         assert!(cg.contains("lease.discard()"));
@@ -78031,6 +78252,249 @@ mod stage199a2b3_direct_reply_txn {
             "a vanished caller's claimed waiter must not be restored"
         );
         assert!(TXN_SRC.contains("IpcReplyDirectError::RecordConsumeFailed"));
+        // Stage 199D: a refused rank-1 placement is the LIVE counterpart — the caller is alive
+        // and exactly ours, so it is returned to Blocked with its waiter reinstalled, while the
+        // record stays Consumed (the one-shot barrier must never be re-armed).
+        let rej = TXN_SRC
+            .split("IPC_DIRECT_REPLY_ENQUEUE_REJECTED")
+            .next()
+            .and_then(|head| head.rsplit("ReceiverEnqueue::Enqueued {").next())
+            .expect("the reply enqueue-rejected arm");
+        assert!(rej.contains("sr_uncommit_blocked_receiver_split"));
+        assert!(rej.contains("sr_restore_endpoint_waiter_split"));
+        assert!(rej.contains("lease.discard()"), "terminal: never restored");
+        assert!(
+            !rej.contains("un_consume") && !rej.contains("reserve_existing_reply_record_split"),
+            "the consumed record must never be re-armed"
+        );
+    }
+
+    /// **NR7 failure accounting + rollback, driven end-to-end (route A).** The caller is pinned
+    /// to an ONLINE WAKE-ONLY CPU, so the final placement is refused after the record was
+    /// consumed.
+    ///
+    /// **UPDATED CONTRACT.** This test previously asserted the record stayed spent and the
+    /// caller's completion was left to "the existing reply timeout". That claim was false for
+    /// exactly this population: `classify_direct_reply` declines `terminal_arbitrated` replies
+    /// before any mutation, and `terminal_arbitrated` *means* a reply timeout is armed for that
+    /// record incarnation — so every direct-eligible reply is untimed and has **no** terminal
+    /// owner. The exact one-shot authority is now restored instead, and the same reply retries.
+    #[test]
+    fn a_refused_placement_rolls_the_nr7_caller_back_and_keeps_the_record_spent() {
+        let fx = blocked_caller_fixture();
+        fx.k.with(|s| {
+            s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+            s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+            s.set_task_home_cpu(1, CpuId(1))
+                .expect("pin the caller to cpu 1");
+        });
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(91);
+
+        let out = fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 91);
+
+        assert_eq!(
+            out,
+            Err(IpcReplyDirectError::EnqueueRejected(
+                crate::kernel::scheduler::SchedulerError::WakeOnly
+            )),
+            "the scheduler's own reason is preserved, not collapsed"
+        );
+        assert!(out.is_err(), "no IpcReplyDirectSuccess may be produced");
+
+        // The caller is exactly as it was before the transaction.
+        fx.k.with(|s| {
+            assert!(
+                matches!(s.task_status(1), Some(TaskStatus::Blocked(_))),
+                "the caller is Blocked again — never Runnable-but-unqueued"
+            );
+            assert!(
+                !s.task_present_in_any_runqueue(1),
+                "and it is neither queued nor current on any CPU"
+            );
+        });
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(
+                fx.published_ack.endpoint_index,
+                fx.published_ack.endpoint_generation,
+                fx.caller
+            ),
+            "the claimed caller waiter was reinstalled exactly once"
+        );
+        // Route A: the exact one-shot authority is back, so the ack is restored, not discarded.
+        assert!(
+            fx.k.with(|s| s
+                .direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "the reply authority is restored to Available at the same generation"
+        );
+        // …including the reverse link the consume closed: the replier owes the reply again.
+        assert_eq!(
+            fx.k.live_server_reply_link_count_split_read(),
+            1,
+            "the reverse link is re-registered, not leaked closed"
+        );
+        assert!(
+            !fx.k.can_reserve_server_reply_link_split(2, fx.replier_asid),
+            "…and it is the exact replier's single outstanding link"
+        );
+        assert!(
+            lease.is_available(),
+            "and the acknowledgement is restored for the retry"
+        );
+
+        // The retry succeeds EXACTLY once…
+        fx.k.with(|s| s.mark_cpu_wake_only(CpuId(1), false).expect("dispatching"));
+        let mut lease2 = claimed_lease(92);
+        let retry =
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease2, 92)
+                .expect("the restored authority is genuinely usable");
+        assert_eq!(retry.wake_target_cpu, CpuId(1));
+        fx.k.with(|s| assert!(s.task_present_in_any_runqueue(1), "the caller is woken"));
+
+        // …and a duplicate reply remains rejected.
+        let mut lease3 = claimed_lease(93);
+        assert!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease3, 93)
+                .is_err(),
+            "the one-shot barrier still holds after the retry"
+        );
+        assert!(
+            !fx.k
+                .with(|s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "the record is spent exactly once"
+        );
+        teardown();
+    }
+
+    /// **Every rejection reason reachable through the real NR7 transaction**, each carrying the
+    /// scheduler's own reason and each restoring the exact reply authority.
+    #[test]
+    fn each_nr7_rejection_reason_preserves_its_scheduler_error_and_restores_the_authority() {
+        use crate::kernel::scheduler::SchedulerError;
+        for (reason, prepare) in [
+            (
+                SchedulerError::WakeOnly,
+                (|k: &SharedKernel| {
+                    k.with(|s| {
+                        s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+                        s.bring_up_cpu(CpuId(1)).expect("online");
+                        s.set_task_home_cpu(1, CpuId(1)).expect("pin");
+                    })
+                }) as fn(&SharedKernel),
+            ),
+            (SchedulerError::CpuOffline, |k: &SharedKernel| {
+                k.with(|s| s.set_task_home_cpu(1, CpuId(1)).expect("pin"));
+            }),
+            (SchedulerError::InvalidCpu, |k: &SharedKernel| {
+                let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8);
+                k.with(|s| s.set_task_home_cpu(1, bogus).expect("pin"));
+            }),
+            (SchedulerError::QueueFull, |k: &SharedKernel| {
+                let here = k.current_cpu_split_read();
+                k.with(|s| {
+                    for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+                        s.register_task(tid).expect("filler");
+                    }
+                });
+                for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+                    let _ = k.sr_enqueue_committed_receiver_split(tid, Some(here));
+                }
+            }),
+        ] {
+            let fx = blocked_caller_fixture();
+            let recv_cap =
+                fx.k.blocked_recv_cap_split_read(1, fx.caller_asid)
+                    .expect("the caller's original recv cap");
+            prepare(&fx.k);
+            let snap = snapshot_for(&fx, b"replyOK!");
+            let ack = fx.published_ack;
+            let mut lease = claimed_lease(210);
+            assert_eq!(
+                fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 210),
+                Err(IpcReplyDirectError::EnqueueRejected(reason)),
+                "{reason:?} must survive to the transaction error"
+            );
+            fx.k.with(|s| {
+                assert_eq!(
+                    s.task_status(1),
+                    Some(TaskStatus::Blocked(
+                        crate::kernel::task::WaitReason::EndpointReceive(recv_cap)
+                    )),
+                    "{reason:?}: Blocked on the EXACT original recv cap"
+                );
+                assert!(
+                    !s.task_present_in_any_runqueue(1),
+                    "{reason:?}: neither queued nor current"
+                );
+            });
+            assert!(
+                fx.k.endpoint_waiter_is_split_read(
+                    fx.published_ack.endpoint_index,
+                    fx.published_ack.endpoint_generation,
+                    fx.caller
+                ),
+                "{reason:?}: the exact waiter restored once"
+            );
+            assert!(
+                fx.k.with(
+                    |s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)
+                ),
+                "{reason:?}: the one-shot authority is restored"
+            );
+            assert!(lease.is_available(), "{reason:?} is retryable");
+            teardown();
+        }
+    }
+
+    /// **A terminal-arbitrated reply still declines before EVERY mutation.** The direct path is
+    /// only reachable for untimed replies — which is exactly why route A (restore the authority)
+    /// is required rather than leaning on a timeout that is not armed.
+    #[test]
+    fn a_terminal_arbitrated_reply_declines_before_every_mutation() {
+        use crate::kernel::direct_eligibility::{
+            DirectReplyEligibility, DirectReplyFacts, classify_direct_reply_eligibility,
+        };
+        let facts = DirectReplyFacts {
+            payload_len: 8,
+            requester_available: true,
+            reply_object: Ok((5, 2)),
+            reply_endpoint: Some((4, 9)),
+            endpoint_admitted: true,
+            transfer_cap_present: false,
+            terminal_arbitrated: true,
+        };
+        assert_eq!(
+            classify_direct_reply_eligibility(&facts),
+            DirectReplyEligibility::TerminalArbitrationUnsupported,
+            "an armed reply timeout keeps the reply on the legacy path"
+        );
+        // Sanity: the SAME facts with the flag clear ARE eligible, so the decline is caused by
+        // arbitration alone and this test cannot pass vacuously.
+        let mut untimed = facts;
+        untimed.terminal_arbitrated = false;
+        assert!(matches!(
+            classify_direct_reply_eligibility(&untimed),
+            DirectReplyEligibility::Eligible { .. }
+        ));
+        // …and the decline is ahead of every mutating step in the classifier's source order.
+        const ELIG: &str = include_str!("../direct_eligibility.rs");
+        let at = ELIG
+            .find("if facts.terminal_arbitrated {")
+            .expect("the arbitration gate");
+        let tail = &ELIG[at..];
+        for mutating in [
+            "reserve",
+            "consume",
+            "copy_slice_to_user",
+            "claim",
+            "enqueue",
+        ] {
+            assert!(
+                !tail[..tail.find("\n}").unwrap_or(tail.len())].contains(mutating),
+                "no `{mutating}` may run after the arbitration gate inside the classifier"
+            );
+        }
     }
 }
 
@@ -79028,15 +79492,20 @@ mod stage199a2c2_riscv_guards {
         );
     }
 
-    // (RISC-V NR6/NR7 split eligibility + reachability) The RISC-V trap route admits NR6/NR7 into the
-    // shared split dispatcher ONLY behind the direct proof gate (the a7→nr + a0..a5→args import is
-    // done by the bridge); a handled NR6/NR7 finalizes via ReturnToCurrent. The whitelist reachability
-    // guard keeps the live drains from being DCE'd.
+    // (RISC-V NR6/NR7 split eligibility + reachability) The RISC-V trap route admits NR6/NR7 into
+    // the shared split dispatcher only behind the CANONICAL admission predicate (the a7→nr +
+    // a0..a5→args import is done by the bridge); a handled NR6/NR7 finalizes via ReturnToCurrent.
+    // The whitelist reachability guard keeps the live drains from being DCE'd.
+    //
+    // Stage 199D (RISC-V readiness blocker 1): this used to pin a DIRECT
+    // `ipccall_direct_proof_enabled()` call. Admission is `production || proof` and RISC-V
+    // production is a compile-time false, so the gate is unchanged in effect — but asking the
+    // canonical helper is what stops a future production flip from silently no-opping.
     #[test]
     fn riscv_nr6_nr7_split_eligibility_gated_and_reachable() {
         assert!(
-            TRAP_SRC.contains("(nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n        || nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"),
-            "RISC-V must admit NR6/NR7 into the split dispatcher only behind the direct proof gate"
+            TRAP_SRC.contains("(nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n        || nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n        && crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "RISC-V must admit NR6/NR7 into the split dispatcher behind the canonical predicate"
         );
         assert!(TRAP_SRC.contains("|| is_ipc_direct"));
         assert!(
@@ -82945,9 +83414,21 @@ mod stage199d_production_default_guards {
             !trap_entry.contains("ipccall_direct_proof_enabled()"),
             "no AArch64-specific proof-only admission rule survives"
         );
+        // Stage 199D (RISC-V readiness blocker 1): RISC-V now asks the CANONICAL predicate, like
+        // AArch64. It remains proof-gated in EFFECT — admission is `production || proof` and
+        // RISC-V production is false — but the mechanism is no longer a direct proof-gate call,
+        // so a future production flip cannot silently no-op.
         assert!(
-            riscv.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"),
-            "RISC-V trap admission remains proof-gated"
+            riscv.contains("&& crate::kernel::boot::ipccall_direct_admission_enabled();"),
+            "RISC-V trap admission uses the canonical predicate"
+        );
+        assert!(
+            !riscv
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.starts_with("//"))
+                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
+            "no RISC-V-specific proof-only admission rule survives"
         );
         // The shared predicates fall back to the proof gate off x86.
         for predicate in [
@@ -105101,6 +105582,14 @@ mod stage199d_remote_wake_authority {
         target != k.current_cpu_split_read()
     }
 
+    /// The committed wake target, or a panic naming the refusal. Stage 199D: a wake target
+    /// exists ONLY for an `Enqueued` outcome, so every test below has to go through this.
+    fn enqueued_cpu(outcome: crate::runtime::ReceiverEnqueue) -> CpuId {
+        outcome
+            .enqueued_cpu()
+            .unwrap_or_else(|| panic!("expected a committed enqueue, got {outcome:?}"))
+    }
+
     /// **53 local successes → zero remote IPIs.** The regression in one test: these are ordinary
     /// production NR6 completions, exactly the traffic the old selector-driven decision turned
     /// into 53 spurious remote wakes.
@@ -105111,7 +105600,7 @@ mod stage199d_remote_wake_authority {
         let mut remote = 0usize;
         for tid in 1..=53u64 {
             // Unpinned receiver: the enqueue falls back to the enqueueing CPU.
-            let target = k.sr_enqueue_committed_receiver_split(tid, None);
+            let target = enqueued_cpu(k.sr_enqueue_committed_receiver_split(tid, None));
             assert_eq!(target, here, "an unpinned enqueue commits to the local CPU");
             if is_remote(&k, target) {
                 remote += 1;
@@ -105128,7 +105617,7 @@ mod stage199d_remote_wake_authority {
         let affinity = k.with(|s| s.task_home_cpu(1));
         assert_eq!(affinity, Some(CpuId(1)), "the home CPU is authoritative");
 
-        let target = k.sr_enqueue_committed_receiver_split(1, affinity);
+        let target = enqueued_cpu(k.sr_enqueue_committed_receiver_split(1, affinity));
         assert_eq!(target, CpuId(1), "the enqueue commits to the home CPU");
         assert!(is_remote(&k, target), "CPU0 -> CPU1 is a remote wake");
         assert_ne!(target, k.current_cpu_split_read());
@@ -105166,16 +105655,32 @@ mod stage199d_remote_wake_authority {
     }
 
     /// **A wrong/stale home CPU fails closed.** An affinity naming a CPU that is not online must
-    /// not silently become a remote wake at a bogus target: the enqueue reports what it actually
-    /// committed to, and an offline target enqueues nothing.
+    /// not become a remote wake at a bogus target.
+    ///
+    /// Stage 199D UPDATED CONTRACT: this test used to assert the seam "reports the target it was
+    /// asked for" — `assert_eq!(target, bogus)` — while also asserting nothing was queued there.
+    /// That pair *is* the false-success defect, written down as if it were correct. The seam now
+    /// reports the refusal, and there is no accessor that yields a wake target for it.
     #[test]
     fn a_stale_home_cpu_fails_closed() {
+        use crate::runtime::ReceiverEnqueue;
         let k = fixture(2, 1);
         let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8 - 1);
-        let target = k.sr_enqueue_committed_receiver_split(1, Some(bogus));
-        // The seam reports the target it was asked for; the scheduler refuses the enqueue on an
-        // offline CPU, so nothing is queued there and no task is lost to a phantom run queue.
-        assert_eq!(target, bogus);
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(bogus));
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: bogus,
+                error: crate::kernel::scheduler::SchedulerError::CpuOffline,
+                reconciled: None,
+            },
+            "an offline target must be reported as refused, not as a committed wake target"
+        );
+        assert_eq!(
+            outcome.enqueued_cpu(),
+            None,
+            "and it must yield NO wake target at all"
+        );
         let queued = k.with(|s| s.runnable_count_on_cpu(bogus));
         assert_eq!(queued, 0, "an offline target must hold no queued task");
     }
@@ -105189,8 +105694,10 @@ mod stage199d_remote_wake_authority {
             s.set_task_home_cpu(1, CpuId(1)).expect("pin 1");
             s.set_task_home_cpu(2, CpuId(2)).expect("pin 2");
         });
-        let t1 = k.sr_enqueue_committed_receiver_split(1, k.with(|s| s.task_home_cpu(1)));
-        let t2 = k.sr_enqueue_committed_receiver_split(2, k.with(|s| s.task_home_cpu(2)));
+        let t1 =
+            enqueued_cpu(k.sr_enqueue_committed_receiver_split(1, k.with(|s| s.task_home_cpu(1))));
+        let t2 =
+            enqueued_cpu(k.sr_enqueue_committed_receiver_split(2, k.with(|s| s.task_home_cpu(2))));
         assert_eq!(t1, CpuId(1));
         assert_eq!(t2, CpuId(2));
         assert_ne!(t1, t2, "independent targets, never a shared assumed CPU");
@@ -105396,9 +105903,20 @@ mod stage199d_remote_wake_authority {
     fn the_enqueue_seam_is_the_single_authority_for_the_target() {
         assert!(
             RUNTIME.contains(
-                "pub(crate) fn sr_enqueue_committed_receiver_split(\n        &self,\n        tid: u64,\n        affinity: Option<CpuId>,\n    ) -> CpuId {"
+                "pub(crate) fn sr_enqueue_committed_receiver_split(\n        &self,\n        tid: u64,\n        affinity: Option<CpuId>,\n    ) -> ReceiverEnqueue {"
             ),
-            "the enqueue seam must report its committed target"
+            "the enqueue seam must report what it ACTUALLY did, not a bare CPU"
+        );
+        // Stage 199D: and the ONLY route from that report to a wake target is `Enqueued`.
+        assert!(
+            RUNTIME.contains("Ok(()) => ReceiverEnqueue::Enqueued { cpu },")
+                && RUNTIME.contains("reconciled: None,"),
+            "success and refusal are distinguished by the enqueue's own result"
+        );
+        // The AlreadyQueued reconciliation happens in the SAME rank-1 closure.
+        assert!(
+            RUNTIME.contains("let reconciled = sm.withdraw_queued_tid_on(cpu, ThreadId(tid));"),
+            "membership is reconciled under the acquisition that detected it"
         );
         assert!(
             RUNTIME.contains("pub(crate) fn current_cpu_split_read(&self) -> CpuId {")
@@ -105882,7 +106400,7 @@ mod stage199d_closure_matrix {
     /// strictly ordered; naming them together with AArch64 was the taxonomy error.
     const RISCV_SEQUENCE: &[&str] = &[
         "1. [CLOSED] kernel target-spec / toolchain repair — the LLVM triple named the Rust target name `riscv64gc`; it now names the LLVM architecture, ISA and ABI unchanged",
-        "2. [AUDITED case_c] RISC-V off-lock NR6/NR7 code — the contract stack is inherited clean, but the trap bridge re-enters the broad lock on the return path even at SMP=1; see §6.1.17",
+        "2. [case_b; blockers 1+2 CLOSED] RISC-V off-lock NR6/NR7 code — the SMP=1/local path is structurally complete (§6.1.18, §6.1.19); the link stays open on blocker 3, the absent cross-hart wake",
         "3. RISC-V production enablement",
         "4. live RISC-V NR6/NR7 and ServerDies evidence",
     ];
@@ -106253,11 +106771,16 @@ mod stage199d_closure_matrix {
             AUDIT.contains("link 1 is **CLOSED**"),
             "the audit must record link 1 as closed"
         );
-        // Link 2 is AUDITED, not closed — case C. The distinction is the whole point: an audit
-        // that found a decisive blocker must not read as progress.
+        // Link 2 is AUDITED and its DECISIVE blocker is closed — but the link itself is not.
+        // The distinction is the whole point: closing the return-path blocker is not the same as
+        // closing the link, because admission is still proof-gated.
         assert!(
-            RISCV_SEQUENCE[1].contains("[AUDITED case_c]"),
-            "link 2 is audited"
+            RISCV_SEQUENCE[1].contains("[case_b; blockers 1+2 CLOSED]"),
+            "link 2 carries the recomputed case-B classification with blockers 1 and 2 closed"
+        );
+        assert!(
+            !RISCV_SEQUENCE[1].starts_with("2. [CLOSED]"),
+            "link 2 itself is NOT closed"
         );
         assert!(
             AUDIT.contains("RISCV_199D_READINESS=case_c"),
@@ -106730,7 +107253,9 @@ mod stage199d_riscv_target_spec_guards {
 // ONE question: can an eligible RISC-V NR6/NR7 transaction complete end-to-end without entering
 // or re-entering the broad `KernelState` lock?
 //
-// **Answer: NO — case C.** A direct-transaction return-path code blocker remains even at SMP=1.
+// **Answer (recomputed after blockers 1 and 2 closed): case B.** The SMP=1 / local path is
+// structurally complete; what remains is the absent cross-hart wake. The original case-C finding
+// and its blocker map are preserved below — an audit does not un-find what it found.
 // The architecture-neutral contract stack (eligibility, disposition, the ack store, the census,
 // the transaction, the projection, the reverse link) is already broad-lock-free and carries no
 // RISC-V special case, and the RISC-V trap wrapper's Phase-1 split return skips the broad-lock
@@ -106769,7 +107294,9 @@ mod stage199d_riscv_production_readiness_audit {
         CodeBlockerEvenAtSmp1,
     }
 
-    const VERDICT: Case = Case::CodeBlockerEvenAtSmp1;
+    /// Recomputed after blockers 1 and 2 closed: the SMP=1 / local path is structurally
+    /// complete, and what remains is the absent cross-hart wake — case B, not case C.
+    const VERDICT: Case = Case::LocalCompleteRemoteMissing;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum BlockerSeverity {
@@ -106786,6 +107313,9 @@ mod stage199d_riscv_production_readiness_audit {
         what: &'static str,
         site: &'static str,
         severity: BlockerSeverity,
+        /// Closed by a later increment. The finding stays in the map — an audit that found a
+        /// blocker does not un-find it when the blocker is fixed.
+        closed: bool,
     }
 
     const BLOCKERS: &[Blocker] = &[
@@ -106795,6 +107325,7 @@ mod stage199d_riscv_production_readiness_audit {
                    admission predicate — flipping the production default alone is a silent no-op",
             site: "src/arch/riscv64/trap.rs",
             severity: BlockerSeverity::SilentNoOp,
+            closed: true,
         },
         Blocker {
             id: 2,
@@ -106803,6 +107334,7 @@ mod stage199d_riscv_production_readiness_audit {
                    a HANDLED direct transaction still enters the broad lock three times",
             site: "src/arch/riscv64/boot.rs",
             severity: BlockerSeverity::Decisive,
+            closed: true,
         },
         Blocker {
             id: 3,
@@ -106810,6 +107342,7 @@ mod stage199d_riscv_production_readiness_audit {
                    x86_64-cfg-gated and RISC-V exposes no SBI IPI / software-interrupt seam",
             site: "src/kernel/ipccall_direct_txn.rs + src/arch/riscv64/sbi.rs",
             severity: BlockerSeverity::LatentAtCurrentTopology,
+            closed: false,
         },
     ];
 
@@ -106839,32 +107372,32 @@ mod stage199d_riscv_production_readiness_audit {
 
     // ── The admission predicate ─────────────────────────────────────────────────────────────
 
-    /// **Blocker 1, pinned exactly.** RISC-V admits NR6/NR7 through
-    /// `ipccall_direct_proof_enabled()`. The canonical predicate the split dispatcher and the
-    /// AArch64 import both ask is `ipccall_direct_admission_enabled()` — RISC-V does not ask it,
-    /// so with the proof gate off NR6/NR7 are not split-eligible and enabling production alone
-    /// changes nothing.
+    /// **Blocker 1 — CLOSED.** RISC-V admits NR6/NR7 through the canonical
+    /// `ipccall_direct_admission_enabled()`, the same predicate the portable import asks. It is
+    /// still proof-gated in EFFECT (admission is `production || proof`; RISC-V production is
+    /// false), so the admitted population is unchanged — but a future production flip can no
+    /// longer silently no-op.
     #[test]
-    fn the_riscv_admission_predicate_is_the_proof_gate_not_the_canonical_one() {
+    fn the_riscv_admission_predicate_is_canonical() {
         let body = function_body(RISCV_TRAP, "pub fn handle_riscv_trap_entry_shared");
         let code = code_lines(body);
         assert!(
             code.iter()
-                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
-            "RISC-V still admits NR6/NR7 on the proof gate — if this changed, the blocker map is stale"
+                .any(|l| l.contains("ipccall_direct_admission_enabled()")),
+            "RISC-V must ask the canonical admission predicate"
         );
         assert!(
             !code
                 .iter()
-                .any(|l| l.contains("ipccall_direct_admission_enabled()")),
-            "RISC-V does NOT ask the canonical admission predicate — blocker 1"
+                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
+            "no direct proof-gate call may remain — blocker 1 is closed"
         );
-        // The canonical predicate exists and IS what the portable import asks.
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         assert!(
             TRAP_ENTRY.contains("ipccall_direct_admission_enabled()"),
-            "the canonical predicate is the portable one; RISC-V is the outlier"
+            "RISC-V now asks the same predicate as the portable import"
         );
+        assert!(MATRIX_BLOCKER(1).closed, "blocker 1 is recorded closed");
     }
 
     /// Both NRs are named, so the gate covers request AND reply.
@@ -106928,42 +107461,41 @@ mod stage199d_riscv_production_readiness_audit {
         }
     }
 
-    /// **Blocker 2, pinned exactly — the decisive finding.** `current_tid_authoritative` is a
-    /// `with_cpu` acquisition, and the RISC-V trap BRIDGE calls it on entry and again on the
-    /// return path, then takes a third `with_cpu` for the SATP asid. All three are outside the
-    /// wrapper, so the Phase-1 early return does not avoid them.
+    /// **Blocker 2 — the decisive finding, now CLOSED.** The bridge used to call
+    /// `current_tid_authoritative` (which is `self.with_cpu(..)`) for the entering and resume
+    /// identities and take a third `with_cpu` for the SATP asid. All three are gone; the record
+    /// of the finding stays, and this guard now pins the closure rather than the defect.
     #[test]
-    fn the_riscv_bridge_brackets_every_trap_with_broad_lock_acquisitions() {
+    fn blocker_two_is_closed_the_bridge_takes_no_broad_lock() {
         assert!(
             function_body(RUNTIME, "pub fn current_tid_authoritative").contains("self.with_cpu("),
             "`current_tid_authoritative` IS a broad-lock acquisition — that is why the bridge's \
-             use of it matters"
+             former use of it was the blocker"
         );
         let bridge = function_body(RISCV_BRIDGE, "extern \"C\" fn yarm_riscv64_trap_bridge");
-        let acquisitions: alloc::vec::Vec<&str> = code_lines(&bridge)
-            .into_iter()
-            .filter(|l| l.contains("current_tid_authoritative") || l.contains("with_cpu("))
-            .collect();
+        for l in code_lines(&bridge) {
+            assert!(
+                !l.contains("current_tid_authoritative") && !l.contains("with_cpu("),
+                "the bridge must hold no broad-lock acquisition: `{l}`"
+            );
+        }
+        // The narrow replacements are in place, at the same boundaries.
         assert!(
-            acquisitions.len() >= 3,
-            "the bridge is expected to hold at least three broad-lock touches, found {}: {:?}",
-            acquisitions.len(),
-            acquisitions
-        );
-        // The two that a HANDLED direct transaction cannot avoid, by name.
-        assert!(
-            bridge
-                .contains("let entering_tid = shared.current_tid_authoritative(cpu).unwrap_or(0);"),
-            "the ENTERING identity is read through the broad lock, before the split dispatcher"
+            bridge.contains("let entering_tid = shared.current_tid_split_read(cpu).unwrap_or(0);")
         );
         assert!(
-            bridge.contains(".current_tid_authoritative(cpu)"),
-            "the RESUME identity is re-read through the broad lock, after the handler returns"
+            bridge.contains("shared.current_tid_split_read(cpu).unwrap_or(entering_tid);"),
+            "the resume snapshot uses the narrow seam with the unchanged fallback"
         );
-        assert!(
-            bridge.contains(".with_cpu(cpu, |k| k.task_asid(resume_tid))"),
-            "the SATP asid lookup is a third broad-lock acquisition on the return path"
-        );
+        assert!(bridge.contains("shared.task_asid_for_tid_split_read(resume_tid)"));
+        let b = MATRIX_BLOCKER(2);
+        assert!(b.closed, "blocker 2 is recorded closed");
+        assert_eq!(b.severity, BlockerSeverity::Decisive);
+    }
+
+    #[allow(non_snake_case)]
+    fn MATRIX_BLOCKER(id: u8) -> &'static Blocker {
+        BLOCKERS.iter().find(|b| b.id == id).expect("blocker")
     }
 
     /// The replacement seams ALREADY EXIST and are architecture-neutral — the smallest next
@@ -107181,8 +107713,8 @@ mod stage199d_riscv_production_readiness_audit {
             "and no IPI extension — there is no cross-hart wake authority to call"
         );
         assert!(
-            RISCV_BRIDGE.contains("RISC-V is BSP-only"),
-            "which is latent only because RISC-V runs one hart"
+            RISCV_BRIDGE.contains("RISCV_SCHEDULER_BSP_ONLY") || RISCV_BRIDGE.contains("online=0"),
+            "latent only because no RISC-V CPU beyond the boot hart is scheduler-online"
         );
     }
 
@@ -107226,15 +107758,37 @@ mod stage199d_riscv_production_readiness_audit {
             .iter()
             .filter(|b| b.severity == BlockerSeverity::Decisive)
             .count();
-        assert_eq!(decisive, 1, "exactly one decisive blocker");
+        assert_eq!(decisive, 1, "exactly one decisive blocker was found");
+        // Recomputed: blockers 1 and 2 are closed, so the SMP=1 / local path is structurally
+        // complete. The only survivor is the absent cross-hart wake — case B.
+        let open: alloc::vec::Vec<u8> = BLOCKERS
+            .iter()
+            .filter(|b| !b.closed)
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(open, alloc::vec![3], "only blocker 3 remains open");
         assert_eq!(
             VERDICT,
-            Case::CodeBlockerEvenAtSmp1,
-            "a decisive blocker means neither case A nor case B"
+            Case::LocalCompleteRemoteMissing,
+            "local complete, remote wake missing"
         );
-        assert_ne!(VERDICT, Case::StructurallyReady);
-        assert_ne!(VERDICT, Case::LocalCompleteRemoteMissing);
+        assert_ne!(
+            VERDICT,
+            Case::StructurallyReady,
+            "case A would require a cross-hart wake to exist"
+        );
+        assert_ne!(
+            VERDICT,
+            Case::CodeBlockerEvenAtSmp1,
+            "no code blocker remains at SMP=1"
+        );
         assert_eq!(BLOCKERS.len(), 3, "three genuine blockers");
+        // Blocker 2 is closed; 1 and 3 remain, so the case-C verdict still stands — with
+        // admission still proof-gated, an SMP=1 production boot does not run NR6/NR7 off-lock
+        // at all, which is a code blocker reachable at SMP=1.
+        assert!(MATRIX_BLOCKER(2).closed, "the decisive blocker is closed");
+        assert!(MATRIX_BLOCKER(1).closed, "admission is now canonical");
+        assert!(!MATRIX_BLOCKER(3).closed, "no cross-hart wake exists");
         for (i, b) in BLOCKERS.iter().enumerate() {
             assert_eq!(b.id as usize, i + 1);
             assert!(!b.what.is_empty() && !b.site.is_empty());
@@ -107245,7 +107799,7 @@ mod stage199d_riscv_production_readiness_audit {
                 .iter()
                 .any(|b| b.severity == BlockerSeverity::Decisive
                     && b.site == "src/arch/riscv64/boot.rs"),
-            "the decisive blocker is on the RISC-V return path"
+            "the decisive blocker was on the RISC-V return path"
         );
     }
 
@@ -107253,10 +107807,3261 @@ mod stage199d_riscv_production_readiness_audit {
     #[test]
     fn the_audit_document_records_case_c() {
         const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+        // The original finding stays on the record; the recomputed verdict sits beside it.
         assert!(AUDIT.contains("RISCV_199D_READINESS=case_c"));
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
         assert!(
             AUDIT.contains("CONDITIONAL_PRODUCTION_ENABLEMENT_AND_LIVE_EVIDENCE"),
             "the reclassification that was NOT taken must still be named, so the decision is legible"
+        );
+    }
+}
+
+// ── RISC-V readiness blocker 2 CLOSED — narrow snapshots on the trap bridge ──────────────────
+//
+// `yarm_riscv64_trap_bridge` used to bracket EVERY trap — including a handled Phase-1 NR6/NR7
+// direct transaction — with broad-lock acquisitions: `current_tid_authoritative` for the entering
+// identity, again for the resume identity, and `with_cpu(|k| k.task_asid(..))` for the SATP
+// lookup. `current_tid_authoritative` is `self.with_cpu(cpu, |kernel| kernel.current_tid())`, so
+// a syscall whose transaction is entirely broad-lock-free still entered the broad lock three
+// times. That was case C's decisive blocker.
+//
+// The replacements are the existing narrow authoritative seams — a call-site swap, no new
+// mechanism and no RISC-V semantic copy:
+//
+//   entering / resume  `current_tid_authoritative(cpu)` -> `current_tid_split_read(cpu)`
+//   SATP asid          `with_cpu(|k| k.task_asid(tid))` -> `task_asid_for_tid_split_read(tid)`
+//
+// **Why the equivalence holds here, when `current_tid_split_read` is marked TRAP_FORBIDDEN for
+// the x86_64 trap seam.** `KernelState::current_tid()` is `current_tid_on(self.current_cpu())`,
+// and `with_cpu(cpu, ..)` calls `set_current_cpu(cpu)` FIRST — so the broad-lock read resolves to
+// `current_tid_on(cpu)`, which is exactly what the split seam reads. The two differ only in (a)
+// serialization against a concurrent broad-lock holder and (b) the `set_current_cpu` side effect.
+// On this bridge both are vacuous: RISC-V is BSP-only, the bridge always passes
+// `BOOTSTRAP_CPU_ID`, and `validate_online_cpu` admits no other CPU while `online_cpus == 1`, so
+// `current_cpu` is invariant and the rebind changes nothing. `riscv_current_cpu_binding_is_invariant`
+// pins that premise, so if RISC-V ever boots a second hart this module fails rather than the
+// bridge silently regressing.
+mod stage199d_riscv_narrow_trap_snapshots {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const BRIDGE: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    fn bridge_body() -> &'static str {
+        let at = BRIDGE
+            .find("extern \"C\" fn yarm_riscv64_trap_bridge")
+            .expect("the trap bridge");
+        let closer = "\n}";
+        let end = BRIDGE[at..]
+            .find(closer)
+            .map(|i| at + i)
+            .unwrap_or(BRIDGE.len());
+        &BRIDGE[at..end]
+    }
+
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    // ── Differential: the narrow snapshot equals the old authoritative result ───────────────
+
+    /// **Same-current.** A single dispatched task: both reads name it.
+    #[test]
+    fn narrow_and_authoritative_agree_for_same_current() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        kernel.with(|state| {
+            state.register_task(77).expect("task77");
+            state.enqueue_current_cpu(77).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+        let narrow = kernel.current_tid_split_read(cpu);
+        let authoritative = kernel.current_tid_authoritative(cpu);
+        assert_eq!(narrow, authoritative, "same-current must agree");
+        assert_eq!(narrow, Some(77));
+        // And the bridge's `unwrap_or(0)` shaping agrees too.
+        assert_eq!(narrow.unwrap_or(0), authoritative.unwrap_or(0));
+    }
+
+    /// **Switched-current.** After a queue-advancing switch both reads name the NEW task, so the
+    /// bridge's `task_switched` decision is unchanged.
+    #[test]
+    fn narrow_and_authoritative_agree_for_switched_current() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        kernel.with(|state| {
+            state.register_task(81).expect("task81");
+            state.register_task(82).expect("task82");
+            state.enqueue_current_cpu(81).expect("enqueue 81");
+            state.enqueue_current_cpu(82).expect("enqueue 82");
+            state.dispatch_next_task().expect("dispatch");
+        });
+        let entering_narrow = kernel.current_tid_split_read(cpu);
+        let entering_auth = kernel.current_tid_authoritative(cpu);
+        assert_eq!(entering_narrow, entering_auth);
+
+        kernel.with(|state| state.yield_current().expect("yield"));
+
+        let resume_narrow = kernel.current_tid_split_read(cpu);
+        let resume_auth = kernel.current_tid_authoritative(cpu);
+        assert_eq!(resume_narrow, resume_auth, "switched-current must agree");
+        assert_ne!(resume_narrow, entering_narrow, "a switch really happened");
+        // The bridge's decision is computed identically from either read.
+        assert_eq!(
+            resume_narrow.unwrap_or(0) != entering_narrow.unwrap_or(0),
+            resume_auth.unwrap_or(0) != entering_auth.unwrap_or(0),
+            "task_switched must be identical under both reads"
+        );
+    }
+
+    /// **Replacement.** A task that exits and is replaced by another TID: both reads name the
+    /// replacement, so the SATP lookup is keyed on the same TID either way.
+    #[test]
+    fn narrow_and_authoritative_agree_for_replacement() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        kernel.with(|state| {
+            state.register_task(91).expect("task91");
+            state.register_task(92).expect("task92");
+            state.enqueue_current_cpu(91).expect("enqueue 91");
+            state.dispatch_next_task().expect("dispatch 91");
+        });
+        let before = kernel.current_tid_split_read(cpu);
+        assert_eq!(before, kernel.current_tid_authoritative(cpu));
+
+        // Replace the running task with a different TID.
+        kernel.with(|state| {
+            state.enqueue_current_cpu(92).expect("enqueue 92");
+            state.yield_current().expect("yield to 92");
+        });
+        let after_narrow = kernel.current_tid_split_read(cpu);
+        let after_auth = kernel.current_tid_authoritative(cpu);
+        assert_eq!(after_narrow, after_auth, "replacement must agree");
+        assert_eq!(
+            kernel.task_asid_for_tid_split_read(after_narrow.unwrap_or(0)),
+            kernel.task_asid_for_tid_split_read(after_auth.unwrap_or(0)),
+            "the SATP lookup is keyed on the same TID under either read"
+        );
+    }
+
+    /// **No-current.** An offline / unbound CPU yields `None` from both, so the bridge's
+    /// `unwrap_or(entering_tid)` fallback and the typed-idle invariant behave identically.
+    #[test]
+    fn narrow_and_authoritative_agree_for_no_current() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let offline = CpuId(7);
+        let narrow = kernel.current_tid_split_read(offline);
+        let authoritative = kernel.current_tid_authoritative(offline);
+        assert_eq!(narrow, None, "no current on an offline CPU");
+        assert_eq!(narrow, authoritative, "no-current must agree");
+        // The typed-idle invariant reads the same 0.
+        assert_eq!(narrow.unwrap_or(0), 0);
+        assert_eq!(authoritative.unwrap_or(0), 0);
+    }
+
+    // ── The fail-closed SATP translation ────────────────────────────────────────────────────
+
+    /// **Stale / missing resume identity must NOT install another task's address space.** The
+    /// narrow asid seam reports both "no such TID" and "no address space" as `0`, where the
+    /// broad-lock read returned `None`. `0` is unambiguous because the allocator never hands out
+    /// `Asid(0)` — so mapping `0` back to `None` reproduces "leave the installed SATP alone".
+    #[test]
+    fn a_missing_resume_tid_yields_no_asid_and_installs_nothing() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        // A TID that was never registered.
+        let raw = kernel.task_asid_for_tid_split_read(999_999);
+        assert_eq!(raw, 0, "an unknown TID reports absence as 0");
+        let translated = match raw {
+            0 => None,
+            v => Some(crate::kernel::vm::Asid(v as u16)),
+        };
+        assert!(
+            translated.is_none(),
+            "absence must translate to None so no SATP write happens"
+        );
+        // The broad-lock read it replaces agrees.
+        let authoritative = kernel
+            .with_cpu(CpuId(0), |k| k.task_asid(999_999))
+            .ok()
+            .flatten();
+        assert_eq!(translated, authoritative, "fail-closed translation matches");
+    }
+
+    /// The translation is exactly the one the bridge performs, and `Asid(0)` never names a real
+    /// address space — the premise the translation rests on.
+    #[test]
+    fn asid_zero_is_never_a_real_address_space() {
+        const VM: &str = include_str!("../vm.rs");
+        assert!(
+            VM.contains("ASID 0 must never be allocated"),
+            "the allocator must never hand out Asid(0), or 0 would be ambiguous"
+        );
+        let body = bridge_body();
+        assert!(
+            body.contains(
+                "let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {"
+            ) && body.contains("0 => None,"),
+            "the bridge must translate 0 to None explicitly"
+        );
+    }
+
+    /// A live TID's asid agrees between the narrow seam and the broad-lock read.
+    #[test]
+    fn a_live_tid_yields_the_same_asid_under_both_reads() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.register_task(55).expect("task55");
+            state.enqueue_current_cpu(55).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+        let narrow = match kernel.task_asid_for_tid_split_read(55) {
+            0 => None,
+            v => Some(crate::kernel::vm::Asid(v as u16)),
+        };
+        let authoritative = kernel
+            .with_cpu(CpuId(0), |k| k.task_asid(55))
+            .ok()
+            .flatten();
+        assert_eq!(narrow, authoritative, "live TID asid must agree");
+    }
+
+    // ── The premise that makes the dropped `set_current_cpu` vacuous ────────────────────────
+
+    /// **The d82ef8de premise, REPLACED — not deleted.** That proof rested on "the bridge always
+    /// passes `BOOTSTRAP_CPU_ID` on a BSP-only architecture", which made the dropped
+    /// `set_current_cpu` rebind vacuous. Stage 199D link 7 makes the bridge DERIVE the trapping
+    /// CpuId, so that premise no longer holds by construction and is replaced by a per-hart one.
+    ///
+    /// The per-hart argument: `with_cpu(cpu, ..)` calls `set_current_cpu(cpu)` and then reads
+    /// `current_tid_on(current_cpu)`, so both reads resolve to `current_tid_on(cpu)` for whatever
+    /// `cpu` the bridge derives — the equivalence is independent of WHICH cpu that is. What the
+    /// old premise additionally bought (an idempotent rebind) is now bought by the fact that only
+    /// the boot hart can reach this bridge at all: the secondaries park with every interrupt
+    /// admission disabled and never enter userspace, so no second hart generates a trap.
+    #[test]
+    fn the_bridge_derives_a_per_hart_cpu_identity() {
+        // The constant is gone; the derivation is in its place.
+        assert!(
+            !bridge_body().contains(
+                "let cpu = crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);"
+            ),
+            "the bridge must no longer hardcode the bootstrap CPU"
+        );
+        assert!(
+            bridge_body()
+                .contains("let cpu = riscv_logical_cpu_for_trap_frame(frame_ptr as usize);"),
+            "the bridge must derive the trapping CpuId from the frame pointer"
+        );
+        // The derivation is authoritative: frames are allocated on the trapping hart's own trap
+        // stack, because the vector's first act swaps sp with sscratch.
+        assert!(
+            BRIDGE.contains("csrrw sp, sscratch, sp"),
+            "the trap vector swaps sp with the per-hart trap stack — that is what makes the \
+             frame pointer name the hart"
+        );
+        assert!(
+            BRIDGE.contains("fn riscv_logical_cpu_for_trap_frame"),
+            "the derivation helper exists"
+        );
+        // A frame outside every secondary region falls back to the bootstrap CPU, reproducing the
+        // previous constant exactly for the boot hart.
+        let helper = BRIDGE
+            .split("fn riscv_logical_cpu_for_trap_frame")
+            .nth(1)
+            .expect("the helper body");
+        assert!(
+            helper.contains(
+                "crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID)"
+            ),
+            "the boot hart's identity is unchanged"
+        );
+        // And only the boot hart can reach the bridge: secondaries park interrupts-disabled.
+        assert!(
+            BRIDGE.contains("RISCV_SECONDARY_INTERRUPTS_DISABLED")
+                && BRIDGE.contains("RISCV_SECONDARY_TRAP_READY_PARKED"),
+            "the secondaries park with interrupt admission proven disabled"
+        );
+    }
+
+    // ── Structural guards ───────────────────────────────────────────────────────────────────
+
+    /// **No broad-lock lookup survives inside the bridge** — in code. Comments explaining the
+    /// history are fine; acquisitions are not.
+    #[test]
+    fn the_bridge_contains_no_broad_lock_acquisition() {
+        for l in code_lines(bridge_body()) {
+            assert!(
+                !l.contains("current_tid_authoritative"),
+                "the bridge must not take the authoritative (broad-lock) current read: `{l}`"
+            );
+            assert!(
+                !l.contains("with_cpu(") && !l.contains("state.lock()"),
+                "the bridge must not acquire the broad lock: `{l}`"
+            );
+        }
+    }
+
+    /// **Nothing broad happens before or after a handled Phase-1 direct transaction.** The
+    /// wrapper's handled path returns before the broad-lock phase, and the bridge that wraps it
+    /// is now clean on both sides — so the whole handled trap is broad-lock-free.
+    #[test]
+    fn a_handled_direct_transaction_never_touches_the_broad_lock() {
+        let wrapper_at = RISCV_TRAP
+            .find("pub fn handle_riscv_trap_entry_shared")
+            .expect("the wrapper");
+        let wrapper = &RISCV_TRAP[wrapper_at..];
+        let handled = wrapper
+            .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
+            .expect("the handled early return");
+        let phase2 = wrapper
+            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+            .expect("the broad-lock phase");
+        assert!(
+            handled < phase2,
+            "the handled split path must return before the broad-lock phase"
+        );
+        for l in code_lines(&wrapper[..handled]) {
+            assert!(
+                !l.contains("with_cpu("),
+                "nothing before the handled return may take the broad lock: `{l}`"
+            );
+        }
+        // …and the bridge on both sides of the wrapper call.
+        let body = bridge_body();
+        let call = body
+            .find("handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)")
+            .expect("the wrapper call");
+        for (half, region) in [("before", &body[..call]), ("after", &body[call..])] {
+            for l in code_lines(region) {
+                assert!(
+                    !l.contains("with_cpu(") && !l.contains("current_tid_authoritative"),
+                    "the bridge must be broad-lock-free {half} the wrapper call: `{l}`"
+                );
+            }
+        }
+    }
+
+    /// The snapshots are taken at the SAME program boundaries: entering before the wrapper call,
+    /// resume after it and before the register write-back.
+    #[test]
+    fn the_snapshots_are_taken_at_the_same_program_boundaries() {
+        let body = bridge_body();
+        let entering = body
+            .find("let entering_tid = shared.current_tid_split_read(cpu).unwrap_or(0);")
+            .expect("entering snapshot");
+        let call = body
+            .find("handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)")
+            .expect("wrapper call");
+        let resume = body
+            .find("let resume_tid = shared")
+            .expect("resume snapshot");
+        let writeback = body
+            .find("if task_switched || scause == EXC_USER_ECALL {")
+            .expect("register write-back");
+        let satp = body
+            .find("let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {")
+            .expect("SATP lookup");
+        assert!(entering < call, "entering snapshot precedes the wrapper");
+        assert!(call < resume, "resume snapshot follows the wrapper");
+        assert!(
+            resume < writeback,
+            "resume snapshot precedes the write-back"
+        );
+        assert!(writeback < satp, "SATP selection follows the write-back");
+    }
+
+    /// SATP is selected from the EXACT resume TID, and the existing activation + `sfence.vma`
+    /// ordering is untouched.
+    #[test]
+    fn satp_is_selected_from_the_exact_resume_tid_with_unchanged_activation() {
+        let body = bridge_body();
+        assert!(
+            body.contains("shared.task_asid_for_tid_split_read(resume_tid)"),
+            "the asid must be keyed on the resume TID, not on `current`"
+        );
+        let satp = body.find("let resume_asid = match").expect("asid lookup");
+        let tail = &body[satp..];
+        let map = tail
+            .find("map_kernel_shared_into_asid(asid)")
+            .expect("shared map");
+        let write = tail.find("write_satp(satp)").expect("satp write");
+        assert!(
+            map < write,
+            "the kernel-shared mapping must still precede the SATP write"
+        );
+        assert!(
+            tail.contains("if let Some(asid) = resume_asid {"),
+            "absence must still skip activation entirely"
+        );
+    }
+
+    // ── Scope: what this increment did NOT change ───────────────────────────────────────────
+
+    /// Blocker 1 is now CLOSED by a later increment: admission is canonical. It remains
+    /// proof-gated in effect on RISC-V, because admission is `production || proof` and RISC-V
+    /// production is false.
+    #[test]
+    fn blocker_one_is_closed_admission_is_canonical() {
+        let at = RISCV_TRAP
+            .find("pub fn handle_riscv_trap_entry_shared")
+            .expect("the wrapper");
+        let wrapper = &RISCV_TRAP[at..];
+        assert!(
+            wrapper.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "RISC-V admission must ask the canonical predicate"
+        );
+        assert!(
+            !code_lines(wrapper)
+                .iter()
+                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
+            "no direct proof-gate call may remain in the RISC-V ingress"
+        );
+    }
+
+    /// Blocker 3 is untouched: no cross-hart wake was added.
+    #[test]
+    fn blocker_three_remains_open() {
+        const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+        assert!(
+            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
+            "no IPI extension may be introduced by this increment"
+        );
+        const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+        assert_eq!(
+            TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "the wake sends stay x86_64-only"
+        );
+    }
+
+    /// Production predicates are untouched.
+    #[test]
+    fn no_production_predicate_changed() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+
+    /// **Coordinate 23 stays OPEN, but case C's decisive blocker is closed.** Closing the
+    /// return-path blocker does not make RISC-V production-ready: admission is still proof-gated
+    /// and there is still no cross-hart wake.
+    #[test]
+    fn coordinate_23_stays_open_with_blocker_two_closed() {
+        assert!(
+            AUDIT.contains("blocker 2 is **CLOSED**"),
+            "the audit must record blocker 2 as closed"
+        );
+        assert!(
+            AUDIT.contains("RISCV_199D_READINESS=case_c"),
+            "the case-C verdict stands: blockers 1 and 3 remain"
+        );
+        // The matrix row is unchanged.
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,"),
+            "coordinate 23 must still be OPEN"
+        );
+    }
+}
+
+// ── RISC-V readiness blocker 1 CLOSED — canonical admission on the RISC-V ingress ────────────
+//
+// The RISC-V Phase-1 whitelist asked `ipccall_direct_proof_enabled()` directly. That made the
+// RISC-V production predicate un-flippable in practice: with the proof gate off, `nr` never
+// reached `try_split_dispatch_into_frame`, so enabling production would have been a SILENT
+// NO-OP. It now asks the canonical `ipccall_direct_admission_enabled()`.
+//
+// **Behaviour-preserving today, provably.** `ipccall_direct_admission_enabled()` is
+// `ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()`, and
+// `ipccall_direct_production_enabled()` is `cfg!(target_arch = "x86_64")` — false on RISC-V. So on
+// RISC-V the canonical predicate reduces to `false || proof`, i.e. *exactly* the proof gate the
+// site used to ask. Neither predicate's implementation changed and no production default moved.
+//
+// All three admission questions now flow through the one helper: the ABI import (unconditional on
+// the RISC-V bridge — `a7`→nr and `a0..a5`→args are set for every ecall), whitelist admission
+// (the site repaired here) and direct-handler reachability (`try_split_dispatch_into_frame`,
+// already canonical).
+mod stage199d_riscv_canonical_admission {
+    use super::*;
+
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BRIDGE: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    fn wrapper() -> &'static str {
+        let at = RISCV_TRAP
+            .find("pub fn handle_riscv_trap_entry_shared")
+            .expect("the RISC-V trap wrapper");
+        let closer = "\n}";
+        let end = RISCV_TRAP[at..]
+            .find(closer)
+            .map(|i| at + i)
+            .unwrap_or(RISCV_TRAP.len());
+        &RISCV_TRAP[at..end]
+    }
+
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    // ── 1. NR6 and NR7 both use canonical admission ─────────────────────────────────────────
+
+    /// The RISC-V whitelist names both NRs and gates them on the canonical helper.
+    #[test]
+    fn riscv_nr6_and_nr7_both_use_canonical_admission() {
+        let w = wrapper();
+        let gate_at = w
+            .find("let is_ipc_direct = (nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR")
+            .expect("the NR6/NR7 admission gate");
+        let gate = &w[gate_at..gate_at + 400];
+        assert!(
+            gate.contains("SYSCALL_IPC_CALL_NR"),
+            "NR6 must be named by the gate"
+        );
+        assert!(
+            gate.contains("SYSCALL_IPC_REPLY_NR"),
+            "NR7 must be named by the gate"
+        );
+        assert!(
+            gate.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "the gate must ask the CANONICAL admission predicate"
+        );
+        // And the whitelist actually consumes it.
+        assert!(
+            w.contains("|| is_ipc_direct)"),
+            "`split_eligible` must include the direct-IPC admission decision"
+        );
+    }
+
+    // ── 2. No direct proof-predicate dependency remains in the arch ingress ─────────────────
+
+    /// **No `ipccall_direct_proof_enabled()` CALL survives anywhere in the RISC-V arch tree.**
+    /// Comments explaining the change are fine; a call is not.
+    #[test]
+    fn no_proof_predicate_call_remains_in_the_riscv_ingress() {
+        for (what, src) in [
+            ("riscv64/trap.rs", RISCV_TRAP),
+            ("riscv64/boot.rs", RISCV_BRIDGE),
+        ] {
+            for l in code_lines(src) {
+                assert!(
+                    !l.contains("ipccall_direct_proof_enabled()"),
+                    "{what} must not ask the proof predicate directly: `{l}`"
+                );
+            }
+        }
+    }
+
+    /// All three admission questions flow through the canonical helper: the import is
+    /// unconditional, the whitelist is canonical, and handler reachability is canonical.
+    #[test]
+    fn all_three_admission_questions_flow_through_the_canonical_helper() {
+        // (a) ABI import — unconditional on this bridge, so it cannot be a proof dependency.
+        for i in 0..6 {
+            let reg = ["A0", "A1", "A2", "A3", "A4", "A5"][i];
+            let expect =
+                alloc::format!("tframe.set_arg({i}, frame.regs[RiscvTrapFrame::{reg}] as usize);");
+            assert!(RISCV_BRIDGE.contains(&expect), "arg{i} import must exist");
+        }
+        assert!(
+            RISCV_BRIDGE
+                .contains("tframe.set_syscall_num(frame.regs[RiscvTrapFrame::A7] as usize);"),
+            "the nr import must exist"
+        );
+        // (b) whitelist admission — canonical (covered above).
+        assert!(wrapper().contains("ipccall_direct_admission_enabled()"));
+        // (c) direct-handler reachability — canonical.
+        assert_eq!(
+            SPLIT
+                .matches("crate::kernel::boot::ipccall_direct_admission_enabled()")
+                .count(),
+            3,
+            "the split dispatcher's three admission decisions stay canonical"
+        );
+        for l in code_lines(SPLIT) {
+            assert!(
+                !l.contains("ipccall_direct_proof_enabled()"),
+                "the split dispatcher must not ask the proof predicate: `{l}`"
+            );
+        }
+    }
+
+    // ── 3. Production-disabled admission equals the proof gate ──────────────────────────────
+
+    /// **The behaviour-preservation proof.** With production disabled, canonical admission IS the
+    /// proof gate — so this repair changes nothing today, on any architecture whose production
+    /// predicate is false.
+    #[test]
+    fn production_disabled_admission_equals_the_proof_gate() {
+        let admission = MOD_SRC
+            .split("pub fn ipccall_direct_admission_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the admission predicate");
+        assert_eq!(
+            admission.trim(),
+            "ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()",
+            "admission is production OR proof — so with production false it reduces to proof"
+        );
+        // Observable identity, on whatever architecture this test build targets: admission is
+        // exactly the disjunction. (This hosted build runs on x86_64, where production is TRUE —
+        // so the reduction below is asserted structurally rather than by running it here.)
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_admission_enabled(),
+            crate::kernel::boot::ipccall_direct_production_enabled()
+                || crate::kernel::boot::ipccall_direct_proof_enabled(),
+            "admission must be exactly production OR proof"
+        );
+        // The RISC-V reduction: production is `cfg!(target_arch = "x86_64")`, so on RISC-V the
+        // first disjunct is a compile-time false and admission IS the proof gate — which is what
+        // makes the repaired site behaviour-preserving there.
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\")",
+            "production is x86_64-only, so it is compile-time false on RISC-V"
+        );
+        assert!(
+            !cfg!(target_arch = "riscv64")
+                || !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "on a RISC-V build the production predicate must be false"
+        );
+    }
+
+    /// Proof selector OFF still declines NR6/NR7 to the unchanged broad-lock path, and ON admits
+    /// exactly the population it did before — because the predicate reduces to the same gate.
+    #[test]
+    fn the_admitted_population_is_unchanged_in_both_selector_states() {
+        // OFF: the proof selector is off by default, so on any architecture whose production
+        // predicate is false, admission is closed and NR6/NR7 decline to the broad-lock path.
+        // (This test build is x86_64, where production is true by design — so the RISC-V
+        // consequence is stated as an implication rather than run here.)
+        assert!(
+            !crate::kernel::boot::ipccall_direct_proof_enabled(),
+            "the proof selector is off by default"
+        );
+        assert!(
+            crate::kernel::boot::ipccall_direct_production_enabled()
+                || !crate::kernel::boot::ipccall_direct_admission_enabled(),
+            "with production false and the selector off, admission must be closed"
+        );
+        // The decline is structural: `split_eligible` requires `is_ipc_direct` for NR6/NR7, and
+        // the fall-through comment records that a normal boot is byte-identical.
+        let w = wrapper();
+        assert!(
+            w.contains("fall through UNCHANGED to the broad-lock handler")
+                && w.contains("a normal boot is byte-identical"),
+            "the feature-off contract must stay recorded at the gate"
+        );
+        // ON: the same gate value the site used to compute — no widening. The only other term is
+        // production, which is false on RISC-V.
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\")",
+            "production is x86_64-only, so on RISC-V admission adds no term beyond proof"
+        );
+    }
+
+    // ── 4. Feature-off stays marker-clean ───────────────────────────────────────────────────
+
+    /// No ordinary feature-off production traffic becomes newly admitted: the RISC-V whitelist
+    /// still admits exactly DebugLog, FutexWake and (gated) NR6/NR7 — nothing else — and emits
+    /// no direct-IPC marker of its own.
+    #[test]
+    fn feature_off_remains_marker_clean() {
+        let w = wrapper();
+        let at = w
+            .find("let split_eligible = is_syscall")
+            .expect("the whitelist");
+        let whitelist = &w[at..at + 320];
+        for nr in [
+            "SYSCALL_DEBUG_LOG_NR",
+            "SYSCALL_FUTEX_WAKE_NR",
+            "is_ipc_direct",
+        ] {
+            assert!(
+                whitelist.contains(nr),
+                "the whitelist must still admit `{nr}`"
+            );
+        }
+        // Nothing else was added to the whitelist.
+        assert_eq!(
+            whitelist.matches("nr == crate::kernel::syscall::").count(),
+            2,
+            "exactly two literal NRs plus the gated direct-IPC term"
+        );
+        // The arch-tagged NR6/NR7 markers are emitted by the kernel drain, not by this gate.
+        assert!(
+            w.contains("NR6/NR7 emit their arch-tagged retirement markers from the drain"),
+            "the gate must not introduce its own direct-IPC marker"
+        );
+    }
+
+    // ── 5–6. The bridge stays broad-lock-free; blocker 2 stays closed ───────────────────────
+
+    /// Blocker 2 stays closed: this repair did not reintroduce a broad-lock acquisition, and the
+    /// handled Phase-1 path is still clean on both sides of the wrapper call.
+    #[test]
+    fn blocker_two_stays_closed_and_the_bridge_stays_broad_lock_free() {
+        let at = RISCV_BRIDGE
+            .find("extern \"C\" fn yarm_riscv64_trap_bridge")
+            .expect("the bridge");
+        let end = RISCV_BRIDGE[at..]
+            .find("\n}")
+            .map(|i| at + i)
+            .unwrap_or(RISCV_BRIDGE.len());
+        let bridge = &RISCV_BRIDGE[at..end];
+        for l in code_lines(bridge) {
+            assert!(
+                !l.contains("current_tid_authoritative") && !l.contains("with_cpu("),
+                "the bridge must stay broad-lock-free: `{l}`"
+            );
+        }
+        assert!(bridge.contains("shared.current_tid_split_read(cpu).unwrap_or(0);"));
+        assert!(bridge.contains("shared.task_asid_for_tid_split_read(resume_tid)"));
+        // And the handled Phase-1 return still precedes the broad-lock phase.
+        let w = wrapper();
+        let handled = w
+            .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
+            .expect("handled return");
+        let phase2 = w
+            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+            .expect("broad-lock phase");
+        assert!(
+            handled < phase2,
+            "handled path returns before the broad lock"
+        );
+        for l in code_lines(&w[..handled]) {
+            assert!(
+                !l.contains("with_cpu("),
+                "nothing before the handled return may take the broad lock: `{l}`"
+            );
+        }
+    }
+
+    // ── 7. Cross-hart wake blocker 3 remains explicitly open ────────────────────────────────
+
+    /// Blocker 3 is untouched and stays explicitly open — which is why the readiness verdict
+    /// moves to case B rather than case A.
+    #[test]
+    fn cross_hart_wake_blocker_three_remains_open() {
+        const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+        assert!(
+            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
+            "no IPI extension may be introduced by this increment"
+        );
+        const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+        assert_eq!(
+            TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "both post-enqueue wake sends stay x86_64-only"
+        );
+        assert!(
+            AUDIT.contains("RISCV_199D_READINESS=case_b"),
+            "the audit must record the recomputed case-B verdict"
+        );
+        assert!(
+            AUDIT.contains("blocker 1 is **CLOSED**"),
+            "the audit must record blocker 1 as closed"
+        );
+    }
+
+    // ── 8. No production predicate changed ──────────────────────────────────────────────────
+
+    /// Neither predicate's implementation moved, and RISC-V production is still false.
+    #[test]
+    fn no_production_predicate_changed() {
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        let admission = MOD_SRC
+            .split("pub fn ipccall_direct_admission_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the admission predicate");
+        assert_eq!(
+            admission.trim(),
+            "ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()"
+        );
+    }
+
+    /// x86_64 and AArch64 ingress predicate behaviour is unchanged — the portable trap entry
+    /// already asked the canonical helper, and this increment did not touch it.
+    #[test]
+    fn x86_and_aarch64_predicate_behaviour_is_unchanged() {
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        assert_eq!(
+            TRAP_ENTRY
+                .matches("crate::kernel::boot::ipccall_direct_admission_enabled()")
+                .count(),
+            2,
+            "the portable import and its return-path twin stay canonical"
+        );
+        for l in code_lines(TRAP_ENTRY) {
+            assert!(
+                !l.contains("ipccall_direct_proof_enabled()"),
+                "the portable trap entry must not ask the proof predicate: `{l}`"
+            );
+        }
+    }
+
+    /// **Coordinate 23 stays OPEN.** Closing blocker 1 makes the SMP=1 path structurally
+    /// complete; it does not earn production enablement or live evidence, and blocker 3 stands.
+    #[test]
+    fn coordinate_23_stays_open() {
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,"),
+            "coordinate 23 must still be OPEN"
+        );
+        assert!(
+            AUDIT.contains("case_b"),
+            "and the audit must carry the recomputed classification"
+        );
+    }
+}
+
+// ── RISC-V readiness blocker 3 — remote-wake readiness audit ─────────────────────────────────
+//
+// The question: after a remote NR6/NR7 enqueue, can RISC-V authoritatively wake the target hart?
+//
+// The intended chain is: committed `wake_target_cpu` → local/remote comparison → arch wake seam →
+// SBI IPI → supervisor software interrupt → target trap entry → pending-bit acknowledgement →
+// `process_cross_cpu_work_for_cpu` → runnable-task selection → user continuation.
+//
+// **Verdict: D — REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY.** The chain does not fail at
+// the transport; it fails at its FIRST link. A remote enqueue cannot even be *requested* on
+// RISC-V: the scheduler runs BSP-only (`online_cpus=1`), and no RISC-V task is ever pinned to
+// CPU 1, so the committed `wake_target_cpu` is always the enqueueing CPU and the remote branch is
+// dead code. Everything downstream is missing too, which is why the minimum is a larger SMP
+// foundation rather than "transport only".
+//
+// Each capability below is decided by a NAMED SOURCE SEAM, and the classification is computed
+// from which capabilities are present — not asserted textually.
+mod stage199d_riscv_remote_wake_readiness {
+    use super::*;
+
+    const RISCV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+    const RISCV_TIMER: &str = include_str!("../../arch/riscv64/timer.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const EXEC_STATE: &str = include_str!("exec_state.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    /// The blocker classification.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Classification {
+        /// A — only the SBI IPI transport is missing.
+        TransportOnlyMissing,
+        /// B — transport AND the software-interrupt trap consumer are missing.
+        TransportAndTrapConsumerMissing,
+        /// C — transport, trap consumer AND an AP dispatcher / user return are missing.
+        ApDispatchFoundationMissing,
+        /// D — a remote enqueue cannot be requested at all under the present topology.
+        RemoteEnqueueUnreachableUnderCurrentTopology,
+        /// E — none of the above; an exact reason is required.
+        Other(&'static str),
+    }
+    use Classification::*;
+
+    /// One link of the intended chain, decided by a named source seam.
+    struct Link {
+        /// Position in the chain, 1 = committed wake target.
+        step: u8,
+        what: &'static str,
+        seam: &'static str,
+        /// WHICH sources the seam must be searched in. Scoping matters: `set_task_home_cpu(..
+        /// CpuId(1))` exists in the tree — for x86_64 — so an unscoped probe would report the
+        /// RISC-V pin as present when no RISC-V path has one.
+        scope: Scope,
+        present: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scope {
+        /// The RISC-V arch sources only.
+        Riscv,
+        /// The architecture-neutral direct-IPC transaction.
+        Txn,
+        /// The architecture-neutral runtime seams.
+        Runtime,
+    }
+
+    fn sources_for(scope: Scope) -> &'static [&'static str] {
+        match scope {
+            Scope::Riscv => &[RISCV_BOOT, RISCV_TRAP, RISCV_SBI, RISCV_TIMER],
+            Scope::Txn => &[TXN],
+            Scope::Runtime => &[RUNTIME],
+        }
+    }
+
+    /// Does the tree contain the seam that would make this link work?
+    fn probe(seam: &str, src: &str) -> bool {
+        src.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+            .any(|l| l.contains(seam))
+    }
+
+    fn chain() -> alloc::vec::Vec<Link> {
+        alloc::vec![
+            Link {
+                step: 1,
+                what: "a RISC-V task can be pinned to a non-boot CPU, so a remote target exists",
+                // `set_task_home_cpu(.., CpuId(1))` has exactly one caller, and it is the x86 AP
+                // workload builder — reached only from `arch/x86_64/smp.rs`.
+                seam: "set_task_home_cpu",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 2,
+                what: "the scheduler brings CPU 1 online so an enqueue can target it",
+                seam: "RISCV_SCHEDULER_SMP_ONLINE",
+                scope: Scope::Riscv,
+                // Stage 199D link 2 closed: trap-ready secondaries are registered through the
+                // GENERIC mark_cpu_wake_only + bring_up_cpu + install_ap_idle_current sequence,
+                // scheduler-online but explicitly NON-DISPATCHABLE.
+                present: true,
+            },
+            Link {
+                step: 3,
+                what: "the committed wake target is reported and compared against the enqueueing CPU",
+                seam: "if success.wake_target_cpu != enqueueing_cpu {",
+                scope: Scope::Txn,
+                present: true,
+            },
+            Link {
+                step: 4,
+                what: "an architecture wake seam exists for RISC-V",
+                seam: "riscv64::smp::send_reschedule_ipi_to",
+                scope: Scope::Txn,
+                present: false,
+            },
+            Link {
+                step: 5,
+                what: "an SBI IPI transport exists",
+                seam: "SBI_EXT_IPI",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 6,
+                what: "supervisor software interrupts are enabled in sie (SSIE, bit 1)",
+                seam: "SSIE",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 7,
+                what: "hart 1's stvec points at the YARM trap vector rather than a wfi park",
+                seam: "RISCV_SECONDARY_TRAP_VECTOR_INSTALLED",
+                scope: Scope::Riscv,
+                // Stage 199D link 7 closed: the secondary installs the real YARM trap vector
+                // after stack, SATP, sfence, sscratch and CPU identity are valid.
+                present: true,
+            },
+            Link {
+                step: 8,
+                what: "the trap decoder recognises the supervisor software interrupt (cause 1)",
+                seam: "IRQ_SUPERVISOR_SOFT",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 9,
+                what: "the cross-CPU work consumer exists and runs on a trap path",
+                seam: "kernel.process_cross_cpu_work_for_cpu(cpu)",
+                scope: Scope::Riscv,
+                present: true,
+            },
+            Link {
+                step: 10,
+                what: "hart 1 can perform saved user dispatch / user return",
+                seam: "RISCV_SECONDARY_USER_DISPATCH",
+                scope: Scope::Riscv,
+                present: false,
+            },
+        ]
+    }
+
+    /// The classification, COMPUTED from which links are present.
+    fn classify() -> Classification {
+        let links = chain();
+        let missing: alloc::vec::Vec<u8> = links
+            .iter()
+            .filter(|l| !l.present)
+            .map(|l| l.step)
+            .collect();
+        if missing.is_empty() {
+            return Other("every link is present — the blocker would be closed");
+        }
+        // The chain is ordered: the EARLIEST missing link decides the classification, because
+        // nothing downstream can be exercised until it exists.
+        let first = missing[0];
+        match first {
+            // Link 1 alone still means the remote target cannot be NAMED: no RISC-V task is
+            // pinned to a non-boot CPU, so `wake_target_cpu` is always the enqueueing CPU even
+            // though CPU 1 is now scheduler-online (wake-only).
+            1 | 2 => RemoteEnqueueUnreachableUnderCurrentTopology,
+            3 => Other("the committed wake target itself is missing"),
+            4 | 5 if missing.iter().all(|s| *s == 4 || *s == 5) => TransportOnlyMissing,
+            4 | 5 if missing.iter().all(|s| matches!(s, 4 | 5 | 6 | 7 | 8)) => {
+                TransportAndTrapConsumerMissing
+            }
+            4 | 5 => ApDispatchFoundationMissing,
+            _ => Other("an unexpected link ordering"),
+        }
+    }
+
+    // ── The verdict ─────────────────────────────────────────────────────────────────────────
+
+    /// **The classification, computed — not asserted.**
+    #[test]
+    fn the_blocker_classifies_as_remote_enqueue_unreachable() {
+        assert_eq!(
+            classify(),
+            RemoteEnqueueUnreachableUnderCurrentTopology,
+            "the earliest missing link is topology, not transport"
+        );
+        let links = chain();
+        let missing: alloc::vec::Vec<u8> = links
+            .iter()
+            .filter(|l| !l.present)
+            .map(|l| l.step)
+            .collect();
+        assert_eq!(
+            missing,
+            alloc::vec![1u8, 4, 5, 6, 8, 10],
+            "links 2, 3, 7 and 9 are closed; the earliest missing link is 1 (no RISC-V task is \
+             pinned to a non-boot CPU), so the verdict is still D"
+        );
+        assert_ne!(classify(), TransportOnlyMissing);
+        assert_ne!(classify(), TransportAndTrapConsumerMissing);
+        assert_ne!(classify(), ApDispatchFoundationMissing);
+    }
+
+    /// Every link's `present` flag agrees with the tree — so the classification cannot drift away
+    /// from the source it claims to describe.
+    #[test]
+    fn every_link_presence_flag_matches_the_tree() {
+        for link in chain() {
+            let found = sources_for(link.scope).iter().any(|s| probe(link.seam, s));
+            assert_eq!(
+                found, link.present,
+                "link {} ({}) claims present={} but the tree says {found}: seam `{}`",
+                link.step, link.what, link.present, link.seam
+            );
+        }
+    }
+
+    // ── Q1/Q2: hart 1 is started, but parked, not online ────────────────────────────────────
+
+    /// HSM `hart_start` IS driven for the secondaries, and the marker itself records the outcome.
+    #[test]
+    fn hart_one_is_started_through_sbi_hsm_but_parked_not_online() {
+        assert!(
+            probe(
+                "crate::arch::riscv64::sbi::hsm_hart_start(hart_id, entry_addr, handoff_ptr)",
+                RISCV_BOOT
+            ),
+            "the secondaries are started through SBI HSM"
+        );
+        assert!(
+            RISCV_BOOT.contains("state=parked_not_online"),
+            "and the start marker records that the hart is parked, NOT online"
+        );
+        assert!(
+            probe(
+                "early_marker!(\"RISCV_SECONDARY_HART_PARK hart={}\", hart_id);",
+                RISCV_BOOT
+            ),
+            "the parked hart emits its park marker"
+        );
+        // The park is a terminal wfi loop inside the secondary's own boot function.
+        let at = RISCV_BOOT
+            .find("extern \"C\" fn yarm_riscv64_secondary_boot")
+            .expect("the secondary boot fn");
+        let body = &RISCV_BOOT[at..];
+        let park = body.find("loop {").expect("the terminal park loop");
+        assert!(
+            body[park..].contains("asm!(\"wfi\""),
+            "the secondary's terminal state is a wfi loop"
+        );
+        assert!(
+            !body[..park].contains("dispatch_next_task") && !body[..park].contains("with_cpu("),
+            "the parked hart runs no scheduler work and takes no broad lock"
+        );
+    }
+
+    // ── Q3: what hart 1 owns ────────────────────────────────────────────────────────────────
+
+    /// The secondary entry gives hart 1 a private stack and a **wfi-park stvec**, clears
+    /// `sstatus.SIE`, and writes neither `sscratch` nor `satp`.
+    #[test]
+    fn hart_one_owns_a_park_vector_and_no_kernel_binding() {
+        let at = RISCV_BOOT
+            .find("yarm_riscv64_secondary_entry:")
+            .expect("the secondary entry stub");
+        let stub = &RISCV_BOOT[at..at + 700];
+        assert!(
+            stub.contains("ld sp, 8(a1)"),
+            "hart 1 gets its own stack from the handoff"
+        );
+        assert!(
+            stub.contains("csrw stvec, t0"),
+            "hart 1 installs a trap vector"
+        );
+        // …but the vector it installs is the local wfi label, not the YARM trap entry.
+        assert!(
+            !stub.contains("yarm_riscv64_trap_entry"),
+            "hart 1's stvec must NOT be the YARM trap vector — it is a wfi park"
+        );
+        assert!(
+            stub.contains("csrc sstatus, t1"),
+            "hart 1 CLEARS sstatus.SIE — interrupts are masked"
+        );
+        assert!(
+            !stub.contains("csrw sscratch") && !stub.contains("csrw satp"),
+            "hart 1 owns no sscratch and no address space"
+        );
+    }
+
+    // ── Q4: interrupt enablement ────────────────────────────────────────────────────────────
+
+    /// Only the timer bit is ever enabled in `sie`; the supervisor **software** interrupt enable
+    /// (SSIE, bit 1) is never set on any hart, so an IPI could not be taken even if one arrived.
+    #[test]
+    fn supervisor_software_interrupts_are_never_enabled() {
+        assert!(
+            probe("in(reg) 1usize << 5,", RISCV_TIMER),
+            "sie.STIE (bit 5, timer) is the one bit the tree enables"
+        );
+        for src in [RISCV_BOOT, RISCV_TRAP, RISCV_TIMER] {
+            assert!(
+                !src.contains("csrs sie, ") || !src.contains("1usize << 1,\n                in"),
+                "no sie.SSIE enablement may exist yet"
+            );
+        }
+        // The trap-ready park REPORTS the ssie bit (read back from `sie`) — reporting is not
+        // enabling. What must not exist is a set of bit 1 in `sie`.
+        for src in [RISCV_BOOT, RISCV_TRAP, RISCV_TIMER] {
+            assert!(
+                !src.contains("csrs sie, ")
+                    && !src
+                        .contains("csrrs zero, sie, {0}\",\n                in(reg) 1usize << 1"),
+                "no sie.SSIE enablement may exist"
+            );
+        }
+        assert!(
+            RISCV_BOOT.contains("csrw sie, zero"),
+            "the secondary clears sie outright — SSIE, STIE and SEIE all off"
+        );
+    }
+
+    // ── Q5/Q6: transport and consumer ───────────────────────────────────────────────────────
+
+    /// No SBI IPI transport exists. The SBI surface carries HSM and TIME only.
+    #[test]
+    fn no_sbi_ipi_transport_exists() {
+        assert!(
+            RISCV_SBI.contains("SBI_EXT_HSM"),
+            "HSM is present — that is how the secondaries are started"
+        );
+        assert!(
+            !RISCV_SBI.contains("SBI_EXT_IPI") && !RISCV_SBI.contains("0x735049"),
+            "the IPI extension is absent"
+        );
+        // And no wake seam calls one.
+        assert!(
+            !probe("send_ipi", RISCV_BOOT) && !probe("send_ipi", RISCV_TRAP),
+            "no RISC-V arch wake seam exists"
+        );
+    }
+
+    /// The trap decoder recognises only the timer and external interrupts; a supervisor software
+    /// interrupt (cause 1) would fall through to `TrapEvent::Unknown`, so there is no consumer.
+    #[test]
+    fn the_supervisor_software_interrupt_has_no_decoder_arm() {
+        assert!(RISCV_TRAP.contains("const IRQ_SUPERVISOR_TIMER: usize = 5;"));
+        assert!(RISCV_TRAP.contains("const IRQ_SUPERVISOR_EXTERNAL: usize = 9;"));
+        assert!(
+            !RISCV_TRAP.contains("IRQ_SUPERVISOR_SOFT"),
+            "cause 1 has no named constant, so no decoder arm can reference it"
+        );
+        let at = RISCV_TRAP
+            .find("pub fn decode_trap_context")
+            .expect("the decoder");
+        let body = &RISCV_TRAP[at..at + 700];
+        assert!(
+            body.contains("IRQ_SUPERVISOR_TIMER => TrapEvent::TimerInterrupt")
+                && body.contains("IRQ_SUPERVISOR_EXTERNAL => TrapEvent::ExternalInterrupt")
+                && body.contains("_ => TrapEvent::Unknown"),
+            "an unrecognised interrupt cause falls to Unknown — there is no software-interrupt arm"
+        );
+    }
+
+    /// The cross-CPU work consumer DOES exist on the RISC-V trap path — but only on the boot
+    /// hart, because hart 1 never enters a YARM trap.
+    #[test]
+    fn the_cross_cpu_consumer_exists_but_only_the_boot_hart_reaches_it() {
+        assert!(
+            probe(
+                "let _ = kernel.process_cross_cpu_work_for_cpu(cpu);",
+                RISCV_TRAP
+            ),
+            "the consumer is wired into the RISC-V trap path"
+        );
+        // It is reached from the broad-lock phase of the boot hart's trap handling, and hart 1's
+        // stvec is a wfi park (proved above), so hart 1 can never reach it.
+        let at = RISCV_TRAP
+            .find("let _ = kernel.process_cross_cpu_work_for_cpu(cpu);")
+            .expect("the call");
+        assert!(
+            RISCV_TRAP[..at].contains("fn handle_trap_entry_with_fault_bookkeeping_mode"),
+            "the consumer sits inside the trap-entry handler"
+        );
+    }
+
+    // ── Q8/Q9: is a remote enqueue even requestable? ────────────────────────────────────────
+
+    /// **The decisive finding.** The wake target is the receiver's captured affinity, falling back
+    /// to the enqueueing CPU. Affinity comes from `tcb.cpu_affinity`, set only by
+    /// `set_task_home_cpu`, whose only `CpuId(1)` caller is the **x86_64** AP workload builder. On
+    /// RISC-V no task is ever pinned, so the committed target is always the enqueueing CPU and the
+    /// remote branch is unreachable.
+    #[test]
+    fn no_riscv_task_can_be_committed_to_cpu_one() {
+        assert!(
+            probe("let cpu = affinity.unwrap_or(sched.current_cpu);", RUNTIME),
+            "the enqueue target is the captured affinity, else the enqueueing CPU"
+        );
+        assert!(
+            probe("ReceiverCommit::Committed(tcb.cpu_affinity)", RUNTIME),
+            "the affinity is the receiver's own captured cpu_affinity"
+        );
+        // The only assignment of a non-zero home CPU is the x86 AP workload builder.
+        assert!(
+            EXEC_STATE.contains("set_task_home_cpu(base_tid, crate::kernel::scheduler::CpuId(1))"),
+            "the sole CpuId(1) pin lives in the AP workload builder"
+        );
+        const X86_SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            X86_SMP.contains("build_ap_workload"),
+            "and that builder is reached only from the x86_64 SMP path"
+        );
+        for src in [RISCV_BOOT, RISCV_TRAP] {
+            assert!(
+                !src.contains("set_task_home_cpu"),
+                "no RISC-V path pins a task to a home CPU"
+            );
+        }
+    }
+
+    /// The remote wake send is x86_64-cfg-gated on both directions, so even a hypothetical remote
+    /// target would not be signalled from the RISC-V build.
+    #[test]
+    fn the_remote_wake_send_is_compiled_out_on_riscv() {
+        assert_eq!(
+            TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "both post-enqueue wake sends are x86_64-only"
+        );
+    }
+
+    // ── Q10: the minimum, and the scope guard ───────────────────────────────────────────────
+
+    /// The minimum is (d) a larger RISC-V SMP foundation — **not** transport alone. Computed:
+    /// more than the transport links are missing.
+    #[test]
+    fn the_minimum_is_a_larger_smp_foundation() {
+        let links = chain();
+        let missing_non_transport: alloc::vec::Vec<u8> = links
+            .iter()
+            .filter(|l| !l.present && !matches!(l.step, 4 | 5))
+            .map(|l| l.step)
+            .collect();
+        assert!(
+            !missing_non_transport.is_empty(),
+            "if only transport were missing the answer would be (a)"
+        );
+        assert_eq!(
+            missing_non_transport,
+            alloc::vec![1u8, 6, 8, 10],
+            "affinity, interrupt enablement, decoder arm and AP dispatch are still absent \
+             (links 2 and 7 are closed)"
+        );
+    }
+
+    /// This increment is an audit: nothing was implemented, flipped or re-homed.
+    #[test]
+    fn the_audit_implemented_nothing() {
+        assert!(
+            !RISCV_SBI.contains("SBI_EXT_IPI"),
+            "no SBI IPI was implemented"
+        );
+        assert!(
+            !RISCV_BOOT.contains("RISCV_SECONDARY_USER_DISPATCH"),
+            "no user work was started on hart 1"
+        );
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+
+    /// The audit document records the computed verdict and the live topology evidence.
+    #[test]
+    fn the_audit_document_records_the_verdict_and_live_evidence() {
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(
+            AUDIT.contains(
+                "RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled"
+            ),
+            "the decisive live marker must be recorded verbatim"
+        );
+        assert!(
+            AUDIT.contains("state=parked_not_online"),
+            "the -smp 2 hart-start outcome must be recorded"
+        );
+        // Coordinate 23 stays OPEN and the ledger is untouched.
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,")
+        );
+    }
+}
+
+// ── RISC-V secondary hart: TRAP-READY PARKED foundation (blocker-3 link 7) ───────────────────
+//
+// Hart 1 now owns a valid kernel execution/trap context and parks with every interrupt admission
+// disabled. It is **not** scheduler-online, runs no scheduler work and no userspace: link 2
+// remains absent, `RISCV_REMOTE_WAKE` remains D, and coordinate 23 remains OPEN.
+mod stage199d_riscv_secondary_trap_ready {
+    use super::*;
+
+    const BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+    const TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    /// A top-level function's body, from its signature to the first column-0 `}`.
+    fn top_level_fn(src: &'static str, sig: &str) -> &'static str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("missing `{sig}`"));
+        let end = src[at..].find("\n}").map(|i| at + i).unwrap_or(src.len());
+        &src[at..end]
+    }
+
+    fn secondary_boot() -> &'static str {
+        top_level_fn(BOOT, "extern \"C\" fn yarm_riscv64_secondary_boot")
+    }
+
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    /// The six markers exist and are emitted in CAUSAL order — identity, then address space,
+    /// then trap stack, then vector, then the interrupt proof, then the park.
+    #[test]
+    fn the_six_trap_ready_markers_are_emitted_in_causal_order() {
+        const ORDER: &[&str] = &[
+            "RISCV_SECONDARY_CPU_ID_BOUND",
+            "RISCV_SECONDARY_KERNEL_SATP_ACTIVE",
+            "RISCV_SECONDARY_SSCRATCH_READY",
+            "RISCV_SECONDARY_TRAP_VECTOR_INSTALLED",
+            "RISCV_SECONDARY_INTERRUPTS_DISABLED",
+            "RISCV_SECONDARY_TRAP_READY_PARKED",
+        ];
+        let body = secondary_boot();
+        let mut last = 0usize;
+        for m in ORDER {
+            let at = body
+                .find(m)
+                .unwrap_or_else(|| panic!("marker `{m}` is missing from the secondary path"));
+            assert!(at > last, "marker `{m}` is emitted out of causal order");
+            last = at;
+        }
+        // Each reports both the hart id and the logical CpuId.
+        for m in ORDER {
+            let at = body.find(m).expect("marker");
+            let line = &body[at..at + 120];
+            assert!(
+                line.contains("hart={}"),
+                "marker `{m}` must report the hart id"
+            );
+        }
+    }
+
+    /// SATP, sscratch and stvec markers report values **read back from the CSRs**, never the
+    /// intended values — a write that silently did not take must not be reported as success.
+    #[test]
+    fn the_csr_markers_report_read_back_values() {
+        let body = secondary_boot();
+        for (write, read) in [
+            ("csrw satp, {v}", "csrr {out}, satp"),
+            ("csrw sscratch, {v}", "csrr {out}, sscratch"),
+            ("csrw stvec, {v}", "csrr {out}, stvec"),
+        ] {
+            let w = body
+                .find(write)
+                .unwrap_or_else(|| panic!("missing `{write}`"));
+            let r = body
+                .find(read)
+                .unwrap_or_else(|| panic!("missing `{read}`"));
+            assert!(
+                r > w,
+                "`{read}` must follow `{write}` — the report is a read-back"
+            );
+        }
+        for reported in ["satp_readback", "sscratch_readback", "stvec_readback"] {
+            assert!(
+                body.contains(reported),
+                "the marker must print the read-back binding `{reported}`"
+            );
+        }
+        // The SATP activation carries the required fence, between write and read-back.
+        let satp_w = body.find("csrw satp, {v}").expect("satp write");
+        let fence = body.find("sfence.vma x0, x0").expect("the required fence");
+        let satp_r = body.find("csrr {out}, satp").expect("satp read-back");
+        assert!(
+            satp_w < fence && fence < satp_r,
+            "sfence.vma must follow the SATP write and precede the read-back"
+        );
+    }
+
+    /// The real trap vector is installed only AFTER identity, address space and trap stack are
+    /// valid.
+    #[test]
+    fn the_real_vector_is_installed_last_of_the_state_steps() {
+        let body = secondary_boot();
+        let bound = body.find("RISCV_SECONDARY_CPU_ID_BOUND").expect("identity");
+        let satp = body
+            .find("RISCV_SECONDARY_KERNEL_SATP_ACTIVE")
+            .expect("satp");
+        let scratch = body
+            .find("RISCV_SECONDARY_SSCRATCH_READY")
+            .expect("sscratch");
+        let vector = body.find("csrw stvec, {v}").expect("the vector install");
+        assert!(
+            bound < vector && satp < vector && scratch < vector,
+            "stvec must be installed after identity, SATP and sscratch"
+        );
+        assert!(
+            body.contains("addr_of!(yarm_riscv64_trap_vector)"),
+            "the installed vector must be the REAL YARM trap entry"
+        );
+    }
+
+    /// `sscratch` follows the EXISTING trap-entry ABI — the vector swaps `sp` with it — and uses
+    /// a PRIVATE per-hart trap stack, not the boot hart's and not its own execution stack.
+    #[test]
+    fn sscratch_follows_the_existing_frame_abi_on_a_private_trap_stack() {
+        assert!(
+            BOOT.contains("csrrw sp, sscratch, sp"),
+            "the one frame convention: the vector swaps sp with sscratch"
+        );
+        assert!(
+            BOOT.contains("fn secondary_trap_stack_top"),
+            "secondaries get their own trap stack"
+        );
+        assert!(
+            BOOT.contains("RISCV64_SECONDARY_TRAP_STACKS"),
+            "…from a dedicated array, not RISCV_TRAP_STACK and not RISCV64_SECONDARY_STACKS"
+        );
+        assert!(
+            secondary_boot().contains("trap_stack_top"),
+            "sscratch is loaded from the handoff's trap-stack top"
+        );
+    }
+
+    /// The logical CpuId is validated and claimed exactly once; duplicates, out-of-range harts
+    /// and the boot hart itself all fail closed.
+    #[test]
+    fn the_cpu_id_mapping_is_validated_and_fails_closed() {
+        assert!(BOOT.contains("fn claim_logical_cpu_id_for_hart"));
+        let claim = BOOT
+            .split("fn claim_logical_cpu_id_for_hart")
+            .nth(1)
+            .expect("the claim fn");
+        // The scheduler bound now constrains the ALLOCATED logical id, not the hart id — the
+        // two are not the same, since the boot hart may be any hart and always owns logical 0.
+        assert!(
+            claim.contains("for id in 1..crate::kernel::scheduler::MAX_CPUS.min(64)"),
+            "the allocated logical id must be bounded by the scheduler's MAX_CPUS"
+        );
+        assert!(
+            claim.contains("let id = candidate?;"),
+            "exhausting the logical CPU space must fail closed"
+        );
+        assert!(
+            claim.contains("hart_id >= QEMU_VIRT_HSM_SECONDARY_HART_LIMIT"),
+            "a hart outside the handoff table must be refused"
+        );
+        assert!(
+            claim.contains("hart_id == boot_hart_id()"),
+            "the boot hart's own id must be refused"
+        );
+        assert!(
+            claim.contains("compare_exchange_weak"),
+            "the claim must be atomic so a duplicate cannot be handed to two harts"
+        );
+        // Duplication is now prevented BY CONSTRUCTION rather than by a check: the id is chosen
+        // from the free set and claimed with a compare-and-swap, so two harts cannot be handed
+        // the same logical CPU even under a concurrent claim.
+        assert!(
+            claim.contains("if seen & (1u64 << id) == 0 {"),
+            "the id must be chosen from the FREE set"
+        );
+        assert!(
+            claim.contains("seen | (1u64 << id)"),
+            "and claimed atomically against the observed word"
+        );
+        // And the secondary declines to install a vector without a valid mapping.
+        assert!(
+            secondary_boot().contains("RISCV_SECONDARY_TRAP_READY_DECLINED"),
+            "an invalid mapping parks without installing a trap vector"
+        );
+    }
+
+    /// **No ASID is allocated and `Asid(0)` cannot be materialised.** The kernel root is the boot
+    /// hart's own live `satp`, captured from the CSR.
+    #[test]
+    fn the_kernel_root_is_captured_not_invented() {
+        let prep = top_level_fn(BOOT, "fn prepare_secondary_handoff");
+        assert!(
+            prep.contains("csrr {out}, satp"),
+            "the kernel root is READ from the boot hart's live satp CSR"
+        );
+        let code = code_lines(prep);
+        for forbidden in [
+            "ensure_asid_root",
+            "activate_asid",
+            "cr3_for_asid",
+            "Asid(0)",
+        ] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "the handoff must not allocate or materialise an address space: `{forbidden}`"
+            );
+        }
+    }
+
+    // ── Scope guards: what this increment must NOT have done ────────────────────────────────
+
+    /// CPU 1 is **not** scheduler-online: no registration call from the RISC-V secondary path.
+    #[test]
+    fn the_secondary_path_never_registers_a_scheduler_cpu() {
+        let body = secondary_boot();
+        let code = code_lines(body);
+        for forbidden in [
+            "set_online",
+            "bring_online",
+            "online_cpu",
+            "register_cpu",
+            "add_cpu",
+            "dispatch_next_task",
+            "enqueue",
+            "process_cross_cpu_work_for_cpu",
+        ] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "the secondary must not touch the scheduler: `{forbidden}`"
+            );
+        }
+        assert!(
+            BOOT.contains("RISCV_SCHEDULER_BSP_ONLY online_cpus=1"),
+            "the BSP-only scheduler attestation is unchanged"
+        );
+    }
+
+    /// No user work, no timer, no affinity, no IPI, no SSIE, no decoder arm.
+    #[test]
+    fn no_out_of_scope_capability_was_added() {
+        let body = secondary_boot();
+        let code = code_lines(body);
+        for forbidden in ["enter_user", "sret", "set_task_home_cpu", "timer"] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "out of scope for the trap-ready park: `{forbidden}`"
+            );
+        }
+        assert!(
+            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
+            "no SBI IPI transport was added"
+        );
+        assert!(
+            !BOOT.contains("send_ipi") && !TRAP.contains("send_ipi"),
+            "no IPI send seam was added"
+        );
+        assert!(
+            !TRAP.contains("IRQ_SUPERVISOR_SOFT"),
+            "no software-interrupt decoder arm was added"
+        );
+        for src in [BOOT, TRAP] {
+            assert!(
+                !src.contains("set_task_home_cpu"),
+                "no RISC-V affinity to CPU 1"
+            );
+        }
+    }
+
+    /// Every interrupt admission is shut, and the marker proves it from read-back CSR bits.
+    #[test]
+    fn every_interrupt_admission_stays_disabled() {
+        let body = secondary_boot();
+        assert!(
+            body.contains("csrw sie, zero"),
+            "sie is cleared outright — SSIE, STIE and SEIE all off"
+        );
+        assert!(body.contains("csrci sstatus, 2"), "sstatus.SIE is cleared");
+        let marker = body
+            .find("RISCV_SECONDARY_INTERRUPTS_DISABLED")
+            .expect("the interrupt-proof marker");
+        let line = &body[marker..marker + 200];
+        for field in ["sstatus_sie=", "ssie=", "stie=", "seie="] {
+            assert!(
+                line.contains(field),
+                "the interrupt proof must report `{field}` from the read-back"
+            );
+        }
+    }
+
+    /// The park is terminal: `wfi` forever, with no scheduler or broad-lock work before it.
+    #[test]
+    fn the_hart_parks_terminally_after_the_markers() {
+        let body = secondary_boot();
+        let ready = body
+            .find("RISCV_SECONDARY_TRAP_READY_PARKED")
+            .expect("the ready marker");
+        let park = body[ready..].find("loop {").expect("the terminal loop") + ready;
+        assert!(
+            body[park..].contains("asm!(\"wfi\""),
+            "the terminal state is a wfi loop"
+        );
+        for l in code_lines(&body[..park]) {
+            assert!(
+                !l.contains("with_cpu(") && !l.contains("state.lock()"),
+                "the secondary takes no broad lock: `{l}`"
+            );
+        }
+    }
+
+    /// The audit records link 7 closed with link 2 still absent, and every downstream verdict
+    /// unchanged.
+    #[test]
+    fn the_record_keeps_every_downstream_verdict_unchanged() {
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+        assert!(
+            AUDIT.contains("link 7 and its hart-local prerequisites are structurally closed"),
+            "the audit must record link 7 as closed"
+        );
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,")
+        );
+    }
+}
+
+// ── RISC-V remote-wake chain link 2 — CPU 1 scheduler-online, WAKE-ONLY ──────────────────────
+//
+// Logical CPU 1 is now registered scheduler-online in the explicitly NON-DISPATCHABLE wake-only
+// state, through the generic mechanism x86_64 (183.5) and AArch64 (195D) already use. It accepts
+// no task placement, runs no dispatcher, owns no timer, consumes no queue and admits no
+// interrupt — the secondary hart stays in its link-7 `wfi` park.
+//
+// This does NOT advance the verdict: link 1 (no RISC-V task is pinned to a non-boot CPU) is still
+// absent, so the committed `wake_target_cpu` remains the enqueueing CPU and
+// `RISCV_REMOTE_WAKE` remains **D**.
+mod stage199d_riscv_link2_wake_only_online {
+    use super::*;
+
+    const BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+    const TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+    const SCHED: &str = include_str!("../../kernel/scheduler.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+    const SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+
+    fn registration() -> &'static str {
+        let at = BOOT
+            .find("fn riscv_bring_trap_ready_secondaries_online_wake_only")
+            .expect("the link-2 registration fn");
+        let end = BOOT[at..].find("\n}").map(|i| at + i).unwrap_or(BOOT.len());
+        &BOOT[at..end]
+    }
+
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    /// **Link 2 is present only because the GENERIC scheduler reports the CPU online AND
+    /// wake-only.** Wake-only is what makes "online" safe: the scheduler's own placement seam
+    /// skips such CPUs, so onlining does not make CPU 1 eligible for ordinary task placement.
+    #[test]
+    fn link_two_rests_on_generic_online_plus_wake_only() {
+        let reg = registration();
+        assert!(
+            reg.contains("kernel.mark_cpu_wake_only(cpu, true)"),
+            "the generic wake-only mark is used"
+        );
+        assert!(
+            reg.contains("kernel.bring_up_cpu(cpu)"),
+            "the generic bring-up handshake is used"
+        );
+        assert!(
+            reg.contains("kernel.install_ap_idle_current(cpu)"),
+            "the existing idle-current convention is used"
+        );
+        // Wake-only is marked BEFORE onlining — no window in which the CPU is online and
+        // placement-eligible.
+        let mark = reg.find("mark_cpu_wake_only(cpu, true)").expect("mark");
+        let online = reg.find("bring_up_cpu(cpu)").expect("bring up");
+        assert!(
+            mark < online,
+            "wake-only must be marked before the CPU is onlined"
+        );
+        // And the scheduler genuinely excludes wake-only CPUs from placement.
+        assert!(
+            SCHED.contains("if self.wake_only & (1u64 << idx) != 0 {")
+                && SCHED.contains("continue;"),
+            "least_loaded_online_cpu must skip wake-only CPUs"
+        );
+    }
+
+    /// No RISC-V-private scheduler and no second online bitmap were created.
+    #[test]
+    fn no_riscv_private_scheduler_or_second_bitmap() {
+        let reg = code_lines(registration());
+        for forbidden in [
+            "static mut",
+            "AtomicU64::new",
+            "online_bitmap =",
+            "fn schedule",
+        ] {
+            assert!(
+                !reg.iter().any(|l| l.contains(forbidden)),
+                "the registration must use only generic seams: `{forbidden}`"
+            );
+        }
+        // The one bitmap it reads is the scheduler's own.
+        for seam in [
+            "kernel.present_cpu_bitmap()",
+            "kernel.online_cpu_bitmap()",
+            "kernel.wake_only_cpu_bitmap()",
+        ] {
+            assert!(
+                registration().contains(seam),
+                "the read-back must come from the generic scheduler seam `{seam}`"
+            );
+        }
+    }
+
+    /// **Publication happens only after the scheduler state READS BACK present=1 online=1
+    /// wake_only=1**, and a partial registration is rolled back instead of reported.
+    #[test]
+    fn the_marker_is_published_only_after_a_three_way_read_back() {
+        let reg = registration();
+        let rb = reg.find("let present_rb").expect("the read-back");
+        let publish = reg
+            .find("RISCV_SCHEDULER_SMP_ONLINE cpu={} present=1 online=1 wake_only=1")
+            .expect("the publication");
+        assert!(rb < publish, "the read-back must precede publication");
+        assert!(
+            reg.contains("if present_rb && online_rb && wake_only_rb {"),
+            "all three must hold before publishing"
+        );
+        assert!(
+            reg.contains("reason=readback_mismatch"),
+            "a mismatch must be reported, not published as success"
+        );
+        // A failed read-back rolls the wake-only mark back.
+        let mismatch = reg.find("reason=readback_mismatch").expect("mismatch arm");
+        assert!(
+            reg[..mismatch]
+                .rfind("mark_cpu_wake_only(cpu, false)")
+                .is_some(),
+            "a mismatch must roll back the wake-only mark"
+        );
+    }
+
+    /// Registration is gated on the hart having acknowledged TRAP_READY_PARKED — the required
+    /// ordering (steps 1-4 before step 5).
+    #[test]
+    fn registration_requires_a_consumed_trap_ready_ack() {
+        assert!(
+            registration().contains("riscv_trap_ready_acked_bitmap()"),
+            "only trap-ready-acked harts may be registered"
+        );
+        // The ack bit is set where the boot hart CONSUMES the ack.
+        let park = BOOT
+            .find("fn park_qemu_virt_secondaries_once")
+            .expect("the park fn");
+        let body = &BOOT[park..];
+        let wait = body
+            .find("wait_for_secondary_ack(slot)")
+            .expect("the ack wait");
+        let set = body.find("RISCV64_TRAP_READY_ACKED").expect("the ack bit");
+        assert!(wait < set, "the bit is set only after the ack is consumed");
+        // And the secondary acks only after publishing TRAP_READY_PARKED.
+        let sec = BOOT
+            .find("extern \"C\" fn yarm_riscv64_secondary_boot")
+            .expect("secondary");
+        let secbody = &BOOT[sec..];
+        let ready = secbody
+            .find("RISCV_SECONDARY_TRAP_READY_PARKED")
+            .expect("ready marker");
+        let ack = secbody
+            .find("RISCV64_SECONDARY_ACK_PARKED")
+            .expect("the ack write");
+        assert!(
+            ready < ack,
+            "the secondary acks only after it is trap-ready parked"
+        );
+    }
+
+    /// The hart-id → logical-CpuId mapping does not assume they are equal. OpenSBI chooses the
+    /// boot hart nondeterministically, and the boot hart is always logical CPU 0.
+    #[test]
+    fn the_logical_cpu_mapping_reserves_zero_for_the_boot_hart() {
+        assert!(
+            BOOT.contains("core::sync::atomic::AtomicU64::new(1)"),
+            "logical id 0 must be PRE-CLAIMED for the boot hart"
+        );
+        let claim = BOOT
+            .split("fn claim_logical_cpu_id_for_hart")
+            .nth(1)
+            .expect("the claim fn");
+        assert!(
+            claim.contains("for id in 1..crate::kernel::scheduler::MAX_CPUS.min(64)"),
+            "secondaries are allocated the lowest free id at or above 1"
+        );
+        assert!(
+            !claim.contains("Ok(_) => return Some(hart_id)"),
+            "the hart id must not be returned as the logical CpuId"
+        );
+    }
+
+    // ── What must NOT have happened ─────────────────────────────────────────────────────────
+
+    /// Link 7 remains present; links 1, 4, 5, 6, 8 and 10 remain absent.
+    #[test]
+    fn only_link_two_moved() {
+        // Link 7 (trap-ready foundation) still there.
+        assert!(BOOT.contains("RISCV_SECONDARY_TRAP_VECTOR_INSTALLED"));
+        // 1 — no RISC-V affinity to a non-boot CPU.
+        for src in [BOOT, TRAP] {
+            assert!(!src.contains("set_task_home_cpu"), "no RISC-V task pinning");
+        }
+        // 4/5 — no arch wake seam, no SBI IPI probe or implementation.
+        assert!(
+            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
+            "no SBI IPI extension or probe was added"
+        );
+        assert!(
+            !BOOT.contains("send_ipi") && !TRAP.contains("send_ipi"),
+            "no arch wake seam was added"
+        );
+        // 6 — no SSIE enablement.
+        for src in [BOOT, TRAP] {
+            assert!(!src.contains("csrs sie, "), "no sie enablement");
+        }
+        assert!(BOOT.contains("csrw sie, zero"), "sie stays cleared");
+        // 8 — no cause-1 decoder arm.
+        assert!(
+            !TRAP.contains("IRQ_SUPERVISOR_SOFT"),
+            "no software-interrupt arm"
+        );
+        // 10 — no secondary dispatch or user return.
+        let sec = BOOT
+            .find("extern \"C\" fn yarm_riscv64_secondary_boot")
+            .expect("secondary");
+        let end = BOOT[sec..]
+            .find("\n}")
+            .map(|i| sec + i)
+            .unwrap_or(BOOT.len());
+        let code = code_lines(&BOOT[sec..end]);
+        for forbidden in [
+            "dispatch",
+            "enter_user",
+            "sret",
+            "enqueue",
+            "process_cross_cpu",
+        ] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "the secondary must have no dispatch/user-return path: `{forbidden}`"
+            );
+        }
+    }
+
+    /// The secondary never calls the scheduler — registration is entirely the boot hart's.
+    #[test]
+    fn the_secondary_never_calls_the_scheduler() {
+        let sec = BOOT
+            .find("extern \"C\" fn yarm_riscv64_secondary_boot")
+            .expect("secondary");
+        let end = BOOT[sec..]
+            .find("\n}")
+            .map(|i| sec + i)
+            .unwrap_or(BOOT.len());
+        let code = code_lines(&BOOT[sec..end]);
+        for forbidden in [
+            "mark_cpu_wake_only",
+            "bring_up_cpu",
+            "install_ap_idle_current",
+            "with_cpu(",
+        ] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "the secondary must not register itself: `{forbidden}`"
+            );
+        }
+        // The registration runs on the boot hart, with a live &mut KernelState.
+        assert!(
+            BOOT.contains("riscv_bring_trap_ready_secondaries_online_wake_only(kernel);"),
+            "the boot hart performs the registration"
+        );
+    }
+
+    /// The smoke gate proves the wake-only state live, and forbids the markers at `-smp 1`.
+    #[test]
+    fn the_smoke_gate_pins_the_wake_only_state() {
+        assert!(
+            SMOKE.contains("online_cpus=${QEMU_SMP}"),
+            "the gate must expect online_cpus == present_cpus"
+        );
+        assert!(
+            SMOKE.contains(
+                "RISCV_SCHEDULER_SMP_ONLINE cpu=[0-9]+ present=1 online=1 wake_only=1 \
+                 dispatchable=0 user_dispatch=0 timer=0 queue=0 irq=0"
+            ) || SMOKE.contains("wake_only=1 dispatchable=0 user_dispatch=0 timer=0 queue=0 irq=0"),
+            "the gate must pin every non-dispatch dimension"
+        );
+        assert!(
+            SMOKE.contains("-smp 1 must emit no secondary marker"),
+            "the gate must forbid secondary markers at -smp 1"
+        );
+        assert!(
+            SMOKE.contains("scheduler registration must follow the trap-ready park"),
+            "the gate must pin the ordering"
+        );
+    }
+
+    /// Every downstream verdict is unchanged.
+    #[test]
+    fn the_verdicts_and_ledger_are_unchanged() {
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,"),
+            "coordinate 23 stays OPEN"
+        );
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+}
+
+/// Stage 199D — the generic, architecture-neutral, non-dispatching runqueue-withdrawal
+/// foundation.
+///
+/// This is **not** RISC-V remote-wake link 1. It adds one seam —
+/// `SmpScheduler::withdraw_queued_tid_on(cpu, tid)` — whose sole authority is removing one queued
+/// occurrence of a TID from a named CPU's runqueue. It is wired into no oracle and no production
+/// path in this increment, so the remote-wake chain status is unchanged.
+mod stage199d_runqueue_withdrawal_foundation {
+    use super::*;
+    use crate::kernel::scheduler::WithdrawOutcome;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::runtime::SharedKernel;
+
+    const SCHED: &str = include_str!("../../kernel/scheduler.rs");
+    const SCHED_STATE: &str = include_str!("scheduler_state.rs");
+
+    /// Body of a method, from its signature to the matching close brace (brace-balanced, so it
+    /// never slices to end-of-file).
+    fn method_body(src: &'static str, sig: &str) -> &'static str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("missing `{sig}`"));
+        let open = at + src[at..].find('{').expect("an opening brace");
+        let mut depth = 0usize;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[at..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after `{sig}`");
+    }
+
+    /// Executable lines only — a token inside a doc comment is documentation, not behaviour.
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .collect()
+    }
+
+    /// The full seam: both scheduler halves plus the narrow `KernelState` wrapper.
+    fn seam_code() -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        for line in code_lines(method_body(
+            SCHED,
+            "pub(crate) fn withdraw_queued_tid(&mut self, tid: ThreadId)",
+        )) {
+            s.push_str(line);
+            s.push('\n');
+        }
+        for line in code_lines(method_body(
+            SCHED,
+            "pub(crate) fn withdraw_queued_tid_on(&mut self, cpu: CpuId, tid: ThreadId)",
+        )) {
+            s.push_str(line);
+            s.push('\n');
+        }
+        for line in code_lines(method_body(
+            SCHED_STATE,
+            "pub(crate) fn withdraw_queued_tid_on(",
+        )) {
+            s.push_str(line);
+            s.push('\n');
+        }
+        // Non-vacuity: an extraction that silently produced nothing would make every
+        // forbidden-token guard below pass for the wrong reason.
+        assert!(
+            s.contains("remove_tid") && s.contains("WithdrawOutcome") && s.lines().count() >= 20,
+            "the seam extraction is degenerate:\n{s}"
+        );
+        s
+    }
+
+    /// Raw in-memory byte image of a TCB's `status` field, read in place.
+    fn status_image(state: &mut KernelState, tid: u64) -> alloc::vec::Vec<u8> {
+        let tcb = state.tcb_mut(tid).expect("a live TCB for the observed tid");
+        let ptr = core::ptr::addr_of!(tcb.status).cast::<u8>();
+        // SAFETY: `status` is a live, initialised, `Copy` field of a live TCB with no interior
+        // pointers, and the read covers exactly `size_of::<TaskStatus>()` bytes of it. The same
+        // field is imaged before and after the withdrawal, so any padding difference could only
+        // make this assertion stricter — never produce a false pass.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, core::mem::size_of::<TaskStatus>()) };
+        bytes.to_vec()
+    }
+
+    /// Boot a kernel with tid 900 dispatched as current on CPU 0 and tid 901 queued behind it.
+    fn kernel_with_queued_peer() -> SharedKernel {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state
+                .register_task_with_class(900, TaskClass::SystemServer)
+                .expect("current task");
+            state
+                .register_task_with_class(901, TaskClass::App)
+                .expect("queued peer");
+            state.enqueue_current_cpu(900).expect("enqueue current");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(900) {
+                state.yield_current().expect("switch to 900");
+            }
+            state.enqueue_current_cpu(901).expect("enqueue peer");
+        });
+        kernel
+    }
+
+    // ── (8) No task-state mutation ─────────────────────────────────────────────────────────
+
+    /// The narrow `KernelState` wrapper acquires only the scheduler state. Withdrawal is a
+    /// runqueue fact, not a lifecycle transition: the withdrawn task's status is byte-for-byte
+    /// what it was, for every status a queued task can legitimately hold.
+    #[test]
+    fn the_wrapper_leaves_the_task_status_byte_for_byte_unchanged() {
+        for status in [
+            TaskStatus::Runnable,
+            TaskStatus::Blocked(WaitReason::Poll),
+            TaskStatus::Blocked(WaitReason::Join(crate::kernel::ipc::ThreadId(900))),
+            TaskStatus::Exited(0x5a5a_5a5a),
+        ] {
+            let kernel = kernel_with_queued_peer();
+            kernel.with(|state| {
+                state.set_task_status_for_test(901, status);
+                let before = status_image(state, 901);
+                let typed_before = state.task_status(901);
+
+                assert_eq!(
+                    state.withdraw_queued_tid_on(CpuId(0), 901),
+                    WithdrawOutcome::Removed,
+                    "the peer is queued on CPU 0 and must be withdrawable"
+                );
+
+                let after = status_image(state, 901);
+                assert_eq!(
+                    before, after,
+                    "the TCB status image changed across a withdrawal of {status:?}"
+                );
+                assert_eq!(state.task_status(901), typed_before);
+                assert_eq!(state.task_status(901), Some(status));
+                assert!(state.task_exists(901), "the TCB itself must survive");
+            });
+        }
+    }
+
+    /// The task the withdrawal did NOT name is untouched too — status and TCB alike.
+    #[test]
+    fn the_wrapper_leaves_untargeted_tasks_untouched() {
+        let kernel = kernel_with_queued_peer();
+        kernel.with(|state| {
+            let current_before = status_image(state, 900);
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(0), 901),
+                WithdrawOutcome::Removed
+            );
+            assert_eq!(status_image(state, 900), current_before);
+            assert_eq!(state.current_tid(), Some(900), "current is unchanged");
+        });
+    }
+
+    // ── Typed outcomes through the wrapper ─────────────────────────────────────────────────
+
+    #[test]
+    fn the_wrapper_reports_each_typed_outcome() {
+        let kernel = kernel_with_queued_peer();
+        kernel.with(|state| {
+            // (3)(4) the current task — including any scheduler-owned idle current — is refused.
+            let before = status_image(state, 900);
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(0), 900),
+                WithdrawOutcome::RefusedCurrent
+            );
+            assert_eq!(status_image(state, 900), before);
+            assert_eq!(state.current_tid(), Some(900));
+
+            // A TID with no queued slot.
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(0), 4242),
+                WithdrawOutcome::NotQueued
+            );
+
+            // (1) an offline / out-of-range CPU is refused rather than silently retargeted.
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(7), 901),
+                WithdrawOutcome::InvalidCpu
+            );
+
+            // …and the peer is still queued after all three refusals.
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(0), 901),
+                WithdrawOutcome::Removed
+            );
+        });
+    }
+
+    // ── (2) Structurally non-dispatching ───────────────────────────────────────────────────
+
+    /// The seam contains no dispatch or context-switch token. This is the structural half of
+    /// "non-dispatching": the behavioural half lives in `scheduler::tests::withdraw_*`.
+    #[test]
+    fn the_seam_contains_no_dispatch_or_context_switch_token() {
+        let code = seam_code();
+        for forbidden in [
+            "dispatch_next",
+            "on_preempt_prefer",
+            "block_current",
+            "set_current",
+            "install_ap_idle_current",
+            "yield_current",
+            "switch_to",
+            "context_switch",
+            "preempt_reenqueue",
+            "self.current =",
+            "enqueue",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the withdrawal seam must not reference `{forbidden}`:\n{code}"
+            );
+        }
+    }
+
+    /// (8) No task-state mutation, structurally: the seam never reaches a TCB at all.
+    #[test]
+    fn the_seam_contains_no_task_state_mutation_token() {
+        let code = seam_code();
+        for forbidden in [
+            "tcb",
+            "Tcb",
+            "ThreadControlBlock",
+            "TaskStatus",
+            "status",
+            "with_tasks",
+            "set_task_status",
+            "task_mut",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the withdrawal seam must not touch task state via `{forbidden}`:\n{code}"
+            );
+        }
+    }
+
+    /// (7) No policy change, structurally: the seam names no topology, affinity, priority,
+    /// timeslice, balancing or timer knob.
+    #[test]
+    fn the_seam_changes_no_policy_state() {
+        let code = seam_code();
+        for forbidden in [
+            "bring_up_cpu",
+            "set_cpu_wake_only",
+            "mark_cpu_wake_only",
+            "set_present_cpu_bitmap",
+            "self.online",
+            "self.present",
+            "self.wake_only",
+            "home_cpu",
+            "affinity",
+            "timeslice",
+            "least_loaded",
+            "balance",
+            "timer",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the withdrawal seam must not change policy state via `{forbidden}`:\n{code}"
+            );
+        }
+    }
+
+    /// Architecture-neutral: the seam names no ISA, no firmware and no arch cfg.
+    #[test]
+    fn the_seam_has_no_architecture_specific_reference() {
+        let code = seam_code();
+        for forbidden in [
+            "riscv",
+            "Riscv",
+            "RISCV",
+            "aarch64",
+            "x86",
+            "target_arch",
+            "hart",
+            "sbi",
+            "Sbi",
+            "SBI",
+            "ipi",
+            "Ipi",
+            "satp",
+            "BOOTSTRAP_CPU_ID",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the withdrawal seam must stay architecture-neutral, found `{forbidden}`:\n{code}"
+            );
+        }
+    }
+
+    /// No duplicated queue algorithm: removal goes through the existing `RingQueue::remove_tid`
+    /// compaction, and the exact-one count shares `RingQueue::index` with the rest of the ring.
+    #[test]
+    fn the_seam_reuses_the_existing_compaction_mechanism() {
+        let per_cpu = method_body(
+            SCHED,
+            "pub(crate) fn withdraw_queued_tid(&mut self, tid: ThreadId)",
+        );
+        assert!(
+            per_cpu.contains(".remove_tid(tid)"),
+            "removal must delegate to RingQueue::remove_tid"
+        );
+        assert!(
+            per_cpu.contains(".count_tid(tid)"),
+            "the exact-one rule must count through the ring's own scan"
+        );
+        let count = method_body(SCHED, "fn count_tid(&self, tid: ThreadId) -> usize");
+        assert!(
+            count.contains("Self::index(self.head + offset)"),
+            "count_tid must reuse the ring's index mapping, not re-derive it"
+        );
+        for mutation in ["self.len", "self.head =", "self.tids["] {
+            assert!(
+                !code_lines(count)
+                    .iter()
+                    .any(|l| l.contains(mutation) && l.contains('=') && !l.contains("==")),
+                "count_tid must be a pure scan, found a write to `{mutation}`"
+            );
+        }
+    }
+
+    // ── Narrow visibility ──────────────────────────────────────────────────────────────────
+
+    /// The seam is `pub(crate)` at every level and adds no broader public API.
+    #[test]
+    fn the_seam_is_not_a_public_api() {
+        for (src, sig) in [
+            (SCHED, "fn withdraw_queued_tid(&mut self, tid: ThreadId)"),
+            (
+                SCHED,
+                "fn withdraw_queued_tid_on(&mut self, cpu: CpuId, tid: ThreadId)",
+            ),
+            (SCHED_STATE, "fn withdraw_queued_tid_on("),
+        ] {
+            let at = src.find(sig).expect("the seam signature");
+            let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let decl = &src[line_start..at + sig.len()];
+            assert!(
+                decl.trim_start().starts_with("pub(crate) fn"),
+                "the seam must stay pub(crate) or narrower: `{}`",
+                decl.trim()
+            );
+        }
+        assert!(
+            SCHED.contains("pub(crate) enum WithdrawOutcome"),
+            "the outcome type stays pub(crate) too"
+        );
+    }
+
+    // ── The increment wires nothing ────────────────────────────────────────────────────────
+
+    /// The seam has no caller outside the scheduler, its wrapper and tests: link 1 stays absent.
+    #[test]
+    fn the_seam_is_wired_into_no_oracle_or_production_path() {
+        fn visit(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+            for entry in std::fs::read_dir(root).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    visit(&path, f);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let src = std::fs::read_to_string(&path).expect("read file");
+                    f(&path, &src);
+                }
+            }
+        }
+
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Stage 199D: `runtime.rs` joined the owners when the enqueue seam gained its
+        // same-acquisition `AlreadyQueued` reconciliation — the seam's ONLY consumer. It is
+        // still wired into no oracle, no RISC-V path and no production wake decision.
+        const OWNERS: &[&str] = &[
+            "src/kernel/scheduler.rs",
+            "src/kernel/boot/scheduler_state.rs",
+            "src/kernel/boot/tests.rs",
+            "src/runtime.rs",
+        ];
+        let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut owners_seen = 0usize;
+        visit(&repo_root.join("src"), &mut |path, src| {
+            let rel = path
+                .strip_prefix(&repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !src.contains("withdraw_queued_tid") {
+                return;
+            }
+            if OWNERS.contains(&rel.as_str()) {
+                owners_seen += 1;
+            } else {
+                callers.push(rel);
+            }
+        });
+        // Non-vacuity: the walk must actually have reached the files that DO name the seam.
+        assert_eq!(
+            owners_seen,
+            OWNERS.len(),
+            "the source walk missed a seam owner — the emptiness below would be meaningless"
+        );
+        assert!(
+            callers.is_empty(),
+            "the foundation must stay unwired in this increment; callers: {callers:?}"
+        );
+    }
+
+    /// The chain verdicts are unchanged by a foundation-only increment.
+    #[test]
+    fn the_remote_wake_verdicts_and_ledger_are_unchanged() {
+        const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+}
+
+/// Stage 199D — RISC-V remote-enqueue reachability (chain link 1, NR6): **HARD-STOP**.
+///
+/// The increment asked for a live proof that a genuine NR6 transaction commits its wake target to
+/// CPU 1 while CPU 1 is simultaneously **online**, **wake-only**, and holding the server **queued
+/// exactly once**. Those three facts are mutually exclusive under the production scheduler
+/// contract: `wake_only` means *explicit placement is denied*. The blocker is not the transaction,
+/// the affinity seam or the withdrawal foundation — all three work. It is the placement itself.
+///
+/// Live evidence, `-smp 2`, RISC-V oracle armed (see `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.25):
+///
+/// ```text
+/// RISCV_REMOTE_ENQUEUE_SERVER_PINNED direction=nr6 tid=10008 endpoint=6 home_cpu=1 …
+/// SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu=1 tid=10008 reason=no_ap_dispatcher_yet
+/// RISCV_REMOTE_ENQUEUE_COMMITTED … wake_target_cpu=1 … queued_exactly_once=0 result=fail
+/// ```
+///
+/// The proof mechanism that produced that log was **reverted**: no closure is claimed, so nothing
+/// of it survives in the tree. These tests pin the contradiction itself, so a future increment
+/// cannot "close" link 1 by quietly deleting the wake-only denial.
+mod stage199d_riscv_remote_enqueue_nr6_hardstop {
+    use super::*;
+    use crate::kernel::scheduler::TaskPriority;
+    use crate::runtime::SharedKernel;
+
+    const SCHED: &str = include_str!("../../kernel/scheduler.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    // ── The blocker, behaviourally ──────────────────────────────────────────────────────────
+
+    /// **The wake-only contract denies exactly the placement the proof needs.** Not a source
+    /// reading — the production scheduler is driven and refuses.
+    #[test]
+    fn an_online_wake_only_cpu_refuses_the_placement_the_proof_requires() {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::SmpScheduler;
+        let mut sched = SmpScheduler::default();
+        sched.set_present_cpu_bitmap(0b11);
+        sched.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+        sched.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
+
+        // Exactly the three facts requirement 6 demands, minus the one that cannot hold.
+        assert!(sched.cpu_is_online(CpuId(1)), "CPU 1 is online");
+        assert!(sched.cpu_wake_only(CpuId(1)), "CPU 1 is wake-only");
+        assert!(
+            sched
+                .enqueue_on_with_priority(CpuId(1), ThreadId(77), TaskPriority::Normal)
+                .is_err(),
+            "placement on an online wake-only CPU must be DENIED — this is the blocker"
+        );
+        assert_eq!(
+            sched.runnable_count_on(CpuId(1)),
+            0,
+            "and nothing is queued there, so `queued_exactly_once=1` is unreachable"
+        );
+        assert!(
+            !sched.task_present_anywhere(ThreadId(77)),
+            "the denied task is queued nowhere at all — it would simply be lost"
+        );
+    }
+
+    /// **REGRESSION — `ca55400b`'s exact defect.** The seam used to report a target it did not
+    /// achieve: aimed at an online wake-only CPU, the rank-1 enqueue's `Err` was discarded and
+    /// `CpuId(1)` was returned for a task that landed in no run queue. Its own doc claimed the
+    /// returned CPU and the enqueued CPU "cannot disagree"; they did. That is what made §6.1.23
+    /// condition 4 score YES.
+    ///
+    /// Reproduced exactly — target online AND wake-only, enqueue refused, task in no runqueue —
+    /// and now the seam must NOT answer `Enqueued { cpu: CpuId(1) }`, and must yield no wake
+    /// target at all.
+    #[test]
+    fn the_committed_wake_target_can_report_a_placement_that_never_happened() {
+        use crate::runtime::ReceiverEnqueue;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let tid = 4242u64;
+        kernel.with(|s| {
+            s.register_task_with_class(tid, crate::kernel::task::TaskClass::App)
+                .expect("task");
+            s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+            s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+            s.set_task_home_cpu(tid, CpuId(1)).expect("home cpu");
+        });
+        // The precondition the defect needed: online AND wake-only.
+        kernel.with(|s| {
+            assert!(s.online_cpu_bitmap() & 0b10 != 0, "CPU 1 is online");
+            assert!(s.wake_only_cpu_bitmap() & 0b10 != 0, "CPU 1 is wake-only");
+        });
+
+        // The REAL seam the NR6 transaction uses for its single, last wake.
+        let outcome = kernel.sr_enqueue_committed_receiver_split(tid, Some(CpuId(1)));
+
+        assert_ne!(
+            outcome,
+            ReceiverEnqueue::Enqueued { cpu: CpuId(1) },
+            "the seam must NOT claim a placement on a wake-only CPU"
+        );
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: CpuId(1),
+                error: crate::kernel::scheduler::SchedulerError::WakeOnly,
+                reconciled: None,
+            },
+            "…it must report the refusal, distinguishing wake-only from offline"
+        );
+        assert_eq!(outcome.enqueued_cpu(), None, "and yield NO wake target");
+        kernel.with(|s| {
+            assert!(
+                !s.task_present_in_any_runqueue(tid),
+                "the task really is in no runqueue — the refusal is the truth"
+            );
+        });
+    }
+
+    /// The two facts requirement 6 needs simultaneously, as a computed truth table over the real
+    /// scheduler. Every row that satisfies "queued exactly once" fails "wake-only", and vice
+    /// versa — there is no row satisfying both.
+    #[test]
+    fn queued_on_the_target_and_target_wake_only_are_mutually_exclusive() {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::SmpScheduler;
+        let mut rows = alloc::vec::Vec::new();
+        for wake_only in [false, true] {
+            let mut sched = SmpScheduler::default();
+            sched.set_present_cpu_bitmap(0b11);
+            sched.bring_up_cpu(CpuId(1)).expect("online");
+            sched
+                .set_cpu_wake_only(CpuId(1), wake_only)
+                .expect("wake-only bit");
+            let _ = sched.enqueue_on_with_priority(CpuId(1), ThreadId(9), TaskPriority::Normal);
+            rows.push((wake_only, sched.runnable_count_on(CpuId(1)) == 1));
+        }
+        assert_eq!(
+            rows,
+            alloc::vec![(false, true), (true, false)],
+            "queued-exactly-once and wake-only never hold together"
+        );
+        assert!(
+            !rows.iter().any(|(wake_only, queued)| *wake_only && *queued),
+            "requirement 6 has no satisfying row under the production scheduler contract"
+        );
+    }
+
+    // ── The denial is production scheduler POLICY, which the hard-stop list forbids touching ──
+
+    /// The denial is not incidental: it is a documented policy with a named future owner
+    /// (the AP dispatcher, Stage 183.6). Removing it is a production scheduler policy change.
+    #[test]
+    fn the_denial_is_documented_production_policy_with_a_named_owner() {
+        let at = SCHED
+            .find("pub fn enqueue_on_with_priority")
+            .expect("the placement seam");
+        let body = &SCHED[at..at + 1600];
+        assert!(
+            body.contains("if self.wake_only & (1u64 << idx) != 0 {"),
+            "the wake-only branch guards placement"
+        );
+        assert!(
+            body.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY")
+                && body.contains("reason=no_ap_dispatcher_yet"),
+            "the denial is attested with its reason"
+        );
+        assert!(
+            body.contains("return Err(SchedulerError::WakeOnly);"),
+            "and it fails closed rather than placing the task, naming wake-only distinctly"
+        );
+        assert!(
+            body.contains("183.6 lifts this per CPU when the AP dispatcher lands"),
+            "the lift is owned by Stage 183.6, not by a 199D proof increment"
+        );
+    }
+
+    /// The second half of the defect — the discarded `Err` at the call site — is **REPAIRED**.
+    ///
+    /// This guard used to pin the defect (`let _ = sm.enqueue_on_with_priority(…)` followed by a
+    /// bare `cpu`). It now pins its absence and the replacement contract, so the discard cannot
+    /// come back.
+    #[test]
+    fn the_enqueue_seam_discards_the_placement_result() {
+        let at = RUNTIME
+            .find("pub(crate) fn sr_enqueue_committed_receiver_split")
+            .expect("the enqueue seam");
+        // Bound the slice at the method's closing brace (column 4), not at a byte count.
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("the method end")];
+        assert!(
+            !body.contains("let _ = sm.enqueue_on_with_priority"),
+            "the enqueue result must never be dropped again"
+        );
+        assert!(
+            body.contains("match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {"),
+            "the result is matched"
+        );
+        assert!(
+            body.contains("Ok(()) => ReceiverEnqueue::Enqueued { cpu },"),
+            "success names the CPU it landed on"
+        );
+        assert!(
+            body.contains("error,") && body.contains("reconciled: None,"),
+            "refusal carries the scheduler's own distinction, not a collapsed bool"
+        );
+    }
+
+    // ── Nothing landed ──────────────────────────────────────────────────────────────────────
+
+    /// No remote-enqueue proof mechanism survives anywhere in the tree: the increment
+    /// hard-stopped, so it claims nothing and wires nothing.
+    #[test]
+    fn no_remote_enqueue_proof_mechanism_landed() {
+        fn visit(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+            for entry in std::fs::read_dir(root).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    visit(&path, f);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let src = std::fs::read_to_string(&path).expect("read file");
+                    f(&path, &src);
+                }
+            }
+        }
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut visited = 0usize;
+        visit(&repo_root.join("src"), &mut |path, src| {
+            visited += 1;
+            let rel = path
+                .strip_prefix(&repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            // This test file quotes the markers in its own doc comment; nothing else may.
+            if rel == "src/kernel/boot/tests.rs" {
+                return;
+            }
+            for marker in [
+                "RISCV_REMOTE_ENQUEUE_COMMITTED",
+                "RISCV_REMOTE_ENQUEUE_WITHDRAWN",
+                "RISCV_REMOTE_ENQUEUE_REHOMED",
+                "RISCV_REMOTE_ENQUEUE_SERVER_PINNED",
+                "riscv_remote_enqueue_proof",
+                "maybe_pin_riscv_remote_enqueue_oracle_server",
+            ] {
+                if src.contains(marker) {
+                    offenders.push(alloc::format!("{rel}: {marker}"));
+                }
+            }
+        });
+        assert!(visited > 100, "the source walk must actually have run");
+        assert!(
+            offenders.is_empty(),
+            "the hard-stop claims no mechanism; found: {offenders:?}"
+        );
+    }
+
+    /// The withdrawal foundation is now consumed by exactly ONE caller — the enqueue seam's
+    /// `AlreadyQueued` membership reconciliation — and by nothing else. It is still not wired
+    /// into any oracle, any RISC-V path, or link 1.
+    #[test]
+    fn the_withdrawal_foundation_remains_unwired() {
+        assert!(
+            SCHED.contains("pub(crate) fn withdraw_queued_tid_on"),
+            "the foundation from §6.1.24 is still present"
+        );
+        let runtime_code: alloc::vec::Vec<&str> = RUNTIME
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(
+            runtime_code
+                .iter()
+                .filter(|l| l.contains("withdraw_queued_tid_on"))
+                .count(),
+            1,
+            "exactly one runtime caller: the same-acquisition reconciliation"
+        );
+        let at = RUNTIME
+            .find("pub(crate) fn sr_enqueue_committed_receiver_split")
+            .expect("the enqueue seam");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
+        assert!(
+            body.contains("withdraw_queued_tid_on"),
+            "…and it is inside the enqueue seam, not anywhere else"
+        );
+    }
+
+    // ── Status ──────────────────────────────────────────────────────────────────────────────
+
+    /// Link 1 stays ABSENT, so the mechanically-computed verdict stays D, and every downstream
+    /// status figure is unchanged. NR7 remote reachability is explicitly NOT live-proved.
+    #[test]
+    fn the_chain_status_and_ledger_are_unchanged() {
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+        assert!(
+            AUDIT.contains("NR7 remote reachability is NOT live-proved"),
+            "the NR7 direction must be recorded as unproved, not silently omitted"
+        );
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,"),
+            "coordinate 23 stays OPEN"
+        );
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+}
+
+/// Stage 199D — the enqueue seam's typed result, driven for every distinction it must make.
+///
+/// `sr_enqueue_committed_receiver_split` used to answer with a bare `CpuId`: the CPU it was
+/// *asked* for, whether or not the enqueue happened. `ca55400b` caught that live. The seam now
+/// reports what it actually did, and the five failure classes stay distinct — they are exactly
+/// `SchedulerError`'s, once wake-only stopped being folded into `CpuOffline`.
+mod stage199d_receiver_enqueue_outcome {
+    use super::*;
+    use crate::kernel::scheduler::{MAX_CPUS, MAX_RUN_QUEUE, SchedulerError, WithdrawOutcome};
+    use crate::runtime::{ReceiverEnqueue, SharedKernel};
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    /// A rejection with no pre-existing membership — the shape the four non-membership
+    /// reasons produce.
+    fn rejected(cpu: CpuId, error: SchedulerError) -> ReceiverEnqueue {
+        ReceiverEnqueue::Rejected {
+            cpu,
+            error,
+            reconciled: None,
+        }
+    }
+
+    /// A kernel with `cpus` CPUs online and tids `1..=n` registered.
+    fn fixture(cpus: u8, n: u64) -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            for c in 1..cpus {
+                s.bring_up_cpu(CpuId(c)).expect("bring up cpu");
+            }
+            for tid in 1..=n {
+                s.register_task(tid).expect("task");
+            }
+        });
+        k
+    }
+
+    // ── (1) success, local ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_successful_local_enqueue_reports_the_cpu_it_landed_on() {
+        let k = fixture(1, 1);
+        let here = k.current_cpu_split_read();
+        let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+        assert_eq!(outcome, ReceiverEnqueue::Enqueued { cpu: here });
+        assert_eq!(outcome.enqueued_cpu(), Some(here));
+        k.with(|s| assert!(s.task_present_in_any_runqueue(1), "really queued"));
+    }
+
+    // ── (2) success, remote to a DISPATCHING cpu ────────────────────────────────────────────
+
+    #[test]
+    fn a_successful_remote_enqueue_to_a_dispatching_cpu_reports_that_cpu() {
+        let k = fixture(2, 1);
+        // Online and NOT wake-only — a genuine dispatching CPU.
+        k.with(|s| {
+            assert!(s.online_cpu_bitmap() & 0b10 != 0, "cpu 1 online");
+            assert_eq!(s.wake_only_cpu_bitmap() & 0b10, 0, "cpu 1 dispatching");
+        });
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(CpuId(1)));
+        assert_eq!(outcome, ReceiverEnqueue::Enqueued { cpu: CpuId(1) });
+        assert_ne!(
+            outcome.enqueued_cpu(),
+            Some(k.current_cpu_split_read()),
+            "this is a genuine remote placement"
+        );
+        assert_eq!(k.with(|s| s.runnable_count_on_cpu(CpuId(1))), 1);
+    }
+
+    // ── (3) online wake-only ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_online_wake_only_target_is_reported_as_wake_only_not_offline() {
+        let k = fixture(1, 1);
+        k.with(|s| {
+            s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+            s.bring_up_cpu(CpuId(1)).expect("online");
+        });
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(CpuId(1)));
+        assert_eq!(
+            outcome,
+            rejected(CpuId(1), SchedulerError::WakeOnly),
+            "wake-only is materially different from offline and must not collapse into it"
+        );
+        assert_eq!(outcome.enqueued_cpu(), None);
+        k.with(|s| assert!(!s.task_present_in_any_runqueue(1)));
+    }
+
+    // ── (4) offline target ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_offline_target_is_reported_as_offline() {
+        let k = fixture(1, 1); // only CPU 0 is online
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(CpuId(1)));
+        assert_eq!(outcome, rejected(CpuId(1), SchedulerError::CpuOffline));
+        assert_eq!(outcome.enqueued_cpu(), None);
+    }
+
+    // ── (5) invalid CPU ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_out_of_range_cpu_is_reported_as_invalid() {
+        let k = fixture(1, 1);
+        let bogus = CpuId(MAX_CPUS as u8);
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(bogus));
+        assert_eq!(
+            outcome,
+            rejected(bogus, SchedulerError::InvalidCpu),
+            "out of range is distinct from present-but-offline"
+        );
+        assert_eq!(outcome.enqueued_cpu(), None);
+    }
+
+    // ── (6) full target queue ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_full_target_queue_is_reported_as_queue_full() {
+        let n = MAX_RUN_QUEUE as u64;
+        let k = fixture(1, n + 1);
+        let here = k.current_cpu_split_read();
+        for tid in 1..=n {
+            assert_eq!(
+                k.sr_enqueue_committed_receiver_split(tid, None),
+                ReceiverEnqueue::Enqueued { cpu: here },
+                "tid {tid} fills the queue"
+            );
+        }
+        let outcome = k.sr_enqueue_committed_receiver_split(n + 1, None);
+        assert_eq!(outcome, rejected(here, SchedulerError::QueueFull));
+        assert_eq!(outcome.enqueued_cpu(), None);
+        k.with(|s| {
+            assert!(
+                !s.task_present_in_any_runqueue(n + 1),
+                "the refused task is queued nowhere"
+            )
+        });
+    }
+
+    // ── (7) AlreadyQueued ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_already_queued_receiver_is_reported_as_already_queued() {
+        let k = fixture(1, 1);
+        let here = k.current_cpu_split_read();
+        assert_eq!(
+            k.sr_enqueue_committed_receiver_split(1, None),
+            ReceiverEnqueue::Enqueued { cpu: here }
+        );
+        let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: here,
+                error: SchedulerError::AlreadyQueued,
+                reconciled: Some(WithdrawOutcome::Removed),
+            },
+            "a double wake must be reported with its membership reconciled, never counted as a \
+             second success"
+        );
+        assert_eq!(outcome.enqueued_cpu(), None);
+        assert!(
+            outcome.receiver_is_unplaced(),
+            "an atomically removed exactly-one entry leaves the receiver unplaced"
+        );
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(here)),
+            0,
+            "the reconciliation removed the pre-existing entry under the same acquisition"
+        );
+    }
+
+    // ── (10) no success object and no wake work on failure ──────────────────────────────────
+
+    /// Structurally: a wake target can be obtained ONLY from `Enqueued`. There is no accessor,
+    /// field or `From` impl that yields a CPU for a rejection.
+    #[test]
+    fn a_rejected_enqueue_yields_no_wake_target_by_any_route() {
+        for error in [
+            SchedulerError::InvalidCpu,
+            SchedulerError::CpuOffline,
+            SchedulerError::WakeOnly,
+            SchedulerError::QueueFull,
+            SchedulerError::AlreadyQueued,
+        ] {
+            let rejected = ReceiverEnqueue::Rejected {
+                cpu: CpuId(1),
+                error,
+                reconciled: None,
+            };
+            assert_eq!(rejected.enqueued_cpu(), None, "{error:?} yields no target");
+        }
+        let at = RUNTIME
+            .find("impl ReceiverEnqueue {")
+            .expect("the outcome impl");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n}\n").expect("impl end")];
+        // Two accessors: the wake target and the unplaced predicate. Neither may return a CPU
+        // for a rejection, and only one returns a CPU at all.
+        assert_eq!(
+            body.matches("pub(crate) fn ").count(),
+            2,
+            "an unexpected accessor is how a rejection would leak a CPU: {body}"
+        );
+        assert_eq!(
+            body.matches("-> Option<CpuId>").count(),
+            1,
+            "exactly one accessor yields a CPU at all"
+        );
+        assert!(
+            body.contains("ReceiverEnqueue::Rejected { .. } => None,"),
+            "and it returns None for every rejection"
+        );
+        assert!(
+            body.contains("pub(crate) fn receiver_is_unplaced(self) -> bool {"),
+            "the membership predicate returns bool — it can never leak a CPU"
+        );
+    }
+
+    /// Both direct successes are constructed only inside an `Enqueued` binding, and the drain's
+    /// IPI + retirement marker sit behind `Ok(success)` — so a refused enqueue signals nothing.
+    #[test]
+    fn no_direct_success_or_wake_work_survives_a_refused_enqueue() {
+        for (direction, success) in [
+            ("ack.server.tid.0", "Ok(IpcCallDirectSuccess {"),
+            ("ack.caller.tid.0", "Ok(IpcReplyDirectSuccess {"),
+        ] {
+            // Whitespace-insensitive: rustfmt reflows the let-else across lines.
+            let squashed: alloc::string::String = TXN
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
+            let bind = alloc::format!(
+                "let outcome = self.sr_enqueue_committed_receiver_split({direction}, affinity); let ReceiverEnqueue::Enqueued {{ cpu: wake_target_cpu, }} = outcome else {{"
+            );
+            let bind = bind
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
+            assert!(
+                squashed.contains(&bind),
+                "the {direction} enqueue must bind through Enqueued only:\n{bind}"
+            );
+            let at = squashed.find(&bind).expect("the binding");
+            let success_squashed = success
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
+            assert!(
+                squashed[at..].contains(&success_squashed),
+                "…and the success object is built after it"
+            );
+        }
+        // The refusal arms return before any success can exist.
+        assert!(TXN.contains("return Err(IpcCallDirectError::EnqueueRejected(error));"));
+        assert!(TXN.contains("return Err(IpcReplyDirectError::EnqueueRejected(error));"));
+        // The drain's IPI and retirement marker are both inside the single success arm.
+        let drain = TXN
+            .split("pub(crate) fn drain_direct_request_post_work(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the drain");
+        let ok_arm = drain
+            .find("if let Ok(success) = result")
+            .expect("success arm");
+        assert!(
+            drain.find("send_reschedule_ipi_to(").expect("ipi") > ok_arm,
+            "no IPI outside the success arm"
+        );
+        assert!(
+            drain
+                .find("emit_ipccall_direct_request_live_markers()")
+                .expect("marker")
+                > ok_arm,
+            "no remote-wake-success marker outside the success arm"
+        );
+    }
+
+    // ── (3) AlreadyQueued in all three membership shapes ────────────────────────────────────
+
+    /// **`AlreadyQueued` never means "nothing is queued".** It reports pre-existing membership,
+    /// and because the membership mirror tracks the queues *plus* the dispatched `current` task,
+    /// it can mean the receiver is executing. Each shape gets its own reconciliation verdict, and
+    /// only an atomically removed exactly-one queued entry counts as unplaced.
+    #[test]
+    fn already_queued_distinguishes_exactly_one_current_and_duplicate() {
+        // (a) exactly one queued entry → Removed → unplaced.
+        {
+            let k = fixture(1, 1);
+            let here = k.current_cpu_split_read();
+            assert!(matches!(
+                k.sr_enqueue_committed_receiver_split(1, None),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+            assert_eq!(
+                outcome,
+                ReceiverEnqueue::Rejected {
+                    cpu: here,
+                    error: SchedulerError::AlreadyQueued,
+                    reconciled: Some(WithdrawOutcome::Removed),
+                }
+            );
+            assert!(outcome.receiver_is_unplaced());
+            k.with(|s| assert!(!s.task_present_in_any_runqueue(1), "atomically withdrawn"));
+        }
+        // (b) the receiver is CURRENT — it may already have executed. Fail closed.
+        {
+            let k = fixture(1, 1);
+            let here = k.current_cpu_split_read();
+            assert!(matches!(
+                k.sr_enqueue_committed_receiver_split(1, None),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            k.with(|s| {
+                s.dispatch_next_on_cpu(here)
+                    .expect("dispatch it to current");
+            });
+            let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+            assert_eq!(
+                outcome,
+                ReceiverEnqueue::Rejected {
+                    cpu: here,
+                    error: SchedulerError::AlreadyQueued,
+                    reconciled: Some(WithdrawOutcome::RefusedCurrent),
+                },
+                "a dispatched receiver must be reported as current, never as unplaced"
+            );
+            assert!(
+                !outcome.receiver_is_unplaced(),
+                "it may already have observed the publication — fail closed"
+            );
+            assert_eq!(
+                k.with(|s| s.current_tid_on_cpu(here)),
+                Some(1),
+                "and it is left exactly as found"
+            );
+        }
+        // (c) duplicate membership → fail closed with zero mutation.
+        {
+            let k = fixture(2, 1);
+            let here = k.current_cpu_split_read();
+            // Force the pathological duplicate: queued on BOTH CPUs (per-CPU membership makes
+            // this reachable, which is precisely why the reconciliation must fail closed).
+            assert!(matches!(
+                k.sr_enqueue_committed_receiver_split(1, Some(here)),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            let other = CpuId(1);
+            assert!(matches!(
+                k.sr_enqueue_committed_receiver_split(1, Some(other)),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            // A third attempt on `here` collides with `here`'s own entry.
+            let outcome = k.sr_enqueue_committed_receiver_split(1, Some(here));
+            assert_eq!(
+                outcome,
+                ReceiverEnqueue::Rejected {
+                    cpu: here,
+                    error: SchedulerError::AlreadyQueued,
+                    reconciled: Some(WithdrawOutcome::Removed),
+                }
+            );
+            // …and the OTHER CPU still holds it, so "unplaced" would be a lie about the system.
+            assert_eq!(
+                k.with(|s| s.runnable_count_on_cpu(other)),
+                1,
+                "membership elsewhere is untouched — `Rejected` speaks only for THIS enqueue"
+            );
+        }
+    }
+
+    // ── (4) Blocked never coexists with scheduler membership ────────────────────────────────
+
+    /// After every recoverable rejection the receiver is `Blocked`, and no `Blocked` task
+    /// anywhere holds queued or current membership. Swept over the whole task table.
+    #[test]
+    fn no_blocked_task_ever_holds_queued_or_current_membership() {
+        let k = fixture(2, 4);
+        // Block tid 1..=4 the way the direct paths leave them, then sweep.
+        k.with(|s| {
+            for tid in 1..=4u64 {
+                s.set_task_status_for_test(
+                    tid,
+                    crate::kernel::task::TaskStatus::Blocked(crate::kernel::task::WaitReason::Poll),
+                );
+            }
+        });
+        k.with(|s| {
+            for tid in 1..=4u64 {
+                assert!(
+                    matches!(
+                        s.task_status(tid),
+                        Some(crate::kernel::task::TaskStatus::Blocked(_))
+                    ),
+                    "tid {tid} is Blocked"
+                );
+                assert!(
+                    !s.task_present_in_any_runqueue(tid),
+                    "a Blocked task must hold NO queued or current membership (tid {tid})"
+                );
+            }
+        });
+        // And the predicate that guards the rollback agrees: a rejection whose receiver still
+        // holds membership is never reported unplaced.
+        let here = k.current_cpu_split_read();
+        assert!(matches!(
+            k.sr_enqueue_committed_receiver_split(1, Some(here)),
+            ReceiverEnqueue::Enqueued { .. }
+        ));
+        k.with(|s| {
+            s.dispatch_next_on_cpu(here).expect("make it current");
+        });
+        assert!(
+            !k.sr_enqueue_committed_receiver_split(1, Some(here))
+                .receiver_is_unplaced(),
+            "a current receiver is never unplaced"
+        );
+    }
+
+    // ── (9) the two properties mutation testing must be able to break ───────────────────────
+
+    /// **The reconciliation is inside the acquisition that detected the collision.** Not "shortly
+    /// after" — inside the same `with_scheduler_split_mut` closure, using the same `sm` binding,
+    /// so no unlock/relock window exists in which a dispatcher could take the entry.
+    #[test]
+    fn the_membership_reconciliation_shares_the_detecting_acquisition() {
+        let at = RUNTIME
+            .find("pub(crate) fn sr_enqueue_committed_receiver_split")
+            .expect("the enqueue seam");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
+        let open = body
+            .find("self.with_scheduler_split_mut(|sched| {")
+            .expect("acquisition");
+        let detect = body
+            .find("Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued)")
+            .expect("the collision arm");
+        let reconcile = body
+            .find("let reconciled = sm.withdraw_queued_tid_on(cpu, ThreadId(tid));")
+            .expect("the reconciliation");
+        assert!(
+            open < detect && detect < reconcile,
+            "detection and reconciliation must both sit inside the one acquisition"
+        );
+        // Exactly one acquisition in the whole seam: a second one would BE the window.
+        assert_eq!(
+            body.matches("with_scheduler_split_mut").count(),
+            1,
+            "a second acquisition is exactly the unlock/relock window this forbids"
+        );
+        // The reconciliation uses the guard's own scheduler binding, not a fresh `self.` call.
+        assert!(
+            !body.contains("self.withdraw_queued_tid"),
+            "reconciling through `self` would re-acquire the lock"
+        );
+    }
+
+    /// **The NR7 authority restore is identity- and generation-exact.** A foreign replier, a
+    /// stale generation, or a record that is not `Consumed` must all be refused — otherwise the
+    /// restore would re-arm a one-shot reply for somebody who never owned it.
+    #[test]
+    fn the_reply_authority_restore_is_identity_and_generation_exact() {
+        let at = RUNTIME
+            .find("pub(crate) fn restore_consumed_reply_record_split")
+            .expect("the restore seam");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
+        for guard in [
+            "ipc.reply_cap_generations[index] == generation",
+            "record.reservation == ReplyRecordReservation::Consumed",
+            "record.responder_tid == Some(replier.tid)",
+            "record.replier_asid == Some(replier.asid)",
+        ] {
+            assert!(
+                body.contains(guard),
+                "the restore must be guarded by `{guard}`"
+            );
+        }
+        assert!(
+            body.contains("register_server_reply_link_split"),
+            "the consume closed the reverse link; the restore must re-register it"
+        );
+    }
+
+    /// The five distinctions are carried by `SchedulerError` itself — no parallel taxonomy, and
+    /// nothing collapsed into `bool` or `Option`.
+    #[test]
+    fn the_outcome_reuses_scheduler_error_and_collapses_nothing() {
+        let distinct = [
+            SchedulerError::InvalidCpu,
+            SchedulerError::CpuOffline,
+            SchedulerError::WakeOnly,
+            SchedulerError::QueueFull,
+            SchedulerError::AlreadyQueued,
+        ];
+        for (i, a) in distinct.iter().enumerate() {
+            for (j, b) in distinct.iter().enumerate() {
+                assert_eq!(i == j, a == b, "{a:?} vs {b:?} must stay distinct");
+            }
+        }
+        assert!(
+            RUNTIME.contains("error: crate::kernel::scheduler::SchedulerError,"),
+            "the rejection carries SchedulerError, not a re-derived enum"
         );
     }
 }

@@ -94,6 +94,19 @@ impl RingQueue {
         Some(self.tids[self.head])
     }
 
+    /// Number of live slots holding `tid`. A scan only — it mutates nothing and shares
+    /// `Self::index` with the rest of the ring, so no queue algorithm is duplicated.
+    fn count_tid(&self, tid: ThreadId) -> usize {
+        let mut seen = 0;
+        for offset in 0..self.len {
+            let idx = Self::index(self.head + offset);
+            if self.tids[idx] == tid {
+                seen += 1;
+            }
+        }
+        seen
+    }
+
     /// Remove `tid` from any position in the ring buffer.
     /// Compacts the elements after the removed slot toward the head.
     /// Returns `true` if `tid` was found and removed, `false` otherwise.
@@ -112,6 +125,27 @@ impl RingQueue {
         }
         false
     }
+}
+
+/// Stage 199D: outcome of a non-dispatching runqueue withdrawal.
+///
+/// `bool` would be genuinely ambiguous here — a bare `false` would conflate "the TID was not
+/// queued", "it is the CPU's current task", "it appears more than once" and "that CPU is not
+/// online", which are four different facts with four different correct responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WithdrawOutcome {
+    /// Exactly one queued incarnation was removed.
+    Removed,
+    /// The TID holds no queued slot on that CPU. Nothing was mutated.
+    NotQueued,
+    /// The TID is that CPU's `current` task — including the scheduler-owned tid-0 idle
+    /// placeholder. Refused BEFORE any mutation; withdrawal never touches `current`.
+    RefusedCurrent,
+    /// The TID occupies more than one queued slot on that CPU. Fail closed: no queue is
+    /// modified, because removing "one of them" would be an arbitrary choice.
+    RefusedDuplicate,
+    /// The CPU id is out of range or not online.
+    InvalidCpu,
 }
 
 #[derive(Debug)]
@@ -401,6 +435,48 @@ impl PriorityScheduler {
         self.dispatch_next()
     }
 
+    /// Stage 199D: remove exactly one queued incarnation of `tid` from THIS CPU's queues.
+    ///
+    /// Non-dispatching by construction: it never reads or writes `current`, never selects a next
+    /// task, and calls no context-switch primitive. It touches only the priority queues and the
+    /// membership table that mirrors them.
+    ///
+    /// The membership update is load-bearing and is why this cannot simply call
+    /// `RingQueue::remove_tid`: the one existing caller (`on_preempt_prefer`) moves the task from
+    /// a queue to `current`, so the task stays present in this scheduler and membership must NOT
+    /// change. Withdrawal removes it from the scheduler entirely, so membership must be cleared
+    /// or a later `enqueue_with_priority` would refuse the TID as already queued.
+    pub(crate) fn withdraw_queued_tid(&mut self, tid: ThreadId) -> WithdrawOutcome {
+        // (3)(4) current-task protection, before any mutation. This also protects the
+        // scheduler-owned tid-0 idle current installed on a wake-only CPU.
+        if self.current.is_some_and(|task| task.tid == tid) {
+            return WithdrawOutcome::RefusedCurrent;
+        }
+        // (5) exact-one rule: count first across every priority queue, mutate only if the count
+        // is exactly 1. A duplicate fails closed with zero mutation.
+        let mut total = 0usize;
+        for queue in self.queues.iter() {
+            total += queue.count_tid(tid);
+        }
+        match total {
+            0 => return WithdrawOutcome::NotQueued,
+            1 => {}
+            _ => return WithdrawOutcome::RefusedDuplicate,
+        }
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            if self.queues[Self::priority_index(priority)].remove_tid(tid) {
+                // The TID has left this scheduler entirely; keep the membership mirror honest.
+                if !self.membership_tracking_exhausted {
+                    self.membership_remove(tid);
+                }
+                return WithdrawOutcome::Removed;
+            }
+        }
+        // Unreachable while the count above is authoritative; fail closed rather than claim a
+        // removal that did not happen.
+        WithdrawOutcome::NotQueued
+    }
+
     pub fn block_current(&mut self) -> Option<ThreadId> {
         let current = self.current.take()?;
         if !self.membership_tracking_exhausted {
@@ -611,7 +687,10 @@ impl SmpScheduler {
                 tid.0,
                 cpu.0
             );
-            return Err(SchedulerError::CpuOffline);
+            // Stage 199D: `WakeOnly`, not `CpuOffline`. The CPU is up; it refuses work. A
+            // direct-IPC wake must be able to tell those apart — collapsing them is what let
+            // `sr_enqueue_committed_receiver_split` report a placement that never happened.
+            return Err(SchedulerError::WakeOnly);
         }
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
@@ -690,6 +769,20 @@ impl SmpScheduler {
         self.schedulers[idx].block_current()
     }
 
+    /// Stage 199D: withdraw one queued incarnation of `tid` from `cpu`'s runqueue.
+    ///
+    /// (1) Exact CPU confinement — only `schedulers[idx]` is inspected or mutated, so a TID
+    /// queued on another CPU is untouched. (2) Non-dispatching — see
+    /// [`PriorityScheduler::withdraw_queued_tid`]. (7) No policy change: online, present,
+    /// wake-only, affinity, priority, timeslice, balancing and timer state are all untouched.
+    /// (8) No task-state mutation: this seam does not see or change any TCB.
+    pub(crate) fn withdraw_queued_tid_on(&mut self, cpu: CpuId, tid: ThreadId) -> WithdrawOutcome {
+        let Ok(idx) = self.check_online_cpu(cpu) else {
+            return WithdrawOutcome::InvalidCpu;
+        };
+        self.schedulers[idx].withdraw_queued_tid(tid)
+    }
+
     pub fn current_tid_on(&self, cpu: CpuId) -> Option<ThreadId> {
         let idx = self.check_online_cpu(cpu).ok()?;
         self.schedulers[idx].current_tid()
@@ -729,6 +822,267 @@ impl SmpScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Stage 199D: non-dispatching runqueue withdrawal ─────────────────────────────────
+
+    fn online_two_cpu_scheduler() -> SmpScheduler {
+        let mut sched = SmpScheduler::default();
+        sched.set_present_cpu_bitmap(0b11);
+        sched.bring_up_cpu(CpuId(1)).expect("cpu1 online");
+        sched
+    }
+
+    #[test]
+    fn withdraw_removes_from_each_priority_queue() {
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            let mut sched = SmpScheduler::default();
+            sched
+                .enqueue_on_with_priority(CpuId(0), ThreadId(7), priority)
+                .expect("enqueue");
+            assert_eq!(
+                sched.withdraw_queued_tid_on(CpuId(0), ThreadId(7)),
+                WithdrawOutcome::Removed,
+                "{priority:?} queue"
+            );
+            assert_eq!(sched.runnable_count_on(CpuId(0)), 0);
+            // …and the TID may be enqueued again, proving the membership mirror was cleared.
+            sched
+                .enqueue_on_with_priority(CpuId(0), ThreadId(7), priority)
+                .expect("re-enqueue after withdrawal");
+        }
+    }
+
+    #[test]
+    fn withdraw_handles_head_middle_and_tail_positions() {
+        for target in [ThreadId(1), ThreadId(2), ThreadId(3)] {
+            let mut sched = SmpScheduler::default();
+            for tid in [ThreadId(1), ThreadId(2), ThreadId(3)] {
+                sched
+                    .enqueue_on_with_priority(CpuId(0), tid, TaskPriority::Normal)
+                    .expect("enqueue");
+            }
+            assert_eq!(
+                sched.withdraw_queued_tid_on(CpuId(0), target),
+                WithdrawOutcome::Removed
+            );
+            // FIFO order of the survivors is preserved.
+            let mut seen = alloc::vec::Vec::new();
+            while let Some(tid) = sched.dispatch_next_on(CpuId(0)) {
+                if seen.contains(&tid) {
+                    break;
+                }
+                seen.push(tid);
+                sched.block_current_on(CpuId(0));
+            }
+            let expected: alloc::vec::Vec<ThreadId> = [ThreadId(1), ThreadId(2), ThreadId(3)]
+                .into_iter()
+                .filter(|t| *t != target)
+                .collect();
+            assert_eq!(
+                seen, expected,
+                "FIFO order preserved after removing {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn withdraw_compacts_a_wrapped_ring_queue() {
+        let mut q = RingQueue::new();
+        // Wrap the ring: fill most of it, drain most of that, then refill past the end.
+        for tid in 1..=60u64 {
+            q.push(ThreadId(tid)).expect("push");
+        }
+        for _ in 0..56 {
+            q.pop().expect("pop");
+        }
+        for tid in 61..=66u64 {
+            q.push(ThreadId(tid)).expect("push past the wrap");
+        }
+        assert!(
+            q.head + q.len > MAX_RUN_QUEUE,
+            "the ring must be wrapped (head={}, len={})",
+            q.head,
+            q.len
+        );
+        let before = q.len;
+        // TID 61 sits at the last physical slot; its successors live past the wrap.
+        assert!(q.remove_tid(ThreadId(61)));
+        assert_eq!(q.len, before - 1);
+        let mut order = alloc::vec::Vec::new();
+        while let Some(tid) = q.pop() {
+            order.push(tid.0);
+        }
+        assert_eq!(
+            order,
+            alloc::vec![57, 58, 59, 60, 62, 63, 64, 65, 66],
+            "wrapped compaction preserves order"
+        );
+    }
+
+    #[test]
+    fn withdraw_from_an_empty_queue_reports_not_queued() {
+        let mut sched = SmpScheduler::default();
+        assert_eq!(
+            sched.withdraw_queued_tid_on(CpuId(0), ThreadId(9)),
+            WithdrawOutcome::NotQueued
+        );
+    }
+
+    #[test]
+    fn withdraw_leaves_a_tid_queued_on_another_cpu_untouched() {
+        let mut sched = online_two_cpu_scheduler();
+        sched
+            .enqueue_on_with_priority(CpuId(1), ThreadId(42), TaskPriority::Normal)
+            .expect("enqueue on cpu1");
+        assert_eq!(
+            sched.withdraw_queued_tid_on(CpuId(0), ThreadId(42)),
+            WithdrawOutcome::NotQueued,
+            "withdrawing from the wrong CPU must not find it"
+        );
+        assert_eq!(sched.runnable_count_on(CpuId(1)), 1, "cpu1 is untouched");
+        assert_eq!(
+            sched.withdraw_queued_tid_on(CpuId(1), ThreadId(42)),
+            WithdrawOutcome::Removed
+        );
+        assert_eq!(sched.runnable_count_on(CpuId(1)), 0);
+    }
+
+    #[test]
+    fn withdraw_refuses_the_current_task_without_mutation() {
+        let mut sched = SmpScheduler::default();
+        sched
+            .enqueue_on_with_priority(CpuId(0), ThreadId(5), TaskPriority::Normal)
+            .expect("enqueue");
+        sched
+            .enqueue_on_with_priority(CpuId(0), ThreadId(6), TaskPriority::Normal)
+            .expect("enqueue");
+        let current = sched.dispatch_next_on(CpuId(0)).expect("dispatch");
+        assert_eq!(current, ThreadId(5));
+        let queued_before = sched.runnable_count_on(CpuId(0));
+        assert_eq!(
+            sched.withdraw_queued_tid_on(CpuId(0), ThreadId(5)),
+            WithdrawOutcome::RefusedCurrent
+        );
+        assert_eq!(
+            sched.current_tid_on(CpuId(0)),
+            Some(ThreadId(5)),
+            "current unchanged"
+        );
+        assert_eq!(
+            sched.runnable_count_on(CpuId(0)),
+            queued_before,
+            "no queue mutated"
+        );
+    }
+
+    #[test]
+    fn withdraw_preserves_the_scheduler_owned_idle_current() {
+        let mut sched = online_two_cpu_scheduler();
+        sched.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
+        sched
+            .install_ap_idle_current(CpuId(1))
+            .expect("idle current");
+        assert_eq!(sched.current_tid_on(CpuId(1)), Some(ThreadId(0)));
+        assert_eq!(
+            sched.withdraw_queued_tid_on(CpuId(1), ThreadId(0)),
+            WithdrawOutcome::RefusedCurrent,
+            "the tid-0 idle current must never be withdrawn"
+        );
+        assert_eq!(
+            sched.current_tid_on(CpuId(1)),
+            Some(ThreadId(0)),
+            "the idle placeholder survives"
+        );
+    }
+
+    #[test]
+    fn withdraw_fails_closed_on_a_duplicate_occurrence_with_zero_mutation() {
+        let mut sched = SmpScheduler::default();
+        // The public enqueue refuses duplicates, so force the pathological state directly to
+        // prove the seam fails closed if it ever arose.
+        sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::High)]
+            .push(ThreadId(3))
+            .expect("push");
+        sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
+            .push(ThreadId(3))
+            .expect("push");
+        sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
+            .push(ThreadId(8))
+            .expect("push");
+        let before = sched.runnable_count_on(CpuId(0));
+        assert_eq!(
+            sched.withdraw_queued_tid_on(CpuId(0), ThreadId(3)),
+            WithdrawOutcome::RefusedDuplicate
+        );
+        assert_eq!(sched.runnable_count_on(CpuId(0)), before, "zero mutation");
+        assert!(
+            sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::High)]
+                .contains(ThreadId(3))
+        );
+        assert!(
+            sched.schedulers[0].queues[PriorityScheduler::priority_index(TaskPriority::Normal)]
+                .contains(ThreadId(3))
+        );
+    }
+
+    #[test]
+    fn withdraw_reports_invalid_cpu_for_an_offline_target() {
+        let mut sched = SmpScheduler::default();
+        assert_eq!(
+            sched.withdraw_queued_tid_on(CpuId(7), ThreadId(1)),
+            WithdrawOutcome::InvalidCpu
+        );
+    }
+
+    #[test]
+    fn withdraw_changes_no_topology_or_current_state() {
+        let mut sched = online_two_cpu_scheduler();
+        // Queue on CPU 1 while it is still a dispatching CPU, then mark it wake-only: the
+        // withdrawal must not disturb that state either.
+        sched
+            .enqueue_on_with_priority(CpuId(1), ThreadId(11), TaskPriority::Normal)
+            .expect("enqueue");
+        sched.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
+        sched
+            .enqueue_on_with_priority(CpuId(0), ThreadId(12), TaskPriority::Normal)
+            .expect("enqueue");
+        let dispatched = sched.dispatch_next_on(CpuId(0)).expect("dispatch");
+
+        let online = sched.online_cpu_bitmap();
+        let present = sched.present_cpu_bitmap();
+        let wake_only = sched.wake_only_bitmap();
+        let cur0 = sched.current_tid_on(CpuId(0));
+        let cur1 = sched.current_tid_on(CpuId(1));
+
+        assert_eq!(
+            sched.withdraw_queued_tid_on(CpuId(1), ThreadId(11)),
+            WithdrawOutcome::Removed
+        );
+
+        assert_eq!(sched.online_cpu_bitmap(), online, "online bitmap unchanged");
+        assert_eq!(
+            sched.present_cpu_bitmap(),
+            present,
+            "present bitmap unchanged"
+        );
+        assert_eq!(
+            sched.wake_only_bitmap(),
+            wake_only,
+            "wake-only bitmap unchanged"
+        );
+        assert_eq!(
+            sched.current_tid_on(CpuId(0)),
+            cur0,
+            "cpu0 current unchanged"
+        );
+        assert_eq!(
+            sched.current_tid_on(CpuId(1)),
+            cur1,
+            "cpu1 current unchanged"
+        );
+        assert_eq!(cur0, Some(dispatched));
+        assert_eq!(sched.runnable_count_on(CpuId(0)), 0, "cpu0 queue untouched");
+    }
 
     #[test]
     fn scheduler_rotates_on_preempt() {

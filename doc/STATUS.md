@@ -23,9 +23,9 @@ Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **40** |
+| Production `SharedKernel::with_cpu` callsites | **39** |
 | Production broad `SharedKernel::with` callsites | **10** |
-| **Total production broad-lock acquisition sites** | **50** |
+| **Total production broad-lock acquisition sites** | **49** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **x86_64 (live) + AArch64 (structural, proof-gated)** via `offlock_authoritative_dispatch_enabled()`; `d6_genuine_enabled()` itself remains compile-time x86_64-only. RISC-V not admitted. |
@@ -67,8 +67,8 @@ complete the canonical stage.**
 | **Total** | **1 of 35** | 12 | 22 |
 
 **No canonical stage in Phases 2–6 or 8 is complete.** The one complete stage, 204A
-(broad-lock callsite census), is documentation rather than lock retirement: 50 callsites
-classified as 0 boot-only, 3 test-only, 2 obsolete, 45 runtime-required, 0 undocumented.
+(broad-lock callsite census), is documentation rather than lock retirement: 49 callsites
+classified as 0 boot-only, 3 test-only, 2 obsolete, 44 runtime-required, 0 undocumented.
 
 > **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
 > was the only row written without an `N of M` denominator, and the totals silently counted it
@@ -497,6 +497,308 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    **Coordinate 23 stays OPEN**; tally and the 40 / 6 / 46 ledger unchanged.
    `stage199d_riscv_production_readiness_audit` (18 tests) pins all of it. See
    `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.17.
+   **RISC-V readiness blocker 2 is now CLOSED — the decisive one.** The trap bridge's four
+   broad-lock lookups (entering identity, the typed-idle invariant read, resume identity, and the
+   SATP asid) are replaced by the existing narrow seams: `current_tid_split_read(cpu)` and
+   `task_asid_for_tid_split_read(resume_tid)`. A call-site swap — no new mechanism, no RISC-V
+   semantic copy. **A handled Phase-1 NR6/NR7 direct transaction now returns to userspace with no
+   broad-lock acquisition at all.** Two things made this non-trivial. First,
+   `current_tid_split_read` is annotated TRAP_FORBIDDEN for the x86_64 trap seam; the equivalence
+   holds here because `with_cpu(cpu, ..)` rebinds `current_cpu` *before* reading, so both resolve
+   to `current_tid_on(cpu)`, and on a BSP-only architecture whose bridge always passes
+   `BOOTSTRAP_CPU_ID` the rebind is idempotent — a guard pins that premise and fails if RISC-V
+   ever boots a second hart. Second, `task_asid_for_tid_split_read` reports both "no such TID" and
+   "no address space" as `0`, where the broad-lock read returned `None` meaning *leave SATP
+   alone*; the bridge translates `0 → None` explicitly, so a stale identity declines instead of
+   installing address space 0. Snapshots are taken at the same program boundaries, SATP is
+   selected from the exact resume TID, and the activation + `sfence.vma` ordering is untouched.
+   **Census: 50 / 40 / 45 → 49 / 39 / 44.** `stage199d_riscv_narrow_trap_snapshots` (16 tests)
+   proves the narrow snapshots match the old authoritative results for same-current,
+   switched-current, replacement and no-current, proves the fail-closed asid translation, and
+   pins that no broad-lock acquisition remains in the bridge. See
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.18.
+   **RISC-V readiness blocker 1 is now CLOSED, and readiness recomputes to
+   `RISCV_199D_READINESS=case_b`.** The RISC-V Phase-1 whitelist asked
+   `ipccall_direct_proof_enabled()` *directly*, which made the RISC-V production predicate
+   un-flippable in practice: with the proof gate off, `nr` never reached
+   `try_split_dispatch_into_frame`, so enabling production would have been a **silent no-op**. It
+   now asks the canonical `ipccall_direct_admission_enabled()`. **Behaviour-preserving today, by
+   construction:** admission is `production || proof` and RISC-V production is
+   `cfg!(target_arch = "x86_64")` — a compile-time false — so on RISC-V the canonical predicate
+   reduces to *exactly* the proof gate the site used to ask. Selector off still declines NR6/NR7
+   to the unchanged broad-lock path; selector on admits the same population; no ordinary
+   feature-off traffic is newly admitted; x86_64 and AArch64 are untouched. All three admission
+   questions now flow through the one helper — the ABI import is unconditional on the RISC-V
+   bridge, whitelist admission is canonical, and handler reachability already was — and **no
+   `ipccall_direct_proof_enabled()` call survives anywhere in `src/arch/`**. Neither predicate's
+   implementation changed and no production default moved.
+   **Recomputed:** blockers 1 and 2 closed ⇒ the **SMP=1/local path is structurally complete**;
+   what remains is **blocker 3**, the absent cross-hart wake (both sends are x86_64-cfg-gated; SBI
+   has HSM but no IPI extension) — which is case B by definition. **Coordinate 23 remains OPEN**:
+   structural completeness is not production readiness, the remote-wake requirement is unresolved,
+   the RISC-V production predicate is still false, and no live evidence is earned.
+   **RISC-V QEMU revalidation — TAKEN.** `qemu-system-riscv64` was installed for the purpose
+   (Ubuntu 24.04 `qemu-system-misc`, QEMU 8.2.2; `qemu-system-aarch64` deliberately not installed)
+   and both runs were executed from a clean `c9840e0f` tree after a fresh artifact build.
+   **The proof-gated direct smoke PASSES:** `STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=riscv64
+   classes=2 live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok`, with genuine NR6
+   request and NR7 reply delivery, request/reply userspace validation, the deliberate duplicate
+   NR7 refused (`dup_rejected=1 err=Err(WrongObject)`), `ret2` return-lane parity, both direct
+   classes retired off-lock (`GLOBAL_LOCK_RETIRE_CLASS_DONE … class=IpcCallDirectRequest` and
+   `class=IpcReplyDirect`) with **no** in-lock dispatch or fallback marker, all fuses zero, and
+   the lease balance holding at the structural `capacity=256`. Feature-off is marker-clean, so
+   selector-off NR6/NR7 stay on the legacy path; selector-on admits the same single oracle round
+   trip as before `c9840e0f`. *sepc-advanced-once, tp/TLS and SATP preservation are attested
+   indirectly* — no marker prints them — by both sides completing their round trip
+   (`client_continuations=1 server_continuations=1`) with zero fault markers.
+   **The stale harness blocker is CLOSED and BOTH RISC-V SMP=1 smokes now pass.** The feature-off
+   core smoke had failed on `\bcapacity\b` in `REJECT_PATTERNS` — added at Stage 181 (`2a30515d`)
+   beside `Vm\(Full\)`/`\boom\b` as an exhaustion proxy, when nothing printed the word benignly —
+   colliding with the `capacity=256` / `ack_capacity=256` / `capacity_refused=0` reporters that
+   Stage 199D (`fcfc55e3`) made unconditional. Capacity checking is **narrowed, not removed**: the
+   bare word is replaced by the exact exhaustion forms the current emitters produce
+   (`capacity_refused=[1-9][0-9]*`, `reason=capacity_exhausted`, `reason=capacity\b`,
+   `reason=cow_capacity`, `reason=page_table_capacity`, `reason=user_vm_capacity`,
+   `reason=deferred_capacity`, `IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL`), plus explicit
+   `kernel_error=CapabilityFull` / `TaskTableFull` — which the retired word match never covered,
+   since they contain no "capacity". `tests/riscv_core_smoke_capacity_rejection.rs` (11 tests) is
+   behavioural: it parses the script's own `REJECT_PATTERNS` and evaluates fixtures with `rg`
+   exactly as the script does. **Feature-off core smoke PASSES** (`[ok] qemu-riscv64-core-smoke
+   passed`, `YARM_BOOT_OK`, service chain up, expected `RISCV_KERNEL_IDLE_WAITING_FOR_IO`
+   terminal, every exhaustion/fault/broad-lock predicate 0, and the direct-oracle markers
+   **absent** as feature-off requires). **Proof-gated direct smoke PASSES unchanged**
+   (`live_cells=2`, request/reply userspace validation, duplicate reply refused, both direct
+   classes retired off-lock with zero in-lock dispatch, fuses clean). **Neither run adds a live
+   cell**; the ledger stays 40 / 6 / 46, `RISCV_199D_READINESS` remains `case_b`, and coordinate
+   23 remains OPEN solely on cross-hart wake, production enablement and production live evidence.
+   **RISC-V blocker 3 audited — `RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY`.**
+   Audit only; nothing implemented, flipped or re-homed. The intended chain (committed
+   `wake_target_cpu` → local/remote comparison → arch wake seam → SBI IPI → supervisor software
+   interrupt → target trap entry → pending-bit ack → cross-CPU work consumption → dispatch → user
+   continuation) has **only two of ten links present**: the wake-target comparison and the
+   cross-CPU consumer. It does **not** fail at the transport — it fails at the first link. Live
+   `-smp 2` evidence: hart 1 *is* started through SBI HSM (`YARM_RISCV64_SMP_HART_START hart=1
+   ret=0 ack=1 state=parked_not_online`) and the DTB scan sees both harts
+   (`present_cpus=2 present_bitmap=0x3`), but `RISCV_SCHEDULER_BSP_ONLY online_cpus=1
+   reason=riscv_smp_scheduler_not_enabled` — hart 1 is **present and started but not
+   scheduler-online**, parked in a `wfi` loop with an `stvec` pointing at that park, `sstatus.SIE`
+   cleared, and no `sscratch`, `satp` or per-CPU binding. `sie.SSIE` is never set on either hart;
+   the only bit the tree enables is `STIE`. There is no SBI IPI transport, and cause 1 has no
+   decoder arm (only causes 5 and 9 are recognised), so a software interrupt would fall to
+   `TrapEvent::Unknown`. Independently, **no RISC-V task is ever pinned to CPU 1** — the sole
+   `set_task_home_cpu(.., CpuId(1))` caller is the x86 AP workload builder — so the committed wake
+   target is always the enqueueing CPU and the remote branch is dead code. Firmware is *not* the
+   constraint: OpenSBI v1.3 advertises `Platform IPI Device : aclint-mswi`. **Minimum needed: (d)
+   a larger RISC-V SMP foundation**, not transport alone. **Smallest next increment:** bring CPU 1
+   online in the RISC-V scheduler and give hart 1 a real trap vector — nothing else — with
+   hard-stops on `probe_extension(0x735049)`, `-smp 1` byte-identity, no user code on hart 1, and
+   a healthy service chain at `online_cpus=2`. `stage199d_riscv_remote_wake_readiness` (13 tests)
+   computes the classification from architecture-scoped seam probes. Ledger unchanged at
+   40 / 6 / 46; coordinate 23 stays OPEN. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.20.
+   **Blocker-3 link 7 is now structurally CLOSED — the trap-ready parked secondary.** Hart 1 owns
+   a valid kernel execution/trap context and parks with every interrupt admission disabled: a
+   validated, atomically-claimed logical `CpuId(1)`; the boot hart's live `satp` captured from its
+   CSR and installed with the required `sfence.vma` (no ASID allocated, so `Asid(0)` cannot be
+   materialised); `sscratch` set to a **private** per-hart trap stack per the existing
+   `csrrw sp, sscratch, sp` frame ABI; and the real `yarm_riscv64_trap_vector` installed **last**,
+   only after identity, address space and trap stack are valid. All six markers report values
+   **read back from the CSRs**. `sie` is cleared outright and `sstatus.SIE` stays 0.
+   **The §6.1.18 narrow-snapshot premise was replaced, not deleted:** the bridge now *derives* the
+   trapping CpuId from the frame pointer (frames land on the trapping hart's own trap stack), and
+   the equivalence argument is re-made per-hart — `with_cpu(cpu, ..)` and
+   `current_tid_split_read(cpu)` both resolve to `current_tid_on(cpu)` for whatever cpu is
+   derived, and only the boot hart can reach the bridge while secondaries park interrupts-disabled
+   and never enter userspace. A live defect was found and fixed en route: the secondary acked
+   *before* emitting its markers, so the boot hart resumed mid-sequence and interleaved the shared
+   SBI console — the ack now lands after the sequence, making `ack=1` attest "trap-ready and
+   parked". Live: `-smp 1` unchanged with **zero** secondary markers and the direct-IPC smoke
+   still `live_cells=2 result=ok`; `-smp 2` passes with `present_cpus=2`, each marker exactly once
+   in causal order, `cpu=1`, `stvec` equal to the real vector, `sscratch` equal to the private
+   trap-stack top, `sie=0x0 sstatus_sie=0 ssie=0 stie=0 seie=0`, **`online_cpus` still 1**, no
+   user/scheduler/timer work on hart 1, a healthy boot-hart service chain and no unexpected trap.
+   **Link 2 remains absent**, so `RISCV_REMOTE_WAKE` stays **D**, `RISCV_199D_READINESS` stays
+   `case_b`, coordinate 23 stays OPEN and the ledger stays 40 / 6 / 46. See §6.1.21.
+   **Chain link 2 is now CLOSED — CPU 1 is scheduler-online, WAKE-ONLY.** The pre-audit found the
+   tree already represents the required state through the **generic** mechanism x86_64 (183.5) and
+   AArch64 (195D) use — no hard-stop, no RISC-V-private scheduler, no second bitmap. The decisive
+   fact is that `least_loaded_online_cpu` **skips wake-only CPUs outright**, so onlining does not
+   make CPU 1 eligible for ordinary placement, and `dispatching = online & !wake_only` keeps user
+   dispatch BSP-only. Wake-only is marked *before* onlining (no placement window), the idle current
+   (tid 0) is installed, and `RISCV_SCHEDULER_SMP_ONLINE` is published only after the scheduler
+   state **reads back** `present=1 online=1 wake_only=1` — a mismatch rolls back and reports
+   instead. Registration is gated on the hart having acknowledged `TRAP_READY_PARKED`, and the
+   secondary never calls the scheduler.
+   **A latent link-7 defect surfaced here:** OpenSBI chooses the boot hart *nondeterministically*
+   (one `-smp 2` run entered on hart 1), while the bridge always names the boot hart `CpuId(0)`.
+   The mapping had assumed `hart_id == logical CpuId`, so secondary hart 0 claimed the boot hart's
+   own logical id — and the duplicate check could not catch it because the claim word was
+   initialised to `0` despite its comment saying bit 0 was pre-claimed. Logical id 0 is now
+   genuinely reserved and secondaries take the lowest free id ≥ 1; verified across three `-smp 2`
+   runs that booted on hart 0 *and* hart 1, `cpu=1` and `online_cpus=2` every time.
+   Live: `-smp 2` passes with `present_cpus=2 online_cpus=2`, `wake_only=1 dispatchable=0
+   user_dispatch=0 timer=0 queue=0 irq=0`, all six link-7 markers once and in order with
+   read-backs unchanged, and **no `cpu=1` dispatch, user-entry, dequeue, timer or task-switch
+   marker at all** — hart 1's only lines are its trap-ready sequence. `-smp 1` unchanged with zero
+   secondary markers and the direct-IPC seal still `live_cells=2 result=ok`. The core smoke gate
+   was updated (it hard-required `online_cpus=1` at any `-smp`) to expect
+   `online_cpus == present_cpus` plus per-CPU non-dispatch assertions and a `-smp 1` marker ban.
+   **Links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent.** The earliest missing link is now 1 — no
+   RISC-V task is pinned to a non-boot CPU — so `RISCV_REMOTE_WAKE` stays **D**,
+   `RISCV_199D_READINESS` stays `case_b`, coordinate 23 stays OPEN and the ledger stays
+   40 / 6 / 46. See §6.1.22.
+   **Chain link 1 HARD-STOPPED — no code written, link 1 remains ABSENT.** The pre-audit found
+   conditions 1–4 satisfiable (the existing oracle already spawns a disposable child server that
+   runs on CPU 0 and parks in the exact NR6 waiter state; `set_task_home_cpu` is arch-neutral; and
+   `sr_enqueue_committed_receiver_split` would genuinely commit to CPU 1 now that it is online),
+   but **condition 5 — safe retirement — is not**. Once the transaction commits, the task sits in
+   CPU 1's runqueue and CPU 1 never dispatches. `RingQueue::remove_tid` is **private to
+   `scheduler.rs`** and reachable only through `on_preempt_prefer`, which also dispatches; there is
+   no `Scheduler`- or `KernelState`-level "remove this TID from that CPU's runqueue". The only two
+   routes are excluded by the condition itself: dispatching it on CPU 1 *schedules* the task there
+   (destroying the wake-only idle-current invariant, which `install_ap_idle_current` refuses to
+   restore while a current exists) and leaves a Runnable-but-unqueued window; or adding a generic
+   removal seam, which is new production scheduler surface. A proof that observed the commit and
+   left the task parked on CPU 1 forever would violate the required "no leaked oracle task"
+   evidence and was **not** fabricated. **The contract that must be split first:** a generic
+   non-dispatching `Scheduler::withdraw_queued_tid_on(cpu, tid)` that removes the TID from that
+   CPU's queues without touching `current`, dispatching, or altering TCB status —
+   `RingQueue::remove_tid` already has the mechanics and compaction; only the non-dispatching path
+   to it is missing. Splitting into link 1A/1B does not help: retirement blocks NR6 and NR7
+   identically. Chain unchanged — links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent;
+   `RISCV_REMOTE_WAKE` recomputes to **D**; `RISCV_199D_READINESS` stays `case_b`; coordinate 23
+   stays OPEN; ledger stays 40 / 6 / 46; `probe_extension(0x735049)` still uncalled.
+   See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.23.
+
+   **The generic non-dispatching runqueue-withdrawal foundation is CLOSED — link 1 is still
+   ABSENT.** This closes the contract split §6.1.23 named as link 1's prerequisite, and nothing
+   more. Three `pub(crate)` levels — `PriorityScheduler::withdraw_queued_tid(tid)`,
+   `SmpScheduler::withdraw_queued_tid_on(cpu, tid)` and a narrow `KernelState` wrapper — remove
+   **exactly one** queued incarnation of a TID from a **named** CPU's runqueue and do nothing else.
+   §6.1.23 sketched the return as `bool`; `bool` is genuinely ambiguous here, so the smallest typed
+   outcome is used instead — `Removed` / `NotQueued` / `RefusedCurrent` / `RefusedDuplicate` /
+   `InvalidCpu` — because a bare `false` would conflate four facts with four different correct
+   responses. The current task is refused **before** any mutation (which is also what protects the
+   scheduler-owned tid-0 idle current on a wake-only CPU); a duplicate occurrence **fails closed**
+   with zero mutation, counted across all three priority queues first; an out-of-range or offline
+   CPU is refused rather than retargeted. Removal delegates to the existing
+   `RingQueue::remove_tid` compaction and the exact-one count reuses the ring's own `index`
+   mapping, so **no queue algorithm is duplicated**; the one thing withdrawal adds is the
+   membership-mirror update, which `remove_tid`'s only pre-existing caller (`on_preempt_prefer`,
+   which moves the task queue → `current`) must *not* do. 21 focused tests cover each priority
+   queue, head/middle/tail, wrapped compaction, the empty queue, the wrong CPU, current refusal,
+   idle-current preservation, duplicate fail-closed, invalid CPU, unrelated FIFO order,
+   online/present/wake-only bitmaps and both current slots. Structural guards prove the seam
+   contains no dispatch or context-switch token, no task-state-mutation token, no policy token and
+   no architecture-specific reference, and that it stays `pub(crate)`; each was mutation-tested and
+   each asserts its own extraction is non-degenerate. `KernelState::withdraw_queued_tid_on` images
+   the TCB `status` field's **raw bytes** before and after, for `Runnable`, `Blocked(Poll)`,
+   `Blocked(Join)` and `Exited`. **Nothing is wired**: a source-tree walk proves the seam has no
+   caller outside the scheduler, its wrapper and tests. Chain unchanged — links 2, 3, 7, 9 present;
+   1, 4, 5, 6, 8, 10 absent; `RISCV_REMOTE_WAKE` stays **D**; `RISCV_199D_READINESS` stays
+   `case_b`; coordinate 23 stays OPEN; **no live cell and no QEMU seal**; ledger stays
+   40 / 6 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.24.
+
+   **RISC-V chain link 1 (NR6) HARD-STOPS on wake-only placement — link 1 remains ABSENT.** The
+   requested proof needs CPU 1 to be **online**, **wake-only** and holding the server **queued
+   exactly once**, all at the same moment. Those three are mutually exclusive: `wake_only` *means*
+   explicit placement is denied, which is the very property that made §6.1.22's onlining safe.
+   The full choreography was implemented and booted at `-smp 2` — a source-only hard-stop would
+   not have been trustworthy, because steps 1–5 and 7–9 all work and only a live run separates
+   "the target was committed" from "the target was requested". The live log is decisive: the pin
+   landed (`RISCV_REMOTE_ENQUEUE_SERVER_PINNED … home_cpu=1 target_online=1 target_wake_only=1
+   result=ok`), the off-lock transaction completed (`IPCCALL_DIRECT_REQUEST_OK arch=riscv64 …`)
+   and reported `wake_target_cpu=1` — but `SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu=1 tid=10008
+   reason=no_ap_dispatcher_yet` fired, so `queued_exactly_once=0` and the withdrawal that followed
+   found `NotQueued`. The mechanism was **reverted in full** once it produced that evidence; a
+   source-tree walk proves nothing of it survives. A **second finding**: the seam that reports the
+   committed target, `sr_enqueue_committed_receiver_split`, documents its return as "the CPU the
+   receiver was **actually enqueued on**" and that the two "cannot disagree" — it discards the
+   enqueue's `Err` and returns the *requested* CPU regardless, driven and demonstrated in
+   `the_committed_wake_target_can_report_a_placement_that_never_happened`. That is what made
+   §6.1.23 score condition 4 YES; **that scoring is corrected to NO**. The defect is latent, not
+   live, on x86_64 (its AP is dispatching, so the denial never fires) and is not repaired here.
+   **The contract that must be split first:** either split `wake_only` into "excluded from
+   balanced placement/dispatch" vs "may receive an explicit remote enqueue" (the small route, and
+   exactly what a remote-enqueue proof needs), or land the AP dispatcher (Stage 183.6, which needs
+   links 4, 5, 6, 8 and 10 too). Both are production scheduler policy, which the increment's own
+   hard-stop list forbids. The §6.1.24 withdrawal foundation is not implicated — `NotQueued` on a
+   genuinely-unqueued TID is its correct fail-closed answer — and remains unwired. **NR7 remote
+   reachability is NOT live-proved**; the NR6 blocker applies to it identically. Chain unchanged —
+   links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent; `RISCV_REMOTE_WAKE` recomputes to **D**;
+   `RISCV_199D_READINESS` stays `case_b`; coordinate 23 stays OPEN; **no new canonical live cell**;
+   ledger stays 40 / 6 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.25.
+
+   **The false-success enqueue contract is REPAIRED.** §6.1.25's second finding, closed — no
+   production predicate, no wake-only change, no RISC-V status change.
+   `sr_enqueue_committed_receiver_split` now returns `ReceiverEnqueue::{Enqueued{cpu},
+   Rejected{cpu,error}}` instead of a bare `CpuId`, carrying `SchedulerError` verbatim so the five
+   distinctions stay distinct: `InvalidCpu`, `CpuOffline`, `WakeOnly`, `QueueFull`,
+   `AlreadyQueued`. `WakeOnly` is new — it used to fold into `CpuOffline`, and "the target is
+   down" versus "the target is up but refuses work" are materially different answers for a wake.
+   The load-bearing rule is **structural**: `enqueued_cpu()` is the only accessor and returns
+   `None` for every rejection, and both transactions bind through an `Enqueued` let-else, so a
+   `wake_target_cpu` cannot be written down unless the rank-1 enqueue returned `Ok`. No success
+   object exists on failure, and the drain's IPI and retirement marker both sit inside
+   `if let Ok(success)`. **Route B (complete rollback), not a bare `Err`:** preflight admission was
+   rejected because `QueueFull` is genuinely racy against other CPUs, so the real enqueue stays the
+   authority. On refusal NR6 undoes the whole publication in reverse order — reverse link, record,
+   reply cap, `Runnable → Blocked` (new `sr_uncommit_blocked_receiver_split`), waiter restore — and
+   the ack lease is restored, so it is genuinely retryable; the end-to-end test proves that by
+   removing the refusal and re-running the *same* transaction to success. NR7 is terminal instead:
+   its enqueue sits after the one-shot `consume_reply_record_split`, which must never be re-armed,
+   so the record stays `Consumed` (the same terminal `CallerGone` uses) while the caller returns to
+   `Blocked` with its waiter — leaving its completion to the existing reply timeout, which the old
+   Runnable-but-unqueued state made impossible. The NR6 reverse-link-failure arm had the identical
+   gap and now shares the same rollback. Twelve focused tests drive the real seam for every
+   distinction plus both end-to-end rollbacks; the regression test reproduces `ca55400b` exactly.
+   Three guards pinning the old contract were **updated, not deleted** —
+   `a_stale_home_cpu_fails_closed` had asserted `assert_eq!(target, bogus)` beside "and nothing is
+   queued there", the defect written down as if correct. RISC-V status recomputes unchanged: link 1
+   ABSENT, links 2/3/7/9 present, 4/5/6/8/10 absent, `RISCV_REMOTE_WAKE` **D**,
+   `RISCV_199D_READINESS` `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live cell, and
+   the withdrawal foundation still unwired. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.26.
+
+   **The two unsound enqueue-REJECTION contracts §6.1.26 shipped are REPAIRED.**
+   **(A) `AlreadyQueued` is not "nothing is queued".** `Rejected` had documented itself as "the
+   receiver is in no run queue" — true for `InvalidCpu`/`CpuOffline`/`WakeOnly`/`QueueFull`, which
+   all fail before touching a queue, but false for `AlreadyQueued`, which reports *pre-existing*
+   membership. And because `contains_tid` reads the membership mirror, which tracks the queues
+   **plus the dispatched `current` task**, `AlreadyQueued` can mean the receiver is **executing**.
+   The ordinary rollback would then have produced a `Blocked` task that is still queued or current.
+   Fixed three ways: the reason now survives into the transaction error
+   (`EnqueueRejected(SchedulerError)`, not one information-free variant); on `AlreadyQueued` the
+   seam reconciles membership via `withdraw_queued_tid_on` **inside the same
+   `with_scheduler_split_mut` closure** that detected it — one acquisition only, never through
+   `self` — and carries the `WithdrawOutcome`; and only `Removed` (an atomically removed
+   exactly-one queued entry, by construction not `current`) may enter the TCB rollback.
+   `RefusedCurrent`/`RefusedDuplicate`/`NotQueued`/`InvalidCpu` fail closed via
+   `EnqueueRejectedUnreconciled`, reclaiming the authority while making **no** restoration claim.
+   The hard-stop window is *closed*, not argued: both transactions now run a pre-commit membership
+   preflight (NR6 9c, NR7 5c) — a still-`Blocked` receiver with its waiter exclusively claimed
+   cannot legitimately hold membership and nothing can wake it, so the check does not race — and
+   decline before the first irreversible mutation.
+   **(B) A direct-eligible NR7 has no timeout owner.** §6.1.26 justified leaving the caller
+   `Blocked` with the record `Consumed` by appealing to "the existing reply timeout". That was
+   false for exactly this population: `classify_direct_reply_eligibility` declines
+   `terminal_arbitrated` replies **before any mutation**, and that flag *means* a reply timeout is
+   armed — so every direct-eligible reply is untimed and the caller was stranded with no terminal
+   owner. The claim is deleted and **route A** implemented:
+   `restore_consumed_reply_record_split` returns the record `Consumed → Available` only at the
+   exact generation, bound to the exact replier `{tid, asid}`, and only from `Consumed`; the
+   reverse link the consume closed is re-registered; the ack lease is restored. Re-arming happens
+   only when the receiver is provably unplaced. Proved end-to-end for each reachable reason:
+   `Blocked` on the **exact original recv cap**, waiter restored once, neither queued nor current,
+   no success/marker/IPI, no cap/record/link leak — NR6 by re-running the same transaction to
+   success, NR7 by the restored authority retrying, succeeding exactly once, and a duplicate
+   remaining rejected. Three mutations were run and all three now fail behaviourally (the
+   reverse-link one was structural-only until a link-count assertion was added). RISC-V status
+   recomputes unchanged: link 1 ABSENT, 2/3/7/9 present, 4/5/6/8/10 absent, `RISCV_REMOTE_WAKE`
+   **D**, `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live cell. The withdrawal
+   foundation is now consumed by exactly one caller — that reconciliation — and by no oracle,
+   no RISC-V path and no link-1 work. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.27.
+
+   `stage199d_riscv_canonical_admission` (11 tests) pins the
+   contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
@@ -733,7 +1035,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **50** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **49** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there

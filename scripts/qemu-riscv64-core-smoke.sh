@@ -422,7 +422,41 @@ REJECT_PATTERNS=(
   'TRAP_HANDLE failed'
   'Vm\(Full\)'
   '\boom\b'
-  '\bcapacity\b'
+  # Stage 199D: the generic `\bcapacity\b` reject was RETIRED here. It was added at
+  # Stage 181 (2a30515d) beside `Vm\(Full\)` and `\boom\b` as a proxy for resource
+  # exhaustion, when no kernel marker printed the word benignly. Since Stage 199D
+  # (fcfc55e3) the structural ack-store bound and the independent waiter census report
+  # `capacity=256`, `ack_capacity=256` and `capacity_refused=0` on EVERY healthy boot,
+  # so the bare word stopped discriminating and failed a healthy RISC-V core boot.
+  #
+  # Capacity checking is NOT removed — it is narrowed to the exact exhaustion forms the
+  # current emitters produce:
+  #   direct ack store    IPC_DIRECT_ACK_FUSES ... capacity_refused=N   (N > 0)
+  #   shared region       SHARED_REGION_CANCEL_FUSE_SET reason=capacity_exhausted
+  #   reply-link install  IPC_SERVER_REPLY_LINK_REGISTER_FAIL ... reason=capacity result=rolled_back
+  #   fork COW            FORK_COW_FAIL reason=cow_capacity
+  #   kernel stack map    D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED ... reason=page_table_capacity
+  #   user VM grow        ... reason=user_vm_capacity
+  #   exit deferral       EXIT_TASK_SYSCALL_DECLINED ... reason=deferred_capacity
+  #   reply-cap mint      IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL ... cnode_capacity=
+  #
+  # `reason=capacity\b` does NOT match `reason=capacity_exhausted` (`_` is a word
+  # character, so there is no boundary), and `reason=deferred_capacity` deliberately does
+  # NOT match the benign `deferred_capacity=ok` in EXIT_TASK_PREFLIGHT_OK.
+  'capacity_refused=[1-9][0-9]*'
+  'reason=capacity_exhausted'
+  'reason=capacity\b'
+  'reason=cow_capacity'
+  'reason=page_table_capacity'
+  'reason=user_vm_capacity'
+  'reason=deferred_capacity'
+  'IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL'
+  # These two exhaustion errors surface only as the Debug field `kernel_error={:?}` of
+  # FORK_COW_FAIL, and were never covered by the retired word match (they do not contain
+  # the substring "capacity"). Named explicitly so the narrowing does not leave them the
+  # only unchecked `*Full` errors beside the already-rejected `Vm\(Full\)`.
+  'kernel_error=CapabilityFull'
+  'kernel_error=TaskTableFull'
   # Stage 184 (CROSS-ARCH-LIVE): the cross-arch live audit must not report a
   # blocked topology, an ungraduated seam, or any fallback/opt-out.
   'CROSS_ARCH_TOPOLOGY_BLOCKED arch=riscv64'
@@ -561,8 +595,13 @@ if (( QEMU_SMP >= 2 )); then
 fi
 
 # Topology assertions: YARM must report present_cpus matching --smp N, and the
-# present_bitmap must be the contiguous 0..N-1 mask for QEMU virt. online_cpus
-# remains 1 until RISC-V SMP scheduling is implemented.
+# present_bitmap must be the contiguous 0..N-1 mask for QEMU virt.
+#
+# Stage 199D link 2: `online_cpus` is no longer pinned to 1. Every TRAP-READY-acknowledged
+# secondary is registered scheduler-online in the WAKE-ONLY (explicitly non-dispatchable) state,
+# so online_cpus == present_cpus. Wake-only CPUs accept no task placement
+# (`least_loaded_online_cpu` skips them) and never dispatch (`dispatching = online & !wake_only`),
+# so this is NOT a claim of RISC-V SMP user dispatch — the per-CPU assertions below pin that.
 expected_bitmap_hex=""
 case "$QEMU_SMP" in
   1) expected_bitmap_hex="0x1" ;;
@@ -571,10 +610,54 @@ case "$QEMU_SMP" in
   4) expected_bitmap_hex="0xf" ;;
 esac
 if [[ -n "$expected_bitmap_hex" ]]; then
-  if ! rg -n "YARM_BOOT_OK present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=1" "$LOGFILE" >/dev/null 2>&1; then
-    echo "[fail] YARM_BOOT_OK must report present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=1"
+  if ! rg -an "YARM_BOOT_OK present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=${QEMU_SMP}" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] YARM_BOOT_OK must report present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=${QEMU_SMP}"
     failures=$((failures + 1))
   fi
+fi
+
+# Stage 199D link 2: every secondary that came online must be WAKE-ONLY, and must have done so
+# only after publishing its link-7 trap-ready state. At -smp 1 there are no secondaries, so none
+# of these markers may appear at all.
+if [[ "$QEMU_SMP" -gt 1 ]]; then
+  expected_secondaries=$(( QEMU_SMP - 1 ))
+  for marker in \
+    "RISCV_SECONDARY_CPU_ID_BOUND" \
+    "RISCV_SECONDARY_KERNEL_SATP_ACTIVE" \
+    "RISCV_SECONDARY_SSCRATCH_READY" \
+    "RISCV_SECONDARY_TRAP_VECTOR_INSTALLED" \
+    "RISCV_SECONDARY_INTERRUPTS_DISABLED" \
+    "RISCV_SECONDARY_TRAP_READY_PARKED" \
+    "RISCV_SCHEDULER_SMP_ONLINE cpu="; do
+    seen=$(rg -ac -- "$marker" "$LOGFILE" 2>/dev/null || echo 0)
+    if [[ "$seen" != "$expected_secondaries" ]]; then
+      echo "[fail] expected ${expected_secondaries}x '${marker}', saw ${seen}"
+      failures=$((failures + 1))
+    fi
+  done
+  # The online secondary must be non-dispatchable in every dimension it reports.
+  if ! rg -an "RISCV_SCHEDULER_SMP_ONLINE cpu=[0-9]+ present=1 online=1 wake_only=1 dispatchable=0 user_dispatch=0 timer=0 queue=0 irq=0" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] RISCV_SCHEDULER_SMP_ONLINE must report wake_only=1 and every dispatch dimension 0"
+    failures=$((failures + 1))
+  fi
+  # Trap-ready state must precede the scheduler registration.
+  ready_line=$(rg -an "RISCV_SECONDARY_TRAP_READY_PARKED" "$LOGFILE" 2>/dev/null | head -n1 | cut -d: -f1)
+  online_line=$(rg -an "RISCV_SCHEDULER_SMP_ONLINE cpu=" "$LOGFILE" 2>/dev/null | head -n1 | cut -d: -f1)
+  if [[ "$ready_line" =~ ^[0-9]+$ && "$online_line" =~ ^[0-9]+$ ]] \
+     && (( ready_line >= online_line )); then
+    echo "[fail] scheduler registration must follow the trap-ready park (ready=${ready_line} online=${online_line})"
+    failures=$((failures + 1))
+  fi
+else
+  for marker in \
+    "RISCV_SECONDARY_CPU_ID_BOUND" \
+    "RISCV_SECONDARY_TRAP_READY_PARKED" \
+    "RISCV_SCHEDULER_SMP_ONLINE"; do
+    if rg -an -- "$marker" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] -smp 1 must emit no secondary marker, but '${marker}' is present"
+      failures=$((failures + 1))
+    fi
+  done
 fi
 
 # Boot hart must not be parked: the RISCV_BOOT_HART_SELECTED hart=N and the
@@ -588,7 +671,9 @@ if [[ -n "$boot_hart" ]]; then
   fi
 fi
 
-# Scheduler-online breadcrumb: always required (RISC-V SMP scheduling is off).
+# Scheduler breadcrumb emitted during the DTB scan, BEFORE kernel bootstrap. It records the
+# scheduler state at that moment; Stage 199D link 2's RISCV_SCHEDULER_SMP_ONLINE supersedes it
+# later in the boot for any trap-ready secondary. Still always required.
 if ! rg -n "RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled" "$LOGFILE" >/dev/null 2>&1; then
   echo "[fail] RISCV_SCHEDULER_BSP_ONLY breadcrumb missing"
   failures=$((failures + 1))
