@@ -698,6 +698,36 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    `case_b`; coordinate 23 stays OPEN; **no live cell and no QEMU seal**; ledger stays
    40 / 6 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.24.
 
+   **RISC-V chain link 1 (NR6) HARD-STOPS on wake-only placement — link 1 remains ABSENT.** The
+   requested proof needs CPU 1 to be **online**, **wake-only** and holding the server **queued
+   exactly once**, all at the same moment. Those three are mutually exclusive: `wake_only` *means*
+   explicit placement is denied, which is the very property that made §6.1.22's onlining safe.
+   The full choreography was implemented and booted at `-smp 2` — a source-only hard-stop would
+   not have been trustworthy, because steps 1–5 and 7–9 all work and only a live run separates
+   "the target was committed" from "the target was requested". The live log is decisive: the pin
+   landed (`RISCV_REMOTE_ENQUEUE_SERVER_PINNED … home_cpu=1 target_online=1 target_wake_only=1
+   result=ok`), the off-lock transaction completed (`IPCCALL_DIRECT_REQUEST_OK arch=riscv64 …`)
+   and reported `wake_target_cpu=1` — but `SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu=1 tid=10008
+   reason=no_ap_dispatcher_yet` fired, so `queued_exactly_once=0` and the withdrawal that followed
+   found `NotQueued`. The mechanism was **reverted in full** once it produced that evidence; a
+   source-tree walk proves nothing of it survives. A **second finding**: the seam that reports the
+   committed target, `sr_enqueue_committed_receiver_split`, documents its return as "the CPU the
+   receiver was **actually enqueued on**" and that the two "cannot disagree" — it discards the
+   enqueue's `Err` and returns the *requested* CPU regardless, driven and demonstrated in
+   `the_committed_wake_target_can_report_a_placement_that_never_happened`. That is what made
+   §6.1.23 score condition 4 YES; **that scoring is corrected to NO**. The defect is latent, not
+   live, on x86_64 (its AP is dispatching, so the denial never fires) and is not repaired here.
+   **The contract that must be split first:** either split `wake_only` into "excluded from
+   balanced placement/dispatch" vs "may receive an explicit remote enqueue" (the small route, and
+   exactly what a remote-enqueue proof needs), or land the AP dispatcher (Stage 183.6, which needs
+   links 4, 5, 6, 8 and 10 too). Both are production scheduler policy, which the increment's own
+   hard-stop list forbids. The §6.1.24 withdrawal foundation is not implicated — `NotQueued` on a
+   genuinely-unqueued TID is its correct fail-closed answer — and remains unwired. **NR7 remote
+   reachability is NOT live-proved**; the NR6 blocker applies to it identically. Chain unchanged —
+   links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent; `RISCV_REMOTE_WAKE` recomputes to **D**;
+   `RISCV_199D_READINESS` stays `case_b`; coordinate 23 stays OPEN; **no new canonical live cell**;
+   ledger stays 40 / 6 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.25.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and

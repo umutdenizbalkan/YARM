@@ -109742,3 +109742,276 @@ mod stage199d_runqueue_withdrawal_foundation {
         assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
     }
 }
+
+/// Stage 199D — RISC-V remote-enqueue reachability (chain link 1, NR6): **HARD-STOP**.
+///
+/// The increment asked for a live proof that a genuine NR6 transaction commits its wake target to
+/// CPU 1 while CPU 1 is simultaneously **online**, **wake-only**, and holding the server **queued
+/// exactly once**. Those three facts are mutually exclusive under the production scheduler
+/// contract: `wake_only` means *explicit placement is denied*. The blocker is not the transaction,
+/// the affinity seam or the withdrawal foundation — all three work. It is the placement itself.
+///
+/// Live evidence, `-smp 2`, RISC-V oracle armed (see `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.25):
+///
+/// ```text
+/// RISCV_REMOTE_ENQUEUE_SERVER_PINNED direction=nr6 tid=10008 endpoint=6 home_cpu=1 …
+/// SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu=1 tid=10008 reason=no_ap_dispatcher_yet
+/// RISCV_REMOTE_ENQUEUE_COMMITTED … wake_target_cpu=1 … queued_exactly_once=0 result=fail
+/// ```
+///
+/// The proof mechanism that produced that log was **reverted**: no closure is claimed, so nothing
+/// of it survives in the tree. These tests pin the contradiction itself, so a future increment
+/// cannot "close" link 1 by quietly deleting the wake-only denial.
+mod stage199d_riscv_remote_enqueue_nr6_hardstop {
+    use super::*;
+    use crate::kernel::scheduler::TaskPriority;
+    use crate::runtime::SharedKernel;
+
+    const SCHED: &str = include_str!("../../kernel/scheduler.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    // ── The blocker, behaviourally ──────────────────────────────────────────────────────────
+
+    /// **The wake-only contract denies exactly the placement the proof needs.** Not a source
+    /// reading — the production scheduler is driven and refuses.
+    #[test]
+    fn an_online_wake_only_cpu_refuses_the_placement_the_proof_requires() {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::SmpScheduler;
+        let mut sched = SmpScheduler::default();
+        sched.set_present_cpu_bitmap(0b11);
+        sched.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+        sched.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
+
+        // Exactly the three facts requirement 6 demands, minus the one that cannot hold.
+        assert!(sched.cpu_is_online(CpuId(1)), "CPU 1 is online");
+        assert!(sched.cpu_wake_only(CpuId(1)), "CPU 1 is wake-only");
+        assert!(
+            sched
+                .enqueue_on_with_priority(CpuId(1), ThreadId(77), TaskPriority::Normal)
+                .is_err(),
+            "placement on an online wake-only CPU must be DENIED — this is the blocker"
+        );
+        assert_eq!(
+            sched.runnable_count_on(CpuId(1)),
+            0,
+            "and nothing is queued there, so `queued_exactly_once=1` is unreachable"
+        );
+        assert!(
+            !sched.task_present_anywhere(ThreadId(77)),
+            "the denied task is queued nowhere at all — it would simply be lost"
+        );
+    }
+
+    /// **`sr_enqueue_committed_receiver_split` reports a target it did not achieve.** Its own
+    /// doc comment says the returned CPU is the one the receiver was *actually enqueued on* and
+    /// that the two "cannot disagree". Driven against an online wake-only CPU, they disagree: the
+    /// rank-1 enqueue's `Err` is discarded and the requested CPU is returned regardless.
+    ///
+    /// This is why §6.1.23 condition 4 was wrongly scored **YES**. It is latent, not live, on
+    /// x86_64 — the AP dispatcher clears `wake_only` there, so the denial never fires.
+    #[test]
+    fn the_committed_wake_target_can_report_a_placement_that_never_happened() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let tid = 4242u64;
+        kernel.with(|s| {
+            s.register_task_with_class(tid, crate::kernel::task::TaskClass::App)
+                .expect("task");
+            s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+            s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+            s.set_task_home_cpu(tid, CpuId(1)).expect("home cpu");
+        });
+
+        // The REAL seam the NR6 transaction uses for its single, last, "non-fallible" wake.
+        let reported = kernel.sr_enqueue_committed_receiver_split(tid, Some(CpuId(1)));
+
+        assert_eq!(
+            reported,
+            CpuId(1),
+            "the seam reports CPU 1 as the committed wake target"
+        );
+        kernel.with(|s| {
+            assert!(
+                !s.task_present_in_any_runqueue(tid),
+                "…yet the task is in NO runqueue: the reported target is the REQUESTED cpu, not \
+                 an achieved placement"
+            );
+        });
+    }
+
+    /// The two facts requirement 6 needs simultaneously, as a computed truth table over the real
+    /// scheduler. Every row that satisfies "queued exactly once" fails "wake-only", and vice
+    /// versa — there is no row satisfying both.
+    #[test]
+    fn queued_on_the_target_and_target_wake_only_are_mutually_exclusive() {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::SmpScheduler;
+        let mut rows = alloc::vec::Vec::new();
+        for wake_only in [false, true] {
+            let mut sched = SmpScheduler::default();
+            sched.set_present_cpu_bitmap(0b11);
+            sched.bring_up_cpu(CpuId(1)).expect("online");
+            sched
+                .set_cpu_wake_only(CpuId(1), wake_only)
+                .expect("wake-only bit");
+            let _ = sched.enqueue_on_with_priority(CpuId(1), ThreadId(9), TaskPriority::Normal);
+            rows.push((wake_only, sched.runnable_count_on(CpuId(1)) == 1));
+        }
+        assert_eq!(
+            rows,
+            alloc::vec![(false, true), (true, false)],
+            "queued-exactly-once and wake-only never hold together"
+        );
+        assert!(
+            !rows.iter().any(|(wake_only, queued)| *wake_only && *queued),
+            "requirement 6 has no satisfying row under the production scheduler contract"
+        );
+    }
+
+    // ── The denial is production scheduler POLICY, which the hard-stop list forbids touching ──
+
+    /// The denial is not incidental: it is a documented policy with a named future owner
+    /// (the AP dispatcher, Stage 183.6). Removing it is a production scheduler policy change.
+    #[test]
+    fn the_denial_is_documented_production_policy_with_a_named_owner() {
+        let at = SCHED
+            .find("pub fn enqueue_on_with_priority")
+            .expect("the placement seam");
+        let body = &SCHED[at..at + 1600];
+        assert!(
+            body.contains("if self.wake_only & (1u64 << idx) != 0 {"),
+            "the wake-only branch guards placement"
+        );
+        assert!(
+            body.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY")
+                && body.contains("reason=no_ap_dispatcher_yet"),
+            "the denial is attested with its reason"
+        );
+        assert!(
+            body.contains("return Err(SchedulerError::CpuOffline);"),
+            "and it fails closed rather than placing the task"
+        );
+        assert!(
+            body.contains("183.6 lifts this per CPU when the AP dispatcher lands"),
+            "the lift is owned by Stage 183.6, not by a 199D proof increment"
+        );
+    }
+
+    /// The `Err` really is discarded at the call site — the second half of the defect.
+    #[test]
+    fn the_enqueue_seam_discards_the_placement_result() {
+        let at = RUNTIME
+            .find("pub(crate) fn sr_enqueue_committed_receiver_split")
+            .expect("the enqueue seam");
+        // Bound the slice at the method's closing brace (column 4), not at a byte count.
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("the method end")];
+        assert!(
+            body.contains("let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);"),
+            "the enqueue result is dropped"
+        );
+        let tail = body
+            .split("let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);")
+            .nth(1)
+            .expect("the code after the enqueue");
+        assert_eq!(
+            tail.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with("//")),
+            Some("cpu"),
+            "…and the REQUESTED cpu is returned unconditionally, with no check in between"
+        );
+    }
+
+    // ── Nothing landed ──────────────────────────────────────────────────────────────────────
+
+    /// No remote-enqueue proof mechanism survives anywhere in the tree: the increment
+    /// hard-stopped, so it claims nothing and wires nothing.
+    #[test]
+    fn no_remote_enqueue_proof_mechanism_landed() {
+        fn visit(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+            for entry in std::fs::read_dir(root).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    visit(&path, f);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let src = std::fs::read_to_string(&path).expect("read file");
+                    f(&path, &src);
+                }
+            }
+        }
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut visited = 0usize;
+        visit(&repo_root.join("src"), &mut |path, src| {
+            visited += 1;
+            let rel = path
+                .strip_prefix(&repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            // This test file quotes the markers in its own doc comment; nothing else may.
+            if rel == "src/kernel/boot/tests.rs" {
+                return;
+            }
+            for marker in [
+                "RISCV_REMOTE_ENQUEUE_COMMITTED",
+                "RISCV_REMOTE_ENQUEUE_WITHDRAWN",
+                "RISCV_REMOTE_ENQUEUE_REHOMED",
+                "RISCV_REMOTE_ENQUEUE_SERVER_PINNED",
+                "riscv_remote_enqueue_proof",
+                "maybe_pin_riscv_remote_enqueue_oracle_server",
+            ] {
+                if src.contains(marker) {
+                    offenders.push(alloc::format!("{rel}: {marker}"));
+                }
+            }
+        });
+        assert!(visited > 100, "the source walk must actually have run");
+        assert!(
+            offenders.is_empty(),
+            "the hard-stop claims no mechanism; found: {offenders:?}"
+        );
+    }
+
+    /// The withdrawal foundation is still unwired — this increment did not consume it.
+    #[test]
+    fn the_withdrawal_foundation_remains_unwired() {
+        assert!(
+            SCHED.contains("pub(crate) fn withdraw_queued_tid_on"),
+            "the foundation from §6.1.24 is still present"
+        );
+        assert!(
+            !RUNTIME.contains("withdraw_queued_tid"),
+            "…and still has no runtime caller"
+        );
+    }
+
+    // ── Status ──────────────────────────────────────────────────────────────────────────────
+
+    /// Link 1 stays ABSENT, so the mechanically-computed verdict stays D, and every downstream
+    /// status figure is unchanged. NR7 remote reachability is explicitly NOT live-proved.
+    #[test]
+    fn the_chain_status_and_ledger_are_unchanged() {
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+        assert!(
+            AUDIT.contains("NR7 remote reachability is NOT live-proved"),
+            "the NR7 direction must be recorded as unproved, not silently omitted"
+        );
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,"),
+            "coordinate 23 stays OPEN"
+        );
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+}

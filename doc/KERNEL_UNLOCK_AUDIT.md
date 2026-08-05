@@ -2346,7 +2346,7 @@ The hard-stop asked whether a disposable proof task can satisfy five conditions.
 | 1 | created and run initially on CPU 0 | **YES** — the existing RISC-V direct-IPC oracle already spawns a disposable child server that runs on the boot hart. |
 | 2 | parked in the exact NR6/NR7 waiter state | **YES** — that server blocks in recv-v2 and publishes its blocked-server acknowledgement; the green `STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL` is the standing proof. |
 | 3 | `home_cpu = CpuId(1)` via generic `set_task_home_cpu` | **YES** — the seam is architecture-neutral and already carries `CpuId(1)` on x86_64. |
-| 4 | remotely enqueued to CPU 1 without executing there | **YES** — `sr_enqueue_committed_receiver_split` uses `affinity.unwrap_or(sched.current_cpu)` and `enqueue_on_with_priority` accepts CPU 1 now that it is online (§6.1.22); the hart never dispatches, so it would never execute. |
+| 4 | remotely enqueued to CPU 1 without executing there | ~~**YES**~~ → **CORRECTED TO NO by §6.1.25.** `enqueue_on_with_priority` does **not** accept CPU 1 merely because it is online: it *denies* placement on a wake-only CPU. `sr_enqueue_committed_receiver_split` discards that `Err` and returns the requested CPU anyway, which is what made this row read YES. |
 | 5 | **safely removed/retired afterwards, without modifying production scheduler or lifecycle semantics** | **NO** |
 
 #### Why condition 5 fails
@@ -2480,6 +2480,129 @@ Withdrawal alone. The remaining link-1 work — spawning a disposable proof task
 NR6/NR7 waiter state, assigning `home_cpu = CpuId(1)`, observing
 `RISCV_REMOTE_ENQUEUE_COMMITTED … target_executed=0`, then retiring it through this seam — is a
 separate increment and is **not** claimed here.
+
+> **Superseded by §6.1.25.** "Withdrawal alone" was wrong. The attempt found a second, earlier
+> blocker: the remote CPU cannot hold the task at all while it is wake-only.
+
+---
+
+### 6.1.25 RISC-V chain link 1 (NR6) — HARD-STOP on wake-only placement; link 1 remains ABSENT
+
+The requested proof was that a genuine NR6 transaction commits its wake target to CPU 1 while
+CPU 1 is simultaneously **online**, **wake-only**, and holding the server **queued exactly once**.
+**Those three facts are mutually exclusive**, and the contradiction is in the production scheduler
+contract, not in the oracle, the affinity seam or the withdrawal foundation.
+
+**Verdicts unchanged.** Link 1 **ABSENT**; links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent;
+`RISCV_REMOTE_WAKE` recomputes mechanically to **D**; `RISCV_199D_READINESS` remains **`case_b`**;
+coordinate 23 remains **OPEN**; ledger remains **40 / 6 / 46**; **no new canonical live cell**.
+**NR7 remote reachability is NOT live-proved** — it was out of scope for this increment and the
+NR6 blocker applies to it identically, since both end in the same rank-1 placement.
+
+#### What was built, run, and then reverted
+
+The full choreography was implemented and booted, because a hard-stop asserted from source alone
+would not have been trustworthy: steps 1–5 and 7–9 all *work*, and only a live run distinguishes
+"the target was committed" from "the target was requested". The mechanism — a recv-entry pin
+through the generic `set_task_home_cpu`, and a post-lock observe → withdraw → rehome → requeue
+bounce on the direct-request drain, both default-off and oracle-gated — was **reverted in full**
+once it produced its evidence. Nothing of it survives in the tree; a source-tree walk
+(`no_remote_enqueue_proof_mechanism_landed`) proves it.
+
+#### The live evidence
+
+QEMU-virt/OpenSBI, `-smp 2`, `yarm.riscv_ipccall_direct_oracle=1`, one clean boot:
+
+```text
+RISCV_SECONDARY_TRAP_READY_PARKED hart=1 cpu=1 online=0 user=0 scheduler=0
+RISCV_SCHEDULER_SMP_ONLINE cpu=1 present=1 online=1 wake_only=1 dispatchable=0 …
+YARM_BOOT_OK present_cpus=2 present_bitmap=0x3 online_cpus=2
+RISCV_REMOTE_ENQUEUE_SERVER_PINNED direction=nr6 tid=10008 endpoint=6 home_cpu=1 \
+    target_online=1 target_wake_only=1 result=ok
+SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu=1 tid=10008 reason=no_ap_dispatcher_yet     ← the blocker
+IPCCALL_DIRECT_REQUEST_OK arch=riscv64 source_copy_offlock=1 reply_cap=1 server_wakes=1
+RISCV_REMOTE_ENQUEUE_COMMITTED direction=nr6 enqueueing_cpu=0 wake_target_cpu=1 \
+    target_online=1 target_wake_only=1 target_executed=0 queued_exactly_once=0 result=fail
+RISCV_REMOTE_ENQUEUE_WITHDRAWN direction=nr6 cpu=1 outcome=NotQueued target_executed=0 result=fail
+RISCV_REMOTE_ENQUEUE_REHOMED direction=nr6 from_cpu=1 to_cpu=0 queued_cpu1=0 queued_cpu0=1 result=ok
+USER_LOG tid=1 msg=RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok=1 reply_ok=1 … result=ok
+```
+
+Read it precisely. The pin landed. The transaction ran off-lock and completed. `wake_target_cpu`
+came back as **1**. The round trip finished and the ack/waiter censuses stayed clean. But the
+server was **never queued on CPU 1** — `queued_exactly_once=0`, and the withdrawal that followed
+found `NotQueued`. Requirement 6 is unsatisfiable.
+
+#### The first missing causal boundary
+
+`SmpScheduler::enqueue_on_with_priority` refuses placement on a wake-only CPU:
+
+```rust
+// Stage 183.5: a wake-only online CPU runs no dispatcher — a task placed on
+// its queue would strand forever. Deny placement explicitly (nothing pins
+// work to APs today; 183.6 lifts this per CPU when the AP dispatcher lands).
+if self.wake_only & (1u64 << idx) != 0 {
+    crate::yarm_log!("SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu={} tid={} reason=no_ap_dispatcher_yet", …);
+    return Err(SchedulerError::CpuOffline);
+}
+```
+
+Wake-only *means* "explicit placement is denied" — it is the property that made §6.1.22's
+onlining safe in the first place. So "CPU 1 is wake-only" and "the server is queued on CPU 1" are
+the same question asked twice with opposite answers. `queued_on_the_target_and_target_wake_only_are_mutually_exclusive`
+computes the truth table over the real scheduler: `(wake_only=false → queued)`,
+`(wake_only=true → not queued)`. There is no satisfying row.
+
+Lifting the denial is **Stage 183.6** work with a named owner (the AP dispatcher), and it is
+production scheduler policy — which the increment's own hard-stop list forbids modifying. So does
+clearing `wake_only` around the enqueue, which mutates the exact topology state §6.1.24
+requirement 7 pins as immutable. There is no third route.
+
+#### A second finding: the committed wake target is not a committed placement
+
+`sr_enqueue_committed_receiver_split` documents its return value as *"the CPU the receiver was
+**actually enqueued on**"*, read "out of the same rank-1 acquisition, so the two cannot disagree".
+They can:
+
+```rust
+let cpu = affinity.unwrap_or(sched.current_cpu);
+let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);   // Err discarded
+cpu                                                                  // returned regardless
+```
+
+`the_committed_wake_target_can_report_a_placement_that_never_happened` drives the real seam against
+an online wake-only CPU and shows it returning `CpuId(1)` for a task that ends up in **no**
+runqueue. This is what made §6.1.23 score condition 4 as **YES** — that scoring is hereby
+**corrected to NO**: `enqueue_on_with_priority` does *not* accept CPU 1 merely because it is
+online.
+
+The defect is **latent, not live, on x86_64**: the SMP oracle brings its AP up dispatching, so
+`wake_only` is clear there and the denial never fires. It is not repaired in this increment —
+it is production behaviour on the one architecture where NR6 is the default, and repairing it
+(returning the achieved placement, or failing the transaction when the wake cannot be placed) is
+its own increment with its own live seal.
+
+#### The exact contract that must be split first
+
+Before link 1 can close, one of these must land — each is a production scheduler change, not a
+proof:
+
+1. **Split `wake_only`** into "excluded from balanced placement / dispatch" and "may receive an
+   explicit remote enqueue", so a CPU can hold a queued task it will not run. This is the minimal
+   split, and it is exactly what a remote-enqueue proof needs: a task parked on a queue that is
+   never drained, then withdrawn.
+2. **Or land the AP dispatcher** (Stage 183.6) so CPU 1 is a genuine dispatching CPU — which
+   requires links 4, 5, 6, 8 and 10 as well, i.e. the whole remote-wake chain.
+
+Route 1 is far smaller and is the recommended next increment. It must also carry the
+`sr_enqueue_committed_receiver_split` repair, or the proof would still be reading a requested
+target rather than an achieved one.
+
+#### Scope note
+
+The withdrawal foundation from §6.1.24 is **not** implicated: it worked exactly as specified —
+`outcome=NotQueued` on a TID that was genuinely not queued is its correct, fail-closed answer.
+It remains unwired (`the_withdrawal_foundation_remains_unwired`).
 
 ---
 
