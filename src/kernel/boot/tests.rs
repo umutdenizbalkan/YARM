@@ -77191,6 +77191,75 @@ mod stage199a2b2d_direct_request_txn {
         }
     }
 
+    /// **Post-copy `AlreadyQueued` reconciled as `Removed` is RECOVERABLE.** `Removed` proves
+    /// exactly one queued entry was withdrawn under the same rank-1 acquisition and that the task
+    /// was not `current` — so the publication was never observed. Treating every reconciled
+    /// outcome as terminal (d6397395) was over-broad.
+    #[test]
+    fn a_post_copy_already_queued_removed_is_recoverable_and_retries_once() {
+        use core::sync::atomic::Ordering;
+        let fx = blocked_server_fixture();
+        let recv_cap =
+            fx.k.blocked_recv_cap_split_read(2, fx.server_aspace_asid)
+                .expect("recv cap");
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(300);
+        // Inject one queued entry immediately before the final enqueue.
+        crate::runtime::FORCE_POST_COPY_MEMBERSHIP.store(1, Ordering::Relaxed);
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 300);
+        crate::runtime::FORCE_POST_COPY_MEMBERSHIP.store(0, Ordering::Relaxed);
+
+        assert_eq!(
+            out,
+            Err(IpcCallDirectError::EnqueueRejected(
+                crate::kernel::scheduler::SchedulerError::AlreadyQueued
+            )),
+            "a reconciled Removed is the RETRYABLE variant, carrying its own reason"
+        );
+        assert_nr6_fully_restored(&fx, recv_cap);
+        assert!(
+            lease.is_available(),
+            "a variant documented retryable must not be returned with a discarded lease"
+        );
+        // …and the same transaction now succeeds exactly once.
+        let mut lease2 = claimed_lease(301);
+        let retry =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease2, 301)
+                .expect("the rolled-back transaction is genuinely retryable");
+        let _ = retry;
+        fx.k.with(|s| {
+            assert!(
+                s.task_present_in_any_runqueue(2),
+                "the retry queued the server"
+            )
+        });
+    }
+
+    /// **Post-copy `AlreadyQueued` as `RefusedCurrent` stays TERMINAL.** The receiver is
+    /// dispatched, so the publication may already have been observed: no restoration claim.
+    #[test]
+    fn a_post_copy_already_queued_current_is_terminal() {
+        use core::sync::atomic::Ordering;
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(302);
+        crate::runtime::FORCE_POST_COPY_MEMBERSHIP.store(2, Ordering::Relaxed);
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 302);
+        crate::runtime::FORCE_POST_COPY_MEMBERSHIP.store(0, Ordering::Relaxed);
+        assert_eq!(
+            out,
+            Err(IpcCallDirectError::EnqueueRejectedUnreconciled(
+                crate::kernel::scheduler::WithdrawOutcome::RefusedCurrent
+            )),
+            "a dispatched receiver is terminal, never retryable"
+        );
+        assert!(!lease.is_available(), "the acknowledgement is discarded");
+    }
+
     /// **Pre-existing membership is declined BEFORE any mutation.** A `Blocked` server that
     /// already holds scheduler membership is an invariant violation; the transaction refuses it
     /// at the preflight rather than publishing and then discovering the collision.
@@ -78367,6 +78436,76 @@ mod stage199a2b3_direct_reply_txn {
             !fx.k
                 .with(|s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
             "the record is spent exactly once"
+        );
+        teardown();
+    }
+
+    /// **NR7 post-copy `AlreadyQueued`+`Removed` is recoverable**, with the full authority
+    /// restore and no timeout dependency whatsoever.
+    #[test]
+    fn a_post_copy_already_queued_removed_restores_the_nr7_authority_and_retries_once() {
+        use core::sync::atomic::Ordering;
+        let fx = blocked_caller_fixture();
+        let recv_cap =
+            fx.k.blocked_recv_cap_split_read(1, fx.caller_asid)
+                .expect("recv cap");
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(310);
+        crate::runtime::FORCE_POST_COPY_MEMBERSHIP.store(1, Ordering::Relaxed);
+        let out = fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 310);
+        crate::runtime::FORCE_POST_COPY_MEMBERSHIP.store(0, Ordering::Relaxed);
+
+        assert_eq!(
+            out,
+            Err(IpcReplyDirectError::EnqueueRejected(
+                crate::kernel::scheduler::SchedulerError::AlreadyQueued
+            ))
+        );
+        fx.k.with(|s| {
+            assert_eq!(
+                s.task_status(1),
+                Some(TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(recv_cap)
+                )),
+                "exact caller Blocked on the exact recv cap"
+            );
+            assert!(
+                !s.task_present_in_any_runqueue(1),
+                "zero queued/current membership"
+            );
+        });
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(
+                fx.published_ack.endpoint_index,
+                fx.published_ack.endpoint_generation,
+                fx.caller
+            ),
+            "exact waiter restored once"
+        );
+        assert!(
+            fx.k.with(|s| s
+                .direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "record Available at the SAME generation"
+        );
+        assert_eq!(
+            fx.k.live_server_reply_link_count_split_read(),
+            1,
+            "exact replier reverse link present"
+        );
+        assert!(lease.is_available(), "acknowledgement restored");
+
+        // The same reply retries successfully…
+        let mut lease2 = claimed_lease(311);
+        fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease2, 311)
+            .expect("the restored authority is usable");
+        fx.k.with(|s| assert!(s.task_present_in_any_runqueue(1), "the caller is woken"));
+        // …and a duplicate is rejected. No timeout was ever involved.
+        let mut lease3 = claimed_lease(312);
+        assert!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease3, 312)
+                .is_err(),
+            "duplicate reply rejected"
         );
         teardown();
     }
@@ -111644,20 +111783,31 @@ mod stage199d_shared_region_enqueue_rejection {
         );
     }
 
-    /// No path that detects membership after a user copy returns retryable authority.
+    /// The recoverable/terminal split, and the early check's position.
+    ///
+    /// **UPDATED CONTRACT.** This guard previously pinned "every `reconciled.is_some()` is
+    /// terminal", which was over-broad: `WithdrawOutcome::Removed` proves exactly one queued
+    /// entry was withdrawn under the detecting acquisition and the task was not `current`, so
+    /// the publication was never observed. Recoverability is now the single predicate
+    /// `receiver_is_unplaced()`, and everything else already took the fail-closed branch.
     #[test]
     fn a_post_copy_membership_detection_is_never_retryable() {
-        // NR6: the lease is only settled (restorable) when the rejection carried NO
-        // reconciliation — i.e. it was not a membership detection.
-        assert!(
-            TXN.contains("if reconciled.is_none() {")
-                && TXN.contains("self.settle_lease_pre_claim(ack, lease, lease_commit_seq);"),
-            "NR6 restores the ack only for non-membership rejections"
+        // Both directions gate the recovery on the one predicate…
+        assert_eq!(
+            TXN.matches("if !outcome.receiver_is_unplaced() {").count(),
+            2,
+            "NR6 and NR7 both fail closed unless the receiver is provably unplaced"
         );
-        // NR7: the authority is only restored for non-membership rejections.
+        // …and the fail-closed branch is what discards, so a retryable variant is never
+        // returned after its lease or authority was dropped.
+        assert_eq!(
+            TXN.matches("EnqueueRejectedUnreconciled(").count(),
+            4,
+            "two declarations plus two returns"
+        );
         assert!(
-            TXN.contains("let authority_restored = reconciled.is_none()"),
-            "NR7 restores the authority only for non-membership rejections"
+            RUNTIME.contains("reconciled == Some(WithdrawOutcome::Removed)"),
+            "only an atomically Removed entry counts as unplaced"
         );
         // And the early check runs before ANY user copy in both directions.
         for (txn_fn, marker) in [
@@ -111688,5 +111838,179 @@ mod stage199d_shared_region_enqueue_rejection {
                 "{txn_fn}: …and precedes the first record mutation"
             );
         }
+    }
+}
+
+/// Stage 199D — **the waiter-ownership exclusivity audit** that Part A of the reorder depends on.
+///
+/// Reordering NR6/NR7 so the exact endpoint-waiter claim precedes every user-visible mutation is
+/// only sound if owning that claim actually EXCLUDES every other wake owner. This module
+/// enumerates each owner that can transition a `Blocked(EndpointReceive)` receiver to `Runnable`
+/// and classifies it by whether it invalidates or arbitrates against an owned claim.
+///
+/// **Verdict: NOT EXCLUSIVE.** Two owners wake by TID without consulting the endpoint-waiter
+/// table, so the reorder is hard-stopped (see `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.29). The
+/// classification is computed from named source seams, not asserted.
+mod stage199d_waiter_ownership_exclusivity_audit {
+    use super::*;
+
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Arbitration {
+        /// Reaches the receiver only THROUGH the endpoint-waiter table, so an owned claim
+        /// (slot already removed) makes it lose.
+        ViaEndpointWaiter,
+        /// Claims the reply terminal cell first, then revalidates and claims the exact waiter.
+        ViaTerminalAndWaiter,
+        /// Wakes by TID from a different structure, or wakes BEFORE clearing the waiter.
+        /// An owned claim does not stop it.
+        NoneAgainstWaiterClaim,
+    }
+    use Arbitration::*;
+
+    struct Owner {
+        what: &'static str,
+        /// The exact source seam the classification is read from.
+        seam: &'static str,
+        src: &'static str,
+        arbitration: Arbitration,
+    }
+
+    fn owners() -> alloc::vec::Vec<Owner> {
+        alloc::vec![
+            Owner {
+                what: "endpoint send delivering to a blocked receiver",
+                seam: "take_endpoint_waiter",
+                src: IPC_STATE,
+                arbitration: ViaEndpointWaiter,
+            },
+            Owner {
+                what: "the direct NR6/NR7 transactions themselves",
+                seam: "sr_claim_endpoint_waiter_split",
+                src: RUNTIME,
+                arbitration: ViaEndpointWaiter,
+            },
+            Owner {
+                what: "server-death completion (ServerDies)",
+                // Claims the terminal cell BEFORE anything, then revalidates the exact caller,
+                // endpoint generation and blocked-recv generation and claims the waiter.
+                seam: "try_claim_peer_death_terminal(identity)",
+                src: IPC_STATE,
+                arbitration: ViaTerminalAndWaiter,
+            },
+            Owner {
+                what: "reply-receive timeout completion (token-bearing)",
+                seam: "reply_terminal_ownership",
+                src: IPC_STATE,
+                arbitration: ViaTerminalAndWaiter,
+            },
+            Owner {
+                // Phase 1 (rank 2) sets Runnable for ANY Blocked(EndpointReceive) with an expired
+                // deadline; Phase 2 (rank 3) clears the waiter slots only AFTERWARDS. The wake
+                // precedes the waiter invalidation, so an owned claim is not consulted.
+                what: "ordinary IPC timeout scan",
+                seam: "let Some(deadline) = tcb.ipc_timeout_deadline else {",
+                src: IPC_STATE,
+                arbitration: NoneAgainstWaiterClaim,
+            },
+            Owner {
+                // Wakes by TID out of `notification_waiters`, guarded only by
+                // `matches!(tcb.status, Blocked(_))` — which is true for our receiver right up
+                // to commit. `endpoint_waiters` is never consulted.
+                what: "notification signal wake",
+                seam: "ipc.notification_waiters[notification_idx].take()",
+                src: IPC_STATE,
+                arbitration: NoneAgainstWaiterClaim,
+            },
+        ]
+    }
+
+    /// Every classification is read from a seam that really exists.
+    #[test]
+    fn every_owner_seam_is_present_in_the_tree() {
+        for owner in owners() {
+            assert!(
+                owner.src.contains(owner.seam),
+                "owner `{}` claims seam `{}` which is not in the tree",
+                owner.what,
+                owner.seam
+            );
+        }
+    }
+
+    /// **The computed verdict.** Exclusivity holds only if EVERY owner arbitrates.
+    #[test]
+    fn waiter_ownership_is_not_exclusive() {
+        let non_arbitrating: alloc::vec::Vec<&'static str> = owners()
+            .iter()
+            .filter(|o| o.arbitration == NoneAgainstWaiterClaim)
+            .map(|o| o.what)
+            .collect();
+        assert_eq!(
+            non_arbitrating,
+            alloc::vec!["ordinary IPC timeout scan", "notification signal wake"],
+            "these owners wake the receiver without consulting an owned endpoint-waiter claim"
+        );
+        assert!(
+            !non_arbitrating.is_empty(),
+            "if this ever becomes empty the reorder is unblocked — see §6.1.29"
+        );
+    }
+
+    /// The timeout scan's ordering is the defect: it wakes at rank 2 and only clears the waiter
+    /// at rank 3, so no claim can lose the race to it.
+    #[test]
+    fn the_timeout_scan_wakes_before_it_clears_the_waiter() {
+        let at = IPC_STATE
+            .find("let Some(deadline) = tcb.ipc_timeout_deadline else {")
+            .expect("the scan");
+        let body = &IPC_STATE[at..];
+        let wake = body
+            .find("tcb.status = TaskStatus::Runnable;")
+            .expect("the wake");
+        let clear = body
+            .find("ipc.clear_endpoint_waiters_for_identity(identity);")
+            .expect("the waiter clear");
+        assert!(
+            wake < clear,
+            "Phase 1 wakes before Phase 2 clears — an owned claim is never consulted"
+        );
+    }
+
+    /// The notification wake reaches the receiver by TID, guarded only by `Blocked(_)`.
+    #[test]
+    fn the_notification_wake_never_consults_the_endpoint_waiter() {
+        let at = IPC_STATE
+            .find("ipc.notification_waiters[notification_idx].take()")
+            .expect("the notification take");
+        let body = &IPC_STATE[at..at + 2000];
+        assert!(
+            body.contains("if matches!(tcb.status, TaskStatus::Blocked(_)) {")
+                && body.contains("tcb.status = TaskStatus::Runnable;"),
+            "it wakes any Blocked task by TID"
+        );
+        assert!(
+            !body.contains("endpoint_waiter"),
+            "…and never consults the endpoint-waiter table"
+        );
+    }
+
+    /// The hard-stop is recorded, and the late claims are therefore still where they were.
+    #[test]
+    fn the_reorder_is_hard_stopped_and_the_single_claim_stays_late() {
+        assert!(
+            AUDIT.contains("WAITER_OWNERSHIP_EXCLUSIVE=no"),
+            "the verdict must be recorded in the canonical audit"
+        );
+        const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+        // Exactly one claim per transaction — the reorder must not leave two.
+        assert_eq!(
+            TXN.matches("sr_claim_endpoint_waiter_split(").count(),
+            2,
+            "one claim in NR6, one in NR7"
+        );
     }
 }

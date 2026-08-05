@@ -835,6 +835,38 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    absent, `RISCV_REMOTE_WAKE` **D**, `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live
    cell. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.28.
 
+   **`WAITER_OWNERSHIP_EXCLUSIVE=no` — the waiter-claim reorder is HARD-STOPPED; the
+   `Removed`-is-recoverable repair is delivered.** Both the NR6/NR7 reorder and the shared-region
+   publication lease rest on one premise: that owning the exact endpoint-waiter claim excludes
+   every other wake owner between the claim and the commit. The required audit refutes it. Six
+   owners were enumerated and classified from named seams; four arbitrate (endpoint send and the
+   direct transactions via the waiter table; server-death and the token-bearing reply timeout via
+   the terminal cell **and** the waiter). **Two do not.** The **ordinary IPC timeout scan** sets
+   `Runnable` for any `Blocked(EndpointReceive)` with an expired deadline in Phase 1 (rank 2) and
+   clears the waiter slots only in Phase 2 (rank 3) — the wake strictly precedes the invalidation,
+   so an owned claim is never consulted. The **notification signal wake** takes a TID out of
+   `notification_waiters` guarded only by `matches!(tcb.status, Blocked(_))` — true for our
+   receiver right up to commit — and never reads `endpoint_waiters` at all. Today's direct-eligible
+   populations are narrower than the mechanism (the only `ipc_timeout_deadline` arm site coincides
+   with `terminal_arbitrated`, which NR7 declines pre-mutation, and an NR6 server is not a reply
+   caller), but that is a cross-subsystem *argument*, not arbitration — exactly what may not be
+   relied on. So no reorder was performed: one claim per transaction, still at NR6 (9) / NR7 (5),
+   with §6.1.28's pre-mutation membership checks retained and correctly described as TOCTOU
+   preflights. **Part C is hard-stopped identically** — building the publication lease would encode
+   the same false exclusivity into a third subsystem. **The contract that must be split first:**
+   either reorder the timeout scan to invalidate the waiter before waking and give the notification
+   wake a waiter-claim check, or introduce a per-task wake-arbitration token every owner must claim.
+   **Delivered: same-acquisition `Removed` is recoverable.** §6.1.28's "every `reconciled.is_some()`
+   is terminal" was over-broad — `Removed` proves exactly one queued entry was withdrawn under the
+   detecting acquisition and the task was not `current`, so the publication was never observed.
+   Both directions now use the single predicate `receiver_is_unplaced()`; terminal stays
+   `RefusedCurrent` / `RefusedDuplicate` / `NotQueued` / `InvalidCpu`, and a variant documented
+   retryable is never returned after its lease or authority was discarded. Exercised end-to-end via
+   a `#[cfg(test)]`-only post-copy membership hook: NR6 restores and retries once; NR7 restores the
+   caller, the exact waiter, the record `Available` at the same generation and the exact replier
+   reverse link, retries once and still rejects a duplicate, with **no timeout dependency**. The
+   accepted §6.1.28 composed restore is preserved. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.29.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and

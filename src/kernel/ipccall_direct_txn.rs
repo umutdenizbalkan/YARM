@@ -594,16 +594,18 @@ impl SharedKernel {
                         idx,
                         rgen,
                     );
-                    // Restoring the lease is admissible only when the exact server really is
-                    // blocked again AND this rejection was NOT a membership detection. A
-                    // membership collision discovered here is discovered AFTER the user copy, so
-                    // it can never yield retryable authority even when the reconciliation removed
-                    // the entry cleanly — the four never-touched-a-queue reasons can.
-                    if reconciled.is_none() {
-                        self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
-                    } else {
-                        lease.discard();
-                    }
+                    // Stage 199D — RECOVERABLE, including `AlreadyQueued` reconciled as
+                    // `Removed`. `Removed` proves exactly one queued entry was withdrawn under
+                    // the same rank-1 acquisition that detected it, and that the task was NOT
+                    // `current` — so it never ran and never observed the publication. Treating
+                    // every reconciled outcome as terminal was over-broad.
+                    //
+                    // `receiver_is_unplaced()` is the single predicate: true for the four
+                    // reasons that never touched a queue, and for `AlreadyQueued` only on
+                    // `Removed`. Everything else took the fail-closed branch above, so a
+                    // variant documented as retryable is never returned after its lease was
+                    // discarded.
+                    self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                     crate::yarm_log!(
                         "IPC_DIRECT_REQUEST_ENQUEUE_REJECTED server_tid={} record_index={} error={:?} restored={} result=rolled_back",
                         ack.server.tid.0,
@@ -908,11 +910,11 @@ impl SharedKernel {
                             cap,
                         )
                     }) && self.sr_restore_endpoint_waiter_split(&claim);
-                    // A membership collision is detected AFTER the caller copy, so it can never
-                    // re-arm the one-shot authority — even reconciled cleanly. Only the four
-                    // never-touched-a-queue reasons may restore.
-                    let authority_restored = reconciled.is_none()
-                        && caller_restored
+                    // Stage 199D — RECOVERABLE, including `AlreadyQueued` reconciled as
+                    // `Removed`: the caller provably never became `current`, so the delivery was
+                    // not observed and the exact one-shot authority may be re-armed. The
+                    // fail-closed branch above already took every other outcome.
+                    let authority_restored = caller_restored
                         && self.restore_consumed_reply_record_split(idx, rgen, snapshot.replier);
                     if authority_restored {
                         // Exact pre-transaction state: the reply may be re-sent and will succeed

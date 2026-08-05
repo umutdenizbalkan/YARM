@@ -4146,6 +4146,11 @@ impl SharedKernel {
         tid: u64,
         affinity: Option<CpuId>,
     ) -> ReceiverEnqueue {
+        // Test-only: inject the post-copy membership collision here rather than in the
+        // transaction, so the transaction file stays free of every fault-injection construct
+        // (pinned by `race_only_variants_are_all_failed_and_never_fall_back`).
+        #[cfg(test)]
+        self.test_force_post_copy_membership(tid, affinity);
         use crate::kernel::scheduler::TaskPriority;
         use crate::kernel::task::TaskClass;
         let priority = match self.task_class_split_read(tid) {
@@ -6689,3 +6694,32 @@ mod tests {
 #[cfg(test)]
 pub(crate) static RESTORE_FORCE_LINK_INSTALL_FAILURE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Test-only fault hook for the POST-COPY membership collision. The early check at NR6 (4a) /
+/// NR7 (2b) makes an ordinary `AlreadyQueued` unreachable at the final enqueue, so the recovery
+/// path is exercised by injecting membership just before it. `0` = off, `1` = one queued entry
+/// (yields `WithdrawOutcome::Removed`), `2` = dispatched as `current` (yields `RefusedCurrent`).
+/// `#[cfg(test)]` — it exists in no shipped kernel.
+#[cfg(test)]
+pub(crate) static FORCE_POST_COPY_MEMBERSHIP: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+impl SharedKernel {
+    /// Inject the membership the hook asks for, immediately before a direct transaction's final
+    /// rank-1 enqueue. One-shot: it clears itself so a retry of the same transaction succeeds.
+    pub(crate) fn test_force_post_copy_membership(&self, tid: u64, affinity: Option<CpuId>) {
+        use core::sync::atomic::Ordering;
+        let mode = FORCE_POST_COPY_MEMBERSHIP.swap(0, Ordering::Relaxed);
+        if mode == 0 {
+            return;
+        }
+        let cpu = affinity.unwrap_or_else(|| self.current_cpu_split_read());
+        let _ = self.sr_enqueue_committed_receiver_split(tid, Some(cpu));
+        if mode == 2 {
+            self.with_scheduler_split_mut(|sched| {
+                let _ = kernel_mut(&mut sched.scheduler).dispatch_next_on(cpu);
+            });
+        }
+    }
+}

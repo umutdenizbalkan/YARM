@@ -2915,6 +2915,113 @@ does not touch the queue entry. Behavioural tests cover `WakeOnly`, `QueueFull`,
 `AlreadyQueued` as exactly-once, current and duplicate, each proving the pre-existing membership
 is untouched.
 
+
+### 6.1.29 Waiter-ownership exclusivity — HARD-STOP; Part B delivered
+
+Three items were requested. **Part B is delivered.** **Parts A and C are hard-stopped** on the
+same finding, and the audit that establishes it is executable and pinned
+(`stage199d_waiter_ownership_exclusivity_audit`).
+
+**`WAITER_OWNERSHIP_EXCLUSIVE=no`.**
+
+Status unchanged: link 1 **ABSENT**; links 2, 3, 7, 9 present; 4, 5, 6, 8, 10 absent;
+`RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**; coordinate 23 **OPEN**;
+ledger **40 / 6 / 46**; **no new live cell**.
+
+#### A/C — the hard-stop
+
+Both parts rest on the same premise: that claiming the exact generation-bearing endpoint waiter
+*before* any user-visible mutation gives the transaction **exclusive** ownership of the receiver,
+so nothing else can wake it between the claim and the commit. The instruction was explicit —
+audit every non-endpoint wake owner, and hard-stop if any can legitimately wake this exact
+receiver without invalidating or arbitrating against the owned claim.
+
+Six owners were enumerated and classified from named source seams:
+
+| Owner | Reaches the receiver via | Arbitrates against an owned claim? |
+|---|---|---|
+| endpoint send delivering to a blocked receiver | `take_endpoint_waiter` | **yes** — through the waiter table |
+| the direct NR6/NR7 transactions | `sr_claim_endpoint_waiter_split` | **yes** — same table, one winner |
+| server-death completion | `try_claim_peer_death_terminal` → revalidate caller + endpoint generation + blocked-recv generation → waiter claim | **yes** — terminal *and* waiter |
+| reply-receive timeout (token-bearing) | `reply_terminal_ownership` | **yes** — terminal *and* waiter |
+| **ordinary IPC timeout scan** | `tcb.ipc_timeout_deadline`, by TCB scan | **NO** |
+| **notification signal wake** | `notification_waiters[i]`, by TID | **NO** |
+
+The last two break exclusivity, and they break it *mechanically*, not incidentally:
+
+* **The ordinary timeout scan wakes before it invalidates.** Phase 1 (rank 2) walks every TCB and
+  sets `Runnable` for any `Blocked(WaitReason::EndpointReceive(_))` whose deadline expired. Phase 2
+  (rank 3) clears the waiter slots **afterwards**. Because the wake strictly precedes the waiter
+  invalidation, an owned claim cannot make it lose — there is no point at which the scan consults
+  the waiter table before waking. Pinned by
+  `the_timeout_scan_wakes_before_it_clears_the_waiter`.
+* **The notification signal wake never consults the endpoint waiter at all.** It takes a TID out
+  of `notification_waiters`, and its only guard is `matches!(tcb.status, Blocked(_))` — true for
+  our receiver right up to commit. `endpoint_waiters` is never read. Pinned by
+  `the_notification_wake_never_consults_the_endpoint_waiter`. The code's own comment documents
+  that a snapshotted notification waiter can race a task woken by another route, so the staleness
+  this depends on is an acknowledged, handled condition — not a hypothetical.
+
+Reachability for *today's* direct-eligible populations is narrower than the mechanism: the only
+site that arms `ipc_timeout_deadline` also arms `reply_timeout_token` under an open terminal cell,
+which is exactly what `terminal_arbitrated` reports — and the NR7 eligibility gate declines that
+population before any mutation, while an NR6 server is not a reply-record caller. But that is a
+cross-subsystem *argument*, not an arbitration mechanism, and it is precisely what the instruction
+forbids relying on: exclusivity may not be claimed until the audit proves it. It does not.
+
+So the reorder is **not performed**. NR6 keeps its single claim at step (9) and NR7 at step (5);
+there is still exactly one claim per transaction (pinned). The pre-mutation membership checks from
+§6.1.28 remain — they are TOCTOU preflights, correctly described as such, and they are strictly
+better than nothing while being no substitute for ownership.
+
+**Part C is hard-stopped for the same reason.** The shared-region publication lease must claim the
+waiter before the first receiver-visible cap mint, mapping or metadata copy, and then rely on that
+claim to guarantee the receiver cannot run while resources are being published. That guarantee is
+exactly what this audit refutes. Building the lease anyway would encode the same false exclusivity
+into a third subsystem, and the instruction's own escape applies: *"Hard-stop and document the
+missing terminal owner if the current case cannot be represented without revoking resources
+underneath a running receiver."* The missing terminal owner is a **waiter-claim-aware wake
+arbitration** that the ordinary timeout scan and the notification wake both honour.
+
+**The contract that must be split first.** Either (1) reorder the ordinary timeout scan to
+invalidate the waiter *before* waking, and give the notification wake a waiter-claim check, so
+both lose to an owned claim; or (2) introduce a per-task wake-arbitration token that every wake
+owner must claim, of which the endpoint waiter becomes one holder. Route 1 is smaller and is the
+recommended next increment; both are production wake-path changes with their own live seals, and
+neither belongs in a rejection-safety repair.
+
+#### B — same-acquisition `Removed` is recoverable (delivered)
+
+§6.1.28's rule that every `reconciled.is_some()` is terminal was over-broad.
+`WithdrawOutcome::Removed` proves that exactly one queued entry was withdrawn **under the same
+rank-1 acquisition that detected the collision**, and that the task was therefore *not* `current`
+— so it never ran and never observed the publication.
+
+Both directions now use the single predicate `ReceiverEnqueue::receiver_is_unplaced()`: true for
+`InvalidCpu`, `CpuOffline`, `WakeOnly` and `QueueFull` (which never touched a queue) and for
+`AlreadyQueued` only on `Removed`. Everything else already took the fail-closed branch, so a
+variant documented as retryable is never returned after its lease or authority was discarded.
+
+Terminal, unchanged: `RefusedCurrent`, `RefusedDuplicate`, `NotQueued`, and an `InvalidCpu`
+withdrawal outcome.
+
+Because §6.1.28's pre-mutation check makes an ordinary post-copy `AlreadyQueued` unreachable, the
+recovery path is exercised by a `#[cfg(test)]`-only hook that injects membership immediately
+before the final enqueue (`1` = one queued entry → `Removed`; `2` = dispatched → `RefusedCurrent`).
+End-to-end, through the real transactions:
+
+* **NR6** — `EnqueueRejected(AlreadyQueued)`, server `Blocked` on the exact original recv cap,
+  exact waiter restored once, zero membership, lease restored, and the same transaction retried
+  successfully.
+* **NR7** — `EnqueueRejected(AlreadyQueued)`, exact caller `Blocked` on the exact recv cap, exact
+  waiter restored once, record `Available` **at the same generation**, exact replier reverse link
+  present (live link count 1), acknowledgement restored, the same reply retried successfully, and
+  a duplicate still rejected. **No timeout dependency anywhere.**
+* **NR6 `RefusedCurrent`** — `EnqueueRejectedUnreconciled(RefusedCurrent)`, lease discarded, no
+  restoration claim.
+
+The accepted §6.1.28 composed record + reverse-link restore is preserved unchanged.
+
 ---
 
 
