@@ -37,6 +37,9 @@ mod tid_allocation_policy;
 mod transfer_state;
 mod types;
 mod user_memory_state;
+/// Stage 199D-WA2A-R1 — helper-only endpoint-waiter ownership primitive, private to the
+/// boot/IPC domain (zero production callers).
+mod waiter_ownership;
 
 use super::capabilities::{
     CNodeId, CapId, CapObject, CapRights, Capability, CapabilityDeriveError, CapabilitySpace,

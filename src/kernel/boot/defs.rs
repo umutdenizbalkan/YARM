@@ -362,6 +362,19 @@ pub(crate) struct IpcSubsystem {
     /// was never recorded, so clearing the latch could let that receiver publish (silent loss). Reset
     /// only with the whole IpcState at kernel init.
     pub(crate) shared_region_cancel_overflow: bool,
+    /// Stage 199D-WA2A-R1 — the SINGLE endpoint-waiter ownership table
+    /// (`waiter_ownership_stores = 1`), indexed identically to `endpoint_waiters` and bounded by
+    /// the same [`ENDPOINT_WAITER_SLOTS`], so the two can never drift.
+    ///
+    /// Deliberately **not** `pub(crate)`: `pub(in crate::kernel::boot)` is the tightest
+    /// visibility Rust can express for a field declared here that the ownership module must also
+    /// reach (`pub(in …)` requires an ancestor module, and `boot` is the nearest common one).
+    /// The type carries no usable API outside
+    /// [`crate::kernel::boot::waiter_ownership`] regardless — every claim/settle method is
+    /// module-private there, and the only cross-module surface is the typed
+    /// `IpcSubsystem::waiter_ownership_*` methods. Helper-only this stage: no production path
+    /// claims through it yet, so it stays empty in every live build.
+    pub(in crate::kernel::boot) waiter_ownership: super::waiter_ownership::WaiterOwnershipTable,
     pub(crate) telemetry: IpcPathTelemetry,
 }
 

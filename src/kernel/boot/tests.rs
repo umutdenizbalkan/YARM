@@ -112463,62 +112463,102 @@ mod stage199d_wa1_gate {
     }
 }
 
-/// Stage 199D-WA2A — boundary guards for the helper-only waiter-ownership primitive.
+/// Stage 199D-WA2A-R1 — boundary guards for the helper-only waiter-ownership primitive.
 ///
 /// The primitive exists so a LATER increment can make endpoint-waiter ownership exclusive. In
 /// this increment it must change nothing: zero production callers, no transaction reorder, no
-/// timeout or notification conversion, and every WA1-GATE status figure intact.
+/// timeout or notification conversion, and every WA1-GATE status figure intact. R1 additionally
+/// pins the four repairs — the structural (endpoint-indexed) bound, rank-3 ownership by
+/// construction, an opaque generation-safe token, and the honestly narrowed census.
 mod stage199d_wa2a_ownership_boundary {
-    const OWNERSHIP: &str = include_str!("../waiter_ownership.rs");
+    use alloc::string::ToString;
+
+    const OWNERSHIP: &str = include_str!("waiter_ownership.rs");
+    const DEFS: &str = include_str!("defs.rs");
+    const BOOTSTRAP: &str = include_str!("bootstrap_state.rs");
     const TXN: &str = include_str!("../ipccall_direct_txn.rs");
     const IPC_STATE: &str = include_str!("ipc_state.rs");
     const MODRS: &str = include_str!("mod.rs");
     const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
     const STATUS: &str = include_str!("../../../doc/STATUS.md");
 
-    /// **Zero production call sites.** A repo-wide walk: only the primitive's own file and the
-    /// module declaration may name it.
-    #[test]
-    fn the_primitive_has_no_production_caller() {
-        fn visit(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+    /// Every `.rs` under `src/`, with each file's `#[cfg(test)] mod tests` tail removed, so a
+    /// guard reasons about production source only.
+    fn production_sources() -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
+        fn visit(
+            root: &std::path::Path,
+            out: &mut alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
+            repo: &std::path::Path,
+        ) {
             for entry in std::fs::read_dir(root).expect("read_dir") {
                 let path = entry.expect("entry").path();
                 if path.is_dir() {
-                    visit(&path, f);
+                    visit(&path, out, repo);
                 } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
                     let src = std::fs::read_to_string(&path).expect("read");
-                    f(&path, &src);
+                    let rel = path
+                        .strip_prefix(repo)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    // This guard file itself quotes every name it forbids; it is not production.
+                    if rel == "src/kernel/boot/tests.rs" {
+                        continue;
+                    }
+                    let production = src
+                        .split("\n#[cfg(test)]\nmod tests")
+                        .next()
+                        .unwrap_or(&src)
+                        .to_string();
+                    out.push((rel, production));
                 }
             }
         }
-        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        // The primitive itself, its `mod` declaration, and this guard file.
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut out = alloc::vec::Vec::new();
+        visit(&repo.join("src"), &mut out, &repo);
+        out
+    }
+
+    /// The declaration line of `struct X { .. }`'s fields, as raw text.
+    fn struct_body<'a>(src: &'a str, header: &str) -> &'a str {
+        let at = src
+            .find(header)
+            .unwrap_or_else(|| panic!("{header} not found"));
+        let rest = &src[at + header.len()..];
+        let end = rest.find("\n}").expect("struct end");
+        &rest[..end]
+    }
+
+    // ── Zero production wiring (unchanged from WA2A) ────────────────────────────────────────
+
+    /// **Zero production call sites.** A repo-wide walk: only the primitive's own file, the two
+    /// boot-domain files that declare and initialize the field, the module declaration and this
+    /// guard file may name it.
+    #[test]
+    fn the_primitive_has_no_production_caller() {
         const OWNERS: &[&str] = &[
-            "src/kernel/waiter_ownership.rs",
-            "src/kernel/mod.rs",
-            "src/kernel/boot/tests.rs",
+            "src/kernel/boot/waiter_ownership.rs",
+            "src/kernel/boot/defs.rs",
+            "src/kernel/boot/bootstrap_state.rs",
+            "src/kernel/boot/mod.rs",
         ];
         let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
         let mut owners_seen = 0usize;
-        visit(&repo_root.join("src"), &mut |path, src| {
-            let rel = path
-                .strip_prefix(&repo_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
+        for (rel, src) in production_sources() {
             let names = src.contains("waiter_ownership")
                 || src.contains("WaiterOwnershipTable")
                 || src.contains("WaiterClaimToken")
                 || src.contains("WaiterOwner::");
             if !names {
-                return;
+                continue;
             }
             if OWNERS.contains(&rel.as_str()) {
                 owners_seen += 1;
             } else {
                 callers.push(rel);
             }
-        });
+        }
         assert_eq!(
             owners_seen,
             OWNERS.len(),
@@ -112526,14 +112566,492 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert!(
             callers.is_empty(),
-            "the primitive is helper-only in WA2A; production callers: {callers:?}"
+            "the primitive is helper-only in WA2A-R1; production callers: {callers:?}"
         );
-        // And it is explicitly marked as such.
         assert!(
             OWNERSHIP.contains("#![cfg_attr(not(test), allow(dead_code))]"),
             "the helper-only marker must be present while there are no callers"
         );
     }
+
+    // ── A. Structural bound, no lifetime leak ───────────────────────────────────────────────
+
+    /// The capacity is DERIVED from the endpoint waiter bound and pinned by a compile-time
+    /// assertion — never a second numeric literal that could drift.
+    #[test]
+    fn the_capacity_is_derived_from_the_endpoint_bound_not_duplicated() {
+        assert!(
+            OWNERSHIP.contains(
+                "pub(crate) const WAITER_OWNERSHIP_SLOTS: usize = ENDPOINT_WAITER_SLOTS;"
+            ),
+            "the slot count must be the endpoint bound itself"
+        );
+        assert!(
+            OWNERSHIP.contains(
+                "const _: () = assert!(WAITER_OWNERSHIP_SLOTS == ENDPOINT_WAITER_SLOTS);"
+            ),
+            "a compile-time equality assertion must pin the relationship"
+        );
+        assert_eq!(
+            crate::kernel::boot::waiter_ownership::WAITER_OWNERSHIP_SLOTS,
+            crate::kernel::boot::ENDPOINT_WAITER_SLOTS
+        );
+        // The associative 64-slot table that leaked capacity across incarnations is gone.
+        assert!(
+            !OWNERSHIP.contains("WAITER_OWNERSHIP_SLOTS: usize = 64"),
+            "the fixed 64-slot associative table must not come back"
+        );
+        assert!(
+            !OWNERSHIP.contains("CapacityExhausted"),
+            "an endpoint-indexed table has no capacity-exhaustion mode: an out-of-range index is \
+             a caller bug, and a live claim is never evicted"
+        );
+    }
+
+    // ── B. Rank-3 ownership is structural ───────────────────────────────────────────────────
+
+    /// Exactly ONE table exists, it is a field of `IpcSubsystem`, and it is NOT `pub(crate)`.
+    #[test]
+    fn exactly_one_ownership_table_field_exists_inside_ipc_subsystem() {
+        let mut declarations: alloc::vec::Vec<_> = production_sources()
+            .into_iter()
+            .filter(|(_, src)| {
+                src.contains("waiter_ownership: super::waiter_ownership::WaiterOwnershipTable,")
+            })
+            .map(|(rel, _)| rel)
+            .collect();
+        declarations.sort();
+        assert_eq!(
+            declarations,
+            alloc::vec!["src/kernel/boot/defs.rs".to_string()],
+            "the table is declared in exactly one place"
+        );
+        let ipc = struct_body(DEFS, "pub(crate) struct IpcSubsystem {");
+        assert_eq!(
+            ipc.matches("waiter_ownership: super::waiter_ownership::WaiterOwnershipTable,")
+                .count(),
+            1,
+            "exactly one ownership field, inside IpcSubsystem"
+        );
+        assert!(
+            ipc.contains("pub(in crate::kernel::boot) waiter_ownership:"),
+            "the field is boot-domain private — `pub(in …)` needs an ancestor module, and `boot` \
+             is the nearest one shared by `defs` and the ownership module"
+        );
+        assert!(
+            !ipc.contains("pub(crate) waiter_ownership") && !ipc.contains("pub waiter_ownership"),
+            "the field must never be crate- or fully public"
+        );
+    }
+
+    /// No static, global or local production instance: the only constructor call in the whole
+    /// tree is the single `IpcSubsystem` initializer.
+    #[test]
+    fn no_static_global_or_local_ownership_table_instance_exists() {
+        let mut constructions: alloc::vec::Vec<(alloc::string::String, usize)> =
+            alloc::vec::Vec::new();
+        for (rel, src) in production_sources() {
+            let n = src.matches("WaiterOwnershipTable::vacant()").count();
+            if n > 0 {
+                constructions.push((rel, n));
+            }
+        }
+        assert_eq!(
+            constructions,
+            alloc::vec![("src/kernel/boot/bootstrap_state.rs".to_string(), 1usize)],
+            "exactly one construction, in the single IpcSubsystem initializer"
+        );
+        assert!(
+            BOOTSTRAP.contains(
+                "waiter_ownership: super::waiter_ownership::WaiterOwnershipTable::vacant(),"
+            ),
+            "and it is an explicit field initializer — never unsafe zero initialization"
+        );
+        for forbidden in [
+            "static WAITER_OWNERSHIP",
+            "static mut WAITER_OWNERSHIP",
+            "const WAITER_OWNERSHIP_TABLE",
+            ": WaiterOwnershipTable =",
+        ] {
+            for (rel, src) in production_sources() {
+                assert!(
+                    !src.contains(forbidden),
+                    "{rel} must not create a standalone table via `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    /// The table's own claim/settle methods are module-private, so a `&mut WaiterOwnershipTable`
+    /// obtained anywhere else in the boot domain is inert. The ONLY usable surface is the typed
+    /// `IpcSubsystem` methods.
+    #[test]
+    fn the_raw_table_methods_are_private_and_the_only_surface_is_ipc_subsystem() {
+        let table_impl = OWNERSHIP
+            .split("impl WaiterOwnershipTable {")
+            .nth(1)
+            .expect("the table impl")
+            .split("\n/// The **entire** cross-module surface")
+            .next()
+            .expect("impl end");
+        for raw in [
+            "claim",
+            "consume",
+            "restore",
+            "cancel",
+            "validate",
+            "stamp",
+            "view",
+            "claimed_count",
+        ] {
+            assert!(
+                table_impl.contains(&alloc::format!("    fn {raw}(")),
+                "`{raw}` must be declared module-private (`fn`, no visibility)"
+            );
+            assert!(
+                !table_impl.contains(&alloc::format!("pub(crate) fn {raw}(")),
+                "`{raw}` must not be crate-visible on the raw table"
+            );
+        }
+        // `vacant` is the one exception, and it stops at the boot domain.
+        assert!(
+            table_impl.contains("pub(in crate::kernel::boot) const fn vacant()"),
+            "the constructor is boot-domain scoped"
+        );
+        // The cross-module surface is exactly the six IpcSubsystem methods.
+        let surface = OWNERSHIP
+            .split("impl IpcSubsystem {")
+            .nth(1)
+            .expect("the surface impl");
+        for method in [
+            "waiter_ownership_claim",
+            "waiter_ownership_consume",
+            "waiter_ownership_restore",
+            "waiter_ownership_cancel",
+            "waiter_ownership_view",
+            "waiter_ownership_claimed_count",
+        ] {
+            assert!(
+                surface.contains(&alloc::format!("pub(crate) fn {method}(")),
+                "`{method}` is part of the declared surface"
+            );
+        }
+        assert_eq!(
+            surface.matches("pub(crate) fn ").count(),
+            6,
+            "and nothing else is exposed"
+        );
+    }
+
+    /// No ownership mutation is reachable through the task, scheduler, capability, VM or
+    /// broad-state APIs: outside the ownership module nothing in the tree names the methods.
+    #[test]
+    fn no_ownership_mutation_is_reachable_through_a_non_ipc_domain_api() {
+        for (rel, src) in production_sources() {
+            if rel == "src/kernel/boot/waiter_ownership.rs" {
+                continue;
+            }
+            for method in [
+                "waiter_ownership_claim",
+                "waiter_ownership_consume",
+                "waiter_ownership_restore",
+                "waiter_ownership_cancel",
+            ] {
+                assert!(
+                    !src.contains(method),
+                    "{rel} must not reach ownership mutation (`{method}`)"
+                );
+            }
+        }
+        // And the primitive itself never enters another domain.
+        for forbidden in [
+            "with_tcbs_mut",
+            "with_ipc_state_mut",
+            "with_scheduler",
+            "with_task_tcbs_split_mut",
+            "SpinLock",
+            "lock()",
+            "TaskStatus",
+            "enqueue",
+        ] {
+            assert!(
+                !OWNERSHIP
+                    .split("\n#[cfg(test)]")
+                    .next()
+                    .expect("production prefix")
+                    .contains(forbidden),
+                "the primitive must not name `{forbidden}` — it takes no lock and nests no domain"
+            );
+        }
+    }
+
+    // ── C. The claim token is opaque and generation-safe ────────────────────────────────────
+
+    #[test]
+    fn the_claim_token_has_no_publicly_visible_field() {
+        let token = struct_body(OWNERSHIP, "pub(crate) struct WaiterClaimToken {");
+        assert!(
+            !token.contains("pub"),
+            "no token field may be pub or pub(crate); found:\n{token}"
+        );
+        for field in ["key:", "owner:", "claim_generation:"] {
+            assert!(token.contains(field), "the token still carries `{field}`");
+        }
+    }
+
+    #[test]
+    fn no_claim_token_struct_literal_exists_outside_its_module() {
+        for (rel, src) in production_sources() {
+            if rel == "src/kernel/boot/waiter_ownership.rs" {
+                continue;
+            }
+            assert!(
+                !src.contains("WaiterClaimToken {"),
+                "{rel} must not be able to forge a token by struct literal"
+            );
+        }
+        // Inside the module, only `claim` mints one.
+        let production = OWNERSHIP
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production prefix");
+        assert_eq!(
+            production.matches("Ok(WaiterClaimToken {").count(),
+            1,
+            "exactly one mint site: a successful claim"
+        );
+    }
+
+    #[test]
+    fn the_live_claim_generation_is_not_exposed_by_any_public_state_method() {
+        let view = OWNERSHIP
+            .split("pub(crate) enum WaiterOwnershipView {")
+            .nth(1)
+            .expect("the view enum")
+            .split("\n}")
+            .next()
+            .expect("view end");
+        assert!(
+            !view.contains("claim_generation"),
+            "the public state view must not carry the live claim generation"
+        );
+        let settle = OWNERSHIP
+            .split("pub(crate) enum SettleError {")
+            .nth(1)
+            .expect("the settle errors")
+            .split("\n}")
+            .next()
+            .expect("settle end");
+        assert!(
+            settle.contains("StaleClaimGeneration,"),
+            "the stale-token error must be payload-free — reporting `live` would leak it"
+        );
+        // The accessor exists only for tests.
+        let at = OWNERSHIP
+            .find("fn claim_generation(&self) -> u64")
+            .expect("the accessor");
+        assert!(
+            OWNERSHIP[..at].ends_with("    #[cfg(test)]\n    "),
+            "the claim-generation accessor must be `#[cfg(test)]`"
+        );
+        for forged in ["fn forged_with_owner", "fn forged_with_key"] {
+            let at = OWNERSHIP.find(forged).expect(forged);
+            assert!(
+                OWNERSHIP[..at].ends_with("    #[cfg(test)]\n    "),
+                "`{forged}` must be `#[cfg(test)]` — production may never re-key a token"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_advancement_is_checked_never_wrapping() {
+        let production = OWNERSHIP
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production prefix");
+        assert!(
+            !production.contains("wrapping_add"),
+            "a wrapping generation would make an ancient token valid again"
+        );
+        assert!(
+            production.contains(".checked_add(1)")
+                && production.contains("ClaimError::ClaimGenerationExhausted"),
+            "advancement is checked and exhaustion is typed"
+        );
+        assert!(
+            production.contains("next_claim_generation: 1"),
+            "generations start at 1, so 0 is never a valid claim generation"
+        );
+    }
+
+    // ── D. The census, honestly narrowed ────────────────────────────────────────────────────
+
+    /// The **independent** census: every production site that assigns a task status. This is the
+    /// complete candidate set, because `status` is a plain TCB field with no aliasing writer —
+    /// `sibling_writes_are_absent` proves that separately. A new site anywhere breaks this pin.
+    #[test]
+    fn every_production_task_status_assignment_site_is_enumerated() {
+        const PINNED: &[(&str, usize)] = &[
+            ("src/kernel/boot/exec_state.rs", 10),
+            ("src/kernel/boot/fault_state.rs", 1),
+            ("src/kernel/boot/ipc_state.rs", 9),
+            ("src/kernel/boot/restart_state.rs", 4),
+            ("src/kernel/boot/scheduler_state.rs", 1),
+            ("src/kernel/boot/thread_state.rs", 4),
+            ("src/kernel/task.rs", 1),
+            ("src/runtime.rs", 7),
+        ];
+        let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
+        for (rel, src) in production_sources() {
+            if !src.contains("TaskStatus") {
+                continue;
+            }
+            let n = src.matches(".status = ").count() + src.matches("status: TaskStatus::").count();
+            if n > 0 {
+                found.push((rel, n));
+            }
+        }
+        found.sort();
+        let expected: alloc::vec::Vec<(alloc::string::String, usize)> =
+            PINNED.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+        assert_eq!(
+            found, expected,
+            "the status-transition census must match exactly — a new or removed site is a new \
+             candidate wake owner and must be classified in §6.1.32"
+        );
+        assert_eq!(found.iter().map(|(_, n)| n).sum::<usize>(), 37);
+    }
+
+    /// The enumeration above is the CLOSURE of "moves a task out of `Blocked`" only because
+    /// `status` has no other writer: no `&mut …status` alias, no whole-TCB overwrite, no
+    /// `mem::replace`/`swap`, and no production path that removes a TCB from the array.
+    #[test]
+    fn no_other_production_writer_can_move_a_task_out_of_blocked() {
+        for (rel, src) in production_sources() {
+            for forbidden in [
+                "&mut tcb.status",
+                "&mut t.status",
+                "mem::replace(&mut tcb.status",
+                "mem::swap(&mut tcb.status",
+                "tcbs[idx] = None",
+                "tcbs[i] = None",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "{rel}: `{forbidden}` would be a status writer outside the census"
+                );
+            }
+        }
+        // The single write into the TCB array only fills a slot proven vacant.
+        let policy = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/kernel/boot/task_policy_state.rs"),
+        )
+        .expect("read");
+        let at = policy
+            .find("tcbs[idx] = Some(tcb);")
+            .expect("the only slot write");
+        assert!(
+            policy[..at].contains("position(|slot| slot.is_none())"),
+            "the only TCB-array write targets a vacant slot, so it can never displace a blocked \
+             receiver"
+        );
+    }
+
+    /// **`WAITER_OWNER_CENSUS_COMPLETE=no`.** The candidate enumeration is mechanical, but the
+    /// per-site *negative* is not: twelve sites assign a status with no guard on the previous
+    /// one, so "it cannot act on `Blocked(EndpointReceive)`" rests on a dynamic invariant
+    /// (the task is freshly registered / is `current` / was just dequeued), which the source
+    /// alone does not establish. The claim is narrowed rather than asserted.
+    #[test]
+    fn the_census_completeness_claim_is_narrowed_not_asserted() {
+        assert!(
+            AUDIT.contains("WAITER_OWNER_CENSUS_COMPLETE=no")
+                && STATUS.contains("WAITER_OWNER_CENSUS_COMPLETE=no"),
+            "the incompleteness must be recorded in both canonical documents"
+        );
+        assert!(
+            AUDIT.contains("waiter-primitive callsite census"),
+            "the original 15-row table must be relabelled as a callsite census, not an \
+             exhaustive owner census"
+        );
+        assert!(
+            OWNERSHIP.contains("waiter-primitive callsite census") || OWNERSHIP.contains("§6.1.32"),
+            "the primitive's doc must point at the narrowed census"
+        );
+    }
+
+    /// The independent census found wake owners the callsite census missed. Each reaches a
+    /// `Blocked(_)` task by numeric TID (or unconditionally) and consults no endpoint waiter.
+    #[test]
+    fn the_newly_found_unguarded_wake_owners_are_recorded() {
+        for owner in [
+            "wake_tid_to_runnable",
+            "wake_destroyed_notification_waiter",
+            "apply_cross_cpu_wake_task",
+            "sr_wake_receiver_split",
+            "exit_task",
+            "mark_task_dead",
+            "reap_faulted_task_noalloc_cleanup",
+        ] {
+            assert!(
+                AUDIT.contains(owner),
+                "§6.1.32 must record the newly found wake owner `{owner}`"
+            );
+        }
+        // …and each really is guarded only on `Blocked(_)` or not at all.
+        for (src, needle) in [
+            (
+                IPC_STATE,
+                "fn wake_tid_to_runnable(&mut self, tid: ThreadId)",
+            ),
+            (
+                IPC_STATE,
+                "pub(crate) fn wake_destroyed_notification_waiter(",
+            ),
+        ] {
+            let body = src.split(needle).nth(1).expect(needle);
+            let window = &body[..body.len().min(1200)];
+            assert!(
+                window.contains("TaskStatus::Blocked(_)"),
+                "`{needle}` accepts any Blocked wait reason, endpoint receives included"
+            );
+            assert!(
+                !window.contains("endpoint_waiters"),
+                "`{needle}` consults no endpoint waiter"
+            );
+        }
+    }
+
+    /// The three facts already established stay explicit.
+    #[test]
+    fn the_already_found_facts_stay_explicit() {
+        for fact in [
+            "process_ipc_timeout_deadlines",
+            "wake_waiter_for_endpoint",
+            "ctx_finalize_and_wake",
+            "clear_ipc_waiters_for_tid",
+            "sr_claim_endpoint_waiter_split",
+            "publish_recv_waiter_live",
+        ] {
+            assert!(
+                AUDIT.contains(fact),
+                "the callsite census row `{fact}` must survive the relabelling"
+            );
+        }
+        assert!(
+            AUDIT.contains("**NO — wakes at task rank first**")
+                && AUDIT.contains("**NO — different table**"),
+            "the ordinary-timeout and notification breaks stay marked"
+        );
+        assert!(
+            AUDIT.contains("take by index with no identity compare")
+                || AUDIT.contains("index only"),
+            "the three index-only removers stay recorded"
+        );
+    }
+
+    // ── Unchanged production contracts ──────────────────────────────────────────────────────
 
     /// NR6 and NR7 still hold exactly their existing SINGLE, LATE waiter claim — no reorder.
     #[test]
@@ -112563,7 +113081,7 @@ mod stage199d_wa2a_ownership_boundary {
             let record = body.find(first_mutation).expect("the record mutation");
             assert!(
                 claim > copy && claim > record,
-                "{txn_fn}: the claim is still LATE — WA2A does not reorder it"
+                "{txn_fn}: the claim is still LATE — WA2A-R1 does not reorder it"
             );
         }
     }
@@ -112571,7 +113089,6 @@ mod stage199d_wa2a_ownership_boundary {
     /// The timeout and notification paths are not silently converted.
     #[test]
     fn the_timeout_and_notification_paths_are_unchanged() {
-        // The ordinary timeout scan still wakes at task rank before clearing at ipc rank.
         let at = IPC_STATE
             .find("let Some(deadline) = tcb.ipc_timeout_deadline else {")
             .expect("the scan");
@@ -112582,14 +113099,12 @@ mod stage199d_wa2a_ownership_boundary {
                 < body
                     .find("ipc.clear_endpoint_waiters_for_identity(identity);")
                     .expect("clear"),
-            "the wake-before-clear ordering is untouched in WA2A"
+            "the wake-before-clear ordering is untouched in WA2A-R1"
         );
-        // The notification wake still keys on its own table.
         assert!(
             IPC_STATE.contains("ipc.notification_waiters[notification_idx].take()"),
             "the notification wake is untouched"
         );
-        // Neither path references the new primitive.
         for owner in ["WaiterOwner::OrdinaryTimeout", "WaiterOwner::Notification"] {
             assert!(
                 !IPC_STATE.contains(owner),
@@ -112614,34 +113129,5 @@ mod stage199d_wa2a_ownership_boundary {
             AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
         );
         assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
-    }
-
-    /// The census the primitive is built against is recorded with its two exclusivity breaks.
-    #[test]
-    fn the_census_is_recorded_with_its_two_breaks() {
-        // 15 audited rows, each naming a real function.
-        for owner in [
-            "publish_recv_waiter_live",
-            "sr_claim_endpoint_waiter_split",
-            "sr_restore_endpoint_waiter_split",
-            "ipc_try_send_to_plain_receiver_endpoint_only",
-            "ipc_try_send_sync_endpoint_only",
-            "ipc_clear_plain_receiver_waiter_only",
-            "wake_waiter_for_endpoint",
-            "ipc_reply",
-            "ctx_finalize_and_wake",
-            "clear_ipc_waiters_for_tid",
-            "process_ipc_timeout_deadlines",
-        ] {
-            assert!(
-                OWNERSHIP.contains(owner),
-                "census row `{owner}` must be recorded in the primitive's doc"
-            );
-        }
-        assert!(
-            OWNERSHIP.contains("**NO — wakes at task rank first**")
-                && OWNERSHIP.contains("**NO — different table**"),
-            "both exclusivity breaks must be marked in the census"
-        );
     }
 }

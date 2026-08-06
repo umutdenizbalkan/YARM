@@ -653,6 +653,7 @@ impl Bootstrap {
                 }; MAX_DEADLINE_TOKENS],
                 shared_region_cancel_requests: [const { None }; MAX_SHARED_REGION_CANCEL_REQUESTS],
                 shared_region_cancel_overflow: false,
+                waiter_ownership: super::waiter_ownership::WaiterOwnershipTable::vacant(),
                 telemetry: IpcPathTelemetry::default(),
             }));
             core::ptr::addr_of_mut!((*state_ptr).capability).write(CapabilitySubsystem {
