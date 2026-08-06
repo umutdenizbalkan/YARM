@@ -906,6 +906,73 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    generation-bearing notification arbitration **not implemented**; RISC-V links/status
    unchanged. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.30.
 
+   **WA2A: the generation-bearing waiter-ownership primitive exists, helper-only.** A mechanically
+   gathered census of **15** production paths that install, replace, remove or clear an endpoint
+   receive waiter, or move an endpoint-blocked task out of `Blocked`, confirms the two exclusivity
+   breaks named above — `process_ipc_timeout_deadlines` (wakes at task rank *before* clearing
+   waiters at ipc rank) and the notification signal wake (reads a different table entirely) — plus
+   three index-only takers (`wake_waiter_for_endpoint`, `ipc_reply`, the shared-region finalize)
+   that cannot tell a replacement waiter from the one they meant. `WaiterOwnershipTable` is the
+   single bounded, allocation-free typed state machine those paths can later route through: its key
+   is exact in four dimensions (endpoint index **and** generation, waiter tid **and** asid, plus the
+   blocked-receive generation) where the waiter table is exact in two, so a recycled endpoint slot,
+   a reused TID under a new ASID and a task that reblocked are three different keys. State is
+   `Available → Claimed{owner, claim_generation} → Consumed | Cancelled`, never a bool; the six
+   owners (`DirectRequest`, `DirectReply`, `OrdinaryTimeout`, `LegacyDelivery`, `Notification`,
+   `Teardown`) are named but **none is wired**. The module acquires no lock at all — the caller
+   supplies the rank-3 guard — so it structurally cannot nest task(2) or scheduler(1) beneath ipc(3),
+   and the returned claim token is `Copy` and outlives the guard. Restoration validates the full key
+   *and* the owner *and* the claim generation, so a stale token is rejected even when the same owner
+   re-claims; that case was found by mutation M2 surviving, and is recorded rather than quietly
+   repaired. **Nothing else moved:** diffing the defined-symbol sets of the freestanding
+   `x86_64-yarm-none` `libyarm.rlib` before and after gives 0 symbols removed, 0 changed and exactly
+   2 added — both never-called constructors inside the new module — which is why no QEMU run was
+   required. `WAITER_OWNERSHIP_EXCLUSIVE` remains **no**, the x86 direct production default remains
+   **OFF** on every architecture, NR6/NR7 keep their single late waiter claim, canonical 199D stays
+   **OPEN**, the ledger stays **39 / 7 / 46**, RISC-V links/status are unchanged and **no new live
+   cell** is earned. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.31.
+
+   **WA2A-R1: the ownership foundation is repaired, and the exclusivity break is WIDER than
+   reported.** Four defects in the WA2A primitive are fixed. (1) The associative 64-slot table
+   leaked capacity across *lifetime*, not size: because a key carries the blocked-wait generation,
+   64 sequential completed waits exhausted it with zero live claims. It is now endpoint-indexed —
+   `WAITER_OWNERSHIP_SLOTS = ENDPOINT_WAITER_SLOTS`, derived and pinned by a compile-time
+   assertion exactly as `DIRECT_ACK_STORE_CAPACITY` is — so a finished incarnation holds its slot
+   only until the next incarnation of that endpoint claims it; three 10 001-cycle tests
+   (claim/restore, claim/consume, claim/cancel) confirm it never exhausts, a live claim is never
+   evicted, and an out-of-range index is a typed fail-closed error. (2) Rank-3 ownership is now
+   structural rather than documentary: the table is a private field of `IpcSubsystem`
+   (`waiter_ownership_stores = 1`), every raw claim/settle method is module-private, and the whole
+   cross-module surface is six typed `IpcSubsystem::waiter_ownership_*` methods, so ownership
+   cannot be mutated through the task, scheduler, capability, VM or broad-state APIs at all. (3)
+   The claim token is opaque — private fields, no forgeable struct literal, no exposure of the
+   live claim generation — and `wrapping_add` is replaced by `checked_add` with a typed
+   `ClaimGenerationExhausted` that leaves both the slot and the counter untouched, so an ancient
+   token can never be made valid again.
+
+   (4) **The census is narrowed honestly.** The 15-row table is relabelled a *waiter-primitive
+   callsite census*: it was collected by grepping the four waiter primitives, so by construction
+   it could only find paths that touch a waiter — and the dangerous owners are the ones that do
+   not. An independent pass starting from task status instead is mechanically complete as an
+   *enumeration*: `status` is a plain TCB field with no aliasing writer (no `&mut …status`, no
+   whole-TCB overwrite, no `mem::replace`/`swap`, no production TCB removal), so the 37
+   status-assignment sites across eight files are the closure of "moves a task out of `Blocked`",
+   and a guard pins the per-file counts. Twelve of them CAN act on `Blocked(EndpointReceive)` —
+   **seven more than the callsite census knew about**, including the generic
+   `wake_tid_to_runnable`, `wake_destroyed_notification_waiter`, `apply_cross_cpu_wake_task`,
+   `sr_wake_receiver_split`, `exit_task`, `mark_task_dead` and `reap_faulted_task_noalloc_cleanup`,
+   each reaching a `Blocked(_)` task by numeric TID (or unconditionally) while consulting no
+   endpoint waiter. Four are provably out of reach from the source; twelve assign a status with no
+   guard on the previous one, so their negative rests on a dynamic invariant the source does not
+   establish. **`WAITER_OWNER_CENSUS_COMPLETE=no`** rather than an unsupported exhaustive claim;
+   proving those twelve negatives is prerequisite work for any `WAITER_OWNERSHIP_EXCLUSIVE=yes`.
+
+   Still helper-only: zero production call sites, neither late waiter claim moved, no timeout,
+   notification, shared-region or teardown path converted. `WAITER_OWNERSHIP_EXCLUSIVE` remains
+   **no**, the x86 direct production default remains **OFF** on every architecture, canonical 199D
+   stays **OPEN**, the ledger stays **39 / 7 / 46**, RISC-V links/status are unchanged and **no new
+   live cell** is earned. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.32.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
