@@ -720,7 +720,7 @@ pub fn handle_riscv_trap_entry_shared(
         if reverify_ok {
             // Queue-advancing dequeue of the FIFO head (the incoming task B).
             let incoming = shared.yield_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming {
+            if let Some(inc) = incoming.tid().map(|t| t.0) {
                 crate::yarm_log!(
                     "RISCV_QUEUE_SWITCH_FOUNDATION_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
@@ -734,7 +734,10 @@ pub fn handle_riscv_trap_entry_shared(
                 // Stage 199D-WA3A: exact `Runnable → Running` (or queue-neutral
                 // `Running → Running`). A refusal rolls the dequeue back inside the seam and
                 // this drain resumes nothing.
-                if !shared.d6_genuine_mark_running_via_task_seam(incoming, cpu) {
+                if !shared
+                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
+                    .may_resume()
+                {
                     crate::yarm_log!(
                         "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=transition_refused",
                         cpu.0,
@@ -827,7 +830,7 @@ pub fn handle_riscv_trap_entry_shared(
             }
             // Queue-advancing dequeue of the FIFO head (the incoming task B).
             let incoming = shared.futex_wait_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming {
+            if let Some(inc) = incoming.tid().map(|t| t.0) {
                 crate::yarm_log!(
                     "RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
@@ -841,7 +844,10 @@ pub fn handle_riscv_trap_entry_shared(
                 // Stage 199D-WA3A: exact `Runnable → Running` (or queue-neutral
                 // `Running → Running`). A refusal rolls the dequeue back inside the seam and
                 // this drain resumes nothing.
-                if !shared.d6_genuine_mark_running_via_task_seam(incoming, cpu) {
+                if !shared
+                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
+                    .may_resume()
+                {
                     crate::yarm_log!(
                         "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=transition_refused",
                         cpu.0,
@@ -970,7 +976,7 @@ pub fn handle_riscv_trap_entry_shared(
             }
             // Queue-advancing dequeue of the FIFO head.
             let incoming = shared.yield_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming {
+            if let Some(inc) = incoming.tid().map(|t| t.0) {
                 crate::yarm_log!(
                     "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
@@ -984,7 +990,10 @@ pub fn handle_riscv_trap_entry_shared(
                 // Stage 199D-WA3A: exact `Runnable → Running` (or queue-neutral
                 // `Running → Running`). A refusal rolls the dequeue back inside the seam and
                 // this drain resumes nothing.
-                if !shared.d6_genuine_mark_running_via_task_seam(incoming, cpu) {
+                if !shared
+                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
+                    .may_resume()
+                {
                     crate::yarm_log!(
                         "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=transition_refused",
                         cpu.0,

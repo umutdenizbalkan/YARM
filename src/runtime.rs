@@ -334,6 +334,98 @@ pub(crate) struct SplitReturnIdentity {
     pub(crate) asid: crate::kernel::vm::Asid,
 }
 
+/// Stage 199D-WA3A-R1 — proof that a specific incarnation was marked `Running` by a specific
+/// dispatch, on a specific CPU. Minted only by a successful mark; carries the exact
+/// incarnation, never a wildcard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DispatchMarkToken {
+    cpu: CpuId,
+    tid: u64,
+    incarnation: MarkedIncarnation,
+    provenance: crate::kernel::scheduler::DispatchSelection,
+}
+
+/// The exact identity a mark token names. There is deliberately no wildcard variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkedIncarnation {
+    /// A user task, identified by its exact address space.
+    User { asid: crate::kernel::vm::Asid },
+    /// The idle task, which has no address space by construction.
+    Idle,
+}
+
+impl DispatchMarkToken {
+    /// Mint a token, or refuse: a user task without an exact ASID fails closed rather than
+    /// stamping a wildcard identity into a rollback authority.
+    fn new(
+        cpu: CpuId,
+        tid: u64,
+        asid: Option<crate::kernel::vm::Asid>,
+        provenance: crate::kernel::scheduler::DispatchSelection,
+    ) -> Option<Self> {
+        let incarnation = match (tid, asid) {
+            (crate::kernel::task_transition::IDLE_TID, _) => MarkedIncarnation::Idle,
+            (_, Some(asid)) => MarkedIncarnation::User { asid },
+            (_, None) => return None,
+        };
+        Some(Self {
+            cpu,
+            tid,
+            incarnation,
+            provenance,
+        })
+    }
+
+    pub(crate) fn tid(&self) -> u64 {
+        self.tid
+    }
+
+    pub(crate) fn cpu(&self) -> CpuId {
+        self.cpu
+    }
+
+    /// The exact ASID to compare against; `None` only for the idle task, which has none.
+    pub(crate) fn expect_asid(&self) -> Option<crate::kernel::vm::Asid> {
+        match self.incarnation {
+            MarkedIncarnation::User { asid } => Some(asid),
+            MarkedIncarnation::Idle => None,
+        }
+    }
+
+    pub(crate) fn provenance(&self) -> crate::kernel::scheduler::DispatchSelection {
+        self.provenance
+    }
+}
+
+/// What a mark attempt did. Typed, so no caller has to infer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchMarkOutcome {
+    /// The task is `Running` and may be resumed.
+    Marked(DispatchMarkToken),
+    /// Nothing was selected.
+    Idle,
+    /// Refused; the exact dequeue was undone. Nothing is current; do not resume.
+    RefusedRolledBack,
+    /// Refused; **no** scheduler state was touched (queue-neutral). Do not resume.
+    RefusedNoSchedulerChange,
+    /// Refused, and the scheduler could not be restored. Torn: take an explicit fatal path.
+    RefusedTorn,
+}
+
+impl DispatchMarkOutcome {
+    pub(crate) fn token(self) -> Option<DispatchMarkToken> {
+        match self {
+            Self::Marked(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// May the caller resume the incoming task?
+    pub(crate) fn may_resume(self) -> bool {
+        matches!(self, Self::Marked(_))
+    }
+}
+
 impl SharedKernel {
     /// Stage 114 fix: this used to also cache `scheduler_state` /
     /// `boot_config_state_lock` / `boot_config` raw pointers computed from
@@ -730,19 +822,23 @@ impl SharedKernel {
     /// never double-advance the run queue. Returns the incoming TID.
     /// Default-off behind `yarm.d6_genuine=1` (gated by the caller).
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn d6_genuine_local_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+    pub(crate) fn d6_genuine_local_dispatch_step_mut(
+        &self,
+        cpu: CpuId,
+    ) -> crate::kernel::scheduler::DispatchSelection {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
-            let incoming = kernel_mut(&mut sched.scheduler)
-                .dispatch_next_on(dispatch_cpu)
-                .map(|tid| tid.0);
+            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
+            let selection =
+                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
+            let incoming = selection.tid().map(|t| t.0);
             crate::yarm_log!(
                 "D6_GENUINE_MUT_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
                 cpu.0,
                 if incoming.is_some() { "some" } else { "none" },
                 incoming
             );
-            incoming
+            selection
         })
     }
 
@@ -791,56 +887,139 @@ impl SharedKernel {
     #[must_use]
     pub(crate) fn d6_genuine_mark_running_via_task_seam(
         &self,
-        incoming: Option<u64>,
+        selection: crate::kernel::scheduler::DispatchSelection,
         cpu: CpuId,
-    ) -> bool {
-        let Some(tid) = incoming else {
-            // Nothing was dispatched, so there is nothing to mark and nothing to undo.
-            return true;
+    ) -> DispatchMarkOutcome {
+        use crate::kernel::scheduler::DispatchSelection;
+        use crate::kernel::task_transition::{
+            TaskTransition, apply_task_transition, log_transition_refusal,
+        };
+        // Stage 199D-WA3A-R1: the transition is chosen by PROVENANCE, produced inside the
+        // scheduler mutation — never reconstructed from TID equality or `Option::is_some`.
+        let (tid, transition) = match selection {
+            DispatchSelection::Idle => return DispatchMarkOutcome::Idle,
+            DispatchSelection::Dequeued { tid } => (tid.0, TaskTransition::DispatchIncoming),
+            DispatchSelection::ContinuedCurrent { tid } => (tid.0, TaskTransition::ContinueCurrent),
         };
         let marked = self.with_task_tcbs_split_mut(|tcbs| {
-            use crate::kernel::task_transition::{
-                TaskTransition, apply_task_transition, log_transition_refusal,
-            };
-            // `PriorityScheduler::dispatch_next` returns the EXISTING current without
-            // dequeuing whenever one is set and is not idle, so this seam sees two legal
-            // shapes and cannot tell them apart from outside: a genuine dequeue
-            // (`Runnable → Running`) and a queue-neutral continuation (`Running → Running`,
-            // a no-op). Both are accepted; every other status — `Blocked(_)` above all, but
-            // also `Faulted`, `Exited` and `Dead` — is refused.
-            match apply_task_transition(tcbs, tid, None, TaskTransition::DispatchIncoming) {
-                Ok(_) => true,
-                Err(_) => {
-                    match apply_task_transition(tcbs, tid, None, TaskTransition::ContinueCurrent) {
-                        Ok(_) => true,
-                        Err(refusal) => {
-                            log_transition_refusal(
-                                "d6_genuine_mark_running_via_task_seam",
-                                tid,
-                                TaskTransition::DispatchIncoming,
-                                refusal,
-                            );
-                            false
-                        }
-                    }
+            let asid = tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.asid);
+            match apply_task_transition(tcbs, tid, None, transition) {
+                Ok(_) => Ok(asid),
+                Err(refusal) => {
+                    log_transition_refusal(
+                        "d6_genuine_mark_running_via_task_seam",
+                        tid,
+                        transition,
+                        refusal,
+                    );
+                    Err(())
                 }
             }
         });
-        if marked {
-            return true;
+        match marked {
+            Ok(asid) => match DispatchMarkToken::new(cpu, tid, asid, selection) {
+                Some(token) => DispatchMarkOutcome::Marked(token),
+                None => {
+                    // A user task with no exact ASID gets NO token: a wildcard identity would
+                    // let a later rollback act on a replacement incarnation. Undo the mark
+                    // exactly, then undo the scheduler step exactly.
+                    let _ = self.with_task_tcbs_split_mut(|tcbs| {
+                        apply_task_transition(
+                            tcbs,
+                            tid,
+                            None,
+                            TaskTransition::RollbackDispatchedIncoming,
+                        )
+                    });
+                    crate::yarm_log!(
+                        "DISPATCH_MARK_REFUSED cpu={} tid={} provenance={} reason=missing_incarnation",
+                        cpu.0,
+                        tid,
+                        selection.marker()
+                    );
+                    self.undo_dispatch_selection(selection, cpu)
+                }
+            },
+            Err(()) => self.undo_dispatch_selection(selection, cpu),
         }
-        // Exact rollback of the rank-1 dequeue: re-enqueue the task and clear `current`.
-        let restored = self.with_scheduler_split_mut(|sched| {
-            kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu)
-                == Some(crate::kernel::ipc::ThreadId(tid))
-        });
-        crate::yarm_log!(
-            "D6_MARK_RUNNING_REFUSED cpu={} tid={} scheduler_rollback={}",
-            cpu.0,
+    }
+
+    /// Hosted/test-only: forge a mark token for a DIFFERENT incarnation, so the exact-identity
+    /// rollback refusal can be driven without a real dispatch.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn stale_dispatch_mark_token_for_test(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> DispatchMarkToken {
+        DispatchMarkToken::new(
+            cpu,
             tid,
-            u8::from(restored)
-        );
-        false
+            Some(asid),
+            crate::kernel::scheduler::DispatchSelection::Dequeued {
+                tid: crate::kernel::ipc::ThreadId(tid),
+            },
+        )
+        .expect("an explicit ASID always mints")
+    }
+
+    /// Undo exactly what `selection` did to the scheduler — and nothing more.
+    ///
+    /// `ContinuedCurrent` removed no runqueue entry, so `preempt_reenqueue_only_on` must NOT
+    /// run for it: doing so would enqueue the current task, which for a
+    /// `Blocked(EndpointReceive)` current is the unarbitrated wake this stage prevents.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    fn undo_dispatch_selection(
+        &self,
+        selection: crate::kernel::scheduler::DispatchSelection,
+        cpu: CpuId,
+    ) -> DispatchMarkOutcome {
+        use crate::kernel::scheduler::DispatchSelection;
+        match selection {
+            DispatchSelection::Idle => DispatchMarkOutcome::Idle,
+            DispatchSelection::ContinuedCurrent { tid } => {
+                crate::yarm_log!(
+                    "DISPATCH_MARK_REFUSED cpu={} tid={} provenance=continued_current scheduler_mutation=none",
+                    cpu.0,
+                    tid.0
+                );
+                DispatchMarkOutcome::RefusedNoSchedulerChange
+            }
+            DispatchSelection::Dequeued { tid } => {
+                // A scheduler rollback may only mutate `current` when `current` IS this TID.
+                if self.current_tid_authoritative(cpu) != Some(tid.0) {
+                    crate::yarm_log!(
+                        "DISPATCH_MARK_REFUSED cpu={} tid={} provenance=dequeued scheduler_rollback=skipped_current_mismatch",
+                        cpu.0,
+                        tid.0
+                    );
+                    return DispatchMarkOutcome::RefusedTorn;
+                }
+                let restored = self.with_scheduler_split_mut(|sched| {
+                    kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu) == Some(tid)
+                });
+                crate::yarm_log!(
+                    "DISPATCH_MARK_REFUSED cpu={} tid={} provenance=dequeued scheduler_rollback={}",
+                    cpu.0,
+                    tid.0,
+                    u8::from(restored)
+                );
+                if restored {
+                    DispatchMarkOutcome::RefusedRolledBack
+                } else {
+                    DispatchMarkOutcome::RefusedTorn
+                }
+            }
+        }
     }
 
     /// Stage 168B (D2-GENUINE-RECV): re-verify — out of the global lock, through
@@ -877,12 +1056,16 @@ impl SharedKernel {
     /// fall back on. Returns the incoming TID (`None` ⇒ idle). Emits
     /// `D2_RECV_GENUINE_DISPATCH_STEP_SPLIT`. Default-off (gated by the caller).
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn d2_recv_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+    pub(crate) fn d2_recv_dispatch_step_mut(
+        &self,
+        cpu: CpuId,
+    ) -> crate::kernel::scheduler::DispatchSelection {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
-            let incoming = kernel_mut(&mut sched.scheduler)
-                .dispatch_next_on(dispatch_cpu)
-                .map(|tid| tid.0);
+            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
+            let selection =
+                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
+            let incoming = selection.tid().map(|t| t.0);
             let result = if incoming.is_some() { "switch" } else { "idle" };
             crate::yarm_log!(
                 "D2_RECV_GENUINE_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
@@ -890,7 +1073,7 @@ impl SharedKernel {
                 result,
                 incoming
             );
-            incoming
+            selection
         })
     }
 
@@ -923,12 +1106,16 @@ impl SharedKernel {
     /// `block_current`), so `dispatch_next_on` genuinely dequeues the next
     /// runnable task here. Emits `D2_SEND_GENUINE_DISPATCH_STEP_SPLIT`.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn d2_send_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+    pub(crate) fn d2_send_dispatch_step_mut(
+        &self,
+        cpu: CpuId,
+    ) -> crate::kernel::scheduler::DispatchSelection {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
-            let incoming = kernel_mut(&mut sched.scheduler)
-                .dispatch_next_on(dispatch_cpu)
-                .map(|tid| tid.0);
+            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
+            let selection =
+                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
+            let incoming = selection.tid().map(|t| t.0);
             let result = if incoming.is_some() { "switch" } else { "idle" };
             crate::yarm_log!(
                 "D2_SEND_GENUINE_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
@@ -936,7 +1123,7 @@ impl SharedKernel {
                 result,
                 incoming
             );
-            incoming
+            selection
         })
     }
 
@@ -993,12 +1180,16 @@ impl SharedKernel {
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
-    pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+    pub(crate) fn futex_wait_dispatch_step_mut(
+        &self,
+        cpu: CpuId,
+    ) -> crate::kernel::scheduler::DispatchSelection {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
-            let incoming = kernel_mut(&mut sched.scheduler)
-                .dispatch_next_on(dispatch_cpu)
-                .map(|tid| tid.0);
+            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
+            let selection =
+                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
+            let incoming = selection.tid().map(|t| t.0);
             match incoming {
                 Some(tid) => crate::yarm_log!(
                     "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu={} tid={}",
@@ -1009,7 +1200,7 @@ impl SharedKernel {
                     crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu={} tid=idle", cpu.0)
                 }
             }
-            incoming
+            selection
         })
     }
 
@@ -1053,19 +1244,23 @@ impl SharedKernel {
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
-    pub(crate) fn yield_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+    pub(crate) fn yield_dispatch_step_mut(
+        &self,
+        cpu: CpuId,
+    ) -> crate::kernel::scheduler::DispatchSelection {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
-            let incoming = kernel_mut(&mut sched.scheduler)
-                .dispatch_next_on(dispatch_cpu)
-                .map(|tid| tid.0);
+            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
+            let selection =
+                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
+            let incoming = selection.tid().map(|t| t.0);
             match incoming {
                 Some(tid) => {
                     crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid={}", cpu.0, tid)
                 }
                 None => crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid=idle", cpu.0),
             }
-            incoming
+            selection
         })
     }
 
@@ -1246,24 +1441,28 @@ impl SharedKernel {
     /// Returns `true` iff the rollback fully succeeded. The caller takes the explicit fatal path
     /// either way — this restores the invariant before halting so the failure is diagnosable and
     /// the scheduler is not left in a torn state.
-    pub(crate) fn direct_dispatch_rollback_split(&self, cpu: CpuId, incoming: u64) -> bool {
-        // Rank 2 first: undo the status mutation — but ONLY from the exact predecessor this
-        // transaction created. Stage 199D-WA3A: an unconditional write here would "roll back"
-        // a task this transaction never dispatched, including a replacement incarnation that
-        // reused the numeric TID, or a receiver that has since blocked.
+    pub(crate) fn direct_dispatch_rollback_split(&self, token: DispatchMarkToken) -> bool {
+        use crate::kernel::task_transition::{
+            TaskTransition, apply_task_transition, log_transition_refusal,
+        };
+        let cpu = token.cpu();
+        let incoming = token.tid();
+        // Rank 2 first: undo the status mutation — but ONLY for the EXACT incarnation this
+        // transaction marked. Stage 199D-WA3A-R1: `expect_asid` comes from the token, never
+        // `None`, so a replacement task that reused the numeric TID is refused outright.
         let status_ok = self.with_task_tcbs_split_mut(|tcbs| {
-            match crate::kernel::task_transition::apply_task_transition(
+            match apply_task_transition(
                 tcbs,
                 incoming,
-                None,
-                crate::kernel::task_transition::TaskTransition::RollbackDispatchedIncoming,
+                token.expect_asid(),
+                TaskTransition::RollbackDispatchedIncoming,
             ) {
                 Ok(_) => true,
                 Err(refusal) => {
-                    crate::kernel::task_transition::log_transition_refusal(
+                    log_transition_refusal(
                         "direct_dispatch_rollback_split",
                         incoming,
-                        crate::kernel::task_transition::TaskTransition::RollbackDispatchedIncoming,
+                        TaskTransition::RollbackDispatchedIncoming,
                         refusal,
                     );
                     false
@@ -1271,26 +1470,60 @@ impl SharedKernel {
             }
         });
         if !status_ok {
-            // Fail closed: the task half was refused, so the scheduler half must NOT run — a
-            // `preempt_reenqueue_only_on` here would re-enqueue a task whose status this
-            // transaction does not own, and could displace a live `current`. The caller's
-            // explicit fatal path handles the torn dispatch.
             crate::yarm_log!(
-                "DIRECT_DISPATCH_ROLLBACK_REFUSED cpu={} incoming={} reason=not_this_transactions_dispatch",
+                "DIRECT_DISPATCH_ROLLBACK_REFUSED cpu={} incoming={} reason=not_this_transactions_incarnation",
                 cpu.0,
                 incoming
             );
             return false;
         }
-        // Rank 1: undo the dequeue and the current-set with the EXISTING exact inverse —
-        // `preempt_reenqueue_only_on` re-enqueues the current task and clears `current` without
-        // dispatching, which is precisely what `dispatch_next_on` did in reverse. No new
-        // scheduler primitive, so no second scheduler policy.
+        // A scheduler rollback may only mutate `current` when `current` IS the token's TID.
+        if self.current_tid_authoritative(cpu) != Some(incoming) {
+            // Compensate the task transition back to the exact incarnation we just moved, so
+            // the TCB is never left `Runnable` while the scheduler still believes it is current.
+            let compensated = self.with_task_tcbs_split_mut(|tcbs| {
+                apply_task_transition(
+                    tcbs,
+                    incoming,
+                    token.expect_asid(),
+                    TaskTransition::DispatchIncoming,
+                )
+                .is_ok()
+            });
+            crate::yarm_log!(
+                "DIRECT_DISPATCH_ROLLBACK_TORN cpu={} incoming={} reason=current_mismatch compensated={}",
+                cpu.0,
+                incoming,
+                u8::from(compensated)
+            );
+            return false;
+        }
+        // Rank 1: undo the dequeue and the current-set with the EXISTING exact inverse.
         let sched_ok = self.with_scheduler_split_mut(|sched| {
             let restored = kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu);
             restored == Some(crate::kernel::ipc::ThreadId(incoming))
         });
-        status_ok && sched_ok
+        if !sched_ok {
+            // Task rollback succeeded but the scheduler did not: do NOT leave status=Runnable
+            // with current=T. Put the task back to Running for its exact incarnation.
+            let compensated = self.with_task_tcbs_split_mut(|tcbs| {
+                apply_task_transition(
+                    tcbs,
+                    incoming,
+                    token.expect_asid(),
+                    TaskTransition::DispatchIncoming,
+                )
+                .is_ok()
+            });
+            crate::yarm_log!(
+                "DIRECT_DISPATCH_ROLLBACK_TORN cpu={} incoming={} reason=scheduler_rollback_failed compensated={}",
+                cpu.0,
+                incoming,
+                u8::from(compensated)
+            );
+            return false;
+        }
+        true
     }
 
     /// Stage 199D — post-lock dispatch step 3b: does the authoritative `current` slot agree

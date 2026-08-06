@@ -53109,7 +53109,7 @@ mod stage168_d6_genuine_b_and_d2_recv {
     #[test]
     fn stage168_mut_dispatch_out_of_lock_call_site() {
         assert!(
-            RUNTIME_SRC.contains("dispatch_next_on(dispatch_cpu)")
+            RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)")
                 && RUNTIME_SRC.contains("self.with_scheduler_split_mut("),
             "the mutating dispatch seam must call dispatch_next_on under the scheduler seam"
         );
@@ -53472,7 +53472,7 @@ mod stage168b_d2_recv_genuine_completion {
             .expect("recv dispatch seam");
         let body = &RUNTIME_SRC[m_idx..m_idx + 700];
         assert!(
-            body.contains("dispatch_next_on(dispatch_cpu)"),
+            body.contains("dispatch_next_selection_on(dispatch_cpu)"),
             "the recv dispatch must be the authoritative queue-advancing dispatch_next_on"
         );
     }
@@ -53798,7 +53798,7 @@ mod stage169_d2_send_genuine {
             .expect("send dispatch seam");
         let body = &RUNTIME_SRC[m_idx..m_idx + 700];
         assert!(
-            body.contains("dispatch_next_on(dispatch_cpu)"),
+            body.contains("dispatch_next_selection_on(dispatch_cpu)"),
             "the send dispatch must be the authoritative queue-advancing dispatch_next_on"
         );
     }
@@ -60949,7 +60949,7 @@ mod stage192a_queue_advancing_dispatch {
             TRAP_SRC.contains("futex_wait_was_deferred")
                 && TRAP_SRC.contains("shared.futex_wait_reverify_blocked(t)")
                 && TRAP_SRC.contains("shared.futex_wait_dispatch_step_mut(cpu)")
-                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)")
+                && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(incoming, cpu)")
                 && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
             "the trap-entry futex drain must reverify + dispatch-step + mark-running + restore"
         );
@@ -60989,7 +60989,7 @@ mod stage192a_queue_advancing_dispatch {
     fn dispatch_step_uses_authoritative_dispatch_next_on() {
         assert!(
             RUNTIME_SRC.contains("pub(crate) fn futex_wait_dispatch_step_mut(")
-                && RUNTIME_SRC.contains(".dispatch_next_on(dispatch_cpu)")
+                && RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)")
                 && RUNTIME_SRC.contains("pub(crate) fn futex_wait_reverify_blocked("),
             "the futex dispatch-step must use the authoritative dispatch_next_on + reverify"
         );
@@ -61035,7 +61035,10 @@ mod stage192a_queue_advancing_dispatch {
         // Reverify passes (still Blocked(Futex)).
         assert!(shared.futex_wait_reverify_blocked(blocked));
         // Queue-advancing dispatch: dequeues `next`, sets it current.
-        let incoming = shared.futex_wait_dispatch_step_mut(CpuId(0));
+        let incoming = shared
+            .futex_wait_dispatch_step_mut(CpuId(0))
+            .tid()
+            .map(|t| t.0);
         assert_eq!(
             incoming,
             Some(next),
@@ -61090,7 +61093,13 @@ mod stage192a_queue_advancing_dispatch {
         let _ = state.block_current_cpu();
         let shared = SharedKernel::new(state);
         // No other runnable ⇒ dispatch idles (the init-park case).
-        assert_eq!(shared.futex_wait_dispatch_step_mut(CpuId(0)), None);
+        assert_eq!(
+            shared
+                .futex_wait_dispatch_step_mut(CpuId(0))
+                .tid()
+                .map(|t| t.0),
+            None
+        );
         // FutexWake split wakes the waiter exactly once.
         assert_eq!(shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX), 1);
         shared.with(|k| assert_eq!(k.task_status(waiter), Some(TaskStatus::Runnable)));
@@ -61152,7 +61161,7 @@ mod stage192b_yield_queue_advancing_dispatch {
             TRAP_SRC.contains("yield_was_deferred")
                 && TRAP_SRC.contains("shared.yield_reverify_ready(cpu)")
                 && TRAP_SRC.contains("shared.yield_dispatch_step_mut(cpu)")
-                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)")
+                && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(incoming, cpu)")
                 && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
             "the trap-entry yield drain must reverify + dispatch-step + mark-running + restore"
         );
@@ -61181,7 +61190,7 @@ mod stage192b_yield_queue_advancing_dispatch {
         assert!(
             SCHED_SRC.contains("pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId>")
                 && RUNTIME_SRC.contains("pub(crate) fn yield_dispatch_step_mut(")
-                && RUNTIME_SRC.contains(".dispatch_next_on(dispatch_cpu)"),
+                && RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)"),
             "the re-enqueue-only split + authoritative dispatch-step must exist"
         );
         // ReapFaultedTask stays global-lock-only.
@@ -61238,7 +61247,7 @@ mod stage192b_yield_queue_advancing_dispatch {
         let shared = SharedKernel::new(state);
         // Reverify passes (current cleared) and the dispatch selects the FIFO head (other).
         assert!(shared.yield_reverify_ready(CpuId(0)));
-        let incoming = shared.yield_dispatch_step_mut(CpuId(0));
+        let incoming = shared.yield_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0);
         assert_eq!(incoming, Some(other), "dispatch selects the FIFO head");
         shared.with(|k| {
             assert_eq!(
@@ -61284,7 +61293,10 @@ mod stage192b_yield_queue_advancing_dispatch {
         });
         assert_eq!(state.preempt_reenqueue_current_cpu(), Some(solo));
         let shared = SharedKernel::new(state);
-        assert_eq!(shared.yield_dispatch_step_mut(CpuId(0)), Some(solo));
+        assert_eq!(
+            shared.yield_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
+            Some(solo)
+        );
         shared.with(|k| assert_eq!(k.current_tid_on_cpu(CpuId(0)), Some(solo)));
     }
 
@@ -72899,7 +72911,7 @@ mod stage196d_riscv_queue_switch_foundation {
         );
         // Before the restore, B is set current + marked Running via the accepted rank-2 task seam.
         assert!(
-            RISCV_TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)")
+            RISCV_TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(incoming, cpu)")
                 && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}"),
             "the incoming task must be marked Running via the accepted task seam before restore"
         );
@@ -105171,7 +105183,7 @@ mod stage199d_aarch64_offlock_dispatch {
         );
         // Settlement happens anyway, and the dequeue legitimately selects that very caller.
         assert_eq!(
-            k.futex_wait_dispatch_step_mut(CpuId(0)),
+            k.futex_wait_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
             Some(OUTGOING),
             "the woken caller is a normal dispatch candidate"
         );
@@ -105209,7 +105221,10 @@ mod stage199d_aarch64_offlock_dispatch {
         );
         // The debt is still owed and still settleable: another task is runnable.
         k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
-        assert_eq!(k.futex_wait_dispatch_step_mut(CpuId(0)), Some(INCOMING));
+        assert_eq!(
+            k.futex_wait_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
+            Some(INCOMING)
+        );
         dd::reset();
     }
 
@@ -105269,7 +105284,7 @@ mod stage199d_aarch64_offlock_dispatch {
         // WITHOUT restoring a frame, and that primitive never returns.
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         let drain = TRAP_ENTRY
-            .split("match shared.futex_wait_dispatch_step_mut(cpu) {")
+            .split("match selection.tid().map(|t| t.0) {")
             .nth(1)
             .and_then(|s| s.split("Some(inc) => {").next())
             .expect("the dequeue None arm");
@@ -105384,9 +105399,13 @@ mod stage199d_aarch64_offlock_dispatch {
         k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
 
         // Commit the scheduler mutation, exactly as the drain does.
-        let inc = k.futex_wait_dispatch_step_mut(CpuId(0)).expect("dequeue");
+        let selection = k.futex_wait_dispatch_step_mut(CpuId(0));
+        let inc = selection.tid().map(|t| t.0).expect("dequeue");
         assert_eq!(inc, INCOMING);
-        assert!(k.d6_genuine_mark_running_via_task_seam(Some(inc), CpuId(0)));
+        let token = k
+            .d6_genuine_mark_running_via_task_seam(selection, CpuId(0))
+            .token()
+            .expect("mark must mint a token");
         assert_eq!(k.current_tid_authoritative(CpuId(0)), Some(INCOMING));
         assert_eq!(
             k.with(|s| s.task_status(INCOMING)),
@@ -105402,7 +105421,7 @@ mod stage199d_aarch64_offlock_dispatch {
 
         // Roll back and check all three coordinates are exactly as before the dequeue.
         assert!(
-            k.direct_dispatch_rollback_split(CpuId(0), inc),
+            k.direct_dispatch_rollback_split(token),
             "rollback must succeed"
         );
         assert_eq!(
@@ -105417,7 +105436,7 @@ mod stage199d_aarch64_offlock_dispatch {
         );
         // The task is back on the run queue — not lost.
         assert_eq!(
-            k.futex_wait_dispatch_step_mut(CpuId(0)),
+            k.futex_wait_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
             Some(INCOMING),
             "the rolled-back task must still be dispatchable"
         );
@@ -105436,7 +105455,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .expect("the direct dispatch drain");
         // The only two paths out after a dequeue are a successful dispatch or the fatal path.
         assert!(
-            drain.contains("shared.direct_dispatch_rollback_split(cpu, inc)")
+            drain.contains("shared.direct_dispatch_rollback_split(t)")
                 && drain.contains("enter_post_lock_dispatch_fatal("),
             "a failed dispatch must roll back exactly and take the explicit fatal path"
         );
@@ -105584,7 +105603,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .and_then(|s| s.split("\n    // Stage 192A").next())
             .expect("the direct dispatch drain");
         assert!(drain.contains("shared.futex_wait_dispatch_step_mut(cpu)"));
-        assert!(drain.contains("shared.d6_genuine_mark_running_via_task_seam(Some(inc), cpu)"));
+        assert!(drain.contains("shared.d6_genuine_mark_running_via_task_seam(selection, cpu)"));
         assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch"));
         // The rollback uses the existing exact inverse of the dequeue, not a new primitive.
         const RUNTIME: &str = include_str!("../../runtime.rs");
@@ -114942,8 +114961,9 @@ mod stage199d_wa3a_transition_barriers {
                 )),
             );
         });
+        let stale = kernel.stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(9));
         assert!(
-            !kernel.direct_dispatch_rollback_split(CpuId(0), OTHER),
+            !kernel.direct_dispatch_rollback_split(stale),
             "a rollback must refuse a task this transaction never dispatched"
         );
         assert_eq!(
@@ -114970,13 +114990,12 @@ mod stage199d_wa3a_transition_barriers {
         });
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
         // Commit the rank-1 dequeue exactly as a drain does, then mark.
-        let inc = kernel
-            .futex_wait_dispatch_step_mut(CpuId(0))
-            .expect("dequeue");
-        assert_eq!(inc, BLOCKED);
-        assert!(
-            !kernel.d6_genuine_mark_running_via_task_seam(Some(inc), CpuId(0)),
-            "a blocked incoming must be refused"
+        let selection = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(selection.tid().map(|t| t.0), Some(BLOCKED));
+        assert_eq!(
+            kernel.d6_genuine_mark_running_via_task_seam(selection, CpuId(0)),
+            crate::runtime::DispatchMarkOutcome::RefusedRolledBack,
+            "a blocked incoming must be refused and the dequeue undone"
         );
         assert_eq!(
             kernel.with(|s| s.task_status(BLOCKED)),
@@ -115021,6 +115040,179 @@ mod stage199d_wa3a_transition_barriers {
     }
 
     // ── spawn: the destination TID must be absent ──────────────────────────────────────────
+
+    // ── WA3A-R1: provenance and exact rollback identity ────────────────────────────────────
+
+    /// **The WA3A defect.** A queue-neutral refusal must not touch the scheduler at all. Undoing
+    /// a "dequeue" that never happened would ENQUEUE the current task — and if that current task
+    /// is a blocked endpoint receiver, that is the unarbitrated wake Stage 199D prevents.
+    #[test]
+    fn a_queue_neutral_blocked_current_is_refused_and_never_enqueued() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            s.enqueue_task(OTHER).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), Some(OTHER));
+        // Block the CURRENT task, then run a queue-neutral dispatch step.
+        kernel.with(|s| {
+            s.set_task_status_for_test(
+                OTHER,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    crate::kernel::capabilities::CapId(5),
+                )),
+            );
+        });
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let selection = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            selection,
+            crate::kernel::scheduler::DispatchSelection::ContinuedCurrent {
+                tid: crate::kernel::ipc::ThreadId(OTHER)
+            },
+            "nothing was dequeued: the existing current was returned"
+        );
+        assert_eq!(
+            kernel.d6_genuine_mark_running_via_task_seam(selection, CpuId(0)),
+            crate::runtime::DispatchMarkOutcome::RefusedNoSchedulerChange,
+            "a queue-neutral refusal must not touch scheduler state"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "the blocked current task must NOT have been enqueued"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            Some(OTHER),
+            "and `current` is unchanged"
+        );
+        assert!(matches!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Blocked(_))
+        ));
+    }
+
+    /// **D's required counterexample.** A stale token for incarnation A must not roll back a
+    /// same-TID, different-ASID replacement B that is legitimately `Running`.
+    #[test]
+    fn a_same_tid_different_asid_running_replacement_rejects_a_stale_rollback() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid_b, _) = kernel
+            .with(|s| {
+                s.register_task(OTHER).expect("register");
+                s.create_user_address_space()
+            })
+            .expect("asid");
+        kernel.with(|s| {
+            s.bind_task_asid(OTHER, asid_b).expect("bind B");
+            s.set_task_status_for_test(OTHER, TaskStatus::Running);
+        });
+        // A token minted for incarnation A ({tid=T, asid=A}) — a different address space.
+        let stale = kernel.stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(0xAA));
+        let current_before = kernel.current_tid_authoritative(CpuId(0));
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let ctx_before = kernel.with(|s| s.thread_user_context(OTHER));
+
+        assert!(
+            !kernel.direct_dispatch_rollback_split(stale),
+            "a stale incarnation's token must not roll back the replacement"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Running),
+            "B stays Running"
+        );
+        assert_eq!(kernel.with(|s| s.task_asid(OTHER)), Some(asid_b));
+        assert_eq!(
+            kernel.with(|s| s.thread_user_context(OTHER)),
+            ctx_before,
+            "B's register context is byte-for-byte unchanged"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            current_before,
+            "scheduler current unchanged"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "scheduler queue unchanged"
+        );
+    }
+
+    /// A genuinely dequeued blocked task is returned to the queue exactly once.
+    #[test]
+    fn a_dequeued_blocked_task_is_returned_exactly_once() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(BLOCKED).expect("register");
+            s.enqueue_task(BLOCKED).expect("enqueue");
+            s.set_task_status_for_test(
+                BLOCKED,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    crate::kernel::capabilities::CapId(3),
+                )),
+            );
+        });
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let selection = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            selection,
+            crate::kernel::scheduler::DispatchSelection::Dequeued {
+                tid: crate::kernel::ipc::ThreadId(BLOCKED)
+            }
+        );
+        assert_eq!(
+            kernel.d6_genuine_mark_running_via_task_seam(selection, CpuId(0)),
+            crate::runtime::DispatchMarkOutcome::RefusedRolledBack
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "returned exactly once — not zero times, not twice"
+        );
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), None);
+    }
+
+    /// A successful mark mints a token carrying the exact incarnation, and a user task with no
+    /// ASID fails closed rather than producing a wildcard token.
+    #[test]
+    fn a_mark_token_carries_the_exact_incarnation_or_is_refused() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, _) = kernel
+            .with(|s| {
+                s.register_task(OTHER).expect("register");
+                s.create_user_address_space()
+            })
+            .expect("asid");
+        kernel.with(|s| {
+            s.bind_task_asid(OTHER, asid).expect("bind");
+            s.enqueue_task(OTHER).expect("enqueue");
+        });
+        let selection = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let token = kernel
+            .d6_genuine_mark_running_via_task_seam(selection, CpuId(0))
+            .token()
+            .expect("a bound user task mints a token");
+        assert_eq!(token.tid(), OTHER);
+        assert_eq!(token.expect_asid(), Some(asid));
+        assert_eq!(token.provenance(), selection);
+        // …and the exact token rolls back cleanly.
+        assert!(kernel.direct_dispatch_rollback_split(token));
+
+        // A user task with NO ASID must not mint a wildcard token.
+        let bare = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        bare.with(|s| {
+            s.register_task(BLOCKED).expect("register");
+            s.enqueue_task(BLOCKED).expect("enqueue");
+        });
+        let sel = bare.futex_wait_dispatch_step_mut(CpuId(0));
+        let outcome = bare.d6_genuine_mark_running_via_task_seam(sel, CpuId(0));
+        assert_eq!(outcome.token(), None, "no ASID ⇒ no token");
+        assert!(!outcome.may_resume());
+    }
 
     /// **HARD-STOP, recorded as a test rather than a claim.** `spawn_user_task_from_image`
     /// still overwrites a pre-existing TID: the absence precondition WA3A set out to enforce is

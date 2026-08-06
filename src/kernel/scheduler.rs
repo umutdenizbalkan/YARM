@@ -43,6 +43,46 @@ struct RingQueue {
     len: usize,
 }
 
+/// Stage 199D-WA3A-R1 — what a dispatch step actually did, produced **inside** the
+/// authoritative scheduler mutation.
+///
+/// Provenance is not derivable after the fact: `dispatch_next` returns the existing `current`
+/// without dequeuing whenever one is set and is not idle, so `outgoing != incoming`, TID equality
+/// and "which helper was called" all fail to distinguish a genuine dequeue from a queue-neutral
+/// continuation. Getting that wrong is not cosmetic — undoing a "dequeue" that never happened
+/// enqueues the current task, which for a `Blocked(EndpointReceive)` current is exactly the
+/// unarbitrated wake Stage 199D exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchSelection {
+    /// A runqueue entry was **removed** and installed as `current`. Undoing this means
+    /// `preempt_reenqueue_only`.
+    Dequeued { tid: ThreadId },
+    /// The existing `current` was returned. **No** runqueue entry was removed, so there is
+    /// nothing to undo and `preempt_reenqueue_only` must never be called for it.
+    ContinuedCurrent { tid: ThreadId },
+    /// Nothing was selected.
+    Idle,
+}
+
+impl DispatchSelection {
+    /// The selected TID, if any.
+    pub fn tid(self) -> Option<ThreadId> {
+        match self {
+            Self::Dequeued { tid } | Self::ContinuedCurrent { tid } => Some(tid),
+            Self::Idle => None,
+        }
+    }
+
+    /// A short stable name for markers.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Dequeued { .. } => "dequeued",
+            Self::ContinuedCurrent { .. } => "continued_current",
+            Self::Idle => "idle",
+        }
+    }
+}
+
 impl RingQueue {
     const fn new() -> Self {
         Self {
@@ -323,27 +363,45 @@ impl PriorityScheduler {
         None
     }
 
-    pub fn dispatch_next(&mut self) -> Option<ThreadId> {
+    /// Provenance-preserving form of [`Self::dispatch_next`]. The `Dequeued` / `ContinuedCurrent`
+    /// distinction is decided here, where the queue is actually manipulated.
+    pub fn dispatch_next_selection(&mut self) -> DispatchSelection {
         if let Some(current) = self.current {
             if current.tid.0 == 0 && self.runnable_count() > 0 {
-                let next = self.dequeue_highest()?;
+                let Some(next) = self.dequeue_highest() else {
+                    return DispatchSelection::Idle;
+                };
                 self.current = Some(next);
                 // Remove idle (tid=0) from the membership table so it can be
                 // re-enqueued later without hitting the AlreadyQueued guard.
                 if !self.membership_tracking_exhausted {
                     self.membership_remove(current.tid);
                 }
-                return Some(next.tid);
+                return DispatchSelection::Dequeued { tid: next.tid };
             }
-            return Some(current.tid);
+            return DispatchSelection::ContinuedCurrent { tid: current.tid };
         }
         // No current task: idle state. Pick the next runnable task if any.
-        let next = self.dequeue_highest()?;
-        self.current = Some(next);
-        Some(next.tid)
+        match self.dequeue_highest() {
+            Some(next) => {
+                self.current = Some(next);
+                DispatchSelection::Dequeued { tid: next.tid }
+            }
+            None => DispatchSelection::Idle,
+        }
+    }
+
+    pub fn dispatch_next(&mut self) -> Option<ThreadId> {
+        self.dispatch_next_selection().tid()
     }
 
     pub fn on_preempt(&mut self) -> Option<ThreadId> {
+        self.on_preempt_selection().tid()
+    }
+
+    /// Provenance-preserving form of [`Self::on_preempt`]. The re-enqueue-failed branch keeps the
+    /// existing `current` and dequeues nothing, so it is `ContinuedCurrent`, not `Dequeued`.
+    pub fn on_preempt_selection(&mut self) -> DispatchSelection {
         if let Some(running) = self.current.take() {
             if !self.membership_tracking_exhausted {
                 self.membership_remove(running.tid);
@@ -359,10 +417,10 @@ impl PriorityScheduler {
                     let _ = self.membership_insert(running.tid);
                 }
                 self.current = Some(running);
-                return Some(running.tid);
+                return DispatchSelection::ContinuedCurrent { tid: running.tid };
             }
         }
-        self.dispatch_next()
+        self.dispatch_next_selection()
     }
 
     /// Stage 192B: the RE-ENQUEUE half of [`on_preempt`] — re-enqueue the current task at
@@ -402,6 +460,12 @@ impl PriorityScheduler {
     /// Used by `yield_current_to` to implement one-shot cooperative handoff without
     /// the busy-loop of `switch_to_runnable_tid`.
     pub fn on_preempt_prefer(&mut self, preferred: ThreadId) -> Option<ThreadId> {
+        self.on_preempt_prefer_selection(preferred).tid()
+    }
+
+    /// Provenance-preserving form of [`Self::on_preempt_prefer`]. Removing `preferred` from a
+    /// queue and installing it as `current` IS a dequeue.
+    pub fn on_preempt_prefer_selection(&mut self, preferred: ThreadId) -> DispatchSelection {
         // Re-enqueue current (same logic as on_preempt).
         if let Some(running) = self.current.take() {
             if !self.membership_tracking_exhausted {
@@ -418,7 +482,7 @@ impl PriorityScheduler {
                     let _ = self.membership_insert(running.tid);
                 }
                 self.current = Some(running);
-                return Some(running.tid);
+                return DispatchSelection::ContinuedCurrent { tid: running.tid };
             }
         }
         // Scan queues in priority order for the preferred TID.
@@ -428,11 +492,11 @@ impl PriorityScheduler {
                     tid: preferred,
                     priority,
                 });
-                return Some(preferred);
+                return DispatchSelection::Dequeued { tid: preferred };
             }
         }
         // Preferred not in any queue; fall back to normal FIFO dispatch.
-        self.dispatch_next()
+        self.dispatch_next_selection()
     }
 
     /// Stage 199D: remove exactly one queued incarnation of `tid` from THIS CPU's queues.
@@ -723,6 +787,34 @@ impl SmpScheduler {
 
     pub fn enqueue_on(&mut self, cpu: CpuId, tid: ThreadId) -> Result<(), SchedulerError> {
         self.enqueue_on_with_priority(cpu, tid, TaskPriority::Normal)
+    }
+
+    /// Provenance-preserving form of [`Self::dispatch_next_on`].
+    pub fn dispatch_next_selection_on(&mut self, cpu: CpuId) -> DispatchSelection {
+        let Ok(idx) = self.check_online_cpu(cpu) else {
+            return DispatchSelection::Idle;
+        };
+        self.schedulers[idx].dispatch_next_selection()
+    }
+
+    /// Provenance-preserving form of [`Self::on_preempt_on`].
+    pub fn on_preempt_selection_on(&mut self, cpu: CpuId) -> DispatchSelection {
+        let Ok(idx) = self.check_online_cpu(cpu) else {
+            return DispatchSelection::Idle;
+        };
+        self.schedulers[idx].on_preempt_selection()
+    }
+
+    /// Provenance-preserving form of [`Self::on_preempt_prefer_on`].
+    pub fn on_preempt_prefer_selection_on(
+        &mut self,
+        cpu: CpuId,
+        preferred: ThreadId,
+    ) -> DispatchSelection {
+        let Ok(idx) = self.check_online_cpu(cpu) else {
+            return DispatchSelection::Idle;
+        };
+        self.schedulers[idx].on_preempt_prefer_selection(preferred)
     }
 
     pub fn dispatch_next_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
