@@ -35,6 +35,8 @@ pub mod topology;
 pub mod trap;
 pub mod trapframe;
 pub mod vm;
+/// Stage 199D-WA2A — helper-only endpoint-waiter ownership primitive (zero production callers).
+pub(crate) mod waiter_ownership;
 
 pub use boot::{Bootstrap, KernelState};
 pub use yarm_ipc_abi::{driver_abi, process_abi, vfs_abi};

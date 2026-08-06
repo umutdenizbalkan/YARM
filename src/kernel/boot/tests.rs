@@ -112462,3 +112462,186 @@ mod stage199d_wa1_gate {
         );
     }
 }
+
+/// Stage 199D-WA2A — boundary guards for the helper-only waiter-ownership primitive.
+///
+/// The primitive exists so a LATER increment can make endpoint-waiter ownership exclusive. In
+/// this increment it must change nothing: zero production callers, no transaction reorder, no
+/// timeout or notification conversion, and every WA1-GATE status figure intact.
+mod stage199d_wa2a_ownership_boundary {
+    const OWNERSHIP: &str = include_str!("../waiter_ownership.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const MODRS: &str = include_str!("mod.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+    const STATUS: &str = include_str!("../../../doc/STATUS.md");
+
+    /// **Zero production call sites.** A repo-wide walk: only the primitive's own file and the
+    /// module declaration may name it.
+    #[test]
+    fn the_primitive_has_no_production_caller() {
+        fn visit(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+            for entry in std::fs::read_dir(root).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    visit(&path, f);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let src = std::fs::read_to_string(&path).expect("read");
+                    f(&path, &src);
+                }
+            }
+        }
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // The primitive itself, its `mod` declaration, and this guard file.
+        const OWNERS: &[&str] = &[
+            "src/kernel/waiter_ownership.rs",
+            "src/kernel/mod.rs",
+            "src/kernel/boot/tests.rs",
+        ];
+        let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut owners_seen = 0usize;
+        visit(&repo_root.join("src"), &mut |path, src| {
+            let rel = path
+                .strip_prefix(&repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let names = src.contains("waiter_ownership")
+                || src.contains("WaiterOwnershipTable")
+                || src.contains("WaiterClaimToken")
+                || src.contains("WaiterOwner::");
+            if !names {
+                return;
+            }
+            if OWNERS.contains(&rel.as_str()) {
+                owners_seen += 1;
+            } else {
+                callers.push(rel);
+            }
+        });
+        assert_eq!(
+            owners_seen,
+            OWNERS.len(),
+            "the walk must have reached every owner — an empty result below would be vacuous"
+        );
+        assert!(
+            callers.is_empty(),
+            "the primitive is helper-only in WA2A; production callers: {callers:?}"
+        );
+        // And it is explicitly marked as such.
+        assert!(
+            OWNERSHIP.contains("#![cfg_attr(not(test), allow(dead_code))]"),
+            "the helper-only marker must be present while there are no callers"
+        );
+    }
+
+    /// NR6 and NR7 still hold exactly their existing SINGLE, LATE waiter claim — no reorder.
+    #[test]
+    fn the_direct_transactions_keep_their_single_late_waiter_claim() {
+        assert_eq!(
+            TXN.matches("sr_claim_endpoint_waiter_split(").count(),
+            2,
+            "one claim in NR6, one in NR7 — no second claim, no removal"
+        );
+        for (txn_fn, first_mutation) in [
+            (
+                "fn ipc_call_direct_request_txn(",
+                "reserve_direct_reply_record_split",
+            ),
+            (
+                "fn ipc_reply_direct_txn(",
+                "reserve_existing_reply_record_split",
+            ),
+        ] {
+            let body = TXN.split(txn_fn).nth(1).expect("the transaction");
+            let claim = body
+                .find("sr_claim_endpoint_waiter_split(")
+                .expect("the claim");
+            let copy = body
+                .find("copy_slice_to_user_asid_split_write")
+                .expect("the user copy");
+            let record = body.find(first_mutation).expect("the record mutation");
+            assert!(
+                claim > copy && claim > record,
+                "{txn_fn}: the claim is still LATE — WA2A does not reorder it"
+            );
+        }
+    }
+
+    /// The timeout and notification paths are not silently converted.
+    #[test]
+    fn the_timeout_and_notification_paths_are_unchanged() {
+        // The ordinary timeout scan still wakes at task rank before clearing at ipc rank.
+        let at = IPC_STATE
+            .find("let Some(deadline) = tcb.ipc_timeout_deadline else {")
+            .expect("the scan");
+        let body = &IPC_STATE[at..];
+        assert!(
+            body.find("tcb.status = TaskStatus::Runnable;")
+                .expect("wake")
+                < body
+                    .find("ipc.clear_endpoint_waiters_for_identity(identity);")
+                    .expect("clear"),
+            "the wake-before-clear ordering is untouched in WA2A"
+        );
+        // The notification wake still keys on its own table.
+        assert!(
+            IPC_STATE.contains("ipc.notification_waiters[notification_idx].take()"),
+            "the notification wake is untouched"
+        );
+        // Neither path references the new primitive.
+        for owner in ["WaiterOwner::OrdinaryTimeout", "WaiterOwner::Notification"] {
+            assert!(
+                !IPC_STATE.contains(owner),
+                "naming `{owner}` in the owner enum does NOT wire that path"
+            );
+        }
+    }
+
+    /// Every WA1-GATE status figure is intact.
+    #[test]
+    fn the_wa1_gate_status_is_unchanged() {
+        let production = MODRS
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the predicate");
+        assert_eq!(production.trim(), "false");
+        assert!(!crate::kernel::boot::ipccall_direct_production_enabled());
+        assert!(AUDIT.contains("WAITER_OWNERSHIP_EXCLUSIVE=no"));
+        assert!(AUDIT.contains("39 / 7 / 46") && STATUS.contains("39 / 7 / 46"));
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+    }
+
+    /// The census the primitive is built against is recorded with its two exclusivity breaks.
+    #[test]
+    fn the_census_is_recorded_with_its_two_breaks() {
+        // 15 audited rows, each naming a real function.
+        for owner in [
+            "publish_recv_waiter_live",
+            "sr_claim_endpoint_waiter_split",
+            "sr_restore_endpoint_waiter_split",
+            "ipc_try_send_to_plain_receiver_endpoint_only",
+            "ipc_try_send_sync_endpoint_only",
+            "ipc_clear_plain_receiver_waiter_only",
+            "wake_waiter_for_endpoint",
+            "ipc_reply",
+            "ctx_finalize_and_wake",
+            "clear_ipc_waiters_for_tid",
+            "process_ipc_timeout_deadlines",
+        ] {
+            assert!(
+                OWNERSHIP.contains(owner),
+                "census row `{owner}` must be recorded in the primitive's doc"
+            );
+        }
+        assert!(
+            OWNERSHIP.contains("**NO — wakes at task rank first**")
+                && OWNERSHIP.contains("**NO — different table**"),
+            "both exclusivity breaks must be marked in the census"
+        );
+    }
+}

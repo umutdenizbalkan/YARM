@@ -3142,6 +3142,122 @@ proof knob.
 
 ---
 
+### 6.1.31 WA2A — the generation-bearing waiter-ownership primitive (helper-only)
+
+An ownership-model increment only. No production call site, no transaction reorder, no timeout,
+notification, shared-region, RISC-V, SBI/IPI, affinity, `wake_only`, ServerDies or 199E change,
+and no change to the production predicate. §6.1.30 remains operative on every contract it states.
+
+#### 1. The census, mechanically gathered
+
+Every production path that installs, replaces, removes or clears an endpoint receive waiter, or
+that moves an endpoint-blocked task out of `Blocked`. Gathered by grepping the four waiter
+primitives (`set_endpoint_waiter`, `take_endpoint_waiter`, `clear_endpoint_waiter_if_identity`,
+`clear_endpoint_waiters_for_identity`) and mapping each site to its enclosing function:
+
+| # | function | lock domains | waiter identity | endpoint generation | consults waiter? |
+|---|---|---|---|---|---|
+| 1 | `publish_recv_waiter_live` | ipc(3) | exact `{tid,asid}` | yes (slot) | installs |
+| 2 | `try_publish_recv_waiter_audit_only` | ipc(3) | exact | yes | installs |
+| 3 | `sr_claim_endpoint_waiter_split` | ipc(3) | exact | **yes, compared** | claims exactly once |
+| 4 | `sr_restore_endpoint_waiter_split` | task(2) probe → ipc(3) | exact | yes | restores exact identity |
+| 5 | `ipc_try_send_to_plain_receiver_endpoint_only` | ipc(3) | exact | yes | clears iff identity matches |
+| 6 | `ipc_try_send_sync_endpoint_only` | ipc(3) | exact | yes | clears iff identity matches |
+| 7 | `ipc_clear_plain_receiver_waiter_only` | ipc(3) | exact | yes | clears iff identity matches |
+| 8 | `wake_waiter_for_endpoint` | ipc(3) → task(2) → sched(1) | index only | slot | takes unconditionally |
+| 9 | `ipc_reply` | broad | index only | slot | takes unconditionally |
+| 10 | `ctx_finalize_and_wake` (shared region) | ipc(3) | index only | slot | takes unconditionally |
+| 11 | `clear_ipc_waiters_for_tid` (teardown) | ipc(3) | identity sweep | — | clears by identity |
+| 12 | **`process_ipc_timeout_deadlines`** | task(2) **then** ipc(3) | identity sweep | — | **NO — wakes at task rank first** |
+| 13 | **notification signal wake** | ipc(3) → task(2) → sched(1) | TID only | — | **NO — different table** |
+| 14 | server-death completion | terminal → ipc(3) → task(2) | exact + blocked-recv gen | yes | claims terminal *and* waiter |
+| 15 | reply-receive timeout | terminal → ipc(3) → task(2) | exact + blocked-recv gen | yes | claims terminal *and* waiter |
+
+Rows **12** and **13** are the two exclusivity breaks named in §6.1.29/§6.1.30 — the same two
+that keep `WAITER_OWNERSHIP_EXCLUSIVE=no`. Rows **8**, **9** and **10** take by index with no
+identity compare, so they cannot distinguish a replacement waiter from the one they meant. The
+census lives in the module doc of `src/kernel/waiter_ownership.rs` and
+`the_census_is_recorded_with_its_two_breaks` pins that both breaks stay recorded.
+
+#### 2. The primitive
+
+`WaiterOwnershipTable` is a bounded (`WAITER_OWNERSHIP_SLOTS = 64`), allocation-free typed state
+machine. Its key is exact in **four** dimensions where the waiter table is exact in two:
+
+* endpoint index **and** endpoint generation,
+* waiter `tid` **and** `asid` (via the existing `ReceiverWaiterIdentity`),
+* the task's blocked-receive generation.
+
+A recycled endpoint slot, a reused numeric TID under a new ASID, and a task that unblocked and
+reblocked are therefore three distinct keys, and none can inherit another's claim. State is
+`Available → Claimed{owner, claim_generation} → Consumed | Cancelled`, never a bool; owners are
+the typed `DirectRequest | DirectReply | OrdinaryTimeout | LegacyDelivery | Notification |
+Teardown`. **Naming an owner does not wire that path.**
+
+`claim()` returns an owned, `Copy` `WaiterClaimToken`. Restoration (`consume`, `restore`,
+`cancel`) validates the full key **and** the owner **and** the `claim_generation`, so a token
+retained across a claim/cancel/re-claim cycle is rejected — including when the *same* owner
+re-claims, which is the case a naive owner-only check would miss.
+
+#### 3. Lock discipline
+
+The module acquires **nothing**. It is a pure state machine over owned data borrowed as
+`&mut WaiterOwnershipTable`, so the caller supplies the rank-3 ipc guard and the primitive
+structurally cannot nest task(2) or scheduler(1) beneath it. The token is `Copy` and outlives the
+guard. `the_primitive_touches_no_other_subsystem_and_takes_no_lock` pins that the source contains
+no lock acquisition and no cross-subsystem import.
+
+#### 4. Mutation results
+
+Five mutations were applied to the real primitive and the hosted suite re-run:
+
+| # | mutation | caught? |
+|---|---|---|
+| M1 | drop the owner comparison in `validate` | yes — 3 tests fail |
+| M2 | drop the `claim_generation` comparison | **initially NO** |
+| M3 | drop endpoint generation from the key | yes |
+| M4 | drop ASID from the key | yes |
+| M5 | drop the blocked-wait generation from the key | yes |
+
+M2 survived because the existing stale-token test re-claimed under a *different* owner, so the
+owner check masked the missing generation check. That is a real gap in the test, not in the
+primitive: `a_stale_token_is_rejected_even_when_the_same_owner_reclaims` was added, and M2 now
+fails. The gap is recorded rather than quietly repaired.
+
+#### 5. Why no QEMU run
+
+The precondition is mechanical, not asserted. Three files change: `src/kernel/mod.rs` (one module
+declaration), `src/kernel/boot/tests.rs` (`#[cfg(test)]`-gated in its entirety) and the new
+`src/kernel/waiter_ownership.rs`. Building the freestanding `x86_64-yarm-none` kernel at the base
+commit and at this commit and diffing the defined-symbol sets of `libyarm.rlib` gives:
+
+```text
+symbols removed: 0
+symbols changed: 0
+symbols added:   2   (kernel::waiter_ownership::WaiterOwnershipTable::{new, Default::default})
+```
+
+Both added symbols are constructors with **zero callers anywhere in the tree**. No existing
+symbol was added, removed or renamed, so no production runtime path changed and there is nothing
+new for a live run to observe. `the_primitive_has_no_production_caller` walks the source tree and
+enforces the zero-caller property going forward, with a non-vacuity assertion so it cannot pass
+by finding nothing.
+
+#### Status
+
+* `WAITER_OWNERSHIP_EXCLUSIVE` — **no** (unchanged; rows 12 and 13 still break it)
+* waiter-claim-aware timeout arbitration — **not implemented**
+* generation-bearing notification arbitration — **not implemented**
+* NR6/NR7 waiter claim position — **unchanged** (single late claim, step 9 / step 5)
+* x86 direct production default — **OFF** on every architecture
+* current ledger — **39 / 7 / 46** (no cell moves)
+* canonical 199D — **OPEN**
+* RISC-V links/status — unchanged (link 1 ABSENT; 2, 3, 7, 9 present; 4, 5, 6, 8, 10 absent;
+  `RISCV_REMOTE_WAKE=D`; `RISCV_199D_READINESS=case_b`; coordinate 23 OPEN)
+* **no new live cell**
+
+---
+
 
 ## 7. Method and limits
 
