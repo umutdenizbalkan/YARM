@@ -639,6 +639,13 @@ impl KernelState {
         self.fault_current_task_with_fault(Some(fault))
     }
 
+    /// Hosted/test-only entry to the private fault path, so the WA3A transition-barrier
+    /// tests can drive the real production code rather than a copy of it.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn fault_current_task_for_test(&mut self) -> Result<(), KernelError> {
+        self.fault_current_task()
+    }
+
     fn fault_current_task(&mut self) -> Result<(), KernelError> {
         let fault = self.with_fault_state(|faults| faults.last_fault);
         self.fault_current_task_with_fault(fault)
@@ -687,6 +694,27 @@ impl KernelState {
         if fault_delivery {
             crate::yarm_log!("FAULT_DELIVERY_TASK_STOP_BEGIN tid={}", running_tid);
         }
+        // Stage 199D-WA3A: validate the victim BEFORE the authoritative scheduler mutation.
+        // `block_current_cpu` clears `current` at rank 1 and is not undone below, so a status
+        // check placed after it would be a check after an irreversible commit. The exact
+        // precondition — the fault victim is the current task and is still `Running` — is
+        // therefore evaluated at rank 2 first, and a refusal touches neither domain.
+        if let Err(refusal) = self.with_tcbs(|tcbs| {
+            crate::kernel::task_transition::task_transition_would_be_accepted(
+                tcbs,
+                running_tid,
+                None,
+                crate::kernel::task_transition::TaskTransition::FaultRunningCurrent,
+            )
+        }) {
+            crate::kernel::task_transition::log_transition_refusal(
+                "fault_current_task_with_fault",
+                running_tid,
+                crate::kernel::task_transition::TaskTransition::FaultRunningCurrent,
+                refusal,
+            );
+            return Err(KernelError::TaskMissing);
+        }
         let faulted_tid = self.block_current_cpu().ok_or_else(|| {
             if cfg!(not(feature = "hosted-dev")) {
                 crate::yarm_log!(
@@ -696,22 +724,32 @@ impl KernelState {
             }
             KernelError::TaskMissing
         })?;
+        // The scheduler must have blocked out exactly the task we validated. Anything else is
+        // a different victim and is refused before the status write.
+        if faulted_tid != running_tid {
+            crate::yarm_log!(
+                "TASK_TRANSITION_REFUSED site=fault_current_task_with_fault tid={} transition=fault_running_current reason=victim_changed observed_tid={}",
+                running_tid,
+                faulted_tid
+            );
+            return Err(KernelError::TaskMissing);
+        }
         self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == faulted_tid)
-                .ok_or_else(|| {
-                    if cfg!(not(feature = "hosted-dev")) {
-                        crate::yarm_log!(
-                            "TASK_MISSING site=fault_current_task/faulted_tcb_lookup cpu={} tid={}",
-                            cpu.0,
-                            faulted_tid
-                        );
-                    }
-                    KernelError::TaskMissing
-                })?;
-            tcb.status = TaskStatus::Faulted;
+            crate::kernel::task_transition::apply_task_transition(
+                tcbs,
+                faulted_tid,
+                None,
+                crate::kernel::task_transition::TaskTransition::FaultRunningCurrent,
+            )
+            .map_err(|refusal| {
+                crate::kernel::task_transition::log_transition_refusal(
+                    "fault_current_task_with_fault",
+                    faulted_tid,
+                    crate::kernel::task_transition::TaskTransition::FaultRunningCurrent,
+                    refusal,
+                );
+                KernelError::TaskMissing
+            })?;
             Ok::<_, KernelError>(())
         })?;
         if fault_delivery {

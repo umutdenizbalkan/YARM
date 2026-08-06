@@ -780,15 +780,67 @@ impl SharedKernel {
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
-    pub(crate) fn d6_genuine_mark_running_via_task_seam(&self, incoming: Option<u64>) {
+    /// Stage 199D-WA3A: the write is now an EXACT `Runnable → Running` transition, compiled
+    /// into every build. `incoming` was produced by a rank-1 dequeue that already set `current`,
+    /// so a refusal cannot simply return: it undoes that dequeue exactly through
+    /// `preempt_reenqueue_only_on` (the existing inverse of `dispatch_next_on`) so the task is
+    /// neither lost from the queue nor left as a `current` the CPU will not resume.
+    ///
+    /// Returns `true` iff the incoming task is now `Running` and may be resumed. `false` means
+    /// nothing is current on `cpu` and the caller must not resume `incoming`.
+    #[must_use]
+    pub(crate) fn d6_genuine_mark_running_via_task_seam(
+        &self,
+        incoming: Option<u64>,
+        cpu: CpuId,
+    ) -> bool {
         let Some(tid) = incoming else {
-            return;
+            // Nothing was dispatched, so there is nothing to mark and nothing to undo.
+            return true;
         };
-        self.with_task_tcbs_split_mut(|tcbs| {
-            if let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) {
-                tcb.status = crate::kernel::task::TaskStatus::Running;
+        let marked = self.with_task_tcbs_split_mut(|tcbs| {
+            use crate::kernel::task_transition::{
+                TaskTransition, apply_task_transition, log_transition_refusal,
+            };
+            // `PriorityScheduler::dispatch_next` returns the EXISTING current without
+            // dequeuing whenever one is set and is not idle, so this seam sees two legal
+            // shapes and cannot tell them apart from outside: a genuine dequeue
+            // (`Runnable → Running`) and a queue-neutral continuation (`Running → Running`,
+            // a no-op). Both are accepted; every other status — `Blocked(_)` above all, but
+            // also `Faulted`, `Exited` and `Dead` — is refused.
+            match apply_task_transition(tcbs, tid, None, TaskTransition::DispatchIncoming) {
+                Ok(_) => true,
+                Err(_) => {
+                    match apply_task_transition(tcbs, tid, None, TaskTransition::ContinueCurrent) {
+                        Ok(_) => true,
+                        Err(refusal) => {
+                            log_transition_refusal(
+                                "d6_genuine_mark_running_via_task_seam",
+                                tid,
+                                TaskTransition::DispatchIncoming,
+                                refusal,
+                            );
+                            false
+                        }
+                    }
+                }
             }
         });
+        if marked {
+            return true;
+        }
+        // Exact rollback of the rank-1 dequeue: re-enqueue the task and clear `current`.
+        let restored = self.with_scheduler_split_mut(|sched| {
+            kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu)
+                == Some(crate::kernel::ipc::ThreadId(tid))
+        });
+        crate::yarm_log!(
+            "D6_MARK_RUNNING_REFUSED cpu={} tid={} scheduler_rollback={}",
+            cpu.0,
+            tid,
+            u8::from(restored)
+        );
+        false
     }
 
     /// Stage 168B (D2-GENUINE-RECV): re-verify — out of the global lock, through
@@ -1195,16 +1247,41 @@ impl SharedKernel {
     /// either way — this restores the invariant before halting so the failure is diagnosable and
     /// the scheduler is not left in a torn state.
     pub(crate) fn direct_dispatch_rollback_split(&self, cpu: CpuId, incoming: u64) -> bool {
-        // Rank 2 first: undo the status mutation.
+        // Rank 2 first: undo the status mutation — but ONLY from the exact predecessor this
+        // transaction created. Stage 199D-WA3A: an unconditional write here would "roll back"
+        // a task this transaction never dispatched, including a replacement incarnation that
+        // reused the numeric TID, or a receiver that has since blocked.
         let status_ok = self.with_task_tcbs_split_mut(|tcbs| {
-            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == incoming) {
-                Some(tcb) => {
-                    tcb.status = crate::kernel::task::TaskStatus::Runnable;
-                    true
+            match crate::kernel::task_transition::apply_task_transition(
+                tcbs,
+                incoming,
+                None,
+                crate::kernel::task_transition::TaskTransition::RollbackDispatchedIncoming,
+            ) {
+                Ok(_) => true,
+                Err(refusal) => {
+                    crate::kernel::task_transition::log_transition_refusal(
+                        "direct_dispatch_rollback_split",
+                        incoming,
+                        crate::kernel::task_transition::TaskTransition::RollbackDispatchedIncoming,
+                        refusal,
+                    );
+                    false
                 }
-                None => false,
             }
         });
+        if !status_ok {
+            // Fail closed: the task half was refused, so the scheduler half must NOT run — a
+            // `preempt_reenqueue_only_on` here would re-enqueue a task whose status this
+            // transaction does not own, and could displace a live `current`. The caller's
+            // explicit fatal path handles the torn dispatch.
+            crate::yarm_log!(
+                "DIRECT_DISPATCH_ROLLBACK_REFUSED cpu={} incoming={} reason=not_this_transactions_dispatch",
+                cpu.0,
+                incoming
+            );
+            return false;
+        }
         // Rank 1: undo the dequeue and the current-set with the EXISTING exact inverse —
         // `preempt_reenqueue_only_on` re-enqueues the current task and clears `current` without
         // dispatching, which is precisely what `dispatch_next_on` did in reverse. No new

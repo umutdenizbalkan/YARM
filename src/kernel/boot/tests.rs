@@ -11692,7 +11692,10 @@ fn stage113_d6_phase_a_lock_dropped_before_phase_b_side_effects() {
     for phase_b_marker in [
         "self.hal.switch_address_space(",
         "self.maybe_switch_kernel_context(",
-        "tcb.status = TaskStatus::Running;",
+        // Stage 199D-WA3A: the raw `tcb.status = Running` write became an EXACT
+        // `Runnable → Running` transition through the production barrier. Same Phase-B
+        // position, stronger contract.
+        "TaskTransition::DispatchIncoming",
     ] {
         let pos = body
             .find(phase_b_marker)
@@ -60946,7 +60949,7 @@ mod stage192a_queue_advancing_dispatch {
             TRAP_SRC.contains("futex_wait_was_deferred")
                 && TRAP_SRC.contains("shared.futex_wait_reverify_blocked(t)")
                 && TRAP_SRC.contains("shared.futex_wait_dispatch_step_mut(cpu)")
-                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)")
                 && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
             "the trap-entry futex drain must reverify + dispatch-step + mark-running + restore"
         );
@@ -61149,7 +61152,7 @@ mod stage192b_yield_queue_advancing_dispatch {
             TRAP_SRC.contains("yield_was_deferred")
                 && TRAP_SRC.contains("shared.yield_reverify_ready(cpu)")
                 && TRAP_SRC.contains("shared.yield_dispatch_step_mut(cpu)")
-                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)")
                 && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
             "the trap-entry yield drain must reverify + dispatch-step + mark-running + restore"
         );
@@ -72896,7 +72899,7 @@ mod stage196d_riscv_queue_switch_foundation {
         );
         // Before the restore, B is set current + marked Running via the accepted rank-2 task seam.
         assert!(
-            RISCV_TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+            RISCV_TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)")
                 && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}"),
             "the incoming task must be marked Running via the accepted task seam before restore"
         );
@@ -105383,7 +105386,7 @@ mod stage199d_aarch64_offlock_dispatch {
         // Commit the scheduler mutation, exactly as the drain does.
         let inc = k.futex_wait_dispatch_step_mut(CpuId(0)).expect("dequeue");
         assert_eq!(inc, INCOMING);
-        k.d6_genuine_mark_running_via_task_seam(Some(inc));
+        assert!(k.d6_genuine_mark_running_via_task_seam(Some(inc), CpuId(0)));
         assert_eq!(k.current_tid_authoritative(CpuId(0)), Some(INCOMING));
         assert_eq!(
             k.with(|s| s.task_status(INCOMING)),
@@ -105581,7 +105584,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .and_then(|s| s.split("\n    // Stage 192A").next())
             .expect("the direct dispatch drain");
         assert!(drain.contains("shared.futex_wait_dispatch_step_mut(cpu)"));
-        assert!(drain.contains("shared.d6_genuine_mark_running_via_task_seam(Some(inc))"));
+        assert!(drain.contains("shared.d6_genuine_mark_running_via_task_seam(Some(inc), cpu)"));
         assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch"));
         // The rollback uses the existing exact inverse of the dequeue, not a new primitive.
         const RUNTIME: &str = include_str!("../../runtime.rs");
@@ -113095,15 +113098,18 @@ mod stage199d_wa2a_ownership_boundary {
     /// `sibling_writes_are_absent` proves that separately. A new site anywhere breaks this pin.
     #[test]
     fn every_production_task_status_assignment_site_is_enumerated() {
+        // Stage 199D-WA3A: eight of the original 37 sites no longer write `tcb.status` at all —
+        // they go through the production transition barrier, whose single write lives in
+        // `task_transition.rs`. The raw-write census is therefore 29 + the barrier's own one.
         const PINNED: &[(&str, usize)] = &[
-            ("src/kernel/boot/exec_state.rs", 10),
-            ("src/kernel/boot/fault_state.rs", 1),
+            ("src/kernel/boot/exec_state.rs", 5),
             ("src/kernel/boot/ipc_state.rs", 9),
             ("src/kernel/boot/restart_state.rs", 4),
             ("src/kernel/boot/scheduler_state.rs", 1),
             ("src/kernel/boot/thread_state.rs", 4),
             ("src/kernel/task.rs", 1),
-            ("src/runtime.rs", 7),
+            ("src/kernel/task_transition.rs", 1),
+            ("src/runtime.rs", 5),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -113121,9 +113127,15 @@ mod stage199d_wa2a_ownership_boundary {
         assert_eq!(
             found, expected,
             "the status-transition census must match exactly — a new or removed site is a new \
-             candidate wake owner and must be classified in §6.1.32"
+             candidate wake owner and must be classified in §6.1.32 / §6.1.35"
         );
-        assert_eq!(found.iter().map(|(_, n)| n).sum::<usize>(), 37);
+        assert_eq!(
+            found.iter().map(|(_, n)| n).sum::<usize>(),
+            30,
+            "29 raw writes plus the single write inside the WA3A barrier"
+        );
+        // The eight barriered sites are enumerated by the WA2B census module, which adds them
+        // back to reach the unchanged total of 37 transition sites.
     }
 
     /// The enumeration above is the CLOSURE of "moves a task out of `Blocked`" only because
@@ -113383,6 +113395,11 @@ mod stage199d_wa2b_wake_owner_census {
     ///
     /// The counts are compared against a mechanical extraction, so a new assignment, a removed
     /// one, or a renamed function all break this table rather than slipping through unclassified.
+    /// `(file, enclosing fn, how many status transition sites it makes, verdict)`.
+    ///
+    /// A **site** is one status transition point, whether it writes `tcb.status` directly or
+    /// goes through the WA3A production barrier. `WA3A_BARRIER_SITES` records which of them are
+    /// barriered and with which typed transitions, so the two views cannot disagree.
     const CENSUS: &[(&str, &str, usize, Verdict)] = &[
         // ── exec_state.rs (10) ──────────────────────────────────────────────────────────────
         (
@@ -113403,36 +113420,41 @@ mod stage199d_wa2b_wake_owner_census {
             2,
             Verdict::Cannot,
         ),
+        // WA3A HARD-STOP: the absence precondition is not satisfiable while boot registers the
+        // RING3 TIDs before spawning onto them, so this site stays CAN (§6.1.35 C).
         (
             "src/kernel/boot/exec_state.rs",
             "spawn_user_task_from_image",
             1,
             Verdict::Can,
         ),
+        // WA3A: barriered, Runnable -> Running (or queue-neutral Running -> Running).
         (
             "src/kernel/boot/exec_state.rs",
             "dispatch_next_task",
             1,
-            Verdict::Can,
+            Verdict::Cannot,
         ),
+        // WA3A: barriered, Running -> Runnable (idle-only Runnable -> Runnable) + dispatch.
         (
             "src/kernel/boot/exec_state.rs",
             "yield_current",
             2,
-            Verdict::Can,
+            Verdict::Cannot,
         ),
         (
             "src/kernel/boot/exec_state.rs",
             "yield_current_to",
             2,
-            Verdict::Can,
+            Verdict::Cannot,
         ),
         // ── fault_state.rs (1) ──────────────────────────────────────────────────────────────
+        // WA3A: barriered, Running -> Faulted, validated BEFORE block_current_cpu.
         (
             "src/kernel/boot/fault_state.rs",
             "fault_current_task_with_fault",
             1,
-            Verdict::Can,
+            Verdict::Cannot,
         ),
         // ── ipc_state.rs (9) ────────────────────────────────────────────────────────────────
         (
@@ -113549,17 +113571,18 @@ mod stage199d_wa2b_wake_owner_census {
         // ── task.rs (1) ─────────────────────────────────────────────────────────────────────
         ("src/kernel/task.rs", "new", 1, Verdict::FreshConstructor),
         // ── runtime.rs (7) ──────────────────────────────────────────────────────────────────
+        // WA3A: barriered.
         (
             "src/runtime.rs",
             "d6_genuine_mark_running_via_task_seam",
             1,
-            Verdict::Can,
+            Verdict::Cannot,
         ),
         (
             "src/runtime.rs",
             "direct_dispatch_rollback_split",
             1,
-            Verdict::Can,
+            Verdict::Cannot,
         ),
         ("src/runtime.rs", "futex_wake_split_mut", 1, Verdict::Cannot),
         ("src/runtime.rs", "sr_wake_receiver_split", 1, Verdict::Can),
@@ -113580,6 +113603,59 @@ mod stage199d_wa2b_wake_owner_census {
             "futex_wait_publish_block_split_mut",
             1,
             Verdict::IntoBlocked,
+        ),
+    ];
+
+    /// The eight WA3A-barriered sites: `(file, fn, sites, the typed transitions it uses)`.
+    ///
+    /// These no longer write `tcb.status` at all — the only production write for this cohort is
+    /// inside `apply_task_transition`, which is exact and fail-closed by construction.
+    const WA3A_BARRIER_SITES: &[(&str, &str, usize, &[&str])] = &[
+        (
+            "src/runtime.rs",
+            "d6_genuine_mark_running_via_task_seam",
+            1,
+            &["DispatchIncoming", "ContinueCurrent"],
+        ),
+        (
+            "src/runtime.rs",
+            "direct_dispatch_rollback_split",
+            1,
+            &["RollbackDispatchedIncoming"],
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "dispatch_next_task",
+            1,
+            &["DispatchIncoming", "ContinueCurrent"],
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current",
+            2,
+            &[
+                "PreemptOutgoing",
+                "PreemptOutgoingIdle",
+                "DispatchIncoming",
+                "ContinueCurrent",
+            ],
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current_to",
+            2,
+            &[
+                "PreemptOutgoing",
+                "PreemptOutgoingIdle",
+                "DispatchIncoming",
+                "ContinueCurrent",
+            ],
+        ),
+        (
+            "src/kernel/boot/fault_state.rs",
+            "fault_current_task_with_fault",
+            1,
+            &["FaultRunningCurrent"],
         ),
     ];
 
@@ -113667,7 +113743,7 @@ mod stage199d_wa2b_wake_owner_census {
     /// Mechanically extracted `(file, fn, count)`, sorted, over the same production sources and
     /// the same two assignment forms the WA2A-R1 enumeration guard counts.
     fn extracted() -> alloc::vec::Vec<(String, String, usize)> {
-        let mut files: alloc::vec::Vec<&str> = CENSUS.iter().map(|(f, ..)| *f).collect();
+        let mut files: alloc::vec::Vec<&str> = FINGERPRINTS.iter().map(|(f, ..)| *f).collect();
         files.sort();
         files.dedup();
         let mut out: alloc::vec::Vec<(String, String, usize)> = alloc::vec::Vec::new();
@@ -113746,55 +113822,6 @@ mod stage199d_wa2b_wake_owner_census {
             "tcb.status",
             "TaskStatus::Runnable",
             "}",
-            "Ok::<_, KernelError>(())",
-        ),
-        (
-            "src/kernel/boot/exec_state.rs",
-            "dispatch_next_task",
-            "tcb.status",
-            "TaskStatus::Running",
-            ".ok_or(KernelError::TaskMissing)?;",
-            "Ok::<_, KernelError>(())",
-        ),
-        (
-            "src/kernel/boot/exec_state.rs",
-            "yield_current",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            ".ok_or(KernelError::TaskMissing)?;",
-            "Ok::<_, KernelError>(())",
-        ),
-        (
-            "src/kernel/boot/exec_state.rs",
-            "yield_current",
-            "tcb.status",
-            "TaskStatus::Running",
-            ".ok_or(KernelError::TaskMissing)?;",
-            "Ok::<_, KernelError>(())",
-        ),
-        (
-            "src/kernel/boot/exec_state.rs",
-            "yield_current_to",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            ".ok_or(KernelError::TaskMissing)?;",
-            "Ok::<_, KernelError>(())",
-        ),
-        (
-            "src/kernel/boot/exec_state.rs",
-            "yield_current_to",
-            "tcb.status",
-            "TaskStatus::Running",
-            ".ok_or(KernelError::TaskMissing)?;",
-            "Ok::<_, KernelError>(())",
-        ),
-        // src/kernel/boot/fault_state.rs
-        (
-            "src/kernel/boot/fault_state.rs",
-            "fault_current_task_with_fault",
-            "tcb.status",
-            "TaskStatus::Faulted",
-            "})?;",
             "Ok::<_, KernelError>(())",
         ),
         // src/kernel/boot/ipc_state.rs
@@ -113957,22 +113984,6 @@ mod stage199d_wa2b_wake_owner_census {
         // src/runtime.rs
         (
             "src/runtime.rs",
-            "d6_genuine_mark_running_via_task_seam",
-            "tcb.status",
-            "crate::kernel::task::TaskStatus::Running",
-            "if let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) {",
-            "}",
-        ),
-        (
-            "src/runtime.rs",
-            "direct_dispatch_rollback_split",
-            "tcb.status",
-            "crate::kernel::task::TaskStatus::Runnable",
-            "Some(tcb) => {",
-            "true",
-        ),
-        (
-            "src/runtime.rs",
             "futex_wake_split_mut",
             "tcb.status",
             "TaskStatus::Runnable",
@@ -114084,7 +114095,11 @@ mod stage199d_wa2b_wake_owner_census {
             FINGERPRINTS.len(),
             "the number of status assignments changed"
         );
-        assert_eq!(sites.len(), 37, "and it must still be 37");
+        assert_eq!(
+            sites.len(),
+            29,
+            "29 raw writes remain after WA3A barriered the other 8"
+        );
         for (i, (file, function, lhs, rhs, before, after)) in sites.iter().enumerate() {
             let (pf, pfn, plhs, prhs, pbefore, pafter) = FINGERPRINTS[i];
             assert_eq!(
@@ -114116,8 +114131,18 @@ mod stage199d_wa2b_wake_owner_census {
                 None => rollup.push((file, function, 1)),
             }
         }
+        // Stage 199D-WA3A: the eight barriered sites no longer write `tcb.status` at all, so
+        // the census covers raw writes AND barriered transitions.
+        for (file, function, sites, _) in WA3A_BARRIER_SITES {
+            match rollup
+                .iter_mut()
+                .find(|(f, n, _)| f == file && n == function)
+            {
+                Some((_, _, n)) => *n += sites,
+                None => rollup.push((file.to_string(), function.to_string(), *sites)),
+            }
+        }
         rollup.sort();
-        assert_eq!(rollup, extracted(), "the two extractions must agree");
         let mut pinned: alloc::vec::Vec<(String, String, usize)> = CENSUS
             .iter()
             .map(|(f, n, c, _)| (f.to_string(), n.to_string(), *c))
@@ -114131,6 +114156,96 @@ mod stage199d_wa2b_wake_owner_census {
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
             37,
             "and it must still be the 37 sites WA2A-R1 pinned"
+        );
+        assert_eq!(
+            FINGERPRINTS.len()
+                + WA3A_BARRIER_SITES
+                    .iter()
+                    .map(|(_, _, n, _)| n)
+                    .sum::<usize>(),
+            37,
+            "29 remaining raw writes + 8 barriered sites"
+        );
+    }
+
+    /// **WA3A.** For the barriered cohort the ONLY production `tcb.status` write is inside the
+    /// barrier, and every barriered site names the typed transitions it may use.
+    #[test]
+    fn the_barrier_is_the_only_writer_for_the_group3_cohort() {
+        let barrier = production_source("src/kernel/task_transition.rs");
+        assert_eq!(
+            barrier.matches("tcb.status = ").count(),
+            1,
+            "exactly one write, in `apply_task_transition`"
+        );
+        assert!(
+            barrier.contains("tcb.status = transition.resulting();"),
+            "and it writes only what the typed transition permits"
+        );
+        assert!(
+            !barrier.contains("debug_assert!(") && !barrier.contains("#[cfg(debug"),
+            "the precondition must hold in RELEASE builds — debug_assert is not sufficient"
+        );
+        for (file, function, _, transitions) in WA3A_BARRIER_SITES {
+            let src = production_source(file);
+            let body = src
+                .split(&alloc::format!("fn {function}("))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{file}: {function}"));
+            let mut end = body.len();
+            for next in [
+                "\n    pub fn ",
+                "\n    pub(crate) fn ",
+                "\n    fn ",
+                "\npub(crate) fn ",
+            ] {
+                if let Some(i) = body.find(next) {
+                    end = end.min(i);
+                }
+            }
+            let scoped = &body[..end];
+            assert!(
+                !scoped.contains("tcb.status = "),
+                "{file}::{function} must not write `tcb.status` directly any more"
+            );
+            for t in *transitions {
+                assert!(
+                    scoped.contains(&alloc::format!("TaskTransition::{t}")),
+                    "{file}::{function} must use the typed transition `{t}`"
+                );
+            }
+        }
+        // The ninth Group-3 site HARD-STOPPED: the absence precondition is not satisfiable by
+        // the current boot sequence, so the gate was reverted rather than weakened. Pin the
+        // reason so the finding cannot be lost, and pin that no weaker predicate crept in.
+        let exec = production_source("src/kernel/boot/exec_state.rs");
+        let spawn = exec
+            .split("pub fn spawn_user_task_from_image(")
+            .nth(1)
+            .expect("spawn");
+        assert!(
+            spawn.contains("Stage 199D-WA3A HARD-STOP"),
+            "the spawn hard-stop must stay recorded at the site"
+        );
+        assert!(
+            !spawn.contains("if self.task_status(spec.tid).is_some() {"),
+            "the absence gate is reverted, not silently retained"
+        );
+        assert!(
+            !spawn.contains("Blocked(WaitReason::EndpointReceive"),
+            "and no weaker `not endpoint-blocked` predicate replaced it"
+        );
+        // The boot sequence that makes the precondition unsatisfiable is pinned too, so the
+        // hard-stop is falsifiable: if boot stops pre-registering, this fails and the site can
+        // be re-derived.
+        let boot = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/arch/x86_64/boot.rs"),
+        )
+        .expect("x86 boot");
+        assert!(
+            boot.contains("kernel.register_task_with_class(RING3_SUPERVISOR_TID")
+                && boot.contains("kernel.spawn_user_task_from_image(UserImageSpec {"),
+            "x86 boot must still register the RING3 TIDs before spawning onto them"
         );
     }
 
@@ -114317,9 +114432,10 @@ mod stage199d_wa2b_wake_owner_census {
             37,
             "the classes must partition the enumerated sites"
         );
+        // Stage 199D-WA3A moved the nine Group-3 sites CAN → CANNOT by production enforcement.
         assert_eq!(
             (can, cannot, into_blocked, fresh, non_production),
-            (21, 7, 7, 1, 1)
+            (13, 15, 7, 1, 1)
         );
 
         // The verdict is derived, not written down.
@@ -114343,8 +114459,8 @@ mod stage199d_wa2b_wake_owner_census {
         }
         // …and the audit records the same computed numbers.
         assert!(
-            AUDIT.contains("| CAN | 21 |")
-                && AUDIT.contains("| CANNOT | 7 |")
+            AUDIT.contains("| CAN | 13 |")
+                && AUDIT.contains("| CANNOT | 15 |")
                 && AUDIT.contains("| INTO_BLOCKED | 7 |")
                 && AUDIT.contains("| FRESH_CONSTRUCTOR | 1 |")
                 && AUDIT.contains("| NON_PRODUCTION | 1 |")
@@ -114411,10 +114527,18 @@ mod stage199d_wa2b_wake_owner_census {
             .filter(|(_, _, _, v)| *v == Verdict::Cannot)
             .map(|(_, _, c, _)| c)
             .sum();
+        // Three proof shapes cover every CANNOT site:
+        //   * PROOFS below — a local precondition plus its caller closure (the pre-WA3A seven);
+        //   * WA3A_BARRIER_SITES — a typed production transition, proven by
+        //     `the_barrier_is_the_only_writer_for_the_group3_cohort` (eight);
+        // `spawn_user_task_from_image` is NOT here: its absence precondition hard-stopped
+        // (§6.1.35 C) and it stays CAN.
+        let barriered: usize = WA3A_BARRIER_SITES.iter().map(|(_, _, n, _)| n).sum();
         assert_eq!(
-            PROOFS.len(),
+            PROOFS.len() + barriered,
             cannot_sites,
-            "every CANNOT assignment needs its own guard + closure proof"
+            "every CANNOT site needs a guard+closure proof, a production barrier, or the \
+             absence gate"
         );
 
         for (file, function, guard, closure) in PROOFS {
@@ -114663,5 +114787,341 @@ mod stage199d_wa2b_wake_owner_census {
                 && matrix.contains("The precondition is *absence*, not"),
             "the spawn_user_task_from_image reasoning must be recorded in full"
         );
+    }
+}
+
+/// Stage 199D-WA3A — behavioural tests for the production transition barriers.
+///
+/// Every one of these drives the REAL production path and asserts the refusal is fail-closed:
+/// the task keeps its status, the scheduler keeps its shape, and nothing is lost.
+mod stage199d_wa3a_transition_barriers {
+    use super::*;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+
+    const BLOCKED: u64 = 41;
+    const OTHER: u64 = 42;
+
+    fn kernel_with(tids: &[u64]) -> KernelState {
+        let mut state = Bootstrap::init().expect("init");
+        for tid in tids {
+            state.register_task(*tid).expect("register");
+        }
+        state
+    }
+
+    fn block_on_endpoint(state: &mut KernelState, tid: u64) {
+        state.set_task_status_for_test(
+            tid,
+            TaskStatus::Blocked(WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(7),
+            )),
+        );
+    }
+
+    /// Snapshot of everything a refusal must leave untouched.
+    fn snapshot(state: &KernelState, tids: &[u64]) -> alloc::vec::Vec<(u64, Option<TaskStatus>)> {
+        tids.iter().map(|t| (*t, state.task_status(*t))).collect()
+    }
+
+    // ── dispatch: a blocked receiver in the run queue is never made Running ─────────────────
+
+    #[test]
+    fn a_blocked_receiver_cannot_be_dispatched_running() {
+        let mut state = kernel_with(&[BLOCKED]);
+        state.enqueue_task(BLOCKED).expect("enqueue");
+        block_on_endpoint(&mut state, BLOCKED);
+        let before = snapshot(&state, &[BLOCKED]);
+        let queued_before = state.runnable_count_on_cpu(CpuId(0));
+
+        let dispatched = state.dispatch_next_task();
+        assert!(
+            dispatched.is_err(),
+            "dispatching a Blocked(EndpointReceive) task must fail closed, got {dispatched:?}"
+        );
+        assert_eq!(snapshot(&state, &[BLOCKED]), before, "status unchanged");
+        assert_eq!(
+            state.runnable_count_on_cpu(CpuId(0)),
+            queued_before,
+            "no task is lost from the run queue"
+        );
+        assert_ne!(
+            state.current_tid(),
+            Some(BLOCKED),
+            "a blocked task must never become current"
+        );
+    }
+
+    #[test]
+    fn a_blocked_receiver_cannot_be_yielded_to_runnable() {
+        let mut state = kernel_with(&[BLOCKED, OTHER]);
+        state.enqueue_task(BLOCKED).expect("enqueue");
+        state.enqueue_task(OTHER).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let current = state.current_tid().expect("a current task");
+        // Block the CURRENT task, exactly as a recv-v2 block does, then yield.
+        block_on_endpoint(&mut state, current);
+        let before = snapshot(&state, &[BLOCKED, OTHER]);
+
+        assert!(
+            state.yield_current().is_err(),
+            "yielding a Blocked(EndpointReceive) current task must fail closed"
+        );
+        assert_eq!(
+            snapshot(&state, &[BLOCKED, OTHER]),
+            before,
+            "neither outgoing nor incoming status changed"
+        );
+        assert_eq!(
+            state.current_tid(),
+            Some(current),
+            "the current slot is untouched by a refused yield"
+        );
+    }
+
+    #[test]
+    fn a_non_running_outgoing_task_cannot_be_preempted() {
+        for bad in [
+            TaskStatus::Faulted,
+            TaskStatus::Exited(2),
+            TaskStatus::Dead,
+            TaskStatus::Blocked(WaitReason::Join(ThreadId(9))),
+        ] {
+            let mut state = kernel_with(&[BLOCKED, OTHER]);
+            state.enqueue_task(BLOCKED).expect("enqueue");
+            state.enqueue_task(OTHER).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            let current = state.current_tid().expect("current");
+            state.set_task_status_for_test(current, bad);
+            assert!(
+                state.yield_current().is_err(),
+                "yielding a {bad:?} current task must fail closed"
+            );
+            assert_eq!(state.task_status(current), Some(bad));
+            assert_eq!(state.current_tid(), Some(current));
+        }
+    }
+
+    #[test]
+    fn a_non_runnable_incoming_task_cannot_become_current() {
+        let mut state = kernel_with(&[BLOCKED, OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch OTHER");
+        assert_eq!(state.current_tid(), Some(OTHER));
+        // Queue a task and then block it, so the next dispatch selects a blocked incoming.
+        state.enqueue_task(BLOCKED).expect("enqueue");
+        block_on_endpoint(&mut state, BLOCKED);
+        let before = snapshot(&state, &[BLOCKED, OTHER]);
+
+        assert!(
+            state.yield_current_to(ThreadId(BLOCKED)).is_err(),
+            "preferring a blocked task must fail closed"
+        );
+        assert_eq!(
+            state.task_status(BLOCKED),
+            before[0].1,
+            "the blocked task keeps its status"
+        );
+        assert_ne!(state.current_tid(), Some(BLOCKED));
+    }
+
+    // ── rollback: only this transaction's dispatch may be undone ───────────────────────────
+
+    #[test]
+    fn a_stale_rollback_plan_cannot_alter_a_replacement_incarnation() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            // The replacement incarnation is Blocked, not the Running task the rollback thinks
+            // it dispatched.
+            s.set_task_status_for_test(
+                OTHER,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    crate::kernel::capabilities::CapId(3),
+                )),
+            );
+        });
+        assert!(
+            !kernel.direct_dispatch_rollback_split(CpuId(0), OTHER),
+            "a rollback must refuse a task this transaction never dispatched"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(3)
+            ))),
+            "and must not have touched it"
+        );
+    }
+
+    #[test]
+    fn the_d6_seam_refuses_a_blocked_incoming_and_rolls_the_dequeue_back() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(BLOCKED).expect("register");
+            s.enqueue_task(BLOCKED).expect("enqueue");
+            s.set_task_status_for_test(
+                BLOCKED,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    crate::kernel::capabilities::CapId(3),
+                )),
+            );
+        });
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        // Commit the rank-1 dequeue exactly as a drain does, then mark.
+        let inc = kernel
+            .futex_wait_dispatch_step_mut(CpuId(0))
+            .expect("dequeue");
+        assert_eq!(inc, BLOCKED);
+        assert!(
+            !kernel.d6_genuine_mark_running_via_task_seam(Some(inc), CpuId(0)),
+            "a blocked incoming must be refused"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(BLOCKED)),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(3)
+            ))),
+            "status untouched"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            None,
+            "the dequeue was rolled back: nothing is current"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "and the task is back in the run queue — nothing is lost"
+        );
+    }
+
+    // ── fault: only the current, Running task may be faulted ───────────────────────────────
+
+    #[test]
+    fn the_fault_path_refuses_a_non_running_victim() {
+        let mut state = kernel_with(&[OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(state.current_tid(), Some(OTHER));
+        block_on_endpoint(&mut state, OTHER);
+        let before = state.task_status(OTHER);
+
+        assert!(
+            state.fault_current_task_for_test().is_err(),
+            "faulting a blocked current task must fail closed"
+        );
+        assert_eq!(state.task_status(OTHER), before, "status untouched");
+        assert_eq!(
+            state.current_tid(),
+            Some(OTHER),
+            "and the scheduler was never blocked out"
+        );
+    }
+
+    // ── spawn: the destination TID must be absent ──────────────────────────────────────────
+
+    /// **HARD-STOP, recorded as a test rather than a claim.** `spawn_user_task_from_image`
+    /// still overwrites a pre-existing TID: the absence precondition WA3A set out to enforce is
+    /// not satisfiable while boot registers the RING3 TIDs before spawning onto them. This test
+    /// documents the CURRENT behaviour so the gap is visible and any future fix is detected.
+    #[test]
+    fn spawn_still_overwrites_a_present_tid_pending_the_boot_sequence_repair() {
+        let mut state = kernel_with(&[OTHER]);
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(OTHER, asid).expect("bind");
+        block_on_endpoint(&mut state, OTHER);
+
+        let spec = crate::kernel::boot::UserImageSpec {
+            tid: OTHER,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: crate::kernel::task::TaskClass::App,
+            startup_args: crate::kernel::boot::UserImageSpec::DEFAULT_STARTUP_ARGS,
+            spawner_tid: 0,
+            service_recv_cap: 0,
+            service_reply_recv_cap: 0,
+            extra_send_caps: [0; 4],
+        };
+        let result = state.spawn_user_task_from_image(spec);
+        assert!(
+            result.is_ok(),
+            "documented gap: a present TID is still accepted, so the census keeps this site CAN"
+        );
+        assert_eq!(
+            state.task_status(OTHER),
+            Some(TaskStatus::Runnable),
+            "the blocked receiver was overwritten — this is exactly what §6.1.35 C hard-stops on"
+        );
+    }
+
+    // ── the valid transitions still work ───────────────────────────────────────────────────
+
+    #[test]
+    fn ordinary_idle_and_repeated_transitions_still_work() {
+        let mut state = kernel_with(&[BLOCKED, OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        // Ordinary dispatch: Runnable -> Running.
+        assert_eq!(state.dispatch_next_task().expect("dispatch"), Some(OTHER));
+        assert_eq!(state.task_status(OTHER), Some(TaskStatus::Running));
+        // Queue-neutral re-dispatch: Running -> Running.
+        assert_eq!(state.dispatch_next_task().expect("dispatch"), Some(OTHER));
+        assert_eq!(state.task_status(OTHER), Some(TaskStatus::Running));
+        // Ordinary yield with a second runnable task.
+        state.enqueue_task(BLOCKED).expect("enqueue");
+        state.yield_current().expect("yield");
+        assert_eq!(
+            state.current_tid().and_then(|t| state.task_status(t)),
+            Some(TaskStatus::Running),
+            "the incoming task is Running after a successful yield"
+        );
+        // The idle task (TID 0) is `current` while `Runnable` — the rank-1 scheduler makes it
+        // current without a mark-running step — so yielding it out is `Runnable → Runnable`.
+        // The typed idle branch must accept that, and the incoming task must still come out
+        // `Running`.
+        let mut idle = Bootstrap::init().expect("init");
+        assert_eq!(
+            idle.current_tid(),
+            Some(0),
+            "the idle task is current at boot"
+        );
+        idle.register_task(OTHER).expect("register");
+        idle.enqueue_task(OTHER).expect("enqueue");
+        // Reproduce the state the rank-1 scheduler leaves after it re-enqueues and re-dispatches
+        // idle without a mark-running step. `destroy_aspace_with_blocked_ipc_waiter_and_
+        // preemption_preserves_ordering` reaches the same state through a real yield sequence.
+        idle.set_task_status_for_test(0, TaskStatus::Runnable);
+        assert_eq!(idle.task_status(0), Some(TaskStatus::Runnable));
+        idle.yield_current()
+            .expect("yielding the idle task must succeed");
+        assert_eq!(idle.current_tid(), Some(OTHER));
+        assert_eq!(idle.task_status(OTHER), Some(TaskStatus::Running));
+        assert_eq!(
+            idle.task_status(0),
+            Some(TaskStatus::Runnable),
+            "and idle is left Runnable, not corrupted"
+        );
+    }
+
+    /// The idle branch is **idle-only**: an ordinary task that is `current` while `Runnable`
+    /// (only reachable through a raw rank-1 preempt, which no production path performs) is
+    /// still refused. The ordinary contract is not weakened to accommodate idle.
+    #[test]
+    fn the_idle_branch_does_not_admit_an_ordinary_runnable_current_task() {
+        let mut state = kernel_with(&[OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        assert!(
+            state.on_preempt_current_cpu().is_some(),
+            "a raw preempt sets a current without marking it Running"
+        );
+        assert_eq!(state.current_tid(), Some(OTHER));
+        assert_eq!(state.task_status(OTHER), Some(TaskStatus::Runnable));
+        assert!(
+            state.yield_current().is_err(),
+            "an ORDINARY Runnable current task must not take the idle branch"
+        );
+        assert_eq!(state.task_status(OTHER), Some(TaskStatus::Runnable));
+        assert_eq!(state.current_tid(), Some(OTHER));
     }
 }

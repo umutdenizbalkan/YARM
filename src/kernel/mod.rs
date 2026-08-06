@@ -29,6 +29,8 @@ pub mod smp;
 pub mod syscall;
 pub mod syscall_split;
 pub mod task;
+/// Stage 199D-WA3A — production-enforced exact task status transitions.
+pub(crate) mod task_transition;
 pub mod terminal_ownership;
 pub mod time;
 pub mod topology;

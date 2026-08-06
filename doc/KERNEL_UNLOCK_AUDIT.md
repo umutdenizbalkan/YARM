@@ -3735,16 +3735,17 @@ still idempotent).
 
 Counts derived from the classification table, not written down:
 
-| class | sites |
-|---|---|
-| CAN | 21 |
-| CANNOT | 7 |
-| INTO_BLOCKED | 7 |
-| FRESH_CONSTRUCTOR | 1 |
-| NON_PRODUCTION | 1 |
-| UNPROVEN | 0 |
+| class | sites (WA2B) | sites (after WA3A) |
+|---|---|---|
+| CAN | 21 | **13** |
+| CANNOT | 7 | **15** |
+| INTO_BLOCKED | 7 | 7 |
+| FRESH_CONSTRUCTOR | 1 | 1 |
+| NON_PRODUCTION | 1 | 1 |
+| UNPROVEN | 0 | 0 |
 
-21 + 7 + 7 + 1 + 1 + 0 = **37**, the mechanically enumerated total.
+Both columns total **37**, the mechanically enumerated set. §6.1.35 (WA3A) is what moved the nine
+Group-3 sites, by enforcing their preconditions in production.
 
 **`WAITER_OWNER_CENSUS_COMPLETE=yes`.** Zero rows remain dependent on an unstated runtime
 invariant. No runtime code was changed to reach this: nine of the twelve resolved *against* the
@@ -3959,6 +3960,190 @@ point of the matrix.
 * current ledger — **39 / 7 / 46** (no cell moves)
 * RISC-V links/status — unchanged (link 1 ABSENT; 2, 3, 7, 9 present; 4, 5, 6, 8, 10 absent;
   `RISCV_REMOTE_WAKE=D`; `RISCV_199D_READINESS=case_b`; coordinate 23 OPEN)
+* **no new live cell**
+
+---
+
+### 6.1.35 WA3A — production-enforced scheduler/lifecycle transition barriers
+
+The first WA3 increment that changes **production executable code**. Scope is exactly the nine
+Group-3 CAN sites from §6.1.34 E.5. Waiter ownership is still wired into nothing, NR6/NR7 claim
+position is unchanged, and no predicate, timeout, notification, teardown, RISC-V link, seal or
+ledger policy moved.
+
+#### A. The barrier
+
+`src/kernel/task_transition.rs` is a new production module: a typed, **release-build**,
+fail-closed transition primitive. `debug_assert` was explicitly rejected — it compiles out of
+release kernels, which is exactly where the proof has to hold.
+
+| transition | from → to | used by |
+|---|---|---|
+| `DispatchIncoming` | `Runnable → Running` | `dispatch_next_task`, both yields' incoming, the D6 seam |
+| `ContinueCurrent` | `Running → Running` | the queue-neutral continuation (see below) |
+| `PreemptOutgoing` | `Running → Runnable` | both yields' outgoing |
+| `PreemptOutgoingIdle` | `Runnable → Runnable`, **`IDLE_TID` only** | idle, see D |
+| `RollbackDispatchedIncoming` | `Running → Runnable` | `direct_dispatch_rollback_split` |
+| `FaultRunningCurrent` | `Running → Faulted` | `fault_current_task_with_fault` |
+
+There is no "set status" escape hatch. Refusals are typed (`TaskMissing`,
+`IncarnationMismatch{observed}`, `WrongStatus{observed}`, `NotIdleTask`) and **write no field of
+the TCB**, so a refusal is observationally identical to never having called. Where the caller
+knows which incarnation it means it passes `expect_asid`, and a recycled numeric TID under a
+different address space is refused before the status is even read.
+
+`the_barrier_is_the_only_writer_for_the_group3_cohort` pins that the module contains exactly one
+`tcb.status =` write, that it writes only `transition.resulting()`, that no `debug_assert!` or
+`cfg(debug…)` gates it, and that none of the eight barriered functions writes `tcb.status`
+directly any more.
+
+**One honest widening.** `PriorityScheduler::dispatch_next` returns the existing `current`
+*without* dequeuing whenever one is set and is not idle, so a dispatch site legitimately sees
+either `Runnable → Running` (a real dequeue) or `Running → Running` (a continuation), and cannot
+tell them apart from outside. Both are accepted; every other status — `Blocked(_)` above all, and
+also `Faulted`, `Exited`, `Dead` — is refused. `ContinueCurrent` is a separate typed variant
+precisely so the idempotent case cannot launder a non-`Running` task into `Running`.
+
+#### B. No partial scheduler/TCB commit
+
+Each path is resolved by one of the three permitted shapes, never by "a status check after an
+irreversible scheduler mutation":
+
+| path | shape | detail |
+|---|---|---|
+| `yield_current` / `yield_current_to` **outgoing** | **(1) validate before either mutation** | the outgoing transition is the first mutation in the function; a refusal returns before `on_preempt_current_cpu`, so `current` is untouched and nothing is enqueued |
+| `fault_current_task_with_fault` | **(1) validate before either mutation** | the `Running`-and-current precondition is evaluated at rank 2 *before* `block_current_cpu` (rank 1), which is not undone below. A second check confirms the scheduler blocked out exactly the validated victim |
+| `dispatch_next_task`, both yields' **incoming** | **(3) exact rollback** | the rank-1 dequeue already ran, so a refusal calls `preempt_reenqueue_current_cpu` — the existing inverse of `dispatch_next_on` — and only when a real dequeue happened (`outgoing != incoming`) |
+| `d6_genuine_mark_running_via_task_seam` | **(3) exact rollback** | the seam now takes `cpu`, returns `bool`, and performs `preempt_reenqueue_only_on` itself on refusal, so the invariant is restored regardless of caller |
+| `direct_dispatch_rollback_split` | **(2) typed transaction** | the task half must succeed as `RollbackDispatchedIncoming` before the scheduler half runs; if it is refused, the scheduler half is **skipped** — re-enqueuing a task this transaction does not own could displace a live `current` |
+| `spawn_user_task_from_image` | **(1) validate before either mutation** | see C |
+
+On refusal, in every case: no task is lost from a run queue (the dequeue is undone, or never
+happened); no blocked task becomes current; no second task becomes current on a CPU; outgoing and
+incoming statuses are unchanged; and CPU affinity / current ownership are coherent.
+`a_blocked_receiver_cannot_be_dispatched_running` and
+`the_d6_seam_refuses_a_blocked_incoming_and_rolls_the_dequeue_back` assert the run-queue length
+and the `current` slot explicitly.
+
+**No new scheduler primitive was needed** — `preempt_reenqueue_only_on` / `preempt_reenqueue_
+current_cpu` already existed as the exact inverse of the dequeue — and **no new broad-lock
+acquisition and no task(2) → scheduler(1) inversion** was introduced: every barrier call runs
+inside a rank-2 acquisition the site already held, and every rollback runs in a separate rank-1
+acquisition.
+
+All eleven `d6_genuine_mark_running_via_task_seam` call sites (x86_64, AArch64 and RISC-V trap
+drains) were updated to consume the `bool` and skip the resume on refusal.
+
+#### C. Spawn must be fresh — **HARD-STOP**
+
+The absence gate was implemented, and then **reverted**, because it is not satisfiable by the
+current boot sequence. `src/arch/x86_64/boot.rs:633-638` (and its AArch64/RISC-V twins) calls
+
+```rust
+kernel.register_task_with_class(RING3_SUPERVISOR_TID, TaskClass::SystemServer)?;
+kernel.register_task_with_class(RING3_PM_SERVER_TID,   TaskClass::SystemServer)?;
+kernel.register_task_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)?;
+```
+
+**before** the corresponding `spawn_user_task_from_image` calls, so the boot capability grants
+have a cnode and a kernel stack to target. With the gate in place, an ordinary `-smp 1` boot
+refuses its own supervisor:
+
+```text
+SPAWN_REFUSED_TID_PRESENT tid=2 reason=destination_not_absent
+failed to bootstrap first user task: TaskTableFull
+```
+
+That is live evidence from `scripts/qemu-x86_64-core-smoke.sh`, not a hosted inference.
+
+> **Method note.** The first core-smoke run of this increment reported PASS against a **stale
+> prebuilt** `build-x86_64/kernel_boot.elf` — the smoke script boots artifacts and does not
+> rebuild. Rebuilding via `scripts/build-qemu-x86_64-artifacts.sh` and re-running is what exposed
+> the refusal. Every live result below is from a genuinely rebuilt kernel.
+
+**No weaker predicate was substituted.** "Not `Blocked(EndpointReceive)`" would still permit
+overwriting a live `Runnable` or `Running` task's register context, entry point, stack, ASID,
+scheduler membership, startup capabilities and process ownership — the precondition is *absence*
+or nothing. Making it absence requires restructuring the register → grant → spawn sequence across
+three architectures, which is outside this increment's stated scope and is not live-verifiable
+for AArch64 here (no `qemu-system-aarch64`).
+
+`spawn_user_task_from_image` therefore stays **CAN**, and the finding is pinned rather than
+narrated:
+
+* `spawn_still_overwrites_a_present_tid_pending_the_boot_sequence_repair` asserts the current
+  behaviour — a present, endpoint-blocked TID is accepted and overwritten — so a future fix is
+  detected rather than assumed;
+* `the_barrier_is_the_only_writer_for_the_group3_cohort` pins that the gate is genuinely reverted
+  (not silently retained), that no weaker predicate replaced it, and that x86 boot still
+  registers before spawning — so the hard-stop is **falsifiable**: change the boot sequence and
+  the guard fails, and the site can be re-derived.
+
+The remaining eight Group-3 sites are enforced as described in A and B. **CAN 21 → 13**, not 12.
+
+#### D. Idle and special paths
+
+The hosted suite found a real invariant break while this was being built: **the idle task
+(`TID 0`) is `current` while `Runnable`.** The rank-1 scheduler makes it current without any
+mark-running step, so preempting it out is `Runnable → Runnable`, not `Running → Runnable`.
+
+Rather than weaken `PreemptOutgoing`, that case gets its **own** transition,
+`PreemptOutgoingIdle`, which the primitive refuses for any TID other than `IDLE_TID` with a typed
+`NotIdleTask`. `the_idle_branch_does_not_admit_an_ordinary_runnable_current_task` drives an
+ordinary task into the same `current`-and-`Runnable` state through a raw rank-1 preempt and
+asserts the yield is still refused. `IDLE_TID` is documented as the same TID
+`PriorityScheduler::dispatch_next` special-cases.
+
+#### E. The recomputed census
+
+Eight sites no longer write `tcb.status` at all; the ninth (spawn) keeps its unguarded write, per
+the C hard-stop. The census is recomputed, not edited: it covers **29 remaining raw writes + 8
+barriered sites = 37**, and `every_status_writer_is_classified_by_its_enclosing_function` derives
+that sum from the fingerprint table and `WA3A_BARRIER_SITES` together.
+
+| class | sites |
+|---|---|
+| CAN | 13 |
+| CANNOT | 15 |
+| INTO_BLOCKED | 7 |
+| FRESH_CONSTRUCTOR | 1 |
+| NON_PRODUCTION | 1 |
+| UNPROVEN | 0 |
+
+`WAITER_OWNER_CENSUS_COMPLETE=yes` and `WAITER_OWNERSHIP_EXCLUSIVE=no` both stand. The remaining
+**13** CAN paths are the eight endpoint-delivery owners, four teardown paths of §6.1.34 E.6, and
+`spawn_user_task_from_image` pending the C repair. The rest of Group 3 is out of the arbitration
+set.
+
+#### F. Mutation results
+
+Nine mutations survive the C hard-stop (M4, the spawn gate, went with it). Each removes one
+production check, and all nine fail a **named** behavioural test:
+
+| # | mutation | caught by |
+|---|---|---|
+| M1 | barrier drops the from-status check | 10 tests |
+| M2 | barrier drops the incarnation check | `a_stale_incarnation_cannot_move_a_replacement_task` |
+| M3 | idle branch admits an ordinary task | `the_idle_branch_does_not_admit_an_ordinary_runnable_current_task` |
+| M5 | dispatch barrier → unconditional write | `a_blocked_receiver_cannot_be_dispatched_running` |
+| M6 | yield-outgoing barrier → unconditional write | `a_blocked_receiver_cannot_be_yielded_to_runnable` |
+| M7 | fault pre-validation removed | `the_fault_path_refuses_a_non_running_victim` |
+| M8 | D6 seam drops the exact scheduler rollback | `the_d6_seam_refuses_a_blocked_incoming_and_rolls_the_dequeue_back` |
+| M9 | rollback barrier → unconditional write | `a_stale_rollback_plan_cannot_alter_a_replacement_incarnation` |
+| M10 | dispatch refusal skips the scheduler rollback | `a_blocked_receiver_cannot_be_dispatched_running` |
+
+#### Status
+
+* production executable code — **changed** (this is not a documentation increment)
+* eight of nine Group-3 sites — **production-refused**; `spawn_user_task_from_image`
+  **hard-stopped** (C), pinned, and left CAN
+* CAN — **21 → 13**
+* new broad-lock acquisitions — **none**; no task(2) → scheduler(1) inversion
+* helper waiter ownership — still **zero production callers**
+* `WAITER_OWNER_CENSUS_COMPLETE` — **yes**; `WAITER_OWNERSHIP_EXCLUSIVE` — **no**
+* x86 direct production default — **OFF** on every architecture
+* NR6/NR7 waiter claim position — **unchanged**
+* canonical 199D — **OPEN**; ledger — **39 / 7 / 46**; RISC-V — unchanged
 * **no new live cell**
 
 ---

@@ -2265,6 +2265,24 @@ impl KernelState {
         mut spec: UserImageSpec,
     ) -> Result<SpawnedUserTask, KernelError> {
         let cpu = self.current_cpu();
+        // Stage 199D-WA3A HARD-STOP: the "destination TID must be absent" precondition is
+        // NOT satisfiable by the current boot sequence, and was reverted rather than weakened.
+        //
+        // `src/arch/x86_64/boot.rs` (and its AArch64/RISC-V twins) deliberately calls
+        // `register_task_with_class(RING3_{SUPERVISOR,PM_SERVER,INIT_SERVER}_TID)` BEFORE these
+        // spawns, so the boot capability grants have a cnode and a kernel stack to target. The
+        // absence gate therefore refused the supervisor spawn on an ordinary `-smp 1` boot:
+        //
+        //     SPAWN_REFUSED_TID_PRESENT tid=2 reason=destination_not_absent
+        //     failed to bootstrap first user task: TaskTableFull
+        //
+        // Making this site CANNOT requires restructuring that register-then-grant-then-spawn
+        // sequence across three architectures — out of scope here, and not live-verifiable for
+        // AArch64 in this environment. A weaker predicate ("not endpoint-blocked") is refused on
+        // purpose: it would still permit overwriting a live `Runnable`/`Running` task's register
+        // context, entry point, stack and ASID. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.35 C.
+        //
+        // This site therefore stays **CAN** in the census.
         if spec.entry == 0 {
             return Err(KernelError::WrongObject);
         }
@@ -3084,15 +3102,57 @@ impl KernelState {
                         ipc.telemetry.scheduler_context_switches.saturating_add(1);
                 });
             }
-            self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == tid)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Running;
-                Ok::<_, KernelError>(())
-            })?;
+            // Stage 199D-WA3A: EXACT dispatch transition. `dispatch_next` returns the
+            // existing current WITHOUT dequeuing when one is set, so both `Runnable → Running`
+            // (a genuine dequeue) and `Running → Running` (a queue-neutral continuation) are
+            // legal; every other status is refused. A refusal after a genuine dequeue undoes
+            // the rank-1 mutation exactly with `preempt_reenqueue_only_on` — the existing
+            // inverse of `dispatch_next_on` — so no task is lost from a run queue and no
+            // blocked task is left as `current`.
+            let dequeued = outgoing_tid != Some(tid);
+            let marked = self.with_tcbs_mut(|tcbs| {
+                use crate::kernel::task_transition::{
+                    TaskTransition, apply_task_transition, log_transition_refusal,
+                };
+                match apply_task_transition(tcbs, tid, None, TaskTransition::DispatchIncoming) {
+                    Ok(_) => true,
+                    Err(_) => match apply_task_transition(
+                        tcbs,
+                        tid,
+                        None,
+                        TaskTransition::ContinueCurrent,
+                    ) {
+                        Ok(_) => true,
+                        Err(refusal) => {
+                            log_transition_refusal(
+                                "dispatch_next_task",
+                                tid,
+                                TaskTransition::DispatchIncoming,
+                                refusal,
+                            );
+                            false
+                        }
+                    },
+                }
+            });
+            if !marked {
+                if dequeued {
+                    let restored = self.preempt_reenqueue_current_cpu();
+                    crate::yarm_log!(
+                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback={}",
+                        "dispatch_next_task",
+                        tid,
+                        u8::from(restored == Some(tid))
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback=not_needed",
+                        "dispatch_next_task",
+                        tid
+                    );
+                }
+                return Err(KernelError::TaskMissing);
+            }
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("DISPATCH: task_running tid={}", tid);
             }
@@ -3141,13 +3201,39 @@ impl KernelState {
                 ipc.telemetry.scheduler_yield_calls.saturating_add(1);
         });
         if let Some(tid) = outgoing_tid {
+            // Stage 199D-WA3A: EXACT `Running → Runnable` for the outgoing current task,
+            // evaluated BEFORE any scheduler mutation below, so a refusal touches neither
+            // domain: the task keeps its status, `current` is untouched and nothing is
+            // enqueued. A task that has already blocked itself must not be made runnable here.
             self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == tid)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Runnable;
+                crate::kernel::task_transition::apply_task_transition(
+                    tcbs,
+                    tid,
+                    None,
+                    crate::kernel::task_transition::TaskTransition::PreemptOutgoing,
+                )
+                .or_else(|first| {
+                    // Idle-only fallback: the idle task is made `current` by the rank-1
+                    // scheduler without a mark-running step, so preempting it out is
+                    // `Runnable → Runnable`. Restricted to `IDLE_TID` inside the primitive,
+                    // so an ordinary task cannot reach it.
+                    crate::kernel::task_transition::apply_task_transition(
+                        tcbs,
+                        tid,
+                        None,
+                        crate::kernel::task_transition::TaskTransition::PreemptOutgoingIdle,
+                    )
+                    .map_err(|_| first)
+                })
+                .map_err(|refusal| {
+                    crate::kernel::task_transition::log_transition_refusal(
+                        "yield_current",
+                        tid,
+                        crate::kernel::task_transition::TaskTransition::PreemptOutgoing,
+                        refusal,
+                    );
+                    KernelError::TaskMissing
+                })?;
                 Ok::<_, KernelError>(())
             })?;
         }
@@ -3410,15 +3496,57 @@ impl KernelState {
                         ipc.telemetry.scheduler_context_switches.saturating_add(1);
                 });
             }
-            self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == tid)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Running;
-                Ok::<_, KernelError>(())
-            })?;
+            // Stage 199D-WA3A: EXACT dispatch transition. `dispatch_next` returns the
+            // existing current WITHOUT dequeuing when one is set, so both `Runnable → Running`
+            // (a genuine dequeue) and `Running → Running` (a queue-neutral continuation) are
+            // legal; every other status is refused. A refusal after a genuine dequeue undoes
+            // the rank-1 mutation exactly with `preempt_reenqueue_only_on` — the existing
+            // inverse of `dispatch_next_on` — so no task is lost from a run queue and no
+            // blocked task is left as `current`.
+            let dequeued = outgoing_tid != Some(tid);
+            let marked = self.with_tcbs_mut(|tcbs| {
+                use crate::kernel::task_transition::{
+                    TaskTransition, apply_task_transition, log_transition_refusal,
+                };
+                match apply_task_transition(tcbs, tid, None, TaskTransition::DispatchIncoming) {
+                    Ok(_) => true,
+                    Err(_) => match apply_task_transition(
+                        tcbs,
+                        tid,
+                        None,
+                        TaskTransition::ContinueCurrent,
+                    ) {
+                        Ok(_) => true,
+                        Err(refusal) => {
+                            log_transition_refusal(
+                                "yield_current",
+                                tid,
+                                TaskTransition::DispatchIncoming,
+                                refusal,
+                            );
+                            false
+                        }
+                    },
+                }
+            });
+            if !marked {
+                if dequeued {
+                    let restored = self.preempt_reenqueue_current_cpu();
+                    crate::yarm_log!(
+                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback={}",
+                        "yield_current",
+                        tid,
+                        u8::from(restored == Some(tid))
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback=not_needed",
+                        "yield_current",
+                        tid
+                    );
+                }
+                return Err(KernelError::TaskMissing);
+            }
             if cfg!(not(feature = "hosted-dev")) && DEBUG_YIELD_LOG {
                 let status = if outgoing_tid == Some(tid) {
                     "same-task"
@@ -3468,13 +3596,39 @@ impl KernelState {
                 ipc.telemetry.scheduler_yield_calls.saturating_add(1);
         });
         if let Some(tid) = outgoing_tid {
+            // Stage 199D-WA3A: EXACT `Running → Runnable` for the outgoing current task,
+            // evaluated BEFORE any scheduler mutation below, so a refusal touches neither
+            // domain: the task keeps its status, `current` is untouched and nothing is
+            // enqueued. A task that has already blocked itself must not be made runnable here.
             self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == tid)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Runnable;
+                crate::kernel::task_transition::apply_task_transition(
+                    tcbs,
+                    tid,
+                    None,
+                    crate::kernel::task_transition::TaskTransition::PreemptOutgoing,
+                )
+                .or_else(|first| {
+                    // Idle-only fallback: the idle task is made `current` by the rank-1
+                    // scheduler without a mark-running step, so preempting it out is
+                    // `Runnable → Runnable`. Restricted to `IDLE_TID` inside the primitive,
+                    // so an ordinary task cannot reach it.
+                    crate::kernel::task_transition::apply_task_transition(
+                        tcbs,
+                        tid,
+                        None,
+                        crate::kernel::task_transition::TaskTransition::PreemptOutgoingIdle,
+                    )
+                    .map_err(|_| first)
+                })
+                .map_err(|refusal| {
+                    crate::kernel::task_transition::log_transition_refusal(
+                        "yield_current_to",
+                        tid,
+                        crate::kernel::task_transition::TaskTransition::PreemptOutgoing,
+                        refusal,
+                    );
+                    KernelError::TaskMissing
+                })?;
                 Ok::<_, KernelError>(())
             })?;
         }
@@ -3492,15 +3646,57 @@ impl KernelState {
                         ipc.telemetry.scheduler_context_switches.saturating_add(1);
                 });
             }
-            self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == tid)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Running;
-                Ok::<_, KernelError>(())
-            })?;
+            // Stage 199D-WA3A: EXACT dispatch transition. `dispatch_next` returns the
+            // existing current WITHOUT dequeuing when one is set, so both `Runnable → Running`
+            // (a genuine dequeue) and `Running → Running` (a queue-neutral continuation) are
+            // legal; every other status is refused. A refusal after a genuine dequeue undoes
+            // the rank-1 mutation exactly with `preempt_reenqueue_only_on` — the existing
+            // inverse of `dispatch_next_on` — so no task is lost from a run queue and no
+            // blocked task is left as `current`.
+            let dequeued = outgoing_tid != Some(tid);
+            let marked = self.with_tcbs_mut(|tcbs| {
+                use crate::kernel::task_transition::{
+                    TaskTransition, apply_task_transition, log_transition_refusal,
+                };
+                match apply_task_transition(tcbs, tid, None, TaskTransition::DispatchIncoming) {
+                    Ok(_) => true,
+                    Err(_) => match apply_task_transition(
+                        tcbs,
+                        tid,
+                        None,
+                        TaskTransition::ContinueCurrent,
+                    ) {
+                        Ok(_) => true,
+                        Err(refusal) => {
+                            log_transition_refusal(
+                                "yield_current_to",
+                                tid,
+                                TaskTransition::DispatchIncoming,
+                                refusal,
+                            );
+                            false
+                        }
+                    },
+                }
+            });
+            if !marked {
+                if dequeued {
+                    let restored = self.preempt_reenqueue_current_cpu();
+                    crate::yarm_log!(
+                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback={}",
+                        "yield_current_to",
+                        tid,
+                        u8::from(restored == Some(tid))
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback=not_needed",
+                        "yield_current_to",
+                        tid
+                    );
+                }
+                return Err(KernelError::TaskMissing);
+            }
         } else {
             // No runnable task after preempt (queue was empty); re-enqueue and redispatch.
             if let Some(tid) = outgoing_tid {

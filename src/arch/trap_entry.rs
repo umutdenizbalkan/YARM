@@ -408,8 +408,9 @@ pub fn handle_trap_entry_shared(
             }
             crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
             let incoming = shared.d2_send_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming {
-                shared.d6_genuine_mark_running_via_task_seam(incoming);
+            if let Some(inc) = incoming
+                && shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)
+            {
                 // Dormant kernel-thread switch_frames variant (user-task sender
                 // resumes via trap-frame restore + syscall restart).
                 if shared.d2_recv_incoming_has_kernel_switch_ctx(inc) {
@@ -479,9 +480,11 @@ pub fn handle_trap_entry_shared(
             }
             crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
             let incoming = shared.d2_recv_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming {
-                // Commit the selected task Running via the rank-2 task seam.
-                shared.d6_genuine_mark_running_via_task_seam(incoming);
+            // Commit the selected task Running via the rank-2 task seam. A refused
+            // transition rolls the dequeue back and resumes nothing.
+            if let Some(inc) = incoming
+                && shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)
+            {
                 // Dormant kernel-thread switch_frames variant (user-task recv
                 // resumes via trap-frame restore + syscall restart, so this does
                 // not fire for the recv workload).
@@ -621,8 +624,10 @@ pub fn handle_trap_entry_shared(
                             // From here the scheduler is MUTATED: `inc` was dequeued and made
                             // current. Any later failure must roll that back exactly and take
                             // the explicit fatal path — never return with it half-committed.
-                            shared.d6_genuine_mark_running_via_task_seam(Some(inc));
-                            let agrees = shared.direct_dispatch_current_agrees_split_read(cpu, inc);
+                            let marked =
+                                shared.d6_genuine_mark_running_via_task_seam(Some(inc), cpu);
+                            let agrees = marked
+                                && shared.direct_dispatch_current_agrees_split_read(cpu, inc);
                             let resumed = agrees
                                 && match frame.as_deref_mut() {
                                     Some(f) => {
@@ -712,8 +717,9 @@ pub fn handle_trap_entry_shared(
         if reverify_ok {
             // Queue-advancing dequeue (emits QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK).
             let incoming = shared.futex_wait_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming {
-                shared.d6_genuine_mark_running_via_task_seam(incoming);
+            if let Some(inc) = incoming
+                && shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)
+            {
                 crate::yarm_log!(
                     "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu={} tid={}",
                     cpu.0,
@@ -789,7 +795,12 @@ pub fn handle_trap_entry_shared(
                 }
                 // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
                 let incoming = shared.futex_wait_dispatch_step_mut(cpu);
-                if let Some(inc) = incoming {
+                // Stage 199D-WA3A: mark Running through the exact rank-2 transition FIRST. A
+                // refusal rolls the dequeue back inside the seam, so the drain simply resumes
+                // nothing and the unchanged clear/fallback tail below runs.
+                if let Some(inc) = incoming
+                    && shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)
+                {
                     crate::yarm_log!(
                         "AARCH64_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} tid={}",
                         cpu.0,
@@ -800,8 +811,6 @@ pub fn handle_trap_entry_shared(
                         cpu.0,
                         inc
                     );
-                    // Mark incoming Running (rank-2 task seam).
-                    shared.d6_genuine_mark_running_via_task_seam(incoming);
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK tid={}", inc);
                     // Arch restore: TTBR0/ASID switch + EL0 frame restore under a brief
                     // `with_cpu` re-acquire (global guard already dropped above).
@@ -895,7 +904,9 @@ pub fn handle_trap_entry_shared(
                 }
                 // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
                 let incoming = shared.yield_dispatch_step_mut(cpu);
-                if let Some(inc) = incoming {
+                if let Some(inc) = incoming
+                    && shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)
+                {
                     crate::yarm_log!(
                         "AARCH64_YIELD_DISPATCH_DEQUEUE_OK cpu={} tid={}",
                         cpu.0,
@@ -906,7 +917,6 @@ pub fn handle_trap_entry_shared(
                         cpu.0,
                         inc
                     );
-                    shared.d6_genuine_mark_running_via_task_seam(incoming);
                     crate::yarm_log!("AARCH64_YIELD_DISPATCH_RUNNING_OK tid={}", inc);
                     let restore = shared
                         .with_cpu(cpu, |kernel| {
@@ -963,8 +973,9 @@ pub fn handle_trap_entry_shared(
         let reverify_ok = shared.yield_reverify_ready(cpu);
         if reverify_ok {
             let incoming = shared.yield_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming {
-                shared.d6_genuine_mark_running_via_task_seam(incoming);
+            if let Some(inc) = incoming
+                && shared.d6_genuine_mark_running_via_task_seam(incoming, cpu)
+            {
                 crate::yarm_log!("YIELD_DISPATCH_CURRENT_SET_OK cpu={} tid={}", cpu.0, inc);
                 let restore = shared
                     .with_cpu(cpu, |kernel| {
@@ -1025,17 +1036,25 @@ pub fn handle_trap_entry_shared(
                 if shared.d6_genuine_dispatch_queue_neutral(cpu) {
                     crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_ENTER cpu={}", cpu.0);
                     let incoming = shared.d6_genuine_local_dispatch_step_mut(cpu);
-                    // Deferred Phase B (idempotent for the same running task).
-                    shared.d6_genuine_mark_running_via_task_seam(incoming);
-                    let n = crate::kernel::boot::D6_GENUINE_MUT_DISPATCH_COUNT
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    crate::yarm_log!(
-                        "D6_GENUINE_MUT_DISPATCH_DONE cpu={} incoming={:?}",
-                        cpu.0,
-                        incoming
-                    );
-                    crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_COUNT value={}", n);
+                    // Deferred Phase B (idempotent for the same running task). Queue-neutral,
+                    // so the transition is normally `Running → Running`; a refusal rolls back
+                    // and the drain declines.
+                    if shared.d6_genuine_mark_running_via_task_seam(incoming, cpu) {
+                        let n = crate::kernel::boot::D6_GENUINE_MUT_DISPATCH_COUNT
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        crate::yarm_log!(
+                            "D6_GENUINE_MUT_DISPATCH_DONE cpu={} incoming={:?}",
+                            cpu.0,
+                            incoming
+                        );
+                        crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_COUNT value={}", n);
+                    } else {
+                        crate::yarm_log!(
+                            "D6_GENUINE_MUT_DISPATCH_DECLINED cpu={} reason=transition_refused",
+                            cpu.0
+                        );
+                    }
                 } else {
                     crate::yarm_log!(
                         "D6_GENUINE_MUT_DISPATCH_FALLBACK reason=state_changed cpu={}",

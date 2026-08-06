@@ -731,7 +731,17 @@ pub fn handle_riscv_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                shared.d6_genuine_mark_running_via_task_seam(incoming);
+                // Stage 199D-WA3A: exact `Runnable → Running` (or queue-neutral
+                // `Running → Running`). A refusal rolls the dequeue back inside the seam and
+                // this drain resumes nothing.
+                if !shared.d6_genuine_mark_running_via_task_seam(incoming, cpu) {
+                    crate::yarm_log!(
+                        "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=transition_refused",
+                        cpu.0,
+                        inc
+                    );
+                    return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                }
                 crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}", inc);
                 // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore.
                 let restore = shared
@@ -828,7 +838,17 @@ pub fn handle_riscv_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                shared.d6_genuine_mark_running_via_task_seam(incoming);
+                // Stage 199D-WA3A: exact `Runnable → Running` (or queue-neutral
+                // `Running → Running`). A refusal rolls the dequeue back inside the seam and
+                // this drain resumes nothing.
+                if !shared.d6_genuine_mark_running_via_task_seam(incoming, cpu) {
+                    crate::yarm_log!(
+                        "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=transition_refused",
+                        cpu.0,
+                        inc
+                    );
+                    return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                }
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming={}", inc);
                 // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore
                 // (reused 196D machinery — no duplicate implementation).
@@ -961,7 +981,17 @@ pub fn handle_riscv_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                shared.d6_genuine_mark_running_via_task_seam(incoming);
+                // Stage 199D-WA3A: exact `Runnable → Running` (or queue-neutral
+                // `Running → Running`). A refusal rolls the dequeue back inside the seam and
+                // this drain resumes nothing.
+                if !shared.d6_genuine_mark_running_via_task_seam(incoming, cpu) {
+                    crate::yarm_log!(
+                        "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=transition_refused",
+                        cpu.0,
+                        inc
+                    );
+                    return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                }
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_RUNNING_OK incoming={}", inc);
                 // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore
                 // (reused 196D–196F machinery — no duplicate implementation).

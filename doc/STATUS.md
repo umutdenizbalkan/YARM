@@ -1114,6 +1114,54 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    `Runnable`/`Running` within `yield_current`, and a brand-new assignment — all four caught, where
    the first two passed under the old fingerprint. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.34 E.
 
+   **WA3A: eight of the nine Group-3 sites are now refused in production; CAN shrinks 21 → 13.**
+   The first WA3 increment that changes production executable code. A new module,
+   `src/kernel/task_transition.rs`, provides a typed **release-build** fail-closed transition
+   barrier — `debug_assert` was rejected outright, since it compiles out of exactly the builds
+   where the proof must hold. Six typed transitions (`DispatchIncoming`, `ContinueCurrent`,
+   `PreemptOutgoing`, `PreemptOutgoingIdle`, `RollbackDispatchedIncoming`, `FaultRunningCurrent`),
+   no set-status escape hatch, typed refusals that write no TCB field, and optional incarnation
+   identity so a recycled numeric TID cannot authorize a transition on a replacement task.
+
+   **No partial scheduler/TCB commit.** Both yields' outgoing transition and the fault path
+   validate *before* either authoritative mutation — the fault precondition now runs ahead of
+   `block_current_cpu`, which was previously an irreversible rank-1 commit with the status check
+   after it. `dispatch_next_task`, both yields' incoming and the D6 seam use exact rollback via
+   the pre-existing `preempt_reenqueue_only_on` / `preempt_reenqueue_current_cpu` — the inverse of
+   `dispatch_next_on` — so **no new scheduler primitive was needed**. `direct_dispatch_rollback_
+   split` became a typed transaction: if the task half is refused, the scheduler half is skipped,
+   because re-enqueuing a task this transaction does not own could displace a live `current`. No
+   new broad-lock acquisition and no task(2) → scheduler(1) inversion. The D6 seam gained a `cpu`
+   parameter and a `bool` return; all eleven x86_64/AArch64/RISC-V trap-drain call sites now skip
+   the resume on refusal.
+
+   **Spawn: HARD-STOP.** The absence gate was implemented and then reverted. x86 boot (and its
+   AArch64/RISC-V twins) calls `register_task_with_class(RING3_{SUPERVISOR,PM,INIT}_TID)` BEFORE
+   the matching spawns, so the gate refused the kernel's own supervisor on an ordinary `-smp 1`
+   boot: `SPAWN_REFUSED_TID_PRESENT tid=2` → `failed to bootstrap first user task: TaskTableFull`.
+   That is live evidence, and it only surfaced after a **rebuild**: the first core-smoke run
+   reported PASS against a stale prebuilt artifact, because the smoke script boots artifacts and
+   does not rebuild them. No weaker predicate was substituted — "not `Blocked(EndpointReceive)`"
+   would still permit overwriting a live task's context, stack, ASID and capabilities — so
+   `spawn_user_task_from_image` stays **CAN**, and CAN shrinks 21 → **13**, not 12. The gap is
+   pinned by a test asserting the current overwrite behaviour plus a guard that the boot sequence
+   still pre-registers, so the hard-stop is falsifiable rather than narrated.
+
+   **A real invariant break surfaced.** The idle task (TID 0) is `current` while `Runnable` — the
+   rank-1 scheduler makes it current with no mark-running step. Rather than weaken
+   `PreemptOutgoing`, that case gets its own `PreemptOutgoingIdle` transition which the primitive
+   refuses for any TID but `IDLE_TID`; a test drives an ordinary task into the same state and
+   confirms it is still refused.
+
+   Census recomputed, not edited: **29 remaining raw writes + 8 barriered sites = 37**, giving
+   **CAN 13 / CANNOT 15 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 1 / NON_PRODUCTION 1 / UNPROVEN 0**.
+   The 13 remaining CAN paths are the eight endpoint-delivery owners, four teardown paths, and
+   spawn pending the C repair. Nine mutations, each removing one production check, all caught by
+   a named behavioural test. Waiter ownership still has **zero production callers**,
+   `WAITER_OWNERSHIP_EXCLUSIVE=no`, `WAITER_OWNER_CENSUS_COMPLETE=yes`, x86 direct production
+   default **OFF**, NR6/NR7 late claims unchanged, canonical 199D **OPEN**, ledger **39 / 7 / 46**,
+   RISC-V unchanged, **no new live cell**. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.35.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
