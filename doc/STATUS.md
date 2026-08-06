@@ -965,8 +965,8 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    each reaching a `Blocked(_)` task by numeric TID (or unconditionally) while consulting no
    endpoint waiter. Four are provably out of reach from the source; twelve assign a status with no
    guard on the previous one, so their negative rests on a dynamic invariant the source does not
-   establish. **`WAITER_OWNER_CENSUS_COMPLETE=no`** rather than an unsupported exhaustive claim;
-   proving those twelve negatives is prerequisite work for any `WAITER_OWNERSHIP_EXCLUSIVE=yes`.
+   establish, so at WA2A-R1 the verdict was recorded as incomplete rather than as an unsupported
+   exhaustive claim. **WA2B-CENSUS resolves all twelve** — see below.
 
    Still helper-only: zero production call sites, neither late waiter claim moved, no timeout,
    notification, shared-region or teardown path converted. `WAITER_OWNERSHIP_EXCLUSIVE` remains
@@ -1007,9 +1007,56 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
 
    Sixteen mutations, all caught (the ten from R1 re-run, plus six for the lifecycle). Still
    helper-only with **zero production callers**; neither late direct waiter claim moved.
-   `WAITER_OWNERSHIP_EXCLUSIVE=no`, `WAITER_OWNER_CENSUS_COMPLETE=no`, x86 direct production
+   `WAITER_OWNERSHIP_EXCLUSIVE=no` (census completeness was still open here; WA2B-CENSUS below
+   raises it to `yes`), x86 direct production
    default **OFF** on every architecture, canonical 199D **OPEN**, ledger **39 / 7 / 46**, RISC-V
    links/status unchanged, **no new live cell**. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.33.
+
+   **WA2B-CENSUS: the wake-owner census is complete, and the answer is worse than hoped.** All
+   twelve rows WA2A-R1 left unproven are resolved, and **nine resolved against the comfortable
+   answer**. `dispatch_next_task`, both halves of `yield_current` and `yield_current_to`,
+   `d6_genuine_mark_running_via_task_seam` and `direct_dispatch_rollback_split` are all **CAN**,
+   because `crates/yarm-kernel/src/scheduler.rs` contains *zero* occurrences of `TaskStatus` — the
+   run queue carries bare TIDs with no status precondition, and no status is read between the
+   dequeue and the `Running` write. `fault_current_task_with_fault` is CAN because it selects by
+   `current`, never by status. `spawn_user_task_from_image` is CAN because `spec.tid` is
+   caller-supplied at 24 sites and `register_task_with_class` is *idempotent*, so an existing —
+   possibly endpoint-blocked — TID passes straight through to the `Runnable` write. Only three
+   resolved to CANNOT, each closed locally: the AP client spawn sits inside
+   `task_status(client_tid).is_none()`, and `spawn_user_thread` and `fork_complete_post_clone`
+   bind their TID from `allocate_thread_id`, which returns a candidate only where
+   `task_status(candidate).is_none()` and otherwise fails closed.
+
+   The verdict is **computed, not asserted**: a guard extracts `(file, enclosing fn, count)`
+   mechanically for all 37 sites and compares it against the classification table, so an
+   unclassified writer cannot exist. **CAN 21 / CANNOT 7 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 1 /
+   NON_PRODUCTION 1 / UNPROVEN 0 = 37**, giving **`WAITER_OWNER_CENSUS_COMPLETE=yes`**. No runtime
+   code was changed to reach that verdict. Every CANNOT pins both its guard and its caller
+   closure, and both closure shapes are local — a value-level filter over every TCB, or a TID
+   bound inside the function behind a fail-closed check — so there is no "helper trusted by its
+   callers" anywhere in the set.
+
+   The owner/wiring matrix (design only) splits the 21 into three groups: eight endpoint-delivery
+   owners that should claim; four teardown paths that should claim and cancel; and **nine
+   scheduler/lifecycle sites that should not claim at all** — they run at scheduler(1)/task(2) and
+   would need ipc(3) *above* scheduler(1), a rank inversion the split-lock architecture cannot
+   express. The correct repair for those nine is a proven-negative precondition rather than a
+   claim, which would move them CAN → CANNOT and shrink the eventual arbitration set from 21 to
+   12. That is a separate increment.
+
+   Also repaired: the `WaiterOwnershipView` contract. R2 said `Available` meant a claim would
+   succeed; with the generation counter saturated an `Available` slot rejects with
+   `ClaimGenerationExhausted`. The implementation is unchanged and correct — only the contract was
+   overstated. `Available` now means armed-and-unclaimed and is the **only slot state structurally
+   eligible** for a claim, and the replacement test proves all three parts including the exhausted
+   case, which stays `Available` and mutates nothing.
+
+   **`WAITER_OWNERSHIP_EXCLUSIVE` remains `no`.** Completing the census says who the owners are; it
+   does not make them arbitrate — not one of the 21 routes through the primitive. Still
+   helper-only with zero production callers; neither late direct waiter claim moved. x86 direct
+   production default **OFF** on every architecture, canonical 199D **OPEN**, ledger
+   **39 / 7 / 46**, RISC-V links/status unchanged, **no new live cell**. See
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.34.
 
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.

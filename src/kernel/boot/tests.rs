@@ -113162,17 +113162,21 @@ mod stage199d_wa2a_ownership_boundary {
         );
     }
 
-    /// **`WAITER_OWNER_CENSUS_COMPLETE=no`.** The candidate enumeration is mechanical, but the
-    /// per-site *negative* is not: twelve sites assign a status with no guard on the previous
-    /// one, so "it cannot act on `Blocked(EndpointReceive)`" rests on a dynamic invariant
-    /// (the task is freshly registered / is `current` / was just dequeued), which the source
-    /// alone does not establish. The claim is narrowed rather than asserted.
+    /// The WA2A-R1 narrowing, **updated to its successor contract**. R1 could only record
+    /// `WAITER_OWNER_CENSUS_COMPLETE=no`, because twelve sites rested on a dynamic invariant the
+    /// source did not establish. WA2B-CENSUS resolved all twelve, so what this guard now proves
+    /// is that the relabelling survives and the verdict is the *computed* one — the arithmetic
+    /// itself lives in `the_census_verdict_is_computed_from_the_table`.
     #[test]
-    fn the_census_completeness_claim_is_narrowed_not_asserted() {
+    fn the_callsite_census_stays_relabelled_under_the_resolved_verdict() {
         assert!(
-            AUDIT.contains("WAITER_OWNER_CENSUS_COMPLETE=no")
-                && STATUS.contains("WAITER_OWNER_CENSUS_COMPLETE=no"),
-            "the incompleteness must be recorded in both canonical documents"
+            AUDIT.contains("WAITER_OWNER_CENSUS_COMPLETE=yes")
+                && STATUS.contains("WAITER_OWNER_CENSUS_COMPLETE=yes"),
+            "the resolved verdict must be recorded in both canonical documents"
+        );
+        assert!(
+            AUDIT.contains("§6.1.34") && STATUS.contains("§6.1.34"),
+            "and both must point at the section that resolves it"
         );
         assert!(
             AUDIT.contains("waiter-primitive callsite census"),
@@ -113333,5 +113337,594 @@ mod stage199d_wa2a_ownership_boundary {
             AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
         );
         assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+    }
+}
+
+/// Stage 199D-WA2B-CENSUS — the **resolved** endpoint-blocked wake-owner census.
+///
+/// WA2A-R1 enumerated every production task-status writer mechanically but left twelve rows
+/// UNPROVEN: sites that assign a status with no guard on the previous one, whose negative rested
+/// on a dynamic invariant the source did not establish. This module resolves all twelve, pins the
+/// guard **and** the caller closure behind every CANNOT, and computes the verdict rather than
+/// asserting it.
+mod stage199d_wa2b_wake_owner_census {
+    use alloc::string::{String, ToString};
+
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+    const STATUS: &str = include_str!("../../../doc/STATUS.md");
+    const EXEC: &str = include_str!("exec_state.rs");
+    const FAULT: &str = include_str!("fault_state.rs");
+    const THREAD: &str = include_str!("thread_state.rs");
+    const POLICY: &str = include_str!("task_policy_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    /// How a site was resolved. `Unproven` exists so the guard can *compute* that none remain,
+    /// rather than the census merely omitting the category.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        /// Can act on a `Blocked(EndpointReceive)` task. Must eventually route through the
+        /// ownership primitive.
+        Can,
+        /// Proven unable to, by a source-enforced precondition that no caller can bypass.
+        Cannot,
+        /// Moves a task *into* `Blocked`; not a transition out.
+        IntoBlocked,
+        /// Initializes a freshly constructed TCB.
+        FreshConstructor,
+        /// `cfg(any(test, hosted-dev))` only.
+        NonProduction,
+        /// Unresolved. Any row here forces `WAITER_OWNER_CENSUS_COMPLETE=no`.
+        #[allow(dead_code)]
+        Unproven,
+    }
+
+    /// `(file, enclosing fn, how many status assignments it makes, verdict)`.
+    ///
+    /// The counts are compared against a mechanical extraction, so a new assignment, a removed
+    /// one, or a renamed function all break this table rather than slipping through unclassified.
+    const CENSUS: &[(&str, &str, usize, Verdict)] = &[
+        // ── exec_state.rs (10) ──────────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/exec_state.rs",
+            "futex_wait_current",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "futex_wake_inner",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "build_ap_workload",
+            2,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "spawn_user_task_from_image",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "dispatch_next_task",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current",
+            2,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current_to",
+            2,
+            Verdict::Can,
+        ),
+        // ── fault_state.rs (1) ──────────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/fault_state.rs",
+            "fault_current_task_with_fault",
+            1,
+            Verdict::Can,
+        ),
+        // ── ipc_state.rs (9) ────────────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "rt_commit_receiver_runnable",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "wake_tid_to_runnable",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "set_task_status_for_test",
+            1,
+            Verdict::NonProduction,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "recv_block_phase_b_task",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "block_current_on_send_with_deadline",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "process_ipc_timeout_deadlines",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "signal_notification",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "wake_destroyed_notification_waiter",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "ipc_recv_with_optional_deadline",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        // ── restart_state.rs (4) ────────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/restart_state.rs",
+            "exit_task",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "restart_task",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "mark_task_dead",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "reap_faulted_task_noalloc_cleanup",
+            1,
+            Verdict::Can,
+        ),
+        // ── scheduler_state.rs (1) ──────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/scheduler_state.rs",
+            "apply_cross_cpu_wake_task",
+            1,
+            Verdict::Can,
+        ),
+        // ── thread_state.rs (4) ─────────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/thread_state.rs",
+            "join_thread",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "wake_joiners_for",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "spawn_user_thread",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "fork_complete_post_clone",
+            1,
+            Verdict::Cannot,
+        ),
+        // ── task.rs (1) ─────────────────────────────────────────────────────────────────────
+        ("src/kernel/task.rs", "new", 1, Verdict::FreshConstructor),
+        // ── runtime.rs (7) ──────────────────────────────────────────────────────────────────
+        (
+            "src/runtime.rs",
+            "d6_genuine_mark_running_via_task_seam",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/runtime.rs",
+            "direct_dispatch_rollback_split",
+            1,
+            Verdict::Can,
+        ),
+        ("src/runtime.rs", "futex_wake_split_mut", 1, Verdict::Cannot),
+        ("src/runtime.rs", "sr_wake_receiver_split", 1, Verdict::Can),
+        (
+            "src/runtime.rs",
+            "sr_commit_blocked_receiver_split",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/runtime.rs",
+            "sr_uncommit_blocked_receiver_split",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/runtime.rs",
+            "futex_wait_publish_block_split_mut",
+            1,
+            Verdict::IntoBlocked,
+        ),
+    ];
+
+    fn production_source(rel: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        src.split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(&src)
+            .to_string()
+    }
+
+    /// The function lexically enclosing byte offset `at`: the latest `fn` header at either
+    /// top level or one `impl` level of indentation.
+    fn enclosing_fn(src: &str, at: usize) -> String {
+        const HEADERS: &[&str] = &[
+            "\nfn ",
+            "\npub fn ",
+            "\npub(crate) fn ",
+            "\npub(super) fn ",
+            "\nunsafe fn ",
+            "\n    fn ",
+            "\n    pub fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(super) fn ",
+            "\n    const fn ",
+            "\n    pub(crate) const fn ",
+            "\n    unsafe fn ",
+            "\n    pub unsafe fn ",
+        ];
+        let pre = &src[..at];
+        let mut best = None::<usize>;
+        for pat in HEADERS {
+            if let Some(i) = pre.rfind(pat) {
+                let start = i + pat.len();
+                if best.is_none_or(|b| b < start) {
+                    best = Some(start);
+                }
+            }
+        }
+        let start = best.expect("every status assignment is inside a function");
+        src[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    }
+
+    /// Mechanically extracted `(file, fn, count)`, sorted, over the same production sources and
+    /// the same two assignment forms the WA2A-R1 enumeration guard counts.
+    fn extracted() -> alloc::vec::Vec<(String, String, usize)> {
+        let mut files: alloc::vec::Vec<&str> = CENSUS.iter().map(|(f, ..)| *f).collect();
+        files.sort();
+        files.dedup();
+        let mut out: alloc::vec::Vec<(String, String, usize)> = alloc::vec::Vec::new();
+        for rel in files {
+            let src = production_source(rel);
+            let mut offsets: alloc::vec::Vec<usize> = src
+                .match_indices(".status = ")
+                .chain(src.match_indices("status: TaskStatus::"))
+                .map(|(i, _)| i)
+                .collect();
+            offsets.sort_unstable();
+            for at in offsets {
+                let f = enclosing_fn(&src, at);
+                match out.iter_mut().find(|(r, n, _)| r == rel && *n == f) {
+                    Some((_, _, n)) => *n += 1,
+                    None => out.push((rel.to_string(), f, 1)),
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Every status assignment lands in a classified function, with the exact count. A new
+    /// assignment, a deleted one, or a rename breaks this — so no writer can stay unclassified.
+    #[test]
+    fn every_status_writer_is_classified_by_its_enclosing_function() {
+        let mut pinned: alloc::vec::Vec<(String, String, usize)> = CENSUS
+            .iter()
+            .map(|(f, n, c, _)| (f.to_string(), n.to_string(), *c))
+            .collect();
+        pinned.sort();
+        assert_eq!(
+            extracted(),
+            pinned,
+            "the classified set must match the mechanically extracted set exactly"
+        );
+        assert_eq!(
+            CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
+            37,
+            "and it must still be the 37 sites WA2A-R1 pinned"
+        );
+    }
+
+    /// **D — compute, do not assert.** The five class counts are derived from the table.
+    #[test]
+    fn the_census_verdict_is_computed_from_the_table() {
+        let count = |v: Verdict| -> usize {
+            CENSUS
+                .iter()
+                .filter(|(_, _, _, w)| *w == v)
+                .map(|(_, _, c, _)| c)
+                .sum()
+        };
+        let can = count(Verdict::Can);
+        let cannot = count(Verdict::Cannot);
+        let into_blocked = count(Verdict::IntoBlocked);
+        let fresh = count(Verdict::FreshConstructor);
+        let non_production = count(Verdict::NonProduction);
+        let unproven = count(Verdict::Unproven);
+
+        assert_eq!(
+            can + cannot + into_blocked + fresh + non_production + unproven,
+            37,
+            "the classes must partition the enumerated sites"
+        );
+        assert_eq!(
+            (can, cannot, into_blocked, fresh, non_production),
+            (21, 7, 7, 1, 1)
+        );
+
+        // The verdict is derived, not written down.
+        let complete = unproven == 0;
+        assert!(complete, "{unproven} rows remain UNPROVEN");
+        let flag = if complete { "yes" } else { "no" };
+        for (name, doc) in [("KERNEL_UNLOCK_AUDIT", AUDIT), ("STATUS", STATUS)] {
+            assert!(
+                doc.contains(&alloc::format!("WAITER_OWNER_CENSUS_COMPLETE={flag}")),
+                "{name} must record the computed verdict WAITER_OWNER_CENSUS_COMPLETE={flag}"
+            );
+            assert!(
+                !doc.contains("WAITER_OWNER_CENSUS_COMPLETE=no"),
+                "{name} must not still carry the superseded WA2A-R1 verdict"
+            );
+            // Completing the census does NOT make the owners arbitrate.
+            assert!(
+                doc.contains("WAITER_OWNERSHIP_EXCLUSIVE=no"),
+                "{name} must keep WAITER_OWNERSHIP_EXCLUSIVE=no"
+            );
+        }
+        // …and the audit records the same computed numbers.
+        assert!(
+            AUDIT.contains("| CAN | 21 |")
+                && AUDIT.contains("| CANNOT | 7 |")
+                && AUDIT.contains("| INTO_BLOCKED | 7 |")
+                && AUDIT.contains("| FRESH_CONSTRUCTOR | 1 |")
+                && AUDIT.contains("| NON_PRODUCTION | 1 |")
+                && AUDIT.contains("| UNPROVEN | 0 |"),
+            "§6.1.34 must carry the computed class table"
+        );
+    }
+
+    /// **C — call-graph closure.** Every CANNOT pins a source-enforced precondition *and* the
+    /// reason no caller can bypass it. A local assertion alone is not enough: the closure fact
+    /// is that the target TID cannot be supplied from outside.
+    #[test]
+    fn every_cannot_row_pins_its_guard_and_its_caller_closure() {
+        // (file source, fn, the guard text, the closure fact that no caller can bypass it)
+        const PROOFS: &[(&str, &str, &str, &str)] = &[
+            (
+                "exec_state.rs",
+                "futex_wake_inner",
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {",
+                // value-level filter over every TCB: no parameter selects a victim
+                "for tcb in tcbs.iter_mut().flatten() {",
+            ),
+            (
+                "exec_state.rs",
+                "build_ap_workload",
+                "if self.task_status(tid).is_some() {",
+                "let tid = base_tid + i;",
+            ),
+            (
+                "exec_state.rs",
+                "build_ap_workload",
+                "if request_client && self.task_status(client_tid).is_none() {",
+                "let client_tid = base_tid + 1000;",
+            ),
+            (
+                "thread_state.rs",
+                "wake_joiners_for",
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Join(ThreadId(target_tid))) {",
+                "for tcb in tcbs.iter_mut().flatten() {",
+            ),
+            (
+                "thread_state.rs",
+                "spawn_user_thread",
+                "let tid = self.allocate_thread_id()?;",
+                // the signature takes a PARENT tid, never the tid being written
+                "pub fn spawn_user_thread(",
+            ),
+            (
+                "thread_state.rs",
+                "fork_complete_post_clone",
+                "let child_tid = match self.allocate_thread_id() {",
+                "fn fork_complete_post_clone(",
+            ),
+            (
+                "runtime.rs",
+                "futex_wake_split_mut",
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {",
+                "for tcb in tcbs.iter_mut().flatten() {",
+            ),
+        ];
+        // Exactly one proof per CANNOT assignment.
+        let cannot_sites: usize = CENSUS
+            .iter()
+            .filter(|(_, _, _, v)| *v == Verdict::Cannot)
+            .map(|(_, _, c, _)| c)
+            .sum();
+        assert_eq!(
+            PROOFS.len(),
+            cannot_sites,
+            "every CANNOT assignment needs its own guard + closure proof"
+        );
+
+        for (file, function, guard, closure) in PROOFS {
+            let src = match *file {
+                "exec_state.rs" => EXEC,
+                "thread_state.rs" => THREAD,
+                "runtime.rs" => RUNTIME,
+                other => panic!("unknown census source {other}"),
+            };
+            let body = src
+                .split(&alloc::format!("fn {function}("))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{file}: {function} not found"));
+            assert!(
+                body.contains(guard),
+                "{file}::{function} lost its precondition `{guard}`"
+            );
+            assert!(
+                body.contains(closure) || src.contains(closure),
+                "{file}::{function} lost its caller-closure fact `{closure}`"
+            );
+        }
+
+        // The two spawn CANNOTs additionally depend on the allocator never handing back a live
+        // TID. If that stopped being fail-closed, both would become CAN.
+        assert!(
+            POLICY.contains("if self.task_status(candidate).is_none() {")
+                && POLICY.contains("Err(KernelError::TaskTableFull)"),
+            "allocate_thread_id must only return an unused TID, and fail closed otherwise"
+        );
+        // Neither spawn function accepts the TID it writes.
+        assert!(
+            THREAD.contains(
+                "pub fn spawn_user_thread(\n        &mut self,\n        parent_tid: u64,"
+            ),
+            "spawn_user_thread must take only a PARENT tid"
+        );
+    }
+
+    /// The three preconditions the CAN verdicts rest on are *absences*, and they must stay
+    /// absent: the scheduler knows nothing about `TaskStatus`, and neither dispatch nor yield
+    /// checks the status of the task it transitions.
+    #[test]
+    fn the_can_verdicts_rest_on_absent_guards_that_must_stay_absent() {
+        let scheduler = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("crates/yarm-kernel/src/scheduler.rs"),
+        )
+        .expect("scheduler");
+        assert!(
+            !scheduler.contains("TaskStatus"),
+            "the run queue carries bare TIDs with NO status precondition — if that ever changes, \
+             the dispatch/yield CAN rows must be re-derived, not silently kept"
+        );
+        // dispatch_next_task: between the dequeue and the Running write there is no status read.
+        let dispatch = EXEC
+            .split("fn dispatch_next_task(")
+            .nth(1)
+            .expect("dispatch_next_task");
+        let from_dequeue = dispatch
+            .split("let next = self.local_dispatch_step_split();")
+            .nth(1)
+            .expect("the dequeue");
+        let to_write = from_dequeue
+            .split("tcb.status = TaskStatus::Running;")
+            .next()
+            .expect("the Running write");
+        for probe in [
+            "TaskStatus::Blocked",
+            "matches!(tcb.status",
+            "tcb.status ==",
+        ] {
+            assert!(
+                !to_write.contains(probe),
+                "dispatch gained a status check (`{probe}`) — re-derive its census row"
+            );
+        }
+        // spawn_user_task_from_image is CAN because registration is IDEMPOTENT: an existing
+        // (possibly endpoint-blocked) TID passes straight through to the Runnable write.
+        assert!(
+            POLICY.contains(
+                "if self.task_status(tid).is_some() {\n            return Ok(());\n        }"
+            ),
+            "register_task_with_class is idempotent, which is exactly why a caller-supplied \
+             spec.tid gives spawn_user_task_from_image no precondition"
+        );
+        // fault_current_task takes whatever was current, with no status read.
+        assert!(
+            FAULT.contains("let faulted_tid = self.block_current_cpu().ok_or_else(|| {"),
+            "the faulting path selects by `current`, not by status"
+        );
+    }
+
+    /// **E.** The owner/wiring matrix is recorded for every CAN path, with the six columns the
+    /// wiring increment needs.
+    #[test]
+    fn the_owner_wiring_matrix_covers_every_can_path() {
+        let matrix = AUDIT
+            .split("#### E. Owner / wiring matrix")
+            .nth(1)
+            .expect("§6.1.34 E")
+            .split("#### ")
+            .next()
+            .expect("matrix end");
+        for function in CENSUS
+            .iter()
+            .filter(|(_, _, _, v)| *v == Verdict::Can)
+            .map(|(_, n, _, _)| *n)
+        {
+            assert!(
+                matrix.contains(function),
+                "the wiring matrix must carry a row for the CAN path `{function}`"
+            );
+        }
+        for owner in [
+            "DirectRequest",
+            "DirectReply",
+            "OrdinaryTimeout",
+            "LegacyDelivery",
+            "Notification",
+            "Teardown",
+        ] {
+            assert!(
+                matrix.contains(owner),
+                "the matrix must assign the `{owner}` owner class"
+            );
+        }
+        // It is a design matrix only.
+        assert!(
+            matrix.contains("design matrix") || matrix.contains("Design only"),
+            "the matrix must say it is design only — no wiring in this increment"
+        );
     }
 }

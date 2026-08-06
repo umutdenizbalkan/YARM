@@ -3177,7 +3177,8 @@ and no change to the production predicate. §6.1.30 remains operative on every c
 > exhaustive wake-owner census. Its collection method — grepping the four waiter primitives —
 > can only find paths that touch a waiter, so by construction it cannot see a path that wakes a
 > blocked receiver without touching one. §6.1.32 runs the independent census that can, finds
-> seven more owners, and sets `WAITER_OWNER_CENSUS_COMPLETE=no`.
+> seven more owners. §6.1.32 D set `WAITER_OWNER_CENSUS_COMPLETE` to `no`; §6.1.34 resolves the
+> remaining twelve rows and raises it to **yes**.
 
 Every production path that calls one of the four waiter primitives (`set_endpoint_waiter`,
 `take_endpoint_waiter`, `clear_endpoint_waiter_if_identity`,
@@ -3428,14 +3429,17 @@ that accepts any `Blocked(_)` task by numeric TID, and it is what `wake_waiter_f
 the split wake plan both call. `the_newly_found_unguarded_wake_owners_are_recorded` pins that each
 one really is guarded only on `Blocked(_)` (or not at all) and consults no endpoint waiter.
 
-**`WAITER_OWNER_CENSUS_COMPLETE=no`.** The candidate *enumeration* is mechanical and pinned. The
-per-site *negative* is not: the twelve UNPROVEN sites assign a status with no guard on the
+> **Superseded by §6.1.34.** All twelve unproven rows below are now resolved — nine to CAN, three
+> to CANNOT — and the verdict is `WAITER_OWNER_CENSUS_COMPLETE=yes`. The reasoning recorded here
+> is why they were open, not the current state.
+
+**`WAITER_OWNER_CENSUS_COMPLETE` was `no` at WA2A-R1.** The candidate *enumeration* is mechanical
+and pinned. The per-site *negative* was not: the twelve UNPROVEN sites assign a status with no guard on the
 previous one, so "it cannot act on `Blocked(EndpointReceive)`" rests on a dynamic invariant — the
 task was just registered, or is `current`, or was just dequeued — that the source alone does not
 establish. Rather than retain an unsupported exhaustive claim, the completeness flag is set to
-`no` and `the_census_completeness_claim_is_narrowed_not_asserted` pins it in both canonical
-documents. Proving those twelve negatives is prerequisite work for any increment that wants to
-claim `WAITER_OWNERSHIP_EXCLUSIVE=yes`.
+`no`. Proving those twelve negatives was prerequisite work for any increment that wants to claim
+`WAITER_OWNERSHIP_EXCLUSIVE=yes`; §6.1.34 does that proof.
 
 The three facts already established stay explicit and are separately pinned: the ordinary timeout
 is non-exclusive; the notification wake uses a separate waiter table; and
@@ -3556,17 +3560,23 @@ WA2A-R1's view reported `Vacant` for an out-of-range index **and** for a key dif
 one occupying the slot. Both are claims that `claim(key)` could succeed, and both were false. The
 view now distinguishes:
 
-| view | means | would `claim` succeed? |
+| view | means | claim-eligible? |
 |---|---|---|
 | `EndpointIndexOutOfRange` | no such slot | no |
 | `Vacant` | nothing armed | no — `NoCurrentWaiter` until armed |
-| `Available` | armed for **this** incarnation | **yes** |
+| `Available` | armed for **this** incarnation, unclaimed | **yes — eligible** |
 | `Claimed { owner }` | this incarnation is owned | no |
 | `Consumed` / `Cancelled` | this incarnation is terminal | no |
 | `ForeignIncarnation { holding }` | a **different** incarnation holds the slot | no |
 
-`the_view_agrees_with_what_claim_would_do` walks every state and asserts that whenever the view is
-not `Available`, `claim` fails. No variant carries `claim_generation`, and
+> **Corrected at WA2B-CENSUS.** This section originally headed the third column "would `claim`
+> succeed?" and answered `Available` → **yes**. That is not literally true: with the generation
+> counter saturated, an `Available` slot rejects with `ClaimGenerationExhausted`. The exact
+> contract is that `Available` means armed-and-unclaimed and is the **only slot state
+> structurally eligible** for a claim — not that a claim from it succeeds. §6.1.34 A carries the
+> repair.
+
+No variant carries `claim_generation` or any counter state, and
 `the_view_carries_no_claim_generation_anywhere` shows the view is identical across two different
 live generations.
 
@@ -3629,6 +3639,165 @@ freshly booted kernel has `occupied_count() == 0` — helper-only, at runtime.
 * helper-only, **zero production callers**
 * `WAITER_OWNERSHIP_EXCLUSIVE` — **no**
 * `WAITER_OWNER_CENSUS_COMPLETE` — **no**
+* x86 direct production default — **OFF** on every architecture
+* NR6/NR7 waiter claim position — **unchanged** (single late claim)
+* canonical 199D — **OPEN**
+* current ledger — **39 / 7 / 46** (no cell moves)
+* RISC-V links/status — unchanged (link 1 ABSENT; 2, 3, 7, 9 present; 4, 5, 6, 8, 10 absent;
+  `RISCV_REMOTE_WAKE=D`; `RISCV_199D_READINESS=case_b`; coordinate 23 OPEN)
+* **no new live cell**
+
+---
+
+### 6.1.34 WA2B-CENSUS — the wake-owner census, resolved
+
+Census resolution and one contract repair. Still **zero production callers**: waiter ownership is
+wired into nothing, neither late direct waiter claim moved, and no NR6/NR7, timeout, notification,
+legacy-delivery, teardown, shared-region, scheduler-policy, predicate, seal, RISC-V, ServerDies or
+199E change.
+
+#### A. The view contract, corrected
+
+§6.1.33 C headed its third column "would `claim` succeed?" and answered `Available` → **yes**.
+That is not literally true:
+
+```text
+slot = Available { key };  next_claim_generation = u64::MAX
+claim(key, owner) → Err(ClaimGenerationExhausted)
+```
+
+The implementation is unchanged and correct — the exhaustion path is exactly the fail-closed
+behaviour §6.1.32 C asked for. Only the *contract* was overstated. It now reads:
+
+* `Available` means the exact incarnation is **armed and unclaimed**;
+* it is the **only** slot state structurally eligible for a claim;
+* a claim from it may still fail closed with `ClaimGenerationExhausted`.
+
+`the_view_agrees_with_what_claim_would_do` is replaced by
+`available_is_the_only_claim_eligible_view_but_is_not_a_promise_of_success`, which proves all
+three parts: every non-`Available` view necessarily rejects; an ordinary `Available` view admits;
+and an **exhausted** `Available` view stays `Available`, rejects with `ClaimGenerationExhausted`
+and mutates nothing. The view still exposes neither `claim_generation` nor any counter state — it
+reports the same `Available` before and after saturation, so exhaustion is not predictable from
+it.
+
+#### B. The twelve unproven rows, resolved
+
+Each row was resolved against the standard §6.1.32 D set: a site is **CANNOT** only when a
+source-enforced precondition or a behavioural test proves it cannot receive an endpoint-blocked
+task. "The task should be current", "it was probably just dequeued" and "spawn normally uses a
+fresh TCB" are not proofs, and none of them was accepted.
+
+| # | site | resolution | why |
+|---|---|---|---|
+| 1 | `build_ap_workload` (AP client spawn) | **CANNOT** | the write is lexically inside `if request_client && self.task_status(client_tid).is_none()`, and `client_tid` is bound locally (`base_tid + 1000`) |
+| 2 | `spawn_user_task_from_image` | **CAN** | `spec.tid` is caller-supplied at **24** call sites, and `register_task_with_class` is *idempotent* (`if task_status(tid).is_some() { return Ok(()) }`) — an existing, possibly endpoint-blocked TID passes straight through to the `Runnable` write |
+| 3 | `dispatch_next_task` → `Running` | **CAN** | `scheduler.rs` contains **zero** occurrences of `TaskStatus`: the run queue carries bare TIDs with no status precondition, and there is no status read between the dequeue and the write |
+| 4 | `yield_current` → outgoing `Runnable` | **CAN** | selects `current_tid()` with no status read; a task that has just executed `recv_block_phase_b_task` is `Blocked(EndpointReceive)` **and** still `current` |
+| 5 | `yield_current` → incoming `Running` | **CAN** | as row 3 |
+| 6 | `yield_current_to` → outgoing `Runnable` | **CAN** | as row 4 |
+| 7 | `yield_current_to` → incoming `Running` | **CAN** | as row 3, via `on_preempt_prefer_on` |
+| 8 | `spawn_user_thread` | **CANNOT** | `let tid = self.allocate_thread_id()?` — the signature takes only `parent_tid`, so no caller can supply the TID written |
+| 9 | `fork_complete_post_clone` | **CANNOT** | `let child_tid = match self.allocate_thread_id()` — same closure |
+| 10 | `d6_genuine_mark_running_via_task_seam` | **CAN** | as row 3; `incoming` comes from the same dequeue |
+| 11 | `direct_dispatch_rollback_split` | **CAN** | as row 3; undoes a dispatch with no status read |
+| 12 | `fault_current_task_with_fault` | **CAN** | `let faulted_tid = self.block_current_cpu()` — selects by `current`, never by status |
+
+Rows 8 and 9 rest on `allocate_thread_id`, which returns a candidate only where
+`self.task_status(candidate).is_none()` and otherwise fails closed with `TaskTableFull`. That is a
+source-enforced precondition, and `every_cannot_row_pins_its_guard_and_its_caller_closure` pins
+both halves of it.
+
+#### C. Call-graph closure
+
+Every **CANNOT** — the four from §6.1.32 plus the three above — is closed *locally*, so no caller
+can bypass it. Two shapes:
+
+| shape | sites | closure |
+|---|---|---|
+| value-level filter over every TCB | `futex_wake_inner`, `futex_wake_split_mut`, `wake_joiners_for` | the loop visits all TCBs and `continue`s unless the exact `WaitReason` matches; no parameter selects a victim |
+| locally bound TID behind a fail-closed check | `build_ap_workload` ×2, `spawn_user_thread`, `fork_complete_post_clone` | the TID is derived inside the function (`base_tid + i`, `base_tid + 1000`, `allocate_thread_id()`), never taken as the parameter that is written |
+
+There is no third shape and no "helper trusted by its callers": had one existed, the site would
+have been **CAN**.
+
+Four guards fail on drift: a new or removed status assignment
+(`every_status_writer_is_classified_by_its_enclosing_function`, which compares a *mechanical*
+extraction of `(file, enclosing fn, count)` against the classified table); a disappeared
+precondition or closure fact (`every_cannot_row_pins_its_guard_and_its_caller_closure`); an
+unclassified writer (same extraction — an unlisted function makes the sets differ); and a
+**newly appearing** guard that would invalidate a CAN row
+(`the_can_verdicts_rest_on_absent_guards_that_must_stay_absent` pins that `scheduler.rs` still
+knows nothing about `TaskStatus`, that dispatch still reads no status, and that registration is
+still idempotent).
+
+#### D. The verdict, computed
+
+Counts derived from the classification table, not written down:
+
+| class | sites |
+|---|---|
+| CAN | 21 |
+| CANNOT | 7 |
+| INTO_BLOCKED | 7 |
+| FRESH_CONSTRUCTOR | 1 |
+| NON_PRODUCTION | 1 |
+| UNPROVEN | 0 |
+
+21 + 7 + 7 + 1 + 1 + 0 = **37**, the mechanically enumerated total.
+
+**`WAITER_OWNER_CENSUS_COMPLETE=yes`.** Zero rows remain dependent on an unstated runtime
+invariant. No runtime code was changed to reach this: nine of the twelve resolved *against* the
+comfortable answer, which is why the CAN set grew from 12 to 21.
+
+**`WAITER_OWNERSHIP_EXCLUSIVE=no` is unchanged.** Completing the census says who the owners are;
+it does not make them arbitrate. Not one of the 21 routes through the primitive yet.
+
+#### E. Owner / wiring matrix
+
+**Design only — nothing here is implemented in this increment.** The 21 CAN sites fall into three
+groups, and the third is the finding that matters most.
+
+**Group 1 — endpoint-delivery owners (8 sites).** These intend to complete a blocked receiver, so
+a claim is the natural fit.
+
+| path | owner | key dimensions available | lock domains today | claim at ipc(3) without inversion? | shape | settle | retire pairs with |
+|---|---|---|---|---|---|---|---|
+| `sr_commit_blocked_receiver_split` | `DirectRequest` / `DirectReply` | all four, exact | ipc(3) → task(2) | **yes** — already claims the waiter here | split txn (already) | consume on commit, restore on rollback | `sr_restore_endpoint_waiter_split` |
+| `rt_commit_receiver_runnable` | `OrdinaryTimeout` | all four (holds the terminal cell + blocked-recv gen) | terminal → ipc(3) → task(2) | **yes** | plan-first (already) | consume | the terminal cell's own clear |
+| `wake_tid_to_runnable` | `LegacyDelivery` | **TID only** — needs the endpoint index and generation threaded from its three callers | task(2) → sched(1) | only if the caller claims; the helper itself sees no endpoint | caller-side claim, token passed in | consume | `take_endpoint_waiter` at the caller |
+| `wake_waiter_for_endpoint` (via the above) | `LegacyDelivery` | index + slot generation; **no identity compare today** | ipc(3) → task(2) → sched(1) | **yes** | plan-first snapshot | consume | its own `take_endpoint_waiter` |
+| `ipc_reply` (via the above) | `LegacyDelivery` | index + slot generation; no identity compare | broad | yes (broad already covers ipc) | in-lock | consume | its own take |
+| `sr_wake_receiver_split` | `LegacyDelivery` | **TID only** | task(2) → sched(1) | no — needs a new ipc(3) phase, or the token from `ctx_finalize_and_wake` | plan-first snapshot | consume | shared-region finalize |
+| `signal_notification` | `Notification` | **TID only, different table** | ipc(3) → task(2) → sched(1) | **yes**, but it must first learn the endpoint the TID is blocked on | plan-first snapshot | cancel (it is not an endpoint delivery) | n/a — it must lose to the endpoint owner |
+| `wake_destroyed_notification_waiter` | `Notification` | TID only | task(2) → sched(1) | no — needs a new ipc(3) phase | plan-first snapshot | cancel | n/a |
+| `process_ipc_timeout_deadlines` | `OrdinaryTimeout` | identity sweep; endpoint index recoverable from the `WaitReason` cap | task(2) **then** ipc(3) | **no — this is the inversion** | must become ipc(3)-first plan, then task(2) apply | consume on fire, restore on loss | `clear_endpoint_waiters_for_identity` |
+| `apply_cross_cpu_wake_task` | `LegacyDelivery` | **TID only**, no ipc domain at all | task(2) → sched(1) | no | the token must travel **inside the `WakeTask` item** | consume | the enqueuer's clear |
+
+**Group 2 — teardown (4 sites).** `exit_task`, `restart_task`, `mark_task_dead`,
+`reap_faulted_task_noalloc_cleanup`. Owner `Teardown`; all four write unconditionally with TID-only
+identity and consult no waiter. They already run near ipc(3) (they clear IPC waiters), so a claim
+at ipc(3) is available without inversion; the settle is **cancel**, and retirement pairs with
+`clear_ipc_waiters_for_tid`.
+
+**Group 3 — scheduler and lifecycle (9 sites).** `dispatch_next_task`, `yield_current` ×2,
+`yield_current_to` ×2, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`,
+`fault_current_task_with_fault`, `spawn_user_task_from_image`.
+
+These are **not** delivery owners: none of them intends to complete a receive. They are CAN only
+because nothing stops them from moving an endpoint-blocked task. Routing them through the
+primitive would be the wrong repair — they run at scheduler(1)/task(2) and would need ipc(3)
+*above* scheduler(1), a rank inversion the split-lock architecture cannot express. **The correct
+repair for group 3 is a proven-negative precondition, not a claim:** an explicit
+`debug_assert`/typed refusal that the task being transitioned is not `Blocked(EndpointReceive)`,
+which would convert these nine rows from CAN to CANNOT and shrink the eventual arbitration set
+from 21 to 12. That is a separate increment; recording it here is the whole point of the matrix.
+
+#### Status
+
+* helper-only, **zero production callers**
+* `WAITER_OWNER_CENSUS_COMPLETE` — **yes** (0 UNPROVEN of 37)
+* `WAITER_OWNERSHIP_EXCLUSIVE` — **no** (21 CAN paths, none arbitrating)
 * x86 direct production default — **OFF** on every architecture
 * NR6/NR7 waiter claim position — **unchanged** (single late claim)
 * canonical 199D — **OPEN**

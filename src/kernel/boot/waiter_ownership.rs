@@ -142,14 +142,22 @@ pub(crate) enum WaiterSlotKind {
 
 /// The answer to "what is the state of *this* incarnation?".
 ///
-/// Every variant is truthful about whether [`IpcSubsystem::waiter_ownership_claim`] could
-/// succeed: only [`WaiterOwnershipView::Available`] says yes. In particular a slot held by a
-/// **different** incarnation reports [`WaiterOwnershipView::ForeignIncarnation`], never
-/// `Vacant` — WA2A-R1 reported `Vacant` there and for an out-of-range index, both of which
-/// implied a claim would be accepted.
+/// **The exact contract** (WA2B-CENSUS corrected the earlier wording):
 ///
-/// Deliberately carries no `claim_generation`: knowing it would let a caller reconstruct
-/// authority it never earned. Only a successful claim mints a token.
+/// * [`WaiterOwnershipView::Available`] means the exact incarnation is **armed and unclaimed**;
+/// * it is the **only** slot state structurally eligible for [`WaiterOwnershipTable::claim`] —
+///   every other view necessarily rejects a claim;
+/// * `Available` is *not* a promise that a claim succeeds: it may still fail closed with
+///   [`ClaimError::ClaimGenerationExhausted`], which mutates nothing and leaves the slot
+///   `Available`.
+///
+/// A slot held by a **different** incarnation reports
+/// [`WaiterOwnershipView::ForeignIncarnation`], never `Vacant` — WA2A-R1 reported `Vacant` there
+/// and for an out-of-range index, both of which implied a claim would be accepted.
+///
+/// Deliberately carries no `claim_generation` and no counter state: knowing either would let a
+/// caller reconstruct authority it never earned, or predict exhaustion it has no business
+/// predicting. Only a successful claim mints a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaiterOwnershipView {
     /// The key names an endpoint index the table does not have.
@@ -157,7 +165,9 @@ pub(crate) enum WaiterOwnershipView {
     /// The slot is genuinely empty. Nothing is armed, so nothing is claimable **yet**: a
     /// `claim` here fails with [`ClaimError::NoCurrentWaiter`] until someone arms it.
     Vacant,
-    /// Armed for exactly this incarnation and unclaimed. A claim would succeed.
+    /// Armed for exactly this incarnation and unclaimed: the only state structurally eligible
+    /// for a claim. A claim from here may still fail closed on
+    /// [`ClaimError::ClaimGenerationExhausted`].
     Available,
     /// This exact incarnation is owned.
     Claimed { owner: WaiterOwner },
@@ -1001,10 +1011,17 @@ mod tests {
 
     // ── C. The view is truthful ─────────────────────────────────────────────────────────────
 
-    /// Only `Available` may imply a claim would succeed, and every other answer is checked
-    /// against what `claim` actually does.
+    /// **The exact view contract**, in three parts:
+    ///
+    /// 1. every non-`Available` view *necessarily* rejects a claim;
+    /// 2. an ordinary (non-exhausted) `Available` view admits one;
+    /// 3. an **exhausted** `Available` view stays `Available` and rejects with
+    ///    `ClaimGenerationExhausted`, mutating nothing.
+    ///
+    /// Part 3 is why the contract is "the only state structurally eligible for a claim" rather
+    /// than "a claim would succeed": the earlier wording was not literally true.
     #[test]
-    fn the_view_agrees_with_what_claim_would_do() {
+    fn available_is_the_only_claim_eligible_view_but_is_not_a_promise_of_success() {
         let bad = key(ENDPOINT_WAITER_SLOTS, 1, 1, 1, 1);
         let foreign = other_incarnations()[0];
 
@@ -1016,7 +1033,7 @@ mod tests {
             Err(ClaimError::NoCurrentWaiter)
         );
 
-        // Available → the one view that promises success.
+        // Available → the only claim-eligible state (part 2: an ordinary one admits a claim).
         t.arm_current(base()).expect("arm");
         assert_eq!(t.view(&base()), WaiterOwnershipView::Available);
         let token = t.claim(base(), WaiterOwner::DirectRequest).expect("claim");
@@ -1050,8 +1067,9 @@ mod tests {
         // Out of range.
         assert_eq!(t.view(&bad), WaiterOwnershipView::EndpointIndexOutOfRange);
 
-        // Exhaustively: whenever the view is not `Available`, a claim fails.
+        // Part 1, exhaustively: whenever the view is not `Available`, a claim NECESSARILY fails.
         for (label, view, k) in [
+            ("vacant", t.view(&key(9, 1, 1, 1, 1)), key(9, 1, 1, 1, 1)),
             ("consumed-exact", t.view(&base()), base()),
             ("foreign", t.view(&foreign), foreign),
             ("out-of-range", t.view(&bad), bad),
@@ -1059,9 +1077,32 @@ mod tests {
             assert_ne!(view, WaiterOwnershipView::Available, "{label}");
             assert!(
                 t.claim(k, WaiterOwner::DirectRequest).is_err(),
-                "{label}: the view promised nothing and claim must agree"
+                "{label}: a non-Available view is not claim-eligible and claim must agree"
             );
         }
+
+        // Part 3: `Available` is eligibility, NOT a promise. With the generation counter
+        // saturated the very same view rejects — and leaves the slot exactly as it was.
+        let mut ex = table();
+        ex.arm_current(base()).expect("arm");
+        ex.next_claim_generation = u64::MAX;
+        assert_eq!(
+            ex.view(&base()),
+            WaiterOwnershipView::Available,
+            "the view reports eligibility, and it does not leak counter state"
+        );
+        assert_eq!(
+            ex.claim(base(), WaiterOwner::DirectRequest),
+            Err(ClaimError::ClaimGenerationExhausted),
+            "an eligible slot can still fail closed"
+        );
+        assert_eq!(
+            ex.view(&base()),
+            WaiterOwnershipView::Available,
+            "and the refusal mutated nothing — still armed, still unclaimed"
+        );
+        assert_eq!(ex.claimed_count(), 0);
+        assert_eq!(ex.occupied_count(), 1);
     }
 
     #[test]
