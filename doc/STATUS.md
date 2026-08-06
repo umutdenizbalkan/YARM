@@ -940,11 +940,12 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    assertion exactly as `DIRECT_ACK_STORE_CAPACITY` is — so a finished incarnation holds its slot
    only until the next incarnation of that endpoint claims it; three 10 001-cycle tests
    (claim/restore, claim/consume, claim/cancel) confirm it never exhausts, a live claim is never
-   evicted, and an out-of-range index is a typed fail-closed error. (2) Rank-3 ownership is now
-   structural rather than documentary: the table is a private field of `IpcSubsystem`
-   (`waiter_ownership_stores = 1`), every raw claim/settle method is module-private, and the whole
-   cross-module surface is six typed `IpcSubsystem::waiter_ownership_*` methods, so ownership
-   cannot be mutated through the task, scheduler, capability, VM or broad-state APIs at all. (3)
+   evicted, and an out-of-range index is a typed fail-closed error. (2) The table became a private field of
+   `IpcSubsystem` (`waiter_ownership_stores = 1`) with every raw method module-private, so
+   ownership cannot be *operated* through the task, scheduler, capability, VM or broad-state APIs
+   at all. (R2 corrects the wording that called a boot-domain reference to it "inert": a boot
+   sibling cannot call a method on the table but could still replace it wholesale, so the accurate
+   description is rank-3 co-location plus source-guarded encapsulation.) (3)
    The claim token is opaque — private fields, no forgeable struct literal, no exposure of the
    live claim generation — and `wrapping_add` is replaced by `checked_add` with a typed
    `ClaimGenerationExhausted` that leaves both the slot and the counter untouched, so an ancient
@@ -972,6 +973,43 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    **no**, the x86 direct production default remains **OFF** on every architecture, canonical 199D
    stays **OPEN**, the ledger stays **39 / 7 / 46**, RISC-V links/status are unchanged and **no new
    live cell** is earned. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.32.
+
+   **WA2A-R2: the primitive rejected stale tokens but ACCEPTED stale claim requests.** R1's
+   `claim` installed a key whenever it differed from the terminal one, reading "different key" as
+   "a newer incarnation is taking over". A key states which incarnation, never when, so
+   `claim A → consume A → claim B → consume B → delayed claim A` minted a fresh token for the
+   older, already-finished incarnation A. Reproduced against `e3e5de91` before the repair.
+
+   `claim` no longer installs a key at all. A slot is armed for exactly one current incarnation by
+   `arm_current` — which the eventual authoritative waiter-publication path will call under the
+   same ipc rank-3 acquisition that installs the receive-waiter — and released by
+   `retire_current`; `claim` succeeds only from `Available` holding that exact key, `restore`
+   returns to `Available` rather than `Vacant` (unarming there would reopen the same hole through
+   the rollback path), a live claim can be neither armed over nor retired nor evicted, and a stale
+   arm or retire can neither erase nor displace the current incarnation. The table stays bounded
+   and leak-free with an **explicit obligation**: a terminal slot blocks its endpoint index until
+   retired — fail-closed, but a liveness duty the wiring increment inherits. Three 10 001-cycle
+   tests assert nothing is left occupied.
+
+   The view is truthful now too: R1 reported `Vacant` both for an out-of-range endpoint index and
+   for a key different from the one occupying the slot, each of which implied a claim would
+   succeed. It distinguishes `EndpointIndexOutOfRange`, `Vacant`, `Available`, `Claimed{owner}`,
+   `Consumed`, `Cancelled` and `ForeignIncarnation{holding}`, carries no claim generation, and a
+   test walks every state asserting that whenever the view is not `Available`, `claim` fails.
+
+   The encapsulation claim is corrected rather than restated: a boot sibling cannot call any
+   method on the table, but the field and `vacant()` are visible within `crate::kernel::boot`, so
+   it could replace the whole table by assignment, `mem::replace`/`swap` or a raw pointer write.
+   Route 2 is taken — **rank-3 co-location plus source-guarded encapsulation, not complete
+   type-system-enforced inertness** — and a guard rejects every one of those forms outside the
+   ownership module, with a non-vacuity check and a positive control that only the declaration and
+   the single initializer name the field.
+
+   Sixteen mutations, all caught (the ten from R1 re-run, plus six for the lifecycle). Still
+   helper-only with **zero production callers**; neither late direct waiter claim moved.
+   `WAITER_OWNERSHIP_EXCLUSIVE=no`, `WAITER_OWNER_CENSUS_COMPLETE=no`, x86 direct production
+   default **OFF** on every architecture, canonical 199D **OPEN**, ledger **39 / 7 / 46**, RISC-V
+   links/status unchanged, **no new live cell**. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.33.
 
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.

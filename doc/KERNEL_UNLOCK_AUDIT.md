@@ -3289,6 +3289,11 @@ by finding nothing.
 
 ### 6.1.32 WA2A-R1 — repairing the ownership foundation
 
+> **Read with §6.1.33.** WA2A-R2 replaced this section's slot model — `claim` could install a key
+> over a *terminal* one, which accepted a delayed request for an older incarnation — with an
+> explicitly armed current incarnation, made the view truthful, and corrected the encapsulation
+> claim in §B below. Where the two sections touch the same contract, **§6.1.33 is operative**.
+
 Four repairs to §6.1.31, and nothing else: no NR6/NR7, timeout, notification, legacy-delivery,
 shared-region or teardown wiring; neither late waiter claim moved; no production predicate,
 scheduler policy, RISC-V link, ServerDies path, canonical 199E path or live-cell change. §6.1.30
@@ -3341,17 +3346,19 @@ live claims.
 The table is no longer a free-standing type a caller could hold. It is a **private field of
 `IpcSubsystem`** (`waiter_ownership_stores = 1`), indexed identically to `endpoint_waiters`, so
 reaching it at all requires the ipc rank-3 guard the caller already holds. The module lives under
-`src/kernel/boot/`, and every raw method on the table — `claim`, `consume`, `restore`, `cancel`,
-`validate`, `stamp`, `view`, `claimed_count` — is **module-private**. The entire cross-module
-surface is six typed `IpcSubsystem::waiter_ownership_*` methods.
+`src/kernel/boot/`, and every raw method on the table is **module-private**, so the typed
+`IpcSubsystem::waiter_ownership_*` methods are the only way to *operate* it.
 
 The field's visibility is `pub(in crate::kernel::boot)`, which is the tightest Rust can express
-here and is stated as such rather than overclaimed: `pub(in …)` requires an *ancestor* module of
-the declaration, and `boot` is the nearest ancestor shared by `defs` (which declares the field)
-and the ownership module (which must reach it). Within the boot domain a `&mut
-WaiterOwnershipTable` is therefore nameable — and **inert**, because every method that could
-mutate it is private to the ownership module. That is the property that matters, and it is what
-the guards pin.
+here: `pub(in …)` requires an *ancestor* module of the declaration, and `boot` is the nearest
+ancestor shared by `defs` (which declares the field) and the ownership module (which must reach
+it).
+
+> **Corrected at WA2A-R2.** This section originally called a boot-domain `&mut
+> WaiterOwnershipTable` **inert**. That was an overclaim: a boot sibling cannot call a method on
+> the table, but it could still replace the whole thing by assignment, `mem::replace`/`swap` or a
+> raw pointer write. The accurate description is **rank-3 co-location plus source-guarded
+> encapsulation, not complete type-system-enforced inertness** — see §6.1.33 D.
 
 Embedding the field changed `IpcSubsystem`'s layout, so the single initializer in
 `bootstrap_state.rs` was updated explicitly with `WaiterOwnershipTable::vacant()` — a `const fn`,
@@ -3466,6 +3473,166 @@ itself, now caught rather than shipped.
 * x86 direct production default — **OFF** on every architecture
 * current ledger — **39 / 7 / 46** (no cell moves)
 * canonical 199D — **OPEN**
+* RISC-V links/status — unchanged (link 1 ABSENT; 2, 3, 7, 9 present; 4, 5, 6, 8, 10 absent;
+  `RISCV_REMOTE_WAKE=D`; `RISCV_199D_READINESS=case_b`; coordinate 23 OPEN)
+* **no new live cell**
+
+---
+
+### 6.1.33 WA2A-R2 — an authoritative current incarnation
+
+Lifecycle, view and encapsulation-claim repairs only. Still **zero production callers**: no NR6,
+NR7, timeout, notification, legacy-delivery, teardown, shared-region or RISC-V wiring; neither
+late direct waiter claim moved; no predicate, scheduler policy, seal, ledger or live-cell change.
+
+#### The defect
+
+WA2A-R1's `claim` accepted any key that differed from a terminal one, on the reasoning that "a
+different incarnation is taking over". A key states *which* incarnation, never *when*, so that
+reasoning cannot distinguish a newer incarnation from an older delayed one:
+
+```text
+claim A → consume A        (slot = Consumed{A})
+claim B → consume B        (slot = Consumed{B};  B replaced A because B ≠ A)
+delayed claim A            → Ok(token, claim_generation = 3)     ← WRONG
+```
+
+Reproduced against `e3e5de91` before the repair: the delayed claim for the already-consumed older
+incarnation A returned a fresh token. The primitive rejected stale **tokens** and accepted stale
+**claim requests** — which is the more dangerous half, because a token is only as good as the
+claim that minted it.
+
+#### A. An explicitly armed current incarnation
+
+`claim` no longer installs a key. The only way a key enters a slot is `arm_current`, which the
+eventual authoritative waiter-publication path will call under the same ipc rank-3 acquisition
+that installs the receive-waiter:
+
+```text
+  Vacant ──arm_current(k)──► Available{k} ──claim(k,owner)──► Claimed{k,owner,gen}
+    ▲                            ▲                              │
+    │                            └──────── restore(token) ──────┤
+    │                                                           │
+    └── retire_current(k) ◄── Consumed{k} / Cancelled{k} ◄── consume/cancel(token)
+```
+
+| operation | accepted from | refused, with no mutation |
+|---|---|---|
+| `arm_current(k)` | `Vacant` only | any occupied slot → `SlotOccupied{holding}`; out-of-range |
+| `claim(k, owner)` | `Available` **holding exactly `k`** | `Vacant` → `NoCurrentWaiter`; a different incarnation → `NoSuchCurrentIncarnation{holding}`; same key already claimed → `AlreadyClaimed{by}`; terminal → `Consumed`/`Cancelled`; out-of-range; generation exhausted |
+| `restore(token)` | `Claimed` | → `Available{k}`, **not** `Vacant` |
+| `consume`/`cancel(token)` | `Claimed` | → `Consumed{k}` / `Cancelled{k}` |
+| `retire_current(k)` | `Available`/`Consumed`/`Cancelled` **holding exactly `k`** | a live claim → `LiveClaim{by}`; a stale key → `NoSuchCurrentIncarnation{holding}`; `Vacant` → `NotArmed`; out-of-range |
+
+`restore` returns to `Available`, not `Vacant`, because the waiter is still published — unarming
+there would let an older delayed request arm the slot, reintroducing the same defect through the
+rollback path.
+
+**Bounded and leak-free, with an explicit obligation.** No historical-key store returns: a slot
+names exactly one incarnation, and `retire_current` returns it to `Vacant`. What buys that is a
+duty the wiring increment inherits and which this section states rather than hides — **a terminal
+slot blocks its endpoint index until it is retired.** That is fail-closed (a stale incarnation can
+never be claimed) but it is a liveness obligation: whatever clears the authoritative receive-waiter
+must also retire the slot, under the same rank-3 acquisition. Three 10 001-cycle tests
+(arm/claim/consume/retire, /cancel/, /restore/) assert `occupied_count() == 0` after every cycle.
+
+#### B. Stale incarnations cannot move the slot backward
+
+| test | proves |
+|---|---|
+| `a_delayed_claim_for_a_consumed_and_retired_incarnation_is_refused` | the exact reported sequence; **fails against `e3e5de91`** |
+| `a_delayed_claim_for_a_cancelled_and_retired_incarnation_is_refused` | same via the cancel path |
+| `an_older_incarnation_is_refused_in_every_identity_dimension` | old endpoint generation, old ASID, old wait generation |
+| `a_stale_arm_or_retire_can_neither_erase_nor_replace_the_current_incarnation` | a late arm and a late retire both bounce off `Available`, `Claimed` and terminal slots |
+| `a_live_claim_can_be_neither_armed_over_nor_retired_nor_evicted` | including `retire_current` of the *exact* live key → `LiveClaim{by}` |
+| `restore_returns_the_exact_incarnation_to_available_not_to_vacant` | and an older request still cannot take it over afterwards |
+| `a_stale_token_is_rejected_even_when_the_same_owner_reclaims` | the claim-generation check, unmasked by owner or key |
+| three 10 001-cycle tests | no leak across complete lifecycles |
+| `every_endpoint_slot_can_be_armed_and_claimed_simultaneously` | `ENDPOINT_WAITER_SLOTS` live at once, then fully unwound |
+
+#### C. A truthful, fail-closed view
+
+WA2A-R1's view reported `Vacant` for an out-of-range index **and** for a key different from the
+one occupying the slot. Both are claims that `claim(key)` could succeed, and both were false. The
+view now distinguishes:
+
+| view | means | would `claim` succeed? |
+|---|---|---|
+| `EndpointIndexOutOfRange` | no such slot | no |
+| `Vacant` | nothing armed | no — `NoCurrentWaiter` until armed |
+| `Available` | armed for **this** incarnation | **yes** |
+| `Claimed { owner }` | this incarnation is owned | no |
+| `Consumed` / `Cancelled` | this incarnation is terminal | no |
+| `ForeignIncarnation { holding }` | a **different** incarnation holds the slot | no |
+
+`the_view_agrees_with_what_claim_would_do` walks every state and asserts that whenever the view is
+not `Available`, `claim` fails. No variant carries `claim_generation`, and
+`the_view_carries_no_claim_generation_anywhere` shows the view is identical across two different
+live generations.
+
+#### D. The structural claim, corrected (route 2)
+
+§6.1.32 B said a boot-domain `&mut WaiterOwnershipTable` was **inert**. It is not. A boot sibling
+cannot call a single method on the table — all of them are module-private — but it could still
+replace the whole table by assignment, `mem::replace`/`swap` or a raw pointer write, because the
+field and `vacant()` are visible within `crate::kernel::boot`.
+
+Route 1 (making replacement unnameable) requires either moving the ownership module under `defs`
+and threading a ~25-field `IpcSubsystem` constructor through the single initializer, or hiding the
+field behind a lazily-initialized `Option` that is itself still assignable. Both are broad
+construction churn for a property the guards already give, so **route 2 is taken and stated
+plainly**: what the primitive has is **rank-3 co-location plus source-guarded encapsulation, not
+complete type-system-enforced inertness.**
+
+`no_boot_sibling_can_replace_or_borrow_the_ownership_table` walks the whole production tree and
+rejects, outside the ownership module: `.waiter_ownership =`, `waiter_ownership = `,
+`mem::replace(&mut`, `mem::swap(&mut`, `ptr::write(&mut`, `&mut ipc.waiter_ownership`,
+`&ipc.waiter_ownership`, `&mut self.waiter_ownership` and `&self.waiter_ownership`. It carries a
+non-vacuity assertion on the file count, a positive control that exactly two files outside the
+module name the field at all (the declaration and the single initializer), and an assertion that
+neither the module doc nor this audit re-asserts the retracted "inert" wording.
+
+#### Mutation results
+
+All sixteen fail — the ten from §6.1.32 re-run against the new implementation, plus six for the
+lifecycle:
+
+| # | mutation | caught by |
+|---|---|---|
+| M1 | drop the owner comparison in `validate` | 2 tests |
+| M2 | drop the claim-generation comparison | 1 test |
+| M3 | drop the key comparison in `validate` | 1 test |
+| M4 | key equality ignores `endpoint_generation` | 6 tests |
+| M5 | key equality ignores the waiter ASID | 5 tests |
+| M6 | key equality ignores the blocked-wait generation | 8 tests |
+| M7 | `wrapping_add` instead of `checked_add` | 2 tests |
+| M8 | evict a live claim | 4 tests |
+| M9 | `restore` makes the incarnation terminal | 6 tests |
+| M10 | out-of-range endpoint index wraps | 1 test |
+| **M11** | **`claim` replaces a different terminal key** (the R2 defect) | 2 tests |
+| **M12** | **`claim` from `Vacant` without `arm_current`** | 3 tests |
+| **M13** | **`restore` to `Vacant` instead of `Available`** | 9 tests |
+| **M14** | **retire a live claim** | 2 tests |
+| **M15** | **report a foreign live incarnation as `Vacant`** | 3 tests |
+| **M16** | **stale retire clears a newer incarnation** | 2 tests |
+
+#### Live verification
+
+The slot representation grew a variant, so the layout check was re-run:
+`scripts/qemu-x86_64-core-smoke.sh` (`-smp 1`) boots clean, six service entries exactly once, all
+`UNLOCK_GRADUATED_*` markers present, and the WA1-GATE seals re-emitted unchanged
+(`IPC_DIRECT_PRODUCTION_DISABLED_SEAL production_enabled=0 … result=ok`). A hosted test asserts a
+freshly booted kernel has `occupied_count() == 0` — helper-only, at runtime.
+
+#### Status
+
+* helper-only, **zero production callers**
+* `WAITER_OWNERSHIP_EXCLUSIVE` — **no**
+* `WAITER_OWNER_CENSUS_COMPLETE` — **no**
+* x86 direct production default — **OFF** on every architecture
+* NR6/NR7 waiter claim position — **unchanged** (single late claim)
+* canonical 199D — **OPEN**
+* current ledger — **39 / 7 / 46** (no cell moves)
 * RISC-V links/status — unchanged (link 1 ABSENT; 2, 3, 7, 9 present; 4, 5, 6, 8, 10 absent;
   `RISCV_REMOTE_WAKE=D`; `RISCV_199D_READINESS=case_b`; coordinate 23 OPEN)
 * **no new live cell**

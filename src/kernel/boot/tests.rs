@@ -112682,11 +112682,12 @@ mod stage199d_wa2a_ownership_boundary {
         }
     }
 
-    /// The table's own claim/settle methods are module-private, so a `&mut WaiterOwnershipTable`
-    /// obtained anywhere else in the boot domain is inert. The ONLY usable surface is the typed
-    /// `IpcSubsystem` methods.
+    /// Every method on the table is module-private, so the typed `IpcSubsystem` methods are the
+    /// only way to **operate** it. This is encapsulation by source guard, not by the type system:
+    /// whole-table replacement is refused separately, by
+    /// `no_boot_sibling_can_replace_or_borrow_the_ownership_table`.
     #[test]
-    fn the_raw_table_methods_are_private_and_the_only_surface_is_ipc_subsystem() {
+    fn the_raw_table_methods_are_private_and_operations_go_through_ipc_subsystem() {
         let table_impl = OWNERSHIP
             .split("impl WaiterOwnershipTable {")
             .nth(1)
@@ -112699,10 +112700,13 @@ mod stage199d_wa2a_ownership_boundary {
             "consume",
             "restore",
             "cancel",
+            "arm_current",
+            "retire_current",
             "validate",
             "stamp",
             "view",
             "claimed_count",
+            "occupied_count",
         ] {
             assert!(
                 table_impl.contains(&alloc::format!("    fn {raw}(")),
@@ -112718,18 +112722,21 @@ mod stage199d_wa2a_ownership_boundary {
             table_impl.contains("pub(in crate::kernel::boot) const fn vacant()"),
             "the constructor is boot-domain scoped"
         );
-        // The cross-module surface is exactly the six IpcSubsystem methods.
+        // The intended cross-module surface is exactly these nine IpcSubsystem methods.
         let surface = OWNERSHIP
             .split("impl IpcSubsystem {")
             .nth(1)
             .expect("the surface impl");
         for method in [
+            "waiter_ownership_arm_current",
             "waiter_ownership_claim",
             "waiter_ownership_consume",
             "waiter_ownership_restore",
             "waiter_ownership_cancel",
+            "waiter_ownership_retire_current",
             "waiter_ownership_view",
             "waiter_ownership_claimed_count",
+            "waiter_ownership_occupied_count",
         ] {
             assert!(
                 surface.contains(&alloc::format!("pub(crate) fn {method}(")),
@@ -112738,8 +112745,203 @@ mod stage199d_wa2a_ownership_boundary {
         }
         assert_eq!(
             surface.matches("pub(crate) fn ").count(),
-            6,
+            9,
             "and nothing else is exposed"
+        );
+    }
+
+    /// **D, route 2.** The field and `vacant()` are visible inside `crate::kernel::boot`, so a
+    /// boot sibling could technically replace the whole table by assignment, `mem::replace`,
+    /// `mem::swap` or a raw pointer write even though it cannot call a single method on it. The
+    /// type system does not stop that; this guard does. Outside the ownership module and the
+    /// single initializer, none of those forms — nor a direct borrow of the field — may appear.
+    #[test]
+    fn no_boot_sibling_can_replace_or_borrow_the_ownership_table() {
+        const OWNERSHIP_MODULE: &str = "src/kernel/boot/waiter_ownership.rs";
+        const INITIALIZER: &str = "src/kernel/boot/bootstrap_state.rs";
+        const DECLARATION: &str = "src/kernel/boot/defs.rs";
+        const FORBIDDEN: &[&str] = &[
+            ".waiter_ownership =",
+            "waiter_ownership = ",
+            "mem::replace(&mut",
+            "mem::swap(&mut",
+            "ptr::write(&mut",
+            "&mut ipc.waiter_ownership",
+            "&ipc.waiter_ownership",
+            "&mut self.waiter_ownership",
+            "&self.waiter_ownership",
+        ];
+        let mut offenders: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut checked = 0usize;
+        for (rel, src) in production_sources() {
+            if rel == OWNERSHIP_MODULE {
+                continue;
+            }
+            checked += 1;
+            for form in FORBIDDEN {
+                if src.contains(form) {
+                    offenders.push(alloc::format!("{rel}: `{form}`"));
+                }
+            }
+        }
+        assert!(
+            checked > 50,
+            "the walk must have covered the tree, not a stub ({checked} files)"
+        );
+        assert!(
+            offenders.is_empty(),
+            "the ownership table may only be replaced or borrowed inside its own module: \
+             {offenders:?}"
+        );
+        // Positive control: outside the module, exactly two files name the field at all — the
+        // declaration and the single struct-literal initializer.
+        let mut namers: alloc::vec::Vec<alloc::string::String> = production_sources()
+            .into_iter()
+            .filter(|(rel, src)| rel != OWNERSHIP_MODULE && src.contains("waiter_ownership:"))
+            .map(|(rel, _)| rel)
+            .collect();
+        namers.sort();
+        assert_eq!(
+            namers,
+            alloc::vec![INITIALIZER.to_string(), DECLARATION.to_string()],
+            "only the declaration and the single initializer name the field"
+        );
+        // …and the documents say so, rather than claiming type-system inertness.
+        assert!(
+            OWNERSHIP.contains("not complete\n//! type-system-enforced inertness")
+                || OWNERSHIP.contains("not complete type-system-enforced inertness"),
+            "the module doc must describe this accurately"
+        );
+        assert!(
+            AUDIT.contains("not complete type-system-enforced inertness")
+                || AUDIT.contains("rank-3 co-location plus source-guarded encapsulation"),
+            "§6.1.33 must describe this accurately"
+        );
+        for overclaim in [
+            "and **inert**, because every method that could mutate it is private",
+            "so a standalone table is useless even where one is nameable",
+        ] {
+            assert!(
+                !AUDIT.contains(overclaim) && !OWNERSHIP.contains(overclaim),
+                "the WA2A-R1 overclaim `{overclaim}` must not survive"
+            );
+        }
+    }
+
+    /// **A.** The lifecycle is arm → claim → settle → retire, stated in source: `claim` never
+    /// installs a key, `restore` returns to `Available`, and a live claim cannot be retired.
+    #[test]
+    fn the_slot_lifecycle_is_arm_claim_settle_retire() {
+        let production = OWNERSHIP
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production prefix");
+        for state in [
+            "    Vacant,",
+            "    Available { key: WaiterKey },",
+            "    Consumed { key: WaiterKey },",
+            "    Cancelled { key: WaiterKey },",
+        ] {
+            assert!(
+                production.contains(state),
+                "the slot state machine must carry `{state}`"
+            );
+        }
+        let claim = production
+            .split("\n    fn claim(")
+            .nth(1)
+            .expect("claim")
+            .split("\n    /// Validate")
+            .next()
+            .expect("claim end");
+        assert!(
+            claim.contains("ClaimError::NoCurrentWaiter")
+                && claim.contains("ClaimError::NoSuchCurrentIncarnation"),
+            "claim must refuse an unarmed slot and a foreign incarnation, each by name"
+        );
+        assert!(
+            !claim.contains("= WaiterOwnershipSlot::Available"),
+            "claim must never WRITE an Available slot — only `arm_current` installs a key \
+             (matching on the pattern is how it reads the armed incarnation)"
+        );
+        let arm = production
+            .split("\n    fn arm_current(")
+            .nth(1)
+            .expect("arm")
+            .split("\n    /// Take ownership")
+            .next()
+            .expect("arm end");
+        assert!(
+            arm.contains("ArmError::SlotOccupied"),
+            "arming must never displace an occupied slot"
+        );
+        let restore = production
+            .split("\n    fn restore(")
+            .nth(1)
+            .expect("restore")
+            .split("\n    /// Terminal abandonment")
+            .next()
+            .expect("restore end");
+        assert!(
+            restore.contains("WaiterOwnershipSlot::Available { key: token.key }")
+                && !restore.contains("WaiterOwnershipSlot::Vacant"),
+            "restore must re-arm the exact incarnation, not unarm the slot"
+        );
+        let retire = production
+            .split("\n    fn retire_current(")
+            .nth(1)
+            .expect("retire")
+            .split("\n    /// The state of")
+            .next()
+            .expect("retire end");
+        assert!(
+            retire.contains("RetireError::LiveClaim")
+                && retire.contains("RetireError::NoSuchCurrentIncarnation"),
+            "retire must refuse both a live claim and a stale key"
+        );
+    }
+
+    /// **C.** The view distinguishes all the required cases and never implies a foreign or
+    /// out-of-range key is claimable.
+    #[test]
+    fn the_view_is_truthful_and_fail_closed() {
+        let view = OWNERSHIP
+            .split("pub(crate) enum WaiterOwnershipView {")
+            .nth(1)
+            .expect("the view enum")
+            .split("\n}")
+            .next()
+            .expect("view end");
+        for variant in [
+            "EndpointIndexOutOfRange,",
+            "Vacant,",
+            "Available,",
+            "Claimed { owner: WaiterOwner },",
+            "Consumed,",
+            "Cancelled,",
+            "ForeignIncarnation { holding: WaiterSlotKind },",
+        ] {
+            assert!(
+                view.contains(variant),
+                "the view must distinguish `{variant}`"
+            );
+        }
+        assert!(
+            !view.contains("claim_generation"),
+            "the public state view must not carry the live claim generation"
+        );
+        let body = OWNERSHIP
+            .split("\n    fn view(&self, key: &WaiterKey)")
+            .nth(1)
+            .expect("view fn")
+            .split("\n    /// Live (claimed")
+            .next()
+            .expect("view fn end");
+        assert!(
+            body.contains("WaiterOwnershipView::EndpointIndexOutOfRange")
+                && body.contains("WaiterOwnershipView::ForeignIncarnation"),
+            "an out-of-range index and a foreign incarnation must each get their own answer, \
+             never Vacant"
         );
     }
 
@@ -112752,10 +112954,12 @@ mod stage199d_wa2a_ownership_boundary {
                 continue;
             }
             for method in [
+                "waiter_ownership_arm_current",
                 "waiter_ownership_claim",
                 "waiter_ownership_consume",
                 "waiter_ownership_restore",
                 "waiter_ownership_cancel",
+                "waiter_ownership_retire_current",
             ] {
                 assert!(
                     !src.contains(method),
