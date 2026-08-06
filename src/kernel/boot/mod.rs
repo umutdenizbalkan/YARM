@@ -790,9 +790,10 @@ pub(crate) fn d6_genuine_enabled() -> bool {
 /// * **x86_64** — unchanged: exactly `d6_genuine_enabled()`.
 /// * **AArch64** — admitted, but only through the same `ipccall_direct_admission_enabled()`
 ///   the direct NR6/NR7 path already uses, and only when no D6-switch diagnostic owns the
-///   switch path. Because `ipccall_direct_production_enabled()` is x86_64-only, that resolves
-///   to the armed proof/oracle gate on AArch64: **the AArch64 production default is OFF** and
-///   an ordinary AArch64 boot publishes no work item and drains nothing.
+///   switch path. Since Stage 199D-WA1-GATE `ipccall_direct_production_enabled()` is `false` on
+///   every architecture, so that resolves to the armed proof/oracle gate everywhere: **the
+///   AArch64 production default is OFF** — as is x86_64's — and an ordinary boot on either
+///   publishes no work item and drains nothing.
 /// * **RISC-V** — not admitted (no RISC-V work in this increment).
 // The only production caller is the AArch64 publication site; a hosted (x86_64) `lib` build
 // compiles no route to it, exactly like the sibling arch-gated predicates.
@@ -3152,15 +3153,19 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # ENABLED on x86_64 — Stage 199D production default
+/// # DISABLED on every architecture — Stage 199D-WA1-GATE
 ///
-/// The off-lock direct NR6/NR7 path is the **production default on x86_64**: ordinary
-/// `IpcCall`/`IpcReply` traffic is serviced before the broad kernel lock, with no oracle, no
-/// proof gate and no endpoint confinement involved. AArch64 and RISC-V still resolve to the
-/// proof gate and the oracle confinement, so their boots are byte-identical.
+/// Ordinary `IpcCall`/`IpcReply` traffic on **every** architecture, x86_64 included, falls back
+/// to the legacy path. Admission and blocked-waiter acknowledgement publication both require an
+/// explicit proof/oracle selector; request/reply endpoint confinement is whatever those
+/// selectors authorize. The rationale is below the blocker history.
 ///
-/// Seven blockers stood between the mechanism and this default. Every one was found by a live
-/// boot rather than by inspection, and every one is closed:
+/// ## Historical — the x86_64 production default (`0b5ec254`, since RECLASSIFIED)
+///
+/// The paragraphs and list that follow record the state when the x86_64 production default was
+/// ON. They are retained as the blocker history that earned that default, **not** as a
+/// description of current behaviour. Seven blockers stood between the mechanism and it; every
+/// one was found by a live boot rather than by inspection, and every one is closed:
 ///
 /// 1. **Capability transfer was silently dropped.** NR7 eligibility carries
 ///    `transfer_cap_present`, asked through the one canonical `transfer_cap_arg_present`
@@ -3217,31 +3222,35 @@ pub const fn ipccall_direct_production_enabled() -> bool {
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.
 ///
-/// x86_64: always (production default). Other architectures: only while the proof gate is
-/// armed, which is what keeps their normal boots byte-identical.
+/// Stage 199D-WA1-GATE: the production term is `false` on every architecture, so this is now
+/// exactly the proof gate. Ordinary traffic — on x86_64 as much as anywhere else — is not
+/// admitted and takes the legacy path; only an explicitly armed proof/oracle selector admits.
 pub fn ipccall_direct_admission_enabled() -> bool {
     ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()
 }
 
 /// True iff a blocked-waiter acknowledgement may be published at all.
 ///
-/// Same split as [`ipccall_direct_admission_enabled`]: unconditional on x86_64, proof-gated
-/// elsewhere. Without this the request path would find nothing to claim and every ordinary
-/// call would decline to legacy.
+/// Same predicate as [`ipccall_direct_admission_enabled`], and since WA1-GATE that means: the
+/// explicit proof/oracle selector, on every architecture. Without it the request path finds
+/// nothing to claim and every ordinary call declines to legacy — which is the current default
+/// everywhere.
 pub fn ipccall_direct_publication_enabled() -> bool {
     ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()
 }
 
 /// True iff this REQUEST endpoint index is admitted to the off-lock path.
 ///
-/// x86_64: every endpoint is admitted — the Buffered-only eligibility contract, not an
-/// oracle endpoint list, is what decides. Other architectures: still confined to the
-/// oracle's provisioned request endpoint.
+/// Stage 199D-WA1-GATE: with the production term `false` on every architecture, admission is
+/// exactly the oracle's provisioned request endpoint — the confinement the explicit selector
+/// authorizes, and nothing wider. The `production ||` term is retained so re-enabling the
+/// default in WA2 restores the Buffered-only eligibility contract without another edit here.
 pub fn ipccall_direct_request_endpoint_admitted(eidx: usize) -> bool {
     ipccall_direct_production_enabled() || ipccall_direct_oracle_request_endpoint_is(eidx)
 }
 
-/// True iff this REPLY endpoint index is admitted to the off-lock path. See the request twin.
+/// True iff this REPLY endpoint index is admitted to the off-lock path. See the request twin —
+/// since WA1-GATE this too is exactly the oracle's provisioned reply endpoint.
 pub fn ipccall_direct_reply_endpoint_admitted(eidx: usize) -> bool {
     ipccall_direct_production_enabled() || ipccall_direct_oracle_reply_endpoint_is(eidx)
 }
@@ -5806,10 +5815,11 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
     let CapObject::Endpoint { index, generation } = endpoint else {
         return;
     };
-    // Stage 199D: on x86_64 EVERY endpoint publishes — the off-lock request path is the
-    // production default and its eligibility contract, not an oracle endpoint list, decides
-    // what it services. On AArch64/RISC-V this still confines publication to the oracle's
-    // provisioned request endpoint, so their normal boots stay byte-identical. Hosted wiring
+    // Stage 199D-WA1-GATE: with the production term `false` on every architecture, publication
+    // is confined to the oracle's provisioned request endpoint EVERYWHERE — x86_64 included —
+    // so every normal boot stays byte-identical to the legacy path. The `production ||` term is
+    // retained so WA2 can restore the eligibility-contract behaviour without editing here.
+    // Hosted wiring
     // tests have no service chain and no provisioned oracle endpoint, so they keep the
     // unconfined publish the fixtures rely on.
     #[cfg(not(feature = "hosted-dev"))]
@@ -6173,9 +6183,9 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
     let CapObject::Endpoint { index, generation } = endpoint else {
         return;
     };
-    // Stage 199D: on x86_64 EVERY reply endpoint publishes — production default. On
-    // AArch64/RISC-V this still confines publication to the oracle's provisioned reply
-    // endpoint. Hosted wiring tests keep the unconfined publish their fixtures rely on.
+    // Stage 199D-WA1-GATE: with the production term `false` on every architecture, reply
+    // publication is confined to the oracle's provisioned reply endpoint EVERYWHERE — x86_64
+    // included. Hosted wiring tests keep the unconfined publish their fixtures rely on.
     #[cfg(not(feature = "hosted-dev"))]
     if !ipccall_direct_reply_endpoint_admitted(index) {
         return;

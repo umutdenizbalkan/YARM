@@ -3321,7 +3321,7 @@ impl KernelState {
         // independently refuses `IpcReply` so the contract cannot be violated even by mistake.
         //
         // Confinement: `offlock_authoritative_dispatch_enabled()` resolves to the armed
-        // proof/oracle gate on AArch64 (production is x86_64-only), so an ordinary AArch64 boot
+        // proof/oracle gate (since WA1-GATE production is `false` everywhere), so an ordinary boot
         // publishes nothing and reaches the unchanged in-lock `dispatch_next_task()` below.
         // Declining publication is always safe for exactly that reason.
         #[cfg(target_arch = "aarch64")]

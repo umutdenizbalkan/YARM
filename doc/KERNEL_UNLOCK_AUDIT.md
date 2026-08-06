@@ -2928,6 +2928,13 @@ Status unchanged: link 1 **ABSENT**; links 2, 3, 7, 9 present; 4, 5, 6, 8, 10 ab
 `RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**; coordinate 23 **OPEN**;
 ledger **39 / 7 / 46**; **no new live cell**.
 
+> **Read with §6.1.30.** This section was written while the x86 direct production default was
+> still ON. Stage 199D-WA1-GATE subsequently disabled it — the **production default is OFF** on
+> every architecture, admission and acknowledgement publication both require an explicit
+> proof/oracle selector, and `AlreadyQueued` + `Removed` is terminal on every freestanding
+> runtime build. Where the two sections touch the same contract, **§6.1.30 is operative**; the
+> statements below have been corrected in place rather than left to be overridden silently.
+
 #### A/C — the hard-stop
 
 Both parts rest on the same premise: that claiming the exact generation-bearing endpoint waiter
@@ -2962,10 +2969,10 @@ The last two break exclusivity, and they break it *mechanically*, not incidental
   that a snapshotted notification waiter can race a task woken by another route, so the staleness
   this depends on is an acknowledged, handled condition — not a hypothetical.
 
-> **RETRACTED — corrected in §6.1.30.** This paragraph claimed reachability was narrower than
-> the mechanism. It was wrong: the claim rested on a `= Some(...)` grep that missed three
-> ordinary arm sites. Ordinary recv/send deadlines exist independently of `reply_timeout_token`,
-> so the race is **reachable in production**, not merely mechanism-level.
+Ordinary recv/send deadlines are armed **independently** of `reply_timeout_token`, so
+`terminal_arbitrated` — which gates direct NR7 eligibility — does not exclude them. The ordinary
+timeout race with a direct publication is therefore **production-reachable**, not merely a
+mechanism-level concern. The seven-site assignment evidence is in §6.1.30.
 
 So the reorder is **not performed**. NR6 keeps its single claim at step (9) and NR7 at step (5);
 there is still exactly one claim per transaction (pinned). The pre-mutation membership checks from
@@ -2988,35 +2995,53 @@ owner must claim, of which the endpoint waiter becomes one holder. Route 1 is sm
 recommended next increment; both are production wake-path changes with their own live seals, and
 neither belongs in a rejection-safety repair.
 
-#### B — same-acquisition `Removed` is recoverable (delivered)
+#### B — the rollback algebra for same-acquisition `Removed` (hosted-test evidence only)
 
-§6.1.28's rule that every `reconciled.is_some()` is terminal was over-broad.
-`WithdrawOutcome::Removed` proves that exactly one queued entry was withdrawn **under the same
-rank-1 acquisition that detected the collision**, and that the task was therefore *not* `current`
-— so it never ran and never observed the publication.
+§6.1.28's rule that every `reconciled.is_some()` is terminal was over-broad **as an algebraic
+statement**, and §6.1.29 corrected the algebra. What `WithdrawOutcome::Removed` actually proves is
+narrower than that correction originally claimed:
 
-Both directions now use the single predicate `ReceiverEnqueue::receiver_is_unplaced()`: true for
-`InvalidCpu`, `CpuOffline`, `WakeOnly` and `QueueFull` (which never touched a queue) and for
-`AlreadyQueued` only on `Removed`. Everything else already took the fail-closed branch, so a
-variant documented as retryable is never returned after its lease or authority was discarded.
+> `Removed` proves that **exactly one queued entry was withdrawn under the detecting scheduler
+> acquisition**, and that the task was **not `current` at that acquisition**. It does **not**
+> prove the task never ran, and it does not prove the task never observed an earlier publication.
 
-Terminal, unchanged: `RefusedCurrent`, `RefusedDuplicate`, `NotQueued`, and an `InvalidCpu`
+Those two are different facts, and only the first is established. While waiter ownership is
+non-exclusive another wake owner could have dispatched the task and re-queued it, leaving exactly
+one entry and a non-`current` task at the moment we look.
+
+**So the split is:**
+
+| build | `AlreadyQueued` + `Removed` |
+|---|---|
+| hosted `#[cfg(test)]` | recoverable — the rollback algebra is exercised end-to-end |
+| **every freestanding runtime build**, proof/oracle kernels included | **terminal**: restores neither the acknowledgement nor NR7 reply authority, and never returns the retryable variant |
+
+`ReceiverEnqueue::rejection_is_runtime_recoverable()` is the predicate that enforces it
+(§6.1.30 §3). The four reasons that provably fail **before touching a runqueue** —
+`InvalidCpu`, `CpuOffline`, `WakeOnly`, `QueueFull` — keep their existing policy in every build.
+Terminal in every build: `RefusedCurrent`, `RefusedDuplicate`, `NotQueued`, and an `InvalidCpu`
 withdrawal outcome.
 
-Because §6.1.28's pre-mutation check makes an ordinary post-copy `AlreadyQueued` unreachable, the
-recovery path is exercised by a `#[cfg(test)]`-only hook that injects membership immediately
-before the final enqueue (`1` = one queued entry → `Removed`; `2` = dispatched → `RefusedCurrent`).
-End-to-end, through the real transactions:
+##### Hosted test-only evidence
 
-* **NR6** — `EnqueueRejected(AlreadyQueued)`, server `Blocked` on the exact original recv cap,
-  exact waiter restored once, zero membership, lease restored, and the same transaction retried
-  successfully.
-* **NR7** — `EnqueueRejected(AlreadyQueued)`, exact caller `Blocked` on the exact recv cap, exact
-  waiter restored once, record `Available` **at the same generation**, exact replier reverse link
-  present (live link count 1), acknowledgement restored, the same reply retried successfully, and
-  a duplicate still rejected. **No timeout dependency anywhere.**
+Everything below is `#[cfg(test)]` evidence about the **rollback algebra**, not a description of
+production behaviour. Because §6.1.28's pre-mutation check makes an ordinary post-copy
+`AlreadyQueued` unreachable, the path is driven by a `#[cfg(test)]`-only hook that injects
+membership immediately before the final enqueue (`1` = one queued entry → `Removed`;
+`2` = dispatched → `RefusedCurrent`). Through the real transactions:
+
+* **NR6 (hosted test only)** — `EnqueueRejected(AlreadyQueued)`, server `Blocked` on the exact
+  original recv cap, exact waiter restored once, zero membership, lease restored, and the same
+  transaction retried successfully.
+* **NR7 (hosted test only)** — `EnqueueRejected(AlreadyQueued)`, exact caller `Blocked` on the
+  exact recv cap, exact waiter restored once, record `Available` **at the same generation**,
+  exact replier reverse link present (live link count 1), acknowledgement restored, the same
+  reply retried successfully, and a duplicate still rejected.
 * **NR6 `RefusedCurrent`** — `EnqueueRejectedUnreconciled(RefusedCurrent)`, lease discarded, no
-  restoration claim.
+  restoration claim. This one holds in **every** build.
+
+On a freestanding runtime build neither retry above occurs: the rejection is terminal before it
+can restore anything. §6.1.30 §3 is the operative contract; this section does not override it.
 
 The accepted §6.1.28 composed record + reverse-link restore is preserved unchanged.
 

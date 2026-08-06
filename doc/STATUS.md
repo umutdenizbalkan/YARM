@@ -95,7 +95,7 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 | `ExitCurrentTask` NR 16 | **2 of 3** | x86_64 `0b5e98f`, AArch64; 202D (one sub-path; RISC-V unearned) |
 | **Server death (`ServerDies`) — x86_64** | **1 of 3** | **`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`; canonical 199D server-crash-cleanup increment** |
 | *Pre-production subtotal* | *39* | *30 + 6 + 2 + 1 — the figure accepted before the x86_64 production default was flipped* |
-| **Direct IPC NR 6 / NR 7 — x86_64 production default ON** | **1** | **`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`, exact commit `0b5ec254`** — 53 NR6 + 41 NR7 ordinary syscalls off-lock with zero broad-lock entries on the **production** path; canonical 199D production-path increment |
+| **Direct IPC NR 6 / NR 7 — HISTORICAL production-default-ON evidence (`0b5ec254`)** | **1** | **`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`, exact commit `0b5ec254`** — 53 NR6 + 41 NR7 ordinary syscalls off-lock with zero broad-lock entries on the **production** path; canonical 199D production-path increment |
 | **Current production-path total** | **39** | 30 + 6 + 2 + 1 — the direct-IPC production cell moved out at Stage 199D-WA1-GATE |
 | **Direct IPC NR 6 / NR 7 — moved to non-production at WA1-GATE** | **1** | **Originally earned UNDER the x86_64 production default** at `0b5ec254` (not under a proof knob). Retained as historical mechanism/production evidence. It is **no longer a claim about the current production predicate**, which `ipccall_direct_production_enabled()` now returns `false` for on every architecture while `WAITER_OWNERSHIP_EXCLUSIVE=no`. |
 | Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D **mechanism**, **not** the production path. Originally earned at `ccceb03d`; **re-earned at `7d5a22c9`** after three repairs — see §0.1. The re-earning restores historical evidence and **adds no new cell**. |
@@ -121,9 +121,13 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 >   retract it, and it earns no new live cell.
 >
 > A previously-quoted figure of **43** matches neither policy: it requires counting the six
-> knob-gated Stage 199 cells *and* excluding the two `ExitCurrentTask` cells. The earlier
-> "39 / 45" pair predates the `0b5ec254` production-default seal and is superseded by
-> **40 / 46**.
+> knob-gated Stage 199 cells *and* excluding the two `ExitCurrentTask` cells.
+>
+> **Complete chronology.** "39 / 45" predates the `0b5ec254` production-default seal and was
+> superseded **historically** by **40 / 46**. Stage 199D-WA1-GATE then disabled the x86 direct
+> production default and **reclassified the current state to 39 / 7 / 46** — the one `0b5ec254`
+> cell moved from current-production to non-production/mechanism evidence. The **historical
+> total remains 46** throughout: no cell was ever retracted and none was newly earned.
 
 ### x86_64 ServerDies cell — evidence
 
@@ -430,9 +434,11 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    constant is restored to `false`; the fix is the exact mirror of the creation one.
    **CANONICAL 199D CLOSURE AUDIT — `CANONICAL_199D_CLOSABLE=no`.** An audit increment with no
    runtime or semantic change. The live-evidence ledger is reconciled: the pre-production
-   subtotal of **39** plus the one production-path increment earned at `0b5ec254` gives
-   **40** production-path cells; the six knob-gated x86 SMP mechanism cells (re-earned at
-   `7d5a22c9`, adding no new cell) give **46** in total. The superseded "39 / 45" pair and the
+   subtotal of **39** plus the one production-path increment earned at `0b5ec254` gave
+   **40** production-path cells at the time; the six knob-gated x86 SMP mechanism cells
+   (re-earned at `7d5a22c9`, adding no new cell) give **46** in total. (Stage 199D-WA1-GATE
+   later disabled the x86 production default and reclassified the current state to
+   **39 / 7 / 46**; the historical total stays 46.) The superseded "39 / 45" pair and the
    never-coherent "43" are retired, and `PROJECT_HISTORY.md` gains the previously missing
    `0b5ec254` row. The **executable closure matrix** (`stage199d_closure_matrix`, 12 tests)
    classifies **23 in-scope coordinates — 19 COMPLETE, 2 `STRUCTURALLY_COMPLETE`, 1 PARTIAL,

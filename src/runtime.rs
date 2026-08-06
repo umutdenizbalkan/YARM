@@ -4102,7 +4102,7 @@ impl SharedKernel {
     /// Stage 199D: this used to compute the target and throw it away, which left the caller with
     /// no authority for the post-enqueue wake decision. The one consumer that needed it
     /// (`drain_direct_request_post_work`) therefore guessed, hardcoding CPU 1 behind a global
-    /// oracle selector — so once the NR6 production default was enabled, EVERY ordinary direct
+    /// oracle selector — so while the NR6 production default was enabled, EVERY ordinary direct
     /// request fired a remote-wake IPI at CPU 1.
     ///
     /// Returning the *requested* CPU was the second half of that same mistake, and `ca55400b`

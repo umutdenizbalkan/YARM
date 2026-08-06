@@ -83533,9 +83533,18 @@ mod stage199d_production_default_guards {
             .split("pub const fn ipccall_direct_production_enabled()")
             .next()
             .expect("doc bounded");
+        // WA1-GATE-DOC-SEAL: repointed. The heading now states the CURRENT contract, and the
+        // blocker history below it is explicitly labelled historical — the seven blockers are
+        // still recorded, which is what this guard exists to protect.
         assert!(
-            doc.contains("ENABLED on x86_64"),
-            "the predicate says plainly that x86_64 is production-default"
+            doc.contains("# DISABLED on every architecture — Stage 199D-WA1-GATE"),
+            "the predicate says plainly that the production default is off"
+        );
+        assert!(
+            doc.contains(
+                "## Historical — the x86_64 production default (`0b5ec254`, since RECLASSIFIED)"
+            ),
+            "…and the blocker history is retained, labelled as history"
         );
         for blocker in [
             "transfer_cap_present",      // 1: capability transfer
@@ -83562,10 +83571,13 @@ mod stage199d_production_default_guards {
             "porting the terminal lease is recorded as future 199E work"
         );
         // AArch64 and RISC-V are explicitly unchanged.
+        // WA1-GATE-DOC-SEAL: the old wording singled out AArch64/RISC-V because x86_64 was the
+        // exception. With the default off everywhere the equivalent statement is stronger, so
+        // this pins the universal form instead of deleting the check.
         assert!(
-            doc.contains("AArch64 and RISC-V still resolve to the")
-                && doc.contains("boots are byte-identical"),
-            "the record states that no other architecture was ported"
+            doc.contains("Ordinary `IpcCall`/`IpcReply` traffic on **every** architecture, x86_64 included, falls back")
+                && doc.contains("to the legacy path"),
+            "the record states that ordinary traffic falls back on every architecture"
         );
         // Stage 199D-WA1-GATE: repointed — the default is OFF while
         // WAITER_OWNERSHIP_EXCLUSIVE=no, and the explicit proof gate is what admits NR6/NR7.
@@ -112289,6 +112301,142 @@ mod stage199d_wa1_gate {
                 "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok={} nr7_ok={} census_ok={} result={}"
             ),
             "the pre-existing quiescent seal is untouched"
+        );
+    }
+
+    // ── Stale-prose guards (WA1-GATE-DOC-SEAL) ──────────────────────────────────────────────
+
+    /// The direct-predicate comment region must not still describe the OLD production default.
+    ///
+    /// Each banned phrase is checked in the region spanning the five direct predicates. A
+    /// phrase is permitted only when the line explicitly labels it as historical, so a quoted
+    /// past state stays possible without letting operative prose drift back.
+    #[test]
+    fn the_direct_predicate_comments_do_not_describe_the_old_default() {
+        let start = MODRS
+            .find("/// True iff the direct NR6/NR7 path is the production default")
+            .expect("the predicate region start");
+        let end = MODRS
+            .find("pub fn ipccall_direct_reply_endpoint_admitted")
+            .expect("the predicate region end");
+        assert!(end > start, "region bounds");
+        const HISTORICAL: [&str; 4] = ["Historical", "HISTORICAL", "historical", "was enabled"];
+        for banned in [
+            "x86_64: always (production default)",
+            "unconditional on x86_64",
+            "x86_64: every endpoint is admitted",
+            "is x86_64-only",
+            "production default on x86_64",
+            "ENABLED on x86_64",
+        ] {
+            for line in MODRS[start..end].lines() {
+                if !line.contains(banned) {
+                    continue;
+                }
+                assert!(
+                    HISTORICAL.iter().any(|h| line.contains(h)),
+                    "stale prose `{banned}` must be corrected or explicitly labelled \
+                     historical:\n  {line}"
+                );
+            }
+        }
+        // …and the current contract is stated positively.
+        assert!(
+            MODRS.contains("# DISABLED on every architecture — Stage 199D-WA1-GATE"),
+            "the predicate heading must state the current contract"
+        );
+    }
+
+    /// The over-strong `Removed` claim must not survive as operative prose.
+    #[test]
+    fn no_document_claims_removed_proves_non_observation() {
+        for (name, doc) in [("KERNEL_UNLOCK_AUDIT.md", AUDIT), ("STATUS.md", STATUS)] {
+            for line in doc.lines() {
+                if !line.contains("never ran and never observed the publication") {
+                    continue;
+                }
+                assert!(
+                    line.contains("does **not**") || line.contains("HISTORICAL"),
+                    "{name}: `Removed` does not prove non-observation; an explicitly labelled \
+                     historical quotation is the only permitted form:\n  {line}"
+                );
+            }
+        }
+        // The corrected statement is present, and the hosted/freestanding split is explicit.
+        assert!(
+            AUDIT.contains("not `current` at that acquisition"),
+            "§6.1.29 must state what Removed actually proves"
+        );
+        assert!(
+            AUDIT.contains("hosted `#[cfg(test)]` | recoverable")
+                && AUDIT.contains("every freestanding runtime build**, proof/oracle kernels included | **terminal**"),
+            "§6.1.29 must split hosted-test evidence from freestanding runtime behaviour"
+        );
+        assert!(
+            AUDIT.contains(
+                "§6.1.30 §3 is the operative contract; this section does not override it."
+            ),
+            "§6.1.29 and §6.1.30 must agree without the reader inferring an override"
+        );
+    }
+
+    /// The retracted narrower-population argument is gone, replaced by a direct statement.
+    #[test]
+    fn the_reachability_prose_is_current_not_a_retraction_note() {
+        assert!(
+            AUDIT.contains("The ordinary\ntimeout race with a direct publication is therefore **production-reachable**")
+                || AUDIT.contains("is therefore **production-reachable**"),
+            "§6.1.29 must state the current fact directly"
+        );
+        assert!(
+            !AUDIT.contains("Reachability for *today's* direct-eligible populations is narrower"),
+            "the false narrower-population argument must not survive"
+        );
+        assert!(
+            !AUDIT.contains("RETRACTED — corrected in §6.1.30"),
+            "the retraction note must be replaced by operative prose, not left in place"
+        );
+    }
+
+    /// All three documents carry the current ledger and describe the predicate as OFF.
+    #[test]
+    fn every_document_pins_the_current_ledger_and_the_disabled_predicate() {
+        for (name, doc) in [("KERNEL_UNLOCK_AUDIT.md", AUDIT), ("STATUS.md", STATUS)] {
+            assert!(
+                doc.contains("39 / 7 / 46"),
+                "{name} must carry the current ledger"
+            );
+        }
+        // §6.1.29 and §6.1.30 both, by name.
+        let s2129 = AUDIT
+            .split("### 6.1.29")
+            .nth(1)
+            .expect("§6.1.29")
+            .split("### 6.1.30")
+            .next()
+            .expect("bounded");
+        assert!(s2129.contains("39 / 7 / 46"), "§6.1.29 carries the ledger");
+        let s2130 = AUDIT.split("### 6.1.30").nth(1).expect("§6.1.30");
+        assert!(s2130.contains("39 / 7 / 46"), "§6.1.30 carries the ledger");
+        for (which, sec) in [("§6.1.29", s2129), ("§6.1.30", s2130)] {
+            assert!(
+                sec.contains("production default: OFF")
+                    || sec.contains("production default — **OFF**")
+                    || sec.contains("production default is OFF")
+                    || sec.contains("production DEFAULT is OFF"),
+                "{which} must describe the production predicate as OFF"
+            );
+        }
+        // The row heading cannot be read as current state.
+        assert!(
+            STATUS.contains("HISTORICAL production-default-ON evidence"),
+            "the ledger row must be qualified as historical"
+        );
+        // The chronology is complete.
+        assert!(
+            STATUS.contains("superseded **historically** by **40 / 46**")
+                && STATUS.contains("reclassified the current state to 39 / 7 / 46"),
+            "STATUS must record 39/45 -> 40/46 -> 39/7/46 with the total unchanged"
         );
     }
 
