@@ -1036,13 +1036,8 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    bound inside the function behind a fail-closed check — so there is no "helper trusted by its
    callers" anywhere in the set.
 
-   The owner/wiring matrix (design only) splits the 21 into three groups: eight endpoint-delivery
-   owners that should claim; four teardown paths that should claim and cancel; and **nine
-   scheduler/lifecycle sites that should not claim at all** — they run at scheduler(1)/task(2) and
-   would need ipc(3) *above* scheduler(1), a rank inversion the split-lock architecture cannot
-   express. The correct repair for those nine is a proven-negative precondition rather than a
-   claim, which would move them CAN → CANNOT and shrink the eventual arbitration set from 21 to
-   12. That is a separate increment.
+   The owner/origin matrix (design only) is repaired by WA2B-MATRIX-R1 below; its first version
+   conflated writer sites with logical origins.
 
    Also repaired: the `WaiterOwnershipView` contract. R2 said `Available` meant a claim would
    succeed; with the generation counter saturated an `Available` slot rejects with
@@ -1057,6 +1052,67 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    production default **OFF** on every architecture, canonical 199D **OPEN**, ledger
    **39 / 7 / 46**, RISC-V links/status unchanged, **no new live cell**. See
    `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.34.
+
+   **WA2B-MATRIX-R1: the owner matrix was wrong in five ways, and the census guard was too
+   coarse.** Documentation and `cfg(test)` only — production executable code is byte-identical to
+   `213bb4e4`, and the accepted verdict (CAN 21 / CANNOT 7 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 1 /
+   NON_PRODUCTION 1 / UNPROVEN 0, `WAITER_OWNER_CENSUS_COMPLETE=yes`,
+   `WAITER_OWNERSHIP_EXCLUSIVE=no`) is unchanged.
+
+   *Writers vs origins.* The first matrix put a "eight status-writer sites" heading over ten
+   *path* rows and listed `ipc_reply` as a direct caller of `wake_tid_to_runnable` when the real
+   chain is `ipc_reply` → `apply_scheduler_wake_plan` → `wake_tid_to_runnable`. The two layers are
+   now separate: the 21 writer sites, and the exact direct production caller set of every helper
+   writer — `wake_tid_to_runnable` 3, `apply_scheduler_wake_plan` 11,
+   `apply_split_receiver_wake_plan` 5, `wake_waiter_for_endpoint` 3, `apply_cross_cpu_wake_task` 1,
+   `rt_commit_receiver_runnable` 2 — each pinned by a guard so a new caller class forces the matrix
+   to be re-derived.
+
+   *Terminal origins.* `rt_commit_receiver_runnable` has two callers carrying **different**
+   terminal claimants: `complete_reply_timeout_over` (`TimedOut`, `TerminalClaimant::Timeout`) and
+   `complete_server_death_over` (`ServerDied`, `TerminalClaimant::PeerDeath`). Mapping ServerDied
+   onto `OrdinaryTimeout` was wrong. Both callers reach the writer having **already won** the
+   reply-terminal cell, so the open question is how an already-won terminal claimant translates
+   into waiter ownership; `WaiterOwner` has no variant for it, recorded as a prerequisite. The enum
+   is **not** changed here.
+
+   *Notification is not an endpoint owner.* `signal_notification` and
+   `wake_destroyed_notification_waiter` take a bare TID, guard only on `Blocked(_)`, and never read
+   `endpoint_waiters`. The earlier matrix said they should claim and **cancel** the endpoint slot —
+   which would let a stale notification destroy a live endpoint wait, turning a lost notification
+   into a lost IPC reply. Retracted. Both move into the production-enforced refusal set, with the
+   required repair recorded: generation-bearing notification waiter identity, a
+   notification-specific blocked reason, stale → clear or ignore, and never consume, cancel or
+   retire an unrelated endpoint waiter. Whether `WaiterOwner::Notification` becomes obsolete after
+   that is recorded as open, and the variant is kept.
+
+   *Three origins, three policies.* `wake_tid_to_runnable` is split: D2 receive-publication
+   rollback (not delivery — must prove no slot is armed); genuine endpoint delivery via
+   `wake_waiter_for_endpoint` (a valid claimant); and a generic `SchedulerWakePlan::Wake(tid)` whose
+   11 origins span at least five causes, where a bare TID is insufficient and the plan must carry a
+   typed cause or `apply_scheduler_wake_plan` must refuse in production. Cross-CPU wakes get the
+   same treatment: five typed `WorkItem` forms, only the endpoint-delivery one may carry a token,
+   and every form must carry `{tid, asid}` to reject stale TID reuse. There is currently **no
+   production producer** of `WorkItem::WakeTask` — a guard asserts that, so the work stays
+   prerequisite rather than remedial.
+
+   *Group-3 preconditions.* `debug_assert` is explicitly rejected — it compiles out of release
+   kernels, so the proof would not exist where it matters. Each of the five sites gets an exact
+   expected transition (`Runnable → Running` only for dispatch; `Running → Runnable` only for
+   yield; the exact transaction predecessor for rollback; current-and-running for fault; **absence**
+   for spawn) with a fail-closed action. For `spawn_user_task_from_image` two near-misses are
+   recorded explicitly: `register_task_with_class` idempotence is not a precondition because it
+   *returns `Ok(())`* for an existing TID, and checking "not `Blocked(EndpointReceive)`" would still
+   permit overwriting the entry point, stack, ASID and register context of a `Runnable` or `Running`
+   victim.
+
+   *The drift guard.* `(file, enclosing fn, count)` could not see a count-preserving substitution
+   inside one function. Each of the 37 sites is now pinned by an exact-site fingerprint — file,
+   enclosing function, normalized LHS, assigned status expression, and the exact preceding and
+   following non-blank non-comment source lines. Four mutations confirm it: a one-line reorder,
+   **removing one assignment and adding an identical one elsewhere in the same function**, swapping
+   `Runnable`/`Running` within `yield_current`, and a brand-new assignment — all four caught, where
+   the first two passed under the old fingerprint. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.34 E.
 
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.

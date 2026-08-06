@@ -3753,45 +3753,200 @@ comfortable answer, which is why the CAN set grew from 12 to 21.
 **`WAITER_OWNERSHIP_EXCLUSIVE=no` is unchanged.** Completing the census says who the owners are;
 it does not make them arbitrate. Not one of the 21 routes through the primitive yet.
 
-#### E. Owner / wiring matrix
+#### E. Owner / origin matrix
 
-**Design only — nothing here is implemented in this increment.** The 21 CAN sites fall into three
-groups, and the third is the finding that matters most.
+**Design only — nothing here is implemented in this increment.**
 
-**Group 1 — endpoint-delivery owners (8 sites).** These intend to complete a blocked receiver, so
-a claim is the natural fit.
+##### E.0 Writer sites and logical origins are two different layers
 
-| path | owner | key dimensions available | lock domains today | claim at ipc(3) without inversion? | shape | settle | retire pairs with |
-|---|---|---|---|---|---|---|---|
-| `sr_commit_blocked_receiver_split` | `DirectRequest` / `DirectReply` | all four, exact | ipc(3) → task(2) | **yes** — already claims the waiter here | split txn (already) | consume on commit, restore on rollback | `sr_restore_endpoint_waiter_split` |
-| `rt_commit_receiver_runnable` | `OrdinaryTimeout` | all four (holds the terminal cell + blocked-recv gen) | terminal → ipc(3) → task(2) | **yes** | plan-first (already) | consume | the terminal cell's own clear |
-| `wake_tid_to_runnable` | `LegacyDelivery` | **TID only** — needs the endpoint index and generation threaded from its three callers | task(2) → sched(1) | only if the caller claims; the helper itself sees no endpoint | caller-side claim, token passed in | consume | `take_endpoint_waiter` at the caller |
-| `wake_waiter_for_endpoint` (via the above) | `LegacyDelivery` | index + slot generation; **no identity compare today** | ipc(3) → task(2) → sched(1) | **yes** | plan-first snapshot | consume | its own `take_endpoint_waiter` |
-| `ipc_reply` (via the above) | `LegacyDelivery` | index + slot generation; no identity compare | broad | yes (broad already covers ipc) | in-lock | consume | its own take |
-| `sr_wake_receiver_split` | `LegacyDelivery` | **TID only** | task(2) → sched(1) | no — needs a new ipc(3) phase, or the token from `ctx_finalize_and_wake` | plan-first snapshot | consume | shared-region finalize |
-| `signal_notification` | `Notification` | **TID only, different table** | ipc(3) → task(2) → sched(1) | **yes**, but it must first learn the endpoint the TID is blocked on | plan-first snapshot | cancel (it is not an endpoint delivery) | n/a — it must lose to the endpoint owner |
-| `wake_destroyed_notification_waiter` | `Notification` | TID only | task(2) → sched(1) | no — needs a new ipc(3) phase | plan-first snapshot | cancel | n/a |
-| `process_ipc_timeout_deadlines` | `OrdinaryTimeout` | identity sweep; endpoint index recoverable from the `WaitReason` cap | task(2) **then** ipc(3) | **no — this is the inversion** | must become ipc(3)-first plan, then task(2) apply | consume on fire, restore on loss | `clear_endpoint_waiters_for_identity` |
-| `apply_cross_cpu_wake_task` | `LegacyDelivery` | **TID only**, no ipc domain at all | task(2) → sched(1) | no | the token must travel **inside the `WakeTask` item** | consume | the enqueuer's clear |
+WA2B-CENSUS's first matrix conflated them: a "Group 1 — eight status-writer sites" heading over a
+table of ten *path* rows mixing writers, helpers and callers, with `ipc_reply` listed as though it
+were a direct caller of `wake_tid_to_runnable` when the real chain runs through
+`apply_scheduler_wake_plan`. The two layers are now separate, and the caller sets are pinned by
+`the_helper_writer_direct_caller_sets_are_pinned`.
 
-**Group 2 — teardown (4 sites).** `exit_task`, `restart_task`, `mark_task_dead`,
-`reap_faulted_task_noalloc_cleanup`. Owner `Teardown`; all four write unconditionally with TID-only
-identity and consult no waiter. They already run near ipc(3) (they clear IPC waiters), so a claim
-at ipc(3) is available without inversion; the settle is **cancel**, and retirement pairs with
-`clear_ipc_waiters_for_tid`.
+**Layer 1 — the 21 CAN status-assignment sites** (this is the census; the counts are the
+classification table's):
 
-**Group 3 — scheduler and lifecycle (9 sites).** `dispatch_next_task`, `yield_current` ×2,
-`yield_current_to` ×2, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`,
-`fault_current_task_with_fault`, `spawn_user_task_from_image`.
+| file | function | sites |
+|---|---|---|
+| `ipc_state.rs` | `rt_commit_receiver_runnable`, `wake_tid_to_runnable`, `process_ipc_timeout_deadlines`, `signal_notification`, `wake_destroyed_notification_waiter` | 5 |
+| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split` | 4 |
+| `restart_state.rs` | `exit_task`, `restart_task`, `mark_task_dead`, `reap_faulted_task_noalloc_cleanup` | 4 |
+| `exec_state.rs` | `spawn_user_task_from_image`, `dispatch_next_task`, `yield_current` ×2, `yield_current_to` ×2 | 6 |
+| `scheduler_state.rs` | `apply_cross_cpu_wake_task` | 1 |
+| `fault_state.rs` | `fault_current_task_with_fault` | 1 |
 
-These are **not** delivery owners: none of them intends to complete a receive. They are CAN only
-because nothing stops them from moving an endpoint-blocked task. Routing them through the
-primitive would be the wrong repair — they run at scheduler(1)/task(2) and would need ipc(3)
-*above* scheduler(1), a rank inversion the split-lock architecture cannot express. **The correct
-repair for group 3 is a proven-negative precondition, not a claim:** an explicit
-`debug_assert`/typed refusal that the task being transitioned is not `Blocked(EndpointReceive)`,
-which would convert these nine rows from CAN to CANNOT and shrink the eventual arbitration set
-from 21 to 12. That is a separate increment; recording it here is the whole point of the matrix.
+**Layer 2 — logical origins**, i.e. every direct production caller of each helper writer:
+
+| helper writer | direct production callers | count |
+|---|---|---|
+| `wake_tid_to_runnable` | `recv_block_unwind_race`, `wake_waiter_for_endpoint`, `apply_scheduler_wake_plan` | 3 |
+| `apply_scheduler_wake_plan` | `apply_split_receiver_wake_plan`, `apply_split_sender_wake_plan`, `ipc_recv_with_optional_deadline` ×2, `ipc_reply` ×2, `ipc_send_with_optional_deadline`, `try_ipc_recv`, `execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`, `execute_blocked_waiter_ordinary_cap_delivery` | 11 |
+| `apply_split_receiver_wake_plan` | `ctx_finalize_and_wake` ×2, `emit_fault_report_for_fault`, `handle_ipc_send`, `handle_ipc_call` | 5 |
+| `wake_waiter_for_endpoint` | `send_message_to_endpoint_and_wake`, `ipc_send_with_optional_deadline` ×2 | 3 |
+| `apply_cross_cpu_wake_task` | `apply_cross_cpu_work` (the `WorkItem::WakeTask` drain) | 1 |
+| `rt_commit_receiver_runnable` | `complete_reply_timeout_over`, `complete_server_death_over` | 2 |
+
+So `ipc_reply` is an origin **two hops** from the writer (`ipc_reply` →
+`apply_scheduler_wake_plan` → `wake_tid_to_runnable`), and `ctx_finalize_and_wake` is **three**
+(→ `apply_split_receiver_wake_plan` → `apply_scheduler_wake_plan` → `wake_tid_to_runnable`).
+
+##### E.1 `rt_commit_receiver_runnable` — two terminal origins, not one
+
+The writer has exactly two callers and they carry **different** terminal claimants:
+
+| caller | result written | terminal cell already won as |
+|---|---|---|
+| `complete_reply_timeout_over` | `SyscallError::TimedOut` | `TerminalClaimant::Timeout` |
+| `complete_server_death_over` | `SyscallError::ServerDied` | `TerminalClaimant::PeerDeath` |
+
+Classifying the common writer as `OrdinaryTimeout` would map `ServerDied` onto a timeout, which is
+wrong: they are distinct one-shot claimants of the *same* `TerminalCell`, and the peer-death path
+additionally emits `IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath`.
+
+Both callers reach the writer having **already won** the reply-terminal cell. The design question
+is therefore not "which owner claims the waiter" but **how an already-won terminal claimant is
+translated into waiter ownership** — the terminal cell and the waiter slot are two authorities and
+one must derive from the other.
+
+> **Prerequisite for the wiring increment.** `WaiterOwner` today has `OrdinaryTimeout` and
+> `Teardown` and no way to say "reply-terminal, claimant = Timeout | PeerDeath". Either it gains a
+> `ReplyTerminal { claimant: TerminalClaimant }` variant, or the wiring proves that holding the
+> terminal cell *is* waiter ownership for this population and the primitive is not consulted at
+> all. **The enum is not changed in this documentation-only increment.**
+
+##### E.2 Notification is not an endpoint owner
+
+`signal_notification` and `wake_destroyed_notification_waiter` take a **bare TID** out of
+`notification_waiters`, guard only on `matches!(tcb.status, TaskStatus::Blocked(_))`, and never
+read `endpoint_waiters`. If that TID has since re-blocked on an endpoint receive, the wake lands on
+a *valid, unrelated* endpoint wait.
+
+The earlier matrix said these should claim the endpoint slot and settle it with `cancel`. **That
+is wrong and is retracted.** Cancelling would make a stale notification destroy a live endpoint
+wait — converting a lost notification into a lost IPC reply, which is strictly worse. A
+notification that finds an endpoint-blocked task has nothing to deliver *to that wait*; it must
+leave it alone.
+
+Both paths therefore move **out** of the "should claim endpoint ownership" set and into the
+production-enforced proven-negative / refusal set. The required future repair:
+
+1. **generation-bearing notification waiter identity** — `notification_waiters` stores
+   `Option<ThreadId>`; it must store the exact `{tid, asid}` plus a wait generation, exactly as
+   `endpoint_waiters` stores `ReceiverWaiterIdentity`;
+2. **a notification-specific blocked reason** (or an equivalent exact wait token), so
+   "is this task still waiting on *this* notification" is answerable without guessing from
+   `Blocked(_)`;
+3. **mismatch or stale record → clear or ignore the notification waiter**, never wake;
+4. **never consume, cancel or retire an unrelated endpoint waiter** — the endpoint slot is not
+   this owner's to settle.
+
+> Whether `WaiterOwner::Notification` survives is **open**. Once notification waits carry exact
+> identity, a notification can no longer collide with an endpoint wait, and the variant may become
+> obsolete. It is **kept** for now: removing it before the exact-identity design exists would
+> lose the record that this collision was found. Decide at the wiring increment, not here.
+
+##### E.3 `wake_tid_to_runnable` — three origins, three different policies
+
+One `LegacyDelivery` policy cannot cover all three.
+
+**(1) `recv_block_unwind_race` — D2 receive-publication rollback.** The waiter publication
+*failed*; this undoes the task block. It is not endpoint delivery, and there is no delivery to
+own. Requirement: exact task incarnation + blocked generation, and a **proof that no ownership
+slot is armed** for that endpoint incarnation (if one were armed, the publication succeeded and
+this is not the rollback path). Settle: nothing to settle — the correct action is
+`retire_current` of a slot that was never armed, i.e. a no-op that must *assert* rather than
+silently succeed.
+
+**(2) `wake_waiter_for_endpoint` — genuine endpoint delivery.** A valid ownership claimant:
+`LegacyDelivery`, exact `WaiterKey`, token required, settle with `consume`. Note it takes the
+waiter **by index with no identity compare** today (census rows 8–10), so the key must be
+reconstructed from the slot before the claim, not after.
+
+**(3) `apply_scheduler_wake_plan` — a generic `SchedulerWakePlan::Wake(tid)`.** The plan carries
+`ThreadId` and nothing else, and its 11 origins span at least five distinct causes:
+
+| origin | cause |
+|---|---|
+| `apply_split_receiver_wake_plan` (5 origins beneath it) | endpoint delivery / shared region / fault report |
+| `apply_split_sender_wake_plan` | blocked **sender** wake |
+| `ipc_reply` ×2 | reply delivery |
+| `ipc_send_with_optional_deadline` | send-to-blocked-receiver |
+| `try_ipc_recv`, `ipc_recv_with_optional_deadline` ×2 | receive-side sender wake |
+| `execute_dispatch_post_work`, `execute_blocked_waiter_{reply,ordinary}_cap_delivery` | post-lock capability delivery |
+
+**A bare `Wake(tid)` is insufficient.** `SchedulerWakePlan` must either carry a typed cause plus
+the exact identity the cause implies (an endpoint `WaiterKey` for delivery, a `{tid, asid}` +
+blocked generation for a sender wake, nothing for a rollback), or `apply_scheduler_wake_plan` must
+**refuse in production** to wake a task whose status is `Blocked(EndpointReceive)` without a token.
+Refusal is the smaller change and is fail-closed; the typed cause is the better long-term shape.
+
+##### E.4 Cross-CPU wake items must be typed
+
+`WorkItem::WakeTask { tid }` is a bare TID. Only an **endpoint-delivery-origin** remote wake may
+carry an endpoint waiter ownership token; every other origin must carry its own identity and must
+not be able to settle an endpoint slot. Required future forms (or an equivalent typed payload):
+
+| form | payload it must carry | may carry an endpoint token? |
+|---|---|---|
+| endpoint delivery | `WaiterKey` + the claim token minted by the origin CPU | **yes** |
+| futex / other scheduler wake | `{tid, asid}` + the futex wait address or wait generation | no |
+| notification | `{tid, asid}` + notification index + notification wait generation | no |
+| rollback / cancellation | `{tid, asid}` + blocked generation + the transaction it rolls back | no |
+| lifecycle wake (spawn, restart, resume) | `{tid, asid}` + the lifecycle epoch | no |
+
+Every form must carry enough to **reject stale TID reuse** — at minimum `{tid, asid}`, since a
+numeric TID alone cannot distinguish a replacement task. It is explicitly **not** the design that every generic `WakeTask` carries an endpoint token.
+
+> There is currently **no production producer** of `WorkItem::WakeTask`: the only occurrence in
+> production source is the drain arm in `apply_cross_cpu_work`, and
+> `the_helper_writer_direct_caller_sets_are_pinned` asserts that. So this is prerequisite design
+> for the first producer, not remediation of an existing one — and the guard fails the moment a
+> producer appears.
+
+##### E.5 Group 3 preconditions must be production-enforced, not `debug_assert`
+
+The earlier matrix suggested `debug_assert`. That is insufficient: `debug_assert` is compiled out
+of release kernels, so the proof would not exist where it matters. Every future CANNOT proof must
+be **enforced in production and fail closed** — a typed refusal, an error return, or an explicit
+fatal, chosen per site.
+
+| site | exact expected transition | fail-closed action on violation |
+|---|---|---|
+| `dispatch_next_task`, `yield_current` (incoming), `yield_current_to` (incoming), `d6_genuine_mark_running_via_task_seam` | `Runnable → Running` **only** | refuse the dispatch and re-enqueue; a dequeued task in any other state is a scheduler-invariant break |
+| `yield_current` (outgoing), `yield_current_to` (outgoing) | `Running → Runnable` **only** | refuse the yield; leave `current` untouched |
+| `direct_dispatch_rollback_split` | the exact transaction predecessor: `Running → Runnable`, and only for the `incoming` this transaction dispatched | refuse the rollback and take the existing explicit fatal path |
+| `fault_current_task_with_fault` | the target is the **current, running** task on this CPU | refuse to fault a task that is not current-and-running |
+| `spawn_user_task_from_image` | the destination TID is **absent** (no TCB) or freshly registered by this call | refuse with an error; never write into an existing TCB |
+
+**`spawn_user_task_from_image` is the sharpest of these.** Two things that look sufficient are not:
+
+* **`register_task_with_class` idempotence is not a precondition.** It *returns `Ok(())`* for an
+  existing TID, so it silently licenses the write instead of refusing it. The check must be at the
+  spawn site and must fail, not succeed.
+* **Checking "not `Blocked(EndpointReceive)`" is not enough either.** The write does not merely
+  wake a blocked receiver — it overwrites the entry point, stack, ASID and register context of
+  **whatever task already holds that TID**. A `Runnable` or `Running` victim is corrupted just as
+  thoroughly, it simply is not an ownership problem. The precondition is *absence*, not
+  *not-endpoint-blocked*.
+
+Enforcing all five would move these nine sites CAN → CANNOT and shrink the eventual arbitration
+set from 21 to 12. That is a separate increment; recording the exact transitions here is the
+point of the matrix.
+
+##### E.6 The resulting owner sets
+
+| set | sites | intended `WaiterOwner` | disposition |
+|---|---|---|---|
+| endpoint delivery, direct IPC | `sr_commit_blocked_receiver_split` | `DirectRequest` (NR6) / `DirectReply` (NR7) | claim → consume on delivery, restore on rollback |
+| endpoint delivery, legacy + shared region | `wake_tid_to_runnable` (via `wake_waiter_for_endpoint`), `sr_wake_receiver_split`, `apply_cross_cpu_wake_task` (endpoint-origin form only) | `LegacyDelivery` | claim → consume; key rebuilt from the slot **before** the claim, since these take by index today |
+| ordinary deadline scan | `process_ipc_timeout_deadlines` | `OrdinaryTimeout` | claim → consume on fire, restore on loss; requires the ipc-first reorder |
+| already-terminal, translation undecided | `rt_commit_receiver_runnable` (Timeout **and** PeerDeath) | **none yet** — see E.1; not `OrdinaryTimeout` | E.1 prerequisite |
+| teardown | `exit_task`, `restart_task`, `mark_task_dead`, `reap_faulted_task_noalloc_cleanup` | `Teardown` | claim → cancel; retire paired with `clear_ipc_waiters_for_tid` |
+| rollback, not delivery | `wake_tid_to_runnable` (via `recv_block_unwind_race`), `direct_dispatch_rollback_split` | **none** | assert no slot armed; never claim |
+| **must refuse, never claim** | `signal_notification`, `wake_destroyed_notification_waiter` | `Notification` — **retracted**, see E.2 | exact notification identity, then refuse |
+| **production-enforced precondition, not a claim** | the nine group-3 scheduler/lifecycle sites | **none** | E.5 transitions |
 
 #### Status
 

@@ -113352,6 +113352,7 @@ mod stage199d_wa2b_wake_owner_census {
 
     const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
     const STATUS: &str = include_str!("../../../doc/STATUS.md");
+    const OWNERSHIP: &str = include_str!("waiter_ownership.rs");
     const EXEC: &str = include_str!("exec_state.rs");
     const FAULT: &str = include_str!("fault_state.rs");
     const THREAD: &str = include_str!("thread_state.rs");
@@ -113582,6 +113583,43 @@ mod stage199d_wa2b_wake_owner_census {
         ),
     ];
 
+    /// Every classified file with comment lines blanked, so a doc-comment mention of a helper
+    /// is never counted as a call site.
+    fn production_sources_no_comments() -> alloc::vec::Vec<(String, String)> {
+        let mut files: alloc::vec::Vec<&str> = alloc::vec![
+            "src/kernel/boot/ipc_state.rs",
+            "src/kernel/boot/exec_state.rs",
+            "src/kernel/boot/fault_state.rs",
+            "src/kernel/boot/restart_state.rs",
+            "src/kernel/boot/scheduler_state.rs",
+            "src/kernel/boot/thread_state.rs",
+            "src/kernel/boot/shared_region_txn.rs",
+            "src/kernel/boot/mod.rs",
+            "src/kernel/syscall/ipc.rs",
+            "src/kernel/task.rs",
+            "src/runtime.rs",
+        ];
+        files.sort();
+        files
+            .into_iter()
+            .map(|rel| {
+                let src = production_source(rel);
+                let blanked: String = src
+                    .lines()
+                    .map(|l| {
+                        if l.trim_start().starts_with("//") {
+                            ""
+                        } else {
+                            l
+                        }
+                    })
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join("\n");
+                (rel.to_string(), blanked)
+            })
+            .collect()
+    }
+
     fn production_source(rel: &str) -> String {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel}: {e}"));
@@ -113653,24 +113691,607 @@ mod stage199d_wa2b_wake_owner_census {
         out
     }
 
-    /// Every status assignment lands in a classified function, with the exact count. A new
-    /// assignment, a deleted one, or a rename breaks this — so no writer can stay unclassified.
+    /// **G — the exact-site fingerprint.** `(file, enclosing fn, count)` alone cannot see a
+    /// count-preserving substitution *inside* one function: delete one assignment, add another,
+    /// and the rollup is unchanged. Each of the 37 sites is therefore pinned by an ordered
+    /// fingerprint of
+    ///
+    /// * file and enclosing function,
+    /// * the normalized left-hand side,
+    /// * the assigned status expression,
+    /// * the exact **preceding** and **following** non-blank, non-comment source lines.
+    ///
+    /// The adjacent-line anchors are what defeat a count-preserving substitution: removing one
+    /// assignment and adding another with the same `(fn, lhs, rhs)` elsewhere in the same
+    /// function lands it between different neighbours, and even a one-line reorder changes them.
+    /// These 37 neighbourhoods are deliberately brittle — a status writer whose surroundings
+    /// changed is a writer whose census row must be re-derived.
+    const FINGERPRINTS: &[(&str, &str, &str, &str, &str, &str)] = &[
+        // src/kernel/boot/exec_state.rs
+        (
+            "src/kernel/boot/exec_state.rs",
+            "futex_wait_current",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "futex_wake_inner",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "wake_tids[wake_count] = Some(tcb.tid.0);",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "build_ap_workload",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "tcb.asid = Some(asid);",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "build_ap_workload",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "tcb.asid = Some(client_asid);",
+            "tcb.user_context.instruction_ptr = VirtAddr(CLIENT_CODE_VA);",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "spawn_user_task_from_image",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "dispatch_next_task",
+            "tcb.status",
+            "TaskStatus::Running",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current",
+            "tcb.status",
+            "TaskStatus::Running",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current_to",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current_to",
+            "tcb.status",
+            "TaskStatus::Running",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        // src/kernel/boot/fault_state.rs
+        (
+            "src/kernel/boot/fault_state.rs",
+            "fault_current_task_with_fault",
+            "tcb.status",
+            "TaskStatus::Faulted",
+            "})?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        // src/kernel/boot/ipc_state.rs
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "rt_commit_receiver_runnable",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "let _ = timed_out;",
+            "Some(tcb.cpu_affinity)",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "wake_tid_to_runnable",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "set_task_status_for_test",
+            "tcb.status",
+            "status",
+            "if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {",
+            "}",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "recv_block_phase_b_task",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointReceive(plan.recv_cap))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.ipc_timeout_deadline = deadline;",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "block_current_on_send_with_deadline",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointSend(send_cap))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.ipc_timeout_deadline = deadline;",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "process_ipc_timeout_deadlines",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {",
+            "tcb.ipc_timeout_deadline = None;",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "signal_notification",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "if matches!(tcb.status, TaskStatus::Blocked(_)) {",
+            "Ok(true)",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "wake_destroyed_notification_waiter",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "if matches!(tcb.status, TaskStatus::Blocked(_)) {",
+            "Ok(true)",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "ipc_recv_with_optional_deadline",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.ipc_timeout_deadline = deadline;",
+        ),
+        // src/kernel/boot/restart_state.rs
+        (
+            "src/kernel/boot/restart_state.rs",
+            "exit_task",
+            "tcb.status",
+            "TaskStatus::Exited(code)",
+            "}",
+            "tcb.restart.token = Some(RestartToken(token));",
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "restart_task",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "tcb.restart.token = None;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "mark_task_dead",
+            "tcb.status",
+            "TaskStatus::Dead",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.restart.token = None;",
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "reap_faulted_task_noalloc_cleanup",
+            "tcb.status",
+            "TaskStatus::Dead",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.restart.token = None;",
+        ),
+        // src/kernel/boot/scheduler_state.rs
+        (
+            "src/kernel/boot/scheduler_state.rs",
+            "apply_cross_cpu_wake_task",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "TaskStatus::Blocked(_) => {",
+            "Ok(CrossCpuWakeApplyResult::Applied)",
+        ),
+        // src/kernel/boot/thread_state.rs
+        (
+            "src/kernel/boot/thread_state.rs",
+            "join_thread",
+            "joiner.status",
+            "TaskStatus::Blocked(WaitReason::Join(ThreadId(tid)))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "wake_joiners_for",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "if wake_count < wake_tids.len() {",
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "spawn_user_thread",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "};",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "fork_complete_post_clone",
+            "child.status",
+            "TaskStatus::Runnable",
+            "child.user_context.arg0 = 0;",
+            "Ok::<_, KernelError>(())",
+        ),
+        // src/kernel/task.rs
+        (
+            "src/kernel/task.rs",
+            "new",
+            "status:",
+            "TaskStatus::Runnable",
+            "thread_group_id: ThreadGroupId(tid.0),",
+            "asid,",
+        ),
+        // src/runtime.rs
+        (
+            "src/runtime.rs",
+            "d6_genuine_mark_running_via_task_seam",
+            "tcb.status",
+            "crate::kernel::task::TaskStatus::Running",
+            "if let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) {",
+            "}",
+        ),
+        (
+            "src/runtime.rs",
+            "direct_dispatch_rollback_split",
+            "tcb.status",
+            "crate::kernel::task::TaskStatus::Runnable",
+            "Some(tcb) => {",
+            "true",
+        ),
+        (
+            "src/runtime.rs",
+            "futex_wake_split_mut",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "woken[n] = (tcb.tid.0, tcb.cpu_affinity);",
+        ),
+        (
+            "src/runtime.rs",
+            "sr_wake_receiver_split",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "if !matches!(old, TaskStatus::Runnable) {",
+            "}",
+        ),
+        (
+            "src/runtime.rs",
+            "sr_commit_blocked_receiver_split",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            ".expect(\"prevalidated present\");",
+            "ReceiverCommit::Committed(tcb.cpu_affinity)",
+        ),
+        (
+            "src/runtime.rs",
+            "sr_uncommit_blocked_receiver_split",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))",
+            "}",
+            "true",
+        ),
+        (
+            "src/runtime.rs",
+            "futex_wait_publish_block_split_mut",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))",
+            "Some(tcb) => {",
+            "true",
+        ),
+    ];
+
+    fn normalize(line: &str) -> String {
+        line.split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ")
+    }
+
+    /// The nearest non-blank, non-comment line in direction `step` from line index `from`.
+    fn neighbour(lines: &[&str], from: usize, forward: bool) -> String {
+        let mut i = from as isize + if forward { 1 } else { -1 };
+        while i >= 0 && (i as usize) < lines.len() {
+            let t = normalize(lines[i as usize]);
+            if !t.is_empty() && !t.starts_with("//") {
+                return t;
+            }
+            i += if forward { 1 } else { -1 };
+        }
+        String::new()
+    }
+
+    /// `(file, fn, lhs, rhs, previous line, following line)` in source order.
+    fn fingerprint_sites() -> alloc::vec::Vec<(String, String, String, String, String, String)> {
+        let mut files: alloc::vec::Vec<&str> = FINGERPRINTS.iter().map(|(f, ..)| *f).collect();
+        files.sort();
+        files.dedup();
+        let mut out = alloc::vec::Vec::new();
+        for rel in files {
+            let src = production_source(rel);
+            let mut offsets: alloc::vec::Vec<usize> = src
+                .match_indices(".status = ")
+                .chain(src.match_indices("status: TaskStatus::"))
+                .map(|(i, _)| i)
+                .collect();
+            offsets.sort_unstable();
+            let lines: alloc::vec::Vec<&str> = src.lines().collect();
+            for at in offsets {
+                let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let line_index = src[..at].matches('\n').count();
+                let end = src[at..]
+                    .find(';')
+                    .or_else(|| src[at..].find(','))
+                    .map(|i| at + i)
+                    .expect("a terminated statement");
+                let stmt: String = normalize(&src[line_start..end]);
+                let (lhs, rhs) = if let Some(rest) = stmt.strip_prefix("status: TaskStatus::") {
+                    ("status:".to_string(), alloc::format!("TaskStatus::{rest}"))
+                } else {
+                    let (l, r) = stmt.split_once('=').expect("an assignment");
+                    (l.trim().to_string(), r.trim().to_string())
+                };
+                out.push((
+                    rel.to_string(),
+                    enclosing_fn(&src, at),
+                    lhs,
+                    rhs,
+                    neighbour(&lines, line_index, false),
+                    neighbour(&lines, line_index, true),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Every status assignment is pinned by its exact site, not merely counted.
+    #[test]
+    fn every_status_writer_is_pinned_by_an_exact_site_fingerprint() {
+        let sites = fingerprint_sites();
+        assert_eq!(
+            sites.len(),
+            FINGERPRINTS.len(),
+            "the number of status assignments changed"
+        );
+        assert_eq!(sites.len(), 37, "and it must still be 37");
+        for (i, (file, function, lhs, rhs, before, after)) in sites.iter().enumerate() {
+            let (pf, pfn, plhs, prhs, pbefore, pafter) = FINGERPRINTS[i];
+            assert_eq!(
+                (file.as_str(), function.as_str(), lhs.as_str(), rhs.as_str()),
+                (pf, pfn, plhs, prhs),
+                "site {i} drifted"
+            );
+            assert_eq!(
+                (before.as_str(), after.as_str()),
+                (pbefore, pafter),
+                "site {i} ({pf}::{pfn}) moved: its neighbourhood changed, so an assignment was \
+                 reordered, replaced, or substituted inside the same function — re-derive its \
+                 census row rather than re-pinning it"
+            );
+        }
+    }
+
+    /// The `(file, fn, count)` rollup the classification table uses is DERIVED from the same
+    /// fingerprints, so the two can never disagree.
     #[test]
     fn every_status_writer_is_classified_by_its_enclosing_function() {
+        let mut rollup: alloc::vec::Vec<(String, String, usize)> = alloc::vec::Vec::new();
+        for (file, function, ..) in fingerprint_sites() {
+            match rollup
+                .iter_mut()
+                .find(|(f, n, _)| *f == file && *n == function)
+            {
+                Some((_, _, n)) => *n += 1,
+                None => rollup.push((file, function, 1)),
+            }
+        }
+        rollup.sort();
+        assert_eq!(rollup, extracted(), "the two extractions must agree");
         let mut pinned: alloc::vec::Vec<(String, String, usize)> = CENSUS
             .iter()
             .map(|(f, n, c, _)| (f.to_string(), n.to_string(), *c))
             .collect();
         pinned.sort();
         assert_eq!(
-            extracted(),
-            pinned,
+            rollup, pinned,
             "the classified set must match the mechanically extracted set exactly"
         );
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
             37,
             "and it must still be the 37 sites WA2A-R1 pinned"
+        );
+    }
+
+    /// **G, second half.** The matrix reasons about helper writers, so their exact direct
+    /// production caller sets are pinned: a new caller class is a new logical origin, and the
+    /// matrix must be re-derived rather than silently inherited.
+    #[test]
+    fn the_helper_writer_direct_caller_sets_are_pinned() {
+        // (helper, [(file, enclosing fn, call count)])
+        const CALLERS: &[(&str, &[(&str, &str, usize)])] = &[
+            (
+                "wake_tid_to_runnable",
+                &[
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "apply_scheduler_wake_plan",
+                        1,
+                    ),
+                    ("src/kernel/boot/ipc_state.rs", "recv_block_unwind_race", 1),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "wake_waiter_for_endpoint",
+                        1,
+                    ),
+                ],
+            ),
+            (
+                "apply_scheduler_wake_plan",
+                &[
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "apply_split_receiver_wake_plan",
+                        1,
+                    ),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "apply_split_sender_wake_plan",
+                        1,
+                    ),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "ipc_recv_with_optional_deadline",
+                        2,
+                    ),
+                    ("src/kernel/boot/ipc_state.rs", "ipc_reply", 2),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "ipc_send_with_optional_deadline",
+                        1,
+                    ),
+                    ("src/kernel/boot/ipc_state.rs", "try_ipc_recv", 1),
+                    (
+                        "src/runtime.rs",
+                        "execute_blocked_waiter_ordinary_cap_delivery",
+                        1,
+                    ),
+                    (
+                        "src/runtime.rs",
+                        "execute_blocked_waiter_reply_cap_delivery",
+                        1,
+                    ),
+                    ("src/runtime.rs", "execute_dispatch_post_work", 1),
+                ],
+            ),
+            (
+                "apply_split_receiver_wake_plan",
+                &[
+                    (
+                        "src/kernel/boot/fault_state.rs",
+                        "emit_fault_report_for_fault",
+                        1,
+                    ),
+                    (
+                        "src/kernel/boot/shared_region_txn.rs",
+                        "ctx_finalize_and_wake",
+                        2,
+                    ),
+                    ("src/kernel/syscall/ipc.rs", "handle_ipc_call", 1),
+                    ("src/kernel/syscall/ipc.rs", "handle_ipc_send", 1),
+                ],
+            ),
+            (
+                "wake_waiter_for_endpoint",
+                &[
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "ipc_send_with_optional_deadline",
+                        2,
+                    ),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "send_message_to_endpoint_and_wake",
+                        1,
+                    ),
+                ],
+            ),
+            (
+                "apply_cross_cpu_wake_task",
+                &[(
+                    "src/kernel/boot/scheduler_state.rs",
+                    "apply_cross_cpu_work",
+                    1,
+                )],
+            ),
+            (
+                "rt_commit_receiver_runnable",
+                &[
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "complete_reply_timeout_over",
+                        1,
+                    ),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "complete_server_death_over",
+                        1,
+                    ),
+                ],
+            ),
+        ];
+        for (helper, pinned) in CALLERS {
+            let mut found: alloc::vec::Vec<(String, String, usize)> = alloc::vec::Vec::new();
+            for (rel, src) in production_sources_no_comments() {
+                let needle = alloc::format!("{helper}(");
+                for (at, _) in src.match_indices(needle.as_str()) {
+                    // the definition itself, and the `_for_test` hook, are not callers
+                    if src[..at].trim_end().ends_with("fn") {
+                        continue;
+                    }
+                    let f = enclosing_fn(&src, at);
+                    if f == *helper || f.ends_with("_for_test") {
+                        continue;
+                    }
+                    match found.iter_mut().find(|(r, n, _)| r == &rel && n == &f) {
+                        Some((_, _, n)) => *n += 1,
+                        None => found.push((rel.clone(), f, 1)),
+                    }
+                }
+            }
+            found.sort();
+            let mut want: alloc::vec::Vec<(String, String, usize)> = pinned
+                .iter()
+                .map(|(f, n, c)| (f.to_string(), n.to_string(), *c))
+                .collect();
+            want.sort();
+            assert_eq!(
+                found, want,
+                "the direct production caller set of `{helper}` changed — re-derive its \
+                 owner/origin rows in §6.1.34 E"
+            );
+        }
+        // `WorkItem::WakeTask` still has NO production producer: the only occurrence is the
+        // drain arm itself. If one appears, the typed-payload work in §6.1.34 E becomes
+        // remedial rather than prerequisite.
+        let mut constructions = 0usize;
+        for (_, src) in production_sources_no_comments() {
+            constructions += src.matches("WorkItem::WakeTask {").count();
+        }
+        assert_eq!(
+            constructions, 1,
+            "exactly one occurrence — the drain match arm — and no production submitter"
         );
     }
 
@@ -113892,10 +114513,10 @@ mod stage199d_wa2b_wake_owner_census {
     #[test]
     fn the_owner_wiring_matrix_covers_every_can_path() {
         let matrix = AUDIT
-            .split("#### E. Owner / wiring matrix")
+            .split("#### E. Owner / origin matrix")
             .nth(1)
             .expect("§6.1.34 E")
-            .split("#### ")
+            .split("\n#### ")
             .next()
             .expect("matrix end");
         for function in CENSUS
@@ -113923,8 +114544,124 @@ mod stage199d_wa2b_wake_owner_census {
         }
         // It is a design matrix only.
         assert!(
-            matrix.contains("design matrix") || matrix.contains("Design only"),
+            matrix.contains("Design only") || matrix.contains("design matrix"),
             "the matrix must say it is design only — no wiring in this increment"
+        );
+
+        // A. writer sites and logical origins are two explicit layers, and every helper's
+        // direct callers are named (not a transitive caller standing in for the real one).
+        assert!(
+            matrix.contains("Layer 1 — the 21 CAN status-assignment sites")
+                && matrix.contains("Layer 2 — logical origins"),
+            "the matrix must separate writer sites from logical origins"
+        );
+        for helper in [
+            "wake_tid_to_runnable",
+            "apply_scheduler_wake_plan",
+            "apply_split_receiver_wake_plan",
+            "wake_waiter_for_endpoint",
+            "apply_cross_cpu_wake_task",
+            "rt_commit_receiver_runnable",
+        ] {
+            assert!(
+                matrix.contains(helper),
+                "the origin layer must close `{helper}`"
+            );
+        }
+        for direct_caller in [
+            "recv_block_unwind_race",
+            "apply_split_sender_wake_plan",
+            "send_message_to_endpoint_and_wake",
+            "execute_dispatch_post_work",
+            "apply_cross_cpu_work",
+        ] {
+            assert!(
+                matrix.contains(direct_caller),
+                "the origin layer must name the real direct caller `{direct_caller}`"
+            );
+        }
+
+        // B. rt_commit_receiver_runnable is split by terminal origin, and ServerDied is NOT
+        // mapped onto OrdinaryTimeout.
+        assert!(
+            matrix.contains("complete_reply_timeout_over")
+                && matrix.contains("complete_server_death_over")
+                && matrix.contains("TerminalClaimant::PeerDeath")
+                && matrix.contains("TerminalClaimant::Timeout"),
+            "the two terminal origins must be recorded separately"
+        );
+        assert!(
+            matrix.contains("ReplyTerminal { claimant: TerminalClaimant }"),
+            "the missing conceptual owner variant must be recorded as a prerequisite"
+        );
+        // …and the enum itself is untouched in this increment.
+        let owner_enum = OWNERSHIP
+            .split("pub(crate) enum WaiterOwner {")
+            .nth(1)
+            .expect("the owner enum")
+            .split("\n}")
+            .next()
+            .expect("enum end");
+        for variant in [
+            "DirectRequest,",
+            "DirectReply,",
+            "OrdinaryTimeout,",
+            "LegacyDelivery,",
+            "Notification,",
+            "Teardown,",
+        ] {
+            assert!(owner_enum.contains(variant), "WaiterOwner lost `{variant}`");
+        }
+        let variants = owner_enum
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.ends_with(',') && l.chars().next().is_some_and(char::is_uppercase))
+            .count();
+        assert_eq!(
+            variants, 6,
+            "WaiterOwner must still have exactly its six variants — R1 is documentation only"
+        );
+
+        // C. notification is NOT an endpoint owner and must never cancel an endpoint wait.
+        assert!(
+            matrix.contains("Notification is not an endpoint owner")
+                && matrix.contains("generation-bearing notification waiter identity")
+                && matrix.contains("never consume, cancel or retire an unrelated endpoint waiter"),
+            "the notification repair must be recorded"
+        );
+        assert!(
+            matrix.contains("Whether `WaiterOwner::Notification` survives is **open**"),
+            "whether the Notification variant becomes obsolete must be recorded, not decided"
+        );
+
+        // D. the three wake_tid_to_runnable origins get three policies.
+        assert!(
+            matrix.contains("three origins, three different policies")
+                && matrix.contains("D2 receive-publication rollback")
+                && matrix.contains("A bare `Wake(tid)` is insufficient."),
+            "the wake_tid_to_runnable split must be recorded"
+        );
+
+        // E. cross-CPU forms are typed, and NOT every WakeTask carries an endpoint token.
+        assert!(
+            matrix.contains("no production producer")
+                && matrix.contains("reject stale TID reuse")
+                && matrix.contains("It is explicitly **not** the design that"),
+            "the cross-CPU typing requirements must be recorded"
+        );
+
+        // F. group-3 preconditions are production-enforced, and debug_assert is refused.
+        assert!(
+            matrix.contains("suggested `debug_assert`. That is insufficient")
+                && matrix.contains("enforced in production and fail closed**")
+                && matrix.contains("`Runnable → Running` **only**")
+                && matrix.contains("`Running → Runnable` **only**"),
+            "the group-3 transitions must be exact and production-enforced"
+        );
+        assert!(
+            matrix.contains("idempotence is not a precondition")
+                && matrix.contains("The precondition is *absence*, not"),
+            "the spawn_user_task_from_image reasoning must be recorded in full"
         );
     }
 }
