@@ -234,10 +234,10 @@ pub(crate) fn try_split_dispatch_into_frame(
         return None;
     };
     // Stage 199D: IpcCall (NR 6) + IpcReply (NR 7) are not in the static NR-only whitelist,
-    // but they ARE admitted to the direct request/reply gates below. On x86_64 that admission
-    // is UNCONDITIONAL — the off-lock path is the production default, with no proof gate and
-    // no oracle selector in the condition. On AArch64/RISC-V admission still requires the
-    // proof gate, so their normal boots stay byte-identical.
+    // but they ARE admitted to the direct request/reply gates below. Since WA1-GATE that
+    // admission requires the explicit proof gate on EVERY architecture, x86_64 included — the
+    // production term is `false` everywhere — so every normal boot stays byte-identical to the
+    // legacy path.
     let direct_ipc_admitted = matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)
         && crate::kernel::boot::ipccall_direct_admission_enabled();
     if classify_split_eligible_nr_only(syscall).is_none() && !direct_ipc_admitted {

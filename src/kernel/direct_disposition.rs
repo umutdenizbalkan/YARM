@@ -215,9 +215,14 @@ pub(crate) fn classify_direct_request_outcome(
         // written, and this file's standing rule is that anything past the copy line never
         // falls through. The kernel could not PLACE the wake — that is an internal condition,
         // not a userspace error.
+        // Stage 199D: an invariant violation detected before ANY mutation. Nothing was
+        // published, so nothing can be delivered twice — but it is not fallback-eligible
+        // either: the receiver's scheduler state is inconsistent with its blocked status, and
+        // handing that to the legacy path would only move the problem.
         IpcCallDirectError::RecordCommitFailed
         | IpcCallDirectError::EnqueueRejected(_)
-        | IpcCallDirectError::EnqueueRejectedUnreconciled(_) => {
+        | IpcCallDirectError::EnqueueRejectedUnreconciled(_)
+        | IpcCallDirectError::ReceiverMembershipViolation => {
             DirectDisposition::Failed(SyscallError::Internal)
         }
     }
@@ -272,7 +277,8 @@ pub(crate) fn classify_direct_reply_outcome(
         // second reply is possible. Past the copy line, so never a fallback.
         IpcReplyDirectError::RecordConsumeFailed
         | IpcReplyDirectError::EnqueueRejected(_)
-        | IpcReplyDirectError::EnqueueRejectedUnreconciled(_) => {
+        | IpcReplyDirectError::EnqueueRejectedUnreconciled(_)
+        | IpcReplyDirectError::ReceiverMembershipViolation => {
             DirectDisposition::Failed(SyscallError::Internal)
         }
     }

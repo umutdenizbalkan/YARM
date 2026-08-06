@@ -1475,7 +1475,7 @@ Coordinate 23 remains **OPEN** on links 2–4.
 
 A target-spec-only repair. **No runtime semantics, production predicate, ABI, ISA, memory layout
 or linker semantics changed**, and no QEMU seal is required or claimed. Coordinate 23 stays OPEN,
-the closure tally is unchanged, and the live-evidence ledger is unchanged at 40 / 6 / 46.
+the closure tally is unchanged, and the live-evidence ledger is unchanged at 39 / 7 / 46.
 
 **The failure, reproduced at the clean parent `2db42681`:**
 
@@ -1945,7 +1945,7 @@ retired off-lock and zero in-lock dispatch or fallback markers, and settled fuse
 directions apart from the one deliberate `duplicate=1`.
 
 **No live cell is added.** This revalidates historical proof-gated evidence after the trap-bridge
-and admission changes; the ledger stays **40 production / 6 knob-gated / 46 total**,
+and admission changes; the ledger stays **39 production / 7 non-production / 46 total**,
 `RISCV_199D_READINESS` remains **`case_b`**, and coordinate 23 remains **OPEN** solely on the
 cross-hart wake requirement, production enablement, and production live evidence. The stale
 harness blocker is **closed**; it was never a kernel defect and closing it earns no cell.
@@ -1962,7 +1962,7 @@ predicate changed.
 ### 6.1.20 RISC-V readiness blocker 3 — remote-wake audit: `RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY`
 
 Audit only. No runtime code, production predicate or scheduler policy changed; nothing was
-implemented, no hart was given user work, no affinity was re-homed. Ledger stays **40 / 6 / 46**
+implemented, no hart was given user work, no affinity was re-homed. Ledger stays **39 / 7 / 46**
 and coordinate 23 remains **OPEN**.
 
 ```
@@ -2119,7 +2119,7 @@ Recorded outcome: **link 7 and its hart-local prerequisites are structurally clo
 kernel execution/trap context and parks with every interrupt admission disabled. **Link 2 remains
 absent** — CPU 1 is *not* scheduler-online, runs no scheduler work and no userspace — so
 `RISCV_REMOTE_WAKE` remains **D**, `RISCV_199D_READINESS` remains **`case_b`**, coordinate 23
-remains **OPEN**, and the ledger stays **40 / 6 / 46**.
+remains **OPEN**, and the ledger stays **39 / 7 / 46**.
 
 #### Pre-analysis: where the trap bridge assumed BSP-only
 
@@ -2228,7 +2228,7 @@ The next increment remains link 2 — bring CPU 1 online — under the hard-stop
 Logical CPU 1 is registered scheduler-online in the explicitly **non-dispatchable** wake-only
 state. **The verdict does not move**: link 1 is still absent, so `RISCV_REMOTE_WAKE` remains
 **D**, `RISCV_199D_READINESS` remains **`case_b`**, coordinate 23 remains **OPEN**, and the ledger
-stays **40 / 6 / 46**. No production flip, no new live cell.
+stays **39 / 7 / 46**. No production flip, no new live cell.
 
 #### Pre-audit: the tree already represents the required state — no hard-stop
 
@@ -2336,7 +2336,7 @@ probed and remains a hard-stop for the later transport increment.
 Pre-audit only. **No code was written**, no oracle was added and no chain entry moved. Links
 2, 3, 7 and 9 remain present; **1, 4, 5, 6, 8 and 10 remain absent**; `RISCV_REMOTE_WAKE` recomputes
 unchanged to **D**; `RISCV_199D_READINESS` remains **`case_b`**; coordinate 23 remains **OPEN**;
-the ledger remains **40 / 6 / 46**. `probe_extension(0x735049)` remains uncalled.
+the ledger remains **39 / 7 / 46**. `probe_extension(0x735049)` remains uncalled.
 
 The hard-stop asked whether a disposable proof task can satisfy five conditions.
 **Conditions 1–4 are satisfiable. Condition 5 is not.**
@@ -2413,7 +2413,7 @@ and tests, and that is machine-checked by a source-tree walk
 
 **Verdicts unchanged.** Links 2, 3, 7, 9 present; **1, 4, 5, 6, 8, 10 absent**;
 `RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**; coordinate 23 **OPEN**;
-ledger **40 production / 6 knob-gated / 46 total**; **no live cell, no QEMU seal**. The
+ledger **39 production / 7 non-production / 46 total**; **no live cell, no QEMU seal**. The
 production predicate is still `cfg!(target_arch = "x86_64")`.
 
 #### The seam
@@ -2495,7 +2495,7 @@ contract, not in the oracle, the affinity seam or the withdrawal foundation.
 
 **Verdicts unchanged.** Link 1 **ABSENT**; links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent;
 `RISCV_REMOTE_WAKE` recomputes mechanically to **D**; `RISCV_199D_READINESS` remains **`case_b`**;
-coordinate 23 remains **OPEN**; ledger remains **40 / 6 / 46**; **no new canonical live cell**.
+coordinate 23 remains **OPEN**; ledger remains **39 / 7 / 46**; **no new canonical live cell**.
 **NR7 remote reachability is NOT live-proved** — it was out of scope for this increment and the
 NR6 blocker applies to it identically, since both end in the same rank-1 placement.
 
@@ -2618,7 +2618,7 @@ consume it.
 
 **RISC-V status is untouched and recomputes unchanged:** link 1 **ABSENT**; links 2, 3, 7, 9
 present; 4, 5, 6, 8, 10 absent; `RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**;
-coordinate 23 **OPEN**; ledger **40 / 6 / 46**; **no new live cell**. The §6.1.24 withdrawal
+coordinate 23 **OPEN**; ledger **39 / 7 / 46**; **no new live cell**. The §6.1.24 withdrawal
 foundation remains unwired.
 
 #### The contract
@@ -2737,7 +2737,7 @@ nothing is queued there", which is the defect written down as if it were correct
 closed here. No production predicate, no `wake_only` policy, no affinity, no SBI/IPI, no AArch64,
 no 199E, and **no RISC-V status change**: link 1 **ABSENT**; links 2, 3, 7, 9 present; 4, 5, 6, 8,
 10 absent; `RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**; coordinate 23
-**OPEN**; ledger **40 / 6 / 46**; **no new live cell**.
+**OPEN**; ledger **39 / 7 / 46**; **no new live cell**.
 
 #### Finding A — `AlreadyQueued` is not "nothing is queued"
 
@@ -2764,6 +2764,9 @@ Three changes:
    `RefusedDuplicate`, `NotQueued` and `InvalidCpu` fail closed through
    `EnqueueRejectedUnreconciled(WithdrawOutcome)`: the externally visible authority is reclaimed,
    and **no claim is made that the receiver was restored**.
+
+> **Placed too late — corrected in §6.1.28.** The preflight sat *after* the record reservation,
+> the reply-cap mint and the user copy, so it could not support retry or restoration.
 
 **On the hard-stop.** "Could an `AlreadyQueued` task already have executed or observed the
 publication?" Rather than argue the window, it is **closed**: both transactions now run a
@@ -2793,7 +2796,10 @@ The whole direct-eligible reply population is therefore **untimed**. The claim i
 
 `consume_reply_record_split` closes the reverse link on the same edge, so the restore
 re-registers it: the replier owes the reply again, exactly as before. The acknowledgement lease is
-restored, not discarded. Re-arming is admissible **only** when `receiver_is_unplaced()` holds —
+restored, not discarded.
+
+> **Not atomic — corrected in §6.1.28.** The record was published `Available` *before* the link
+> registration was attempted, so a refused registration left `Available`-without-link. Re-arming is admissible **only** when `receiver_is_unplaced()` holds —
 otherwise the caller may already have observed the delivery, and arming a second reply against it
 would be unsound.
 
@@ -2821,6 +2827,318 @@ Three mutations, each caught:
 | reconciliation replaced by a constant `Removed` (i.e. no atomic withdrawal) | `the_membership_reconciliation_shares_the_detecting_acquisition`, `already_queued_distinguishes_exactly_one_current_and_duplicate`, `no_blocked_task_ever_holds_queued_or_current_membership` |
 | replier identity guard dropped from the authority restore | `the_reply_authority_restore_is_identity_and_generation_exact` |
 | reverse-link re-registration dropped | initially **structural only** — a behavioural link-count assertion was added, and it now fails too |
+
+
+### 6.1.28 Three rejection-safety defects — repaired
+
+Review of §6.1.27 found three. All closed here. No production predicate, no `wake_only` policy,
+no affinity, no SBI/IPI, no AArch64, no ServerDies, no 199E, no RISC-V link-1 work.
+**RISC-V status recomputes unchanged**: link 1 **ABSENT**; links 2, 3, 7, 9 present; 4, 5, 6, 8,
+10 absent; `RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**; coordinate 23
+**OPEN**; ledger **39 / 7 / 46**; **no new live cell**.
+
+#### 1. Membership detection moved before user-visible mutation
+
+§6.1.27's preflight was placed too late. Traced exactly:
+
+| direction | first userspace-observable mutation | old preflight | new |
+|---|---|---|---|
+| NR6 | (5) record reserved → visible to another transaction; (6)/(7) provisional cap in the **server's own cnode**; (8) copy into the server's user memory | (9c), after all three | **(4a)**, before all three |
+| NR7 | (3) record `Available → Reserved`; (4) copy into the caller's user memory | (5c), after both | **(2b)**, before both |
+
+A receiver reported `RefusedCurrent` may already be executing and may already have read those
+bytes, so a check after them cannot support retry or authority restoration. The new check runs
+before any user copy, any provisional capability in the receiver's cnode, any record state
+exposed to another transaction, any waiter claim and any TCB mutation.
+
+A legitimate `Blocked` receiver holding a committed waiter cannot acquire scheduler membership —
+nothing can wake it while both are true — so an early positive result is an **invariant
+violation**, not a retryable `WouldBlock`. It performs no mutation, **discards** the claimed
+acknowledgement rather than re-arming it, returns the typed
+`ReceiverMembershipViolation`, and claims nothing about the receiver being restored or unplaced.
+
+The post-copy defence remains for genuine invariant violations, classified by the
+same-acquisition `WithdrawOutcome`: `Removed` → rollback may proceed; `RefusedCurrent` →
+publication may have been observed, never restore; `RefusedDuplicate` / `NotQueued` /
+`InvalidCpu` → fail closed. And **no post-copy membership detection returns retryable
+authority**: NR6 settles the lease only when `reconciled.is_none()`, NR7 restores the authority
+only when `reconciled.is_none()` — so even a cleanly-`Removed` collision found after the copy is
+terminal.
+
+`direct_server_exact_still_blocked` and `direct_caller_exact_still_blocked` now also require the
+absence of scheduler membership: `Blocked` plus an intact waiter is **not** sufficient when the
+task is queued or current.
+
+#### 2. The NR7 authority restore is all-or-nothing
+
+The old version published `Consumed → Available` and only afterwards attempted registration,
+which permits `Available`-without-link — an invokable reply with no teardown-visible link.
+
+Replaced by one composed transaction. The task lock (rank 2) is taken first and held across the
+whole operation; the ipc lock (rank 3) is nested inside it — ascending rank order, so the
+discipline is preserved. Under that single hold: **(1)** locate the exact replier incarnation and
+validate its link slot free (or already exactly ours) and its status live, **writing nothing**;
+**(2)** at rank 3 validate the record (exact index, exact generation, `Consumed`, bound to this
+exact replier) and flip it; **(3)** install the link through the shared
+`install_server_reply_link` decision, which also stamps the leak accounting.
+
+Step 1 makes step 3 unreachable, but the revert is implemented anyway and **exercised**: a
+`#[cfg(test)]`-only fault hook forces the install to fail after the flip, and
+`a_forced_link_install_failure_leaves_the_record_consumed` proves the record is reverted. Only
+two outcomes are observable: **A** record `Available` and the exact link installed, or **B**
+record `Consumed` and no newly installed link.
+
+Five failure cases each proved to leave outcome B, with the live link count unchanged and no
+second reply invokable: occupied link slot, changed replier incarnation, recycled generation,
+already-`Available` record, `Cancelled` record.
+
+#### 3. The hidden shared-region side effect is gone
+
+§6.1.27 put the `AlreadyQueued` reconciliation in the seam that the shared-region finalizer also
+calls, so that caller silently withdrew a pre-existing scheduler entry it had no rollback for.
+
+**Option A** was taken — a separate seam, not a flag:
+
+* `sr_enqueue_committed_receiver_split` — generic, **never** reconciles (`reconciled: None`);
+* `sr_enqueue_committed_receiver_reconciled_split` — direct-IPC only, used by exactly the two
+  transactions.
+
+The shared-region finalizer cannot select the reconciling one because it calls the other
+function; a guard pins that it names neither `reconciled_split` nor `withdraw_queued_tid`, and
+that the reconciling seam has exactly two call sites.
+
+Its rejection contract is repaired too: it no longer returns `Some(true)` after a refusal. On the
+four never-touched-a-queue reasons it restores its own receiver (`Runnable → Blocked` on the
+exact recv cap, waiter reinstalled) and reports `None`. On an unreconciled `AlreadyQueued` it
+fails closed with **zero mutation** — it does not force `Blocked` on top of live membership and
+does not touch the queue entry. Behavioural tests cover `WakeOnly`, `QueueFull`, and
+`AlreadyQueued` as exactly-once, current and duplicate, each proving the pre-existing membership
+is untouched.
+
+
+### 6.1.29 Waiter-ownership exclusivity — HARD-STOP; Part B delivered
+
+Three items were requested. **Part B is delivered.** **Parts A and C are hard-stopped** on the
+same finding, and the audit that establishes it is executable and pinned
+(`stage199d_waiter_ownership_exclusivity_audit`).
+
+**`WAITER_OWNERSHIP_EXCLUSIVE=no`.**
+
+Status unchanged: link 1 **ABSENT**; links 2, 3, 7, 9 present; 4, 5, 6, 8, 10 absent;
+`RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**; coordinate 23 **OPEN**;
+ledger **39 / 7 / 46**; **no new live cell**.
+
+> **Read with §6.1.30.** This section was written while the x86 direct production default was
+> still ON. Stage 199D-WA1-GATE subsequently disabled it — the **production default is OFF** on
+> every architecture, admission and acknowledgement publication both require an explicit
+> proof/oracle selector, and `AlreadyQueued` + `Removed` is terminal on every freestanding
+> runtime build. Where the two sections touch the same contract, **§6.1.30 is operative**; the
+> statements below have been corrected in place rather than left to be overridden silently.
+
+#### A/C — the hard-stop
+
+Both parts rest on the same premise: that claiming the exact generation-bearing endpoint waiter
+*before* any user-visible mutation gives the transaction **exclusive** ownership of the receiver,
+so nothing else can wake it between the claim and the commit. The instruction was explicit —
+audit every non-endpoint wake owner, and hard-stop if any can legitimately wake this exact
+receiver without invalidating or arbitrating against the owned claim.
+
+Six owners were enumerated and classified from named source seams:
+
+| Owner | Reaches the receiver via | Arbitrates against an owned claim? |
+|---|---|---|
+| endpoint send delivering to a blocked receiver | `take_endpoint_waiter` | **yes** — through the waiter table |
+| the direct NR6/NR7 transactions | `sr_claim_endpoint_waiter_split` | **yes** — same table, one winner |
+| server-death completion | `try_claim_peer_death_terminal` → revalidate caller + endpoint generation + blocked-recv generation → waiter claim | **yes** — terminal *and* waiter |
+| reply-receive timeout (token-bearing) | `reply_terminal_ownership` | **yes** — terminal *and* waiter |
+| **ordinary IPC timeout scan** | `tcb.ipc_timeout_deadline`, by TCB scan | **NO** |
+| **notification signal wake** | `notification_waiters[i]`, by TID | **NO** |
+
+The last two break exclusivity, and they break it *mechanically*, not incidentally:
+
+* **The ordinary timeout scan wakes before it invalidates.** Phase 1 (rank 2) walks every TCB and
+  sets `Runnable` for any `Blocked(WaitReason::EndpointReceive(_))` whose deadline expired. Phase 2
+  (rank 3) clears the waiter slots **afterwards**. Because the wake strictly precedes the waiter
+  invalidation, an owned claim cannot make it lose — there is no point at which the scan consults
+  the waiter table before waking. Pinned by
+  `the_timeout_scan_wakes_before_it_clears_the_waiter`.
+* **The notification signal wake never consults the endpoint waiter at all.** It takes a TID out
+  of `notification_waiters`, and its only guard is `matches!(tcb.status, Blocked(_))` — true for
+  our receiver right up to commit. `endpoint_waiters` is never read. Pinned by
+  `the_notification_wake_never_consults_the_endpoint_waiter`. The code's own comment documents
+  that a snapshotted notification waiter can race a task woken by another route, so the staleness
+  this depends on is an acknowledged, handled condition — not a hypothetical.
+
+Ordinary recv/send deadlines are armed **independently** of `reply_timeout_token`, so
+`terminal_arbitrated` — which gates direct NR7 eligibility — does not exclude them. The ordinary
+timeout race with a direct publication is therefore **production-reachable**, not merely a
+mechanism-level concern. The seven-site assignment evidence is in §6.1.30.
+
+So the reorder is **not performed**. NR6 keeps its single claim at step (9) and NR7 at step (5);
+there is still exactly one claim per transaction (pinned). The pre-mutation membership checks from
+§6.1.28 remain — they are TOCTOU preflights, correctly described as such, and they are strictly
+better than nothing while being no substitute for ownership.
+
+**Part C is hard-stopped for the same reason.** The shared-region publication lease must claim the
+waiter before the first receiver-visible cap mint, mapping or metadata copy, and then rely on that
+claim to guarantee the receiver cannot run while resources are being published. That guarantee is
+exactly what this audit refutes. Building the lease anyway would encode the same false exclusivity
+into a third subsystem, and the instruction's own escape applies: *"Hard-stop and document the
+missing terminal owner if the current case cannot be represented without revoking resources
+underneath a running receiver."* The missing terminal owner is a **waiter-claim-aware wake
+arbitration** that the ordinary timeout scan and the notification wake both honour.
+
+**The contract that must be split first.** Either (1) reorder the ordinary timeout scan to
+invalidate the waiter *before* waking, and give the notification wake a waiter-claim check, so
+both lose to an owned claim; or (2) introduce a per-task wake-arbitration token that every wake
+owner must claim, of which the endpoint waiter becomes one holder. Route 1 is smaller and is the
+recommended next increment; both are production wake-path changes with their own live seals, and
+neither belongs in a rejection-safety repair.
+
+#### B — the rollback algebra for same-acquisition `Removed` (hosted-test evidence only)
+
+§6.1.28's rule that every `reconciled.is_some()` is terminal was over-broad **as an algebraic
+statement**, and §6.1.29 corrected the algebra. What `WithdrawOutcome::Removed` actually proves is
+narrower than that correction originally claimed:
+
+> `Removed` proves that **exactly one queued entry was withdrawn under the detecting scheduler
+> acquisition**, and that the task was **not `current` at that acquisition**. It does **not**
+> prove the task never ran, and it does not prove the task never observed an earlier publication.
+
+Those two are different facts, and only the first is established. While waiter ownership is
+non-exclusive another wake owner could have dispatched the task and re-queued it, leaving exactly
+one entry and a non-`current` task at the moment we look.
+
+**So the split is:**
+
+| build | `AlreadyQueued` + `Removed` |
+|---|---|
+| hosted `#[cfg(test)]` | recoverable — the rollback algebra is exercised end-to-end |
+| **every freestanding runtime build**, proof/oracle kernels included | **terminal**: restores neither the acknowledgement nor NR7 reply authority, and never returns the retryable variant |
+
+`ReceiverEnqueue::rejection_is_runtime_recoverable()` is the predicate that enforces it
+(§6.1.30 §3). The four reasons that provably fail **before touching a runqueue** —
+`InvalidCpu`, `CpuOffline`, `WakeOnly`, `QueueFull` — keep their existing policy in every build.
+Terminal in every build: `RefusedCurrent`, `RefusedDuplicate`, `NotQueued`, and an `InvalidCpu`
+withdrawal outcome.
+
+##### Hosted test-only evidence
+
+Everything below is `#[cfg(test)]` evidence about the **rollback algebra**, not a description of
+production behaviour. Because §6.1.28's pre-mutation check makes an ordinary post-copy
+`AlreadyQueued` unreachable, the path is driven by a `#[cfg(test)]`-only hook that injects
+membership immediately before the final enqueue (`1` = one queued entry → `Removed`;
+`2` = dispatched → `RefusedCurrent`). Through the real transactions:
+
+* **NR6 (hosted test only)** — `EnqueueRejected(AlreadyQueued)`, server `Blocked` on the exact
+  original recv cap, exact waiter restored once, zero membership, lease restored, and the same
+  transaction retried successfully.
+* **NR7 (hosted test only)** — `EnqueueRejected(AlreadyQueued)`, exact caller `Blocked` on the
+  exact recv cap, exact waiter restored once, record `Available` **at the same generation**,
+  exact replier reverse link present (live link count 1), acknowledgement restored, the same
+  reply retried successfully, and a duplicate still rejected.
+* **NR6 `RefusedCurrent`** — `EnqueueRejectedUnreconciled(RefusedCurrent)`, lease discarded, no
+  restoration claim. This one holds in **every** build.
+
+On a freestanding runtime build neither retry above occurs: the rejection is terminal before it
+can restore anything. §6.1.30 §3 is the operative contract; this section does not override it.
+
+The accepted §6.1.28 composed record + reverse-link restore is preserved unchanged.
+
+
+### 6.1.30 WA1-GATE — the x86 direct production default is OFF
+
+Predicate, rejection policy, evidence and ledger only. No timeout processing, notification wake,
+waiter representation, `WaitReason`, endpoint-waiter claiming, shared-region publication, RISC-V
+link 1, SBI/IPI, affinity, `wake_only`, ServerDies or 199E work.
+
+#### 1. The reachability record, corrected
+
+§6.1.29 argued the ordinary timeout mechanism was unreachable for the direct-eligible population.
+**That is retracted.** The argument rested on a grep for `ipc_timeout_deadline = Some(...)`, which
+found exactly one site — the reply-receive timeout, which also arms `reply_timeout_token` under an
+open terminal cell. A complete audit of `ipc_timeout_deadline\s*=` finds **seven** assignments,
+of which three arm an ordinary deadline by assigning a variable:
+
+| site | wait reason set alongside | reply token? |
+|---|---|---|
+| `ipc_state.rs:2011` `= Some(deadline_tick)` | reply-receive (terminal-arbitrated) | **yes** |
+| `ipc_state.rs:3110` `= deadline` | `Blocked(EndpointReceive(plan.recv_cap))` in `recv_block_phase_b_task` | no |
+| `ipc_state.rs:3412` `= deadline` | `Blocked(EndpointSend(send_cap))` | no |
+| `ipc_state.rs:6441` `= deadline` | `Blocked(EndpointReceive(recv_cap))`, queued-recv block | no |
+| `322`, `2968`, `3588` | clears (`= None`) | — |
+
+**Corrected result.** Ordinary recv/send deadlines exist **independently** of
+`reply_timeout_token`, so `terminal_arbitrated` — which gates direct NR7 eligibility — does not
+exclude them. `process_ipc_timeout_deadlines` can therefore genuinely race an endpoint-blocked
+receiver **during** a direct NR6/NR7 publication: it wakes at task rank before invalidating the
+waiter at ipc rank, so it never consults the claim. `WAITER_OWNERSHIP_EXCLUSIVE` remains **no**,
+and this is a **reachable production safety issue**, not a mechanism-level concern.
+
+`every_ipc_timeout_deadline_assignment_site_is_enumerated` pins the complete list, so the
+`= Some` error cannot recur.
+
+#### 2. The gate
+
+`ipccall_direct_production_enabled()` returns `false` on **every** architecture. Its body is
+exactly `false` — no `target_arch`, no `cfg!`, no `||`, no atomic load — so no architecture branch
+or boot selector can silently restore it. `ipccall_direct_admission_enabled()` is unchanged in
+form (`production || proof`); only its production term went false, which makes admission exactly
+the proof gate. Every explicit selector survives verbatim: `ipccall_direct_proof_enabled`, the
+three per-arch oracle selectors and the umbrella `ipccall_direct_oracle_enabled`.
+
+Driven behaviourally: with the proof selector clear, admission **and** publication are both
+false — ordinary NR6/NR7 reach neither the direct transaction nor the blocked-waiter
+acknowledgement, and fall back to the accepted legacy path. With it set, both are true.
+
+#### 3. `AlreadyQueued + Removed` fails closed
+
+`Removed` proves only that one queued entry was removed under the detecting scheduler
+acquisition. It does **not** prove the receiver never ran, nor that it never observed an earlier
+publication, while waiter ownership is non-exclusive. `rejection_is_runtime_recoverable()`
+therefore makes it recoverable only under `cfg!(test)`; every freestanding runtime build —
+including the explicit proof/oracle kernels — takes the terminal path, restoring no
+acknowledgement, no NR7 reply authority and never returning the retryable variant. The four
+reasons that provably fail before touching a runqueue keep their existing policy unchanged.
+
+#### 4. Evidence, not re-labelled
+
+The `0b5ec254` seal remains valid **historical** evidence that the x86 production default once
+ran NR6 and NR7 off-lock. It is not evidence about the current configuration, and it is **not**
+re-emitted with changed semantics. A distinct current-state seal is added beside it, computed
+from the same authoritative per-direction counters (`REQUEST.completed` / `REPLY.completed`) —
+never inferred from absent user logs:
+
+```text
+IPC_DIRECT_PRODUCTION_DISABLED_SEAL production_enabled=0 ordinary_nr6_direct=0 \
+    ordinary_nr7_direct=0 proof_nr6_available=1 proof_nr7_available=1 result=ok
+```
+
+#### 5. Ledger: 39 / 7 / 46
+
+Exactly one cell moves. The ledger records the x86 NR6+NR7 production-default increment as **one
+combined cell**, not two, so current production goes 40 → **39** and non-production/mechanism
+evidence goes 6 → **7**. The historical total is **46**, unchanged — nothing is retracted and **no
+new live cell is earned**.
+
+The seventh non-production cell is described accurately: originally earned **under the x86_64
+production default** at `0b5ec254`, retained as historical mechanism/production evidence, and no
+longer a claim about the current production predicate. It was **not** originally earned under a
+proof knob.
+
+#### Status
+
+* ordinary timeout reachability correction — **accepted**
+* `WAITER_OWNERSHIP_EXCLUSIVE` — **no**
+* waiter-claim-aware timeout arbitration — **not implemented**
+* generation-bearing notification arbitration — **not implemented**
+* x86 direct production default — **OFF**
+* explicit proof/oracle direct mechanism — **preserved**
+* current ledger — **39 / 7 / 46**
+* canonical 199D — **OPEN**
+* RISC-V links/status — unchanged (link 1 ABSENT; 2, 3, 7, 9 present; 4, 5, 6, 8, 10 absent;
+  `RISCV_REMOTE_WAKE=D`; `RISCV_199D_READINESS=case_b`; coordinate 23 OPEN)
+* **no new live cell**
 
 ---
 
