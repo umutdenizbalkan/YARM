@@ -4219,10 +4219,17 @@ from §6.1.35 D. `apply_dispatch_transition` carries the fallback in one place, 
 off-lock commits cannot drift on which statuses idle may hold.
 
 `no_group3_caller_reconstructs_a_dequeued_bool` pins that no production Group-3 caller contains
-`let dequeued =`, `outgoing_tid != Some(tid)` or `incoming.is_some()`. The one surviving
-"did the resumed task change?" comparison is a **context-switch counter**, moved into the named
-`note_context_switch_if_task_changed` helper and pinned to exactly that one site — a telemetry
-question, not a provenance one.
+`let dequeued =`, `outgoing_tid != Some(tid)` or `incoming.is_some()`. It caught two survivals in
+this increment's own work, and both were repaired rather than exempted:
+
+* the `scheduler_context_switches` counter compared outgoing to incoming. That is a genuinely
+  different question — "did the resumed task change?", not "was the queue advanced?" — so it
+  moved into the named `note_context_switch_if_task_changed` helper and is pinned to exactly
+  that one site, where the comment says why it is not provenance;
+* the `result=` field of `D6_GENUINE_MUT_DISPATCH_STEP_SPLIT` and both
+  `D2_*_GENUINE_DISPATCH_STEP_SPLIT` markers was formatted from `Option::is_some`. The emitted
+  text is unchanged (the smoke gates pin `result=switch`), but the field is now read off the
+  typed `DispatchSelection`, so there is no second source of truth about what the dispatch did.
 
 #### C. Only dequeue authority may undo a dequeue
 

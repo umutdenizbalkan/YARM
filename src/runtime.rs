@@ -990,10 +990,17 @@ impl SharedKernel {
             let selection =
                 kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
             let incoming = selection.tid().map(|t| t.0);
+            // Stage 199D-WA3A-R2-SEAL: the marker field is read off the TYPED selection, not
+            // reconstructed from `Option::is_some` — same emitted text, no second source of
+            // truth about what the dispatch did.
+            let result = match selection {
+                crate::kernel::scheduler::DispatchSelection::Idle => "none",
+                _ => "some",
+            };
             crate::yarm_log!(
                 "D6_GENUINE_MUT_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
                 cpu.0,
-                if incoming.is_some() { "some" } else { "none" },
+                result,
                 incoming
             );
             CpuDispatch::Selected {
@@ -1283,7 +1290,11 @@ impl SharedKernel {
             let selection =
                 kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
             let incoming = selection.tid().map(|t| t.0);
-            let result = if incoming.is_some() { "switch" } else { "idle" };
+            // Stage 199D-WA3A-R2-SEAL: read off the TYPED selection, not `Option::is_some`.
+            let result = match selection {
+                crate::kernel::scheduler::DispatchSelection::Idle => "idle",
+                _ => "switch",
+            };
             crate::yarm_log!(
                 "D2_RECV_GENUINE_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
                 cpu.0,
@@ -1347,7 +1358,11 @@ impl SharedKernel {
             let selection =
                 kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
             let incoming = selection.tid().map(|t| t.0);
-            let result = if incoming.is_some() { "switch" } else { "idle" };
+            // Stage 199D-WA3A-R2-SEAL: read off the TYPED selection, not `Option::is_some`.
+            let result = match selection {
+                crate::kernel::scheduler::DispatchSelection::Idle => "idle",
+                _ => "switch",
+            };
             crate::yarm_log!(
                 "D2_SEND_GENUINE_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
                 cpu.0,
