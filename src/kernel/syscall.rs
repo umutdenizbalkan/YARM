@@ -6592,15 +6592,16 @@ mod tests {
             "scheduler_state.rs must define the typed local-dispatch helper"
         );
         assert!(
-            exec_src.contains("self.local_dispatch_step_split()"),
+            exec_src.contains("self.local_dispatch_step_split_selection()"),
             "dispatch_next_task must route through the typed helper"
         );
         // The helper must take only the scheduler-state lock — `scheduler_state()`
         // is the rank-1 split-mut accessor. Bound the captured slice to the
         // helper body so forbidden-substring checks don't bleed into the next
-        // method's body.
+        // method's body. Stage 199D-WA3A-R2-SEAL: the provenance-preserving form is the one
+        // that takes the lock; the legacy `local_dispatch_step_split` is a thin wrapper.
         let helper_body = sched_src
-            .split("fn local_dispatch_step_split")
+            .split("fn local_dispatch_step_split_selection")
             .nth(1)
             .expect("helper present");
         let next_fn = helper_body

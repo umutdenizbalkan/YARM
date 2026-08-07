@@ -6,6 +6,9 @@ use crate::kernel::boot::{FaultBookkeepingMode, KernelState, TrapHandleError};
 use crate::kernel::scheduler::{CpuId, MAX_CPUS};
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::VirtAddr;
+// Stage 199D-WA3A-R2-SEAL (item E): every dispatch-mark consumer in this file matches all five
+// outcomes explicitly; `RefusedTorn` reaches `dispatch_torn_fatal` and never returns.
+use crate::runtime::{DispatchMarkOutcome as Mark, dispatch_torn_fatal};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const INTERRUPT_BIT: usize = 1usize << (usize::BITS as usize - 1);
@@ -719,8 +722,8 @@ pub fn handle_riscv_trap_entry_shared(
         );
         if reverify_ok {
             // Queue-advancing dequeue of the FIFO head (the incoming task B).
-            let incoming = shared.yield_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming.tid().map(|t| t.0) {
+            let dispatch = shared.yield_dispatch_step_mut(cpu);
+            if let Some(inc) = dispatch.tid().map(|t| t.0) {
                 crate::yarm_log!(
                     "RISCV_QUEUE_SWITCH_FOUNDATION_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
@@ -731,19 +734,40 @@ pub fn handle_riscv_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                // Stage 199D-WA3A: exact `Runnable → Running` (or queue-neutral
-                // `Running → Running`). A refusal rolls the dequeue back inside the seam and
-                // this drain resumes nothing.
-                if !shared
-                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                    .may_resume()
-                {
-                    crate::yarm_log!(
-                        "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=transition_refused",
-                        cpu.0,
-                        inc
-                    );
-                    return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                // Stage 199D-WA3A-R2-SEAL (item E): exact `Runnable → Running` (or the
+                // queue-neutral `Running → Running`), with all five outcomes matched
+                // explicitly. A refusal has already undone exactly what the selection did, so
+                // this drain returns to the unchanged current — except `RefusedTorn`, which is
+                // fatal and must never return to userspace or continue scheduling.
+                match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                    Mark::Marked(_) => {}
+                    Mark::Idle => {
+                        crate::yarm_log!(
+                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
+                            cpu.0,
+                            inc
+                        );
+                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                    }
+                    Mark::RefusedRolledBack => {
+                        crate::yarm_log!(
+                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_dequeue_undone",
+                            cpu.0,
+                            inc
+                        );
+                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                    }
+                    Mark::RefusedNoSchedulerChange => {
+                        crate::yarm_log!(
+                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_scheduler_untouched",
+                            cpu.0,
+                            inc
+                        );
+                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                    }
+                    Mark::RefusedTorn => {
+                        dispatch_torn_fatal(cpu, inc, "riscv_queue_switch_foundation_dispatch")
+                    }
                 }
                 crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}", inc);
                 // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore.
@@ -829,8 +853,8 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}", out);
             }
             // Queue-advancing dequeue of the FIFO head (the incoming task B).
-            let incoming = shared.futex_wait_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming.tid().map(|t| t.0) {
+            let dispatch = shared.futex_wait_dispatch_step_mut(cpu);
+            if let Some(inc) = dispatch.tid().map(|t| t.0) {
                 crate::yarm_log!(
                     "RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
@@ -841,19 +865,38 @@ pub fn handle_riscv_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                // Stage 199D-WA3A: exact `Runnable → Running` (or queue-neutral
-                // `Running → Running`). A refusal rolls the dequeue back inside the seam and
-                // this drain resumes nothing.
-                if !shared
-                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                    .may_resume()
-                {
-                    crate::yarm_log!(
-                        "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=transition_refused",
-                        cpu.0,
-                        inc
-                    );
-                    return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                // Stage 199D-WA3A-R2-SEAL (item E): exact `Runnable → Running` (or the
+                // queue-neutral `Running → Running`), with all five outcomes matched
+                // explicitly. A refusal has already undone exactly what the selection did, so
+                // this drain returns to the unchanged current — except `RefusedTorn`, which is
+                // fatal and must never return to userspace or continue scheduling.
+                match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                    Mark::Marked(_) => {}
+                    Mark::Idle => {
+                        crate::yarm_log!(
+                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
+                            cpu.0,
+                            inc
+                        );
+                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                    }
+                    Mark::RefusedRolledBack => {
+                        crate::yarm_log!(
+                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_dequeue_undone",
+                            cpu.0,
+                            inc
+                        );
+                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                    }
+                    Mark::RefusedNoSchedulerChange => {
+                        crate::yarm_log!(
+                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_scheduler_untouched",
+                            cpu.0,
+                            inc
+                        );
+                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                    }
+                    Mark::RefusedTorn => dispatch_torn_fatal(cpu, inc, "riscv_futex_wait_dispatch"),
                 }
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming={}", inc);
                 // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore
@@ -975,8 +1018,8 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_REVERIFY_OK outgoing={}", out);
             }
             // Queue-advancing dequeue of the FIFO head.
-            let incoming = shared.yield_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming.tid().map(|t| t.0) {
+            let dispatch = shared.yield_dispatch_step_mut(cpu);
+            if let Some(inc) = dispatch.tid().map(|t| t.0) {
                 crate::yarm_log!(
                     "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
@@ -987,19 +1030,38 @@ pub fn handle_riscv_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                // Stage 199D-WA3A: exact `Runnable → Running` (or queue-neutral
-                // `Running → Running`). A refusal rolls the dequeue back inside the seam and
-                // this drain resumes nothing.
-                if !shared
-                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                    .may_resume()
-                {
-                    crate::yarm_log!(
-                        "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=transition_refused",
-                        cpu.0,
-                        inc
-                    );
-                    return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                // Stage 199D-WA3A-R2-SEAL (item E): exact `Runnable → Running` (or the
+                // queue-neutral `Running → Running`), with all five outcomes matched
+                // explicitly. A refusal has already undone exactly what the selection did, so
+                // this drain returns to the unchanged current — except `RefusedTorn`, which is
+                // fatal and must never return to userspace or continue scheduling.
+                match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                    Mark::Marked(_) => {}
+                    Mark::Idle => {
+                        crate::yarm_log!(
+                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
+                            cpu.0,
+                            inc
+                        );
+                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                    }
+                    Mark::RefusedRolledBack => {
+                        crate::yarm_log!(
+                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_dequeue_undone",
+                            cpu.0,
+                            inc
+                        );
+                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                    }
+                    Mark::RefusedNoSchedulerChange => {
+                        crate::yarm_log!(
+                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_scheduler_untouched",
+                            cpu.0,
+                            inc
+                        );
+                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+                    }
+                    Mark::RefusedTorn => dispatch_torn_fatal(cpu, inc, "riscv_yield_dispatch"),
                 }
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_RUNNING_OK incoming={}", inc);
                 // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore

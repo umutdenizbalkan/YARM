@@ -1029,7 +1029,12 @@ fn destroy_aspace_with_blocked_ipc_waiter_and_preemption_preserves_ordering() {
         Some(0b11)
     );
 
-    assert!(state.on_preempt_current_cpu().is_some());
+    // Stage 199D-WA3A-R2-SEAL: preempt through the BARRIERED path. The raw
+    // `on_preempt_current_cpu` seam re-enqueues the outgoing task without moving its status,
+    // leaving a `Running` task in the run queue — exactly the double-queued state the exact
+    // `DispatchIncoming` transition now refuses. No production site calls the raw seam.
+    state.yield_current().expect("preempt");
+    assert!(state.current_tid().is_some());
     if state.current_tid() != Some(2) {
         state.yield_current().expect("reschedule task2");
     }
@@ -11667,7 +11672,12 @@ fn stage113_d6_dispatch_seam_anchor_present_and_called_once() {
         "local_dispatch_step_split must remain present in scheduler_state.rs"
     );
     let exec_src = include_str!("exec_state.rs");
-    let calls = exec_src.matches("self.local_dispatch_step_split()").count();
+    // Stage 199D-WA3A-R2-SEAL (item B): the anchor is the provenance-preserving form. The
+    // legacy `local_dispatch_step_split()` is a thin wrapper over it, so there is still exactly
+    // ONE queue-manipulating call.
+    let calls = exec_src
+        .matches("self.local_dispatch_step_split_selection()")
+        .count();
     assert_eq!(
         calls, 1,
         "dispatch_next_task must call local_dispatch_step_split exactly once"
@@ -11687,15 +11697,16 @@ fn stage113_d6_phase_a_lock_dropped_before_phase_b_side_effects() {
         .expect("dispatch_ready_task must exist after dispatch_next_task");
     let body = &exec_src[body_start..body_end];
     let phase_a = body
-        .find("self.local_dispatch_step_split()")
+        .find("self.local_dispatch_step_split_selection()")
         .expect("Phase A call must be present");
     for phase_b_marker in [
         "self.hal.switch_address_space(",
         "self.maybe_switch_kernel_context(",
         // Stage 199D-WA3A: the raw `tcb.status = Running` write became an EXACT
-        // `Runnable → Running` transition through the production barrier. Same Phase-B
-        // position, stronger contract.
-        "TaskTransition::DispatchIncoming",
+        // `Runnable → Running` transition through the production barrier. Stage
+        // 199D-WA3A-R2-SEAL moved that barrier into the ONE shared in-lock commit, chosen by
+        // typed provenance. Same Phase-B position, stronger contract.
+        "self.commit_dispatch_selection_in_lock(selection, \"dispatch_next_task\")",
     ] {
         let pos = body
             .find(phase_b_marker)
@@ -33281,7 +33292,9 @@ mod stage114_d3_vm_brk_shrink_live {
         let exec_src = include_str!("exec_state.rs");
         assert!(sched_src.contains("pub fn local_dispatch_step_split"));
         assert_eq!(
-            exec_src.matches("self.local_dispatch_step_split()").count(),
+            exec_src
+                .matches("self.local_dispatch_step_split_selection()")
+                .count(),
             1,
             "dispatch_next_task must still call local_dispatch_step_split exactly once"
         );
@@ -53139,7 +53152,7 @@ mod stage168_d6_genuine_b_and_d2_recv {
             .find("D6_GENUINE_MUT_DISPATCH_ELIGIBLE")
             .expect("eligible marker");
         let step_idx = EXEC_STATE_SRC
-            .find("let next = self.local_dispatch_step_split();")
+            .find("let selection = self.local_dispatch_step_split_selection();")
             .expect("in-lock authoritative dispatch must still exist");
         assert!(
             defer_idx < step_idx,
@@ -53470,10 +53483,15 @@ mod stage168b_d2_recv_genuine_completion {
         let m_idx = RUNTIME_SRC
             .find("fn d2_recv_dispatch_step_mut")
             .expect("recv dispatch seam");
-        let body = &RUNTIME_SRC[m_idx..m_idx + 700];
+        let body = &RUNTIME_SRC[m_idx..m_idx + 1600];
         assert!(
             body.contains("dispatch_next_selection_on(dispatch_cpu)"),
             "the recv dispatch must be the authoritative queue-advancing dispatch_next_on"
+        );
+        // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates the CPU before mutating.
+        assert!(
+            body.contains("DISPATCH_STEP_REFUSED_CPU_MISMATCH"),
+            "the recv dispatch seam must authenticate the caller's CPU before any mutation"
         );
     }
 
@@ -53796,10 +53814,15 @@ mod stage169_d2_send_genuine {
         let m_idx = RUNTIME_SRC
             .find("fn d2_send_dispatch_step_mut")
             .expect("send dispatch seam");
-        let body = &RUNTIME_SRC[m_idx..m_idx + 700];
+        let body = &RUNTIME_SRC[m_idx..m_idx + 1600];
         assert!(
             body.contains("dispatch_next_selection_on(dispatch_cpu)"),
             "the send dispatch must be the authoritative queue-advancing dispatch_next_on"
+        );
+        // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates the CPU before mutating.
+        assert!(
+            body.contains("DISPATCH_STEP_REFUSED_CPU_MISMATCH"),
+            "the send dispatch seam must authenticate the caller's CPU before any mutation"
         );
     }
 
@@ -60949,7 +60972,7 @@ mod stage192a_queue_advancing_dispatch {
             TRAP_SRC.contains("futex_wait_was_deferred")
                 && TRAP_SRC.contains("shared.futex_wait_reverify_blocked(t)")
                 && TRAP_SRC.contains("shared.futex_wait_dispatch_step_mut(cpu)")
-                && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(incoming, cpu)")
+                && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
                 && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
             "the trap-entry futex drain must reverify + dispatch-step + mark-running + restore"
         );
@@ -61154,14 +61177,14 @@ mod stage192b_yield_queue_advancing_dispatch {
         );
         assert!(
             EXEC_SRC.contains("YIELD_INLOCK_DISPATCH_FALLBACK")
-                && EXEC_SRC.contains("let next_tid = self.on_preempt_current_cpu();"),
+                && EXEC_SRC.contains("let selection = self.on_preempt_current_cpu_selection();"),
             "the in-lock on_preempt fallback must be preserved"
         );
         assert!(
             TRAP_SRC.contains("yield_was_deferred")
                 && TRAP_SRC.contains("shared.yield_reverify_ready(cpu)")
                 && TRAP_SRC.contains("shared.yield_dispatch_step_mut(cpu)")
-                && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(incoming, cpu)")
+                && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
                 && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
             "the trap-entry yield drain must reverify + dispatch-step + mark-running + restore"
         );
@@ -71893,7 +71916,7 @@ mod stage195g_aarch64_yield_dispatch {
             "the Yield mechanism must be default-on (no enable-knob gate)"
         );
         assert!(
-            body.contains("self.on_preempt_current_cpu();"),
+            body.contains("self.on_preempt_current_cpu_selection();"),
             "ineligible/failed cases must fall back to the legacy in-lock on_preempt dispatch"
         );
         assert!(
@@ -72911,7 +72934,7 @@ mod stage196d_riscv_queue_switch_foundation {
         );
         // Before the restore, B is set current + marked Running via the accepted rank-2 task seam.
         assert!(
-            RISCV_TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(incoming, cpu)")
+            RISCV_TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
                 && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}"),
             "the incoming task must be marked Running via the accepted task seam before restore"
         );
@@ -73604,7 +73627,7 @@ mod stage196g_riscv_yield_default_on {
         );
         assert!(
             EXEC_STATE_SRC.contains("RISCV_YIELD_DISPATCH_FALLBACK reason=reenqueue_failed")
-                && EXEC_STATE_SRC.contains("self.on_preempt_current_cpu();"),
+                && EXEC_STATE_SRC.contains("self.on_preempt_current_cpu_selection();"),
             "a re-enqueue failure must clear + fall back to the legacy on_preempt path"
         );
     }
@@ -105002,6 +105025,12 @@ mod stage199d_aarch64_offlock_dispatch {
         (k, out_asid, in_asid)
     }
 
+    /// Stage 199D-WA3A-R2-SEAL: the exact-incarnation mark token for `INCOMING` as a genuine
+    /// dequeue on CPU 0 — the authority the drain actually holds after a successful mark.
+    fn incoming_token(k: &SharedKernel, in_asid: Asid) -> crate::runtime::DispatchMarkToken {
+        k.stale_dispatch_mark_token_for_test(CpuId(0), INCOMING, in_asid)
+    }
+
     /// Give the incoming task a distinctive saved context so a restore can be checked exactly.
     fn save_context(k: &SharedKernel, tid: u64, pc: usize) -> TrapFrame {
         let mut f = TrapFrame::new(6, [0x1, 0x2, 0x3, 0x4, 0x5, 0x6]);
@@ -105284,7 +105313,7 @@ mod stage199d_aarch64_offlock_dispatch {
         // WITHOUT restoring a frame, and that primitive never returns.
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         let drain = TRAP_ENTRY
-            .split("match selection.tid().map(|t| t.0) {")
+            .split("match dispatch.tid().map(|t| t.0) {")
             .nth(1)
             .and_then(|s| s.split("Some(inc) => {").next())
             .expect("the dequeue None arm");
@@ -105399,11 +105428,11 @@ mod stage199d_aarch64_offlock_dispatch {
         k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
 
         // Commit the scheduler mutation, exactly as the drain does.
-        let selection = k.futex_wait_dispatch_step_mut(CpuId(0));
-        let inc = selection.tid().map(|t| t.0).expect("dequeue");
+        let dispatch = k.futex_wait_dispatch_step_mut(CpuId(0));
+        let inc = dispatch.tid().map(|t| t.0).expect("dequeue");
         assert_eq!(inc, INCOMING);
         let token = k
-            .d6_genuine_mark_running_via_task_seam(selection, CpuId(0))
+            .d6_genuine_mark_running_via_task_seam(dispatch)
             .token()
             .expect("mark must mint a token");
         assert_eq!(k.current_tid_authoritative(CpuId(0)), Some(INCOMING));
@@ -105415,13 +105444,17 @@ mod stage199d_aarch64_offlock_dispatch {
         // FAULT INJECTION: the task has no saved context, so the restore cannot proceed.
         // (The fixture never saved one for INCOMING.)
         assert!(
-            k.direct_dispatch_restore_context_split(INCOMING).is_some(),
+            k.direct_dispatch_restore_context_split(token).is_some(),
             "sanity: a registered task does have a (zeroed) context"
         );
 
         // Roll back and check all three coordinates are exactly as before the dequeue.
         assert!(
-            k.direct_dispatch_rollback_split(token),
+            k.direct_dispatch_rollback_split(
+                token
+                    .into_dequeued_authority()
+                    .expect("a genuine dequeue is dequeue authority")
+            ),
             "rollback must succeed"
         );
         assert_eq!(
@@ -105455,7 +105488,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .expect("the direct dispatch drain");
         // The only two paths out after a dequeue are a successful dispatch or the fatal path.
         assert!(
-            drain.contains("shared.direct_dispatch_rollback_split(t)")
+            drain.contains("shared.direct_dispatch_rollback_split(a)")
                 && drain.contains("enter_post_lock_dispatch_fatal("),
             "a failed dispatch must roll back exactly and take the explicit fatal path"
         );
@@ -105479,7 +105512,7 @@ mod stage199d_aarch64_offlock_dispatch {
         crate::arch::hal::reset_all_active_address_spaces();
         // CPU 0 activates the incoming task's address space.
         assert_eq!(
-            k.direct_dispatch_activate_asid_split(CpuId(0), INCOMING),
+            k.direct_dispatch_activate_asid_split(incoming_token(&k, in_asid)),
             Some(in_asid.0)
         );
         assert_eq!(
@@ -105510,11 +105543,11 @@ mod stage199d_aarch64_offlock_dispatch {
     /// never hand back the outgoing task's frame.
     #[test]
     fn the_restore_can_never_return_the_outgoing_tasks_frame() {
-        let (k, _out, _in) = fixture();
+        let (k, _out, in_asid) = fixture();
         let _outgoing_frame = save_context(&k, OUTGOING, 0xDEAD_BEEF);
         let incoming_frame = save_context(&k, INCOMING, 0x1234_5678);
         let (restored, _) = k
-            .direct_dispatch_restore_context_split(INCOMING)
+            .direct_dispatch_restore_context_split(incoming_token(&k, in_asid))
             .expect("incoming context");
         let mut target = TrapFrame::new(6, [0; 6]);
         target.apply_user_context(restored);
@@ -105529,15 +105562,15 @@ mod stage199d_aarch64_offlock_dispatch {
     /// The pending TLS restore is delivered and taken exactly once.
     #[test]
     fn the_incoming_tls_is_restored_exactly_once() {
-        let (k, _out, _in) = fixture();
+        let (k, _out, in_asid) = fixture();
         let _ = save_context(&k, INCOMING, 0x5000);
         k.with(|s| s.set_thread_tls_base(INCOMING, 0x7000).expect("tls base"));
         let (_, tls) = k
-            .direct_dispatch_restore_context_split(INCOMING)
+            .direct_dispatch_restore_context_split(incoming_token(&k, in_asid))
             .expect("context");
         assert_eq!(tls, Some(0x7000));
         let (_, again) = k
-            .direct_dispatch_restore_context_split(INCOMING)
+            .direct_dispatch_restore_context_split(incoming_token(&k, in_asid))
             .expect("context");
         assert_eq!(again, None, "the TLS restore request is taken once");
         dd::reset();
@@ -105603,7 +105636,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .and_then(|s| s.split("\n    // Stage 192A").next())
             .expect("the direct dispatch drain");
         assert!(drain.contains("shared.futex_wait_dispatch_step_mut(cpu)"));
-        assert!(drain.contains("shared.d6_genuine_mark_running_via_task_seam(selection, cpu)"));
+        assert!(drain.contains("d6_genuine_mark_running_via_task_seam(dispatch)"));
         assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch"));
         // The rollback uses the existing exact inverse of the dequeue, not a new primitive.
         const RUNTIME: &str = include_str!("../../runtime.rs");
@@ -113420,7 +113453,7 @@ mod stage199d_wa2b_wake_owner_census {
     /// goes through the WA3A production barrier. `WA3A_BARRIER_SITES` records which of them are
     /// barriered and with which typed transitions, so the two views cannot disagree.
     const CENSUS: &[(&str, &str, usize, Verdict)] = &[
-        // ── exec_state.rs (10) ──────────────────────────────────────────────────────────────
+        // ── exec_state.rs (7) ───────────────────────────────────────────────────────────────
         (
             "src/kernel/boot/exec_state.rs",
             "futex_wait_current",
@@ -113447,24 +113480,20 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Can,
         ),
-        // WA3A: barriered, Runnable -> Running (or queue-neutral Running -> Running).
-        (
-            "src/kernel/boot/exec_state.rs",
-            "dispatch_next_task",
-            1,
-            Verdict::Cannot,
-        ),
-        // WA3A: barriered, Running -> Runnable (idle-only Runnable -> Runnable) + dispatch.
+        // WA3A-R2-SEAL: `dispatch_next_task`'s mark moved into the ONE shared in-lock commit
+        // (`scheduler_state.rs::commit_dispatch_selection_in_lock`), so it has no row of its own.
+        // WA3A: barriered, Running -> Runnable (idle-only Runnable -> Runnable). The dispatch
+        // half moved to the shared in-lock commit.
         (
             "src/kernel/boot/exec_state.rs",
             "yield_current",
-            2,
+            1,
             Verdict::Cannot,
         ),
         (
             "src/kernel/boot/exec_state.rs",
             "yield_current_to",
-            2,
+            1,
             Verdict::Cannot,
         ),
         // ── fault_state.rs (1) ──────────────────────────────────────────────────────────────
@@ -113555,12 +113584,21 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Can,
         ),
-        // ── scheduler_state.rs (1) ──────────────────────────────────────────────────────────
+        // ── scheduler_state.rs (4) ──────────────────────────────────────────────────────────
         (
             "src/kernel/boot/scheduler_state.rs",
             "apply_cross_cpu_wake_task",
             1,
             Verdict::Can,
+        ),
+        // WA3A-R2-SEAL: the ONE in-lock dispatch commit, shared by `dispatch_next_task`,
+        // `yield_current` and `yield_current_to`. Barriered: the transition is chosen by the
+        // typed provenance the authoritative scheduler mutation produced, never reconstructed.
+        (
+            "src/kernel/boot/scheduler_state.rs",
+            "commit_dispatch_selection_in_lock",
+            3,
+            Verdict::Cannot,
         ),
         // ── thread_state.rs (4) ─────────────────────────────────────────────────────────────
         (
@@ -113642,33 +113680,26 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             &["RollbackDispatchedIncoming"],
         ),
+        // Stage 199D-WA3A-R2-SEAL (item B): the in-lock dispatch marks of `dispatch_next_task`,
+        // `yield_current` and `yield_current_to` are ONE shared commit, so the transition can no
+        // longer drift between the three sites.
         (
-            "src/kernel/boot/exec_state.rs",
-            "dispatch_next_task",
-            1,
+            "src/kernel/boot/scheduler_state.rs",
+            "commit_dispatch_selection_in_lock",
+            3,
             &["DispatchIncoming", "ContinueCurrent"],
         ),
         (
             "src/kernel/boot/exec_state.rs",
             "yield_current",
-            2,
-            &[
-                "PreemptOutgoing",
-                "PreemptOutgoingIdle",
-                "DispatchIncoming",
-                "ContinueCurrent",
-            ],
+            1,
+            &["PreemptOutgoing", "PreemptOutgoingIdle"],
         ),
         (
             "src/kernel/boot/exec_state.rs",
             "yield_current_to",
-            2,
-            &[
-                "PreemptOutgoing",
-                "PreemptOutgoingIdle",
-                "DispatchIncoming",
-                "ContinueCurrent",
-            ],
+            1,
+            &["PreemptOutgoing", "PreemptOutgoingIdle"],
         ),
         (
             "src/kernel/boot/fault_state.rs",
@@ -113715,7 +113746,7 @@ mod stage199d_wa2b_wake_owner_census {
             .collect()
     }
 
-    fn production_source(rel: &str) -> String {
+    pub(super) fn production_source(rel: &str) -> String {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel}: {e}"));
         src.split("\n#[cfg(test)]\nmod tests")
@@ -114612,19 +114643,26 @@ mod stage199d_wa2b_wake_owner_census {
             "the run queue carries bare TIDs with NO status precondition — if that ever changes, \
              the dispatch/yield CAN rows must be re-derived, not silently kept"
         );
-        // dispatch_next_task: between the dequeue and the Running write there is no status read.
+        // dispatch_next_task: between the dequeue and the barriered commit there is no status
+        // read. Stage 199D-WA3A-R2-SEAL: the commit itself moved into
+        // `commit_dispatch_selection_in_lock`, so the window ends at the call to it — which is
+        // exactly where the raw write used to be.
         let dispatch = EXEC
             .split("fn dispatch_next_task(")
             .nth(1)
             .expect("dispatch_next_task");
         let from_dequeue = dispatch
-            .split("let next = self.local_dispatch_step_split();")
+            .split("let selection = self.local_dispatch_step_split_selection();")
             .nth(1)
             .expect("the dequeue");
         let to_write = from_dequeue
-            .split("tcb.status = TaskStatus::Running;")
+            .split("self.commit_dispatch_selection_in_lock(selection, \"dispatch_next_task\")")
             .next()
-            .expect("the Running write");
+            .expect("the barriered commit");
+        assert!(
+            to_write.len() < from_dequeue.len(),
+            "the barriered commit must still follow the dequeue in dispatch_next_task"
+        );
         for probe in [
             "TaskStatus::Blocked",
             "matches!(tcb.status",
@@ -114814,6 +114852,7 @@ mod stage199d_wa2b_wake_owner_census {
 /// Every one of these drives the REAL production path and asserts the refusal is fail-closed:
 /// the task keeps its status, the scheduler keeps its shape, and nothing is lost.
 mod stage199d_wa3a_transition_barriers {
+    use super::stage199d_wa2b_wake_owner_census::production_source;
     use super::*;
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::scheduler::CpuId;
@@ -114961,7 +115000,10 @@ mod stage199d_wa3a_transition_barriers {
                 )),
             );
         });
-        let stale = kernel.stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(9));
+        let stale = kernel
+            .stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(9))
+            .into_dequeued_authority()
+            .expect("a dequeue-provenance token is dequeue authority");
         assert!(
             !kernel.direct_dispatch_rollback_split(stale),
             "a rollback must refuse a task this transaction never dispatched"
@@ -114990,10 +115032,10 @@ mod stage199d_wa3a_transition_barriers {
         });
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
         // Commit the rank-1 dequeue exactly as a drain does, then mark.
-        let selection = kernel.futex_wait_dispatch_step_mut(CpuId(0));
-        assert_eq!(selection.tid().map(|t| t.0), Some(BLOCKED));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(dispatch.tid().map(|t| t.0), Some(BLOCKED));
         assert_eq!(
-            kernel.d6_genuine_mark_running_via_task_seam(selection, CpuId(0)),
+            kernel.d6_genuine_mark_running_via_task_seam(dispatch),
             crate::runtime::DispatchMarkOutcome::RefusedRolledBack,
             "a blocked incoming must be refused and the dequeue undone"
         );
@@ -115065,16 +115107,19 @@ mod stage199d_wa3a_transition_barriers {
             );
         });
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
-        let selection = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
         assert_eq!(
-            selection,
-            crate::kernel::scheduler::DispatchSelection::ContinuedCurrent {
-                tid: crate::kernel::ipc::ThreadId(OTHER)
+            dispatch,
+            crate::runtime::CpuDispatch::Selected {
+                cpu: CpuId(0),
+                selection: crate::kernel::scheduler::DispatchSelection::ContinuedCurrent {
+                    tid: crate::kernel::ipc::ThreadId(OTHER)
+                }
             },
             "nothing was dequeued: the existing current was returned"
         );
         assert_eq!(
-            kernel.d6_genuine_mark_running_via_task_seam(selection, CpuId(0)),
+            kernel.d6_genuine_mark_running_via_task_seam(dispatch),
             crate::runtime::DispatchMarkOutcome::RefusedNoSchedulerChange,
             "a queue-neutral refusal must not touch scheduler state"
         );
@@ -115110,7 +115155,10 @@ mod stage199d_wa3a_transition_barriers {
             s.set_task_status_for_test(OTHER, TaskStatus::Running);
         });
         // A token minted for incarnation A ({tid=T, asid=A}) — a different address space.
-        let stale = kernel.stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(0xAA));
+        let stale = kernel
+            .stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(0xAA))
+            .into_dequeued_authority()
+            .expect("a dequeue-provenance token is dequeue authority");
         let current_before = kernel.current_tid_authoritative(CpuId(0));
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
         let ctx_before = kernel.with(|s| s.thread_user_context(OTHER));
@@ -115157,15 +115205,18 @@ mod stage199d_wa3a_transition_barriers {
             );
         });
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
-        let selection = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
         assert_eq!(
-            selection,
-            crate::kernel::scheduler::DispatchSelection::Dequeued {
-                tid: crate::kernel::ipc::ThreadId(BLOCKED)
+            dispatch,
+            crate::runtime::CpuDispatch::Selected {
+                cpu: CpuId(0),
+                selection: crate::kernel::scheduler::DispatchSelection::Dequeued {
+                    tid: crate::kernel::ipc::ThreadId(BLOCKED)
+                }
             }
         );
         assert_eq!(
-            kernel.d6_genuine_mark_running_via_task_seam(selection, CpuId(0)),
+            kernel.d6_genuine_mark_running_via_task_seam(dispatch),
             crate::runtime::DispatchMarkOutcome::RefusedRolledBack
         );
         assert_eq!(
@@ -115191,16 +115242,28 @@ mod stage199d_wa3a_transition_barriers {
             s.bind_task_asid(OTHER, asid).expect("bind");
             s.enqueue_task(OTHER).expect("enqueue");
         });
-        let selection = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
         let token = kernel
-            .d6_genuine_mark_running_via_task_seam(selection, CpuId(0))
+            .d6_genuine_mark_running_via_task_seam(dispatch)
             .token()
             .expect("a bound user task mints a token");
         assert_eq!(token.tid(), OTHER);
         assert_eq!(token.expect_asid(), Some(asid));
-        assert_eq!(token.provenance(), selection);
+        assert_eq!(
+            crate::runtime::CpuDispatch::Selected {
+                cpu: token.cpu(),
+                selection: token.provenance()
+            },
+            dispatch
+        );
         // …and the exact token rolls back cleanly.
-        assert!(kernel.direct_dispatch_rollback_split(token));
+        assert!(
+            kernel.direct_dispatch_rollback_split(
+                token
+                    .into_dequeued_authority()
+                    .expect("a genuine dequeue is dequeue authority")
+            )
+        );
 
         // A user task with NO ASID must not mint a wildcard token.
         let bare = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
@@ -115209,9 +115272,12 @@ mod stage199d_wa3a_transition_barriers {
             s.enqueue_task(BLOCKED).expect("enqueue");
         });
         let sel = bare.futex_wait_dispatch_step_mut(CpuId(0));
-        let outcome = bare.d6_genuine_mark_running_via_task_seam(sel, CpuId(0));
+        let outcome = bare.d6_genuine_mark_running_via_task_seam(sel);
         assert_eq!(outcome.token(), None, "no ASID ⇒ no token");
-        assert!(!outcome.may_resume());
+        assert_ne!(
+            outcome.disposition(),
+            crate::runtime::DispatchDisposition::ResumeIncoming
+        );
     }
 
     /// **HARD-STOP, recorded as a test rather than a claim.** `spawn_user_task_from_image`
@@ -115246,6 +115312,504 @@ mod stage199d_wa3a_transition_barriers {
             Some(TaskStatus::Runnable),
             "the blocked receiver was overwritten — this is exactly what §6.1.35 C hard-stops on"
         );
+    }
+
+    // ── WA3A-R2-SEAL A: identity availability is part of the SAME rank-2 decision ──────────
+
+    /// **The WA3A-R1 defect.** A non-idle `Running` current with NO ASID used to be marked
+    /// `Running` (a successful `ContinueCurrent`), have the missing identity discovered
+    /// afterwards, and be rolled back `Running -> Runnable` — while
+    /// `undo_dispatch_selection(ContinuedCurrent)` correctly mutated no scheduler state. The
+    /// result was `current = T` with `status(T) = Runnable`: a task the CPU believes is running
+    /// while the task table says it is merely runnable.
+    ///
+    /// Deciding identity availability BEFORE the transition makes the refusal mutation-free.
+    #[test]
+    fn an_asid_less_continued_current_is_refused_with_zero_mutation() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            s.enqueue_task(OTHER).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        // A non-idle task that is `current` and `Running`, and has NO address space.
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), Some(OTHER));
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Running)
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_asid(OTHER)),
+            None,
+            "no ASID by setup"
+        );
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            dispatch,
+            crate::runtime::CpuDispatch::Selected {
+                cpu: CpuId(0),
+                selection: crate::kernel::scheduler::DispatchSelection::ContinuedCurrent {
+                    tid: ThreadId(OTHER)
+                }
+            },
+            "queue-neutral: the existing current was returned, nothing was dequeued"
+        );
+        let outcome = kernel.d6_genuine_mark_running_via_task_seam(dispatch);
+        assert_eq!(
+            outcome,
+            crate::runtime::DispatchMarkOutcome::RefusedNoSchedulerChange,
+            "no exact identity ⇒ refuse; and a continuation refusal touches no scheduler state"
+        );
+        assert_eq!(outcome.token(), None, "and mints no token");
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Running),
+            "THE DEFECT: the status must NOT have been moved to Runnable"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            Some(OTHER),
+            "and `current` must still be T"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "queue membership and count unchanged"
+        );
+    }
+
+    /// The `Dequeued` half of the same rule: an ASID-less incoming is refused before its status
+    /// is touched, and the exact dequeue is undone — the task is restored EXACTLY once.
+    #[test]
+    fn an_asid_less_dequeued_incoming_is_refused_and_restored_exactly_once() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            s.enqueue_task(OTHER).expect("enqueue");
+        });
+        assert_eq!(
+            kernel.with(|s| s.task_asid(OTHER)),
+            None,
+            "no ASID by setup"
+        );
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            dispatch,
+            crate::runtime::CpuDispatch::Selected {
+                cpu: CpuId(0),
+                selection: crate::kernel::scheduler::DispatchSelection::Dequeued {
+                    tid: ThreadId(OTHER)
+                }
+            }
+        );
+        let outcome = kernel.d6_genuine_mark_running_via_task_seam(dispatch);
+        assert_eq!(
+            outcome,
+            crate::runtime::DispatchMarkOutcome::RefusedRolledBack
+        );
+        assert_eq!(outcome.token(), None, "no ASID ⇒ no token");
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Runnable),
+            "the status was never moved: the refusal precedes the transition"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            None,
+            "current is cleared"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "restored exactly once — not zero times, not twice"
+        );
+    }
+
+    // ── WA3A-R2-SEAL B: typed provenance through the in-lock Group-3 cohort ────────────────
+
+    /// **B's required counterexample.** A lone task that yields is re-enqueued and then
+    /// GENUINELY dequeued again: `outgoing == incoming`, so every reconstruction
+    /// (`outgoing_tid != Some(tid)`, TID equality, "which helper was called") says "not
+    /// dequeued" — and undoing that dispatch would then skip the re-enqueue and lose the task.
+    /// The provenance produced inside the mutation says `Dequeued`, which is the truth.
+    #[test]
+    fn a_lone_task_yield_is_dequeued_provenance_even_though_outgoing_equals_incoming() {
+        let mut state = kernel_with(&[OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(state.current_tid(), Some(OTHER));
+        // The caller is Running and is the ONLY task. Preempt it out, exactly as yield does.
+        state.set_task_status_for_test(OTHER, TaskStatus::Runnable);
+        let selection = state.on_preempt_current_cpu_selection();
+        assert_eq!(
+            selection,
+            crate::kernel::scheduler::DispatchSelection::Dequeued {
+                tid: ThreadId(OTHER)
+            },
+            "outgoing == incoming, yet the run queue really was advanced"
+        );
+        assert_eq!(state.current_tid(), Some(OTHER));
+    }
+
+    /// No production Group-3 caller reconstructs provenance any more.
+    #[test]
+    fn no_group3_caller_reconstructs_a_dequeued_bool() {
+        for rel in [
+            "src/kernel/boot/exec_state.rs",
+            "src/kernel/boot/scheduler_state.rs",
+            "src/runtime.rs",
+            "src/arch/trap_entry.rs",
+            "src/arch/riscv64/trap.rs",
+            "src/arch/aarch64/trap.rs",
+        ] {
+            // Comment lines are stripped: a doc comment that NAMES the forbidden
+            // reconstruction (to explain why it is forbidden) is not the reconstruction.
+            let src: String = production_source(rel)
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            for probe in [
+                "let dequeued =",
+                "outgoing_tid != Some(tid)",
+                "incoming.is_some()",
+            ] {
+                assert!(
+                    !src.contains(probe),
+                    "{rel} still reconstructs dispatch provenance (`{probe}`)"
+                );
+            }
+            // "did the RESUMED task change?" is a telemetry question, not a provenance one.
+            // It survives in exactly ONE named helper so it can never drift back into a
+            // dispatch decision.
+            let telemetry = src.matches("outgoing_tid != Some(incoming)").count();
+            if rel == "src/kernel/boot/scheduler_state.rs" {
+                assert_eq!(
+                    telemetry, 1,
+                    "the context-switch counter must live in one named helper"
+                );
+                let body = src
+                    .split("fn note_context_switch_if_task_changed(")
+                    .nth(1)
+                    .expect("the telemetry helper");
+                assert!(
+                    body[..body.find("\n    ///").unwrap_or(body.len())]
+                        .contains("outgoing_tid != Some(incoming)"),
+                    "and only inside that helper"
+                );
+            } else {
+                assert_eq!(telemetry, 0, "{rel} must not compare outgoing to incoming");
+            }
+        }
+        // …and the three in-lock Group-3 sites all go through the ONE typed commit.
+        let exec = production_source("src/kernel/boot/exec_state.rs");
+        for site in ["dispatch_next_task", "yield_current", "yield_current_to"] {
+            assert!(
+                exec.contains(&alloc::format!(
+                    "self.commit_dispatch_selection_in_lock(selection, \"{site}\")"
+                )),
+                "{site} must commit through the typed provenance path"
+            );
+        }
+    }
+
+    // ── WA3A-R2-SEAL C: only DEQUEUE authority may undo a dequeue ──────────────────────────
+
+    /// **C's required test.** A genuine, successful `ContinuedCurrent` mark is minted, then
+    /// offered as authority to roll back a dequeue. The narrowing refuses, so the call is
+    /// unrepresentable, and every coordinate is byte-for-byte unchanged.
+    #[test]
+    fn a_continued_current_mark_is_not_dequeue_rollback_authority() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, _) = kernel
+            .with(|s| {
+                s.register_task(OTHER).expect("register");
+                s.create_user_address_space()
+            })
+            .expect("asid");
+        kernel.with(|s| {
+            s.bind_task_asid(OTHER, asid).expect("bind");
+            s.enqueue_task(OTHER).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        // A REAL queue-neutral mark: current is set, non-idle, Running, with an exact ASID.
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let token = kernel
+            .d6_genuine_mark_running_via_task_seam(dispatch)
+            .token()
+            .expect("a queue-neutral continuation of a bound task marks successfully");
+        assert_eq!(
+            token.provenance(),
+            crate::kernel::scheduler::DispatchSelection::ContinuedCurrent {
+                tid: ThreadId(OTHER)
+            }
+        );
+
+        let status_before = kernel.with(|s| s.task_status(OTHER));
+        let ctx_before = kernel.with(|s| s.thread_user_context(OTHER));
+        let current_before = kernel.current_tid_authoritative(CpuId(0));
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+
+        assert_eq!(
+            token.into_dequeued_authority(),
+            None,
+            "a continuation removed no runqueue entry, so it is not dequeue authority"
+        );
+
+        assert_eq!(kernel.with(|s| s.task_status(OTHER)), status_before);
+        assert_eq!(kernel.with(|s| s.thread_user_context(OTHER)), ctx_before);
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), current_before);
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before
+        );
+        // And structurally: the rollback takes the sealed type, so there is no bool to get wrong.
+        let runtime = production_source("src/runtime.rs");
+        assert!(
+            runtime.contains("authority: DequeuedDispatchMarkToken,"),
+            "the dequeue rollback must take sealed dequeue authority, not a bare token"
+        );
+        assert_eq!(
+            runtime.matches("DequeuedDispatchMarkToken(self)").count(),
+            1,
+            "`into_dequeued_authority` must be the ONLY constructor of dequeue authority"
+        );
+    }
+
+    // ── WA3A-R2-SEAL D: the token's CPU is scheduler-authenticated ─────────────────────────
+
+    /// A dispatch step requested for a CPU that is not the authoritative dispatch CPU refuses
+    /// BEFORE the dequeue: nothing is mutated and no token can be minted, so no caller can
+    /// stamp an unverified CPU into rollback authority.
+    #[test]
+    fn a_mismatched_cpu_refuses_before_any_mutation_and_mints_no_token() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            s.enqueue_task(OTHER).expect("enqueue");
+        });
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let status_before = kernel.with(|s| s.task_status(OTHER));
+        let current_before = kernel.current_tid_authoritative(CpuId(0));
+
+        // CPU 3 is NOT the authoritative dispatch CPU (which is CPU 0 here).
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(3));
+        assert_eq!(
+            dispatch,
+            crate::runtime::CpuDispatch::RefusedCpuMismatch {
+                requested: CpuId(3),
+                authoritative: CpuId(0)
+            }
+        );
+        assert_eq!(dispatch.tid(), None, "nothing was selected");
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "zero mutation: the task is still queued on the authoritative CPU"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            current_before,
+            "and `current` on the authoritative CPU is untouched"
+        );
+        assert_eq!(kernel.with(|s| s.task_status(OTHER)), status_before);
+
+        let outcome = kernel.d6_genuine_mark_running_via_task_seam(dispatch);
+        assert_eq!(
+            outcome,
+            crate::runtime::DispatchMarkOutcome::RefusedNoSchedulerChange
+        );
+        assert_eq!(outcome.token(), None, "and no token");
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before
+        );
+        assert_eq!(kernel.with(|s| s.task_status(OTHER)), status_before);
+    }
+
+    /// Structurally: the mark seam takes NO `cpu` argument, and every off-lock dispatch seam
+    /// authenticates the requested CPU before it mutates.
+    #[test]
+    fn the_mark_seam_cannot_be_handed_an_unverified_cpu() {
+        let runtime = production_source("src/runtime.rs");
+        assert!(
+            runtime.contains("fn d6_genuine_mark_running_via_task_seam(\n        &self,\n        dispatch: CpuDispatch,\n    ) -> DispatchMarkOutcome"),
+            "the mark seam must take the CPU-bound dispatch, not a (selection, cpu) pair"
+        );
+        for seam in [
+            "d6_genuine_local_dispatch_step_mut",
+            "d2_recv_dispatch_step_mut",
+            "d2_send_dispatch_step_mut",
+            "futex_wait_dispatch_step_mut",
+            "yield_dispatch_step_mut",
+        ] {
+            let body = runtime
+                .split(&alloc::format!("fn {seam}("))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{seam}"));
+            let end = body.find("\n    /// ").unwrap_or(body.len());
+            let scoped = &body[..end];
+            let guard = scoped
+                .find("if dispatch_cpu != cpu {")
+                .unwrap_or_else(|| panic!("{seam} must authenticate the CPU"));
+            let mutate = scoped
+                .find("dispatch_next_selection_on(")
+                .unwrap_or_else(|| panic!("{seam} must dispatch"));
+            assert!(
+                guard < mutate,
+                "{seam} must authenticate the CPU BEFORE it dequeues"
+            );
+        }
+    }
+
+    // ── WA3A-R2-SEAL E: RefusedTorn is unignorable ─────────────────────────────────────────
+
+    /// The pure outcome → disposition mapping. Each of the five outcomes maps to a DISTINCT
+    /// disposition, so no caller can collapse the three refusals into one branch through it.
+    #[test]
+    fn every_mark_outcome_has_its_own_disposition() {
+        use crate::runtime::{DispatchDisposition as D, DispatchMarkOutcome as O};
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let token = kernel.stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(1));
+        let pairs = [
+            (O::Marked(token), D::ResumeIncoming),
+            (O::Idle, D::SettleIdle),
+            (O::RefusedRolledBack, D::DeclineDequeueUndone),
+            (O::RefusedNoSchedulerChange, D::DeclineSchedulerUntouched),
+            (O::RefusedTorn, D::Fatal),
+        ];
+        for (outcome, expected) in pairs {
+            assert_eq!(outcome.disposition(), expected);
+        }
+        // Injective: five outcomes, five distinct dispositions.
+        for i in 0..pairs.len() {
+            for j in (i + 1)..pairs.len() {
+                assert_ne!(
+                    pairs[i].1, pairs[j].1,
+                    "two outcomes share a disposition — that IS the collapse this forbids"
+                );
+            }
+        }
+    }
+
+    /// `may_resume` is gone, every architecture-facing consumer matches all five outcomes
+    /// explicitly, and `RefusedTorn` reaches the divergent fatal at every one of them.
+    #[test]
+    fn every_architecture_caller_matches_all_five_outcomes_and_torn_is_fatal() {
+        let runtime = production_source("src/runtime.rs");
+        assert!(
+            !runtime.contains("fn may_resume("),
+            "`may_resume` collapsed the three refusals into one branch and must not return"
+        );
+        assert!(
+            runtime.contains(
+                "pub(crate) fn dispatch_torn_fatal(cpu: CpuId, tid: u64, site: &'static str) -> !"
+            ),
+            "the torn-dispatch fatal must be divergent"
+        );
+        for rel in ["src/arch/trap_entry.rs", "src/arch/riscv64/trap.rs"] {
+            let src = production_source(rel);
+            assert!(
+                !src.contains("may_resume"),
+                "{rel} must not collapse outcomes through `may_resume`"
+            );
+            let consumers = src
+                .matches("d6_genuine_mark_running_via_task_seam(dispatch)")
+                .count();
+            assert!(consumers > 0, "{rel} must consume the mark seam");
+            for arm in [
+                "Mark::Marked(",
+                "Mark::Idle =>",
+                "Mark::RefusedRolledBack =>",
+                "Mark::RefusedNoSchedulerChange =>",
+                "Mark::RefusedTorn =>",
+            ] {
+                assert_eq!(
+                    src.matches(arm).count(),
+                    consumers,
+                    "{rel}: every one of the {consumers} consumers must match `{arm}`"
+                );
+            }
+            assert_eq!(
+                src.matches("dispatch_torn_fatal(").count(),
+                consumers,
+                "{rel}: every consumer must route RefusedTorn to the divergent fatal"
+            );
+        }
+    }
+
+    // ── WA3A-R2-SEAL F: the resume uses the token's exact identity ─────────────────────────
+
+    /// **F's required counterexample.** Mark incarnation A `{tid = T, asid = A}`, then replace
+    /// the TCB with incarnation B `{tid = T, asid = B}`. Every downstream resume step resolved
+    /// through A's token refuses: B's address space is never activated, B's context is never
+    /// copied into a frame, and B's parked completion is never consumed — so the caller takes
+    /// its rollback/fatal path instead of resuming a task it never dispatched.
+    #[test]
+    fn the_post_mark_resume_refuses_a_replacement_incarnation() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid_b = kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            let (b, _) = s.create_user_address_space().expect("asid B");
+            s.bind_task_asid(OTHER, b).expect("bind B");
+            s.set_task_status_for_test(OTHER, TaskStatus::Running);
+            b
+        });
+        // A token for incarnation A — a DIFFERENT address space under the same numeric TID.
+        let asid_a = Asid(0xA1);
+        assert_ne!(asid_a, asid_b);
+        let token_a = kernel.stale_dispatch_mark_token_for_test(CpuId(0), OTHER, asid_a);
+
+        crate::arch::hal::reset_all_active_address_spaces();
+        let ctx_before = kernel.with(|s| s.thread_user_context(OTHER));
+
+        assert_eq!(
+            kernel.direct_dispatch_activate_asid_split(token_a),
+            None,
+            "A's token must not activate B's address space"
+        );
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(0)),
+            None,
+            "and nothing was activated on this CPU"
+        );
+        assert_eq!(
+            kernel.direct_dispatch_restore_context_split(token_a),
+            None,
+            "A's token must not hand back B's saved context"
+        );
+        assert_eq!(
+            kernel.with(|s| s.thread_user_context(OTHER)),
+            ctx_before,
+            "B's register context is byte-for-byte unchanged"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Running),
+            "and B is still Running"
+        );
+        crate::arch::hal::reset_all_active_address_spaces();
+
+        // Structurally: the AArch64 resume is driven by the token, not a bare numeric TID.
+        let aarch64 = production_source("src/arch/aarch64/trap.rs");
+        assert!(
+            aarch64.contains("token: crate::runtime::DispatchMarkToken,"),
+            "the direct-dispatch resume must take the exact mark token"
+        );
+        for seam in [
+            "direct_dispatch_activate_asid_split(token)",
+            "direct_dispatch_restore_context_split(token)",
+            "direct_dispatch_take_completion_split(token)",
+        ] {
+            assert!(
+                aarch64.contains(seam),
+                "the resume must reach `{seam}` with the token, not a re-resolved TID"
+            );
+        }
     }
 
     // ── the valid transitions still work ───────────────────────────────────────────────────

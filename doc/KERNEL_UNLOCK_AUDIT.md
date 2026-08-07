@@ -4148,6 +4148,177 @@ production check, and all nine fail a **named** behavioural test:
 
 ---
 
+### 6.1.36 WA3A-R2-SEAL — the final combined production repair for WA3A
+
+WA3A-R1 typed the dispatch provenance and the rollback identity, and in doing so introduced a
+torn state of its own. This increment repairs that and five related gaps. It changes production
+executable code on all three architectures. Waiter ownership is still wired into nothing, the
+spawn hard-stop of §6.1.35 C is untouched, and no predicate, timeout, notification, teardown,
+seal, ledger entry or canonical stage status moved.
+
+#### A. Identity availability is part of the same rank-2 decision
+
+**The defect this repairs, in full.** In WA3A-R1 the mark seam did this:
+
+1. `ContinuedCurrent { tid: T }` for a non-idle `Running` current — a legal `Running → Running`
+   transition, which **succeeded**;
+2. `DispatchMarkToken::new` then refused, because a user task with no ASID has no exact
+   incarnation to name;
+3. the common failure branch performed `RollbackDispatchedIncoming`, moving `T` back
+   `Running → Runnable`;
+4. `undo_dispatch_selection(ContinuedCurrent)` correctly mutated **no** scheduler state — a
+   continuation removed no runqueue entry, so there is nothing to undo.
+
+The result was `current = T` while `status(T) = Runnable`: the CPU believes `T` is running, the
+task table says it is merely runnable, and nothing in the system can tell which is right. The
+"rollback" was the corruption.
+
+The repair is structural rather than a reordered branch: identity resolution moved **inside the
+same rank-2 acquisition** as the transition, and **strictly before** it
+(`MarkedIncarnation::resolve`, then `apply_dispatch_transition`). A non-idle task with no ASID
+now refuses with the TCB untouched, so `undo_dispatch_selection` has only the scheduler step to
+undo — and for a continuation that step is, correctly, nothing.
+
+| selection | refusal outcome | task status | `current` | run queue |
+|---|---|---|---|---|
+| `ContinuedCurrent { T }` | `RefusedNoSchedulerChange` | unchanged (`Running`) | unchanged (`T`) | unchanged |
+| `Dequeued { T }` | `RefusedRolledBack` | unchanged (`Runnable`) | cleared | `T` restored **once** |
+| `Idle` | `Idle` | — | — | — |
+
+Pinned by `an_asid_less_continued_current_is_refused_with_zero_mutation` and
+`an_asid_less_dequeued_incoming_is_refused_and_restored_exactly_once`.
+
+#### B. Typed provenance through the in-lock Group-3 cohort
+
+WA3A-R1 typed the five **off-lock** seams and left the three **in-lock** ones reconstructing
+`let dequeued = outgoing_tid != Some(tid);`. That reconstruction is not merely inelegant — it is
+wrong, and the counterexample is ordinary:
+
+> A lone task yields. `on_preempt` re-enqueues it and then genuinely dequeues it again. The
+> outgoing task and the incoming task are the same task, so every reconstruction says "not
+> dequeued" — and a refusal would then skip the re-enqueue and **lose the only runnable task**.
+
+`KernelState` gained the provenance-preserving forms `local_dispatch_step_split_selection`,
+`on_preempt_current_cpu_selection` and `on_preempt_prefer_current_cpu_selection` (the legacy
+`Option<u64>` functions are now thin wrappers, so there is still exactly one queue-manipulating
+body each). All three in-lock Group-3 sites now commit through **one** shared barrier,
+`commit_dispatch_selection_in_lock`, and undo through `undo_dispatch_selection_in_lock`.
+
+That also removed a second, quieter reconstruction: the old sites tried `DispatchIncoming` and
+fell back to `ContinueCurrent`, which *infers* the transition from which one happens to succeed —
+and would launder a double-queued `Running` task through the dequeue path. The transition is now
+chosen by provenance alone.
+
+**One honest consequence.** Making the transition exact exposed that the idle/bootstrap task's
+status is not governed by the ordinary dispatch contract at all: boot leaves `TID 0` `Running`
+and re-dequeues it, while a later queue-neutral step finds it `Runnable`. Rather than weaken
+`DispatchIncoming` or `ContinueCurrent`, each got an idle-only twin —
+`RedispatchIdleAlreadyRunning` (`Running → Running`) and `ContinueCurrentIdle`
+(`Runnable → Runnable`) — refused for every TID but `IDLE_TID`, joining `PreemptOutgoingIdle`
+from §6.1.35 D. `apply_dispatch_transition` carries the fallback in one place, so the in-lock and
+off-lock commits cannot drift on which statuses idle may hold.
+
+`no_group3_caller_reconstructs_a_dequeued_bool` pins that no production Group-3 caller contains
+`let dequeued =`, `outgoing_tid != Some(tid)` or `incoming.is_some()`. The one surviving
+"did the resumed task change?" comparison is a **context-switch counter**, moved into the named
+`note_context_switch_if_task_changed` helper and pinned to exactly that one site — a telemetry
+question, not a provenance one.
+
+#### C. Only dequeue authority may undo a dequeue
+
+`direct_dispatch_rollback_split` used to accept any `DispatchMarkToken`. A `ContinuedCurrent`
+mark removed no runqueue entry, so using it to "undo a dequeue" would enqueue the **current**
+task — which for a `Blocked(EndpointReceive)` current is exactly the unarbitrated wake Stage 199D
+exists to prevent.
+
+It now takes a `DequeuedDispatchMarkToken`, a sealed newtype whose only constructor is
+`DispatchMarkToken::into_dequeued_authority` — `Some` only when the provenance is a genuine
+dequeue **of that very TID**. Presenting a continuation is not a refused call at the mutation
+site; it is **unrepresentable**.
+`a_continued_current_mark_is_not_dequeue_rollback_authority` mints a real successful
+`ContinuedCurrent` mark, shows the narrowing yields `None`, and asserts status, `current`,
+register context and queue count are byte-for-byte unchanged — plus that the narrowing is the
+only constructor.
+
+#### D. The token's CPU is scheduler-authenticated
+
+The off-lock seams mutated `sched.current_cpu` while the token recorded the trap `cpu` the caller
+supplied. Nothing checked they agreed, so a caller could stamp an unverified CPU into rollback
+authority — and a rollback would then re-enqueue on, and clear `current` of, the wrong core.
+
+The seams now authenticate the requested CPU against the authoritative dispatch CPU **before any
+mutation** and return a `CpuDispatch`, which binds the selection to the CPU that produced it. On
+mismatch nothing is dequeued and a `RefusedCpuMismatch` is returned (`DISPATCH_STEP_REFUSED_CPU_MISMATCH`).
+`d6_genuine_mark_running_via_task_seam` consequently takes **no `cpu` argument at all**: there is
+nothing left for a caller to get wrong. `a_mismatched_cpu_refuses_before_any_mutation_and_mints_no_token`
+proves zero mutation and no token; `the_mark_seam_cannot_be_handed_an_unverified_cpu` pins that
+the guard precedes the dequeue in all five seams.
+
+#### E. `RefusedTorn` is unignorable
+
+`DispatchMarkOutcome::may_resume()` collapsed `RefusedRolledBack`, `RefusedNoSchedulerChange` and
+`RefusedTorn` into one `false`. It is **removed**. Every one of the eleven production consumers
+on x86_64, AArch64 and RISC-V now matches all five outcomes explicitly, each with its own
+evidence marker, and `RefusedTorn` routes to `dispatch_torn_fatal(cpu, tid, site) -> !`.
+
+A torn dispatch means the rank-1 scheduler and the rank-2 task table disagree about who is
+running. Resuming a frame, running ordinary fallback dispatch, entering WFI/HLT as though
+`current` were clear, or returning to userspace would each run an arbitrary frame under an
+arbitrary address space, so the fatal is the only correct disposition.
+
+The pure mapping is `DispatchMarkOutcome::disposition()`, which is total and **injective on the
+refusals** — `ResumeIncoming`, `SettleIdle`, `DeclineDequeueUndone`, `DeclineSchedulerUntouched`,
+`Fatal` — so there is no value two different refusals share.
+`every_mark_outcome_has_its_own_disposition` checks the mapping and the injectivity;
+`every_architecture_caller_matches_all_five_outcomes_and_torn_is_fatal` counts the consumers per
+arch file and asserts each of the five arms, and `dispatch_torn_fatal`, appears exactly once per
+consumer.
+
+#### F. The post-mark resume uses the token's exact identity
+
+After `Marked(token)` the AArch64 direct-dispatch resume re-resolved the task by numeric TID for
+ASID activation, saved-context/TLS restore and the pending-completion take. A replacement
+incarnation that reused the TID would therefore have **its** address space activated and **its**
+context copied into the outgoing frame.
+
+`direct_dispatch_resume_incoming` now takes the `DispatchMarkToken`, and each of
+`direct_dispatch_activate_asid_split`, `direct_dispatch_restore_context_split` and
+`direct_dispatch_take_completion_split` resolves on the exact `{tid, asid}` pair the mark
+recorded. A mismatch refuses (`AARCH64_DIRECT_DISPATCH_IDENTITY_REFUSED`) and the caller takes its
+rollback/fatal path. `the_post_mark_resume_refuses_a_replacement_incarnation` runs the required
+counterexample: mark A `{tid = T, asid = A}`, replace the TCB with B `{tid = T, asid = B}`,
+then show nothing is activated, B's context is never handed back, and B is byte-for-byte
+unchanged.
+
+#### Census
+
+Unchanged in every class. Three rows moved file, because the in-lock dispatch mark is now one
+shared commit rather than three copies: `exec_state.rs` drops from 10 to 7 sites and
+`scheduler_state.rs` rises from 1 to 4, with `commit_dispatch_selection_in_lock` carrying 3
+`Cannot` sites. **29 remaining raw writes + 8 barriered sites = 37**, and
+**CAN 13 / CANNOT 15 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 1 / NON_PRODUCTION 1 / UNPROVEN 0**.
+
+#### Status
+
+* production executable code — **changed**, on all three architectures
+* the WA3A-R1 torn `current = T` / `status(T) = Runnable` state — **eliminated**, mutation-free
+* provenance reconstruction in the Group-3 cohort — **none remaining**
+* dequeue rollback authority — **sealed**; a continuation cannot express it
+* token CPU — **scheduler-authenticated**; the mark seam takes no `cpu`
+* `RefusedTorn` — **fatal at every one of the eleven callers**
+* post-mark resume — **exact-incarnation** on every step
+* census — **13 / 15 / 7 / 1 / 1 / 0**, unchanged
+* new broad-lock acquisitions — **none**; no task(2) → scheduler(1) inversion
+* helper waiter ownership — still **zero production callers**
+* `WAITER_OWNER_CENSUS_COMPLETE` — **yes**; `WAITER_OWNERSHIP_EXCLUSIVE` — **no**
+* direct production default — **OFF**; NR6/NR7 claim position — **unchanged**
+* canonical 199D — **OPEN**; ledger — **39 / 7 / 46**; **no new live cell**
+
+WA3A is sealed. The next increment is the one-shot `ReservedUnstarted → LiveSpawned` TCB
+protocol, which closes the final Group-3 CAN site and moves CAN 13 → 12.
+
+---
+
 
 ## 7. Method and limits
 

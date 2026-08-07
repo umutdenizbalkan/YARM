@@ -68,6 +68,19 @@ pub(crate) enum TaskTransition {
     /// without a mark-running step, so preempting it out is `Runnable → Runnable`. Refused for
     /// every other TID, so an ordinary task can never take this branch.
     PreemptOutgoingIdle,
+    /// **Idle only.** Stage 199D-WA3A-R2-SEAL: idle continues to be `current` across a
+    /// queue-neutral dispatch (`dispatch_next_selection` returns `ContinuedCurrent { tid: 0 }`
+    /// when the idle task is current and nothing is runnable). Idle is not marked `Running` by
+    /// that step, so this is `Runnable → Runnable`. Refused for every other TID, so the
+    /// ordinary [`Self::ContinueCurrent`] contract is not weakened to accommodate idle.
+    ContinueCurrentIdle,
+    /// **Idle only.** Stage 199D-WA3A-R2-SEAL: idle is genuinely dequeued while it is already
+    /// `Running` — boot dispatches [`IDLE_TID`] once (leaving it `Running`) and then re-enqueues
+    /// and re-dequeues the same task, so the incoming status is `Running`, not `Runnable`. This
+    /// is `Running → Running`. Refused for every other TID: a double-queued ORDINARY task that
+    /// is already `Running` is a scheduler invariant break and still fails closed under
+    /// [`Self::DispatchIncoming`].
+    RedispatchIdleAlreadyRunning,
 }
 
 impl TaskTransition {
@@ -75,10 +88,11 @@ impl TaskTransition {
     pub(crate) const fn expected_from(self) -> TaskStatus {
         match self {
             Self::DispatchIncoming => TaskStatus::Runnable,
-            Self::PreemptOutgoingIdle => TaskStatus::Runnable,
+            Self::PreemptOutgoingIdle | Self::ContinueCurrentIdle => TaskStatus::Runnable,
             Self::ContinueCurrent
             | Self::PreemptOutgoing
             | Self::RollbackDispatchedIncoming
+            | Self::RedispatchIdleAlreadyRunning
             | Self::FaultRunningCurrent => TaskStatus::Running,
         }
     }
@@ -86,10 +100,13 @@ impl TaskTransition {
     /// The status the task ends in.
     pub(crate) const fn resulting(self) -> TaskStatus {
         match self {
-            Self::DispatchIncoming | Self::ContinueCurrent => TaskStatus::Running,
+            Self::DispatchIncoming | Self::ContinueCurrent | Self::RedispatchIdleAlreadyRunning => {
+                TaskStatus::Running
+            }
             Self::PreemptOutgoing
             | Self::RollbackDispatchedIncoming
-            | Self::PreemptOutgoingIdle => TaskStatus::Runnable,
+            | Self::PreemptOutgoingIdle
+            | Self::ContinueCurrentIdle => TaskStatus::Runnable,
             Self::FaultRunningCurrent => TaskStatus::Faulted,
         }
     }
@@ -103,6 +120,32 @@ impl TaskTransition {
             Self::RollbackDispatchedIncoming => "rollback_dispatched_incoming",
             Self::FaultRunningCurrent => "fault_running_current",
             Self::PreemptOutgoingIdle => "preempt_outgoing_idle",
+            Self::ContinueCurrentIdle => "continue_current_idle",
+            Self::RedispatchIdleAlreadyRunning => "redispatch_idle_already_running",
+        }
+    }
+
+    /// Is this transition restricted to [`IDLE_TID`] by construction?
+    pub(crate) const fn is_idle_only(self) -> bool {
+        matches!(
+            self,
+            Self::PreemptOutgoingIdle
+                | Self::ContinueCurrentIdle
+                | Self::RedispatchIdleAlreadyRunning
+        )
+    }
+
+    /// Stage 199D-WA3A-R2-SEAL — the idle-only twin of a dispatch transition, if it has one.
+    ///
+    /// The idle/bootstrap task is placed in and taken out of `current` by the rank-1 scheduler
+    /// without a mark-running step, so neither ordinary dispatch transition describes it: boot
+    /// leaves it `Running` and a later queue-neutral dispatch finds it `Runnable`. Each twin is
+    /// still exactly ONE `from → to` pair and is refused for every non-[`IDLE_TID`] task.
+    pub(crate) const fn idle_twin(self) -> Option<Self> {
+        match self {
+            Self::DispatchIncoming => Some(Self::RedispatchIdleAlreadyRunning),
+            Self::ContinueCurrent => Some(Self::ContinueCurrentIdle),
+            _ => None,
         }
     }
 }
@@ -132,7 +175,7 @@ pub(crate) fn apply_task_transition(
     expect_asid: Option<Asid>,
     transition: TaskTransition,
 ) -> Result<TaskStatus, TransitionRefusal> {
-    if transition == TaskTransition::PreemptOutgoingIdle && tid != IDLE_TID {
+    if transition.is_idle_only() && tid != IDLE_TID {
         return Err(TransitionRefusal::NotIdleTask);
     }
     let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) else {
@@ -153,6 +196,26 @@ pub(crate) fn apply_task_transition(
     Ok(observed)
 }
 
+/// Stage 199D-WA3A-R2-SEAL — apply a dispatch transition, falling back to its idle-only twin.
+///
+/// One place, so the in-lock (`commit_dispatch_selection_in_lock`) and off-lock
+/// (`d6_genuine_mark_running_via_task_seam`) dispatch commits cannot drift apart on which
+/// statuses idle may hold. The reported refusal is always the ORDINARY transition's, so a
+/// refused ordinary task is never mis-described as an idle refusal.
+pub(crate) fn apply_dispatch_transition(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+    transition: TaskTransition,
+) -> Result<TaskStatus, TransitionRefusal> {
+    match apply_task_transition(tcbs, tid, None, transition) {
+        Ok(previous) => Ok(previous),
+        Err(first) => match transition.idle_twin() {
+            Some(idle) => apply_task_transition(tcbs, tid, None, idle).map_err(|_| first),
+            None => Err(first),
+        },
+    }
+}
+
 /// Read-only sibling of [`apply_task_transition`]: would the transition be accepted?
 ///
 /// Used where the authoritative scheduler mutation must be validated **before** it happens, so
@@ -163,7 +226,7 @@ pub(crate) fn task_transition_would_be_accepted(
     expect_asid: Option<Asid>,
     transition: TaskTransition,
 ) -> Result<TaskStatus, TransitionRefusal> {
-    if transition == TaskTransition::PreemptOutgoingIdle && tid != IDLE_TID {
+    if transition.is_idle_only() && tid != IDLE_TID {
         return Err(TransitionRefusal::NotIdleTask);
     }
     let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == tid) else {

@@ -1162,6 +1162,55 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    default **OFF**, NR6/NR7 late claims unchanged, canonical 199D **OPEN**, ledger **39 / 7 / 46**,
    RISC-V unchanged, **no new live cell**. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.35.
 
+   **WA3A-R2-SEAL: the R1 repair had introduced a torn state of its own; WA3A is now sealed.**
+   WA3A-R1 typed the dispatch provenance, and in doing so created this: a non-idle `Running`
+   current with no ASID performed a legal `Running → Running`, `DispatchMarkToken::new` then
+   refused for want of an exact incarnation, the common failure branch rolled the status back to
+   `Runnable`, and `undo_dispatch_selection(ContinuedCurrent)` correctly mutated no scheduler
+   state — leaving `current = T` with `status(T) = Runnable`. The "rollback" was the corruption.
+   Identity resolution moved **inside** the same rank-2 acquisition as the transition and
+   strictly before it, so a missing identity refuses with the TCB untouched and there is nothing
+   to undo but the scheduler step.
+
+   **Provenance reconstruction is gone from the whole Group-3 cohort.** R1 left the three in-lock
+   sites computing `let dequeued = outgoing_tid != Some(tid);`, which is not merely inelegant but
+   wrong: a lone task that yields is re-enqueued and then genuinely dequeued again, so outgoing
+   == incoming while the queue really did advance — and a refusal would have skipped the
+   re-enqueue and lost the only runnable task. `KernelState` gained the provenance-preserving
+   `*_selection` seams and all three sites now commit through ONE shared
+   `commit_dispatch_selection_in_lock`. The old try-`DispatchIncoming`-then-`ContinueCurrent`
+   fallback went with it — inferring the transition from which one succeeds would launder a
+   double-queued `Running` task through the dequeue path.
+
+   **A second idle finding, handled the same way as the first.** Making the transition exact
+   showed that the idle/bootstrap task's status is not governed by the ordinary contract at all:
+   boot leaves TID 0 `Running` and re-dequeues it, while a queue-neutral step finds it
+   `Runnable`. Rather than weaken either ordinary transition, each got an idle-only twin
+   (`RedispatchIdleAlreadyRunning`, `ContinueCurrentIdle`), refused for every TID but `IDLE_TID`,
+   joining `PreemptOutgoingIdle` from WA3A.
+
+   **Three more seals.** Dequeue rollback now takes a sealed `DequeuedDispatchMarkToken` whose
+   only constructor checks the provenance, so presenting a continuation is unrepresentable rather
+   than refused late. The off-lock seams authenticate the requested CPU against the authoritative
+   dispatch CPU **before any mutation** and return a CPU-bound `CpuDispatch`, so the mark seam
+   takes no `cpu` argument and no caller can stamp an unverified CPU into rollback authority.
+   `may_resume()` is removed: all eleven x86_64/AArch64/RISC-V consumers now match all five
+   outcomes explicitly and route `RefusedTorn` to a divergent `dispatch_torn_fatal` — never a
+   resume, a fallback dispatch, an idle halt or a return to userspace. The AArch64 post-mark
+   resume drives ASID activation, context/TLS restore and the completion take off the token's
+   exact `{tid, asid}`, so a replacement incarnation that reused the TID is refused instead of
+   resumed.
+
+   Census unchanged in every class — **CAN 13 / CANNOT 15 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 1
+   / NON_PRODUCTION 1 / UNPROVEN 0** — with three rows moved from `exec_state.rs` (10 → 7) to
+   `scheduler_state.rs` (1 → 4) because the in-lock dispatch mark is now one shared commit.
+   Waiter ownership still has **zero production callers**, `WAITER_OWNERSHIP_EXCLUSIVE=no`,
+   `WAITER_OWNER_CENSUS_COMPLETE=yes`, direct production default **OFF**, NR6/NR7 late claims
+   unchanged, spawn still **hard-stopped** and CAN, canonical 199D **OPEN**, ledger
+   **39 / 7 / 46**, **no new live cell**. WA3A is sealed; the next increment is the one-shot
+   `ReservedUnstarted → LiveSpawned` TCB protocol (CAN 13 → 12).
+   See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.36.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and

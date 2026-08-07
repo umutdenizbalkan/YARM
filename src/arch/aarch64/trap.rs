@@ -135,19 +135,35 @@ pub(crate) fn enter_post_lock_dispatch_fatal(cpu: CpuId, incoming: u64, rolled_b
 /// frame is left untouched and the caller fails closed.
 pub(crate) fn direct_dispatch_resume_incoming(
     shared: &crate::runtime::SharedKernel,
-    cpu: CpuId,
-    incoming: u64,
+    token: crate::runtime::DispatchMarkToken,
     frame: &mut TrapFrame,
 ) -> bool {
+    // Stage 199D-WA3A-R2-SEAL (item F): every step below names the incoming task by the mark
+    // TOKEN's exact incarnation — the `{tid, asid}` pair this transaction actually marked — and
+    // not by the bare numeric TID. If the TCB has since been replaced by a different
+    // incarnation that reused the TID, each step refuses and this returns `false`, so the
+    // caller takes its rollback/fatal path: the replacement's address space is never activated
+    // and its context is never copied into the frame.
+    let incoming = token.tid();
     // (1) ASID / TTBR0, recorded against THIS CPU — an active address space is per-core state.
-    let asid = shared.direct_dispatch_activate_asid_split(cpu, incoming);
+    let Some(asid) = shared.direct_dispatch_activate_asid_split(token) else {
+        crate::yarm_log!(
+            "AARCH64_DIRECT_DISPATCH_IDENTITY_REFUSED tid={} step=ttbr0",
+            incoming
+        );
+        return false;
+    };
     crate::yarm_log!(
         "AARCH64_DIRECT_DISPATCH_TTBR0_OK tid={} asid={}",
         incoming,
-        asid.unwrap_or(0)
+        asid
     );
     // (2)+(3) Complete saved EL0 context and the TLS-restore take, one rank-2 acquisition.
-    let Some((context, tls)) = shared.direct_dispatch_restore_context_split(incoming) else {
+    let Some((context, tls)) = shared.direct_dispatch_restore_context_split(token) else {
+        crate::yarm_log!(
+            "AARCH64_DIRECT_DISPATCH_IDENTITY_REFUSED tid={} step=context",
+            incoming
+        );
         return false;
     };
     frame.apply_user_context(context);
@@ -157,14 +173,14 @@ pub(crate) fn direct_dispatch_resume_incoming(
     );
     #[cfg(test)]
     {
-        let idx = cpu.0 as usize;
+        let idx = token.cpu().0 as usize;
         if idx < MAX_CPUS {
             LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
         }
     }
     // (4) The remotely-completed blocked syscall, consumed before the mirror below.
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-    if let Some(done) = shared.direct_dispatch_take_completion_split(incoming) {
+    if let Some(done) = shared.direct_dispatch_take_completion_split(token) {
         frame.set_arg(0, done.result as usize);
         for lane in 1..=5 {
             frame.set_arg(lane, 0);

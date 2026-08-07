@@ -5,6 +5,10 @@ use crate::arch::trap::TrapEvent;
 use crate::kernel::boot::{FaultBookkeepingMode, KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trapframe::TrapFrame;
+// Stage 199D-WA3A-R2-SEAL (item E): every dispatch-mark consumer in this file matches all five
+// outcomes explicitly; `RefusedTorn` reaches `dispatch_torn_fatal` and never returns.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::runtime::{DispatchMarkOutcome as Mark, dispatch_torn_fatal};
 
 /// Stage 197 (FIRST-COHORT SEAL): arch tag for the `YARM_LOCK_SPLIT_DISPATCH`
 /// marker — canonical `arch=<arch> ` on every architecture (x86_64 normalized from
@@ -407,12 +411,41 @@ pub fn handle_trap_entry_shared(
                 crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_REVERIFY_OK tid={}", t);
             }
             crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
-            let incoming = shared.d2_send_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming.tid().map(|t| t.0)
-                && shared
-                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                    .may_resume()
-            {
+            let dispatch = shared.d2_send_dispatch_step_mut(cpu);
+            // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
+            // with its own evidence. `RefusedTorn` is fatal — it may never fall through to a
+            // resume, an ordinary fallback dispatch, an idle halt or a return to userspace.
+            let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                Mark::Marked(token) => Some(token),
+                Mark::Idle => {
+                    crate::yarm_log!(
+                        "D2_SEND_GENUINE_DISPATCH_DECLINED cpu={} reason=idle",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedRolledBack => {
+                    crate::yarm_log!(
+                        "D2_SEND_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedNoSchedulerChange => {
+                    crate::yarm_log!(
+                        "D2_SEND_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedTorn => dispatch_torn_fatal(
+                    cpu,
+                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+                    "d2_send_genuine_dispatch",
+                ),
+            };
+            if let Some(token) = marked {
+                let inc = token.tid();
                 // Dormant kernel-thread switch_frames variant (user-task sender
                 // resumes via trap-frame restore + syscall restart).
                 if shared.d2_recv_incoming_has_kernel_switch_ctx(inc) {
@@ -440,9 +473,9 @@ pub fn handle_trap_entry_shared(
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
                     + 1;
                 crate::yarm_log!(
-                    "D2_SEND_GENUINE_DISPATCH_DONE result=switch cpu={} incoming={:?} count={}",
+                    "D2_SEND_GENUINE_DISPATCH_DONE result=switch cpu={} incoming={} count={}",
                     cpu.0,
-                    incoming,
+                    inc,
                     n
                 );
             } else {
@@ -481,14 +514,41 @@ pub fn handle_trap_entry_shared(
                 crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid={}", t);
             }
             crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
-            let incoming = shared.d2_recv_dispatch_step_mut(cpu);
-            // Commit the selected task Running via the rank-2 task seam. A refused
-            // transition rolls the dequeue back and resumes nothing.
-            if let Some(inc) = incoming.tid().map(|t| t.0)
-                && shared
-                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                    .may_resume()
-            {
+            let dispatch = shared.d2_recv_dispatch_step_mut(cpu);
+            // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
+            // with its own evidence. `RefusedTorn` is fatal — it may never fall through to a
+            // resume, an ordinary fallback dispatch, an idle halt or a return to userspace.
+            let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                Mark::Marked(token) => Some(token),
+                Mark::Idle => {
+                    crate::yarm_log!(
+                        "D2_RECV_GENUINE_DISPATCH_DECLINED cpu={} reason=idle",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedRolledBack => {
+                    crate::yarm_log!(
+                        "D2_RECV_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedNoSchedulerChange => {
+                    crate::yarm_log!(
+                        "D2_RECV_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedTorn => dispatch_torn_fatal(
+                    cpu,
+                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+                    "d2_recv_genuine_dispatch",
+                ),
+            };
+            if let Some(token) = marked {
+                let inc = token.tid();
                 // Dormant kernel-thread switch_frames variant (user-task recv
                 // resumes via trap-frame restore + syscall restart, so this does
                 // not fire for the recv workload).
@@ -520,9 +580,9 @@ pub fn handle_trap_entry_shared(
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
                     + 1;
                 crate::yarm_log!(
-                    "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu={} incoming={:?} count={}",
+                    "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu={} incoming={} count={}",
                     cpu.0,
-                    incoming,
+                    inc,
                     n
                 );
             } else {
@@ -607,8 +667,8 @@ pub fn handle_trap_entry_shared(
                     // (2) ONE authoritative dequeue under the rank-1 scheduler seam. This is the
                     //     single queue-advancing step for the cycle. It may legitimately select
                     //     the outgoing caller itself, if a reply re-queued it.
-                    let selection = shared.futex_wait_dispatch_step_mut(cpu);
-                    match selection.tid().map(|t| t.0) {
+                    let dispatch = shared.futex_wait_dispatch_step_mut(cpu);
+                    match dispatch.tid().map(|t| t.0) {
                         None => {
                             // SETTLE (idle). The run queue is empty: the outgoing caller stays
                             // parked, `current` stays clear, no frame is restored and no incoming
@@ -629,17 +689,54 @@ pub fn handle_trap_entry_shared(
                             // From here the scheduler is MUTATED: `inc` was dequeued and made
                             // current. Any later failure must roll that back exactly and take
                             // the explicit fatal path — never return with it half-committed.
-                            let mark = shared.d6_genuine_mark_running_via_task_seam(selection, cpu);
-                            let agrees = mark.may_resume()
+                            //
+                            // Stage 199D-WA3A-R2-SEAL (item E): all five mark outcomes are
+                            // matched explicitly. `RefusedTorn` never reaches the rollback or
+                            // the idle settle — the scheduler and the task table already
+                            // disagree, so there is nothing left to roll back.
+                            let marked = match shared
+                                .d6_genuine_mark_running_via_task_seam(dispatch)
+                            {
+                                Mark::Marked(token) => Some(token),
+                                Mark::Idle => {
+                                    crate::yarm_log!(
+                                        "AARCH64_DIRECT_DISPATCH_DECLINED cpu={} reason=idle",
+                                        cpu.0
+                                    );
+                                    None
+                                }
+                                Mark::RefusedRolledBack => {
+                                    crate::yarm_log!(
+                                        "AARCH64_DIRECT_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                                        cpu.0
+                                    );
+                                    None
+                                }
+                                Mark::RefusedNoSchedulerChange => {
+                                    crate::yarm_log!(
+                                        "AARCH64_DIRECT_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                                        cpu.0
+                                    );
+                                    None
+                                }
+                                Mark::RefusedTorn => {
+                                    dispatch_torn_fatal(cpu, inc, "aarch64_direct_dispatch")
+                                }
+                            };
+                            let agrees = marked.is_some()
                                 && shared.direct_dispatch_current_agrees_split_read(cpu, inc);
+                            // Stage 199D-WA3A-R2-SEAL (item F): the resume runs off the mark
+                            // TOKEN's exact incarnation, not the bare numeric TID, so a
+                            // replacement task that reused the TID cannot have its address
+                            // space activated or its context copied into the frame.
                             let resumed = agrees
-                                && match frame.as_deref_mut() {
-                                    Some(f) => {
+                                && match (marked, frame.as_deref_mut()) {
+                                    (Some(token), Some(f)) => {
                                         super::aarch64::trap::direct_dispatch_resume_incoming(
-                                            shared, cpu, inc, f,
+                                            shared, token, f,
                                         )
                                     }
-                                    None => false,
+                                    _ => false,
                                 };
                             if resumed {
                                 crate::yarm_log!(
@@ -657,9 +754,14 @@ pub fn handle_trap_entry_shared(
                                 // then halt: returning "declined" here would leave the scheduler
                                 // believing `inc` is running while we eret through another
                                 // task's frame.
-                                let rolled_back = mark
-                                    .token()
-                                    .is_some_and(|t| shared.direct_dispatch_rollback_split(t));
+                                // Stage 199D-WA3A-R2-SEAL (item C): only a token whose
+                                // provenance is a genuine dequeue OF THIS TID can authorize
+                                // undoing a dequeue. A `ContinuedCurrent` mark narrows to
+                                // `None` here, so the rollback is unrepresentable rather than
+                                // refused at the mutation site.
+                                let rolled_back = marked
+                                    .and_then(|t| t.into_dequeued_authority())
+                                    .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
                                 crate::yarm_log!(
                                     "AARCH64_DIRECT_DISPATCH_ROLLBACK cpu={} incoming={} reason={} rolled_back={}",
                                     cpu.0,
@@ -722,12 +824,41 @@ pub fn handle_trap_entry_shared(
             .unwrap_or(false);
         if reverify_ok {
             // Queue-advancing dequeue (emits QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK).
-            let incoming = shared.futex_wait_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming.tid().map(|t| t.0)
-                && shared
-                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                    .may_resume()
-            {
+            let dispatch = shared.futex_wait_dispatch_step_mut(cpu);
+            // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
+            // with its own evidence. `RefusedTorn` is fatal — it may never fall through to a
+            // resume, an ordinary fallback dispatch, an idle halt or a return to userspace.
+            let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                Mark::Marked(token) => Some(token),
+                Mark::Idle => {
+                    crate::yarm_log!(
+                        "QUEUE_ADVANCING_DISPATCH_DECLINED cpu={} reason=idle",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedRolledBack => {
+                    crate::yarm_log!(
+                        "QUEUE_ADVANCING_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedNoSchedulerChange => {
+                    crate::yarm_log!(
+                        "QUEUE_ADVANCING_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedTorn => dispatch_torn_fatal(
+                    cpu,
+                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+                    "futex_wait_queue_advancing_dispatch",
+                ),
+            };
+            if let Some(token) = marked {
+                let inc = token.tid();
                 crate::yarm_log!(
                     "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu={} tid={}",
                     cpu.0,
@@ -802,15 +933,43 @@ pub fn handle_trap_entry_shared(
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}", t);
                 }
                 // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
-                let incoming = shared.futex_wait_dispatch_step_mut(cpu);
-                // Stage 199D-WA3A: mark Running through the exact rank-2 transition FIRST. A
-                // refusal rolls the dequeue back inside the seam, so the drain simply resumes
-                // nothing and the unchanged clear/fallback tail below runs.
-                if let Some(inc) = incoming.tid().map(|t| t.0)
-                    && shared
-                        .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                        .may_resume()
-                {
+                let dispatch = shared.futex_wait_dispatch_step_mut(cpu);
+                // Stage 199D-WA3A-R2-SEAL (item E): mark Running through the exact rank-2
+                // transition FIRST, then match all five outcomes explicitly. A refusal has
+                // already undone exactly what the selection did, so the drain resumes nothing
+                // and the unchanged clear/fallback tail below runs — except for `RefusedTorn`,
+                // which is fatal and never returns.
+                let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                    Mark::Marked(token) => Some(token),
+                    Mark::Idle => {
+                        crate::yarm_log!(
+                            "AARCH64_FUTEX_WAIT_DISPATCH_DECLINED cpu={} reason=idle",
+                            cpu.0
+                        );
+                        None
+                    }
+                    Mark::RefusedRolledBack => {
+                        crate::yarm_log!(
+                            "AARCH64_FUTEX_WAIT_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                            cpu.0
+                        );
+                        None
+                    }
+                    Mark::RefusedNoSchedulerChange => {
+                        crate::yarm_log!(
+                            "AARCH64_FUTEX_WAIT_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                            cpu.0
+                        );
+                        None
+                    }
+                    Mark::RefusedTorn => dispatch_torn_fatal(
+                        cpu,
+                        dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+                        "aarch64_futex_wait_dispatch",
+                    ),
+                };
+                if let Some(token) = marked {
+                    let inc = token.tid();
                     crate::yarm_log!(
                         "AARCH64_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} tid={}",
                         cpu.0,
@@ -913,12 +1072,40 @@ pub fn handle_trap_entry_shared(
                     crate::yarm_log!("AARCH64_YIELD_DISPATCH_REVERIFY_OK tid={}", t);
                 }
                 // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
-                let incoming = shared.yield_dispatch_step_mut(cpu);
-                if let Some(inc) = incoming.tid().map(|t| t.0)
-                    && shared
-                        .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                        .may_resume()
-                {
+                let dispatch = shared.yield_dispatch_step_mut(cpu);
+                // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly,
+                // each with its own evidence. `RefusedTorn` is fatal and never returns.
+                let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                    Mark::Marked(token) => Some(token),
+                    Mark::Idle => {
+                        crate::yarm_log!(
+                            "AARCH64_YIELD_DISPATCH_DECLINED cpu={} reason=idle",
+                            cpu.0
+                        );
+                        None
+                    }
+                    Mark::RefusedRolledBack => {
+                        crate::yarm_log!(
+                            "AARCH64_YIELD_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                            cpu.0
+                        );
+                        None
+                    }
+                    Mark::RefusedNoSchedulerChange => {
+                        crate::yarm_log!(
+                            "AARCH64_YIELD_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                            cpu.0
+                        );
+                        None
+                    }
+                    Mark::RefusedTorn => dispatch_torn_fatal(
+                        cpu,
+                        dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+                        "aarch64_yield_dispatch",
+                    ),
+                };
+                if let Some(token) = marked {
+                    let inc = token.tid();
                     crate::yarm_log!(
                         "AARCH64_YIELD_DISPATCH_DEQUEUE_OK cpu={} tid={}",
                         cpu.0,
@@ -984,12 +1171,37 @@ pub fn handle_trap_entry_shared(
         crate::yarm_log!("YIELD_DISPATCH_DEFER_BEGIN cpu={} drain=1", cpu.0);
         let reverify_ok = shared.yield_reverify_ready(cpu);
         if reverify_ok {
-            let incoming = shared.yield_dispatch_step_mut(cpu);
-            if let Some(inc) = incoming.tid().map(|t| t.0)
-                && shared
-                    .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                    .may_resume()
-            {
+            let dispatch = shared.yield_dispatch_step_mut(cpu);
+            // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
+            // with its own evidence. `RefusedTorn` is fatal and never returns.
+            let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                Mark::Marked(token) => Some(token),
+                Mark::Idle => {
+                    crate::yarm_log!("YIELD_DISPATCH_DECLINED cpu={} reason=idle", cpu.0);
+                    None
+                }
+                Mark::RefusedRolledBack => {
+                    crate::yarm_log!(
+                        "YIELD_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedNoSchedulerChange => {
+                    crate::yarm_log!(
+                        "YIELD_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedTorn => dispatch_torn_fatal(
+                    cpu,
+                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+                    "yield_queue_advancing_dispatch",
+                ),
+            };
+            if let Some(token) = marked {
+                let inc = token.tid();
                 crate::yarm_log!("YIELD_DISPATCH_CURRENT_SET_OK cpu={} tid={}", cpu.0, inc);
                 let restore = shared
                     .with_cpu(cpu, |kernel| {
@@ -1049,28 +1261,46 @@ pub fn handle_trap_entry_shared(
                 // unchanged unless an in-lock fallback superseded the deferral).
                 if shared.d6_genuine_dispatch_queue_neutral(cpu) {
                     crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_ENTER cpu={}", cpu.0);
-                    let incoming = shared.d6_genuine_local_dispatch_step_mut(cpu);
-                    // Deferred Phase B (idempotent for the same running task). Queue-neutral,
-                    // so the transition is normally `Running → Running`; a refusal rolls back
-                    // and the drain declines.
-                    if shared
-                        .d6_genuine_mark_running_via_task_seam(incoming, cpu)
-                        .may_resume()
-                    {
-                        let n = crate::kernel::boot::D6_GENUINE_MUT_DISPATCH_COUNT
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-                            + 1;
-                        crate::yarm_log!(
-                            "D6_GENUINE_MUT_DISPATCH_DONE cpu={} incoming={:?}",
-                            cpu.0,
-                            incoming
-                        );
-                        crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_COUNT value={}", n);
-                    } else {
-                        crate::yarm_log!(
-                            "D6_GENUINE_MUT_DISPATCH_DECLINED cpu={} reason=transition_refused",
-                            cpu.0
-                        );
+                    let dispatch = shared.d6_genuine_local_dispatch_step_mut(cpu);
+                    // Deferred Phase B. Queue-neutral, so the transition is normally
+                    // `Running → Running` (or `Runnable → Runnable` for idle continuing to be
+                    // idle). Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched
+                    // explicitly; `RefusedTorn` is fatal and never returns.
+                    match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                        Mark::Marked(token) => {
+                            let n = crate::kernel::boot::D6_GENUINE_MUT_DISPATCH_COUNT
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                                + 1;
+                            crate::yarm_log!(
+                                "D6_GENUINE_MUT_DISPATCH_DONE cpu={} incoming={}",
+                                cpu.0,
+                                token.tid()
+                            );
+                            crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_COUNT value={}", n);
+                        }
+                        Mark::Idle => {
+                            crate::yarm_log!(
+                                "D6_GENUINE_MUT_DISPATCH_DECLINED cpu={} reason=idle",
+                                cpu.0
+                            );
+                        }
+                        Mark::RefusedRolledBack => {
+                            crate::yarm_log!(
+                                "D6_GENUINE_MUT_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                                cpu.0
+                            );
+                        }
+                        Mark::RefusedNoSchedulerChange => {
+                            crate::yarm_log!(
+                                "D6_GENUINE_MUT_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                                cpu.0
+                            );
+                        }
+                        Mark::RefusedTorn => dispatch_torn_fatal(
+                            cpu,
+                            dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+                            "d6_genuine_local_dispatch",
+                        ),
                     }
                 } else {
                     crate::yarm_log!(

@@ -2926,7 +2926,10 @@ impl KernelState {
         // local_dispatch_step_split's doc comment in scheduler_state.rs for
         // the deferred SharedKernel-seam live-wire blocker (§D-NEXT-1 PR-C
         // in doc/KERNEL_UNLOCKING.md).
-        let next = self.local_dispatch_step_split();
+        // Stage 199D-WA3A-R2-SEAL (item B): typed provenance, produced inside the
+        // authoritative scheduler mutation. Nothing below reconstructs it.
+        let selection = self.local_dispatch_step_split_selection();
+        let next = selection.tid().map(|t| t.0);
         if let Some(tid) = next {
             crate::yarm_log!("SCHED_DISPATCH_NEXT chosen_tid={}", tid);
             crate::yarm_log!("D6_DISPATCH_SELECTED tid={}", tid);
@@ -3096,61 +3099,13 @@ impl KernelState {
             {
                 crate::yarm_log!("CTX1 after maybe_switch_kernel_context tid={}", tid);
             }
-            if outgoing_tid != Some(tid) {
-                self.with_ipc_state_mut(|ipc| {
-                    ipc.telemetry.scheduler_context_switches =
-                        ipc.telemetry.scheduler_context_switches.saturating_add(1);
-                });
-            }
-            // Stage 199D-WA3A: EXACT dispatch transition. `dispatch_next` returns the
-            // existing current WITHOUT dequeuing when one is set, so both `Runnable → Running`
-            // (a genuine dequeue) and `Running → Running` (a queue-neutral continuation) are
-            // legal; every other status is refused. A refusal after a genuine dequeue undoes
-            // the rank-1 mutation exactly with `preempt_reenqueue_only_on` — the existing
-            // inverse of `dispatch_next_on` — so no task is lost from a run queue and no
-            // blocked task is left as `current`.
-            let dequeued = outgoing_tid != Some(tid);
-            let marked = self.with_tcbs_mut(|tcbs| {
-                use crate::kernel::task_transition::{
-                    TaskTransition, apply_task_transition, log_transition_refusal,
-                };
-                match apply_task_transition(tcbs, tid, None, TaskTransition::DispatchIncoming) {
-                    Ok(_) => true,
-                    Err(_) => match apply_task_transition(
-                        tcbs,
-                        tid,
-                        None,
-                        TaskTransition::ContinueCurrent,
-                    ) {
-                        Ok(_) => true,
-                        Err(refusal) => {
-                            log_transition_refusal(
-                                "dispatch_next_task",
-                                tid,
-                                TaskTransition::DispatchIncoming,
-                                refusal,
-                            );
-                            false
-                        }
-                    },
-                }
-            });
-            if !marked {
-                if dequeued {
-                    let restored = self.preempt_reenqueue_current_cpu();
-                    crate::yarm_log!(
-                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback={}",
-                        "dispatch_next_task",
-                        tid,
-                        u8::from(restored == Some(tid))
-                    );
-                } else {
-                    crate::yarm_log!(
-                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback=not_needed",
-                        "dispatch_next_task",
-                        tid
-                    );
-                }
+            self.note_context_switch_if_task_changed(outgoing_tid, tid);
+            // Stage 199D-WA3A-R2-SEAL (item B): EXACT dispatch transition, chosen by the
+            // typed provenance the authoritative scheduler mutation produced. A refusal undoes
+            // exactly what that selection did — `preempt_reenqueue_only_on` for a genuine
+            // dequeue, nothing at all for a queue-neutral continuation — so no task is lost
+            // from a run queue and no blocked task is left as `current`.
+            if !self.commit_dispatch_selection_in_lock(selection, "dispatch_next_task") {
                 return Err(KernelError::TaskMissing);
             }
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
@@ -3483,68 +3438,25 @@ impl KernelState {
             }
         }
 
-        let next_tid = self.on_preempt_current_cpu();
+        // Stage 199D-WA3A-R2-SEAL (item B): typed provenance, produced inside the
+        // authoritative scheduler mutation. The lone-task yield is the counterexample that
+        // makes reconstruction wrong: the outgoing task is re-enqueued and then genuinely
+        // dequeued again, so `outgoing == incoming` while the provenance is `Dequeued`.
+        let selection = self.on_preempt_current_cpu_selection();
+        let next_tid = selection.tid().map(|t| t.0);
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);
             if let Some(asid) = incoming_asid {
                 self.hal.switch_address_space(self.current_cpu(), asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
-            if outgoing_tid != Some(tid) {
-                self.with_ipc_state_mut(|ipc| {
-                    ipc.telemetry.scheduler_context_switches =
-                        ipc.telemetry.scheduler_context_switches.saturating_add(1);
-                });
-            }
-            // Stage 199D-WA3A: EXACT dispatch transition. `dispatch_next` returns the
-            // existing current WITHOUT dequeuing when one is set, so both `Runnable → Running`
-            // (a genuine dequeue) and `Running → Running` (a queue-neutral continuation) are
-            // legal; every other status is refused. A refusal after a genuine dequeue undoes
-            // the rank-1 mutation exactly with `preempt_reenqueue_only_on` — the existing
-            // inverse of `dispatch_next_on` — so no task is lost from a run queue and no
-            // blocked task is left as `current`.
-            let dequeued = outgoing_tid != Some(tid);
-            let marked = self.with_tcbs_mut(|tcbs| {
-                use crate::kernel::task_transition::{
-                    TaskTransition, apply_task_transition, log_transition_refusal,
-                };
-                match apply_task_transition(tcbs, tid, None, TaskTransition::DispatchIncoming) {
-                    Ok(_) => true,
-                    Err(_) => match apply_task_transition(
-                        tcbs,
-                        tid,
-                        None,
-                        TaskTransition::ContinueCurrent,
-                    ) {
-                        Ok(_) => true,
-                        Err(refusal) => {
-                            log_transition_refusal(
-                                "yield_current",
-                                tid,
-                                TaskTransition::DispatchIncoming,
-                                refusal,
-                            );
-                            false
-                        }
-                    },
-                }
-            });
-            if !marked {
-                if dequeued {
-                    let restored = self.preempt_reenqueue_current_cpu();
-                    crate::yarm_log!(
-                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback={}",
-                        "yield_current",
-                        tid,
-                        u8::from(restored == Some(tid))
-                    );
-                } else {
-                    crate::yarm_log!(
-                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback=not_needed",
-                        "yield_current",
-                        tid
-                    );
-                }
+            self.note_context_switch_if_task_changed(outgoing_tid, tid);
+            // Stage 199D-WA3A-R2-SEAL (item B): EXACT dispatch transition, chosen by the
+            // typed provenance the authoritative scheduler mutation produced. A refusal undoes
+            // exactly what that selection did — `preempt_reenqueue_only_on` for a genuine
+            // dequeue, nothing at all for a queue-neutral continuation — so no task is lost
+            // from a run queue and no blocked task is left as `current`.
+            if !self.commit_dispatch_selection_in_lock(selection, "yield_current") {
                 return Err(KernelError::TaskMissing);
             }
             if cfg!(not(feature = "hosted-dev")) && DEBUG_YIELD_LOG {
@@ -3632,7 +3544,10 @@ impl KernelState {
                 Ok::<_, KernelError>(())
             })?;
         }
-        let next_tid = self.on_preempt_prefer_current_cpu(target.0);
+        // Stage 199D-WA3A-R2-SEAL (item B): typed provenance, produced inside the
+        // authoritative scheduler mutation. Nothing below reconstructs it.
+        let selection = self.on_preempt_prefer_current_cpu_selection(target.0);
+        let next_tid = selection.tid().map(|t| t.0);
         let achieved = next_tid == Some(target.0);
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);
@@ -3640,61 +3555,13 @@ impl KernelState {
                 self.hal.switch_address_space(self.current_cpu(), asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
-            if outgoing_tid != Some(tid) {
-                self.with_ipc_state_mut(|ipc| {
-                    ipc.telemetry.scheduler_context_switches =
-                        ipc.telemetry.scheduler_context_switches.saturating_add(1);
-                });
-            }
-            // Stage 199D-WA3A: EXACT dispatch transition. `dispatch_next` returns the
-            // existing current WITHOUT dequeuing when one is set, so both `Runnable → Running`
-            // (a genuine dequeue) and `Running → Running` (a queue-neutral continuation) are
-            // legal; every other status is refused. A refusal after a genuine dequeue undoes
-            // the rank-1 mutation exactly with `preempt_reenqueue_only_on` — the existing
-            // inverse of `dispatch_next_on` — so no task is lost from a run queue and no
-            // blocked task is left as `current`.
-            let dequeued = outgoing_tid != Some(tid);
-            let marked = self.with_tcbs_mut(|tcbs| {
-                use crate::kernel::task_transition::{
-                    TaskTransition, apply_task_transition, log_transition_refusal,
-                };
-                match apply_task_transition(tcbs, tid, None, TaskTransition::DispatchIncoming) {
-                    Ok(_) => true,
-                    Err(_) => match apply_task_transition(
-                        tcbs,
-                        tid,
-                        None,
-                        TaskTransition::ContinueCurrent,
-                    ) {
-                        Ok(_) => true,
-                        Err(refusal) => {
-                            log_transition_refusal(
-                                "yield_current_to",
-                                tid,
-                                TaskTransition::DispatchIncoming,
-                                refusal,
-                            );
-                            false
-                        }
-                    },
-                }
-            });
-            if !marked {
-                if dequeued {
-                    let restored = self.preempt_reenqueue_current_cpu();
-                    crate::yarm_log!(
-                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback={}",
-                        "yield_current_to",
-                        tid,
-                        u8::from(restored == Some(tid))
-                    );
-                } else {
-                    crate::yarm_log!(
-                        "DISPATCH_REFUSED site={} tid={} scheduler_rollback=not_needed",
-                        "yield_current_to",
-                        tid
-                    );
-                }
+            self.note_context_switch_if_task_changed(outgoing_tid, tid);
+            // Stage 199D-WA3A-R2-SEAL (item B): EXACT dispatch transition, chosen by the
+            // typed provenance the authoritative scheduler mutation produced. A refusal undoes
+            // exactly what that selection did — `preempt_reenqueue_only_on` for a genuine
+            // dequeue, nothing at all for a queue-neutral continuation — so no task is lost
+            // from a run queue and no blocked task is left as `current`.
+            if !self.commit_dispatch_selection_in_lock(selection, "yield_current_to") {
                 return Err(KernelError::TaskMissing);
             }
         } else {
