@@ -7625,6 +7625,11 @@ pub struct KernelState {
     capability: CapabilitySubsystem,
     tid_allocation_policy: TidAllocationPolicy,
     tid_allocation_cursor: TidAllocationCursor,
+    /// Stage 199D-WA3B: monotonic source of spawn-reservation generations.
+    ///
+    /// Never derived from the TID, so a token minted for an earlier occupant of numeric TID `T`
+    /// can never match a later occupant of `T`. Advanced once per reservation and never reset.
+    spawn_reservation_generation: u64,
     tcbs: KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
     task_classes: KernelStorage<[Option<TaskClass>; MAX_TASKS]>,
     tls_restore_pending: KernelStorage<[Option<ThreadId>; MAX_TASKS]>,

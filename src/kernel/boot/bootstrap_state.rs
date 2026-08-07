@@ -672,6 +672,9 @@ impl Bootstrap {
                     INITIAL_DYNAMIC_TID,
                 )),
             );
+            // Stage 199D-WA3B: reservation generations start at 1 so a zero-valued generation
+            // can never accidentally match a real reservation.
+            core::ptr::addr_of_mut!((*state_ptr).spawn_reservation_generation).write(1);
             core::ptr::addr_of_mut!((*state_ptr).tcbs)
                 .write(store_kernel_value([const { None }; MAX_TASKS]));
             core::ptr::addr_of_mut!((*state_ptr).task_classes)

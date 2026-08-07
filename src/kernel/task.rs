@@ -52,6 +52,18 @@ pub enum FaultPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
     Runnable,
+    /// Stage 199D-WA3B: a one-shot **spawn reservation**, not a live task.
+    ///
+    /// Bootstrap must own a task's CNode, class and kernel-side provisioning BEFORE the spawn
+    /// runs, because the boot capability grants need a destination CNode. Historically that
+    /// pre-registration produced an ordinary `Runnable` TCB, which is exactly what let
+    /// `spawn_user_task_from_image` overwrite an arbitrary existing task.
+    ///
+    /// A `Reserved` task is deliberately none of the live states: it is not `Runnable`, so no
+    /// dispatch transition accepts it; it is not `Blocked(_)`, so no wake, timeout or waiter
+    /// path names it; and it is refused by `enqueue`, so it can never reach a run queue. It
+    /// leaves this state exactly once, through the typed spawn commit.
+    Reserved,
     /// Set only by `KernelState::dispatch_next_task()` / yield scheduling paths.
     /// Do not assign directly outside scheduler-mediated transitions.
     Running,
@@ -59,6 +71,31 @@ pub enum TaskStatus {
     Faulted,
     Exited(u64),
     Dead,
+}
+
+/// Stage 199D-WA3B: which half of the one-shot spawn protocol a reservation is in.
+///
+/// `ReservedUnstarted` is the resting state a reservation is created in and restored to if a
+/// spawn fails. `Spawning` is held only across a single `spawn_user_task_from_image` call, so a
+/// second consume of the same token cannot find a `ReservedUnstarted` reservation to claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnPhase {
+    /// Reserved and idle: provisioned, not started, consumable exactly once.
+    ReservedUnstarted,
+    /// Claimed by an in-flight spawn. Not consumable.
+    Spawning,
+}
+
+/// Stage 199D-WA3B: the authoritative reservation record carried by a `Reserved` TCB.
+///
+/// `generation` is drawn from a monotonic kernel counter, never from the TID, so a token minted
+/// for an earlier occupant of numeric TID `T` cannot authorize a later occupant of `T`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnReservation {
+    pub(crate) generation: u64,
+    pub(crate) class: TaskClass,
+    pub(crate) process_pid: u64,
+    pub(crate) phase: SpawnPhase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +257,11 @@ pub struct ThreadControlBlock {
     /// incarnation is refused, so a NEW receive can never observe an OLD result and no
     /// completion is observed twice.
     pub pending_syscall_completion: Option<BlockedSyscallCompletion>,
+    /// Stage 199D-WA3B: the one-shot spawn reservation this TCB carries, if it is one.
+    ///
+    /// `Some` exactly when `status == TaskStatus::Reserved`. Cleared by the typed live commit,
+    /// so a spawned task carries no residual reservation authority.
+    pub(crate) spawn_reservation: Option<SpawnReservation>,
 }
 
 /// Stage 200D — a generation-bearing reverse link from an authorized replier to the reply
@@ -356,7 +398,36 @@ impl ThreadControlBlock {
             server_reply_link: None,
             blocked_recv_generation: 0,
             pending_syscall_completion: None,
+            spawn_reservation: None,
         }
+    }
+
+    /// Stage 199D-WA3B: a NON-LIVE spawn reservation.
+    ///
+    /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not
+    /// silently acquire spawn-reservation semantics, and a reservation must not silently be an
+    /// ordinary live task. The only difference is the status and the reservation record — every
+    /// other field is the same default, so the pre-spawn provisioning bootstrap needs
+    /// (CNode/process association, class, kernel stack and kernel context) works unchanged.
+    pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self {
+        let mut tcb = Self::new(tid, None);
+        tcb.status = TaskStatus::Reserved;
+        // Stage 199D-WA3B PROCESS IDENTITY: `task_cnode` resolves a task's CNode through
+        // `thread_group_id`, so the reserved TCB must carry the OWNING PROCESS identity from the
+        // moment it exists — otherwise the pre-spawn capability grants this whole protocol exists
+        // to preserve would resolve to the wrong CNode. Storing `process_pid` in the reservation
+        // record alone would leave the two inconsistent.
+        tcb.thread_group_id = ThreadGroupId(reservation.process_pid);
+        tcb.spawn_reservation = Some(reservation);
+        tcb
+    }
+
+    /// Stage 199D-WA3B: is this TCB a non-live spawn reservation?
+    ///
+    /// The single predicate every scheduler / wake / waiter path uses, so "reserved" cannot come
+    /// to mean two different things in two different places.
+    pub fn is_spawn_reservation(&self) -> bool {
+        matches!(self.status, TaskStatus::Reserved)
     }
 }
 

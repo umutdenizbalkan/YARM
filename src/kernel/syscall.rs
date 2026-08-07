@@ -2627,7 +2627,7 @@ mod tests {
         let mut state = Bootstrap::init().expect("kernel");
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
         state
-            .spawn_user_task_from_image(crate::kernel::boot::UserImageSpec {
+            .reserve_and_spawn_user_task_from_image_for_test(crate::kernel::boot::UserImageSpec {
                 tid: 41,
                 entry: 0x4000,
                 asid: Some(asid),

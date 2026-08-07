@@ -1313,13 +1313,27 @@ pub fn bootstrap_first_user_task(
         return Err(crate::kernel::boot::KernelError::MemoryObjectMissing);
     };
 
-    if supervisor_aei.is_some() {
-        kernel.register_task_with_class(RING3_SUPERVISOR_TID, TaskClass::SystemServer)?;
-    }
-    if pm_aei.is_some() {
-        kernel.register_task_with_class(RING3_PM_SERVER_TID, TaskClass::SystemServer)?;
-    }
-    kernel.register_task_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)?;
+    // Stage 199D-WA3B: RESERVE, do not register. The pre-spawn capability grants below still
+    // need a destination CNode and kernel-side provisioning — a reservation owns exactly those —
+    // but a reservation is not a live task, so the spawns consume an exact one-shot token.
+    let supervisor_reservation = if supervisor_aei.is_some() {
+        Some(
+            kernel
+                .reserve_task_for_spawn_with_class(RING3_SUPERVISOR_TID, TaskClass::SystemServer)?,
+        )
+    } else {
+        None
+    };
+    let pm_reservation = if pm_aei.is_some() {
+        Some(
+            kernel
+                .reserve_task_for_spawn_with_class(RING3_PM_SERVER_TID, TaskClass::SystemServer)?,
+        )
+    } else {
+        None
+    };
+    let init_reservation =
+        kernel.reserve_task_for_spawn_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)?;
 
     let (_, pm_inbound_send_root, pm_inbound_recv_root) = kernel.create_endpoint(16)?;
     let pm_inbound_send_init = kernel.grant_capability_task_to_task_with_rights(
@@ -1512,14 +1526,19 @@ pub fn bootstrap_first_user_task(
         for n in 0..10usize {
             crate::yarm_log!("SUP_STARTUP_SLOT slot={} value={}", n, sup_args[n]);
         }
-        kernel.spawn_user_task_from_image(UserImageSpec {
-            tid: RING3_SUPERVISOR_TID,
-            entry: sup_entry,
-            asid: Some(sup_asid),
-            class: TaskClass::SystemServer,
-            startup_args: sup_args,
-            ..Default::default()
-        })?;
+        let supervisor_reservation =
+            supervisor_reservation.ok_or(crate::kernel::boot::KernelError::TaskMissing)?;
+        kernel.spawn_user_task_from_image(
+            supervisor_reservation,
+            UserImageSpec {
+                tid: RING3_SUPERVISOR_TID,
+                entry: sup_entry,
+                asid: Some(sup_asid),
+                class: TaskClass::SystemServer,
+                startup_args: sup_args,
+                ..Default::default()
+            },
+        )?;
         kernel.set_task_brk_bounds(RING3_SUPERVISOR_TID, sup_heap, sup_heap)?;
         crate::yarm_log!("YARM_SUPERVISOR_TID2_SPAWNED tid={}", RING3_SUPERVISOR_TID);
     }
@@ -1533,14 +1552,18 @@ pub fn bootstrap_first_user_task(
         if let Some(c) = pm_inbound_recv_pm {
             pm_args[17] = c.0;
         }
-        kernel.spawn_user_task_from_image(UserImageSpec {
-            tid: RING3_PM_SERVER_TID,
-            entry: pm_entry,
-            asid: Some(pm_asid),
-            class: TaskClass::SystemServer,
-            startup_args: pm_args,
-            ..Default::default()
-        })?;
+        let pm_reservation = pm_reservation.ok_or(crate::kernel::boot::KernelError::TaskMissing)?;
+        kernel.spawn_user_task_from_image(
+            pm_reservation,
+            UserImageSpec {
+                tid: RING3_PM_SERVER_TID,
+                entry: pm_entry,
+                asid: Some(pm_asid),
+                class: TaskClass::SystemServer,
+                startup_args: pm_args,
+                ..Default::default()
+            },
+        )?;
         kernel.set_task_brk_bounds(RING3_PM_SERVER_TID, pm_heap, pm_heap)?;
         crate::yarm_log!("YARM_PM_TID3_SPAWNED tid={}", RING3_PM_SERVER_TID);
     }
@@ -1783,14 +1806,17 @@ pub fn bootstrap_first_user_task(
         init_args[2],
         init_args[3]
     );
-    kernel.spawn_user_task_from_image(UserImageSpec {
-        tid: RING3_INIT_SERVER_TID,
-        entry: init_entry,
-        asid: Some(init_asid),
-        class: TaskClass::SystemServer,
-        startup_args: init_args,
-        ..Default::default()
-    })?;
+    kernel.spawn_user_task_from_image(
+        init_reservation,
+        UserImageSpec {
+            tid: RING3_INIT_SERVER_TID,
+            entry: init_entry,
+            asid: Some(init_asid),
+            class: TaskClass::SystemServer,
+            startup_args: init_args,
+            ..Default::default()
+        },
+    )?;
     kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, init_heap, init_heap)?;
     crate::yarm_log!(
         "YARM_INIT_DONE arch=riscv64 phase=kernel_static_init_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",

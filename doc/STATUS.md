@@ -1211,6 +1211,54 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    `ReservedUnstarted → LiveSpawned` TCB protocol (CAN 13 → 12).
    See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.36.
 
+   **WA3B: the last Group-3 CAN site is closed; spawn can no longer overwrite a live task.**
+   The WA3A hard-stop was that `spawn_user_task_from_image`'s only authorization was
+   `register_task_with_class` idempotence, so a spawn could overwrite an existing task's register
+   context, entry, stack, ASID and scheduler membership — a `Blocked(EndpointReceive)` receiver as
+   easily as an idle one. The literal absence gate was reverted because bootstrap legitimately
+   pre-registers the RING3 TIDs so the boot capability grants have a destination CNode.
+
+   The resolution is that "provisioned" and "live" were the same thing and should not be. A new
+   `TaskStatus::Reserved` carries a `SpawnReservation { generation, class, process_pid, phase }`,
+   created by `reserve_task_for_spawn_with_class` through the SAME capacity/CNode/class/kernel-
+   context provisioning ordinary registration uses — so bootstrap's dependency is unchanged — but
+   a reservation is not live: it cannot be enqueued (guards on both enqueue seams), cannot be
+   dispatched, cannot be woken, and cannot block or publish a waiter. Choosing a status variant
+   rather than a side field is what makes those hold structurally: every site that allow-lists
+   statuses now refuses reservations automatically, and only two exhaustive `TaskStatus` matches
+   existed in the kernel to update.
+
+   **Exact one-shot consumption.** `spawn_user_task_from_image(token, spec)` validates TID,
+   generation, class, process and phase atomically before ANY spawn-specific mutation, claims
+   `ReservedUnstarted → Spawning`, and commits `Spawning → LiveSpawned` strictly before the
+   enqueue — so nothing partial is ever scheduler-visible. The generation is monotonic and never
+   derived from the TID, so a token for an earlier occupant of a numeric TID cannot act on a
+   later one. `cancel_spawn_reservation` covers setup failing before spawn, validating read-only
+   first and reusing the existing `release_kernel_context` + no-alloc process-CNode reap.
+
+   **Failed spawn restores an exact baseline.** "All fallible work before any TCB mutation" is
+   *not* achievable — spawn binds the incoming ASID before the fallible stack allocation, because
+   the x86_64 switch-frame retry and the stack allocator both need it bound. So the claim captures
+   a `SpawnBaseline` of every field the body may write and a failure replays all of them: after an
+   ordinary error the reservation is observationally identical to the pre-claim reservation, with
+   no stale ASID or partial live identity and nothing enqueued. VM/capability cleanup on failure
+   is unchanged and remains a pre-existing gap this stage does not open.
+
+   All three architectures now bootstrap as **reserve → grant → consume**. The production caller
+   closure is **13**, not the 18 previously counted — that figure included six `#[cfg(test)]`
+   sites — and is pinned mechanically.
+
+   **Census: 12 / 16 / 7 / 2 / 1 / 0, total 38.** The two predicted movements hold exactly
+   (CAN 13 → 12, CANNOT 15 → 16). The total moved from 37 because `ThreadControlBlock::reserved`
+   is a genuinely new status writer, classified `FRESH_CONSTRUCTOR` alongside `new`; forcing 37
+   would have meant hiding it or hiding spawn's departure from the raw-write set. Composition:
+   29 raw writes + 8 transition-barriered + 1 reservation-barriered. Waiter ownership still has
+   **zero production callers**, `WAITER_OWNERSHIP_EXCLUSIVE=no`,
+   `WAITER_OWNER_CENSUS_COMPLETE=yes`, direct production default **OFF**, canonical 199D **OPEN**,
+   ledger **39 / 7 / 46**, **no new live cell**. Spawn work stops here; the next stage is
+   production endpoint-waiter ARM/RETIRE wiring.
+   See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.37.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and

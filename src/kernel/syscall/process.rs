@@ -346,18 +346,27 @@ pub(super) fn handle_spawn_process(
         parent_pid,
         startup_args_count
     );
+    // Stage 199D-WA3B: this site has no pre-spawn setup, so it reserves immediately before the
+    // spawn and consumes that exact reservation. `tid` came from `allocate_thread_id`, so the
+    // reservation refuses if anything already occupies it — the overwrite contract is gone.
+    let reservation = kernel
+        .reserve_task_for_spawn_with_class(tid, TaskClass::SystemServer)
+        .map_err(SyscallError::from)?;
     let spawned = kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid,
-            entry: elf.entry as usize,
-            asid: Some(asid),
-            class: TaskClass::SystemServer,
-            startup_args,
-            spawner_tid,
-            service_recv_cap,
-            service_reply_recv_cap,
-            extra_send_caps,
-        })
+        .spawn_user_task_from_image(
+            reservation,
+            UserImageSpec {
+                tid,
+                entry: elf.entry as usize,
+                asid: Some(asid),
+                class: TaskClass::SystemServer,
+                startup_args,
+                spawner_tid,
+                service_recv_cap,
+                service_reply_recv_cap,
+                extra_send_caps,
+            },
+        )
         .map_err(|err| {
             crate::yarm_log!(
                 "KSPAWN_SPAWN_TASK_FAIL tid={} asid={} err={:?}",
@@ -588,18 +597,27 @@ pub(super) fn handle_spawn_process_from_user_buf(
         parent_pid,
         startup_args_count
     );
+    // Stage 199D-WA3B: this site has no pre-spawn setup, so it reserves immediately before the
+    // spawn and consumes that exact reservation. `tid` came from `allocate_thread_id`, so the
+    // reservation refuses if anything already occupies it — the overwrite contract is gone.
+    let reservation = kernel
+        .reserve_task_for_spawn_with_class(tid, TaskClass::SystemServer)
+        .map_err(SyscallError::from)?;
     let spawned = kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid,
-            entry: elf.entry as usize,
-            asid: Some(asid),
-            class: TaskClass::SystemServer,
-            startup_args,
-            spawner_tid,
-            service_recv_cap,
-            service_reply_recv_cap,
-            extra_send_caps,
-        })
+        .spawn_user_task_from_image(
+            reservation,
+            UserImageSpec {
+                tid,
+                entry: elf.entry as usize,
+                asid: Some(asid),
+                class: TaskClass::SystemServer,
+                startup_args,
+                spawner_tid,
+                service_recv_cap,
+                service_reply_recv_cap,
+                extra_send_caps,
+            },
+        )
         .map_err(|err| {
             crate::yarm_log!(
                 "KSPAWN_SPAWN_TASK_FAIL tid={} asid={} err={:?}",
@@ -807,18 +825,27 @@ pub(super) fn handle_spawn_from_initramfs_file(
         service_send_cap
     };
 
+    // Stage 199D-WA3B: this site has no pre-spawn setup, so it reserves immediately before the
+    // spawn and consumes that exact reservation. `tid` came from `allocate_thread_id`, so the
+    // reservation refuses if anything already occupies it — the overwrite contract is gone.
+    let reservation = kernel
+        .reserve_task_for_spawn_with_class(tid, TaskClass::SystemServer)
+        .map_err(SyscallError::from)?;
     let spawned = kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid,
-            entry: elf.entry as usize,
-            asid: Some(asid),
-            class: TaskClass::SystemServer,
-            startup_args,
-            spawner_tid,
-            service_recv_cap,
-            service_reply_recv_cap,
-            extra_send_caps,
-        })
+        .spawn_user_task_from_image(
+            reservation,
+            UserImageSpec {
+                tid,
+                entry: elf.entry as usize,
+                asid: Some(asid),
+                class: TaskClass::SystemServer,
+                startup_args,
+                spawner_tid,
+                service_recv_cap,
+                service_reply_recv_cap,
+                extra_send_caps,
+            },
+        )
         .map_err(SyscallError::from)?;
 
     crate::yarm_log!("KSPAWN_FROM_CPIO spawned_tid={}", spawned.tid);
@@ -966,7 +993,10 @@ pub(super) fn handle_reap_faulted_task(
         | crate::kernel::task::TaskStatus::Dead => {}
         crate::kernel::task::TaskStatus::Runnable
         | crate::kernel::task::TaskStatus::Running
-        | crate::kernel::task::TaskStatus::Blocked(_) => {
+        | crate::kernel::task::TaskStatus::Blocked(_)
+        // Stage 199D-WA3B: a spawn reservation has never run, so it is not a faulted task to
+        // reap. Reaping one would destroy provisioning an in-flight bootstrap still needs.
+        | crate::kernel::task::TaskStatus::Reserved => {
             crate::yarm_log!(
                 "TASK_REAP_FAULTED_REJECT target_tid={} reason=non_terminal",
                 target
@@ -1181,18 +1211,27 @@ pub(super) fn handle_spawn_from_memory_object(
         service_send_cap
     };
 
+    // Stage 199D-WA3B: this site has no pre-spawn setup, so it reserves immediately before the
+    // spawn and consumes that exact reservation. `tid` came from `allocate_thread_id`, so the
+    // reservation refuses if anything already occupies it — the overwrite contract is gone.
+    let reservation = kernel
+        .reserve_task_for_spawn_with_class(tid, TaskClass::SystemServer)
+        .map_err(SyscallError::from)?;
     let spawned = kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid,
-            entry,
-            asid: Some(asid),
-            class: TaskClass::SystemServer,
-            startup_args,
-            spawner_tid,
-            service_recv_cap,
-            service_reply_recv_cap,
-            extra_send_caps,
-        })
+        .spawn_user_task_from_image(
+            reservation,
+            UserImageSpec {
+                tid,
+                entry,
+                asid: Some(asid),
+                class: TaskClass::SystemServer,
+                startup_args,
+                spawner_tid,
+                service_recv_cap,
+                service_reply_recv_cap,
+                extra_send_caps,
+            },
+        )
         .map_err(SyscallError::from)?;
 
     crate::yarm_log!(

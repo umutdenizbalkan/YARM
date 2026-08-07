@@ -607,7 +607,32 @@ impl KernelState {
         })
     }
 
+    /// Stage 199D-WA3B: refuse to make a non-live spawn reservation scheduler-visible.
+    ///
+    /// This is the structural half of "a reservation cannot be selected or enqueued": the run
+    /// queue carries bare TIDs with no status precondition, so the only place that can keep a
+    /// `Reserved` task out of it is the enqueue seam itself. Every enqueue path goes through
+    /// here, and the typed live commit is what clears `Reserved` — so a reservation becomes
+    /// enqueueable at exactly the moment it stops being a reservation, and not before.
+    fn refuse_enqueue_of_spawn_reservation(&self, tid: u64) -> Result<(), KernelError> {
+        let reserved = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .is_some_and(|tcb| tcb.is_spawn_reservation())
+        });
+        if reserved {
+            crate::yarm_log!(
+                "ENQUEUE_REFUSED tid={} reason=spawn_reservation_not_live",
+                tid
+            );
+            return Err(KernelError::WrongObject);
+        }
+        Ok(())
+    }
+
     pub(crate) fn enqueue_task(&mut self, tid: u64) -> Result<CpuId, KernelError> {
+        self.refuse_enqueue_of_spawn_reservation(tid)?;
         self.ensure_driver_affinity(tid)?;
         let priority = self.task_priority(tid)?;
         let mut sched = self.scheduler_state();
@@ -655,6 +680,7 @@ impl KernelState {
     }
 
     pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
+        self.refuse_enqueue_of_spawn_reservation(tid)?;
         let priority = self.task_priority(tid)?;
         let current_cpu = self.current_cpu();
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
@@ -740,6 +766,16 @@ impl KernelState {
     /// This is the canonical wake-transition point for cross-CPU `WakeTask`
     /// items.  The caller (or a test) can inspect the returned
     /// `CrossCpuWakeApplyResult` to determine which guard path was taken.
+    /// Test/hosted-only: drive the cross-CPU wake application directly.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn apply_cross_cpu_wake_task_for_test(
+        &mut self,
+        cpu: CpuId,
+        tid: ThreadId,
+    ) -> Result<CrossCpuWakeApplyResult, KernelError> {
+        self.apply_cross_cpu_wake_task(cpu, tid)
+    }
+
     pub(crate) fn apply_cross_cpu_wake_task(
         &mut self,
         cpu: CpuId,
@@ -761,6 +797,10 @@ impl KernelState {
                 TaskStatus::Runnable => Ok(CrossCpuWakeApplyResult::SkippedAlreadyRunnable),
                 TaskStatus::Running => Ok(CrossCpuWakeApplyResult::SkippedRunning),
                 TaskStatus::Faulted => Ok(CrossCpuWakeApplyResult::SkippedFaulted),
+                // Stage 199D-WA3B: a spawn reservation is not a live task. A cross-CPU wake
+                // naming it is either stale or malformed; it must never become Runnable, and
+                // must never be enqueued (the `Applied` arm below is what enqueues).
+                TaskStatus::Reserved => Ok(CrossCpuWakeApplyResult::SkippedReserved),
             }
         })?;
         if result == CrossCpuWakeApplyResult::Applied {

@@ -2260,29 +2260,99 @@ impl KernelState {
         })
     }
 
+    /// Stage 199D-WA3B: spawn a user task by consuming an EXACT one-shot reservation.
+    ///
+    /// `reservation` is the authority, not `spec.tid`. Before any spawn-specific mutation the
+    /// reservation is validated and claimed atomically under one rank-2 acquisition — exact TID,
+    /// exact generation, expected class, expected process, and phase `ReservedUnstarted` — so a
+    /// stale token, a duplicate token, a wrong class, a wrong process, or a TID whose TCB is
+    /// live, runnable, blocked, faulted, exited or dead all fail closed BEFORE any side effect.
+    ///
+    /// The task becomes scheduler-visible only after the typed `Spawning -> LiveSpawned` commit,
+    /// which is also what clears `TaskStatus::Reserved` — so `enqueue` cannot see it any earlier.
+    /// On an ordinary returned error the SAME reservation incarnation is restored to
+    /// `ReservedUnstarted`, keeping its generation, so the caller's token remains exactly as
+    /// valid as it was and the lifecycle never stays `Spawning`.
     pub fn spawn_user_task_from_image(
         &mut self,
+        reservation: crate::kernel::spawn_reservation::SpawnReservationToken,
         mut spec: UserImageSpec,
     ) -> Result<SpawnedUserTask, KernelError> {
         let cpu = self.current_cpu();
-        // Stage 199D-WA3A HARD-STOP: the "destination TID must be absent" precondition is
-        // NOT satisfiable by the current boot sequence, and was reverted rather than weakened.
-        //
-        // `src/arch/x86_64/boot.rs` (and its AArch64/RISC-V twins) deliberately calls
-        // `register_task_with_class(RING3_{SUPERVISOR,PM_SERVER,INIT_SERVER}_TID)` BEFORE these
-        // spawns, so the boot capability grants have a cnode and a kernel stack to target. The
-        // absence gate therefore refused the supervisor spawn on an ordinary `-smp 1` boot:
-        //
-        //     SPAWN_REFUSED_TID_PRESENT tid=2 reason=destination_not_absent
-        //     failed to bootstrap first user task: TaskTableFull
-        //
-        // Making this site CANNOT requires restructuring that register-then-grant-then-spawn
-        // sequence across three architectures — out of scope here, and not live-verifiable for
-        // AArch64 in this environment. A weaker predicate ("not endpoint-blocked") is refused on
-        // purpose: it would still permit overwriting a live `Runnable`/`Running` task's register
-        // context, entry point, stack and ASID. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.35 C.
-        //
-        // This site therefore stays **CAN** in the census.
+        if spec.tid != reservation.tid() {
+            crate::yarm_log!(
+                "SPAWN_RESERVATION_REFUSED site=spawn_user_task_from_image tid={} reason=spec_tid_mismatch reservation_tid={}",
+                spec.tid,
+                reservation.tid()
+            );
+            return Err(KernelError::WrongObject);
+        }
+        // Claim the reservation FIRST: everything below this line is spawn-specific mutation.
+        let baseline = self.with_tcbs_mut(|tcbs| {
+            crate::kernel::spawn_reservation::claim_for_spawn(tcbs, &reservation).map_err(
+                |refusal| {
+                    crate::kernel::spawn_reservation::log_reservation_refusal(
+                        "spawn_user_task_from_image",
+                        spec.tid,
+                        refusal,
+                    );
+                    KernelError::WrongObject
+                },
+            )
+        })?;
+        let tid = spec.tid;
+        match self.spawn_image_after_claim(&reservation, spec) {
+            Ok(spawned) => Ok(spawned),
+            Err(err) => {
+                // The reservation lifecycle is transactional: restore the SAME incarnation, so
+                // it never stays `Spawning` after an ordinary returned error and the caller's
+                // token stays exactly as valid as it was.
+                let restored = self.with_tcbs_mut(|tcbs| {
+                    crate::kernel::spawn_reservation::restore_after_failed_spawn(
+                        tcbs,
+                        &reservation,
+                        baseline,
+                    )
+                    .is_ok()
+                });
+                crate::yarm_log!(
+                    "SPAWN_FAILED_RESERVATION_RESTORED tid={} restored={} err={:?}",
+                    tid,
+                    u8::from(restored),
+                    err
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// Test/hosted-only: reserve and immediately consume, for tests whose subject is something
+    /// other than the reservation protocol itself.
+    ///
+    /// Deliberately NOT available in production: every production caller states its own
+    /// reservation, because where the reservation comes from is exactly what this stage makes
+    /// explicit. This helper still goes through the real reservation path, so it inherits the
+    /// refusal on an occupied TID — it is a convenience, not a bypass.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub fn reserve_and_spawn_user_task_from_image_for_test(
+        &mut self,
+        spec: UserImageSpec,
+    ) -> Result<SpawnedUserTask, KernelError> {
+        let reservation = self.reserve_task_for_spawn_with_class(spec.tid, spec.class)?;
+        self.spawn_user_task_from_image(reservation, spec)
+    }
+
+    /// The spawn body proper, entered only with the reservation already claimed
+    /// (`Spawning`). Every `?` here returns to the caller above, which restores the reservation.
+    fn spawn_image_after_claim(
+        &mut self,
+        reservation: &crate::kernel::spawn_reservation::SpawnReservationToken,
+        mut spec: UserImageSpec,
+    ) -> Result<SpawnedUserTask, KernelError> {
+        let cpu = self.current_cpu();
+        // Stage 199D-WA3B: the WA3A hard-stop is closed. The destination is no longer "any TID
+        // the caller names" — it is the exact reservation claimed above, which by construction
+        // was never a live task. Registration idempotence is no longer spawn authorization.
         if spec.entry == 0 {
             return Err(KernelError::WrongObject);
         }
@@ -2317,7 +2387,9 @@ impl KernelState {
         // same tid, which the post-register invariant below (`tcb_count > 1`) detects
         // after `register_task_with_class` has (idempotently) claimed the slot.
         let spawn_lc = crate::kernel::boot::spawn_lifecycle_enabled();
-        self.register_task_with_class(spec.tid, spec.class)?;
+        // Stage 199D-WA3B: no registration here. The TCB, CNode, class and kernel context were
+        // provisioned by `reserve_task_for_spawn_with_class`, and the reservation is already
+        // claimed — so this spawn cannot create, and cannot overwrite, anything.
         crate::yarm_log!("SPAWN_TASK_REGISTER_OK tid={}", spec.tid);
         if spawn_lc {
             crate::yarm_log!("SPAWN_LIFECYCLE_TCB_ALLOC_OK tid={}", spec.tid);
@@ -2649,9 +2721,25 @@ impl KernelState {
             {
                 tcb.cpu_affinity = Some(CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID));
             }
-            tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        // Stage 199D-WA3B: the EXACT one-shot commit `Spawning -> LiveSpawned`. This is the only
+        // place a reserved TCB becomes `Runnable`, it clears the reservation record so the token
+        // can never be consumed again, and it runs strictly BEFORE the enqueue below — so the
+        // task becomes scheduler-visible only after a fully successful image construction.
+        self.with_tcbs_mut(|tcbs| {
+            crate::kernel::spawn_reservation::commit_live_spawn(tcbs, reservation).map_err(
+                |refusal| {
+                    crate::kernel::spawn_reservation::log_reservation_refusal(
+                        "spawn_user_task_from_image/commit",
+                        spec.tid,
+                        refusal,
+                    );
+                    KernelError::WrongObject
+                },
+            )
+        })?;
+        crate::yarm_log!("SPAWN_TASK_LIVE_COMMIT_OK tid={}", spec.tid);
         crate::yarm_log!("SPAWN_TASK_CONTEXT_OK tid={}", spec.tid);
         if spawn_lc {
             crate::yarm_log!("SPAWN_LIFECYCLE_THREAD_READY tid={}", spec.tid);
