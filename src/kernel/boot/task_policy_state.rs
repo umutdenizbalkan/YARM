@@ -214,7 +214,7 @@ impl KernelState {
     ///
     /// These only READ or drive existing production seams; none of them is a second lifecycle
     /// authority.
-    #[cfg(any(test, feature = "hosted-dev"))]
+    #[cfg(test)]
     pub(crate) fn wake_task_for_test(&mut self, tid: u64) -> Result<(), KernelError> {
         self.wake_tid_to_runnable_for_test(ThreadId(tid))
     }
