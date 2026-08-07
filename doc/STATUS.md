@@ -940,11 +940,12 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    assertion exactly as `DIRECT_ACK_STORE_CAPACITY` is — so a finished incarnation holds its slot
    only until the next incarnation of that endpoint claims it; three 10 001-cycle tests
    (claim/restore, claim/consume, claim/cancel) confirm it never exhausts, a live claim is never
-   evicted, and an out-of-range index is a typed fail-closed error. (2) Rank-3 ownership is now
-   structural rather than documentary: the table is a private field of `IpcSubsystem`
-   (`waiter_ownership_stores = 1`), every raw claim/settle method is module-private, and the whole
-   cross-module surface is six typed `IpcSubsystem::waiter_ownership_*` methods, so ownership
-   cannot be mutated through the task, scheduler, capability, VM or broad-state APIs at all. (3)
+   evicted, and an out-of-range index is a typed fail-closed error. (2) The table became a private field of
+   `IpcSubsystem` (`waiter_ownership_stores = 1`) with every raw method module-private, so
+   ownership cannot be *operated* through the task, scheduler, capability, VM or broad-state APIs
+   at all. (R2 corrects the wording that called a boot-domain reference to it "inert": a boot
+   sibling cannot call a method on the table but could still replace it wholesale, so the accurate
+   description is rank-3 co-location plus source-guarded encapsulation.) (3)
    The claim token is opaque — private fields, no forgeable struct literal, no exposure of the
    live claim generation — and `wrapping_add` is replaced by `checked_add` with a typed
    `ClaimGenerationExhausted` that leaves both the slot and the counter untouched, so an ancient
@@ -964,14 +965,251 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    each reaching a `Blocked(_)` task by numeric TID (or unconditionally) while consulting no
    endpoint waiter. Four are provably out of reach from the source; twelve assign a status with no
    guard on the previous one, so their negative rests on a dynamic invariant the source does not
-   establish. **`WAITER_OWNER_CENSUS_COMPLETE=no`** rather than an unsupported exhaustive claim;
-   proving those twelve negatives is prerequisite work for any `WAITER_OWNERSHIP_EXCLUSIVE=yes`.
+   establish, so at WA2A-R1 the verdict was recorded as incomplete rather than as an unsupported
+   exhaustive claim. **WA2B-CENSUS resolves all twelve** — see below.
 
    Still helper-only: zero production call sites, neither late waiter claim moved, no timeout,
    notification, shared-region or teardown path converted. `WAITER_OWNERSHIP_EXCLUSIVE` remains
    **no**, the x86 direct production default remains **OFF** on every architecture, canonical 199D
    stays **OPEN**, the ledger stays **39 / 7 / 46**, RISC-V links/status are unchanged and **no new
    live cell** is earned. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.32.
+
+   **WA2A-R2: the primitive rejected stale tokens but ACCEPTED stale claim requests.** R1's
+   `claim` installed a key whenever it differed from the terminal one, reading "different key" as
+   "a newer incarnation is taking over". A key states which incarnation, never when, so
+   `claim A → consume A → claim B → consume B → delayed claim A` minted a fresh token for the
+   older, already-finished incarnation A. Reproduced against `e3e5de91` before the repair.
+
+   `claim` no longer installs a key at all. A slot is armed for exactly one current incarnation by
+   `arm_current` — which the eventual authoritative waiter-publication path will call under the
+   same ipc rank-3 acquisition that installs the receive-waiter — and released by
+   `retire_current`; `claim` succeeds only from `Available` holding that exact key, `restore`
+   returns to `Available` rather than `Vacant` (unarming there would reopen the same hole through
+   the rollback path), a live claim can be neither armed over nor retired nor evicted, and a stale
+   arm or retire can neither erase nor displace the current incarnation. The table stays bounded
+   and leak-free with an **explicit obligation**: a terminal slot blocks its endpoint index until
+   retired — fail-closed, but a liveness duty the wiring increment inherits. Three 10 001-cycle
+   tests assert nothing is left occupied.
+
+   The view is truthful now too: R1 reported `Vacant` both for an out-of-range endpoint index and
+   for a key different from the one occupying the slot, each of which implied a claim would
+   succeed. It distinguishes `EndpointIndexOutOfRange`, `Vacant`, `Available`, `Claimed{owner}`,
+   `Consumed`, `Cancelled` and `ForeignIncarnation{holding}`, carries no claim generation, and a
+   test walks every state asserting that whenever the view is not `Available`, `claim` fails.
+
+   The encapsulation claim is corrected rather than restated: a boot sibling cannot call any
+   method on the table, but the field and `vacant()` are visible within `crate::kernel::boot`, so
+   it could replace the whole table by assignment, `mem::replace`/`swap` or a raw pointer write.
+   Route 2 is taken — **rank-3 co-location plus source-guarded encapsulation, not complete
+   type-system-enforced inertness** — and a guard rejects every one of those forms outside the
+   ownership module, with a non-vacuity check and a positive control that only the declaration and
+   the single initializer name the field.
+
+   Sixteen mutations, all caught (the ten from R1 re-run, plus six for the lifecycle). Still
+   helper-only with **zero production callers**; neither late direct waiter claim moved.
+   `WAITER_OWNERSHIP_EXCLUSIVE=no` (census completeness was still open here; WA2B-CENSUS below
+   raises it to `yes`), x86 direct production
+   default **OFF** on every architecture, canonical 199D **OPEN**, ledger **39 / 7 / 46**, RISC-V
+   links/status unchanged, **no new live cell**. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.33.
+
+   **WA2B-CENSUS: the wake-owner census is complete, and the answer is worse than hoped.** All
+   twelve rows WA2A-R1 left unproven are resolved, and **nine resolved against the comfortable
+   answer**. `dispatch_next_task`, both halves of `yield_current` and `yield_current_to`,
+   `d6_genuine_mark_running_via_task_seam` and `direct_dispatch_rollback_split` are all **CAN**,
+   because `crates/yarm-kernel/src/scheduler.rs` contains *zero* occurrences of `TaskStatus` — the
+   run queue carries bare TIDs with no status precondition, and no status is read between the
+   dequeue and the `Running` write. `fault_current_task_with_fault` is CAN because it selects by
+   `current`, never by status. `spawn_user_task_from_image` is CAN because `spec.tid` is
+   caller-supplied at 24 sites and `register_task_with_class` is *idempotent*, so an existing —
+   possibly endpoint-blocked — TID passes straight through to the `Runnable` write. Only three
+   resolved to CANNOT, each closed locally: the AP client spawn sits inside
+   `task_status(client_tid).is_none()`, and `spawn_user_thread` and `fork_complete_post_clone`
+   bind their TID from `allocate_thread_id`, which returns a candidate only where
+   `task_status(candidate).is_none()` and otherwise fails closed.
+
+   The verdict is **computed, not asserted**: a guard extracts `(file, enclosing fn, count)`
+   mechanically for all 37 sites and compares it against the classification table, so an
+   unclassified writer cannot exist. **CAN 21 / CANNOT 7 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 1 /
+   NON_PRODUCTION 1 / UNPROVEN 0 = 37**, giving **`WAITER_OWNER_CENSUS_COMPLETE=yes`**. No runtime
+   code was changed to reach that verdict. Every CANNOT pins both its guard and its caller
+   closure, and both closure shapes are local — a value-level filter over every TCB, or a TID
+   bound inside the function behind a fail-closed check — so there is no "helper trusted by its
+   callers" anywhere in the set.
+
+   The owner/origin matrix (design only) is repaired by WA2B-MATRIX-R1 below; its first version
+   conflated writer sites with logical origins.
+
+   Also repaired: the `WaiterOwnershipView` contract. R2 said `Available` meant a claim would
+   succeed; with the generation counter saturated an `Available` slot rejects with
+   `ClaimGenerationExhausted`. The implementation is unchanged and correct — only the contract was
+   overstated. `Available` now means armed-and-unclaimed and is the **only slot state structurally
+   eligible** for a claim, and the replacement test proves all three parts including the exhausted
+   case, which stays `Available` and mutates nothing.
+
+   **`WAITER_OWNERSHIP_EXCLUSIVE` remains `no`.** Completing the census says who the owners are; it
+   does not make them arbitrate — not one of the 21 routes through the primitive. Still
+   helper-only with zero production callers; neither late direct waiter claim moved. x86 direct
+   production default **OFF** on every architecture, canonical 199D **OPEN**, ledger
+   **39 / 7 / 46**, RISC-V links/status unchanged, **no new live cell**. See
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.34.
+
+   **WA2B-MATRIX-R1: the owner matrix was wrong in five ways, and the census guard was too
+   coarse.** Documentation and `cfg(test)` only — production executable code is byte-identical to
+   `213bb4e4`, and the accepted verdict (CAN 21 / CANNOT 7 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 1 /
+   NON_PRODUCTION 1 / UNPROVEN 0, `WAITER_OWNER_CENSUS_COMPLETE=yes`,
+   `WAITER_OWNERSHIP_EXCLUSIVE=no`) is unchanged.
+
+   *Writers vs origins.* The first matrix put a "eight status-writer sites" heading over ten
+   *path* rows and listed `ipc_reply` as a direct caller of `wake_tid_to_runnable` when the real
+   chain is `ipc_reply` → `apply_scheduler_wake_plan` → `wake_tid_to_runnable`. The two layers are
+   now separate: the 21 writer sites, and the exact direct production caller set of every helper
+   writer — `wake_tid_to_runnable` 3, `apply_scheduler_wake_plan` 11,
+   `apply_split_receiver_wake_plan` 5, `wake_waiter_for_endpoint` 3, `apply_cross_cpu_wake_task` 1,
+   `rt_commit_receiver_runnable` 2 — each pinned by a guard so a new caller class forces the matrix
+   to be re-derived.
+
+   *Terminal origins.* `rt_commit_receiver_runnable` has two callers carrying **different**
+   terminal claimants: `complete_reply_timeout_over` (`TimedOut`, `TerminalClaimant::Timeout`) and
+   `complete_server_death_over` (`ServerDied`, `TerminalClaimant::PeerDeath`). Mapping ServerDied
+   onto `OrdinaryTimeout` was wrong. Both callers reach the writer having **already won** the
+   reply-terminal cell, so the open question is how an already-won terminal claimant translates
+   into waiter ownership; `WaiterOwner` has no variant for it, recorded as a prerequisite. The enum
+   is **not** changed here.
+
+   *Notification is not an endpoint owner.* `signal_notification` and
+   `wake_destroyed_notification_waiter` take a bare TID, guard only on `Blocked(_)`, and never read
+   `endpoint_waiters`. The earlier matrix said they should claim and **cancel** the endpoint slot —
+   which would let a stale notification destroy a live endpoint wait, turning a lost notification
+   into a lost IPC reply. Retracted. Both move into the production-enforced refusal set, with the
+   required repair recorded: generation-bearing notification waiter identity, a
+   notification-specific blocked reason, stale → clear or ignore, and never consume, cancel or
+   retire an unrelated endpoint waiter. Whether `WaiterOwner::Notification` becomes obsolete after
+   that is recorded as open, and the variant is kept.
+
+   *Three origins, three policies.* `wake_tid_to_runnable` is split: D2 receive-publication
+   rollback (not delivery — must prove no slot is armed); genuine endpoint delivery via
+   `wake_waiter_for_endpoint` (a valid claimant); and a generic `SchedulerWakePlan::Wake(tid)` whose
+   11 origins span at least five causes, where a bare TID is insufficient and the plan must carry a
+   typed cause or `apply_scheduler_wake_plan` must refuse in production. Cross-CPU wakes get the
+   same treatment: five typed `WorkItem` forms, only the endpoint-delivery one may carry a token,
+   and every form must carry `{tid, asid}` to reject stale TID reuse. There is currently **no
+   production producer** of `WorkItem::WakeTask` — a guard asserts that, so the work stays
+   prerequisite rather than remedial.
+
+   *Group-3 preconditions.* `debug_assert` is explicitly rejected — it compiles out of release
+   kernels, so the proof would not exist where it matters. Each of the five sites gets an exact
+   expected transition (`Runnable → Running` only for dispatch; `Running → Runnable` only for
+   yield; the exact transaction predecessor for rollback; current-and-running for fault; **absence**
+   for spawn) with a fail-closed action. For `spawn_user_task_from_image` two near-misses are
+   recorded explicitly: `register_task_with_class` idempotence is not a precondition because it
+   *returns `Ok(())`* for an existing TID, and checking "not `Blocked(EndpointReceive)`" would still
+   permit overwriting the entry point, stack, ASID and register context of a `Runnable` or `Running`
+   victim.
+
+   *The drift guard.* `(file, enclosing fn, count)` could not see a count-preserving substitution
+   inside one function. Each of the 37 sites is now pinned by an exact-site fingerprint — file,
+   enclosing function, normalized LHS, assigned status expression, and the exact preceding and
+   following non-blank non-comment source lines. Four mutations confirm it: a one-line reorder,
+   **removing one assignment and adding an identical one elsewhere in the same function**, swapping
+   `Runnable`/`Running` within `yield_current`, and a brand-new assignment — all four caught, where
+   the first two passed under the old fingerprint. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.34 E.
+
+   **WA3A: eight of the nine Group-3 sites are now refused in production; CAN shrinks 21 → 13.**
+   The first WA3 increment that changes production executable code. A new module,
+   `src/kernel/task_transition.rs`, provides a typed **release-build** fail-closed transition
+   barrier — `debug_assert` was rejected outright, since it compiles out of exactly the builds
+   where the proof must hold. Six typed transitions (`DispatchIncoming`, `ContinueCurrent`,
+   `PreemptOutgoing`, `PreemptOutgoingIdle`, `RollbackDispatchedIncoming`, `FaultRunningCurrent`),
+   no set-status escape hatch, typed refusals that write no TCB field, and optional incarnation
+   identity so a recycled numeric TID cannot authorize a transition on a replacement task.
+
+   **No partial scheduler/TCB commit.** Both yields' outgoing transition and the fault path
+   validate *before* either authoritative mutation — the fault precondition now runs ahead of
+   `block_current_cpu`, which was previously an irreversible rank-1 commit with the status check
+   after it. `dispatch_next_task`, both yields' incoming and the D6 seam use exact rollback via
+   the pre-existing `preempt_reenqueue_only_on` / `preempt_reenqueue_current_cpu` — the inverse of
+   `dispatch_next_on` — so **no new scheduler primitive was needed**. `direct_dispatch_rollback_
+   split` became a typed transaction: if the task half is refused, the scheduler half is skipped,
+   because re-enqueuing a task this transaction does not own could displace a live `current`. No
+   new broad-lock acquisition and no task(2) → scheduler(1) inversion. The D6 seam gained a `cpu`
+   parameter and a `bool` return; all eleven x86_64/AArch64/RISC-V trap-drain call sites now skip
+   the resume on refusal.
+
+   **Spawn: HARD-STOP.** The absence gate was implemented and then reverted. x86 boot (and its
+   AArch64/RISC-V twins) calls `register_task_with_class(RING3_{SUPERVISOR,PM,INIT}_TID)` BEFORE
+   the matching spawns, so the gate refused the kernel's own supervisor on an ordinary `-smp 1`
+   boot: `SPAWN_REFUSED_TID_PRESENT tid=2` → `failed to bootstrap first user task: TaskTableFull`.
+   That is live evidence, and it only surfaced after a **rebuild**: the first core-smoke run
+   reported PASS against a stale prebuilt artifact, because the smoke script boots artifacts and
+   does not rebuild them. No weaker predicate was substituted — "not `Blocked(EndpointReceive)`"
+   would still permit overwriting a live task's context, stack, ASID and capabilities — so
+   `spawn_user_task_from_image` stays **CAN**, and CAN shrinks 21 → **13**, not 12. The gap is
+   pinned by a test asserting the current overwrite behaviour plus a guard that the boot sequence
+   still pre-registers, so the hard-stop is falsifiable rather than narrated.
+
+   **A real invariant break surfaced.** The idle task (TID 0) is `current` while `Runnable` — the
+   rank-1 scheduler makes it current with no mark-running step. Rather than weaken
+   `PreemptOutgoing`, that case gets its own `PreemptOutgoingIdle` transition which the primitive
+   refuses for any TID but `IDLE_TID`; a test drives an ordinary task into the same state and
+   confirms it is still refused.
+
+   Census recomputed, not edited: **29 remaining raw writes + 8 barriered sites = 37**, giving
+   **CAN 13 / CANNOT 15 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 1 / NON_PRODUCTION 1 / UNPROVEN 0**.
+   The 13 remaining CAN paths are the eight endpoint-delivery owners, four teardown paths, and
+   spawn pending the C repair. Nine mutations, each removing one production check, all caught by
+   a named behavioural test. Waiter ownership still has **zero production callers**,
+   `WAITER_OWNERSHIP_EXCLUSIVE=no`, `WAITER_OWNER_CENSUS_COMPLETE=yes`, x86 direct production
+   default **OFF**, NR6/NR7 late claims unchanged, canonical 199D **OPEN**, ledger **39 / 7 / 46**,
+   RISC-V unchanged, **no new live cell**. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.35.
+
+   **WA3A-R2-SEAL: the R1 repair had introduced a torn state of its own; WA3A is now sealed.**
+   WA3A-R1 typed the dispatch provenance, and in doing so created this: a non-idle `Running`
+   current with no ASID performed a legal `Running → Running`, `DispatchMarkToken::new` then
+   refused for want of an exact incarnation, the common failure branch rolled the status back to
+   `Runnable`, and `undo_dispatch_selection(ContinuedCurrent)` correctly mutated no scheduler
+   state — leaving `current = T` with `status(T) = Runnable`. The "rollback" was the corruption.
+   Identity resolution moved **inside** the same rank-2 acquisition as the transition and
+   strictly before it, so a missing identity refuses with the TCB untouched and there is nothing
+   to undo but the scheduler step.
+
+   **Provenance reconstruction is gone from the whole Group-3 cohort.** R1 left the three in-lock
+   sites computing `let dequeued = outgoing_tid != Some(tid);`, which is not merely inelegant but
+   wrong: a lone task that yields is re-enqueued and then genuinely dequeued again, so outgoing
+   == incoming while the queue really did advance — and a refusal would have skipped the
+   re-enqueue and lost the only runnable task. `KernelState` gained the provenance-preserving
+   `*_selection` seams and all three sites now commit through ONE shared
+   `commit_dispatch_selection_in_lock`. The old try-`DispatchIncoming`-then-`ContinueCurrent`
+   fallback went with it — inferring the transition from which one succeeds would launder a
+   double-queued `Running` task through the dequeue path.
+
+   **A second idle finding, handled the same way as the first.** Making the transition exact
+   showed that the idle/bootstrap task's status is not governed by the ordinary contract at all:
+   boot leaves TID 0 `Running` and re-dequeues it, while a queue-neutral step finds it
+   `Runnable`. Rather than weaken either ordinary transition, each got an idle-only twin
+   (`RedispatchIdleAlreadyRunning`, `ContinueCurrentIdle`), refused for every TID but `IDLE_TID`,
+   joining `PreemptOutgoingIdle` from WA3A.
+
+   **Three more seals.** Dequeue rollback now takes a sealed `DequeuedDispatchMarkToken` whose
+   only constructor checks the provenance, so presenting a continuation is unrepresentable rather
+   than refused late. The off-lock seams authenticate the requested CPU against the authoritative
+   dispatch CPU **before any mutation** and return a CPU-bound `CpuDispatch`, so the mark seam
+   takes no `cpu` argument and no caller can stamp an unverified CPU into rollback authority.
+   `may_resume()` is removed: all eleven x86_64/AArch64/RISC-V consumers now match all five
+   outcomes explicitly and route `RefusedTorn` to a divergent `dispatch_torn_fatal` — never a
+   resume, a fallback dispatch, an idle halt or a return to userspace. The AArch64 post-mark
+   resume drives ASID activation, context/TLS restore and the completion take off the token's
+   exact `{tid, asid}`, so a replacement incarnation that reused the TID is refused instead of
+   resumed.
+
+   Census unchanged in every class — **CAN 13 / CANNOT 15 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 1
+   / NON_PRODUCTION 1 / UNPROVEN 0** — with three rows moved from `exec_state.rs` (10 → 7) to
+   `scheduler_state.rs` (1 → 4) because the in-lock dispatch mark is now one shared commit.
+   Waiter ownership still has **zero production callers**, `WAITER_OWNERSHIP_EXCLUSIVE=no`,
+   `WAITER_OWNER_CENSUS_COMPLETE=yes`, direct production default **OFF**, NR6/NR7 late claims
+   unchanged, spawn still **hard-stopped** and CAN, canonical 199D **OPEN**, ledger
+   **39 / 7 / 46**, **no new live cell**. WA3A is sealed; the next increment is the one-shot
+   `ReservedUnstarted → LiveSpawned` TCB protocol (CAN 13 → 12).
+   See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.36.
 
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.

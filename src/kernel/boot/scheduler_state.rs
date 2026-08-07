@@ -224,26 +224,51 @@ impl KernelState {
     /// `D6_DISPATCH_SCHED_PHASE_DONE` — none of these are required for
     /// acceptance.
     pub fn local_dispatch_step_split(&mut self) -> Option<u64> {
+        self.local_dispatch_step_split_selection()
+            .tid()
+            .map(|tid| tid.0)
+    }
+
+    /// Stage 199D-WA3A-R2-SEAL (item B) — the provenance-preserving form of
+    /// `local_dispatch_step_split`.
+    ///
+    /// `dispatch_next_on` returns the existing `current` WITHOUT dequeuing whenever one is set
+    /// and is not idle, so no caller can tell a genuine dequeue from a queue-neutral
+    /// continuation after the fact. This returns what the authoritative mutation actually did,
+    /// produced inside it, so the in-lock Group-3 callers never reconstruct a `dequeued` bool
+    /// from `outgoing_tid != Some(tid)` — a reconstruction that is simply wrong for the
+    /// lone-task yield, where the outgoing task is re-enqueued and then genuinely dequeued
+    /// again (outgoing == incoming, yet the provenance is `Dequeued`).
+    pub(crate) fn local_dispatch_step_split_selection(
+        &mut self,
+    ) -> crate::kernel::scheduler::DispatchSelection {
         let cpu = self.current_cpu();
         crate::yarm_log!("D6_DISPATCH_SPLIT_BEGIN cpu={}", cpu.0);
-        let next = {
+        let selection = {
             let mut sched = self.scheduler_state();
-            kernel_mut(&mut sched.scheduler)
-                .dispatch_next_on(cpu)
-                .map(|tid| tid.0)
+            kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu)
         };
+        let next = selection.tid().map(|tid| tid.0);
         crate::yarm_log!("D6_DISPATCH_SCHED_PHASE_DONE cpu={} tid={:?}", cpu.0, next);
         self.note_d6_local_dispatch();
         crate::yarm_log!("D6_LOCAL_DISPATCH cpu={} tid={:?}", cpu.0, next);
-        next
+        selection
     }
 
     pub fn on_preempt_current_cpu(&mut self) -> Option<u64> {
+        self.on_preempt_current_cpu_selection()
+            .tid()
+            .map(|tid| tid.0)
+    }
+
+    /// Stage 199D-WA3A-R2-SEAL (item B) — the provenance-preserving form of
+    /// `on_preempt_current_cpu`.
+    pub(crate) fn on_preempt_current_cpu_selection(
+        &mut self,
+    ) -> crate::kernel::scheduler::DispatchSelection {
         let cpu = self.current_cpu();
         let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler)
-            .on_preempt_on(cpu)
-            .map(|tid| tid.0)
+        kernel_mut(&mut sched.scheduler).on_preempt_selection_on(cpu)
     }
 
     /// Stage 192B: re-enqueue the current task on the current CPU and clear the current
@@ -262,11 +287,125 @@ impl KernelState {
     /// next task.  Returns the TID of the new current task (which is `preferred`
     /// when it was runnable, or the FIFO head otherwise).
     pub(crate) fn on_preempt_prefer_current_cpu(&mut self, preferred: u64) -> Option<u64> {
+        self.on_preempt_prefer_current_cpu_selection(preferred)
+            .tid()
+            .map(|tid| tid.0)
+    }
+
+    /// Stage 199D-WA3A-R2-SEAL (item B) — the provenance-preserving form of
+    /// `on_preempt_prefer_current_cpu`.
+    pub(crate) fn on_preempt_prefer_current_cpu_selection(
+        &mut self,
+        preferred: u64,
+    ) -> crate::kernel::scheduler::DispatchSelection {
         let cpu = self.current_cpu();
         let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler)
-            .on_preempt_prefer_on(cpu, ThreadId(preferred))
-            .map(|tid| tid.0)
+        kernel_mut(&mut sched.scheduler).on_preempt_prefer_selection_on(cpu, ThreadId(preferred))
+    }
+
+    /// Stage 199D-WA3A-R2-SEAL — count a context switch iff the RESUMED task differs from the
+    /// outgoing one.
+    ///
+    /// This is a TELEMETRY question ("did the running task change?"), not a provenance one
+    /// ("was the run queue advanced?"). The two are genuinely different: a lone task that yields
+    /// is re-enqueued and then genuinely dequeued again, so the queue advanced while the running
+    /// task did not change. Whether the queue advanced is `DispatchSelection`'s business and is
+    /// produced inside the authoritative scheduler mutation; it must never be inferred from
+    /// here. Kept as one named helper so the comparison exists in exactly one place.
+    pub(crate) fn note_context_switch_if_task_changed(
+        &mut self,
+        outgoing_tid: Option<u64>,
+        incoming: u64,
+    ) {
+        if outgoing_tid != Some(incoming) {
+            self.with_ipc_state_mut(|ipc| {
+                ipc.telemetry.scheduler_context_switches =
+                    ipc.telemetry.scheduler_context_switches.saturating_add(1);
+            });
+        }
+    }
+
+    /// Stage 199D-WA3A-R2-SEAL (item B) — mark the selected task `Running` through the EXACT
+    /// transition its provenance licenses, or undo exactly what the selection did.
+    ///
+    /// `DispatchIncoming` (`Runnable → Running`) for a genuine dequeue, `ContinueCurrent`
+    /// (`Running → Running`) for a queue-neutral continuation — chosen by the provenance the
+    /// authoritative scheduler mutation produced. Never by trying one transition and falling
+    /// back to the other (which would let a double-queued `Running` task be laundered through
+    /// the dequeue path), and never by a reconstructed `outgoing_tid != Some(tid)`.
+    ///
+    /// Returns `true` iff the task is now in its post-transition status. On `false` the
+    /// scheduler step has already been undone exactly and `DISPATCH_REFUSED` emitted, so the
+    /// caller only has to decline.
+    pub(crate) fn commit_dispatch_selection_in_lock(
+        &mut self,
+        selection: crate::kernel::scheduler::DispatchSelection,
+        site: &'static str,
+    ) -> bool {
+        use crate::kernel::scheduler::DispatchSelection;
+        use crate::kernel::task_transition::{
+            TaskTransition, apply_dispatch_transition, log_transition_refusal,
+        };
+        let (tid, transition) = match selection {
+            // Nothing was selected, so there is nothing to mark and nothing to undo.
+            DispatchSelection::Idle => return true,
+            DispatchSelection::Dequeued { tid } => (tid.0, TaskTransition::DispatchIncoming),
+            DispatchSelection::ContinuedCurrent { tid } => (tid.0, TaskTransition::ContinueCurrent),
+        };
+        let marked = self.with_tcbs_mut(|tcbs| {
+            // `apply_dispatch_transition` carries the idle-only fallback: the idle/bootstrap
+            // task is placed in and out of `current` by the rank-1 scheduler without a
+            // mark-running step, so it is `Running` after boot and `Runnable` after a
+            // queue-neutral step. Each idle twin is refused for every other TID, so a
+            // double-queued ORDINARY task still fails closed.
+            apply_dispatch_transition(tcbs, tid, transition)
+                .map_err(|refusal| log_transition_refusal(site, tid, transition, refusal))
+                .is_ok()
+        });
+        if !marked {
+            self.undo_dispatch_selection_in_lock(selection, site);
+        }
+        marked
+    }
+
+    /// Stage 199D-WA3A-R2-SEAL (item B) — undo exactly what an in-lock `selection` did to the
+    /// scheduler, and nothing more.
+    ///
+    /// The in-lock twin of `SharedKernel::undo_dispatch_selection`. `ContinuedCurrent` removed
+    /// no runqueue entry, so `preempt_reenqueue_current_cpu` must NOT run for it: doing so
+    /// would enqueue the current task, which for a `Blocked(EndpointReceive)` current is
+    /// exactly the unarbitrated wake Stage 199D exists to prevent. Emits `DISPATCH_REFUSED`
+    /// with the provenance that decided the undo.
+    pub(crate) fn undo_dispatch_selection_in_lock(
+        &mut self,
+        selection: crate::kernel::scheduler::DispatchSelection,
+        site: &'static str,
+    ) {
+        use crate::kernel::scheduler::DispatchSelection;
+        match selection {
+            DispatchSelection::Idle => {
+                crate::yarm_log!(
+                    "DISPATCH_REFUSED site={} tid=none scheduler_rollback=not_needed",
+                    site
+                );
+            }
+            DispatchSelection::ContinuedCurrent { tid } => {
+                crate::yarm_log!(
+                    "DISPATCH_REFUSED site={} tid={} scheduler_rollback=not_needed",
+                    site,
+                    tid.0
+                );
+            }
+            DispatchSelection::Dequeued { tid } => {
+                let restored = self.preempt_reenqueue_current_cpu();
+                crate::yarm_log!(
+                    "DISPATCH_REFUSED site={} tid={} scheduler_rollback={}",
+                    site,
+                    tid.0,
+                    u8::from(restored == Some(tid.0))
+                );
+            }
+        }
     }
 
     /// Stage 199A2D2C2C: preempt the current task on a SPECIFIC `cpu`, preferring `preferred` as the

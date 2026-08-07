@@ -1029,7 +1029,12 @@ fn destroy_aspace_with_blocked_ipc_waiter_and_preemption_preserves_ordering() {
         Some(0b11)
     );
 
-    assert!(state.on_preempt_current_cpu().is_some());
+    // Stage 199D-WA3A-R2-SEAL: preempt through the BARRIERED path. The raw
+    // `on_preempt_current_cpu` seam re-enqueues the outgoing task without moving its status,
+    // leaving a `Running` task in the run queue — exactly the double-queued state the exact
+    // `DispatchIncoming` transition now refuses. No production site calls the raw seam.
+    state.yield_current().expect("preempt");
+    assert!(state.current_tid().is_some());
     if state.current_tid() != Some(2) {
         state.yield_current().expect("reschedule task2");
     }
@@ -11667,7 +11672,12 @@ fn stage113_d6_dispatch_seam_anchor_present_and_called_once() {
         "local_dispatch_step_split must remain present in scheduler_state.rs"
     );
     let exec_src = include_str!("exec_state.rs");
-    let calls = exec_src.matches("self.local_dispatch_step_split()").count();
+    // Stage 199D-WA3A-R2-SEAL (item B): the anchor is the provenance-preserving form. The
+    // legacy `local_dispatch_step_split()` is a thin wrapper over it, so there is still exactly
+    // ONE queue-manipulating call.
+    let calls = exec_src
+        .matches("self.local_dispatch_step_split_selection()")
+        .count();
     assert_eq!(
         calls, 1,
         "dispatch_next_task must call local_dispatch_step_split exactly once"
@@ -11687,12 +11697,16 @@ fn stage113_d6_phase_a_lock_dropped_before_phase_b_side_effects() {
         .expect("dispatch_ready_task must exist after dispatch_next_task");
     let body = &exec_src[body_start..body_end];
     let phase_a = body
-        .find("self.local_dispatch_step_split()")
+        .find("self.local_dispatch_step_split_selection()")
         .expect("Phase A call must be present");
     for phase_b_marker in [
         "self.hal.switch_address_space(",
         "self.maybe_switch_kernel_context(",
-        "tcb.status = TaskStatus::Running;",
+        // Stage 199D-WA3A: the raw `tcb.status = Running` write became an EXACT
+        // `Runnable → Running` transition through the production barrier. Stage
+        // 199D-WA3A-R2-SEAL moved that barrier into the ONE shared in-lock commit, chosen by
+        // typed provenance. Same Phase-B position, stronger contract.
+        "self.commit_dispatch_selection_in_lock(selection, \"dispatch_next_task\")",
     ] {
         let pos = body
             .find(phase_b_marker)
@@ -33278,7 +33292,9 @@ mod stage114_d3_vm_brk_shrink_live {
         let exec_src = include_str!("exec_state.rs");
         assert!(sched_src.contains("pub fn local_dispatch_step_split"));
         assert_eq!(
-            exec_src.matches("self.local_dispatch_step_split()").count(),
+            exec_src
+                .matches("self.local_dispatch_step_split_selection()")
+                .count(),
             1,
             "dispatch_next_task must still call local_dispatch_step_split exactly once"
         );
@@ -53106,7 +53122,7 @@ mod stage168_d6_genuine_b_and_d2_recv {
     #[test]
     fn stage168_mut_dispatch_out_of_lock_call_site() {
         assert!(
-            RUNTIME_SRC.contains("dispatch_next_on(dispatch_cpu)")
+            RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)")
                 && RUNTIME_SRC.contains("self.with_scheduler_split_mut("),
             "the mutating dispatch seam must call dispatch_next_on under the scheduler seam"
         );
@@ -53136,7 +53152,7 @@ mod stage168_d6_genuine_b_and_d2_recv {
             .find("D6_GENUINE_MUT_DISPATCH_ELIGIBLE")
             .expect("eligible marker");
         let step_idx = EXEC_STATE_SRC
-            .find("let next = self.local_dispatch_step_split();")
+            .find("let selection = self.local_dispatch_step_split_selection();")
             .expect("in-lock authoritative dispatch must still exist");
         assert!(
             defer_idx < step_idx,
@@ -53467,10 +53483,15 @@ mod stage168b_d2_recv_genuine_completion {
         let m_idx = RUNTIME_SRC
             .find("fn d2_recv_dispatch_step_mut")
             .expect("recv dispatch seam");
-        let body = &RUNTIME_SRC[m_idx..m_idx + 700];
+        let body = &RUNTIME_SRC[m_idx..m_idx + 1600];
         assert!(
-            body.contains("dispatch_next_on(dispatch_cpu)"),
+            body.contains("dispatch_next_selection_on(dispatch_cpu)"),
             "the recv dispatch must be the authoritative queue-advancing dispatch_next_on"
+        );
+        // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates the CPU before mutating.
+        assert!(
+            body.contains("DISPATCH_STEP_REFUSED_CPU_MISMATCH"),
+            "the recv dispatch seam must authenticate the caller's CPU before any mutation"
         );
     }
 
@@ -53793,10 +53814,15 @@ mod stage169_d2_send_genuine {
         let m_idx = RUNTIME_SRC
             .find("fn d2_send_dispatch_step_mut")
             .expect("send dispatch seam");
-        let body = &RUNTIME_SRC[m_idx..m_idx + 700];
+        let body = &RUNTIME_SRC[m_idx..m_idx + 1600];
         assert!(
-            body.contains("dispatch_next_on(dispatch_cpu)"),
+            body.contains("dispatch_next_selection_on(dispatch_cpu)"),
             "the send dispatch must be the authoritative queue-advancing dispatch_next_on"
+        );
+        // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates the CPU before mutating.
+        assert!(
+            body.contains("DISPATCH_STEP_REFUSED_CPU_MISMATCH"),
+            "the send dispatch seam must authenticate the caller's CPU before any mutation"
         );
     }
 
@@ -60946,7 +60972,7 @@ mod stage192a_queue_advancing_dispatch {
             TRAP_SRC.contains("futex_wait_was_deferred")
                 && TRAP_SRC.contains("shared.futex_wait_reverify_blocked(t)")
                 && TRAP_SRC.contains("shared.futex_wait_dispatch_step_mut(cpu)")
-                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
                 && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
             "the trap-entry futex drain must reverify + dispatch-step + mark-running + restore"
         );
@@ -60986,7 +61012,7 @@ mod stage192a_queue_advancing_dispatch {
     fn dispatch_step_uses_authoritative_dispatch_next_on() {
         assert!(
             RUNTIME_SRC.contains("pub(crate) fn futex_wait_dispatch_step_mut(")
-                && RUNTIME_SRC.contains(".dispatch_next_on(dispatch_cpu)")
+                && RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)")
                 && RUNTIME_SRC.contains("pub(crate) fn futex_wait_reverify_blocked("),
             "the futex dispatch-step must use the authoritative dispatch_next_on + reverify"
         );
@@ -61032,7 +61058,10 @@ mod stage192a_queue_advancing_dispatch {
         // Reverify passes (still Blocked(Futex)).
         assert!(shared.futex_wait_reverify_blocked(blocked));
         // Queue-advancing dispatch: dequeues `next`, sets it current.
-        let incoming = shared.futex_wait_dispatch_step_mut(CpuId(0));
+        let incoming = shared
+            .futex_wait_dispatch_step_mut(CpuId(0))
+            .tid()
+            .map(|t| t.0);
         assert_eq!(
             incoming,
             Some(next),
@@ -61087,7 +61116,13 @@ mod stage192a_queue_advancing_dispatch {
         let _ = state.block_current_cpu();
         let shared = SharedKernel::new(state);
         // No other runnable ⇒ dispatch idles (the init-park case).
-        assert_eq!(shared.futex_wait_dispatch_step_mut(CpuId(0)), None);
+        assert_eq!(
+            shared
+                .futex_wait_dispatch_step_mut(CpuId(0))
+                .tid()
+                .map(|t| t.0),
+            None
+        );
         // FutexWake split wakes the waiter exactly once.
         assert_eq!(shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX), 1);
         shared.with(|k| assert_eq!(k.task_status(waiter), Some(TaskStatus::Runnable)));
@@ -61142,14 +61177,14 @@ mod stage192b_yield_queue_advancing_dispatch {
         );
         assert!(
             EXEC_SRC.contains("YIELD_INLOCK_DISPATCH_FALLBACK")
-                && EXEC_SRC.contains("let next_tid = self.on_preempt_current_cpu();"),
+                && EXEC_SRC.contains("let selection = self.on_preempt_current_cpu_selection();"),
             "the in-lock on_preempt fallback must be preserved"
         );
         assert!(
             TRAP_SRC.contains("yield_was_deferred")
                 && TRAP_SRC.contains("shared.yield_reverify_ready(cpu)")
                 && TRAP_SRC.contains("shared.yield_dispatch_step_mut(cpu)")
-                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
                 && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
             "the trap-entry yield drain must reverify + dispatch-step + mark-running + restore"
         );
@@ -61178,7 +61213,7 @@ mod stage192b_yield_queue_advancing_dispatch {
         assert!(
             SCHED_SRC.contains("pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId>")
                 && RUNTIME_SRC.contains("pub(crate) fn yield_dispatch_step_mut(")
-                && RUNTIME_SRC.contains(".dispatch_next_on(dispatch_cpu)"),
+                && RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)"),
             "the re-enqueue-only split + authoritative dispatch-step must exist"
         );
         // ReapFaultedTask stays global-lock-only.
@@ -61235,7 +61270,7 @@ mod stage192b_yield_queue_advancing_dispatch {
         let shared = SharedKernel::new(state);
         // Reverify passes (current cleared) and the dispatch selects the FIFO head (other).
         assert!(shared.yield_reverify_ready(CpuId(0)));
-        let incoming = shared.yield_dispatch_step_mut(CpuId(0));
+        let incoming = shared.yield_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0);
         assert_eq!(incoming, Some(other), "dispatch selects the FIFO head");
         shared.with(|k| {
             assert_eq!(
@@ -61281,7 +61316,10 @@ mod stage192b_yield_queue_advancing_dispatch {
         });
         assert_eq!(state.preempt_reenqueue_current_cpu(), Some(solo));
         let shared = SharedKernel::new(state);
-        assert_eq!(shared.yield_dispatch_step_mut(CpuId(0)), Some(solo));
+        assert_eq!(
+            shared.yield_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
+            Some(solo)
+        );
         shared.with(|k| assert_eq!(k.current_tid_on_cpu(CpuId(0)), Some(solo)));
     }
 
@@ -71878,7 +71916,7 @@ mod stage195g_aarch64_yield_dispatch {
             "the Yield mechanism must be default-on (no enable-knob gate)"
         );
         assert!(
-            body.contains("self.on_preempt_current_cpu();"),
+            body.contains("self.on_preempt_current_cpu_selection();"),
             "ineligible/failed cases must fall back to the legacy in-lock on_preempt dispatch"
         );
         assert!(
@@ -72896,7 +72934,7 @@ mod stage196d_riscv_queue_switch_foundation {
         );
         // Before the restore, B is set current + marked Running via the accepted rank-2 task seam.
         assert!(
-            RISCV_TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+            RISCV_TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
                 && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}"),
             "the incoming task must be marked Running via the accepted task seam before restore"
         );
@@ -73589,7 +73627,7 @@ mod stage196g_riscv_yield_default_on {
         );
         assert!(
             EXEC_STATE_SRC.contains("RISCV_YIELD_DISPATCH_FALLBACK reason=reenqueue_failed")
-                && EXEC_STATE_SRC.contains("self.on_preempt_current_cpu();"),
+                && EXEC_STATE_SRC.contains("self.on_preempt_current_cpu_selection();"),
             "a re-enqueue failure must clear + fall back to the legacy on_preempt path"
         );
     }
@@ -104987,6 +105025,12 @@ mod stage199d_aarch64_offlock_dispatch {
         (k, out_asid, in_asid)
     }
 
+    /// Stage 199D-WA3A-R2-SEAL: the exact-incarnation mark token for `INCOMING` as a genuine
+    /// dequeue on CPU 0 — the authority the drain actually holds after a successful mark.
+    fn incoming_token(k: &SharedKernel, in_asid: Asid) -> crate::runtime::DispatchMarkToken {
+        k.stale_dispatch_mark_token_for_test(CpuId(0), INCOMING, in_asid)
+    }
+
     /// Give the incoming task a distinctive saved context so a restore can be checked exactly.
     fn save_context(k: &SharedKernel, tid: u64, pc: usize) -> TrapFrame {
         let mut f = TrapFrame::new(6, [0x1, 0x2, 0x3, 0x4, 0x5, 0x6]);
@@ -105168,7 +105212,7 @@ mod stage199d_aarch64_offlock_dispatch {
         );
         // Settlement happens anyway, and the dequeue legitimately selects that very caller.
         assert_eq!(
-            k.futex_wait_dispatch_step_mut(CpuId(0)),
+            k.futex_wait_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
             Some(OUTGOING),
             "the woken caller is a normal dispatch candidate"
         );
@@ -105206,7 +105250,10 @@ mod stage199d_aarch64_offlock_dispatch {
         );
         // The debt is still owed and still settleable: another task is runnable.
         k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
-        assert_eq!(k.futex_wait_dispatch_step_mut(CpuId(0)), Some(INCOMING));
+        assert_eq!(
+            k.futex_wait_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
+            Some(INCOMING)
+        );
         dd::reset();
     }
 
@@ -105266,7 +105313,7 @@ mod stage199d_aarch64_offlock_dispatch {
         // WITHOUT restoring a frame, and that primitive never returns.
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         let drain = TRAP_ENTRY
-            .split("match shared.futex_wait_dispatch_step_mut(cpu) {")
+            .split("match dispatch.tid().map(|t| t.0) {")
             .nth(1)
             .and_then(|s| s.split("Some(inc) => {").next())
             .expect("the dequeue None arm");
@@ -105381,9 +105428,13 @@ mod stage199d_aarch64_offlock_dispatch {
         k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
 
         // Commit the scheduler mutation, exactly as the drain does.
-        let inc = k.futex_wait_dispatch_step_mut(CpuId(0)).expect("dequeue");
+        let dispatch = k.futex_wait_dispatch_step_mut(CpuId(0));
+        let inc = dispatch.tid().map(|t| t.0).expect("dequeue");
         assert_eq!(inc, INCOMING);
-        k.d6_genuine_mark_running_via_task_seam(Some(inc));
+        let token = k
+            .d6_genuine_mark_running_via_task_seam(dispatch)
+            .token()
+            .expect("mark must mint a token");
         assert_eq!(k.current_tid_authoritative(CpuId(0)), Some(INCOMING));
         assert_eq!(
             k.with(|s| s.task_status(INCOMING)),
@@ -105393,13 +105444,17 @@ mod stage199d_aarch64_offlock_dispatch {
         // FAULT INJECTION: the task has no saved context, so the restore cannot proceed.
         // (The fixture never saved one for INCOMING.)
         assert!(
-            k.direct_dispatch_restore_context_split(INCOMING).is_some(),
+            k.direct_dispatch_restore_context_split(token).is_some(),
             "sanity: a registered task does have a (zeroed) context"
         );
 
         // Roll back and check all three coordinates are exactly as before the dequeue.
         assert!(
-            k.direct_dispatch_rollback_split(CpuId(0), inc),
+            k.direct_dispatch_rollback_split(
+                token
+                    .into_dequeued_authority()
+                    .expect("a genuine dequeue is dequeue authority")
+            ),
             "rollback must succeed"
         );
         assert_eq!(
@@ -105414,7 +105469,7 @@ mod stage199d_aarch64_offlock_dispatch {
         );
         // The task is back on the run queue — not lost.
         assert_eq!(
-            k.futex_wait_dispatch_step_mut(CpuId(0)),
+            k.futex_wait_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
             Some(INCOMING),
             "the rolled-back task must still be dispatchable"
         );
@@ -105433,7 +105488,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .expect("the direct dispatch drain");
         // The only two paths out after a dequeue are a successful dispatch or the fatal path.
         assert!(
-            drain.contains("shared.direct_dispatch_rollback_split(cpu, inc)")
+            drain.contains("shared.direct_dispatch_rollback_split(a)")
                 && drain.contains("enter_post_lock_dispatch_fatal("),
             "a failed dispatch must roll back exactly and take the explicit fatal path"
         );
@@ -105457,7 +105512,7 @@ mod stage199d_aarch64_offlock_dispatch {
         crate::arch::hal::reset_all_active_address_spaces();
         // CPU 0 activates the incoming task's address space.
         assert_eq!(
-            k.direct_dispatch_activate_asid_split(CpuId(0), INCOMING),
+            k.direct_dispatch_activate_asid_split(incoming_token(&k, in_asid)),
             Some(in_asid.0)
         );
         assert_eq!(
@@ -105488,11 +105543,11 @@ mod stage199d_aarch64_offlock_dispatch {
     /// never hand back the outgoing task's frame.
     #[test]
     fn the_restore_can_never_return_the_outgoing_tasks_frame() {
-        let (k, _out, _in) = fixture();
+        let (k, _out, in_asid) = fixture();
         let _outgoing_frame = save_context(&k, OUTGOING, 0xDEAD_BEEF);
         let incoming_frame = save_context(&k, INCOMING, 0x1234_5678);
         let (restored, _) = k
-            .direct_dispatch_restore_context_split(INCOMING)
+            .direct_dispatch_restore_context_split(incoming_token(&k, in_asid))
             .expect("incoming context");
         let mut target = TrapFrame::new(6, [0; 6]);
         target.apply_user_context(restored);
@@ -105507,15 +105562,15 @@ mod stage199d_aarch64_offlock_dispatch {
     /// The pending TLS restore is delivered and taken exactly once.
     #[test]
     fn the_incoming_tls_is_restored_exactly_once() {
-        let (k, _out, _in) = fixture();
+        let (k, _out, in_asid) = fixture();
         let _ = save_context(&k, INCOMING, 0x5000);
         k.with(|s| s.set_thread_tls_base(INCOMING, 0x7000).expect("tls base"));
         let (_, tls) = k
-            .direct_dispatch_restore_context_split(INCOMING)
+            .direct_dispatch_restore_context_split(incoming_token(&k, in_asid))
             .expect("context");
         assert_eq!(tls, Some(0x7000));
         let (_, again) = k
-            .direct_dispatch_restore_context_split(INCOMING)
+            .direct_dispatch_restore_context_split(incoming_token(&k, in_asid))
             .expect("context");
         assert_eq!(again, None, "the TLS restore request is taken once");
         dd::reset();
@@ -105581,7 +105636,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .and_then(|s| s.split("\n    // Stage 192A").next())
             .expect("the direct dispatch drain");
         assert!(drain.contains("shared.futex_wait_dispatch_step_mut(cpu)"));
-        assert!(drain.contains("shared.d6_genuine_mark_running_via_task_seam(Some(inc))"));
+        assert!(drain.contains("d6_genuine_mark_running_via_task_seam(dispatch)"));
         assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch"));
         // The rollback uses the existing exact inverse of the dequeue, not a new primitive.
         const RUNTIME: &str = include_str!("../../runtime.rs");
@@ -112682,11 +112737,12 @@ mod stage199d_wa2a_ownership_boundary {
         }
     }
 
-    /// The table's own claim/settle methods are module-private, so a `&mut WaiterOwnershipTable`
-    /// obtained anywhere else in the boot domain is inert. The ONLY usable surface is the typed
-    /// `IpcSubsystem` methods.
+    /// Every method on the table is module-private, so the typed `IpcSubsystem` methods are the
+    /// only way to **operate** it. This is encapsulation by source guard, not by the type system:
+    /// whole-table replacement is refused separately, by
+    /// `no_boot_sibling_can_replace_or_borrow_the_ownership_table`.
     #[test]
-    fn the_raw_table_methods_are_private_and_the_only_surface_is_ipc_subsystem() {
+    fn the_raw_table_methods_are_private_and_operations_go_through_ipc_subsystem() {
         let table_impl = OWNERSHIP
             .split("impl WaiterOwnershipTable {")
             .nth(1)
@@ -112699,10 +112755,13 @@ mod stage199d_wa2a_ownership_boundary {
             "consume",
             "restore",
             "cancel",
+            "arm_current",
+            "retire_current",
             "validate",
             "stamp",
             "view",
             "claimed_count",
+            "occupied_count",
         ] {
             assert!(
                 table_impl.contains(&alloc::format!("    fn {raw}(")),
@@ -112718,18 +112777,21 @@ mod stage199d_wa2a_ownership_boundary {
             table_impl.contains("pub(in crate::kernel::boot) const fn vacant()"),
             "the constructor is boot-domain scoped"
         );
-        // The cross-module surface is exactly the six IpcSubsystem methods.
+        // The intended cross-module surface is exactly these nine IpcSubsystem methods.
         let surface = OWNERSHIP
             .split("impl IpcSubsystem {")
             .nth(1)
             .expect("the surface impl");
         for method in [
+            "waiter_ownership_arm_current",
             "waiter_ownership_claim",
             "waiter_ownership_consume",
             "waiter_ownership_restore",
             "waiter_ownership_cancel",
+            "waiter_ownership_retire_current",
             "waiter_ownership_view",
             "waiter_ownership_claimed_count",
+            "waiter_ownership_occupied_count",
         ] {
             assert!(
                 surface.contains(&alloc::format!("pub(crate) fn {method}(")),
@@ -112738,8 +112800,203 @@ mod stage199d_wa2a_ownership_boundary {
         }
         assert_eq!(
             surface.matches("pub(crate) fn ").count(),
-            6,
+            9,
             "and nothing else is exposed"
+        );
+    }
+
+    /// **D, route 2.** The field and `vacant()` are visible inside `crate::kernel::boot`, so a
+    /// boot sibling could technically replace the whole table by assignment, `mem::replace`,
+    /// `mem::swap` or a raw pointer write even though it cannot call a single method on it. The
+    /// type system does not stop that; this guard does. Outside the ownership module and the
+    /// single initializer, none of those forms — nor a direct borrow of the field — may appear.
+    #[test]
+    fn no_boot_sibling_can_replace_or_borrow_the_ownership_table() {
+        const OWNERSHIP_MODULE: &str = "src/kernel/boot/waiter_ownership.rs";
+        const INITIALIZER: &str = "src/kernel/boot/bootstrap_state.rs";
+        const DECLARATION: &str = "src/kernel/boot/defs.rs";
+        const FORBIDDEN: &[&str] = &[
+            ".waiter_ownership =",
+            "waiter_ownership = ",
+            "mem::replace(&mut",
+            "mem::swap(&mut",
+            "ptr::write(&mut",
+            "&mut ipc.waiter_ownership",
+            "&ipc.waiter_ownership",
+            "&mut self.waiter_ownership",
+            "&self.waiter_ownership",
+        ];
+        let mut offenders: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut checked = 0usize;
+        for (rel, src) in production_sources() {
+            if rel == OWNERSHIP_MODULE {
+                continue;
+            }
+            checked += 1;
+            for form in FORBIDDEN {
+                if src.contains(form) {
+                    offenders.push(alloc::format!("{rel}: `{form}`"));
+                }
+            }
+        }
+        assert!(
+            checked > 50,
+            "the walk must have covered the tree, not a stub ({checked} files)"
+        );
+        assert!(
+            offenders.is_empty(),
+            "the ownership table may only be replaced or borrowed inside its own module: \
+             {offenders:?}"
+        );
+        // Positive control: outside the module, exactly two files name the field at all — the
+        // declaration and the single struct-literal initializer.
+        let mut namers: alloc::vec::Vec<alloc::string::String> = production_sources()
+            .into_iter()
+            .filter(|(rel, src)| rel != OWNERSHIP_MODULE && src.contains("waiter_ownership:"))
+            .map(|(rel, _)| rel)
+            .collect();
+        namers.sort();
+        assert_eq!(
+            namers,
+            alloc::vec![INITIALIZER.to_string(), DECLARATION.to_string()],
+            "only the declaration and the single initializer name the field"
+        );
+        // …and the documents say so, rather than claiming type-system inertness.
+        assert!(
+            OWNERSHIP.contains("not complete\n//! type-system-enforced inertness")
+                || OWNERSHIP.contains("not complete type-system-enforced inertness"),
+            "the module doc must describe this accurately"
+        );
+        assert!(
+            AUDIT.contains("not complete type-system-enforced inertness")
+                || AUDIT.contains("rank-3 co-location plus source-guarded encapsulation"),
+            "§6.1.33 must describe this accurately"
+        );
+        for overclaim in [
+            "and **inert**, because every method that could mutate it is private",
+            "so a standalone table is useless even where one is nameable",
+        ] {
+            assert!(
+                !AUDIT.contains(overclaim) && !OWNERSHIP.contains(overclaim),
+                "the WA2A-R1 overclaim `{overclaim}` must not survive"
+            );
+        }
+    }
+
+    /// **A.** The lifecycle is arm → claim → settle → retire, stated in source: `claim` never
+    /// installs a key, `restore` returns to `Available`, and a live claim cannot be retired.
+    #[test]
+    fn the_slot_lifecycle_is_arm_claim_settle_retire() {
+        let production = OWNERSHIP
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production prefix");
+        for state in [
+            "    Vacant,",
+            "    Available { key: WaiterKey },",
+            "    Consumed { key: WaiterKey },",
+            "    Cancelled { key: WaiterKey },",
+        ] {
+            assert!(
+                production.contains(state),
+                "the slot state machine must carry `{state}`"
+            );
+        }
+        let claim = production
+            .split("\n    fn claim(")
+            .nth(1)
+            .expect("claim")
+            .split("\n    /// Validate")
+            .next()
+            .expect("claim end");
+        assert!(
+            claim.contains("ClaimError::NoCurrentWaiter")
+                && claim.contains("ClaimError::NoSuchCurrentIncarnation"),
+            "claim must refuse an unarmed slot and a foreign incarnation, each by name"
+        );
+        assert!(
+            !claim.contains("= WaiterOwnershipSlot::Available"),
+            "claim must never WRITE an Available slot — only `arm_current` installs a key \
+             (matching on the pattern is how it reads the armed incarnation)"
+        );
+        let arm = production
+            .split("\n    fn arm_current(")
+            .nth(1)
+            .expect("arm")
+            .split("\n    /// Take ownership")
+            .next()
+            .expect("arm end");
+        assert!(
+            arm.contains("ArmError::SlotOccupied"),
+            "arming must never displace an occupied slot"
+        );
+        let restore = production
+            .split("\n    fn restore(")
+            .nth(1)
+            .expect("restore")
+            .split("\n    /// Terminal abandonment")
+            .next()
+            .expect("restore end");
+        assert!(
+            restore.contains("WaiterOwnershipSlot::Available { key: token.key }")
+                && !restore.contains("WaiterOwnershipSlot::Vacant"),
+            "restore must re-arm the exact incarnation, not unarm the slot"
+        );
+        let retire = production
+            .split("\n    fn retire_current(")
+            .nth(1)
+            .expect("retire")
+            .split("\n    /// The state of")
+            .next()
+            .expect("retire end");
+        assert!(
+            retire.contains("RetireError::LiveClaim")
+                && retire.contains("RetireError::NoSuchCurrentIncarnation"),
+            "retire must refuse both a live claim and a stale key"
+        );
+    }
+
+    /// **C.** The view distinguishes all the required cases and never implies a foreign or
+    /// out-of-range key is claimable.
+    #[test]
+    fn the_view_is_truthful_and_fail_closed() {
+        let view = OWNERSHIP
+            .split("pub(crate) enum WaiterOwnershipView {")
+            .nth(1)
+            .expect("the view enum")
+            .split("\n}")
+            .next()
+            .expect("view end");
+        for variant in [
+            "EndpointIndexOutOfRange,",
+            "Vacant,",
+            "Available,",
+            "Claimed { owner: WaiterOwner },",
+            "Consumed,",
+            "Cancelled,",
+            "ForeignIncarnation { holding: WaiterSlotKind },",
+        ] {
+            assert!(
+                view.contains(variant),
+                "the view must distinguish `{variant}`"
+            );
+        }
+        assert!(
+            !view.contains("claim_generation"),
+            "the public state view must not carry the live claim generation"
+        );
+        let body = OWNERSHIP
+            .split("\n    fn view(&self, key: &WaiterKey)")
+            .nth(1)
+            .expect("view fn")
+            .split("\n    /// Live (claimed")
+            .next()
+            .expect("view fn end");
+        assert!(
+            body.contains("WaiterOwnershipView::EndpointIndexOutOfRange")
+                && body.contains("WaiterOwnershipView::ForeignIncarnation"),
+            "an out-of-range index and a foreign incarnation must each get their own answer, \
+             never Vacant"
         );
     }
 
@@ -112752,10 +113009,12 @@ mod stage199d_wa2a_ownership_boundary {
                 continue;
             }
             for method in [
+                "waiter_ownership_arm_current",
                 "waiter_ownership_claim",
                 "waiter_ownership_consume",
                 "waiter_ownership_restore",
                 "waiter_ownership_cancel",
+                "waiter_ownership_retire_current",
             ] {
                 assert!(
                     !src.contains(method),
@@ -112891,15 +113150,18 @@ mod stage199d_wa2a_ownership_boundary {
     /// `sibling_writes_are_absent` proves that separately. A new site anywhere breaks this pin.
     #[test]
     fn every_production_task_status_assignment_site_is_enumerated() {
+        // Stage 199D-WA3A: eight of the original 37 sites no longer write `tcb.status` at all —
+        // they go through the production transition barrier, whose single write lives in
+        // `task_transition.rs`. The raw-write census is therefore 29 + the barrier's own one.
         const PINNED: &[(&str, usize)] = &[
-            ("src/kernel/boot/exec_state.rs", 10),
-            ("src/kernel/boot/fault_state.rs", 1),
+            ("src/kernel/boot/exec_state.rs", 5),
             ("src/kernel/boot/ipc_state.rs", 9),
             ("src/kernel/boot/restart_state.rs", 4),
             ("src/kernel/boot/scheduler_state.rs", 1),
             ("src/kernel/boot/thread_state.rs", 4),
             ("src/kernel/task.rs", 1),
-            ("src/runtime.rs", 7),
+            ("src/kernel/task_transition.rs", 1),
+            ("src/runtime.rs", 5),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -112917,9 +113179,15 @@ mod stage199d_wa2a_ownership_boundary {
         assert_eq!(
             found, expected,
             "the status-transition census must match exactly — a new or removed site is a new \
-             candidate wake owner and must be classified in §6.1.32"
+             candidate wake owner and must be classified in §6.1.32 / §6.1.35"
         );
-        assert_eq!(found.iter().map(|(_, n)| n).sum::<usize>(), 37);
+        assert_eq!(
+            found.iter().map(|(_, n)| n).sum::<usize>(),
+            30,
+            "29 raw writes plus the single write inside the WA3A barrier"
+        );
+        // The eight barriered sites are enumerated by the WA2B census module, which adds them
+        // back to reach the unchanged total of 37 transition sites.
     }
 
     /// The enumeration above is the CLOSURE of "moves a task out of `Blocked`" only because
@@ -112958,17 +113226,21 @@ mod stage199d_wa2a_ownership_boundary {
         );
     }
 
-    /// **`WAITER_OWNER_CENSUS_COMPLETE=no`.** The candidate enumeration is mechanical, but the
-    /// per-site *negative* is not: twelve sites assign a status with no guard on the previous
-    /// one, so "it cannot act on `Blocked(EndpointReceive)`" rests on a dynamic invariant
-    /// (the task is freshly registered / is `current` / was just dequeued), which the source
-    /// alone does not establish. The claim is narrowed rather than asserted.
+    /// The WA2A-R1 narrowing, **updated to its successor contract**. R1 could only record
+    /// `WAITER_OWNER_CENSUS_COMPLETE=no`, because twelve sites rested on a dynamic invariant the
+    /// source did not establish. WA2B-CENSUS resolved all twelve, so what this guard now proves
+    /// is that the relabelling survives and the verdict is the *computed* one — the arithmetic
+    /// itself lives in `the_census_verdict_is_computed_from_the_table`.
     #[test]
-    fn the_census_completeness_claim_is_narrowed_not_asserted() {
+    fn the_callsite_census_stays_relabelled_under_the_resolved_verdict() {
         assert!(
-            AUDIT.contains("WAITER_OWNER_CENSUS_COMPLETE=no")
-                && STATUS.contains("WAITER_OWNER_CENSUS_COMPLETE=no"),
-            "the incompleteness must be recorded in both canonical documents"
+            AUDIT.contains("WAITER_OWNER_CENSUS_COMPLETE=yes")
+                && STATUS.contains("WAITER_OWNER_CENSUS_COMPLETE=yes"),
+            "the resolved verdict must be recorded in both canonical documents"
+        );
+        assert!(
+            AUDIT.contains("§6.1.34") && STATUS.contains("§6.1.34"),
+            "and both must point at the section that resolves it"
         );
         assert!(
             AUDIT.contains("waiter-primitive callsite census"),
@@ -113129,5 +113401,2483 @@ mod stage199d_wa2a_ownership_boundary {
             AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
         );
         assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+    }
+}
+
+/// Stage 199D-WA2B-CENSUS — the **resolved** endpoint-blocked wake-owner census.
+///
+/// WA2A-R1 enumerated every production task-status writer mechanically but left twelve rows
+/// UNPROVEN: sites that assign a status with no guard on the previous one, whose negative rested
+/// on a dynamic invariant the source did not establish. This module resolves all twelve, pins the
+/// guard **and** the caller closure behind every CANNOT, and computes the verdict rather than
+/// asserting it.
+mod stage199d_wa2b_wake_owner_census {
+    use alloc::string::{String, ToString};
+
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+    const STATUS: &str = include_str!("../../../doc/STATUS.md");
+    const OWNERSHIP: &str = include_str!("waiter_ownership.rs");
+    const EXEC: &str = include_str!("exec_state.rs");
+    const FAULT: &str = include_str!("fault_state.rs");
+    const THREAD: &str = include_str!("thread_state.rs");
+    const POLICY: &str = include_str!("task_policy_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    /// How a site was resolved. `Unproven` exists so the guard can *compute* that none remain,
+    /// rather than the census merely omitting the category.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        /// Can act on a `Blocked(EndpointReceive)` task. Must eventually route through the
+        /// ownership primitive.
+        Can,
+        /// Proven unable to, by a source-enforced precondition that no caller can bypass.
+        Cannot,
+        /// Moves a task *into* `Blocked`; not a transition out.
+        IntoBlocked,
+        /// Initializes a freshly constructed TCB.
+        FreshConstructor,
+        /// `cfg(any(test, hosted-dev))` only.
+        NonProduction,
+        /// Unresolved. Any row here forces `WAITER_OWNER_CENSUS_COMPLETE=no`.
+        #[allow(dead_code)]
+        Unproven,
+    }
+
+    /// `(file, enclosing fn, how many status assignments it makes, verdict)`.
+    ///
+    /// The counts are compared against a mechanical extraction, so a new assignment, a removed
+    /// one, or a renamed function all break this table rather than slipping through unclassified.
+    /// `(file, enclosing fn, how many status transition sites it makes, verdict)`.
+    ///
+    /// A **site** is one status transition point, whether it writes `tcb.status` directly or
+    /// goes through the WA3A production barrier. `WA3A_BARRIER_SITES` records which of them are
+    /// barriered and with which typed transitions, so the two views cannot disagree.
+    const CENSUS: &[(&str, &str, usize, Verdict)] = &[
+        // ── exec_state.rs (7) ───────────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/exec_state.rs",
+            "futex_wait_current",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "futex_wake_inner",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "build_ap_workload",
+            2,
+            Verdict::Cannot,
+        ),
+        // WA3A HARD-STOP: the absence precondition is not satisfiable while boot registers the
+        // RING3 TIDs before spawning onto them, so this site stays CAN (§6.1.35 C).
+        (
+            "src/kernel/boot/exec_state.rs",
+            "spawn_user_task_from_image",
+            1,
+            Verdict::Can,
+        ),
+        // WA3A-R2-SEAL: `dispatch_next_task`'s mark moved into the ONE shared in-lock commit
+        // (`scheduler_state.rs::commit_dispatch_selection_in_lock`), so it has no row of its own.
+        // WA3A: barriered, Running -> Runnable (idle-only Runnable -> Runnable). The dispatch
+        // half moved to the shared in-lock commit.
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current_to",
+            1,
+            Verdict::Cannot,
+        ),
+        // ── fault_state.rs (1) ──────────────────────────────────────────────────────────────
+        // WA3A: barriered, Running -> Faulted, validated BEFORE block_current_cpu.
+        (
+            "src/kernel/boot/fault_state.rs",
+            "fault_current_task_with_fault",
+            1,
+            Verdict::Cannot,
+        ),
+        // ── ipc_state.rs (9) ────────────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "rt_commit_receiver_runnable",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "wake_tid_to_runnable",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "set_task_status_for_test",
+            1,
+            Verdict::NonProduction,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "recv_block_phase_b_task",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "block_current_on_send_with_deadline",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "process_ipc_timeout_deadlines",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "signal_notification",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "wake_destroyed_notification_waiter",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "ipc_recv_with_optional_deadline",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        // ── restart_state.rs (4) ────────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/restart_state.rs",
+            "exit_task",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "restart_task",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "mark_task_dead",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "reap_faulted_task_noalloc_cleanup",
+            1,
+            Verdict::Can,
+        ),
+        // ── scheduler_state.rs (4) ──────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/scheduler_state.rs",
+            "apply_cross_cpu_wake_task",
+            1,
+            Verdict::Can,
+        ),
+        // WA3A-R2-SEAL: the ONE in-lock dispatch commit, shared by `dispatch_next_task`,
+        // `yield_current` and `yield_current_to`. Barriered: the transition is chosen by the
+        // typed provenance the authoritative scheduler mutation produced, never reconstructed.
+        (
+            "src/kernel/boot/scheduler_state.rs",
+            "commit_dispatch_selection_in_lock",
+            3,
+            Verdict::Cannot,
+        ),
+        // ── thread_state.rs (4) ─────────────────────────────────────────────────────────────
+        (
+            "src/kernel/boot/thread_state.rs",
+            "join_thread",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "wake_joiners_for",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "spawn_user_thread",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "fork_complete_post_clone",
+            1,
+            Verdict::Cannot,
+        ),
+        // ── task.rs (1) ─────────────────────────────────────────────────────────────────────
+        ("src/kernel/task.rs", "new", 1, Verdict::FreshConstructor),
+        // ── runtime.rs (7) ──────────────────────────────────────────────────────────────────
+        // WA3A: barriered.
+        (
+            "src/runtime.rs",
+            "d6_genuine_mark_running_via_task_seam",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/runtime.rs",
+            "direct_dispatch_rollback_split",
+            1,
+            Verdict::Cannot,
+        ),
+        ("src/runtime.rs", "futex_wake_split_mut", 1, Verdict::Cannot),
+        ("src/runtime.rs", "sr_wake_receiver_split", 1, Verdict::Can),
+        (
+            "src/runtime.rs",
+            "sr_commit_blocked_receiver_split",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/runtime.rs",
+            "sr_uncommit_blocked_receiver_split",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        (
+            "src/runtime.rs",
+            "futex_wait_publish_block_split_mut",
+            1,
+            Verdict::IntoBlocked,
+        ),
+    ];
+
+    /// The eight WA3A-barriered sites: `(file, fn, sites, the typed transitions it uses)`.
+    ///
+    /// These no longer write `tcb.status` at all — the only production write for this cohort is
+    /// inside `apply_task_transition`, which is exact and fail-closed by construction.
+    const WA3A_BARRIER_SITES: &[(&str, &str, usize, &[&str])] = &[
+        (
+            "src/runtime.rs",
+            "d6_genuine_mark_running_via_task_seam",
+            1,
+            &["DispatchIncoming", "ContinueCurrent"],
+        ),
+        (
+            "src/runtime.rs",
+            "direct_dispatch_rollback_split",
+            1,
+            &["RollbackDispatchedIncoming"],
+        ),
+        // Stage 199D-WA3A-R2-SEAL (item B): the in-lock dispatch marks of `dispatch_next_task`,
+        // `yield_current` and `yield_current_to` are ONE shared commit, so the transition can no
+        // longer drift between the three sites.
+        (
+            "src/kernel/boot/scheduler_state.rs",
+            "commit_dispatch_selection_in_lock",
+            3,
+            &["DispatchIncoming", "ContinueCurrent"],
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current",
+            1,
+            &["PreemptOutgoing", "PreemptOutgoingIdle"],
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "yield_current_to",
+            1,
+            &["PreemptOutgoing", "PreemptOutgoingIdle"],
+        ),
+        (
+            "src/kernel/boot/fault_state.rs",
+            "fault_current_task_with_fault",
+            1,
+            &["FaultRunningCurrent"],
+        ),
+    ];
+
+    /// Every classified file with comment lines blanked, so a doc-comment mention of a helper
+    /// is never counted as a call site.
+    fn production_sources_no_comments() -> alloc::vec::Vec<(String, String)> {
+        let mut files: alloc::vec::Vec<&str> = alloc::vec![
+            "src/kernel/boot/ipc_state.rs",
+            "src/kernel/boot/exec_state.rs",
+            "src/kernel/boot/fault_state.rs",
+            "src/kernel/boot/restart_state.rs",
+            "src/kernel/boot/scheduler_state.rs",
+            "src/kernel/boot/thread_state.rs",
+            "src/kernel/boot/shared_region_txn.rs",
+            "src/kernel/boot/mod.rs",
+            "src/kernel/syscall/ipc.rs",
+            "src/kernel/task.rs",
+            "src/runtime.rs",
+        ];
+        files.sort();
+        files
+            .into_iter()
+            .map(|rel| {
+                let src = production_source(rel);
+                let blanked: String = src
+                    .lines()
+                    .map(|l| {
+                        if l.trim_start().starts_with("//") {
+                            ""
+                        } else {
+                            l
+                        }
+                    })
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join("\n");
+                (rel.to_string(), blanked)
+            })
+            .collect()
+    }
+
+    pub(super) fn production_source(rel: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        src.split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(&src)
+            .to_string()
+    }
+
+    /// The function lexically enclosing byte offset `at`: the latest `fn` header at either
+    /// top level or one `impl` level of indentation.
+    fn enclosing_fn(src: &str, at: usize) -> String {
+        const HEADERS: &[&str] = &[
+            "\nfn ",
+            "\npub fn ",
+            "\npub(crate) fn ",
+            "\npub(super) fn ",
+            "\nunsafe fn ",
+            "\n    fn ",
+            "\n    pub fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(super) fn ",
+            "\n    const fn ",
+            "\n    pub(crate) const fn ",
+            "\n    unsafe fn ",
+            "\n    pub unsafe fn ",
+        ];
+        let pre = &src[..at];
+        let mut best = None::<usize>;
+        for pat in HEADERS {
+            if let Some(i) = pre.rfind(pat) {
+                let start = i + pat.len();
+                if best.is_none_or(|b| b < start) {
+                    best = Some(start);
+                }
+            }
+        }
+        let start = best.expect("every status assignment is inside a function");
+        src[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    }
+
+    /// Mechanically extracted `(file, fn, count)`, sorted, over the same production sources and
+    /// the same two assignment forms the WA2A-R1 enumeration guard counts.
+    fn extracted() -> alloc::vec::Vec<(String, String, usize)> {
+        let mut files: alloc::vec::Vec<&str> = FINGERPRINTS.iter().map(|(f, ..)| *f).collect();
+        files.sort();
+        files.dedup();
+        let mut out: alloc::vec::Vec<(String, String, usize)> = alloc::vec::Vec::new();
+        for rel in files {
+            let src = production_source(rel);
+            let mut offsets: alloc::vec::Vec<usize> = src
+                .match_indices(".status = ")
+                .chain(src.match_indices("status: TaskStatus::"))
+                .map(|(i, _)| i)
+                .collect();
+            offsets.sort_unstable();
+            for at in offsets {
+                let f = enclosing_fn(&src, at);
+                match out.iter_mut().find(|(r, n, _)| r == rel && *n == f) {
+                    Some((_, _, n)) => *n += 1,
+                    None => out.push((rel.to_string(), f, 1)),
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// **G — the exact-site fingerprint.** `(file, enclosing fn, count)` alone cannot see a
+    /// count-preserving substitution *inside* one function: delete one assignment, add another,
+    /// and the rollup is unchanged. Each of the 37 sites is therefore pinned by an ordered
+    /// fingerprint of
+    ///
+    /// * file and enclosing function,
+    /// * the normalized left-hand side,
+    /// * the assigned status expression,
+    /// * the exact **preceding** and **following** non-blank, non-comment source lines.
+    ///
+    /// The adjacent-line anchors are what defeat a count-preserving substitution: removing one
+    /// assignment and adding another with the same `(fn, lhs, rhs)` elsewhere in the same
+    /// function lands it between different neighbours, and even a one-line reorder changes them.
+    /// These 37 neighbourhoods are deliberately brittle — a status writer whose surroundings
+    /// changed is a writer whose census row must be re-derived.
+    const FINGERPRINTS: &[(&str, &str, &str, &str, &str, &str)] = &[
+        // src/kernel/boot/exec_state.rs
+        (
+            "src/kernel/boot/exec_state.rs",
+            "futex_wait_current",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "futex_wake_inner",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "wake_tids[wake_count] = Some(tcb.tid.0);",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "build_ap_workload",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "tcb.asid = Some(asid);",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "build_ap_workload",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "tcb.asid = Some(client_asid);",
+            "tcb.user_context.instruction_ptr = VirtAddr(CLIENT_CODE_VA);",
+        ),
+        (
+            "src/kernel/boot/exec_state.rs",
+            "spawn_user_task_from_image",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "Ok::<_, KernelError>(())",
+        ),
+        // src/kernel/boot/ipc_state.rs
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "rt_commit_receiver_runnable",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "let _ = timed_out;",
+            "Some(tcb.cpu_affinity)",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "wake_tid_to_runnable",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "set_task_status_for_test",
+            "tcb.status",
+            "status",
+            "if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {",
+            "}",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "recv_block_phase_b_task",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointReceive(plan.recv_cap))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.ipc_timeout_deadline = deadline;",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "block_current_on_send_with_deadline",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointSend(send_cap))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.ipc_timeout_deadline = deadline;",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "process_ipc_timeout_deadlines",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {",
+            "tcb.ipc_timeout_deadline = None;",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "signal_notification",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "if matches!(tcb.status, TaskStatus::Blocked(_)) {",
+            "Ok(true)",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "wake_destroyed_notification_waiter",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "if matches!(tcb.status, TaskStatus::Blocked(_)) {",
+            "Ok(true)",
+        ),
+        (
+            "src/kernel/boot/ipc_state.rs",
+            "ipc_recv_with_optional_deadline",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.ipc_timeout_deadline = deadline;",
+        ),
+        // src/kernel/boot/restart_state.rs
+        (
+            "src/kernel/boot/restart_state.rs",
+            "exit_task",
+            "tcb.status",
+            "TaskStatus::Exited(code)",
+            "}",
+            "tcb.restart.token = Some(RestartToken(token));",
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "restart_task",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "tcb.restart.token = None;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "mark_task_dead",
+            "tcb.status",
+            "TaskStatus::Dead",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.restart.token = None;",
+        ),
+        (
+            "src/kernel/boot/restart_state.rs",
+            "reap_faulted_task_noalloc_cleanup",
+            "tcb.status",
+            "TaskStatus::Dead",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "tcb.restart.token = None;",
+        ),
+        // src/kernel/boot/scheduler_state.rs
+        (
+            "src/kernel/boot/scheduler_state.rs",
+            "apply_cross_cpu_wake_task",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "TaskStatus::Blocked(_) => {",
+            "Ok(CrossCpuWakeApplyResult::Applied)",
+        ),
+        // src/kernel/boot/thread_state.rs
+        (
+            "src/kernel/boot/thread_state.rs",
+            "join_thread",
+            "joiner.status",
+            "TaskStatus::Blocked(WaitReason::Join(ThreadId(tid)))",
+            ".ok_or(KernelError::TaskMissing)?;",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "wake_joiners_for",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "if wake_count < wake_tids.len() {",
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "spawn_user_thread",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "};",
+            "Ok::<_, KernelError>(())",
+        ),
+        (
+            "src/kernel/boot/thread_state.rs",
+            "fork_complete_post_clone",
+            "child.status",
+            "TaskStatus::Runnable",
+            "child.user_context.arg0 = 0;",
+            "Ok::<_, KernelError>(())",
+        ),
+        // src/kernel/task.rs
+        (
+            "src/kernel/task.rs",
+            "new",
+            "status:",
+            "TaskStatus::Runnable",
+            "thread_group_id: ThreadGroupId(tid.0),",
+            "asid,",
+        ),
+        // src/runtime.rs
+        (
+            "src/runtime.rs",
+            "futex_wake_split_mut",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "woken[n] = (tcb.tid.0, tcb.cpu_affinity);",
+        ),
+        (
+            "src/runtime.rs",
+            "sr_wake_receiver_split",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "if !matches!(old, TaskStatus::Runnable) {",
+            "}",
+        ),
+        (
+            "src/runtime.rs",
+            "sr_commit_blocked_receiver_split",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            ".expect(\"prevalidated present\");",
+            "ReceiverCommit::Committed(tcb.cpu_affinity)",
+        ),
+        (
+            "src/runtime.rs",
+            "sr_uncommit_blocked_receiver_split",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))",
+            "}",
+            "true",
+        ),
+        (
+            "src/runtime.rs",
+            "futex_wait_publish_block_split_mut",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))",
+            "Some(tcb) => {",
+            "true",
+        ),
+    ];
+
+    fn normalize(line: &str) -> String {
+        line.split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ")
+    }
+
+    /// The nearest non-blank, non-comment line in direction `step` from line index `from`.
+    fn neighbour(lines: &[&str], from: usize, forward: bool) -> String {
+        let mut i = from as isize + if forward { 1 } else { -1 };
+        while i >= 0 && (i as usize) < lines.len() {
+            let t = normalize(lines[i as usize]);
+            if !t.is_empty() && !t.starts_with("//") {
+                return t;
+            }
+            i += if forward { 1 } else { -1 };
+        }
+        String::new()
+    }
+
+    /// `(file, fn, lhs, rhs, previous line, following line)` in source order.
+    fn fingerprint_sites() -> alloc::vec::Vec<(String, String, String, String, String, String)> {
+        let mut files: alloc::vec::Vec<&str> = FINGERPRINTS.iter().map(|(f, ..)| *f).collect();
+        files.sort();
+        files.dedup();
+        let mut out = alloc::vec::Vec::new();
+        for rel in files {
+            let src = production_source(rel);
+            let mut offsets: alloc::vec::Vec<usize> = src
+                .match_indices(".status = ")
+                .chain(src.match_indices("status: TaskStatus::"))
+                .map(|(i, _)| i)
+                .collect();
+            offsets.sort_unstable();
+            let lines: alloc::vec::Vec<&str> = src.lines().collect();
+            for at in offsets {
+                let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let line_index = src[..at].matches('\n').count();
+                let end = src[at..]
+                    .find(';')
+                    .or_else(|| src[at..].find(','))
+                    .map(|i| at + i)
+                    .expect("a terminated statement");
+                let stmt: String = normalize(&src[line_start..end]);
+                let (lhs, rhs) = if let Some(rest) = stmt.strip_prefix("status: TaskStatus::") {
+                    ("status:".to_string(), alloc::format!("TaskStatus::{rest}"))
+                } else {
+                    let (l, r) = stmt.split_once('=').expect("an assignment");
+                    (l.trim().to_string(), r.trim().to_string())
+                };
+                out.push((
+                    rel.to_string(),
+                    enclosing_fn(&src, at),
+                    lhs,
+                    rhs,
+                    neighbour(&lines, line_index, false),
+                    neighbour(&lines, line_index, true),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Every status assignment is pinned by its exact site, not merely counted.
+    #[test]
+    fn every_status_writer_is_pinned_by_an_exact_site_fingerprint() {
+        let sites = fingerprint_sites();
+        assert_eq!(
+            sites.len(),
+            FINGERPRINTS.len(),
+            "the number of status assignments changed"
+        );
+        assert_eq!(
+            sites.len(),
+            29,
+            "29 raw writes remain after WA3A barriered the other 8"
+        );
+        for (i, (file, function, lhs, rhs, before, after)) in sites.iter().enumerate() {
+            let (pf, pfn, plhs, prhs, pbefore, pafter) = FINGERPRINTS[i];
+            assert_eq!(
+                (file.as_str(), function.as_str(), lhs.as_str(), rhs.as_str()),
+                (pf, pfn, plhs, prhs),
+                "site {i} drifted"
+            );
+            assert_eq!(
+                (before.as_str(), after.as_str()),
+                (pbefore, pafter),
+                "site {i} ({pf}::{pfn}) moved: its neighbourhood changed, so an assignment was \
+                 reordered, replaced, or substituted inside the same function — re-derive its \
+                 census row rather than re-pinning it"
+            );
+        }
+    }
+
+    /// The `(file, fn, count)` rollup the classification table uses is DERIVED from the same
+    /// fingerprints, so the two can never disagree.
+    #[test]
+    fn every_status_writer_is_classified_by_its_enclosing_function() {
+        let mut rollup: alloc::vec::Vec<(String, String, usize)> = alloc::vec::Vec::new();
+        for (file, function, ..) in fingerprint_sites() {
+            match rollup
+                .iter_mut()
+                .find(|(f, n, _)| *f == file && *n == function)
+            {
+                Some((_, _, n)) => *n += 1,
+                None => rollup.push((file, function, 1)),
+            }
+        }
+        // Stage 199D-WA3A: the eight barriered sites no longer write `tcb.status` at all, so
+        // the census covers raw writes AND barriered transitions.
+        for (file, function, sites, _) in WA3A_BARRIER_SITES {
+            match rollup
+                .iter_mut()
+                .find(|(f, n, _)| f == file && n == function)
+            {
+                Some((_, _, n)) => *n += sites,
+                None => rollup.push((file.to_string(), function.to_string(), *sites)),
+            }
+        }
+        rollup.sort();
+        let mut pinned: alloc::vec::Vec<(String, String, usize)> = CENSUS
+            .iter()
+            .map(|(f, n, c, _)| (f.to_string(), n.to_string(), *c))
+            .collect();
+        pinned.sort();
+        assert_eq!(
+            rollup, pinned,
+            "the classified set must match the mechanically extracted set exactly"
+        );
+        assert_eq!(
+            CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
+            37,
+            "and it must still be the 37 sites WA2A-R1 pinned"
+        );
+        assert_eq!(
+            FINGERPRINTS.len()
+                + WA3A_BARRIER_SITES
+                    .iter()
+                    .map(|(_, _, n, _)| n)
+                    .sum::<usize>(),
+            37,
+            "29 remaining raw writes + 8 barriered sites"
+        );
+    }
+
+    /// **WA3A.** For the barriered cohort the ONLY production `tcb.status` write is inside the
+    /// barrier, and every barriered site names the typed transitions it may use.
+    #[test]
+    fn the_barrier_is_the_only_writer_for_the_group3_cohort() {
+        let barrier = production_source("src/kernel/task_transition.rs");
+        assert_eq!(
+            barrier.matches("tcb.status = ").count(),
+            1,
+            "exactly one write, in `apply_task_transition`"
+        );
+        assert!(
+            barrier.contains("tcb.status = transition.resulting();"),
+            "and it writes only what the typed transition permits"
+        );
+        assert!(
+            !barrier.contains("debug_assert!(") && !barrier.contains("#[cfg(debug"),
+            "the precondition must hold in RELEASE builds — debug_assert is not sufficient"
+        );
+        for (file, function, _, transitions) in WA3A_BARRIER_SITES {
+            let src = production_source(file);
+            let body = src
+                .split(&alloc::format!("fn {function}("))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{file}: {function}"));
+            let mut end = body.len();
+            for next in [
+                "\n    pub fn ",
+                "\n    pub(crate) fn ",
+                "\n    fn ",
+                "\npub(crate) fn ",
+            ] {
+                if let Some(i) = body.find(next) {
+                    end = end.min(i);
+                }
+            }
+            let scoped = &body[..end];
+            assert!(
+                !scoped.contains("tcb.status = "),
+                "{file}::{function} must not write `tcb.status` directly any more"
+            );
+            for t in *transitions {
+                assert!(
+                    scoped.contains(&alloc::format!("TaskTransition::{t}")),
+                    "{file}::{function} must use the typed transition `{t}`"
+                );
+            }
+        }
+        // The ninth Group-3 site HARD-STOPPED: the absence precondition is not satisfiable by
+        // the current boot sequence, so the gate was reverted rather than weakened. Pin the
+        // reason so the finding cannot be lost, and pin that no weaker predicate crept in.
+        let exec = production_source("src/kernel/boot/exec_state.rs");
+        let spawn = exec
+            .split("pub fn spawn_user_task_from_image(")
+            .nth(1)
+            .expect("spawn");
+        assert!(
+            spawn.contains("Stage 199D-WA3A HARD-STOP"),
+            "the spawn hard-stop must stay recorded at the site"
+        );
+        assert!(
+            !spawn.contains("if self.task_status(spec.tid).is_some() {"),
+            "the absence gate is reverted, not silently retained"
+        );
+        assert!(
+            !spawn.contains("Blocked(WaitReason::EndpointReceive"),
+            "and no weaker `not endpoint-blocked` predicate replaced it"
+        );
+        // The boot sequence that makes the precondition unsatisfiable is pinned too, so the
+        // hard-stop is falsifiable: if boot stops pre-registering, this fails and the site can
+        // be re-derived.
+        let boot = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/arch/x86_64/boot.rs"),
+        )
+        .expect("x86 boot");
+        assert!(
+            boot.contains("kernel.register_task_with_class(RING3_SUPERVISOR_TID")
+                && boot.contains("kernel.spawn_user_task_from_image(UserImageSpec {"),
+            "x86 boot must still register the RING3 TIDs before spawning onto them"
+        );
+    }
+
+    /// **G, second half.** The matrix reasons about helper writers, so their exact direct
+    /// production caller sets are pinned: a new caller class is a new logical origin, and the
+    /// matrix must be re-derived rather than silently inherited.
+    #[test]
+    fn the_helper_writer_direct_caller_sets_are_pinned() {
+        // (helper, [(file, enclosing fn, call count)])
+        const CALLERS: &[(&str, &[(&str, &str, usize)])] = &[
+            (
+                "wake_tid_to_runnable",
+                &[
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "apply_scheduler_wake_plan",
+                        1,
+                    ),
+                    ("src/kernel/boot/ipc_state.rs", "recv_block_unwind_race", 1),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "wake_waiter_for_endpoint",
+                        1,
+                    ),
+                ],
+            ),
+            (
+                "apply_scheduler_wake_plan",
+                &[
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "apply_split_receiver_wake_plan",
+                        1,
+                    ),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "apply_split_sender_wake_plan",
+                        1,
+                    ),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "ipc_recv_with_optional_deadline",
+                        2,
+                    ),
+                    ("src/kernel/boot/ipc_state.rs", "ipc_reply", 2),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "ipc_send_with_optional_deadline",
+                        1,
+                    ),
+                    ("src/kernel/boot/ipc_state.rs", "try_ipc_recv", 1),
+                    (
+                        "src/runtime.rs",
+                        "execute_blocked_waiter_ordinary_cap_delivery",
+                        1,
+                    ),
+                    (
+                        "src/runtime.rs",
+                        "execute_blocked_waiter_reply_cap_delivery",
+                        1,
+                    ),
+                    ("src/runtime.rs", "execute_dispatch_post_work", 1),
+                ],
+            ),
+            (
+                "apply_split_receiver_wake_plan",
+                &[
+                    (
+                        "src/kernel/boot/fault_state.rs",
+                        "emit_fault_report_for_fault",
+                        1,
+                    ),
+                    (
+                        "src/kernel/boot/shared_region_txn.rs",
+                        "ctx_finalize_and_wake",
+                        2,
+                    ),
+                    ("src/kernel/syscall/ipc.rs", "handle_ipc_call", 1),
+                    ("src/kernel/syscall/ipc.rs", "handle_ipc_send", 1),
+                ],
+            ),
+            (
+                "wake_waiter_for_endpoint",
+                &[
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "ipc_send_with_optional_deadline",
+                        2,
+                    ),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "send_message_to_endpoint_and_wake",
+                        1,
+                    ),
+                ],
+            ),
+            (
+                "apply_cross_cpu_wake_task",
+                &[(
+                    "src/kernel/boot/scheduler_state.rs",
+                    "apply_cross_cpu_work",
+                    1,
+                )],
+            ),
+            (
+                "rt_commit_receiver_runnable",
+                &[
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "complete_reply_timeout_over",
+                        1,
+                    ),
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "complete_server_death_over",
+                        1,
+                    ),
+                ],
+            ),
+        ];
+        for (helper, pinned) in CALLERS {
+            let mut found: alloc::vec::Vec<(String, String, usize)> = alloc::vec::Vec::new();
+            for (rel, src) in production_sources_no_comments() {
+                let needle = alloc::format!("{helper}(");
+                for (at, _) in src.match_indices(needle.as_str()) {
+                    // the definition itself, and the `_for_test` hook, are not callers
+                    if src[..at].trim_end().ends_with("fn") {
+                        continue;
+                    }
+                    let f = enclosing_fn(&src, at);
+                    if f == *helper || f.ends_with("_for_test") {
+                        continue;
+                    }
+                    match found.iter_mut().find(|(r, n, _)| r == &rel && n == &f) {
+                        Some((_, _, n)) => *n += 1,
+                        None => found.push((rel.clone(), f, 1)),
+                    }
+                }
+            }
+            found.sort();
+            let mut want: alloc::vec::Vec<(String, String, usize)> = pinned
+                .iter()
+                .map(|(f, n, c)| (f.to_string(), n.to_string(), *c))
+                .collect();
+            want.sort();
+            assert_eq!(
+                found, want,
+                "the direct production caller set of `{helper}` changed — re-derive its \
+                 owner/origin rows in §6.1.34 E"
+            );
+        }
+        // `WorkItem::WakeTask` still has NO production producer: the only occurrence is the
+        // drain arm itself. If one appears, the typed-payload work in §6.1.34 E becomes
+        // remedial rather than prerequisite.
+        let mut constructions = 0usize;
+        for (_, src) in production_sources_no_comments() {
+            constructions += src.matches("WorkItem::WakeTask {").count();
+        }
+        assert_eq!(
+            constructions, 1,
+            "exactly one occurrence — the drain match arm — and no production submitter"
+        );
+    }
+
+    /// **D — compute, do not assert.** The five class counts are derived from the table.
+    #[test]
+    fn the_census_verdict_is_computed_from_the_table() {
+        let count = |v: Verdict| -> usize {
+            CENSUS
+                .iter()
+                .filter(|(_, _, _, w)| *w == v)
+                .map(|(_, _, c, _)| c)
+                .sum()
+        };
+        let can = count(Verdict::Can);
+        let cannot = count(Verdict::Cannot);
+        let into_blocked = count(Verdict::IntoBlocked);
+        let fresh = count(Verdict::FreshConstructor);
+        let non_production = count(Verdict::NonProduction);
+        let unproven = count(Verdict::Unproven);
+
+        assert_eq!(
+            can + cannot + into_blocked + fresh + non_production + unproven,
+            37,
+            "the classes must partition the enumerated sites"
+        );
+        // Stage 199D-WA3A moved the nine Group-3 sites CAN → CANNOT by production enforcement.
+        assert_eq!(
+            (can, cannot, into_blocked, fresh, non_production),
+            (13, 15, 7, 1, 1)
+        );
+
+        // The verdict is derived, not written down.
+        let complete = unproven == 0;
+        assert!(complete, "{unproven} rows remain UNPROVEN");
+        let flag = if complete { "yes" } else { "no" };
+        for (name, doc) in [("KERNEL_UNLOCK_AUDIT", AUDIT), ("STATUS", STATUS)] {
+            assert!(
+                doc.contains(&alloc::format!("WAITER_OWNER_CENSUS_COMPLETE={flag}")),
+                "{name} must record the computed verdict WAITER_OWNER_CENSUS_COMPLETE={flag}"
+            );
+            assert!(
+                !doc.contains("WAITER_OWNER_CENSUS_COMPLETE=no"),
+                "{name} must not still carry the superseded WA2A-R1 verdict"
+            );
+            // Completing the census does NOT make the owners arbitrate.
+            assert!(
+                doc.contains("WAITER_OWNERSHIP_EXCLUSIVE=no"),
+                "{name} must keep WAITER_OWNERSHIP_EXCLUSIVE=no"
+            );
+        }
+        // …and the audit records the same computed numbers.
+        assert!(
+            AUDIT.contains("| CAN | 13 |")
+                && AUDIT.contains("| CANNOT | 15 |")
+                && AUDIT.contains("| INTO_BLOCKED | 7 |")
+                && AUDIT.contains("| FRESH_CONSTRUCTOR | 1 |")
+                && AUDIT.contains("| NON_PRODUCTION | 1 |")
+                && AUDIT.contains("| UNPROVEN | 0 |"),
+            "§6.1.34 must carry the computed class table"
+        );
+    }
+
+    /// **C — call-graph closure.** Every CANNOT pins a source-enforced precondition *and* the
+    /// reason no caller can bypass it. A local assertion alone is not enough: the closure fact
+    /// is that the target TID cannot be supplied from outside.
+    #[test]
+    fn every_cannot_row_pins_its_guard_and_its_caller_closure() {
+        // (file source, fn, the guard text, the closure fact that no caller can bypass it)
+        const PROOFS: &[(&str, &str, &str, &str)] = &[
+            (
+                "exec_state.rs",
+                "futex_wake_inner",
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {",
+                // value-level filter over every TCB: no parameter selects a victim
+                "for tcb in tcbs.iter_mut().flatten() {",
+            ),
+            (
+                "exec_state.rs",
+                "build_ap_workload",
+                "if self.task_status(tid).is_some() {",
+                "let tid = base_tid + i;",
+            ),
+            (
+                "exec_state.rs",
+                "build_ap_workload",
+                "if request_client && self.task_status(client_tid).is_none() {",
+                "let client_tid = base_tid + 1000;",
+            ),
+            (
+                "thread_state.rs",
+                "wake_joiners_for",
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Join(ThreadId(target_tid))) {",
+                "for tcb in tcbs.iter_mut().flatten() {",
+            ),
+            (
+                "thread_state.rs",
+                "spawn_user_thread",
+                "let tid = self.allocate_thread_id()?;",
+                // the signature takes a PARENT tid, never the tid being written
+                "pub fn spawn_user_thread(",
+            ),
+            (
+                "thread_state.rs",
+                "fork_complete_post_clone",
+                "let child_tid = match self.allocate_thread_id() {",
+                "fn fork_complete_post_clone(",
+            ),
+            (
+                "runtime.rs",
+                "futex_wake_split_mut",
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {",
+                "for tcb in tcbs.iter_mut().flatten() {",
+            ),
+        ];
+        // Exactly one proof per CANNOT assignment.
+        let cannot_sites: usize = CENSUS
+            .iter()
+            .filter(|(_, _, _, v)| *v == Verdict::Cannot)
+            .map(|(_, _, c, _)| c)
+            .sum();
+        // Three proof shapes cover every CANNOT site:
+        //   * PROOFS below — a local precondition plus its caller closure (the pre-WA3A seven);
+        //   * WA3A_BARRIER_SITES — a typed production transition, proven by
+        //     `the_barrier_is_the_only_writer_for_the_group3_cohort` (eight);
+        // `spawn_user_task_from_image` is NOT here: its absence precondition hard-stopped
+        // (§6.1.35 C) and it stays CAN.
+        let barriered: usize = WA3A_BARRIER_SITES.iter().map(|(_, _, n, _)| n).sum();
+        assert_eq!(
+            PROOFS.len() + barriered,
+            cannot_sites,
+            "every CANNOT site needs a guard+closure proof, a production barrier, or the \
+             absence gate"
+        );
+
+        for (file, function, guard, closure) in PROOFS {
+            let src = match *file {
+                "exec_state.rs" => EXEC,
+                "thread_state.rs" => THREAD,
+                "runtime.rs" => RUNTIME,
+                other => panic!("unknown census source {other}"),
+            };
+            let body = src
+                .split(&alloc::format!("fn {function}("))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{file}: {function} not found"));
+            assert!(
+                body.contains(guard),
+                "{file}::{function} lost its precondition `{guard}`"
+            );
+            assert!(
+                body.contains(closure) || src.contains(closure),
+                "{file}::{function} lost its caller-closure fact `{closure}`"
+            );
+        }
+
+        // The two spawn CANNOTs additionally depend on the allocator never handing back a live
+        // TID. If that stopped being fail-closed, both would become CAN.
+        assert!(
+            POLICY.contains("if self.task_status(candidate).is_none() {")
+                && POLICY.contains("Err(KernelError::TaskTableFull)"),
+            "allocate_thread_id must only return an unused TID, and fail closed otherwise"
+        );
+        // Neither spawn function accepts the TID it writes.
+        assert!(
+            THREAD.contains(
+                "pub fn spawn_user_thread(\n        &mut self,\n        parent_tid: u64,"
+            ),
+            "spawn_user_thread must take only a PARENT tid"
+        );
+    }
+
+    /// The three preconditions the CAN verdicts rest on are *absences*, and they must stay
+    /// absent: the scheduler knows nothing about `TaskStatus`, and neither dispatch nor yield
+    /// checks the status of the task it transitions.
+    #[test]
+    fn the_can_verdicts_rest_on_absent_guards_that_must_stay_absent() {
+        let scheduler = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("crates/yarm-kernel/src/scheduler.rs"),
+        )
+        .expect("scheduler");
+        assert!(
+            !scheduler.contains("TaskStatus"),
+            "the run queue carries bare TIDs with NO status precondition — if that ever changes, \
+             the dispatch/yield CAN rows must be re-derived, not silently kept"
+        );
+        // dispatch_next_task: between the dequeue and the barriered commit there is no status
+        // read. Stage 199D-WA3A-R2-SEAL: the commit itself moved into
+        // `commit_dispatch_selection_in_lock`, so the window ends at the call to it — which is
+        // exactly where the raw write used to be.
+        let dispatch = EXEC
+            .split("fn dispatch_next_task(")
+            .nth(1)
+            .expect("dispatch_next_task");
+        let from_dequeue = dispatch
+            .split("let selection = self.local_dispatch_step_split_selection();")
+            .nth(1)
+            .expect("the dequeue");
+        let to_write = from_dequeue
+            .split("self.commit_dispatch_selection_in_lock(selection, \"dispatch_next_task\")")
+            .next()
+            .expect("the barriered commit");
+        assert!(
+            to_write.len() < from_dequeue.len(),
+            "the barriered commit must still follow the dequeue in dispatch_next_task"
+        );
+        for probe in [
+            "TaskStatus::Blocked",
+            "matches!(tcb.status",
+            "tcb.status ==",
+        ] {
+            assert!(
+                !to_write.contains(probe),
+                "dispatch gained a status check (`{probe}`) — re-derive its census row"
+            );
+        }
+        // spawn_user_task_from_image is CAN because registration is IDEMPOTENT: an existing
+        // (possibly endpoint-blocked) TID passes straight through to the Runnable write.
+        assert!(
+            POLICY.contains(
+                "if self.task_status(tid).is_some() {\n            return Ok(());\n        }"
+            ),
+            "register_task_with_class is idempotent, which is exactly why a caller-supplied \
+             spec.tid gives spawn_user_task_from_image no precondition"
+        );
+        // fault_current_task takes whatever was current, with no status read.
+        assert!(
+            FAULT.contains("let faulted_tid = self.block_current_cpu().ok_or_else(|| {"),
+            "the faulting path selects by `current`, not by status"
+        );
+    }
+
+    /// **E.** The owner/wiring matrix is recorded for every CAN path, with the six columns the
+    /// wiring increment needs.
+    #[test]
+    fn the_owner_wiring_matrix_covers_every_can_path() {
+        let matrix = AUDIT
+            .split("#### E. Owner / origin matrix")
+            .nth(1)
+            .expect("§6.1.34 E")
+            .split("\n#### ")
+            .next()
+            .expect("matrix end");
+        for function in CENSUS
+            .iter()
+            .filter(|(_, _, _, v)| *v == Verdict::Can)
+            .map(|(_, n, _, _)| *n)
+        {
+            assert!(
+                matrix.contains(function),
+                "the wiring matrix must carry a row for the CAN path `{function}`"
+            );
+        }
+        for owner in [
+            "DirectRequest",
+            "DirectReply",
+            "OrdinaryTimeout",
+            "LegacyDelivery",
+            "Notification",
+            "Teardown",
+        ] {
+            assert!(
+                matrix.contains(owner),
+                "the matrix must assign the `{owner}` owner class"
+            );
+        }
+        // It is a design matrix only.
+        assert!(
+            matrix.contains("Design only") || matrix.contains("design matrix"),
+            "the matrix must say it is design only — no wiring in this increment"
+        );
+
+        // A. writer sites and logical origins are two explicit layers, and every helper's
+        // direct callers are named (not a transitive caller standing in for the real one).
+        assert!(
+            matrix.contains("Layer 1 — the 21 CAN status-assignment sites")
+                && matrix.contains("Layer 2 — logical origins"),
+            "the matrix must separate writer sites from logical origins"
+        );
+        for helper in [
+            "wake_tid_to_runnable",
+            "apply_scheduler_wake_plan",
+            "apply_split_receiver_wake_plan",
+            "wake_waiter_for_endpoint",
+            "apply_cross_cpu_wake_task",
+            "rt_commit_receiver_runnable",
+        ] {
+            assert!(
+                matrix.contains(helper),
+                "the origin layer must close `{helper}`"
+            );
+        }
+        for direct_caller in [
+            "recv_block_unwind_race",
+            "apply_split_sender_wake_plan",
+            "send_message_to_endpoint_and_wake",
+            "execute_dispatch_post_work",
+            "apply_cross_cpu_work",
+        ] {
+            assert!(
+                matrix.contains(direct_caller),
+                "the origin layer must name the real direct caller `{direct_caller}`"
+            );
+        }
+
+        // B. rt_commit_receiver_runnable is split by terminal origin, and ServerDied is NOT
+        // mapped onto OrdinaryTimeout.
+        assert!(
+            matrix.contains("complete_reply_timeout_over")
+                && matrix.contains("complete_server_death_over")
+                && matrix.contains("TerminalClaimant::PeerDeath")
+                && matrix.contains("TerminalClaimant::Timeout"),
+            "the two terminal origins must be recorded separately"
+        );
+        assert!(
+            matrix.contains("ReplyTerminal { claimant: TerminalClaimant }"),
+            "the missing conceptual owner variant must be recorded as a prerequisite"
+        );
+        // …and the enum itself is untouched in this increment.
+        let owner_enum = OWNERSHIP
+            .split("pub(crate) enum WaiterOwner {")
+            .nth(1)
+            .expect("the owner enum")
+            .split("\n}")
+            .next()
+            .expect("enum end");
+        for variant in [
+            "DirectRequest,",
+            "DirectReply,",
+            "OrdinaryTimeout,",
+            "LegacyDelivery,",
+            "Notification,",
+            "Teardown,",
+        ] {
+            assert!(owner_enum.contains(variant), "WaiterOwner lost `{variant}`");
+        }
+        let variants = owner_enum
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.ends_with(',') && l.chars().next().is_some_and(char::is_uppercase))
+            .count();
+        assert_eq!(
+            variants, 6,
+            "WaiterOwner must still have exactly its six variants — R1 is documentation only"
+        );
+
+        // C. notification is NOT an endpoint owner and must never cancel an endpoint wait.
+        assert!(
+            matrix.contains("Notification is not an endpoint owner")
+                && matrix.contains("generation-bearing notification waiter identity")
+                && matrix.contains("never consume, cancel or retire an unrelated endpoint waiter"),
+            "the notification repair must be recorded"
+        );
+        assert!(
+            matrix.contains("Whether `WaiterOwner::Notification` survives is **open**"),
+            "whether the Notification variant becomes obsolete must be recorded, not decided"
+        );
+
+        // D. the three wake_tid_to_runnable origins get three policies.
+        assert!(
+            matrix.contains("three origins, three different policies")
+                && matrix.contains("D2 receive-publication rollback")
+                && matrix.contains("A bare `Wake(tid)` is insufficient."),
+            "the wake_tid_to_runnable split must be recorded"
+        );
+
+        // E. cross-CPU forms are typed, and NOT every WakeTask carries an endpoint token.
+        assert!(
+            matrix.contains("no production producer")
+                && matrix.contains("reject stale TID reuse")
+                && matrix.contains("It is explicitly **not** the design that"),
+            "the cross-CPU typing requirements must be recorded"
+        );
+
+        // F. group-3 preconditions are production-enforced, and debug_assert is refused.
+        assert!(
+            matrix.contains("suggested `debug_assert`. That is insufficient")
+                && matrix.contains("enforced in production and fail closed**")
+                && matrix.contains("`Runnable → Running` **only**")
+                && matrix.contains("`Running → Runnable` **only**"),
+            "the group-3 transitions must be exact and production-enforced"
+        );
+        assert!(
+            matrix.contains("idempotence is not a precondition")
+                && matrix.contains("The precondition is *absence*, not"),
+            "the spawn_user_task_from_image reasoning must be recorded in full"
+        );
+    }
+}
+
+/// Stage 199D-WA3A — behavioural tests for the production transition barriers.
+///
+/// Every one of these drives the REAL production path and asserts the refusal is fail-closed:
+/// the task keeps its status, the scheduler keeps its shape, and nothing is lost.
+mod stage199d_wa3a_transition_barriers {
+    use super::stage199d_wa2b_wake_owner_census::production_source;
+    use super::*;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+
+    const BLOCKED: u64 = 41;
+    const OTHER: u64 = 42;
+
+    fn kernel_with(tids: &[u64]) -> KernelState {
+        let mut state = Bootstrap::init().expect("init");
+        for tid in tids {
+            state.register_task(*tid).expect("register");
+        }
+        state
+    }
+
+    fn block_on_endpoint(state: &mut KernelState, tid: u64) {
+        state.set_task_status_for_test(
+            tid,
+            TaskStatus::Blocked(WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(7),
+            )),
+        );
+    }
+
+    /// Snapshot of everything a refusal must leave untouched.
+    fn snapshot(state: &KernelState, tids: &[u64]) -> alloc::vec::Vec<(u64, Option<TaskStatus>)> {
+        tids.iter().map(|t| (*t, state.task_status(*t))).collect()
+    }
+
+    // ── dispatch: a blocked receiver in the run queue is never made Running ─────────────────
+
+    #[test]
+    fn a_blocked_receiver_cannot_be_dispatched_running() {
+        let mut state = kernel_with(&[BLOCKED]);
+        state.enqueue_task(BLOCKED).expect("enqueue");
+        block_on_endpoint(&mut state, BLOCKED);
+        let before = snapshot(&state, &[BLOCKED]);
+        let queued_before = state.runnable_count_on_cpu(CpuId(0));
+
+        let dispatched = state.dispatch_next_task();
+        assert!(
+            dispatched.is_err(),
+            "dispatching a Blocked(EndpointReceive) task must fail closed, got {dispatched:?}"
+        );
+        assert_eq!(snapshot(&state, &[BLOCKED]), before, "status unchanged");
+        assert_eq!(
+            state.runnable_count_on_cpu(CpuId(0)),
+            queued_before,
+            "no task is lost from the run queue"
+        );
+        assert_ne!(
+            state.current_tid(),
+            Some(BLOCKED),
+            "a blocked task must never become current"
+        );
+    }
+
+    #[test]
+    fn a_blocked_receiver_cannot_be_yielded_to_runnable() {
+        let mut state = kernel_with(&[BLOCKED, OTHER]);
+        state.enqueue_task(BLOCKED).expect("enqueue");
+        state.enqueue_task(OTHER).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let current = state.current_tid().expect("a current task");
+        // Block the CURRENT task, exactly as a recv-v2 block does, then yield.
+        block_on_endpoint(&mut state, current);
+        let before = snapshot(&state, &[BLOCKED, OTHER]);
+
+        assert!(
+            state.yield_current().is_err(),
+            "yielding a Blocked(EndpointReceive) current task must fail closed"
+        );
+        assert_eq!(
+            snapshot(&state, &[BLOCKED, OTHER]),
+            before,
+            "neither outgoing nor incoming status changed"
+        );
+        assert_eq!(
+            state.current_tid(),
+            Some(current),
+            "the current slot is untouched by a refused yield"
+        );
+    }
+
+    #[test]
+    fn a_non_running_outgoing_task_cannot_be_preempted() {
+        for bad in [
+            TaskStatus::Faulted,
+            TaskStatus::Exited(2),
+            TaskStatus::Dead,
+            TaskStatus::Blocked(WaitReason::Join(ThreadId(9))),
+        ] {
+            let mut state = kernel_with(&[BLOCKED, OTHER]);
+            state.enqueue_task(BLOCKED).expect("enqueue");
+            state.enqueue_task(OTHER).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            let current = state.current_tid().expect("current");
+            state.set_task_status_for_test(current, bad);
+            assert!(
+                state.yield_current().is_err(),
+                "yielding a {bad:?} current task must fail closed"
+            );
+            assert_eq!(state.task_status(current), Some(bad));
+            assert_eq!(state.current_tid(), Some(current));
+        }
+    }
+
+    #[test]
+    fn a_non_runnable_incoming_task_cannot_become_current() {
+        let mut state = kernel_with(&[BLOCKED, OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch OTHER");
+        assert_eq!(state.current_tid(), Some(OTHER));
+        // Queue a task and then block it, so the next dispatch selects a blocked incoming.
+        state.enqueue_task(BLOCKED).expect("enqueue");
+        block_on_endpoint(&mut state, BLOCKED);
+        let before = snapshot(&state, &[BLOCKED, OTHER]);
+
+        assert!(
+            state.yield_current_to(ThreadId(BLOCKED)).is_err(),
+            "preferring a blocked task must fail closed"
+        );
+        assert_eq!(
+            state.task_status(BLOCKED),
+            before[0].1,
+            "the blocked task keeps its status"
+        );
+        assert_ne!(state.current_tid(), Some(BLOCKED));
+    }
+
+    // ── rollback: only this transaction's dispatch may be undone ───────────────────────────
+
+    #[test]
+    fn a_stale_rollback_plan_cannot_alter_a_replacement_incarnation() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            // The replacement incarnation is Blocked, not the Running task the rollback thinks
+            // it dispatched.
+            s.set_task_status_for_test(
+                OTHER,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    crate::kernel::capabilities::CapId(3),
+                )),
+            );
+        });
+        let stale = kernel
+            .stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(9))
+            .into_dequeued_authority()
+            .expect("a dequeue-provenance token is dequeue authority");
+        assert!(
+            !kernel.direct_dispatch_rollback_split(stale),
+            "a rollback must refuse a task this transaction never dispatched"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(3)
+            ))),
+            "and must not have touched it"
+        );
+    }
+
+    #[test]
+    fn the_d6_seam_refuses_a_blocked_incoming_and_rolls_the_dequeue_back() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(BLOCKED).expect("register");
+            s.enqueue_task(BLOCKED).expect("enqueue");
+            s.set_task_status_for_test(
+                BLOCKED,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    crate::kernel::capabilities::CapId(3),
+                )),
+            );
+        });
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        // Commit the rank-1 dequeue exactly as a drain does, then mark.
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(dispatch.tid().map(|t| t.0), Some(BLOCKED));
+        assert_eq!(
+            kernel.d6_genuine_mark_running_via_task_seam(dispatch),
+            crate::runtime::DispatchMarkOutcome::RefusedRolledBack,
+            "a blocked incoming must be refused and the dequeue undone"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(BLOCKED)),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(3)
+            ))),
+            "status untouched"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            None,
+            "the dequeue was rolled back: nothing is current"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "and the task is back in the run queue — nothing is lost"
+        );
+    }
+
+    // ── fault: only the current, Running task may be faulted ───────────────────────────────
+
+    #[test]
+    fn the_fault_path_refuses_a_non_running_victim() {
+        let mut state = kernel_with(&[OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(state.current_tid(), Some(OTHER));
+        block_on_endpoint(&mut state, OTHER);
+        let before = state.task_status(OTHER);
+
+        assert!(
+            state.fault_current_task_for_test().is_err(),
+            "faulting a blocked current task must fail closed"
+        );
+        assert_eq!(state.task_status(OTHER), before, "status untouched");
+        assert_eq!(
+            state.current_tid(),
+            Some(OTHER),
+            "and the scheduler was never blocked out"
+        );
+    }
+
+    // ── spawn: the destination TID must be absent ──────────────────────────────────────────
+
+    // ── WA3A-R1: provenance and exact rollback identity ────────────────────────────────────
+
+    /// **The WA3A defect.** A queue-neutral refusal must not touch the scheduler at all. Undoing
+    /// a "dequeue" that never happened would ENQUEUE the current task — and if that current task
+    /// is a blocked endpoint receiver, that is the unarbitrated wake Stage 199D prevents.
+    #[test]
+    fn a_queue_neutral_blocked_current_is_refused_and_never_enqueued() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            s.enqueue_task(OTHER).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), Some(OTHER));
+        // Block the CURRENT task, then run a queue-neutral dispatch step.
+        kernel.with(|s| {
+            s.set_task_status_for_test(
+                OTHER,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    crate::kernel::capabilities::CapId(5),
+                )),
+            );
+        });
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            dispatch,
+            crate::runtime::CpuDispatch::Selected {
+                cpu: CpuId(0),
+                selection: crate::kernel::scheduler::DispatchSelection::ContinuedCurrent {
+                    tid: crate::kernel::ipc::ThreadId(OTHER)
+                }
+            },
+            "nothing was dequeued: the existing current was returned"
+        );
+        assert_eq!(
+            kernel.d6_genuine_mark_running_via_task_seam(dispatch),
+            crate::runtime::DispatchMarkOutcome::RefusedNoSchedulerChange,
+            "a queue-neutral refusal must not touch scheduler state"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "the blocked current task must NOT have been enqueued"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            Some(OTHER),
+            "and `current` is unchanged"
+        );
+        assert!(matches!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Blocked(_))
+        ));
+    }
+
+    /// **D's required counterexample.** A stale token for incarnation A must not roll back a
+    /// same-TID, different-ASID replacement B that is legitimately `Running`.
+    #[test]
+    fn a_same_tid_different_asid_running_replacement_rejects_a_stale_rollback() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid_b, _) = kernel
+            .with(|s| {
+                s.register_task(OTHER).expect("register");
+                s.create_user_address_space()
+            })
+            .expect("asid");
+        kernel.with(|s| {
+            s.bind_task_asid(OTHER, asid_b).expect("bind B");
+            s.set_task_status_for_test(OTHER, TaskStatus::Running);
+        });
+        // A token minted for incarnation A ({tid=T, asid=A}) — a different address space.
+        let stale = kernel
+            .stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(0xAA))
+            .into_dequeued_authority()
+            .expect("a dequeue-provenance token is dequeue authority");
+        let current_before = kernel.current_tid_authoritative(CpuId(0));
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let ctx_before = kernel.with(|s| s.thread_user_context(OTHER));
+
+        assert!(
+            !kernel.direct_dispatch_rollback_split(stale),
+            "a stale incarnation's token must not roll back the replacement"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Running),
+            "B stays Running"
+        );
+        assert_eq!(kernel.with(|s| s.task_asid(OTHER)), Some(asid_b));
+        assert_eq!(
+            kernel.with(|s| s.thread_user_context(OTHER)),
+            ctx_before,
+            "B's register context is byte-for-byte unchanged"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            current_before,
+            "scheduler current unchanged"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "scheduler queue unchanged"
+        );
+    }
+
+    /// A genuinely dequeued blocked task is returned to the queue exactly once.
+    #[test]
+    fn a_dequeued_blocked_task_is_returned_exactly_once() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(BLOCKED).expect("register");
+            s.enqueue_task(BLOCKED).expect("enqueue");
+            s.set_task_status_for_test(
+                BLOCKED,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(
+                    crate::kernel::capabilities::CapId(3),
+                )),
+            );
+        });
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            dispatch,
+            crate::runtime::CpuDispatch::Selected {
+                cpu: CpuId(0),
+                selection: crate::kernel::scheduler::DispatchSelection::Dequeued {
+                    tid: crate::kernel::ipc::ThreadId(BLOCKED)
+                }
+            }
+        );
+        assert_eq!(
+            kernel.d6_genuine_mark_running_via_task_seam(dispatch),
+            crate::runtime::DispatchMarkOutcome::RefusedRolledBack
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "returned exactly once — not zero times, not twice"
+        );
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), None);
+    }
+
+    /// A successful mark mints a token carrying the exact incarnation, and a user task with no
+    /// ASID fails closed rather than producing a wildcard token.
+    #[test]
+    fn a_mark_token_carries_the_exact_incarnation_or_is_refused() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, _) = kernel
+            .with(|s| {
+                s.register_task(OTHER).expect("register");
+                s.create_user_address_space()
+            })
+            .expect("asid");
+        kernel.with(|s| {
+            s.bind_task_asid(OTHER, asid).expect("bind");
+            s.enqueue_task(OTHER).expect("enqueue");
+        });
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let token = kernel
+            .d6_genuine_mark_running_via_task_seam(dispatch)
+            .token()
+            .expect("a bound user task mints a token");
+        assert_eq!(token.tid(), OTHER);
+        assert_eq!(token.expect_asid(), Some(asid));
+        assert_eq!(
+            crate::runtime::CpuDispatch::Selected {
+                cpu: token.cpu(),
+                selection: token.provenance()
+            },
+            dispatch
+        );
+        // …and the exact token rolls back cleanly.
+        assert!(
+            kernel.direct_dispatch_rollback_split(
+                token
+                    .into_dequeued_authority()
+                    .expect("a genuine dequeue is dequeue authority")
+            )
+        );
+
+        // A user task with NO ASID must not mint a wildcard token.
+        let bare = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        bare.with(|s| {
+            s.register_task(BLOCKED).expect("register");
+            s.enqueue_task(BLOCKED).expect("enqueue");
+        });
+        let sel = bare.futex_wait_dispatch_step_mut(CpuId(0));
+        let outcome = bare.d6_genuine_mark_running_via_task_seam(sel);
+        assert_eq!(outcome.token(), None, "no ASID ⇒ no token");
+        assert_ne!(
+            outcome.disposition(),
+            crate::runtime::DispatchDisposition::ResumeIncoming
+        );
+    }
+
+    /// **HARD-STOP, recorded as a test rather than a claim.** `spawn_user_task_from_image`
+    /// still overwrites a pre-existing TID: the absence precondition WA3A set out to enforce is
+    /// not satisfiable while boot registers the RING3 TIDs before spawning onto them. This test
+    /// documents the CURRENT behaviour so the gap is visible and any future fix is detected.
+    #[test]
+    fn spawn_still_overwrites_a_present_tid_pending_the_boot_sequence_repair() {
+        let mut state = kernel_with(&[OTHER]);
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(OTHER, asid).expect("bind");
+        block_on_endpoint(&mut state, OTHER);
+
+        let spec = crate::kernel::boot::UserImageSpec {
+            tid: OTHER,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: crate::kernel::task::TaskClass::App,
+            startup_args: crate::kernel::boot::UserImageSpec::DEFAULT_STARTUP_ARGS,
+            spawner_tid: 0,
+            service_recv_cap: 0,
+            service_reply_recv_cap: 0,
+            extra_send_caps: [0; 4],
+        };
+        let result = state.spawn_user_task_from_image(spec);
+        assert!(
+            result.is_ok(),
+            "documented gap: a present TID is still accepted, so the census keeps this site CAN"
+        );
+        assert_eq!(
+            state.task_status(OTHER),
+            Some(TaskStatus::Runnable),
+            "the blocked receiver was overwritten — this is exactly what §6.1.35 C hard-stops on"
+        );
+    }
+
+    // ── WA3A-R2-SEAL A: identity availability is part of the SAME rank-2 decision ──────────
+
+    /// **The WA3A-R1 defect.** A non-idle `Running` current with NO ASID used to be marked
+    /// `Running` (a successful `ContinueCurrent`), have the missing identity discovered
+    /// afterwards, and be rolled back `Running -> Runnable` — while
+    /// `undo_dispatch_selection(ContinuedCurrent)` correctly mutated no scheduler state. The
+    /// result was `current = T` with `status(T) = Runnable`: a task the CPU believes is running
+    /// while the task table says it is merely runnable.
+    ///
+    /// Deciding identity availability BEFORE the transition makes the refusal mutation-free.
+    #[test]
+    fn an_asid_less_continued_current_is_refused_with_zero_mutation() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            s.enqueue_task(OTHER).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        // A non-idle task that is `current` and `Running`, and has NO address space.
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), Some(OTHER));
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Running)
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_asid(OTHER)),
+            None,
+            "no ASID by setup"
+        );
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            dispatch,
+            crate::runtime::CpuDispatch::Selected {
+                cpu: CpuId(0),
+                selection: crate::kernel::scheduler::DispatchSelection::ContinuedCurrent {
+                    tid: ThreadId(OTHER)
+                }
+            },
+            "queue-neutral: the existing current was returned, nothing was dequeued"
+        );
+        let outcome = kernel.d6_genuine_mark_running_via_task_seam(dispatch);
+        assert_eq!(
+            outcome,
+            crate::runtime::DispatchMarkOutcome::RefusedNoSchedulerChange,
+            "no exact identity ⇒ refuse; and a continuation refusal touches no scheduler state"
+        );
+        assert_eq!(outcome.token(), None, "and mints no token");
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Running),
+            "THE DEFECT: the status must NOT have been moved to Runnable"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            Some(OTHER),
+            "and `current` must still be T"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "queue membership and count unchanged"
+        );
+    }
+
+    /// The `Dequeued` half of the same rule: an ASID-less incoming is refused before its status
+    /// is touched, and the exact dequeue is undone — the task is restored EXACTLY once.
+    #[test]
+    fn an_asid_less_dequeued_incoming_is_refused_and_restored_exactly_once() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            s.enqueue_task(OTHER).expect("enqueue");
+        });
+        assert_eq!(
+            kernel.with(|s| s.task_asid(OTHER)),
+            None,
+            "no ASID by setup"
+        );
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            dispatch,
+            crate::runtime::CpuDispatch::Selected {
+                cpu: CpuId(0),
+                selection: crate::kernel::scheduler::DispatchSelection::Dequeued {
+                    tid: ThreadId(OTHER)
+                }
+            }
+        );
+        let outcome = kernel.d6_genuine_mark_running_via_task_seam(dispatch);
+        assert_eq!(
+            outcome,
+            crate::runtime::DispatchMarkOutcome::RefusedRolledBack
+        );
+        assert_eq!(outcome.token(), None, "no ASID ⇒ no token");
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Runnable),
+            "the status was never moved: the refusal precedes the transition"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            None,
+            "current is cleared"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "restored exactly once — not zero times, not twice"
+        );
+    }
+
+    // ── WA3A-R2-SEAL B: typed provenance through the in-lock Group-3 cohort ────────────────
+
+    /// **B's required counterexample.** A lone task that yields is re-enqueued and then
+    /// GENUINELY dequeued again: `outgoing == incoming`, so every reconstruction
+    /// (`outgoing_tid != Some(tid)`, TID equality, "which helper was called") says "not
+    /// dequeued" — and undoing that dispatch would then skip the re-enqueue and lose the task.
+    /// The provenance produced inside the mutation says `Dequeued`, which is the truth.
+    #[test]
+    fn a_lone_task_yield_is_dequeued_provenance_even_though_outgoing_equals_incoming() {
+        let mut state = kernel_with(&[OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(state.current_tid(), Some(OTHER));
+        // The caller is Running and is the ONLY task. Preempt it out, exactly as yield does.
+        state.set_task_status_for_test(OTHER, TaskStatus::Runnable);
+        let selection = state.on_preempt_current_cpu_selection();
+        assert_eq!(
+            selection,
+            crate::kernel::scheduler::DispatchSelection::Dequeued {
+                tid: ThreadId(OTHER)
+            },
+            "outgoing == incoming, yet the run queue really was advanced"
+        );
+        assert_eq!(state.current_tid(), Some(OTHER));
+    }
+
+    /// No production Group-3 caller reconstructs provenance any more.
+    #[test]
+    fn no_group3_caller_reconstructs_a_dequeued_bool() {
+        for rel in [
+            "src/kernel/boot/exec_state.rs",
+            "src/kernel/boot/scheduler_state.rs",
+            "src/runtime.rs",
+            "src/arch/trap_entry.rs",
+            "src/arch/riscv64/trap.rs",
+            "src/arch/aarch64/trap.rs",
+        ] {
+            // Comment lines are stripped: a doc comment that NAMES the forbidden
+            // reconstruction (to explain why it is forbidden) is not the reconstruction.
+            let src: String = production_source(rel)
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            for probe in [
+                "let dequeued =",
+                "outgoing_tid != Some(tid)",
+                "incoming.is_some()",
+            ] {
+                assert!(
+                    !src.contains(probe),
+                    "{rel} still reconstructs dispatch provenance (`{probe}`)"
+                );
+            }
+            // "did the RESUMED task change?" is a telemetry question, not a provenance one.
+            // It survives in exactly ONE named helper so it can never drift back into a
+            // dispatch decision.
+            let telemetry = src.matches("outgoing_tid != Some(incoming)").count();
+            if rel == "src/kernel/boot/scheduler_state.rs" {
+                assert_eq!(
+                    telemetry, 1,
+                    "the context-switch counter must live in one named helper"
+                );
+                let body = src
+                    .split("fn note_context_switch_if_task_changed(")
+                    .nth(1)
+                    .expect("the telemetry helper");
+                assert!(
+                    body[..body.find("\n    ///").unwrap_or(body.len())]
+                        .contains("outgoing_tid != Some(incoming)"),
+                    "and only inside that helper"
+                );
+            } else {
+                assert_eq!(telemetry, 0, "{rel} must not compare outgoing to incoming");
+            }
+        }
+        // …and the three in-lock Group-3 sites all go through the ONE typed commit.
+        let exec = production_source("src/kernel/boot/exec_state.rs");
+        for site in ["dispatch_next_task", "yield_current", "yield_current_to"] {
+            assert!(
+                exec.contains(&alloc::format!(
+                    "self.commit_dispatch_selection_in_lock(selection, \"{site}\")"
+                )),
+                "{site} must commit through the typed provenance path"
+            );
+        }
+    }
+
+    // ── WA3A-R2-SEAL C: only DEQUEUE authority may undo a dequeue ──────────────────────────
+
+    /// **C's required test.** A genuine, successful `ContinuedCurrent` mark is minted, then
+    /// offered as authority to roll back a dequeue. The narrowing refuses, so the call is
+    /// unrepresentable, and every coordinate is byte-for-byte unchanged.
+    #[test]
+    fn a_continued_current_mark_is_not_dequeue_rollback_authority() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, _) = kernel
+            .with(|s| {
+                s.register_task(OTHER).expect("register");
+                s.create_user_address_space()
+            })
+            .expect("asid");
+        kernel.with(|s| {
+            s.bind_task_asid(OTHER, asid).expect("bind");
+            s.enqueue_task(OTHER).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        // A REAL queue-neutral mark: current is set, non-idle, Running, with an exact ASID.
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let token = kernel
+            .d6_genuine_mark_running_via_task_seam(dispatch)
+            .token()
+            .expect("a queue-neutral continuation of a bound task marks successfully");
+        assert_eq!(
+            token.provenance(),
+            crate::kernel::scheduler::DispatchSelection::ContinuedCurrent {
+                tid: ThreadId(OTHER)
+            }
+        );
+
+        let status_before = kernel.with(|s| s.task_status(OTHER));
+        let ctx_before = kernel.with(|s| s.thread_user_context(OTHER));
+        let current_before = kernel.current_tid_authoritative(CpuId(0));
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+
+        assert_eq!(
+            token.into_dequeued_authority(),
+            None,
+            "a continuation removed no runqueue entry, so it is not dequeue authority"
+        );
+
+        assert_eq!(kernel.with(|s| s.task_status(OTHER)), status_before);
+        assert_eq!(kernel.with(|s| s.thread_user_context(OTHER)), ctx_before);
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), current_before);
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before
+        );
+        // And structurally: the rollback takes the sealed type, so there is no bool to get wrong.
+        let runtime = production_source("src/runtime.rs");
+        assert!(
+            runtime.contains("authority: DequeuedDispatchMarkToken,"),
+            "the dequeue rollback must take sealed dequeue authority, not a bare token"
+        );
+        assert_eq!(
+            runtime.matches("DequeuedDispatchMarkToken(self)").count(),
+            1,
+            "`into_dequeued_authority` must be the ONLY constructor of dequeue authority"
+        );
+    }
+
+    // ── WA3A-R2-SEAL D: the token's CPU is scheduler-authenticated ─────────────────────────
+
+    /// A dispatch step requested for a CPU that is not the authoritative dispatch CPU refuses
+    /// BEFORE the dequeue: nothing is mutated and no token can be minted, so no caller can
+    /// stamp an unverified CPU into rollback authority.
+    #[test]
+    fn a_mismatched_cpu_refuses_before_any_mutation_and_mints_no_token() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            s.enqueue_task(OTHER).expect("enqueue");
+        });
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let status_before = kernel.with(|s| s.task_status(OTHER));
+        let current_before = kernel.current_tid_authoritative(CpuId(0));
+
+        // CPU 3 is NOT the authoritative dispatch CPU (which is CPU 0 here).
+        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(3));
+        assert_eq!(
+            dispatch,
+            crate::runtime::CpuDispatch::RefusedCpuMismatch {
+                requested: CpuId(3),
+                authoritative: CpuId(0)
+            }
+        );
+        assert_eq!(dispatch.tid(), None, "nothing was selected");
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "zero mutation: the task is still queued on the authoritative CPU"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            current_before,
+            "and `current` on the authoritative CPU is untouched"
+        );
+        assert_eq!(kernel.with(|s| s.task_status(OTHER)), status_before);
+
+        let outcome = kernel.d6_genuine_mark_running_via_task_seam(dispatch);
+        assert_eq!(
+            outcome,
+            crate::runtime::DispatchMarkOutcome::RefusedNoSchedulerChange
+        );
+        assert_eq!(outcome.token(), None, "and no token");
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before
+        );
+        assert_eq!(kernel.with(|s| s.task_status(OTHER)), status_before);
+    }
+
+    /// Structurally: the mark seam takes NO `cpu` argument, and every off-lock dispatch seam
+    /// authenticates the requested CPU before it mutates.
+    #[test]
+    fn the_mark_seam_cannot_be_handed_an_unverified_cpu() {
+        let runtime = production_source("src/runtime.rs");
+        assert!(
+            runtime.contains("fn d6_genuine_mark_running_via_task_seam(\n        &self,\n        dispatch: CpuDispatch,\n    ) -> DispatchMarkOutcome"),
+            "the mark seam must take the CPU-bound dispatch, not a (selection, cpu) pair"
+        );
+        for seam in [
+            "d6_genuine_local_dispatch_step_mut",
+            "d2_recv_dispatch_step_mut",
+            "d2_send_dispatch_step_mut",
+            "futex_wait_dispatch_step_mut",
+            "yield_dispatch_step_mut",
+        ] {
+            let body = runtime
+                .split(&alloc::format!("fn {seam}("))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{seam}"));
+            let end = body.find("\n    /// ").unwrap_or(body.len());
+            let scoped = &body[..end];
+            let guard = scoped
+                .find("if dispatch_cpu != cpu {")
+                .unwrap_or_else(|| panic!("{seam} must authenticate the CPU"));
+            let mutate = scoped
+                .find("dispatch_next_selection_on(")
+                .unwrap_or_else(|| panic!("{seam} must dispatch"));
+            assert!(
+                guard < mutate,
+                "{seam} must authenticate the CPU BEFORE it dequeues"
+            );
+        }
+    }
+
+    // ── WA3A-R2-SEAL E: RefusedTorn is unignorable ─────────────────────────────────────────
+
+    /// The pure outcome → disposition mapping. Each of the five outcomes maps to a DISTINCT
+    /// disposition, so no caller can collapse the three refusals into one branch through it.
+    #[test]
+    fn every_mark_outcome_has_its_own_disposition() {
+        use crate::runtime::{DispatchDisposition as D, DispatchMarkOutcome as O};
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let token = kernel.stale_dispatch_mark_token_for_test(CpuId(0), OTHER, Asid(1));
+        let pairs = [
+            (O::Marked(token), D::ResumeIncoming),
+            (O::Idle, D::SettleIdle),
+            (O::RefusedRolledBack, D::DeclineDequeueUndone),
+            (O::RefusedNoSchedulerChange, D::DeclineSchedulerUntouched),
+            (O::RefusedTorn, D::Fatal),
+        ];
+        for (outcome, expected) in pairs {
+            assert_eq!(outcome.disposition(), expected);
+        }
+        // Injective: five outcomes, five distinct dispositions.
+        for i in 0..pairs.len() {
+            for j in (i + 1)..pairs.len() {
+                assert_ne!(
+                    pairs[i].1, pairs[j].1,
+                    "two outcomes share a disposition — that IS the collapse this forbids"
+                );
+            }
+        }
+    }
+
+    /// `may_resume` is gone, every architecture-facing consumer matches all five outcomes
+    /// explicitly, and `RefusedTorn` reaches the divergent fatal at every one of them.
+    #[test]
+    fn every_architecture_caller_matches_all_five_outcomes_and_torn_is_fatal() {
+        let runtime = production_source("src/runtime.rs");
+        assert!(
+            !runtime.contains("fn may_resume("),
+            "`may_resume` collapsed the three refusals into one branch and must not return"
+        );
+        assert!(
+            runtime.contains(
+                "pub(crate) fn dispatch_torn_fatal(cpu: CpuId, tid: u64, site: &'static str) -> !"
+            ),
+            "the torn-dispatch fatal must be divergent"
+        );
+        for rel in ["src/arch/trap_entry.rs", "src/arch/riscv64/trap.rs"] {
+            let src = production_source(rel);
+            assert!(
+                !src.contains("may_resume"),
+                "{rel} must not collapse outcomes through `may_resume`"
+            );
+            let consumers = src
+                .matches("d6_genuine_mark_running_via_task_seam(dispatch)")
+                .count();
+            assert!(consumers > 0, "{rel} must consume the mark seam");
+            for arm in [
+                "Mark::Marked(",
+                "Mark::Idle =>",
+                "Mark::RefusedRolledBack =>",
+                "Mark::RefusedNoSchedulerChange =>",
+                "Mark::RefusedTorn =>",
+            ] {
+                assert_eq!(
+                    src.matches(arm).count(),
+                    consumers,
+                    "{rel}: every one of the {consumers} consumers must match `{arm}`"
+                );
+            }
+            assert_eq!(
+                src.matches("dispatch_torn_fatal(").count(),
+                consumers,
+                "{rel}: every consumer must route RefusedTorn to the divergent fatal"
+            );
+        }
+    }
+
+    // ── WA3A-R2-SEAL F: the resume uses the token's exact identity ─────────────────────────
+
+    /// **F's required counterexample.** Mark incarnation A `{tid = T, asid = A}`, then replace
+    /// the TCB with incarnation B `{tid = T, asid = B}`. Every downstream resume step resolved
+    /// through A's token refuses: B's address space is never activated, B's context is never
+    /// copied into a frame, and B's parked completion is never consumed — so the caller takes
+    /// its rollback/fatal path instead of resuming a task it never dispatched.
+    #[test]
+    fn the_post_mark_resume_refuses_a_replacement_incarnation() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid_b = kernel.with(|s| {
+            s.register_task(OTHER).expect("register");
+            let (b, _) = s.create_user_address_space().expect("asid B");
+            s.bind_task_asid(OTHER, b).expect("bind B");
+            s.set_task_status_for_test(OTHER, TaskStatus::Running);
+            b
+        });
+        // A token for incarnation A — a DIFFERENT address space under the same numeric TID.
+        let asid_a = Asid(0xA1);
+        assert_ne!(asid_a, asid_b);
+        let token_a = kernel.stale_dispatch_mark_token_for_test(CpuId(0), OTHER, asid_a);
+
+        crate::arch::hal::reset_all_active_address_spaces();
+        let ctx_before = kernel.with(|s| s.thread_user_context(OTHER));
+
+        assert_eq!(
+            kernel.direct_dispatch_activate_asid_split(token_a),
+            None,
+            "A's token must not activate B's address space"
+        );
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(0)),
+            None,
+            "and nothing was activated on this CPU"
+        );
+        assert_eq!(
+            kernel.direct_dispatch_restore_context_split(token_a),
+            None,
+            "A's token must not hand back B's saved context"
+        );
+        assert_eq!(
+            kernel.with(|s| s.thread_user_context(OTHER)),
+            ctx_before,
+            "B's register context is byte-for-byte unchanged"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(OTHER)),
+            Some(TaskStatus::Running),
+            "and B is still Running"
+        );
+        crate::arch::hal::reset_all_active_address_spaces();
+
+        // Structurally: the AArch64 resume is driven by the token, not a bare numeric TID.
+        let aarch64 = production_source("src/arch/aarch64/trap.rs");
+        assert!(
+            aarch64.contains("token: crate::runtime::DispatchMarkToken,"),
+            "the direct-dispatch resume must take the exact mark token"
+        );
+        for seam in [
+            "direct_dispatch_activate_asid_split(token)",
+            "direct_dispatch_restore_context_split(token)",
+            "direct_dispatch_take_completion_split(token)",
+        ] {
+            assert!(
+                aarch64.contains(seam),
+                "the resume must reach `{seam}` with the token, not a re-resolved TID"
+            );
+        }
+    }
+
+    // ── the valid transitions still work ───────────────────────────────────────────────────
+
+    #[test]
+    fn ordinary_idle_and_repeated_transitions_still_work() {
+        let mut state = kernel_with(&[BLOCKED, OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        // Ordinary dispatch: Runnable -> Running.
+        assert_eq!(state.dispatch_next_task().expect("dispatch"), Some(OTHER));
+        assert_eq!(state.task_status(OTHER), Some(TaskStatus::Running));
+        // Queue-neutral re-dispatch: Running -> Running.
+        assert_eq!(state.dispatch_next_task().expect("dispatch"), Some(OTHER));
+        assert_eq!(state.task_status(OTHER), Some(TaskStatus::Running));
+        // Ordinary yield with a second runnable task.
+        state.enqueue_task(BLOCKED).expect("enqueue");
+        state.yield_current().expect("yield");
+        assert_eq!(
+            state.current_tid().and_then(|t| state.task_status(t)),
+            Some(TaskStatus::Running),
+            "the incoming task is Running after a successful yield"
+        );
+        // The idle task (TID 0) is `current` while `Runnable` — the rank-1 scheduler makes it
+        // current without a mark-running step — so yielding it out is `Runnable → Runnable`.
+        // The typed idle branch must accept that, and the incoming task must still come out
+        // `Running`.
+        let mut idle = Bootstrap::init().expect("init");
+        assert_eq!(
+            idle.current_tid(),
+            Some(0),
+            "the idle task is current at boot"
+        );
+        idle.register_task(OTHER).expect("register");
+        idle.enqueue_task(OTHER).expect("enqueue");
+        // Reproduce the state the rank-1 scheduler leaves after it re-enqueues and re-dispatches
+        // idle without a mark-running step. `destroy_aspace_with_blocked_ipc_waiter_and_
+        // preemption_preserves_ordering` reaches the same state through a real yield sequence.
+        idle.set_task_status_for_test(0, TaskStatus::Runnable);
+        assert_eq!(idle.task_status(0), Some(TaskStatus::Runnable));
+        idle.yield_current()
+            .expect("yielding the idle task must succeed");
+        assert_eq!(idle.current_tid(), Some(OTHER));
+        assert_eq!(idle.task_status(OTHER), Some(TaskStatus::Running));
+        assert_eq!(
+            idle.task_status(0),
+            Some(TaskStatus::Runnable),
+            "and idle is left Runnable, not corrupted"
+        );
+    }
+
+    /// The idle branch is **idle-only**: an ordinary task that is `current` while `Runnable`
+    /// (only reachable through a raw rank-1 preempt, which no production path performs) is
+    /// still refused. The ordinary contract is not weakened to accommodate idle.
+    #[test]
+    fn the_idle_branch_does_not_admit_an_ordinary_runnable_current_task() {
+        let mut state = kernel_with(&[OTHER]);
+        state.enqueue_task(OTHER).expect("enqueue");
+        assert!(
+            state.on_preempt_current_cpu().is_some(),
+            "a raw preempt sets a current without marking it Running"
+        );
+        assert_eq!(state.current_tid(), Some(OTHER));
+        assert_eq!(state.task_status(OTHER), Some(TaskStatus::Runnable));
+        assert!(
+            state.yield_current().is_err(),
+            "an ORDINARY Runnable current task must not take the idle branch"
+        );
+        assert_eq!(state.task_status(OTHER), Some(TaskStatus::Runnable));
+        assert_eq!(state.current_tid(), Some(OTHER));
     }
 }
