@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use super::EndpointWaiterRecord;
 use super::{
     IpcEndpointRecvResult, IpcEndpointSendResult, IpcEndpointSplitRejectReason, IpcFastpathResult,
     IpcSubsystem, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
@@ -29,6 +30,13 @@ struct RecvBlockPhasePlan {
     /// Stage 198E3B2B2: the blocking receiver's captured ASID, threaded from the task phase (rank 2)
     /// so the ipc phase (rank 3) can publish the COMPLETE generation-bearing waiter identity.
     receiver_asid: Asid,
+    /// Stage 199D-WA3C1: the FRESH blocked-recv generation minted in Phase B under task rank 2.
+    ///
+    /// The receiver ASID above is captured in Phase A (it is a pre-existing property of the
+    /// task); the wait generation is *created* in Phase B, in the same acquisition that marks the
+    /// task Blocked. It is threaded into Phase C so the publisher stores a complete record —
+    /// never re-read later by bare TID.
+    wait_generation: u64,
 }
 
 /// Stage 200C2B — a reserved-but-not-committed reply win. Minted by
@@ -681,15 +689,20 @@ impl IpcSubsystem {
 
     /// The present receiver waiter's TID (for waking / telemetry only — never an authority check).
     pub(crate) fn endpoint_waiter_tid(&self, idx: usize) -> Option<ThreadId> {
-        self.endpoint_waiters
-            .get(idx)
-            .copied()
-            .flatten()
-            .map(|w| w.tid)
+        self.endpoint_waiter_record(idx).map(|r| r.tid())
     }
 
     /// The present receiver waiter's COMPLETE identity, or `None`.
+    ///
+    /// Stage 199D-WA3C1: a narrow projection of the authoritative record, so the many callers
+    /// that only need `{tid, asid}` never have to know the slot's storage layout — and never
+    /// silently discard the generation the record now carries.
     pub(crate) fn endpoint_waiter_identity(&self, idx: usize) -> Option<ReceiverWaiterIdentity> {
+        self.endpoint_waiter_record(idx).map(|r| r.receiver)
+    }
+
+    /// Stage 199D-WA3C1: the AUTHORITATIVE published waiter record, generation and all.
+    pub(crate) fn endpoint_waiter_record(&self, idx: usize) -> Option<EndpointWaiterRecord> {
         self.endpoint_waiters.get(idx).copied().flatten()
     }
 
@@ -698,14 +711,25 @@ impl IpcSubsystem {
         self.endpoint_waiters.get(idx).map(Option::is_some) == Some(true)
     }
 
-    /// Publish (overwrite) the complete identity at `idx`. Returns the displaced identity, if any.
+    /// Publish the complete record at `idx`, returning the displaced record, if any.
+    ///
+    /// Stage 199D-WA3C1 deliberately PRESERVES last-receiver-wins: a new receiver may replace an
+    /// existing waiter. That semantic is load-bearing for the relay, direct-request, direct-reply
+    /// and reply-timeout paths, which have their own replacement/rollback contracts, so changing
+    /// it is out of scope here and is WA3C2's question to answer.
     pub(crate) fn set_endpoint_waiter(
         &mut self,
         idx: usize,
-        identity: ReceiverWaiterIdentity,
-    ) -> Option<ReceiverWaiterIdentity> {
+        record: EndpointWaiterRecord,
+    ) -> Option<EndpointWaiterRecord> {
         let displaced = self.endpoint_waiters.get(idx).copied().flatten();
-        self.endpoint_waiters[idx] = Some(identity);
+        // A displacement removes the old waiter, so its direct-ack lease must retire with it —
+        // exactly as any other removal would. Without this a replaced waiter's lease would
+        // outlive its waiter, which is the leak the central removal body exists to prevent.
+        if let Some(old) = displaced {
+            self.release_direct_ack_lease(idx, old.receiver);
+        }
+        self.endpoint_waiters[idx] = Some(record);
         // Stage 199D independent census: the waiter table's own publisher maintains the
         // count, so it cannot drift by a path forgetting to report. A displacement is net
         // zero — one waiter left as another arrived.
@@ -764,14 +788,58 @@ impl IpcSubsystem {
         crate::kernel::direct_ack_census::note_waiter_unlinked();
     }
 
+    /// Stage 199D-WA3C1 — **the ONE place an endpoint waiter slot is cleared.**
+    ///
+    /// Every removal family below delegates here, so the three things that must happen exactly
+    /// once per departing waiter — slot clear, direct-ack lease release, census unlink — are one
+    /// step that cannot half-happen and cannot be forgotten by a new caller.
+    ///
+    /// `expected` is the exact record a caller already knows it is removing; `None` means
+    /// "whatever is there". A mismatch removes nothing and reports `None`.
+    fn remove_endpoint_waiter_at(
+        &mut self,
+        idx: usize,
+        expected: Option<EndpointWaiterRecord>,
+    ) -> Option<EndpointWaiterRecord> {
+        let record = self.endpoint_waiter_record(idx)?;
+        if let Some(expected) = expected
+            && expected != record
+        {
+            return None;
+        }
+        self.endpoint_waiters[idx] = None;
+        // The lease identity contract is `{endpoint index, endpoint generation, receiver}` and is
+        // deliberately NOT re-keyed on `wait_generation`: WA3C1 changes the waiter record, not the
+        // direct-ack contract.
+        self.release_direct_ack_lease(idx, record.receiver);
+        self.note_waiter_removed();
+        Some(record)
+    }
+
+    /// Remove the EXACT record at `idx`, discarding nothing. Returns whether it was removed.
+    ///
+    /// Preferred over the identity-only clears wherever the caller already holds the record, so a
+    /// stale incarnation cannot remove a replacement that reused the same `{tid, asid}`.
+    pub(crate) fn remove_endpoint_waiter_exact(
+        &mut self,
+        idx: usize,
+        record: EndpointWaiterRecord,
+    ) -> bool {
+        self.remove_endpoint_waiter_at(idx, Some(record)).is_some()
+    }
+
     /// Unconditionally take (remove + return) the waiter at `idx`.
     pub(crate) fn take_endpoint_waiter(&mut self, idx: usize) -> Option<ReceiverWaiterIdentity> {
-        let taken = self.endpoint_waiters.get_mut(idx).and_then(Option::take);
-        if let Some(waiter) = taken {
-            self.release_direct_ack_lease(idx, waiter);
-            self.note_waiter_removed();
-        }
-        taken
+        self.remove_endpoint_waiter_at(idx, None)
+            .map(|r| r.receiver)
+    }
+
+    /// Unconditionally take the complete record at `idx`.
+    pub(crate) fn take_endpoint_waiter_record(
+        &mut self,
+        idx: usize,
+    ) -> Option<EndpointWaiterRecord> {
+        self.remove_endpoint_waiter_at(idx, None)
     }
 
     /// Clear the slot at `idx` iff it EXACTLY matches `identity` (full generation-bearing compare).
@@ -781,14 +849,17 @@ impl IpcSubsystem {
         idx: usize,
         identity: ReceiverWaiterIdentity,
     ) -> bool {
-        if self.endpoint_waiters.get(idx).copied().flatten() == Some(identity) {
-            self.endpoint_waiters[idx] = None;
-            self.release_direct_ack_lease(idx, identity);
-            self.note_waiter_removed();
-            true
-        } else {
-            false
+        // Identity-keyed by design: a REBLOCKED waiter (same `{tid, asid}`, new wait generation)
+        // is still this receiver, and the accepted semantics of this API are that it clears it.
+        // What it must never do is clear a DIFFERENT receiver — that protection is the identity
+        // compare, and it is unchanged.
+        let Some(record) = self.endpoint_waiter_record(idx) else {
+            return false;
+        };
+        if record.receiver != identity {
+            return false;
         }
+        self.remove_endpoint_waiter_at(idx, Some(record)).is_some()
     }
 
     /// Clear EVERY endpoint receive-waiter slot whose complete identity matches `identity`
@@ -797,17 +868,21 @@ impl IpcSubsystem {
         // Indexed rather than iterator-based so the lease release — which reads the endpoint
         // generation table — can run per slot without holding a mutable borrow across it.
         for idx in 0..self.endpoint_waiters.len() {
-            if self.endpoint_waiters[idx] == Some(identity) {
-                self.endpoint_waiters[idx] = None;
-                self.release_direct_ack_lease(idx, identity);
-                self.note_waiter_removed();
+            let Some(record) = self.endpoint_waiter_record(idx) else {
+                continue;
+            };
+            if record.receiver == identity {
+                self.remove_endpoint_waiter_at(idx, Some(record));
             }
         }
     }
 
     /// Whether any endpoint receive-waiter slot still holds the complete `identity`.
     pub(crate) fn any_endpoint_waiter_is(&self, identity: ReceiverWaiterIdentity) -> bool {
-        self.endpoint_waiters.iter().any(|w| *w == Some(identity))
+        self.endpoint_waiters
+            .iter()
+            .flatten()
+            .any(|r| r.receiver == identity)
     }
 }
 
@@ -3085,6 +3160,8 @@ impl KernelState {
             endpoint_idx,
             recv_cap,
             receiver_asid,
+            // Phase B mints the real generation; 0 is never published.
+            wait_generation: 0,
         })
     }
 
@@ -3100,19 +3177,38 @@ impl KernelState {
         plan: RecvBlockPhasePlan,
         deadline: Option<u64>,
     ) -> Result<RecvBlockPhasePlan, KernelError> {
-        self.with_tcbs_mut(|tcbs| {
+        // Stage 199D-WA3C1: mint the FRESH blocked-recv generation here, under task rank 2, in
+        // the same acquisition that marks the task Blocked — so a task cannot be Blocked for a
+        // receive whose generation was never advanced.
+        //
+        // CHECKED advancement: wrapping back to an earlier generation would let a stale record
+        // compare equal to a newer one, which is exactly the confusion the generation exists to
+        // prevent. On exhaustion this fails closed and the caller unwinds the block.
+        let wait_generation = self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == plan.blocked_tid.0)
                 .ok_or(KernelError::TaskMissing)?;
+            let next = tcb
+                .blocked_recv_generation
+                .checked_add(1)
+                .ok_or(KernelError::WouldBlock)?;
+            tcb.blocked_recv_generation = next;
             tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(plan.recv_cap));
             tcb.ipc_timeout_deadline = deadline;
             tcb.ipc_timeout_fired = false;
-            Ok::<_, KernelError>(())
+            Ok::<_, KernelError>(next)
         })?;
-        crate::yarm_log!("D2_RECV_WAITER_TASK_BLOCKED tid={}", plan.blocked_tid.0);
-        Ok(plan)
+        crate::yarm_log!(
+            "D2_RECV_WAITER_TASK_BLOCKED tid={} wait_gen={}",
+            plan.blocked_tid.0,
+            wait_generation
+        );
+        Ok(RecvBlockPhasePlan {
+            wait_generation,
+            ..plan
+        })
     }
 
     /// D-NEXT-1 PR-A Phase C — ipc domain, rank 3: atomically recheck the
@@ -3127,7 +3223,10 @@ impl KernelState {
     ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
         let outcome = self.publish_recv_waiter_live(
             plan.endpoint_idx,
-            ReceiverWaiterIdentity::new(plan.blocked_tid, plan.receiver_asid),
+            EndpointWaiterRecord::new(
+                ReceiverWaiterIdentity::new(plan.blocked_tid, plan.receiver_asid),
+                plan.wait_generation,
+            ),
             plan.recv_cap,
         );
         if matches!(
@@ -5249,20 +5348,63 @@ impl KernelState {
 
     pub fn destroy_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
         let limits = self.runtime_capacity_config();
-        self.with_ipc_state_mut(|ipc| {
+        let stranded = self.with_ipc_state_mut(|ipc| {
             if endpoint_idx >= limits.max_endpoints || ipc.endpoints[endpoint_idx].is_none() {
                 return Err(KernelError::WrongObject);
             }
             ipc.endpoints[endpoint_idx] = None;
-            ipc.endpoint_waiters[endpoint_idx] = None;
+            // Stage 199D-WA3C1 (E) — REAL PRE-EXISTING BUG, fixed here.
+            //
+            // This used to be `ipc.endpoint_waiters[endpoint_idx] = None;`: a raw slot write that
+            // bypassed the accessor family entirely, so it never released the direct-ack lease and
+            // never unlinked the waiter census. The leak was permanent, because the lease is keyed
+            // on the endpoint generation that the next lines advance — after which no release
+            // could ever match it again.
+            //
+            // Order matters: remove through the central lifecycle while the OLD generation is
+            // still authoritative, and only then advance it.
+            let stranded = ipc.take_endpoint_waiter_record(endpoint_idx);
             ipc.endpoint_sender_waiters[endpoint_idx] = [None; MAX_ENDPOINT_SENDER_WAITERS];
             let mut next_generation = ipc.endpoint_generations[endpoint_idx].wrapping_add(1);
             if next_generation == 0 {
                 next_generation = 1;
             }
             ipc.endpoint_generations[endpoint_idx] = next_generation;
-            Ok(())
+            Ok(stranded)
         })?;
+        // Stage 199D-WA3C1 (F) — the second half of the same defect: the parked receiver used to
+        // be discarded silently, leaving it `Blocked(EndpointReceive)` on an endpoint that no
+        // longer exists, with nothing that could ever wake it.
+        //
+        // Wake the EXACT incarnation the record named — never a numeric TID. A replacement task
+        // that reused the TID under a different ASID, a receiver that already completed and is no
+        // longer blocked, or one that has since re-blocked under a NEWER wait generation are all
+        // different receivers, and none of them is the one this endpoint stranded.
+        if let Some(record) = stranded {
+            let exact = self.with_tcbs(|tcbs| {
+                tcbs.iter().flatten().any(|tcb| {
+                    tcb.tid == record.receiver.tid
+                        && tcb.asid == Some(record.receiver.asid)
+                        && tcb.blocked_recv_generation == record.wait_generation
+                        && matches!(
+                            tcb.status,
+                            TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                        )
+                })
+            });
+            crate::yarm_log!(
+                "ENDPOINT_DESTROY_WAITER_RELEASED endpoint={} tid={} asid={} wait_gen={} exact={}",
+                endpoint_idx,
+                record.receiver.tid.0,
+                record.receiver.asid.0,
+                record.wait_generation,
+                u8::from(exact)
+            );
+            if exact {
+                // The ordinary wake seam — not a new raw status writer.
+                let _ = self.wake_tid_to_runnable(record.receiver.tid);
+            }
+        }
         self.with_fault_state_mut(|faults| {
             if faults.fault_handler_endpoint == Some(endpoint_idx) {
                 faults.fault_handler_endpoint = None;
@@ -6020,8 +6162,9 @@ impl KernelState {
             if ipc.endpoint_waiter_present(endpoint_idx) {
                 return PublishWaiterOutcome::ReceiverAlreadyWaiting;
             }
-            // Stage 198E3B2B2: store the COMPLETE generation-bearing identity.
-            ipc.set_endpoint_waiter(endpoint_idx, receiver);
+            // Stage 199D-WA3C1: the audit-only helper has no task phase to mint a generation,
+            // so it names incarnation 0 explicitly rather than inventing one.
+            ipc.set_endpoint_waiter(endpoint_idx, EndpointWaiterRecord::new(receiver, 0));
             crate::yarm_log!(
                 "D2_RECV_WAITER_PUBLISH_AUDIT endpoint={} tid={} asid={} recv_cap={}",
                 endpoint_idx,
@@ -6058,10 +6201,11 @@ impl KernelState {
     pub(crate) fn publish_recv_waiter_live(
         &mut self,
         endpoint_idx: usize,
-        receiver: ReceiverWaiterIdentity,
+        record: EndpointWaiterRecord,
         recv_cap: CapId,
     ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
         use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
+        let receiver = record.receiver;
         let receiver_tid = receiver.tid;
         let outcome = self.with_ipc_state_mut(|ipc| {
             if endpoint_idx >= ipc.endpoints.len() {
@@ -6074,14 +6218,19 @@ impl KernelState {
             if endpoint.queued() > 0 {
                 return PublishWaiterOutcome::QueueNonEmpty;
             }
-            // Stage 198E3B2B2: store the COMPLETE generation-bearing identity (canonical overwrite
-            // semantics preserved — a displaced waiter is logged, last receiver wins).
-            if let Some(displaced) = ipc.set_endpoint_waiter(endpoint_idx, receiver) {
+            // Stage 199D-WA3C1: store the COMPLETE generation-bearing RECORD. Canonical
+            // last-receiver-wins is PRESERVED on purpose — the relay, direct-request,
+            // direct-reply and reply-timeout paths each have their own replacement/rollback
+            // contract built on it. Whether YARM should keep replacement at all is WA3C2's
+            // question; this increment must not answer it by accident.
+            if let Some(displaced) = ipc.set_endpoint_waiter(endpoint_idx, record) {
                 crate::yarm_log!(
-                    "D2_RECV_WAITER_DISPLACED endpoint={} old_tid={} new_tid={}",
+                    "D2_RECV_WAITER_DISPLACED endpoint={} old_tid={} old_wait_gen={} new_tid={} new_wait_gen={}",
                     endpoint_idx,
-                    displaced.tid.0,
-                    receiver_tid.0
+                    displaced.tid().0,
+                    displaced.wait_generation,
+                    receiver_tid.0,
+                    record.wait_generation
                 );
             }
             crate::yarm_log!(

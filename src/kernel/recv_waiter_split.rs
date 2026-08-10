@@ -601,9 +601,12 @@ mod tests {
         // Step 3 (receiver, rank 3): publish observes the non-empty queue.
         let outcome = state.publish_recv_waiter_live(
             idx,
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                ThreadId(0),
-                crate::kernel::vm::Asid(0),
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(0),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
             recv_cap,
         );

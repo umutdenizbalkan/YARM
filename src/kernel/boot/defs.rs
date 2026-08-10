@@ -147,6 +147,41 @@ impl ReceiverWaiterIdentity {
     }
 }
 
+/// Stage 199D-WA3C1 — the AUTHORITATIVE published endpoint receive-waiter.
+///
+/// `ReceiverWaiterIdentity` alone cannot distinguish incarnations: the SAME `{tid, asid}` may
+/// block on the SAME endpoint, unblock, and block again. Carrying the receiver's
+/// `blocked_recv_generation` IN the published record — rather than in a parallel array — gives
+/// the waiter and its generation one lifetime, so there is no second field that can be updated a
+/// moment later, or forgotten.
+///
+/// WA3C1 scope note: this record is what a future ownership `WaiterKey` will be derived from, but
+/// **no ownership arming happens yet**. The waiter table remains the single authority for who is
+/// parked on an endpoint, and last-receiver-wins replacement is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EndpointWaiterRecord {
+    pub(crate) receiver: ReceiverWaiterIdentity,
+    /// The receiver's `blocked_recv_generation` at the moment it committed THIS blocking receive.
+    pub(crate) wait_generation: u64,
+}
+
+impl EndpointWaiterRecord {
+    pub(crate) fn new(receiver: ReceiverWaiterIdentity, wait_generation: u64) -> Self {
+        Self {
+            receiver,
+            wait_generation,
+        }
+    }
+
+    pub(crate) fn tid(&self) -> ThreadId {
+        self.receiver.tid
+    }
+
+    pub(crate) fn asid(&self) -> Asid {
+        self.receiver.asid
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RobustFutexRecord {
     pub(crate) tid: ThreadId,
@@ -317,7 +352,7 @@ pub(crate) struct IpcSubsystem {
     /// once, since a lease exists exactly while one of these slots does.
     /// [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`] is derived from the
     /// same constant, so the two can never drift.
-    pub(crate) endpoint_waiters: [Option<ReceiverWaiterIdentity>; ENDPOINT_WAITER_SLOTS],
+    pub(crate) endpoint_waiters: [Option<EndpointWaiterRecord>; ENDPOINT_WAITER_SLOTS],
     pub(crate) endpoint_sender_waiters:
         [[Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS]; ENDPOINT_WAITER_SLOTS],
     pub(crate) endpoint_generations: [u64; ENDPOINT_WAITER_SLOTS],
