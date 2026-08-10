@@ -4479,6 +4479,121 @@ must create the first real production callers of the WA2A ownership primitive.
 
 ---
 
+### 6.1.38 WA3C1 — generation-bearing waiter record, central removal, and the `destroy_endpoint` repair
+
+WA3C set out to wire the WA2A ownership primitive into the live waiter lifecycle. It was **split**,
+because the strict single-waiter publication that exact ownership requires turned out to conflict
+with a semantic the kernel actively depends on. WA3C1 is the half that is independently correct
+and independently useful; WA3C2 owns the semantic question.
+
+#### A. Why the split — the proven blocker
+
+Exact ownership needs strict publication: `arm_current` refuses an occupied ownership slot, so a
+silent "last receiver wins" replacement would strand the previous blocked receiver with neither a
+waiter nor an owner. Making publication strict produced a **reproducible hang** in
+`vfs_file_grant_ro_relay_preserves_transferred_cap`. The same test passes in ~0.03 s at the
+accepted base and ~0.08 s under WA3C1, so the hang is attributable to strict publication and
+nothing else.
+
+That is not an isolated test. Waiter replacement is *deliberately exercised* by a cohort:
+
+| test | what it pins |
+|---|---|
+| `replacement_publishes_and_is_not_removable_by_stale_identity` | a replacement survives a stale identity clear |
+| `waiter_replaced_by_other_tid_rejects_claim` | a claim against a replaced waiter is refused |
+| `replacement_waiter_rolls_back_zero_wake` | replacement rollback wakes nobody |
+| `replaced_restore_never_strands_never_clobbers` | restore neither strands nor clobbers |
+| `d_reply_vs_endpoint_replacement_stale_claim_rejected` | reply-vs-endpoint replacement ordering |
+| `c15_waiter_replacement_before_fire` | replacement before a timeout fires |
+| `stage199d_delivery_projection_differential` (35 tests) | the delivery projection differential |
+
+Replacement is therefore a **contract**, not an accident, and the relay, direct-request,
+direct-reply and reply-timeout paths each build rollback behaviour on it. Deciding whether YARM
+should keep it is a design question that must be answered from those contracts and from the relay
+hang — not settled as a side effect of wiring ownership. WA3C1 changes none of it.
+
+#### B. What WA3C1 actually changes
+
+**The authoritative waiter record is generation-bearing.** `endpoint_waiters` stores
+`EndpointWaiterRecord { receiver, wait_generation }` instead of a bare `ReceiverWaiterIdentity`.
+The generation lives *in* the published record rather than in a parallel array, so the waiter and
+its incarnation have one lifetime — there is no second field to update a moment later, or forget.
+Narrow projections (`endpoint_waiter_identity`, `tid()`, `asid()`) keep the many `{tid, asid}`
+callers off the storage layout.
+
+**A fresh blocked-receive generation per real cycle.** `recv_block_phase_b_task` mints it with
+`checked_add(1)` under task rank 2, in the same acquisition that marks the task `Blocked`, and it
+is threaded through `RecvBlockPhasePlan` into Phase C — never re-read later by bare TID. Wrapping
+would let a stale record compare equal to a newer one, which is the exact confusion the generation
+exists to prevent, so exhaustion fails closed and the scheduler/task block is unwound coherently.
+This is the only new publication failure WA3C1 introduces.
+
+**One central removal body.** `remove_endpoint_waiter_at` owns the three things that must happen
+exactly once per departing waiter — slot clear, direct-ack lease release, census unlink — and
+`take_endpoint_waiter`, `clear_endpoint_waiter_if_identity` and
+`clear_endpoint_waiters_for_identity` all delegate to it. `remove_endpoint_waiter_exact` is added
+for callers that already hold the record, so the generation is not discarded where it is known.
+The direct-ack lease key is deliberately **unchanged** — WA3C1 changes the waiter record, not the
+lease contract.
+
+#### C. Two real production defects fixed
+
+1. **Displacement leaked a direct-ack lease.** `set_endpoint_waiter` replaced the record without
+   releasing the displaced waiter's lease. A replaced waiter is a departing waiter; its lease now
+   retires with it.
+2. **`destroy_endpoint` bypassed the waiter lifecycle entirely.** It did
+   `ipc.endpoint_waiters[endpoint_idx] = None;` — a raw slot write — and then advanced
+   `endpoint_generations`. So it never released the lease and never unlinked the census, and the
+   leak was *permanent*, because the lease is keyed on the generation the next line advanced past.
+   It now removes through the central lifecycle while the OLD generation is still authoritative,
+   and only then advances.
+
+#### D. The stranded receiver
+
+The same function also discarded a parked receiver without waking it, leaving it
+`Blocked(EndpointReceive)` on an endpoint that no longer existed, with nothing that could ever
+wake it. WA3C1 snapshots the complete record under IPC rank 3, releases the lock, and wakes the
+receiver **only** if `{tid, asid, wait_generation, Blocked(EndpointReceive)}` all still match.
+
+This makes `destroy_endpoint` a **new production caller of `wake_tid_to_runnable`** — recorded in
+the pinned caller set rather than suppressed. It is safe because it is exact in every dimension: a
+replacement task that reused the TID under a different ASID is refused by the ASID compare; a
+receiver that already completed is refused by the status compare; and a receiver that has since
+re-blocked under a newer generation is refused by the generation compare. No numeric-TID-only
+resurrection is possible.
+
+#### E. Ownership remains dormant
+
+Production callers of all six ownership operations — `arm_current`, `claim`, `consume`, `cancel`,
+`restore`, `retire_current` — remain **zero**, pinned by guard. The record WA3C1 introduces is the
+representation a future `WaiterKey` will be derived from, but nothing derives one yet.
+
+#### Census
+
+Recomputed mechanically and **unchanged**: **CAN 12 / CANNOT 16 / INTO_BLOCKED 7 /
+FRESH_CONSTRUCTOR 2 / NON_PRODUCTION 1 / UNPROVEN 0, total 38.** The generation write is
+`tcb.blocked_recv_generation`, not a `TaskStatus` write, so it introduces no new status authority.
+The one census-relevant movement is the new `wake_tid_to_runnable` caller above.
+
+#### Status
+
+* production executable code — **changed**
+* waiter representation — **generation-bearing**
+* last-receiver-wins — **preserved**; the replacement cohort passes unchanged
+* waiter removal — **centralized**; lease + census settled exactly once
+* displacement lease leak — **fixed**
+* `destroy_endpoint` raw clear / lease leak / census drift / stranded receiver — **fixed**
+* ownership ARM / RETIRE / CLAIM / settle production callers — **0**
+* `WAITER_OWNER_CENSUS_COMPLETE` — **yes**; `WAITER_OWNERSHIP_EXCLUSIVE` — **no**
+* direct production default — **OFF**; canonical 199D — **OPEN**; ledger — **39 / 7 / 46**
+* **no new live cell**
+
+WA3C2 begins with the semantic investigation: keep waiter replacement, or move to strict
+single-waiter publication — decided from the relay hang and the DirectRequest / DirectReply /
+reply-timeout replacement contracts, before ownership ARM/RETIRE is made live.
+
+---
+
 
 ## 7. Method and limits
 

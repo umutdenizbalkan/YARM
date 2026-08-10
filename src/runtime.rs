@@ -4579,15 +4579,19 @@ impl SharedKernel {
         self.with_ipc_split_mut(|ipc| {
             // Stage 198E3B2B2: the slot must hold the COMPLETE identity (tid + ASID) — numeric TID
             // reuse with a different ASID is not our receiver and is never claimed/cleared.
+            // Stage 199D-WA3C1: capture the exact record BEFORE removal so a restore can
+            // republish the same incarnation.
+            let record = ipc.endpoint_waiter_record(eidx);
             if eidx < ipc.endpoint_waiters.len()
                 && ipc.endpoint_generations[eidx] == egen
-                && ipc.endpoint_waiter_identity(eidx) == Some(receiver)
+                && record.map(|r| r.receiver) == Some(receiver)
             {
                 ipc.take_endpoint_waiter(eidx);
                 Some(WaiterClaim {
                     eidx,
                     generation: egen,
                     receiver,
+                    wait_generation: record.map(|r| r.wait_generation).unwrap_or(0),
                 })
             } else {
                 None
@@ -4653,7 +4657,13 @@ impl SharedKernel {
                 && ipc.endpoint_generations[claim.eidx] == claim.generation
                 && !ipc.endpoint_waiter_present(claim.eidx)
             {
-                ipc.set_endpoint_waiter(claim.eidx, claim.receiver);
+                ipc.set_endpoint_waiter(
+                    claim.eidx,
+                    crate::kernel::boot::EndpointWaiterRecord::new(
+                        claim.receiver,
+                        claim.wait_generation,
+                    ),
+                );
                 true
             } else {
                 false
@@ -5638,8 +5648,8 @@ impl SharedKernel {
         let mut out = LeaseBijection::default();
         for idx in 0..slots {
             let entry = self.with_ipc_split_mut(|ipc| {
-                ipc.endpoint_waiters[idx]
-                    .map(|id| (id.tid.0, id.asid.0, ipc.endpoint_generations[idx]))
+                ipc.endpoint_waiter_record(idx)
+                    .map(|r| (r.tid().0, r.asid().0, ipc.endpoint_generations[idx]))
             });
             let waiter = entry.map(|(tid, asid, generation)| CensusWaiter {
                 endpoint_index: idx,
@@ -6005,6 +6015,9 @@ pub(crate) struct WaiterClaim {
     /// Stage 198E3B2B2: the COMPLETE generation-bearing receiver identity (tid + ASID) that was
     /// removed — a restore can only ever re-install this exact identity, never a replacement task.
     pub(crate) receiver: crate::kernel::boot::ReceiverWaiterIdentity,
+    /// Stage 199D-WA3C1: the wait generation of the record that was removed, so a restore
+    /// republishes the SAME incarnation rather than minting a fresh-looking one.
+    pub(crate) wait_generation: u64,
 }
 
 /// Stage 199D — what the single rank-1 receiver enqueue actually did.

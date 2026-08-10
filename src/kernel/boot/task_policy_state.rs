@@ -228,6 +228,17 @@ impl KernelState {
         self.with_tcbs(|tcbs| tcbs.iter().flatten().find(|t| t.tid.0 == tid).cloned())
     }
 
+    /// Test/hosted-only: drive a task's blocked-receive generation to an exact value, so the
+    /// checked-exhaustion path can be reached without a billion real blocking cycles.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn set_blocked_recv_generation_for_test(&mut self, tid: u64, generation: u64) {
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(t) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                t.blocked_recv_generation = generation;
+            }
+        });
+    }
+
     pub fn allocate_thread_id(&mut self) -> Result<u64, KernelError> {
         let limits = self.runtime_capacity_config();
         if self.with_tcbs(|tcbs| tcbs.iter().flatten().count()) >= limits.max_tasks {

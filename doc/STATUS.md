@@ -1259,6 +1259,49 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    production endpoint-waiter ARM/RETIRE wiring.
    See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.37.
 
+   **WA3C1: the waiter record becomes generation-bearing, removal is centralized, and two real
+   production defects in `destroy_endpoint` are fixed. WA3C was SPLIT by a proven blocker.**
+   WA3C intended to wire the WA2A ownership primitive into the live waiter lifecycle. Exact
+   ownership requires STRICT single-waiter publication — `arm_current` refuses an occupied
+   ownership slot, so a silent replacement would strand the previous receiver with neither a
+   waiter nor an owner. Making publication strict produced a **reproducible hang** in
+   `vfs_file_grant_ro_relay_preserves_transferred_cap`, which passes in ~0.03 s at the accepted
+   base and ~0.08 s under WA3C1. Waiter replacement turns out to be a deliberate contract, not an
+   accident: six named tests plus the 35-test `stage199d_delivery_projection_differential` family
+   exercise it, and the relay, direct-request, direct-reply and reply-timeout paths build rollback
+   behaviour on it. Whether YARM should keep replacement is a design question that must be decided
+   from those contracts — not settled as a side effect of wiring ownership. WA3C1 therefore
+   changes none of it, and WA3C2 owns the question.
+
+   **What landed.** `endpoint_waiters` now stores `EndpointWaiterRecord { receiver,
+   wait_generation }` rather than a bare identity, with the generation IN the record rather than a
+   parallel array, so the waiter and its incarnation have one lifetime. A fresh blocked-receive
+   generation is minted with `checked_add` under task rank 2 in Phase B — in the same acquisition
+   that marks the task Blocked — and threaded through `RecvBlockPhasePlan` into Phase C, never
+   re-read by bare TID; exhaustion fails closed and unwinds coherently. One central
+   `remove_endpoint_waiter_at` owns slot clear, direct-ack lease release and census unlink, and
+   the take / exact-clear / identity-clear families all delegate to it. The direct-ack lease key is
+   deliberately unchanged.
+
+   **Two real defects fixed.** Waiter *displacement* never released the displaced waiter's
+   direct-ack lease. And `destroy_endpoint` did a raw `endpoint_waiters[idx] = None` that bypassed
+   the accessor family entirely, so it released no lease and unlinked no census — a *permanent*
+   leak, because the lease is keyed on the endpoint generation the next line advanced past. It
+   also discarded the parked receiver, leaving it `Blocked(EndpointReceive)` on an endpoint that no
+   longer existed. Removal now happens while the OLD generation is authoritative, and the receiver
+   is woken only when `{tid, asid, wait_generation, Blocked(EndpointReceive)}` all still match — so
+   a replacement incarnation, a completed receiver, or one that re-blocked under a newer generation
+   is never resurrected. That makes `destroy_endpoint` a NEW production caller of
+   `wake_tid_to_runnable`, recorded in the pinned caller set rather than suppressed.
+
+   Census recomputed and unchanged: **CAN 12 / CANNOT 16 / INTO_BLOCKED 7 / FRESH_CONSTRUCTOR 2 /
+   NON_PRODUCTION 1 / UNPROVEN 0, total 38** — the generation write is not a `TaskStatus` write.
+   Ownership stays **helper-only**: production callers of `arm_current`, `claim`, `consume`,
+   `cancel`, `restore` and `retire_current` are all **0**, pinned by guard.
+   `WAITER_OWNER_CENSUS_COMPLETE=yes`, `WAITER_OWNERSHIP_EXCLUSIVE=no`, direct production default
+   **OFF**, canonical 199D **OPEN**, ledger **39 / 7 / 46**, **no new live cell**.
+   See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.38.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
