@@ -7331,27 +7331,37 @@ pub fn bootstrap_first_user_task(
         return Err(crate::kernel::boot::KernelError::MemoryObjectMissing);
     };
 
-    // Pre-register all tasks so cap grants work.
-    if supervisor_aei.is_some() {
-        kernel
-            .register_task_with_class(RING3_SUPERVISOR_TID, TaskClass::SystemServer)
-            .map_err(|e| {
-                crate::yarm_log!("YARM_FIRST_USER_FAIL step=register_supervisor err={:?}", e);
-                e
-            })?;
-    }
-    if pm_aei.is_some() {
-        kernel
-            .register_task_with_class(RING3_PM_SERVER_TID, TaskClass::SystemServer)
-            .map_err(|e| {
-                crate::yarm_log!("YARM_FIRST_USER_FAIL step=register_pm err={:?}", e);
-                e
-            })?;
-    }
-    kernel
-        .register_task_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)
+    // Stage 199D-WA3B: pre-RESERVE all tasks so cap grants work. A reservation owns the CNode,
+    // class and kernel-side provisioning the grants below need, but is NOT a live task — so the
+    // spawns consume an exact one-shot token instead of overwriting whatever occupies the TID.
+    let supervisor_reservation = if supervisor_aei.is_some() {
+        Some(
+            kernel
+                .reserve_task_for_spawn_with_class(RING3_SUPERVISOR_TID, TaskClass::SystemServer)
+                .map_err(|e| {
+                    crate::yarm_log!("YARM_FIRST_USER_FAIL step=reserve_supervisor err={:?}", e);
+                    e
+                })?,
+        )
+    } else {
+        None
+    };
+    let pm_reservation = if pm_aei.is_some() {
+        Some(
+            kernel
+                .reserve_task_for_spawn_with_class(RING3_PM_SERVER_TID, TaskClass::SystemServer)
+                .map_err(|e| {
+                    crate::yarm_log!("YARM_FIRST_USER_FAIL step=reserve_pm err={:?}", e);
+                    e
+                })?,
+        )
+    } else {
+        None
+    };
+    let init_reservation = kernel
+        .reserve_task_for_spawn_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)
         .map_err(|e| {
-            crate::yarm_log!("YARM_FIRST_USER_FAIL step=register_init err={:?}", e);
+            crate::yarm_log!("YARM_FIRST_USER_FAIL step=reserve_init err={:?}", e);
             e
         })?;
 
@@ -7635,15 +7645,20 @@ pub fn bootstrap_first_user_task(
         for n in 0..10usize {
             crate::yarm_log!("SUP_STARTUP_SLOT slot={} value={}", n, sup_args[n]);
         }
+        let supervisor_reservation =
+            supervisor_reservation.ok_or(crate::kernel::boot::KernelError::TaskMissing)?;
         kernel
-            .spawn_user_task_from_image(UserImageSpec {
-                tid: RING3_SUPERVISOR_TID,
-                entry: sup_entry,
-                asid: Some(sup_asid),
-                class: TaskClass::SystemServer,
-                startup_args: sup_args,
-                ..Default::default()
-            })
+            .spawn_user_task_from_image(
+                supervisor_reservation,
+                UserImageSpec {
+                    tid: RING3_SUPERVISOR_TID,
+                    entry: sup_entry,
+                    asid: Some(sup_asid),
+                    class: TaskClass::SystemServer,
+                    startup_args: sup_args,
+                    ..Default::default()
+                },
+            )
             .map_err(|e| {
                 crate::yarm_log!("YARM_FIRST_USER_FAIL step=spawn_supervisor err={:?}", e);
                 e
@@ -7667,15 +7682,19 @@ pub fn bootstrap_first_user_task(
         if let Some(c) = pm_inbound_recv_pm {
             pm_args[17] = c.0;
         }
+        let pm_reservation = pm_reservation.ok_or(crate::kernel::boot::KernelError::TaskMissing)?;
         kernel
-            .spawn_user_task_from_image(UserImageSpec {
-                tid: RING3_PM_SERVER_TID,
-                entry: pm_entry,
-                asid: Some(pm_asid),
-                class: TaskClass::SystemServer,
-                startup_args: pm_args,
-                ..Default::default()
-            })
+            .spawn_user_task_from_image(
+                pm_reservation,
+                UserImageSpec {
+                    tid: RING3_PM_SERVER_TID,
+                    entry: pm_entry,
+                    asid: Some(pm_asid),
+                    class: TaskClass::SystemServer,
+                    startup_args: pm_args,
+                    ..Default::default()
+                },
+            )
             .map_err(|e| {
                 crate::yarm_log!("YARM_FIRST_USER_FAIL step=spawn_pm err={:?}", e);
                 e
@@ -7924,14 +7943,17 @@ pub fn bootstrap_first_user_task(
     );
     crate::yarm_log!("YARM_FIRST_USER_SPAWN_BEGIN tid={}", RING3_INIT_SERVER_TID);
     kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid: RING3_INIT_SERVER_TID,
-            entry: init_entry,
-            asid: Some(init_asid),
-            class: TaskClass::SystemServer,
-            startup_args: init_args,
-            ..Default::default()
-        })
+        .spawn_user_task_from_image(
+            init_reservation,
+            UserImageSpec {
+                tid: RING3_INIT_SERVER_TID,
+                entry: init_entry,
+                asid: Some(init_asid),
+                class: TaskClass::SystemServer,
+                startup_args: init_args,
+                ..Default::default()
+            },
+        )
         .map_err(|e| {
             crate::yarm_log!("YARM_FIRST_USER_FAIL step=spawn_init err={:?}", e);
             e

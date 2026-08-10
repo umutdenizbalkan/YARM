@@ -4326,6 +4326,159 @@ protocol, which closes the final Group-3 CAN site and moves CAN 13 → 12.
 
 ---
 
+### 6.1.37 WA3B — the one-shot spawn reservation/consumption protocol
+
+Closes the last Group-3 `CAN` site, `spawn_user_task_from_image`, and with it the §6.1.35 C
+hard-stop. Production executable code changes on all three architectures. Waiter ownership is
+still wired into nothing.
+
+#### A. What was actually wrong
+
+Spawn's only authorization was that `register_task_with_class` is **idempotent**: handed a TID
+that already had a live TCB it returned `Ok(())`, and the spawn then overwrote that task's
+register context, entry point, stack, ASID, thread group and scheduler membership. A
+`Blocked(EndpointReceive)` receiver was as overwritable as an idle one.
+
+WA3A's obvious repair — "the destination TID must be absent" — was implemented and reverted,
+because it is genuinely incompatible with bootstrap: all three architectures register the
+supervisor / PM / init TIDs *before* spawning onto them, so the boot capability grants have a
+destination CNode. The gate refused the kernel's own supervisor on an ordinary boot
+(`SPAWN_REFUSED_TID_PRESENT tid=2`).
+
+The resolution is not a better predicate. It is that "provisioned" and "live" were the same
+thing, and they should not be.
+
+#### B. The reservation lifecycle
+
+```text
+  ReservedUnstarted --claim--> Spawning --commit--> LiveSpawned (Runnable)
+                         ^                 |
+                         +-----restore-----+   (spawn failed; same incarnation)
+                         |
+                    cancel (setup failed before spawn) --> gone
+```
+
+`TaskStatus::Reserved` is a genuinely non-live status, and choosing a **status variant** rather
+than a side field is what makes the invariants hold rather than be asserted: every existing site
+that allow-lists statuses now refuses reservations automatically. `wake_tid_to_runnable` already
+gated on `Blocked|Runnable|Running`, so ordinary wake refuses a reservation with no edit at all;
+the cross-CPU wake path gained an explicit `SkippedReserved`; the reap path refuses it as
+non-terminal. Only two exhaustive `TaskStatus` matches existed in the kernel, which is why the
+blast radius was small enough for this to be the right representation.
+
+| invariant | how it is enforced |
+|---|---|
+| not `Runnable`/`Running`/`Blocked` | a distinct status variant |
+| cannot be enqueued | `refuse_enqueue_of_spawn_reservation` on both enqueue seams — the run queue carries bare TIDs, so the enqueue seam is the only possible choke point |
+| cannot be dispatched | it can never be enqueued, and `DispatchIncoming` requires `Runnable` |
+| cannot be woken | `Reserved` is outside every wake path's allow-list |
+| cannot block / publish a waiter | blocking is reachable only for the *current* task, and it can never become current |
+| owns pre-spawn resources | the reservation reuses the SAME capacity / CNode-slot / class / kernel-context provisioning as ordinary registration |
+
+**Process identity.** `task_cnode` resolves a task's CNode through `thread_group_id`, so
+`ThreadControlBlock::reserved` sets it to the OWNING process from the moment the TCB exists.
+Storing `process_pid` in the reservation record while leaving `thread_group_id` defaulted to the
+TID would have left the pre-spawn grants resolving to the wrong CNode —
+`a_reservation_resolves_its_process_cnode_before_spawn` pins both halves.
+
+#### C. Exact identity
+
+`SpawnReservationToken` has private fields and no public constructor; the only way to hold one is
+to have created the reservation. It carries `{tid, generation, class, process_pid}`, and the
+generation comes from a monotonic kernel counter that is **never derived from the TID** — so a
+token minted for an earlier occupant of numeric TID `T` cannot authorize a later occupant.
+`claim_for_spawn` validates all four plus the phase atomically under one rank-2 acquisition,
+before any spawn-specific mutation.
+
+#### D. Failed spawn restores the exact baseline
+
+"All fallible work completes before any TCB mutation" is **not** achievable here, and the audit
+should say why rather than assert the convenient version: spawn binds the incoming ASID before
+the fallible stack allocation and user-memory copy, because the x86_64 kernel switch-frame retry
+and the stack allocator both need the target address space bound.
+
+So WA3B takes the other permitted proof. `claim_for_spawn` captures a `SpawnBaseline` — status,
+thread group, ASID, user entry, user stack top, register context, TLS pointer, CPU affinity — and
+a failed spawn replays every one of them. After an ordinary returned error the reservation is
+observationally identical to the pre-claim reservation: no stale ASID, no partial live identity,
+nothing enqueued, and the caller's token is exactly as valid as it was.
+`the_baseline_replay_restores_every_field_the_spawn_body_may_write` dirties each field and
+asserts the whole TCB comes back byte-for-byte.
+
+VM and capability cleanup on a failed spawn is **unchanged** and remains a pre-existing gap; this
+stage does not make it worse and deliberately does not open it.
+
+#### E. Cancellation
+
+`cancel_spawn_reservation(token)` covers setup failing *before* spawn is invoked. It validates
+read-only first, so a stale token, a token naming a replacement occupant, a `Spawning`
+reservation and a live task are all refused with zero mutation. On success it releases the kernel
+context and removes the TCB through the EXISTING cleanup primitives (`release_kernel_context`,
+then the no-alloc process-CNode reap, which itself only proceeds when no other thread owns the
+process). After cancellation the token names nothing.
+
+#### F. The converted caller closure
+
+Every production caller reserves, or consumes a reservation made earlier:
+
+| file | callers | shape |
+|---|---|---|
+| `src/arch/x86_64/boot.rs` | 3 | reserve → grant → consume |
+| `src/arch/aarch64/boot.rs` | 3 | reserve → grant → consume |
+| `src/arch/riscv64/boot.rs` | 3 | reserve → grant → consume |
+| `src/kernel/syscall/process.rs` | 4 | reserve immediately before spawn |
+
+**13 production callers, not the 18 previously counted** — the earlier figure included six
+`#[cfg(test)]` call sites. `the_production_spawn_caller_closure_is_pinned` recomputes the set
+mechanically and fails if it changes; test callers go through an explicitly test-only
+`reserve_and_spawn_user_task_from_image_for_test` convenience, which still goes through the real
+reservation path.
+
+#### G. Census — 38, not 37
+
+The two movements this stage predicted hold exactly:
+
+| class | before | after |
+|---|---|---|
+| CAN | 13 | **12** |
+| CANNOT | 15 | **16** |
+| INTO_BLOCKED | 7 | 7 |
+| FRESH_CONSTRUCTOR | 1 | **2** |
+| NON_PRODUCTION | 1 | 1 |
+| UNPROVEN | 0 | 0 |
+| **total** | 37 | **38** |
+
+The total moved because `ThreadControlBlock::reserved` is a genuinely new status writer that did
+not exist before. It is classified `FRESH_CONSTRUCTOR` alongside `new`: it fills a slot that was
+`None`, so it can wake nothing — and unlike `new` it starts *not* runnable. Forcing the total
+back to 37 would have meant hiding either it or spawn's departure from the raw-write set, which
+is exactly what the census exists to prevent. `spawn_user_task_from_image` now writes no status
+at all; it is tracked as a reservation-barriered site, the same way WA3A's eight are tracked as
+transition-barriered.
+
+Composition: **29 raw writes + 8 transition-barriered + 1 reservation-barriered = 38.**
+
+`WAITER_OWNER_CENSUS_COMPLETE=yes` and `WAITER_OWNERSHIP_EXCLUSIVE=no` both stand.
+
+#### Status
+
+* production executable code — **changed**, on all three architectures
+* bootstrap — **reserve → grant → consume** on x86_64, AArch64 and RISC-V
+* spawn overwriting an arbitrary existing TCB — **impossible**; registration idempotence is no
+  longer authorization anywhere
+* stale tokens — cannot consume, cancel, or affect a reused TID
+* reserved tasks — non-live, non-enqueueable, non-dispatchable, non-wakeable
+* CAN **13 → 12**; CANNOT **15 → 16**; total **37 → 38** (disclosed above)
+* new broad-lock acquisitions — **none**; no task(2) → scheduler(1) inversion
+* helper waiter ownership — still **zero production callers**
+* direct production default — **OFF**; canonical 199D — **OPEN**; ledger — **39 / 7 / 46**
+* **no new live cell**
+
+Spawn work stops here. The next stage is production endpoint-waiter ARM/RETIRE wiring, which
+must create the first real production callers of the WA2A ownership primitive.
+
+---
+
 
 ## 7. Method and limits
 

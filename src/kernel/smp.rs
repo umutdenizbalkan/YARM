@@ -35,6 +35,8 @@ pub enum CrossCpuWakeApplyResult {
     SkippedRunning,
     /// TCB exists but status is `Faulted`; wake on faulted task, silently dropped.
     SkippedFaulted,
+    /// Stage 199D-WA3B: the target is a non-live spawn reservation, not a task that can be woken.
+    SkippedReserved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1429,7 +1429,7 @@ mod tests {
         let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
         state
-            .spawn_user_task_from_image(UserImageSpec {
+            .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
                 tid: 50,
                 entry: 0x4000,
                 asid: Some(asid),
@@ -1467,7 +1467,7 @@ mod tests {
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
         state
-            .spawn_user_task_from_image(UserImageSpec {
+            .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
                 tid: 60,
                 entry: 0x4000,
                 asid: Some(asid),

@@ -672,7 +672,7 @@ fn spawn_user_task_from_image_registers_asid_and_class() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _map_cap) = state.create_user_address_space().expect("asid");
     let spawned = state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 55,
             entry: 0x8000,
             asid: Some(asid),
@@ -724,7 +724,7 @@ fn spawn_user_task_from_image_copies_startup_args_into_user_context() {
     startup_args[1] = 0x1234;
     startup_args[2] = 0x5678;
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 77,
             entry: 0x8000,
             asid: Some(asid),
@@ -847,7 +847,7 @@ fn supervisor_fault_slot_cap_can_register_supervisor_endpoint() {
 fn spawn_user_task_from_image_requires_valid_asid() {
     let mut state = Bootstrap::init().expect("init");
     let err = state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 77,
             entry: 0x9000,
             asid: None,
@@ -6705,7 +6705,7 @@ fn spawn_user_thread_inherits_group_and_asid_and_sets_tls() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 7,
             entry: 0x4000,
             asid: Some(asid),
@@ -6731,7 +6731,7 @@ fn spawn_user_thread_rejects_misaligned_stack_top() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 8,
             entry: 0x4000,
             asid: Some(asid),
@@ -6757,7 +6757,7 @@ fn futex_wait_blocks_current_and_wake_requeues_waiter() {
     let (asid0, aspace_cap0) = state.create_user_address_space().expect("asid0");
     state.bind_task_asid(0, asid0).expect("bind0");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 1,
             entry: 0x4000,
             asid: Some(asid),
@@ -6812,7 +6812,7 @@ fn futex_wait_and_wake_reject_kernel_space_address() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 2,
             entry: 0x4000,
             asid: Some(asid),
@@ -6841,7 +6841,7 @@ fn fork_child_preserves_parent_registers_except_arg0() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 33,
             entry: 0x8000,
             asid: Some(asid),
@@ -6908,7 +6908,7 @@ fn fork_child_sets_tls_restore_pending_when_tls_present() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 34,
             entry: 0x8200,
             asid: Some(asid),
@@ -6931,7 +6931,7 @@ fn fork_child_starts_with_empty_robust_futex_state() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 35,
             entry: 0x8300,
             asid: Some(asid),
@@ -6954,7 +6954,7 @@ fn fork_child_inherits_brk_bounds() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 37,
             entry: 0x8400,
             asid: Some(asid),
@@ -6975,7 +6975,7 @@ fn fork_child_inherits_parent_endpoint_caps_with_same_rights() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 39,
             entry: 0x8600,
             asid: Some(asid),
@@ -7045,7 +7045,7 @@ fn fork_child_does_not_inherit_kernel_caps() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 40,
             entry: 0x8700,
             asid: Some(asid),
@@ -7084,7 +7084,7 @@ fn spawn_thread_does_not_get_independent_brk_bounds() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 38,
             entry: 0x8500,
             asid: Some(asid),
@@ -7194,7 +7194,7 @@ fn fork_cow_cap_refcount_incremented_after_inherit() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 42,
             entry: 0x9000,
             asid: Some(parent_asid),
@@ -7237,7 +7237,7 @@ fn fork_child_exit_does_not_reclaim_shared_frame_while_parent_alive() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 43,
             entry: 0x9100,
             asid: Some(parent_asid),
@@ -7287,7 +7287,7 @@ fn fork_parent_exit_does_not_reclaim_while_child_maps_frame() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 44,
             entry: 0x9200,
             asid: Some(parent_asid),
@@ -7335,7 +7335,7 @@ fn fork_both_exit_reclaims_shared_frame() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 45,
             entry: 0x9300,
             asid: Some(parent_asid),
@@ -7874,7 +7874,7 @@ fn fork_cow_split_old_frame_eventually_freed_after_both_exit() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 51,
             entry: 0x9400,
             asid: Some(parent_asid),
@@ -7998,7 +7998,7 @@ fn cow_fault_preserves_parent_content_and_copies_to_child() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 61,
             entry: 0x5000,
             asid: Some(parent_asid),
@@ -8337,7 +8337,7 @@ fn cow_split_success_removes_faulting_record() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 67,
             entry: 0x6000,
             asid: Some(parent_asid),
@@ -8389,7 +8389,7 @@ fn cow_both_sides_split_independently() {
     state.register_task(68).expect("parent task");
     state.bind_task_asid(68, parent_asid).expect("bind parent");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 169,
             entry: 0x7000,
             asid: Some(helper_asid),
@@ -8706,7 +8706,7 @@ fn cow_map_empty_bucket_removed_after_last_entry_cleared() {
 
     let (helper_asid75, _) = state.create_user_address_space().expect("helper asid75");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 75,
             entry: 0xA000,
             asid: Some(helper_asid75),
@@ -8760,7 +8760,7 @@ fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 20,
             entry: 0x7000,
             asid: Some(asid),
@@ -8909,7 +8909,7 @@ fn join_blocks_until_target_exits_and_detached_threads_reap_on_exit() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 30,
             entry: 0x4000,
             asid: Some(asid),
@@ -17459,7 +17459,7 @@ fn exit_task_clears_endpoint_receiver_waiter_slot() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 200,
             entry: 0x4000,
             asid: Some(asid),
@@ -17510,7 +17510,7 @@ fn exit_task_clears_notification_waiter_slot() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 201,
             entry: 0x4000,
             asid: Some(asid),
@@ -17578,7 +17578,7 @@ fn join_thread_reap_triggers_process_cnode_cleanup() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 210,
             entry: 0x5000,
             asid: Some(asid),
@@ -17633,7 +17633,7 @@ fn join_thread_immediate_reap_when_target_already_exited() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 211,
             entry: 0x5000,
             asid: Some(asid),
@@ -17680,7 +17680,7 @@ fn robust_futex_wake_works_when_exit_is_externally_driven() {
 
     // Spawn the waiter task (TID 220) in asid_waiter.
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 220,
             entry: 0x4000,
             asid: Some(asid_waiter),
@@ -17691,7 +17691,7 @@ fn robust_futex_wake_works_when_exit_is_externally_driven() {
         .expect("waiter");
     // Spawn the victim task (TID 221) in asid_victim.
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 221,
             entry: 0x4100,
             asid: Some(asid_victim),
@@ -17824,7 +17824,7 @@ fn joiner_exits_while_waiting_does_not_leave_stale_waiter() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 232,
             entry: 0x5000,
             asid: Some(asid),
@@ -17911,7 +17911,7 @@ fn memory_object_reclaimed_after_all_refs_released_on_task_exit() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 250,
             entry: 0x5000,
             asid: Some(asid),
@@ -20198,7 +20198,7 @@ fn fork_cap_inheritance_increments_refcount() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
     state
-        .spawn_user_task_from_image(UserImageSpec {
+        .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
             tid: 51,
             entry: 0x9000,
             asid: Some(parent_asid),
@@ -112539,7 +112539,8 @@ mod stage199d_wa2a_ownership_boundary {
 
     /// Every `.rs` under `src/`, with each file's `#[cfg(test)] mod tests` tail removed, so a
     /// guard reasons about production source only.
-    fn production_sources() -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
+    pub(super) fn production_sources()
+    -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
         fn visit(
             root: &std::path::Path,
             out: &mut alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
@@ -113152,14 +113153,20 @@ mod stage199d_wa2a_ownership_boundary {
     fn every_production_task_status_assignment_site_is_enumerated() {
         // Stage 199D-WA3A: eight of the original 37 sites no longer write `tcb.status` at all —
         // they go through the production transition barrier, whose single write lives in
-        // `task_transition.rs`. The raw-write census is therefore 29 + the barrier's own one.
+        // `task_transition.rs`.
+        //
+        // Stage 199D-WA3B: `spawn_user_task_from_image` stopped writing too (exec_state 5 -> 4);
+        // it commits through the RESERVATION barrier in `spawn_reservation.rs`, whose two writes
+        // are the live commit and the failed-spawn baseline restore. `task.rs` gains the
+        // non-live reservation constructor (1 -> 2).
         const PINNED: &[(&str, usize)] = &[
-            ("src/kernel/boot/exec_state.rs", 5),
+            ("src/kernel/boot/exec_state.rs", 4),
             ("src/kernel/boot/ipc_state.rs", 9),
             ("src/kernel/boot/restart_state.rs", 4),
             ("src/kernel/boot/scheduler_state.rs", 1),
             ("src/kernel/boot/thread_state.rs", 4),
-            ("src/kernel/task.rs", 1),
+            ("src/kernel/spawn_reservation.rs", 2),
+            ("src/kernel/task.rs", 2),
             ("src/kernel/task_transition.rs", 1),
             ("src/runtime.rs", 5),
         ];
@@ -113183,11 +113190,11 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            30,
-            "29 raw writes plus the single write inside the WA3A barrier"
+            32,
+            "29 raw writes, the WA3A barrier's single write, and the WA3B barrier's two"
         );
-        // The eight barriered sites are enumerated by the WA2B census module, which adds them
-        // back to reach the unchanged total of 37 transition sites.
+        // The nine barriered sites are enumerated by the WA2B census module, which adds them
+        // back to reach the total of 38 transition sites.
     }
 
     /// The enumeration above is the CLOSURE of "moves a task out of `Blocked`" only because
@@ -113472,13 +113479,14 @@ mod stage199d_wa2b_wake_owner_census {
             2,
             Verdict::Cannot,
         ),
-        // WA3A HARD-STOP: the absence precondition is not satisfiable while boot registers the
-        // RING3 TIDs before spawning onto them, so this site stays CAN (§6.1.35 C).
+        // Stage 199D-WA3B: the WA3A hard-stop is CLOSED. Spawn now consumes an exact one-shot
+        // reservation, so it cannot overwrite a live, blocked, faulted, exited or dead task —
+        // CAN -> CANNOT.
         (
             "src/kernel/boot/exec_state.rs",
             "spawn_user_task_from_image",
             1,
-            Verdict::Can,
+            Verdict::Cannot,
         ),
         // WA3A-R2-SEAL: `dispatch_next_task`'s mark moved into the ONE shared in-lock commit
         // (`scheduler_state.rs::commit_dispatch_selection_in_lock`), so it has no row of its own.
@@ -113625,8 +113633,17 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Cannot,
         ),
-        // ── task.rs (1) ─────────────────────────────────────────────────────────────────────
+        // ── task.rs (2) ─────────────────────────────────────────────────────────────────────
         ("src/kernel/task.rs", "new", 1, Verdict::FreshConstructor),
+        // Stage 199D-WA3B: the non-live reservation constructor. A fresh constructor like
+        // `new`: it fills a slot that was `None`, so it can wake nothing — and unlike `new` it
+        // starts NOT runnable.
+        (
+            "src/kernel/task.rs",
+            "reserved",
+            1,
+            Verdict::FreshConstructor,
+        ),
         // ── runtime.rs (7) ──────────────────────────────────────────────────────────────────
         // WA3A: barriered.
         (
@@ -113667,6 +113684,20 @@ mod stage199d_wa2b_wake_owner_census {
     ///
     /// These no longer write `tcb.status` at all — the only production write for this cohort is
     /// inside `apply_task_transition`, which is exact and fail-closed by construction.
+    /// Stage 199D-WA3B: the site whose status transition goes through the RESERVATION barrier
+    /// rather than the WA3A transition barrier. `spawn_user_task_from_image` no longer writes
+    /// `tcb.status` at all: it claims, and then commits, an exact one-shot reservation.
+    const WA3B_RESERVATION_SITES: &[(&str, &str, usize, &[&str])] = &[(
+        "src/kernel/boot/exec_state.rs",
+        "spawn_user_task_from_image",
+        1,
+        &[
+            "claim_for_spawn",
+            "commit_live_spawn",
+            "restore_after_failed_spawn",
+        ],
+    )];
+
     const WA3A_BARRIER_SITES: &[(&str, &str, usize, &[&str])] = &[
         (
             "src/runtime.rs",
@@ -113833,7 +113864,6 @@ mod stage199d_wa2b_wake_owner_census {
     /// These 37 neighbourhoods are deliberately brittle — a status writer whose surroundings
     /// changed is a writer whose census row must be re-derived.
     const FINGERPRINTS: &[(&str, &str, &str, &str, &str, &str)] = &[
-        // src/kernel/boot/exec_state.rs
         (
             "src/kernel/boot/exec_state.rs",
             "futex_wait_current",
@@ -113866,15 +113896,6 @@ mod stage199d_wa2b_wake_owner_census {
             "tcb.asid = Some(client_asid);",
             "tcb.user_context.instruction_ptr = VirtAddr(CLIENT_CODE_VA);",
         ),
-        (
-            "src/kernel/boot/exec_state.rs",
-            "spawn_user_task_from_image",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            "}",
-            "Ok::<_, KernelError>(())",
-        ),
-        // src/kernel/boot/ipc_state.rs
         (
             "src/kernel/boot/ipc_state.rs",
             "rt_commit_receiver_runnable",
@@ -113947,7 +113968,6 @@ mod stage199d_wa2b_wake_owner_census {
             ".ok_or(KernelError::TaskMissing)?;",
             "tcb.ipc_timeout_deadline = deadline;",
         ),
-        // src/kernel/boot/restart_state.rs
         (
             "src/kernel/boot/restart_state.rs",
             "exit_task",
@@ -113980,7 +114000,6 @@ mod stage199d_wa2b_wake_owner_census {
             ".ok_or(KernelError::TaskMissing)?;",
             "tcb.restart.token = None;",
         ),
-        // src/kernel/boot/scheduler_state.rs
         (
             "src/kernel/boot/scheduler_state.rs",
             "apply_cross_cpu_wake_task",
@@ -113989,7 +114008,6 @@ mod stage199d_wa2b_wake_owner_census {
             "TaskStatus::Blocked(_) => {",
             "Ok(CrossCpuWakeApplyResult::Applied)",
         ),
-        // src/kernel/boot/thread_state.rs
         (
             "src/kernel/boot/thread_state.rs",
             "join_thread",
@@ -114022,16 +114040,22 @@ mod stage199d_wa2b_wake_owner_census {
             "child.user_context.arg0 = 0;",
             "Ok::<_, KernelError>(())",
         ),
-        // src/kernel/task.rs
         (
             "src/kernel/task.rs",
             "new",
             "status:",
-            "TaskStatus::Runnable",
+            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, server_reply_link: None, blocked_recv_generation: 0, pending_syscall_completion: None, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
             "thread_group_id: ThreadGroupId(tid.0),",
             "asid,",
         ),
-        // src/runtime.rs
+        (
+            "src/kernel/task.rs",
+            "reserved",
+            "tcb.status",
+            "TaskStatus::Reserved",
+            "let mut tcb = Self::new(tid, None);",
+            "tcb.thread_group_id = ThreadGroupId(reservation.process_pid);",
+        ),
         (
             "src/runtime.rs",
             "futex_wake_split_mut",
@@ -114148,7 +114172,7 @@ mod stage199d_wa2b_wake_owner_census {
         assert_eq!(
             sites.len(),
             29,
-            "29 raw writes remain after WA3A barriered the other 8"
+            "still 29 raw writes: WA3B removed spawn's and added the reservation constructor's"
         );
         for (i, (file, function, lhs, rhs, before, after)) in sites.iter().enumerate() {
             let (pf, pfn, plhs, prhs, pbefore, pafter) = FINGERPRINTS[i];
@@ -114183,7 +114207,10 @@ mod stage199d_wa2b_wake_owner_census {
         }
         // Stage 199D-WA3A: the eight barriered sites no longer write `tcb.status` at all, so
         // the census covers raw writes AND barriered transitions.
-        for (file, function, sites, _) in WA3A_BARRIER_SITES {
+        for (file, function, sites, _) in WA3A_BARRIER_SITES
+            .iter()
+            .chain(WA3B_RESERVATION_SITES.iter())
+        {
             match rollup
                 .iter_mut()
                 .find(|(f, n, _)| f == file && n == function)
@@ -114202,19 +114229,28 @@ mod stage199d_wa2b_wake_owner_census {
             rollup, pinned,
             "the classified set must match the mechanically extracted set exactly"
         );
+        // Stage 199D-WA3B: 38, not 37. `spawn_user_task_from_image` stopped writing
+        // `tcb.status` (it commits through the reservation barrier instead), and
+        // `ThreadControlBlock::reserved` — the non-live reservation constructor this stage
+        // requires — is a genuinely NEW fresh-constructor writer. Reporting 38 is the honest
+        // result; forcing 37 would mean hiding one of the two.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            37,
-            "and it must still be the 37 sites WA2A-R1 pinned"
+            38,
+            "37 pinned by WA2A-R1, plus `ThreadControlBlock::reserved`"
         );
         assert_eq!(
             FINGERPRINTS.len()
                 + WA3A_BARRIER_SITES
                     .iter()
                     .map(|(_, _, n, _)| n)
+                    .sum::<usize>()
+                + WA3B_RESERVATION_SITES
+                    .iter()
+                    .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            37,
-            "29 remaining raw writes + 8 barriered sites"
+            38,
+            "29 raw writes + 8 transition-barriered sites + 1 reservation-barriered site"
         );
     }
 
@@ -114273,30 +114309,57 @@ mod stage199d_wa2b_wake_owner_census {
             .split("pub fn spawn_user_task_from_image(")
             .nth(1)
             .expect("spawn");
+        let spawn = &spawn[..spawn.find("\n    fn ").unwrap_or(spawn.len())];
+        for needle in [
+            "reservation: crate::kernel::spawn_reservation::SpawnReservationToken",
+            "claim_for_spawn",
+            "restore_after_failed_spawn",
+        ] {
+            assert!(
+                spawn.contains(needle),
+                "spawn must consume an exact reservation (`{needle}`)"
+            );
+        }
         assert!(
-            spawn.contains("Stage 199D-WA3A HARD-STOP"),
-            "the spawn hard-stop must stay recorded at the site"
+            !exec.contains("Stage 199D-WA3A HARD-STOP"),
+            "the WA3A hard-stop note must be gone now that the site is closed"
         );
+        // Registration idempotence is no longer spawn authorization anywhere in the body.
+        let body = exec
+            .split("fn spawn_image_after_claim(")
+            .nth(1)
+            .expect("spawn body");
         assert!(
-            !spawn.contains("if self.task_status(spec.tid).is_some() {"),
-            "the absence gate is reverted, not silently retained"
+            !body[..body.find("SPAWN_TASK_CONTEXT_OK").unwrap_or(body.len())]
+                .contains("self.register_task_with_class("),
+            "the spawn body must not register — the reservation already provisioned the TCB"
         );
-        assert!(
-            !spawn.contains("Blocked(WaitReason::EndpointReceive"),
-            "and no weaker `not endpoint-blocked` predicate replaced it"
-        );
-        // The boot sequence that makes the precondition unsatisfiable is pinned too, so the
-        // hard-stop is falsifiable: if boot stops pre-registering, this fails and the site can
-        // be re-derived.
-        let boot = std::fs::read_to_string(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/arch/x86_64/boot.rs"),
-        )
-        .expect("x86 boot");
-        assert!(
-            boot.contains("kernel.register_task_with_class(RING3_SUPERVISOR_TID")
-                && boot.contains("kernel.spawn_user_task_from_image(UserImageSpec {"),
-            "x86 boot must still register the RING3 TIDs before spawning onto them"
-        );
+        // The boot sequence is pinned in its NEW shape: reserve, grant, consume. If any boot
+        // path regresses to register-then-overwrite, this fails.
+        for (arch, rel) in [
+            ("x86_64", "src/arch/x86_64/boot.rs"),
+            ("aarch64", "src/arch/aarch64/boot.rs"),
+            ("riscv64", "src/arch/riscv64/boot.rs"),
+        ] {
+            let boot = std::fs::read_to_string(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel),
+            )
+            .unwrap_or_else(|e| panic!("{rel}: {e}"));
+            assert!(
+                boot.contains(
+                    "reserve_task_for_spawn_with_class(\n            RING3_SUPERVISOR_TID"
+                ) || boot.contains("reserve_task_for_spawn_with_class(RING3_SUPERVISOR_TID"),
+                "{arch} boot must RESERVE the supervisor TID, not register it"
+            );
+            assert!(
+                boot.contains("reserve_task_for_spawn_with_class(RING3_INIT_SERVER_TID"),
+                "{arch} boot must RESERVE the init TID, not register it"
+            );
+            assert!(
+                !boot.contains("register_task_with_class(RING3_"),
+                "{arch} boot must not pre-register a LIVE task for a TID it will spawn onto"
+            );
+        }
     }
 
     /// **G, second half.** The matrix reasons about helper writers, so their exact direct
@@ -114479,13 +114542,17 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            37,
+            38,
             "the classes must partition the enumerated sites"
         );
-        // Stage 199D-WA3A moved the nine Group-3 sites CAN → CANNOT by production enforcement.
+        // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
+        // Stage 199D-WA3B moved the ninth — `spawn_user_task_from_image` — the same way, via the
+        // one-shot reservation protocol, and added ONE new fresh-constructor writer
+        // (`ThreadControlBlock::reserved`). Hence 38, not 37: the two movements the stage
+        // predicted hold exactly, and the extra site is disclosed rather than absorbed.
         assert_eq!(
             (can, cannot, into_blocked, fresh, non_production),
-            (13, 15, 7, 1, 1)
+            (12, 16, 7, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -114581,14 +114648,18 @@ mod stage199d_wa2b_wake_owner_census {
         //   * PROOFS below — a local precondition plus its caller closure (the pre-WA3A seven);
         //   * WA3A_BARRIER_SITES — a typed production transition, proven by
         //     `the_barrier_is_the_only_writer_for_the_group3_cohort` (eight);
-        // `spawn_user_task_from_image` is NOT here: its absence precondition hard-stopped
-        // (§6.1.35 C) and it stays CAN.
-        let barriered: usize = WA3A_BARRIER_SITES.iter().map(|(_, _, n, _)| n).sum();
+        //   * WA3B_RESERVATION_SITES — an exact one-shot reservation, proven by the same test
+        //     plus the WA3B behavioural suite (one: `spawn_user_task_from_image`).
+        let barriered: usize = WA3A_BARRIER_SITES
+            .iter()
+            .chain(WA3B_RESERVATION_SITES.iter())
+            .map(|(_, _, n, _)| n)
+            .sum();
         assert_eq!(
             PROOFS.len() + barriered,
             cannot_sites,
-            "every CANNOT site needs a guard+closure proof, a production barrier, or the \
-             absence gate"
+            "every CANNOT site needs a guard+closure proof, a transition barrier, or a \
+             reservation barrier"
         );
 
         for (file, function, guard, closure) in PROOFS {
@@ -115280,17 +115351,27 @@ mod stage199d_wa3a_transition_barriers {
         );
     }
 
-    /// **HARD-STOP, recorded as a test rather than a claim.** `spawn_user_task_from_image`
-    /// still overwrites a pre-existing TID: the absence precondition WA3A set out to enforce is
-    /// not satisfiable while boot registers the RING3 TIDs before spawning onto them. This test
-    /// documents the CURRENT behaviour so the gap is visible and any future fix is detected.
+    /// **The WA3A hard-stop, now closed by WA3B.** This test used to assert the OPPOSITE: that
+    /// a present, endpoint-blocked TID was accepted and overwritten, because
+    /// `register_task_with_class` idempotence was the only authorization spawn had. Spawn now
+    /// requires an exact one-shot reservation, and a live blocked receiver is not one.
     #[test]
-    fn spawn_still_overwrites_a_present_tid_pending_the_boot_sequence_repair() {
+    fn spawn_can_no_longer_overwrite_a_present_blocked_tid() {
         let mut state = kernel_with(&[OTHER]);
         let (asid, _) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(OTHER, asid).expect("bind");
         block_on_endpoint(&mut state, OTHER);
+        let before = state.task_status(OTHER);
+        let ctx_before = state.thread_user_context(OTHER);
 
+        // There is no reservation for a live task, so one cannot even be minted for it.
+        assert!(
+            state
+                .reserve_task_for_spawn_with_class(OTHER, crate::kernel::task::TaskClass::App)
+                .is_err(),
+            "an occupied TID cannot be reserved"
+        );
+        // And the test-only reserve-then-spawn convenience fails at the same gate.
         let spec = crate::kernel::boot::UserImageSpec {
             tid: OTHER,
             entry: 0x4000,
@@ -115302,15 +115383,21 @@ mod stage199d_wa3a_transition_barriers {
             service_reply_recv_cap: 0,
             extra_send_caps: [0; 4],
         };
-        let result = state.spawn_user_task_from_image(spec);
         assert!(
-            result.is_ok(),
-            "documented gap: a present TID is still accepted, so the census keeps this site CAN"
+            state
+                .reserve_and_spawn_user_task_from_image_for_test(spec)
+                .is_err(),
+            "spawn must refuse a TID it holds no reservation for"
         );
         assert_eq!(
             state.task_status(OTHER),
-            Some(TaskStatus::Runnable),
-            "the blocked receiver was overwritten — this is exactly what §6.1.35 C hard-stops on"
+            before,
+            "the blocked receiver keeps its status"
+        );
+        assert_eq!(
+            state.thread_user_context(OTHER),
+            ctx_before,
+            "and its register context is byte-for-byte unchanged"
         );
     }
 
@@ -115879,5 +115966,525 @@ mod stage199d_wa3a_transition_barriers {
         );
         assert_eq!(state.task_status(OTHER), Some(TaskStatus::Runnable));
         assert_eq!(state.current_tid(), Some(OTHER));
+    }
+}
+
+/// Stage 199D-WA3B — the one-shot spawn reservation/consumption protocol.
+///
+/// The WA3A hard-stop was that `spawn_user_task_from_image` could overwrite an arbitrary
+/// existing TCB, because `register_task_with_class` idempotence was its only authorization and
+/// bootstrap legitimately pre-registers the RING3 TIDs. These tests prove the replacement: a
+/// reservation is provisioned but NOT live, and spawn consumes exactly one.
+#[cfg(test)]
+mod stage199d_wa3b_spawn_reservation {
+    use super::stage199d_wa2a_ownership_boundary::production_sources;
+    use super::stage199d_wa2b_wake_owner_census::production_source;
+    use super::*;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+
+    const T: u64 = 61;
+    const VICTIM: u64 = 62;
+
+    fn kernel() -> KernelState {
+        Bootstrap::init().expect("init")
+    }
+
+    fn spec_for(tid: u64, asid: crate::kernel::vm::Asid) -> crate::kernel::boot::UserImageSpec {
+        crate::kernel::boot::UserImageSpec {
+            tid,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            ..Default::default()
+        }
+    }
+
+    // ── A. A reservation is provisioned, but it is not a live task ─────────────────────────
+
+    #[test]
+    fn a_reservation_is_not_runnable_running_or_blocked() {
+        let mut state = kernel();
+        let _token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        let status = state.task_status(T).expect("reserved task exists");
+        assert_eq!(status, TaskStatus::Reserved);
+        assert_ne!(status, TaskStatus::Runnable);
+        assert_ne!(status, TaskStatus::Running);
+        assert!(!matches!(status, TaskStatus::Blocked(_)));
+        assert!(!matches!(
+            status,
+            TaskStatus::Faulted | TaskStatus::Exited(_) | TaskStatus::Dead
+        ));
+    }
+
+    #[test]
+    fn a_reservation_cannot_be_enqueued_or_dispatched() {
+        let mut state = kernel();
+        let _token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        let queued_before = state.runnable_count_on_cpu(CpuId(0));
+
+        assert!(
+            state.enqueue_task(T).is_err(),
+            "a reservation must not reach a run queue"
+        );
+        assert!(
+            state.enqueue_on_cpu(CpuId(0), T).is_err(),
+            "not on an explicit CPU either"
+        );
+        assert_eq!(state.runnable_count_on_cpu(CpuId(0)), queued_before);
+
+        // And with nothing enqueued, dispatch cannot select it.
+        let _ = state.dispatch_next_task();
+        assert_ne!(state.current_tid(), Some(T));
+        assert_eq!(state.task_status(T), Some(TaskStatus::Reserved));
+    }
+
+    #[test]
+    fn an_ordinary_wake_cannot_make_a_reservation_runnable() {
+        let mut state = kernel();
+        let _token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        // The generic wake seam allow-lists Blocked/Runnable/Running; `Reserved` is none of them.
+        assert!(
+            state.wake_task_for_test(T).is_err(),
+            "a reservation is not wakeable"
+        );
+        assert_eq!(state.task_status(T), Some(TaskStatus::Reserved));
+        // The cross-CPU wake path classifies it explicitly rather than applying.
+        let applied = state
+            .apply_cross_cpu_wake_task_for_test(CpuId(0), crate::kernel::ipc::ThreadId(T))
+            .expect("wake apply");
+        assert_eq!(
+            applied,
+            crate::kernel::smp::CrossCpuWakeApplyResult::SkippedReserved
+        );
+        assert_eq!(state.task_status(T), Some(TaskStatus::Reserved));
+    }
+
+    #[test]
+    fn a_reservation_cannot_publish_endpoint_waiter_ownership() {
+        let mut state = kernel();
+        let _token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        // Blocking is only reachable for the CURRENT task, and a reservation can never be
+        // current: it cannot be enqueued, so it cannot be dispatched. That is the structural
+        // argument; pin both halves so neither can regress silently.
+        assert_ne!(state.current_tid(), Some(T));
+        assert!(state.enqueue_task(T).is_err());
+        // No waiter record names it.
+        let owns_a_waiter = (0..crate::kernel::boot::MAX_ENDPOINTS).any(|idx| {
+            state.with_ipc_state(|ipc| {
+                ipc.endpoint_waiter_present(idx)
+                    && ipc.endpoint_waiter_tid(idx) == Some(ThreadId(T))
+            })
+        });
+        assert!(
+            !owns_a_waiter,
+            "a reservation must own no endpoint waiter slot"
+        );
+    }
+
+    // ── B. Provisioning bootstrap actually needs ───────────────────────────────────────────
+
+    #[test]
+    fn a_reservation_resolves_its_process_cnode_before_spawn() {
+        let mut state = kernel();
+        // Reserve T inside process VICTIM's process, the shape bootstrap uses for a service.
+        let _token = state
+            .reserve_task_for_spawn_with_class_in_process(T, TaskClass::SystemServer, VICTIM)
+            .expect("reserve in process");
+        assert_eq!(
+            state.thread_group_id(T).map(|g| g.0),
+            Some(VICTIM),
+            "the reserved TCB must carry the OWNING PROCESS identity, not its own tid"
+        );
+        let cnode = state
+            .task_cnode(T)
+            .expect("task_cnode must resolve through the reserved TCB before spawn");
+        assert_eq!(
+            Some(cnode),
+            state.process_cnode_for_pid(VICTIM),
+            "and it must be the process's CNode"
+        );
+    }
+
+    /// **The original boot counterexample, as a regression test.** Reserve, grant a capability
+    /// into the reservation's CNode, then spawn — the exact sequence the WA3A absence gate broke.
+    #[test]
+    fn reserve_then_pre_spawn_grant_then_spawn_succeeds() {
+        let mut state = kernel();
+        let token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::SystemServer)
+            .expect("reserve");
+        let (_, send_root, _recv_root) = state.create_endpoint(4).expect("endpoint");
+        let granted = state
+            .grant_capability_task_to_task(0, send_root, T)
+            .expect("pre-spawn grant into the reservation's cnode");
+        assert!(granted.0 != 0);
+
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        let spawned = state
+            .spawn_user_task_from_image(token, spec_for(T, asid))
+            .expect("spawn must consume the reservation");
+        assert_eq!(spawned.tid, T);
+        assert_eq!(state.task_status(T), Some(TaskStatus::Runnable));
+        assert_eq!(state.task_asid(T), Some(asid));
+    }
+
+    // ── C. Exactly-once consumption ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_valid_token_consumes_exactly_once_and_a_second_consume_refuses() {
+        let mut state = kernel();
+        let token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state
+            .spawn_user_task_from_image(token, spec_for(T, asid))
+            .expect("first consume");
+        assert_eq!(state.task_status(T), Some(TaskStatus::Runnable));
+        let ctx_after_first = state.thread_user_context(T);
+
+        // The very same token, again.
+        let (asid2, _) = state.create_user_address_space().expect("asid2");
+        assert!(
+            state
+                .spawn_user_task_from_image(token, spec_for(T, asid2))
+                .is_err(),
+            "a consumed reservation cannot be consumed again"
+        );
+        assert_eq!(state.task_asid(T), Some(asid), "the live ASID is unchanged");
+        assert_eq!(state.thread_user_context(T), ctx_after_first);
+    }
+
+    #[test]
+    fn a_stale_token_cannot_consume_a_reused_tid() {
+        let mut state = kernel();
+        let stale = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve A");
+        state.cancel_spawn_reservation(stale).expect("cancel A");
+        // Same numeric TID, a NEW reservation with a new generation.
+        let fresh = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve B");
+        assert_ne!(stale.generation(), fresh.generation());
+
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        assert!(
+            state
+                .spawn_user_task_from_image(stale, spec_for(T, asid))
+                .is_err(),
+            "a token for the previous occupant must not consume the replacement"
+        );
+        assert_eq!(
+            state.task_status(T),
+            Some(TaskStatus::Reserved),
+            "the replacement reservation is untouched"
+        );
+        // The fresh token still works.
+        state
+            .spawn_user_task_from_image(fresh, spec_for(T, asid))
+            .expect("the current reservation still consumes");
+    }
+
+    // ── D. Live victims are untouched ──────────────────────────────────────────────────────
+
+    #[test]
+    fn no_live_victim_can_be_reserved_or_spawned_over() {
+        for victim in [
+            TaskStatus::Runnable,
+            TaskStatus::Running,
+            TaskStatus::Blocked(WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(3),
+            )),
+            TaskStatus::Faulted,
+            TaskStatus::Exited(7),
+            TaskStatus::Dead,
+        ] {
+            let mut state = kernel();
+            state.register_task(VICTIM).expect("register victim");
+            state.set_task_status_for_test(VICTIM, victim);
+            let ctx_before = state.thread_user_context(VICTIM);
+
+            assert!(
+                state
+                    .reserve_task_for_spawn_with_class(VICTIM, TaskClass::App)
+                    .is_err(),
+                "an occupied TID cannot be reserved ({victim:?})"
+            );
+            assert_eq!(
+                state.task_status(VICTIM),
+                Some(victim),
+                "{victim:?} victim keeps its status"
+            );
+            assert_eq!(
+                state.thread_user_context(VICTIM),
+                ctx_before,
+                "{victim:?} victim's register context is byte-for-byte unchanged"
+            );
+        }
+    }
+
+    // ── E. Failure is transactional ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_failed_spawn_restores_the_exact_reservation_baseline() {
+        let mut state = kernel();
+        let token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        let baseline_status = state.task_status(T);
+        let baseline_ctx = state.thread_user_context(T);
+        let baseline_group = state.thread_group_id(T);
+        let queued_before = state.runnable_count_on_cpu(CpuId(0));
+
+        // `entry == 0` is refused inside the claimed body, so the reservation really was moved
+        // to `Spawning` and really is restored.
+        let mut bad = spec_for(T, crate::kernel::vm::Asid(0));
+        bad.entry = 0;
+        bad.asid = None;
+        assert!(state.spawn_user_task_from_image(token, bad).is_err());
+
+        assert_eq!(state.task_status(T), baseline_status, "still Reserved");
+        assert_eq!(state.task_asid(T), None, "no stale ASID");
+        assert_eq!(
+            state.thread_user_context(T),
+            baseline_ctx,
+            "no stale context"
+        );
+        assert_eq!(state.thread_group_id(T), baseline_group);
+        assert_eq!(
+            state.runnable_count_on_cpu(CpuId(0)),
+            queued_before,
+            "a failed spawn never enqueues"
+        );
+        // And the reservation is usable again — it was restored, not consumed.
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state
+            .spawn_user_task_from_image(token, spec_for(T, asid))
+            .expect("the restored reservation still consumes");
+    }
+
+    /// The baseline replay itself, exercised directly: dirty every field the spawn body may
+    /// write, then restore and prove each one went back.
+    #[test]
+    fn the_baseline_replay_restores_every_field_the_spawn_body_may_write() {
+        use crate::kernel::spawn_reservation as sr;
+        let mut state = kernel();
+        let token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        let before = state
+            .thread_control_block_snapshot_for_test(T)
+            .expect("tcb");
+
+        let baseline = state
+            .with_tcbs_mut(|tcbs| sr::claim_for_spawn(tcbs, &token))
+            .expect("claim");
+        state.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == T)
+                .expect("tcb");
+            tcb.asid = Some(crate::kernel::vm::Asid(9));
+            tcb.user_entry = Some(crate::kernel::vm::VirtAddr(0xDEAD));
+            tcb.user_stack_top = Some(crate::kernel::vm::VirtAddr(0xBEEF));
+            tcb.user_context.instruction_ptr = crate::kernel::vm::VirtAddr(0xF00D);
+            tcb.tls_ptr = Some(crate::kernel::vm::VirtAddr(0x1234));
+            tcb.cpu_affinity = Some(CpuId(1));
+            tcb.thread_group_id = crate::kernel::task::ThreadGroupId(999);
+        });
+        state
+            .with_tcbs_mut(|tcbs| sr::restore_after_failed_spawn(tcbs, &token, baseline))
+            .expect("restore");
+
+        let after = state
+            .thread_control_block_snapshot_for_test(T)
+            .expect("tcb");
+        assert_eq!(
+            after, before,
+            "a restored reservation is observationally identical to the pre-claim reservation"
+        );
+    }
+
+    // ── F. Explicit cancellation ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn cancellation_removes_the_reservation_and_its_resources() {
+        let mut state = kernel();
+        let token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        assert!(state.task_status(T).is_some());
+        state.cancel_spawn_reservation(token).expect("cancel");
+        assert_eq!(
+            state.task_status(T),
+            None,
+            "the reserved TCB is gone, not merely marked"
+        );
+        assert_eq!(state.task_cnode(T), None, "and it owns no process CNode");
+        // The TID is free again.
+        state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("the TID is reusable after cancellation");
+    }
+
+    #[test]
+    fn a_cancelled_token_can_do_nothing_afterwards() {
+        let mut state = kernel();
+        let token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        state.cancel_spawn_reservation(token).expect("cancel");
+        assert!(
+            state.cancel_spawn_reservation(token).is_err(),
+            "a second cancellation refuses"
+        );
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        assert!(
+            state
+                .spawn_user_task_from_image(token, spec_for(T, asid))
+                .is_err(),
+            "and it cannot be consumed"
+        );
+    }
+
+    #[test]
+    fn a_stale_cancellation_cannot_affect_a_reused_tid() {
+        let mut state = kernel();
+        let stale = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve A");
+        state.cancel_spawn_reservation(stale).expect("cancel A");
+        let fresh = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve B");
+
+        assert!(
+            state.cancel_spawn_reservation(stale).is_err(),
+            "the stale token must not cancel the replacement reservation"
+        );
+        assert_eq!(
+            state.task_status(T),
+            Some(TaskStatus::Reserved),
+            "B survives"
+        );
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state
+            .spawn_user_task_from_image(fresh, spec_for(T, asid))
+            .expect("B is still consumable");
+    }
+
+    #[test]
+    fn cancellation_refuses_a_live_task_and_an_in_flight_spawn() {
+        // A live task: cancelling through a token whose TID has since gone live must refuse.
+        let mut state = kernel();
+        let token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state
+            .spawn_user_task_from_image(token, spec_for(T, asid))
+            .expect("spawn");
+        let status_before = state.task_status(T);
+        assert!(
+            state.cancel_spawn_reservation(token).is_err(),
+            "a LiveSpawned task must not be cancellable through its old token"
+        );
+        assert_eq!(state.task_status(T), status_before);
+    }
+
+    // ── G. Success ordering ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_successful_spawn_goes_live_once_and_is_enqueued_only_afterwards() {
+        let mut state = kernel();
+        let token = state
+            .reserve_task_for_spawn_with_class(T, TaskClass::App)
+            .expect("reserve");
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        let queued_before = state.runnable_count_on_cpu(CpuId(0));
+        state
+            .spawn_user_task_from_image(token, spec_for(T, asid))
+            .expect("spawn");
+
+        assert_eq!(state.task_status(T), Some(TaskStatus::Runnable));
+        assert_eq!(state.task_asid(T), Some(asid));
+        assert_eq!(
+            state.runnable_count_on_cpu(CpuId(0)),
+            queued_before + 1,
+            "enqueued exactly once"
+        );
+        // Structural: the live commit precedes the enqueue in the source, so a partial spawn can
+        // never be scheduler-visible.
+        let exec = production_source("src/kernel/boot/exec_state.rs");
+        let body = exec
+            .split("fn spawn_image_after_claim(")
+            .nth(1)
+            .expect("spawn body");
+        let commit = body.find("commit_live_spawn").expect("live commit");
+        let enqueue = body
+            .find("self.enqueue_on_cpu(chosen_cpu")
+            .expect("enqueue");
+        assert!(
+            commit < enqueue,
+            "the live commit must precede the enqueue: nothing partial may be schedulable"
+        );
+    }
+
+    // ── H. The production caller closure ───────────────────────────────────────────────────
+
+    /// Every production caller of `spawn_user_task_from_image` is pinned. Test callers go
+    /// through the `_for_test` convenience, so this set is exactly the production closure.
+    #[test]
+    fn the_production_spawn_caller_closure_is_pinned() {
+        const EXPECTED: &[(&str, usize)] = &[
+            ("src/arch/aarch64/boot.rs", 3),
+            ("src/arch/riscv64/boot.rs", 3),
+            ("src/arch/x86_64/boot.rs", 3),
+            ("src/kernel/syscall/process.rs", 4),
+        ];
+        let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
+        for (rel, src) in production_sources() {
+            if rel == "src/kernel/boot/exec_state.rs" {
+                continue; // the definition and the test-only convenience live here
+            }
+            let n = src.matches("spawn_user_task_from_image(").count();
+            if n > 0 {
+                found.push((rel, n));
+            }
+        }
+        found.sort();
+        let expected: alloc::vec::Vec<(alloc::string::String, usize)> = EXPECTED
+            .iter()
+            .map(|(f, n)| (alloc::string::String::from(*f), *n))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "the production spawn caller set changed — every caller must reserve (or consume an \
+             existing reservation) and none may retain the legacy overwrite contract"
+        );
+        assert_eq!(
+            found.iter().map(|(_, n)| n).sum::<usize>(),
+            13,
+            "13 production callers"
+        );
+        // None of them authorizes a spawn by TID alone.
+        for (rel, src) in production_sources() {
+            assert!(
+                !src.contains(".spawn_user_task_from_image(UserImageSpec {"),
+                "{rel} spawns without a reservation token"
+            );
+        }
     }
 }
