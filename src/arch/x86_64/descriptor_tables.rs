@@ -627,7 +627,7 @@ fn halt_forever() -> ! {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn idle_halt_loop() -> ! {
+pub(crate) fn idle_halt_loop() -> ! {
     loop {
         unsafe {
             core::arch::asm!("sti", "hlt", options(nomem, nostack));

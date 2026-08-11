@@ -165,30 +165,254 @@ pub(crate) fn ensure_user_return_cr3(
     let _ = (kernel, tid, task_asid);
 }
 
+/// U3 (203C) — the broad-lock-free twin of [`ensure_user_return_cr3`].
+///
+/// Every step of the rare repair path is preserved verbatim: the ACTUAL hardware CR3 read, the
+/// target task's CR3 lookup, the live RIP/RSP sampling on mismatch, the scan of all TCB kernel
+/// stacks for the one containing RSP (through the rank-2 seam here), the identical fallback
+/// bounds, `ensure_kernel_return_context_mapped_for_asid`, and the CR3 write ONLY once that
+/// mapping is proven. A page-table failure is never weakened into success — it still takes the
+/// `USER_CR3_PRE_IRET_SKIP` path and leaves hardware CR3 untouched. The markers are the same
+/// ones, with the same fields.
+///
+/// `active_asid` was derived as "the current task's ASID, else the target's". The caller has
+/// already established that the scheduler names `tid` as current and that `task_asid` is the
+/// incarnation still bound to it, so that derivation and `task_asid` are the same value here —
+/// the diagnostic is unchanged, not approximated.
+pub(crate) fn ensure_user_return_cr3_split(
+    shared: &crate::runtime::SharedKernel,
+    tid: u64,
+    task_asid: crate::kernel::vm::Asid,
+) {
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        let task_cr3 = match crate::arch::x86_64::page_table::cr3_for_asid(task_asid) {
+            Some(c) => c,
+            None => return,
+        };
+        let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+        let active_asid = task_asid;
+        let active_cr3 =
+            crate::arch::x86_64::page_table::cr3_for_asid(active_asid).unwrap_or(hw_cr3);
+        crate::yarm_log!(
+            "USER_CR3_PRE_IRET_CHECK tid={} task_asid={} task_cr3=0x{:016x} active_asid={} active_cr3=0x{:016x} hw_cr3=0x{:016x}",
+            tid,
+            task_asid.0,
+            task_cr3,
+            active_asid.0,
+            active_cr3,
+            hw_cr3,
+        );
+        if hw_cr3 != task_cr3 {
+            // Stage 141/142: repair the kernel return context before force-writing CR3.
+            let mut rip: u64 = 0;
+            let mut rsp: u64 = 0;
+            unsafe {
+                core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nostack, preserves_flags));
+                core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
+            }
+            // Stage 143: the correct LIVE kernel stack, not the target task's own (which may
+            // be idle) — the same scan, through the rank-2 task seam.
+            let (stack_base, stack_top, owner_tid) =
+                find_kernel_stack_bounds_containing_rsp_split(shared, rsp);
+            crate::yarm_log!(
+                "USER_CR3_RETURN_STACK_SELECT rsp=0x{:x} base=0x{:x} top=0x{:x} owner_tid={}",
+                rsp,
+                stack_base,
+                stack_top,
+                owner_tid,
+            );
+            let ctx_mapped =
+                crate::arch::x86_64::page_table::ensure_kernel_return_context_mapped_for_asid(
+                    task_asid, rip, rsp, stack_base, stack_top,
+                );
+            crate::yarm_log!(
+                "USER_CR3_PRE_IRET_SWITCH tid={} from=0x{:016x} to=0x{:016x} ctx_mapped={}",
+                tid,
+                hw_cr3,
+                task_cr3,
+                ctx_mapped,
+            );
+            if ctx_mapped {
+                // Guarded force path: return-context mapping proven, safe to write.
+                crate::arch::x86_64::page_table::write_cr3_for_asid(task_asid);
+            } else {
+                // Do not switch into a root that lacks the live kernel stack;
+                // that is the exact #PF Stage 140 caused. Leave hw CR3 as-is.
+                crate::yarm_log!(
+                    "USER_CR3_PRE_IRET_SKIP tid={} reason=return_ctx_unmapped",
+                    tid
+                );
+            }
+        }
+        let final_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+        crate::yarm_log!(
+            "USER_CR3_PRE_IRET_OK tid={} hw_cr3=0x{:016x}",
+            tid,
+            final_cr3
+        );
+    }
+    #[cfg(feature = "hosted-dev")]
+    let _ = (shared, tid, task_asid);
+}
+
+/// U3 (203C) — truthful divergence when an exact-token post-lock resume refuses.
+///
+/// The x86 analogue of the established AArch64 `enter_post_lock_dispatch_fatal`. A refusal
+/// means the dispatch already mutated the scheduler and the identity then failed to hold, so
+/// returning would IRET through the OUTGOING task's frame. Instead the caller rolls the
+/// dequeue back with its exact authority and diverges here, into the same wake-capable
+/// `idle_halt_loop` the ordinary idle outcome uses — never a spin that masks the fault, and
+/// never a resume of a replacement incarnation.
+pub(crate) fn enter_post_lock_dispatch_fatal(cpu: CpuId, incoming: u64, rolled_back: bool) -> ! {
+    crate::yarm_log!(
+        "X86_POST_LOCK_DISPATCH_FATAL cpu={} incoming={} rolled_back={} reason=partial_dispatch_unrecoverable",
+        cpu.0,
+        incoming,
+        rolled_back as u32
+    );
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::descriptor_tables::idle_halt_loop();
+    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+    panic!("x86_64 post-lock dispatch refused after marking: partial dispatch unrecoverable");
+}
+
+/// Why an exact-token post-lock resume refused. Each variant names the step that refused, so a
+/// caller's diagnostic and its rollback decision are driven by evidence rather than inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum X86ResumeRefusal {
+    /// The rank-1 scheduler no longer names the token's incoming TID on the token's CPU.
+    SchedulerCurrent,
+    /// The token's exact ASID is no longer bound to that TID (a replacement incarnation), or
+    /// the token names the idle task, which has no address space to activate.
+    Asid,
+    /// The token's exact incarnation has no restorable saved context.
+    Context,
+}
+
+/// U3 (203C) — the x86_64 post-lock resume of a MARKED incoming task, without a broad lock.
+///
+/// This is the shared, class-neutral replacement for the two D2 switch-success bodies that
+/// re-acquired `with_cpu` to run `d2_recv_switch_incoming_asid(inc)` +
+/// `post_switch_restore_arch_thread_state(...)`. It reproduces that operation's observable
+/// effects in the same order, reaching every piece of state through the exact-token seams:
+///
+/// 1. **Scheduler re-validation** — the rank-1 seam must still name the token's incoming TID
+///    on the token's own authenticated CPU. Checked FIRST, so a divergence refuses before the
+///    frame is touched at all.
+/// 2. **Exact ASID activation** — `direct_dispatch_activate_asid_split`, which on x86_64 runs
+///    the identical primitive pair the broad path ran (`hal_adapters::switch_address_space`
+///    then `note_address_space_activated`), refusing unless the TCB still carries the token's
+///    ASID.
+/// 3. **Exact context + TLS** — `direct_dispatch_restore_context_split` reads the same
+///    `tcb.user_context` `apply_current_thread_to_frame` read and takes the same pending
+///    TLS-restore request `take_tls_restore_request` took, in ONE rank-2 acquisition, resolved
+///    by exact `{tid, asid}` rather than by re-reading `current`.
+/// 4. **Frame application**, then the FS base and `LAST_RESTORED_TLS_BASE` update, unchanged.
+/// 5. **The pre-IRET CR3 invariant**, including its rare repair path — see
+///    [`ensure_user_return_cr3_split`]. ASID activation does NOT make this redundant: it is a
+///    check against the ACTUAL hardware CR3, which a D6 proof switch can still have left
+///    disagreeing.
+///
+/// **`frame == None` is preserved exactly.** The old body activated the ASID and then called a
+/// restore hook whose first statement was `let Some(frame) = frame else { return Ok(()) }` — so
+/// activation happened and nothing else did. That is reproduced here, and an absent frame is
+/// NOT an error.
+///
+/// **The idle token refuses.** A `Marked` token carries no ASID only for the idle TID, and the
+/// old path skipped both activation (`task_asid(0)` was `None`) and the CR3 block (`tid != 0`).
+/// Resuming idle through a user-frame restore is the very thing the x86 trap epilogue already
+/// refuses to do, so this returns `Asid` rather than restoring one. Class-neutral: no D2, IPC
+/// or direct-dispatch telemetry is emitted here.
+pub(crate) fn x86_post_lock_resume_marked_incoming(
+    shared: &crate::runtime::SharedKernel,
+    token: crate::runtime::DispatchMarkToken,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), X86ResumeRefusal> {
+    let incoming = token.tid();
+    let cpu = token.cpu();
+    if shared.current_tid_split_read(cpu) != Some(incoming) {
+        return Err(X86ResumeRefusal::SchedulerCurrent);
+    }
+    let asid = token.expect_asid().ok_or(X86ResumeRefusal::Asid)?;
+    shared
+        .direct_dispatch_activate_asid_split(token)
+        .ok_or(X86ResumeRefusal::Asid)?;
+    // The old restore hook returned `Ok(())` for an absent frame, AFTER the activation above.
+    let Some(frame) = frame else {
+        return Ok(());
+    };
+    let (context, tls) = shared
+        .direct_dispatch_restore_context_split(token)
+        .ok_or(X86ResumeRefusal::Context)?;
+    frame.apply_user_context(context);
+    let tls = tls.unwrap_or(0);
+    restore_fs_base_if_needed(tls);
+    let idx = cpu.0 as usize;
+    if idx < MAX_CPUS {
+        LAST_RESTORED_TLS_BASE[idx].store(tls, Ordering::Relaxed);
+    }
+    // Stage 140, unchanged: enforce hw CR3 == task_cr3 before the assembly stub does IRET.
+    // The old guards were `current_tid()` non-zero and the task having an ASID; both are
+    // answered by the token, which is strictly more exact than re-reading `current`.
+    if incoming != 0 {
+        ensure_user_return_cr3_split(shared, incoming, asid);
+    }
+    Ok(())
+}
+
+/// The estimate used when no TCB owns a kernel stack containing `rsp`.
+///
+/// U3 (203C): lifted out of [`find_kernel_stack_bounds_containing_rsp`] so the broad-lock
+/// lookup and the rank-2 split lookup share ONE definition. "Identical fallback bounds" is
+/// then a property of the code rather than an assertion about two copies that could drift.
+pub(crate) fn fallback_kernel_stack_bounds(rsp: u64) -> (u64, u64, u64) {
+    const PAGE_SZ: u64 = 4096;
+    const STACK_FLOOR: u64 = 0xFFFF_8000_0000_1000;
+    // Stage 165J: x86_64 per-task kernel stacks are 128 KiB (124 KiB usable
+    // above the guard page), so the fallback estimate spans 124 KiB.
+    let top = (rsp & !(PAGE_SZ - 1)) + PAGE_SZ;
+    let base = (rsp & !(PAGE_SZ - 1))
+        .saturating_sub(124 * 1024)
+        .max(STACK_FLOOR);
+    (base, top, 0)
+}
+
+/// Does `tcb`'s kernel stack contain `rsp`? The single predicate both lookups apply, so the
+/// split scan cannot drift from the broad-lock scan it replaces.
+pub(crate) fn kernel_stack_bounds_if_containing(
+    tcb: &crate::kernel::task::ThreadControlBlock,
+    rsp: u64,
+) -> Option<(u64, u64, u64)> {
+    let base = tcb.kernel_context.stack_base.map_or(0u64, |v| v.0);
+    let top = tcb.kernel_context.stack_top.map_or(0u64, |v| v.0);
+    (base != 0 && top != 0 && rsp >= base && rsp < top).then_some((base, top, tcb.tid.0))
+}
+
 #[cfg(not(feature = "hosted-dev"))]
 fn find_kernel_stack_bounds_containing_rsp(kernel: &KernelState, rsp: u64) -> (u64, u64, u64) {
     let found = kernel.with_tcbs(|tcbs| {
-        tcbs.iter().flatten().find_map(|tcb| {
-            let base = tcb.kernel_context.stack_base.map_or(0u64, |v| v.0);
-            let top = tcb.kernel_context.stack_top.map_or(0u64, |v| v.0);
-            if base != 0 && top != 0 && rsp >= base && rsp < top {
-                Some((base, top, tcb.tid.0))
-            } else {
-                None
-            }
-        })
+        tcbs.iter()
+            .flatten()
+            .find_map(|tcb| kernel_stack_bounds_if_containing(tcb, rsp))
     });
-    found.unwrap_or_else(|| {
-        const PAGE_SZ: u64 = 4096;
-        const STACK_FLOOR: u64 = 0xFFFF_8000_0000_1000;
-        // Stage 165J: x86_64 per-task kernel stacks are 128 KiB (124 KiB usable
-        // above the guard page), so the fallback estimate spans 124 KiB.
-        let top = (rsp & !(PAGE_SZ - 1)) + PAGE_SZ;
-        let base = (rsp & !(PAGE_SZ - 1))
-            .saturating_sub(124 * 1024)
-            .max(STACK_FLOOR);
-        (base, top, 0)
-    })
+    found.unwrap_or_else(|| fallback_kernel_stack_bounds(rsp))
+}
+
+/// U3 (203C) — the rank-2 split twin of [`find_kernel_stack_bounds_containing_rsp`].
+///
+/// Scans the SAME TCB fields with the SAME predicate and the SAME fallback, through the
+/// task-domain seam instead of the broad `KernelState` lock. Nothing is mutated.
+pub(crate) fn find_kernel_stack_bounds_containing_rsp_split(
+    shared: &crate::runtime::SharedKernel,
+    rsp: u64,
+) -> (u64, u64, u64) {
+    let found = shared.with_task_tcbs_split_mut(|tcbs| {
+        tcbs.iter()
+            .flatten()
+            .find_map(|tcb| kernel_stack_bounds_if_containing(tcb, rsp))
+    });
+    found.unwrap_or_else(|| fallback_kernel_stack_bounds(rsp))
 }
 
 #[cfg(not(feature = "hosted-dev"))]

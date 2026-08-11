@@ -461,14 +461,32 @@ pub fn handle_trap_entry_shared(
                     );
                     crate::yarm_log!("D2_SEND_GENUINE_FIRST_RESUME incoming={}", inc);
                 }
-                let restore = shared
-                    .with_cpu(cpu, |kernel| {
-                        kernel.d2_recv_switch_incoming_asid(inc);
-                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
-                    })
-                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                // U3 (203C): the broad `with_cpu` re-acquire that ran
+                // `d2_recv_switch_incoming_asid(inc)` + the arch restore is retired. The
+                // COMPLETE token is carried into one neutral exact-token transaction, so the
+                // ASID, context, TLS and CR3 authority all come from the marked incarnation
+                // rather than from a bare TID re-reading `current`.
+                let resumed = crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming(
+                    shared,
+                    token,
+                    frame.as_deref_mut(),
+                );
+                // The deferral is cleared exactly once, on both outcomes, before anything else
+                // — exactly where the old code cleared it.
                 crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
-                restore??;
+                if resumed.is_err() {
+                    // Refused AFTER the scheduler was mutated: undo the dequeue with the
+                    // token's own narrowed authority (a `ContinuedCurrent` mark yields none,
+                    // and none is fabricated), then diverge. No success marker is emitted.
+                    let rolled_back = token
+                        .into_dequeued_authority()
+                        .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
+                    crate::arch::x86_64::trap::enter_post_lock_dispatch_fatal(
+                        cpu,
+                        inc,
+                        rolled_back,
+                    );
+                }
                 let n = crate::kernel::boot::D2_SEND_DISPATCH_COUNT
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
                     + 1;
@@ -566,16 +584,27 @@ pub fn handle_trap_entry_shared(
                     crate::yarm_log!("D2_RECV_GENUINE_FIRST_RESUME incoming={}", inc);
                 }
                 // Restore the incoming task's arch thread state (frame + CR3).
-                // The dispatch above already ran lock-free; this brief re-acquire
-                // only performs the arch restore, exactly as D6-SWITCH-A does.
-                let restore = shared
-                    .with_cpu(cpu, |kernel| {
-                        kernel.d2_recv_switch_incoming_asid(inc);
-                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
-                    })
-                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                //
+                // U3 (203C): this was a brief broad `with_cpu` re-acquire. It is now the SAME
+                // neutral exact-token transaction the homologous blocking-send switch-success
+                // uses — the two were byte-identical bodies, and they now share one
+                // implementation rather than two copies that could drift.
+                let resumed = crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming(
+                    shared,
+                    token,
+                    frame.as_deref_mut(),
+                );
                 crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
-                restore??;
+                if resumed.is_err() {
+                    let rolled_back = token
+                        .into_dequeued_authority()
+                        .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
+                    crate::arch::x86_64::trap::enter_post_lock_dispatch_fatal(
+                        cpu,
+                        inc,
+                        rolled_back,
+                    );
+                }
                 let n = crate::kernel::boot::D2_RECV_DISPATCH_COUNT
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
                     + 1;

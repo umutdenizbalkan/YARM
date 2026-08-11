@@ -39281,13 +39281,39 @@ mod stage143_live_stack_selection {
             fn_body.contains("with_tcbs"),
             "find_kernel_stack_bounds_containing_rsp must use with_tcbs to scan all TCBs"
         );
+        // U3 (203C): the range predicate lives in ONE shared helper now, applied by both the
+        // broad-lock scan and its rank-2 split twin — so the two cannot drift. Assert the
+        // predicate where it lives, and that both scans apply that same helper.
+        let pred_start = TRAP_RS_SRC
+            .find("fn kernel_stack_bounds_if_containing")
+            .expect("shared range predicate present");
+        let pred = &TRAP_RS_SRC[pred_start..pred_start.saturating_add(600)];
         assert!(
-            fn_body.contains("rsp >= base") || fn_body.contains("base <= rsp"),
+            pred.contains("rsp >= base") || pred.contains("base <= rsp"),
             "helper must check rsp >= base"
         );
         assert!(
-            fn_body.contains("rsp < top") || fn_body.contains("top > rsp"),
+            pred.contains("rsp < top") || pred.contains("top > rsp"),
             "helper must check rsp < top"
+        );
+        assert!(
+            fn_body.contains("kernel_stack_bounds_if_containing(tcb, rsp)"),
+            "the broad-lock scan must apply the shared predicate"
+        );
+        let split_start = TRAP_RS_SRC
+            .find("fn find_kernel_stack_bounds_containing_rsp_split")
+            .expect("rank-2 split twin present");
+        let split_body = &TRAP_RS_SRC[split_start..split_start.saturating_add(600)];
+        assert!(
+            split_body.contains("with_task_tcbs_split_mut")
+                && split_body.contains("kernel_stack_bounds_if_containing(tcb, rsp)"),
+            "the split scan must scan the same TCB fields with the same predicate, under rank 2"
+        );
+        // And both fall back to the SAME bounds definition.
+        assert!(
+            fn_body.contains("fallback_kernel_stack_bounds(rsp)")
+                && split_body.contains("fallback_kernel_stack_bounds(rsp)"),
+            "both scans must share one fallback-bounds definition"
         );
     }
 
@@ -53912,15 +53938,21 @@ mod stage169_d2_send_genuine {
             .map(|r| drain_start + r)
             .expect("recv drain follows send drain");
         let drain = &TRAP_ENTRY_SRC[drain_start..drain_end];
+        // U3 (203C): the hardened restore is no longer reached through a broad `with_cpu`
+        // re-acquire. The drain now calls the SHARED neutral exact-token transaction — the
+        // same one the homologous blocking-recv drain calls — so there is still exactly one
+        // restore mechanism, not a new one.
         assert!(
-            drain.contains(
-                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
-            ),
-            "the send drain must reuse the hardened post_switch restore"
+            drain.contains("x86_post_lock_resume_marked_incoming("),
+            "the send drain must reuse the shared exact-token resume transaction"
         );
         assert!(
             !drain.contains("switch_frames("),
             "the send drain must NOT introduce a new switch_frames call"
+        );
+        assert!(
+            !drain.contains(".with_cpu(") && !drain.contains(".with(|state|"),
+            "the send drain must take no broad lock"
         );
     }
 
@@ -54062,6 +54094,366 @@ mod stage169_d2_send_genuine {
         assert!(
             SMOKE_SRC.contains("Stage 169 incomplete"),
             "smoke must reject the send-path in-lock fallback"
+        );
+    }
+
+    // ── U3 (203C): the shared x86_64 exact-token post-lock resume ────────────────────────
+    //
+    // The blocking-send and blocking-receive switch-success restores were byte-identical
+    // broad `with_cpu` re-acquires that had already discarded the token down to a bare TID.
+    // They now share ONE neutral transaction. These bound its behaviour and its structure.
+
+    use crate::arch::x86_64::trap::{
+        X86ResumeRefusal, fallback_kernel_stack_bounds, x86_post_lock_resume_marked_incoming,
+    };
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const X86_TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const U3_OUTGOING: u64 = 2;
+    const U3_INCOMING: u64 = 3;
+
+    fn u3_code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// `OUTGOING` current, `INCOMING` runnable and enqueued — the shape the D2 drains reach
+    /// after their in-lock phase deferred the queue-advancing dispatch.
+    fn u3_fixture() -> (SharedKernel, Asid) {
+        crate::arch::hal::reset_all_active_address_spaces();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let in_asid = k.with(|s| {
+            s.register_task(U3_OUTGOING).expect("outgoing");
+            s.register_task(U3_INCOMING).expect("incoming");
+            let (a, _) = s.create_user_address_space().expect("outgoing asid");
+            s.bind_task_asid(U3_OUTGOING, a).expect("bind outgoing");
+            let (b, _) = s.create_user_address_space().expect("incoming asid");
+            s.bind_task_asid(U3_INCOMING, b).expect("bind incoming");
+            s.set_task_status_for_test(U3_INCOMING, TaskStatus::Runnable);
+            b
+        });
+        (k, in_asid)
+    }
+
+    /// Commit the same scheduler mutation the drains commit, and mint the same token.
+    fn u3_mark(k: &SharedKernel) -> crate::runtime::DispatchMarkToken {
+        k.with(|s| s.enqueue_task(U3_INCOMING).expect("enqueue"));
+        let dispatch = k.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(dispatch.tid().map(|t| t.0), Some(U3_INCOMING));
+        k.d6_genuine_mark_running_via_task_seam(dispatch)
+            .token()
+            .expect("a genuine dequeue mints a token")
+    }
+
+    fn u3_frame() -> TrapFrame {
+        let mut f = TrapFrame::new(15, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        for i in 0..16 {
+            f.set_user_gpr(i, 0xB000 + i);
+        }
+        f.set_saved_pc(0xDEAD_1000);
+        f.set_saved_sp(0xBEEF_1000);
+        f
+    }
+
+    /// The exact marked incarnation resumes, and the frame receives that task's saved context.
+    #[test]
+    fn u3_exact_token_identity_resumes_and_restores_context() {
+        let (k, asid) = u3_fixture();
+        let mut saved = u3_frame().capture_user_context();
+        saved.instruction_ptr = VirtAddr(0x4_1000);
+        assert!(k.split_return_commit_context_split(
+            crate::runtime::SplitReturnIdentity {
+                tid: U3_INCOMING,
+                asid
+            },
+            saved
+        ));
+        let token = u3_mark(&k);
+        let mut frame = u3_frame();
+        assert_eq!(
+            x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame)),
+            Ok(())
+        );
+        let mut expected = u3_frame();
+        expected.apply_user_context(saved);
+        assert_eq!(
+            frame, expected,
+            "the incoming task's exact saved context reaches the frame"
+        );
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(0)),
+            Some(asid),
+            "the token's exact ASID was activated"
+        );
+    }
+
+    /// TID reuse by a replacement incarnation refuses at the ASID step — before any context is
+    /// copied — and the frame is untouched.
+    #[test]
+    fn u3_stale_asid_refuses_before_touching_the_frame() {
+        let (k, _asid) = u3_fixture();
+        let token = u3_mark(&k);
+        // Replace the incarnation: same numeric TID, different ASID.
+        k.with(|s| {
+            let (fresh, _) = s.create_user_address_space().expect("replacement asid");
+            s.bind_task_asid(U3_INCOMING, fresh).expect("rebind");
+        });
+        let mut frame = u3_frame();
+        let before = u3_frame();
+        assert_eq!(
+            x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame)),
+            Err(X86ResumeRefusal::Asid)
+        );
+        assert_eq!(frame, before, "a refusal must not mutate the frame");
+    }
+
+    /// If the rank-1 scheduler no longer names the token's TID on the token's CPU, the resume
+    /// refuses FIRST — before the ASID is activated and before the frame is touched.
+    #[test]
+    fn u3_scheduler_current_mismatch_refuses_first() {
+        let (k, _asid) = u3_fixture();
+        let token = u3_mark(&k);
+        // Move `current` away from the marked incoming task through a production path: the
+        // dequeue is rolled back, which clears `current` and re-queues the task.
+        assert!(
+            k.direct_dispatch_rollback_split(
+                token
+                    .into_dequeued_authority()
+                    .expect("a genuine dequeue is dequeue authority")
+            )
+        );
+        assert_ne!(k.current_tid_split_read(CpuId(0)), Some(U3_INCOMING));
+        let mut frame = u3_frame();
+        let before = u3_frame();
+        assert_eq!(
+            x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame)),
+            Err(X86ResumeRefusal::SchedulerCurrent)
+        );
+        assert_eq!(frame, before, "no frame mutation before the identity holds");
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(0)),
+            None,
+            "and no address space was activated"
+        );
+    }
+
+    /// The pending TLS-restore request is taken through the token seam, exactly once, and the
+    /// per-CPU FS-base tracking cell follows it.
+    #[test]
+    fn u3_tls_request_is_taken_once_and_tracked() {
+        let (k, _asid) = u3_fixture();
+        k.with(|s| s.set_thread_tls_base(U3_INCOMING, 0x7F00).expect("tls"));
+        let token = u3_mark(&k);
+        let mut frame = u3_frame();
+        assert_eq!(
+            x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame)),
+            Ok(())
+        );
+        assert_eq!(
+            crate::arch::x86_64::trap::last_restored_tls_base(CpuId(0)),
+            Some(0x7F00),
+            "the restored TLS base is recorded for this CPU"
+        );
+        // Taken exactly once: a second resume finds no pending request.
+        let mut frame2 = u3_frame();
+        let _ = x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame2));
+        assert_eq!(
+            k.direct_dispatch_restore_context_split(token)
+                .map(|(_, t)| t),
+            Some(None),
+            "no TLS-restore request remains pending"
+        );
+    }
+
+    /// `frame == None` keeps its old contract: the ASID is activated and nothing else happens,
+    /// and it is NOT an error.
+    #[test]
+    fn u3_absent_frame_activates_asid_and_succeeds() {
+        let (k, asid) = u3_fixture();
+        let token = u3_mark(&k);
+        assert_eq!(
+            x86_post_lock_resume_marked_incoming(&k, token, None),
+            Ok(())
+        );
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(0)),
+            Some(asid),
+            "activation happened before the absent-frame return, as it did before"
+        );
+    }
+
+    /// The fallback kernel-stack bounds are one definition shared by the broad-lock scan and
+    /// its rank-2 twin, and the arithmetic is the Stage 165J 124 KiB window with its floor.
+    #[test]
+    fn u3_fallback_stack_bounds_are_one_shared_definition() {
+        const FLOOR: u64 = 0xFFFF_8000_0000_1000;
+        let rsp = 0xFFFF_8000_0100_0ABCu64;
+        let (base, top, owner) = fallback_kernel_stack_bounds(rsp);
+        assert_eq!(top, (rsp & !4095) + 4096);
+        assert_eq!(base, (rsp & !4095) - 124 * 1024);
+        assert_eq!(owner, 0, "the fallback names no owning task");
+        // The floor clamps a low RSP rather than underflowing.
+        let (low_base, _, _) = fallback_kernel_stack_bounds(FLOOR + 16);
+        assert_eq!(low_base, FLOOR);
+        assert_eq!(fallback_kernel_stack_bounds(0).0, FLOOR);
+    }
+
+    /// The rank-2 stack scan finds the TCB whose kernel stack contains RSP, and falls back to
+    /// the shared bounds otherwise — the same two outcomes the broad-lock scan has.
+    #[test]
+    fn u3_split_stack_scan_matches_the_broad_scan_outcomes() {
+        let (k, _asid) = u3_fixture();
+        let base = 0xFFFF_8000_0020_0000u64;
+        let top = base + 128 * 1024;
+        k.with(|s| {
+            s.with_tcb_mut(U3_INCOMING, |tcb| {
+                tcb.kernel_context.stack_base = Some(VirtAddr(base));
+                tcb.kernel_context.stack_top = Some(VirtAddr(top));
+            })
+            .expect("incoming tcb");
+        });
+        let inside = base + 4096;
+        assert_eq!(
+            crate::arch::x86_64::trap::find_kernel_stack_bounds_containing_rsp_split(&k, inside),
+            (base, top, U3_INCOMING),
+            "the owning task's real bounds are selected"
+        );
+        let outside = top + 4096;
+        assert_eq!(
+            crate::arch::x86_64::trap::find_kernel_stack_bounds_containing_rsp_split(&k, outside),
+            fallback_kernel_stack_bounds(outside),
+            "outside every stack, the shared fallback is used"
+        );
+    }
+
+    /// The CR3 rare path is preserved whole. Its body is freestanding-only, so this is a
+    /// structural proof: every step of the old `ensure_user_return_cr3` survives in the split
+    /// twin, in order, and the guarded write still happens ONLY after the mapping is proven.
+    #[test]
+    fn u3_cr3_pre_iret_invariant_and_repair_path_are_preserved() {
+        let split = X86_TRAP_SRC
+            .split("pub(crate) fn ensure_user_return_cr3_split(")
+            .nth(1)
+            .expect("the split CR3 enforcement is present")
+            .split("\n}\n")
+            .next()
+            .expect("bounded body");
+        let split = u3_code_only(split);
+        for step in [
+            "read_hw_cr3()",
+            "cr3_for_asid(task_asid)",
+            "USER_CR3_PRE_IRET_CHECK",
+            "if hw_cr3 != task_cr3 {",
+            "mov {}, rsp",
+            "find_kernel_stack_bounds_containing_rsp_split(shared, rsp)",
+            "USER_CR3_RETURN_STACK_SELECT",
+            "ensure_kernel_return_context_mapped_for_asid(",
+            "USER_CR3_PRE_IRET_SWITCH",
+            "USER_CR3_PRE_IRET_SKIP",
+            "USER_CR3_PRE_IRET_OK",
+        ] {
+            assert!(
+                split.contains(step),
+                "the CR3 repair path must retain: {step}"
+            );
+        }
+        // The guarded write is inside the ctx_mapped arm, and the skip is the else.
+        let mapped = split
+            .find("if ctx_mapped {")
+            .expect("the mapping guard survives");
+        let write = split
+            .find("write_cr3_for_asid(task_asid)")
+            .expect("the guarded write survives");
+        let skip = split.find("USER_CR3_PRE_IRET_SKIP").expect("the skip arm");
+        assert!(
+            mapped < write && write < skip,
+            "CR3 is written only inside the proven-mapped arm; an unmapped return context skips"
+        );
+        // A page-table failure is never weakened into success.
+        assert!(
+            !split.contains("unwrap_or(true)") && !split.contains("ctx_mapped || "),
+            "an unmapped return context must not be coerced into a successful switch"
+        );
+    }
+
+    /// Both target regions are broad-lock-free, both use the shared transaction, and the
+    /// acquisitions this increment deliberately left alone are still there.
+    #[test]
+    fn u3_both_d2_regions_are_drained_and_the_others_remain() {
+        let src = u3_code_only(TRAP_ENTRY_SRC);
+        // Bound each region by CODE landmarks: `src` is comment-stripped, so a section
+        // header comment would not be found and the slice would run past the region.
+        let send = src
+            .split("D2_SEND_GENUINE_GLOBAL_DROPPED")
+            .nth(1)
+            .expect("send drain")
+            .split("D2_SEND_GENUINE_FALLBACK")
+            .next()
+            .expect("the send block ends at its fallback arm");
+        let recv = src
+            .split("D2_RECV_GENUINE_GLOBAL_DROPPED")
+            .nth(1)
+            .expect("recv drain")
+            .split("D2_RECV_GENUINE_FALLBACK")
+            .next()
+            .expect("the recv block ends at its fallback arm");
+        for (name, region) in [("send", send), ("recv", recv)] {
+            assert!(
+                !region.contains(".with_cpu(") && !region.contains(".with(|state|"),
+                "the D2 {name} switch-success region must take no broad lock"
+            );
+            assert!(
+                region.contains("x86_post_lock_resume_marked_incoming("),
+                "the D2 {name} region must use the shared exact-token transaction"
+            );
+            // Rollback authority is never fabricated, and no success marker follows a refusal.
+            assert!(
+                region.contains(".into_dequeued_authority()")
+                    && region.contains("direct_dispatch_rollback_split"),
+                "the D2 {name} refusal must roll back only with exact dequeued authority"
+            );
+            assert!(
+                !region.contains("DequeuedDispatchMarkToken("),
+                "the D2 {name} refusal must not fabricate dequeue authority"
+            );
+            let refusal = region.find("if resumed.is_err() {").expect("refusal arm");
+            let fatal = region
+                .find("enter_post_lock_dispatch_fatal(")
+                .expect("truthful divergence");
+            let success = region
+                .find("DISPATCH_DONE result=switch")
+                .expect("success marker");
+            assert!(
+                refusal < fatal && fatal < success,
+                "the D2 {name} refusal diverges before any switch-success marker is emitted"
+            );
+        }
+        // Exactly seven broad acquisitions remain in the file, and the four this increment
+        // deliberately did not touch are among them.
+        assert_eq!(
+            src.matches(".with_cpu(").count(),
+            7,
+            "trap_entry.rs retains exactly seven broad acquisitions"
+        );
+        assert!(
+            src.contains("FUTEX_WAIT_DISPATCH_COUNT"),
+            "x86 FutexWait remains"
+        );
+        assert!(src.contains("YIELD_DISPATCH_COUNT"), "x86 Yield remains");
+        assert!(
+            src.contains("D6_CONTROLLED_SWITCH_PROOF_STATE_CLEAR_OK"),
+            "the D6 controlled proof restore remains"
+        );
+        assert!(
+            src.contains("EXIT_TASK_RESTORE_OWNER arch=aarch64"),
+            "the AArch64 exit restore remains"
         );
     }
 }
