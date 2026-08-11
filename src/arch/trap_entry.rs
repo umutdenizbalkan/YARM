@@ -1028,13 +1028,20 @@ pub fn handle_trap_entry_shared(
                     // Lock-dropped proof: re-acquiring `with_cpu` here is only possible because
                     // the broad guard was released above (a held guard would deadlock). Inside,
                     // confirm `current` is None/idle. We restore NO frame.
-                    // U3 (canonical 203C): the rank-1 CPU-indexed scheduler read replaces the
-                    // broad re-acquire. This is a POST-LOCK read at an explicit `cpu`, not the
-                    // forbidden pre-global-lock x86 requester snapshot. Predicate preserved
-                    // exactly: `None` -> true, `Some(0)` -> true, live nonzero -> false; an
-                    // invalid/offline CPU yields `None`, matching the old `unwrap_or(true)`
-                    // error default. No broad-lock fallback.
-                    let current_none = matches!(shared.current_tid_split_read(cpu), None | Some(0));
+                    // Lock-dropped proof: re-acquiring `with_cpu` here is only possible because
+                    // the broad guard was released above (a held guard would deadlock). Inside,
+                    // confirm `current` is None/idle. We restore NO frame.
+                    //
+                    // BLOCKS U3: this drain was briefly retired onto `current_tid_split_read(cpu)`
+                    // and then RESTORED. Its only live acceptance gate is the Stage 195F
+                    // no-incoming idle oracle, whose precondition ("all servers up and blocked on
+                    // recv") is unreachable behind the pre-existing SpawnV5/initramfs stall — so
+                    // the substitution could not be live-proven. The accepted pre-U3 body is
+                    // retained verbatim rather than shipped unverified. The two FutexWait/Yield
+                    // switch-success restores ARE live-proven and stay retired.
+                    let current_none = shared
+                        .with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))
+                        .unwrap_or(true);
                     crate::yarm_log!(
                         "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu={}",
                         cpu.0

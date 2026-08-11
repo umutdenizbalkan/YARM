@@ -71876,7 +71876,7 @@ mod stage195f_aarch64_futex_wait_default_on {
             })
             .unwrap_or("");
         assert!(
-            idle_branch.contains("matches!(shared.current_tid_split_read(cpu), None | Some(0))"),
+            idle_branch.contains("kernel.current_tid(), None | Some(0)"),
             "the idle branch must verify current is None/idle"
         );
         assert!(

@@ -36,10 +36,12 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // Stage 199D: 12 -> 11. The AArch64 handled-split return path no longer reacquires the
     // broad lock to finalize a syscall; it uses two bounded rank-2 task-domain transactions
     // (exact-incarnation TLS take, exact-incarnation context commit) instead.
-    // U3 (203C): 11 -> 8. The AArch64 FutexWait and Yield switch-success restores now run the
-    // neutral exact-token resume core (`direct_dispatch_resume_incoming_core`), and the
-    // FutexWait no-incoming idle check reads `current` through the rank-1 scheduler seam.
-    ("src/arch/trap_entry.rs", 8),
+    // U3 (203C): 11 -> 9. The AArch64 FutexWait and Yield switch-success restores now run the
+    // neutral exact-token resume core (`direct_dispatch_resume_incoming_core`). The FutexWait
+    // no-incoming idle check was briefly retired too and then RESTORED: its only live gate (the
+    // Stage 195F idle oracle) is unreachable behind the pre-existing SpawnV5 stall, so that one
+    // substitution could not be live-proven and was not shipped.
+    ("src/arch/trap_entry.rs", 9),
     ("src/arch/x86_64/descriptor_tables.rs", 2),
     ("src/arch/x86_64/smp.rs", 4),
     ("src/kernel/boot/thread_state.rs", 1),
@@ -80,7 +82,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 30; // U3: 38 -> 33 -> 30 (five RISC-V + three AArch64 drains)
+const AUDITED_WITH_CPU_TOTAL: usize = 31; // U3: 38 -> 33 -> 31 (five RISC-V + two AArch64 drains)
 const AUDITED_WITH_BROAD_TOTAL: usize = 6; // U2: 9 -> 6 (three test-only acquisitions relocated)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -89,7 +91,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 36; // U3: 44 -> 39 -> 36 (eight drains retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 37; // U3: 44 -> 39 -> 37 (seven drains retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

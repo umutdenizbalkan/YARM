@@ -748,6 +748,39 @@ extern "C" fn futex_oracle_child() -> ! {
 /// retirement, so the parent's handshake `FutexWait` below is dispatched by the OUT-OF-LOCK
 /// drain (task A blocks via NR 9 → drain dispatches task B = the child → child wakes A via NR 10
 /// → A resumes). The extra `AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE` marker attests that flow.
+/// BLOCKS U3 — the AArch64 kernel-unlocking slot-5 oracle dispatcher.
+///
+/// Runs the FutexWake / FutexWait / FutexWait-idle / Yield / direct-IpcCall selectors at the
+/// EARLIEST safe point in init: after the startup context and PM caps are validated and before
+/// the SpawnV5 service chain. Each arm below is moved verbatim from its previous late position —
+/// same selector value, same feature gates, same call, same arguments, same termination and
+/// marker contract. Selector mutual exclusion is preserved because the sentinel is a single
+/// slot-5 value. Selector 6 (shared-region), 8/9 (reply-timeout) and the ExitCurrentTask arm are
+/// deliberately NOT moved and stay where they were.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn dispatch_aarch64_unlocking_oracle_early(ctx: &yarm_user_rt::runtime::StartupContext) {
+    // Stage 195C: default-off AArch64 FutexWake live oracle. The kernel reuses init
+    // startup slot 5 (supervisor_control_recv_ep, unused by init) as a sentinel (=1) ONLY
+    // under `yarm.aarch64_futex_wake_oracle=1`. A normal boot leaves it None and skips this.
+    if ctx.supervisor_control_recv_ep == Some(1) || ctx.supervisor_control_recv_ep == Some(2) {
+        // Slot-5 sentinel: 1 = Stage 195C FutexWake oracle; 2 = Stage 195E FutexWait
+        // queue-advancing SWITCH oracle (same parent/child flow, but the parent's handshake
+        // FutexWait is serviced by the out-of-lock drain).
+        let futex_wait_mode = ctx.supervisor_control_recv_ep == Some(2);
+        run_aarch64_futex_wake_oracle(ctx.task_id, futex_wait_mode);
+    }
+    if ctx.supervisor_control_recv_ep == Some(4) {
+        // Slot-5 sentinel 4 = Stage 195G two-task Yield oracle (Proof A).
+        run_aarch64_yield_two_task_oracle(ctx.task_id);
+    }
+    // Stage 199A2C1: default-off + feature-gated AArch64 DIRECT IpcCall/IpcReply live round-trip
+    // oracle. Slot-5 selector 7, mutually exclusive with 1-6. Requires the build feature AND the
+    // runtime knob.
+    if ctx.supervisor_control_recv_ep == Some(7) {
+        run_aarch64_ipccall_direct_oracle(ctx.task_id);
+    }
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn run_aarch64_futex_wake_oracle(init_tid: u64, futex_wait_mode: bool) {
     yarm_user_rt::user_log!(
@@ -3854,6 +3887,16 @@ pub fn run() {
     };
     yarm_user_rt::user_log!("INIT_PM_CAPS send={} reply={}", pm_send, pm_recv);
 
+    // BLOCKS U3: the AArch64 kernel-unlocking slot-5 oracles are dispatched HERE — after the
+    // startup context and PM caps are validated, and BEFORE the SpawnV5 service chain below.
+    // They used to sit ~475 lines further down, past every SpawnV5/VFS/blkcache step, so on
+    // AArch64 they were never reached and their live acceptance evidence could not be produced.
+    // None of them needs a spawned service: each drives its own parent/child topology through
+    // syscalls using only the startup context and the PM/supervisor established by bootstrap.
+    // With slot 5 unset this is a no-op and the ordinary service chain runs unchanged.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    dispatch_aarch64_unlocking_oracle_early(&ctx);
+
     // --- Spawn initramfs_srv (image_id=4) ---
     yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
     let Some((child_tid, initramfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 4, [0, 0, 0, 0], 0)
@@ -4326,32 +4369,24 @@ pub fn run() {
         run_x86_exit_current_task_oracle(ctx.task_id);
     }
 
-    // Stage 195C: default-off AArch64 FutexWake live oracle. The kernel reuses init
-    // startup slot 5 (supervisor_control_recv_ep, unused by init) as a sentinel (=1) ONLY
-    // under `yarm.aarch64_futex_wake_oracle=1`. A normal boot leaves it None and skips this.
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    if ctx.supervisor_control_recv_ep == Some(1) || ctx.supervisor_control_recv_ep == Some(2) {
-        // Slot-5 sentinel: 1 = Stage 195C FutexWake oracle; 2 = Stage 195E FutexWait
-        // queue-advancing SWITCH oracle (same parent/child flow, but the parent's handshake
-        // FutexWait is serviced by the out-of-lock drain).
-        let futex_wait_mode = ctx.supervisor_control_recv_ep == Some(2);
-        run_aarch64_futex_wake_oracle(ctx.task_id, futex_wait_mode);
-    }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if ctx.supervisor_control_recv_ep == Some(3) {
         // Slot-5 sentinel 3 = Stage 195F NO-INCOMING idle oracle. All servers are up and blocked
         // on recv; init is the last runnable user task. This blocks on a never-woken futex and
         // does not return — the default-on post-lock drain takes the Idle outcome.
+        //
+        // BLOCKS U3: this arm stays LATE deliberately. Its precondition above ("all servers up
+        // and blocked on recv") is only true after the SpawnV5 service chain, so dispatching it
+        // early makes the drain find a runnable incoming task and never take the Idle outcome.
         run_aarch64_futex_wait_idle_oracle(ctx.task_id);
-    }
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    if ctx.supervisor_control_recv_ep == Some(4) {
-        // Slot-5 sentinel 4 = Stage 195G two-task Yield oracle (Proof A).
-        run_aarch64_yield_two_task_oracle(ctx.task_id);
     }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if ctx.supervisor_control_recv_ep == Some(5) {
         // Slot-5 sentinel 5 = Stage 195G lone-task Yield oracle (Proof B).
+        //
+        // BLOCKS U3: this arm stays LATE deliberately. Its accepted contract expects init to be
+        // the sole runnable task at tid=1; dispatched early it observes tid=2 and the established
+        // `AARCH64_YIELD_DISPATCH_DEQUEUE_OK cpu=0 tid=1` evidence no longer matches.
         run_aarch64_yield_lone_task_oracle(ctx.task_id);
     }
     // Stage 198E3C2B: default-off + feature-gated AArch64 DIRECT shared-region live oracle. Slot-5
@@ -4361,15 +4396,6 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if ctx.supervisor_control_recv_ep == Some(6) {
         run_aarch64_shared_region_direct_oracle(ctx.task_id);
-    }
-    // Stage 199A2C1: default-off + feature-gated AArch64 DIRECT IpcCall/IpcReply live round-trip
-    // oracle. Slot-5 selector 7 (the next free AArch64 selector, mutually exclusive with 1-6) tells
-    // init to run the parent(client)/child(server) NR6 request + NR7 reply round trip through the
-    // accepted off-lock transactions, reusing the SAME arch-neutral core as x86. Requires both the
-    // build feature AND the runtime knob.
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    if ctx.supervisor_control_recv_ep == Some(7) {
-        run_aarch64_ipccall_direct_oracle(ctx.task_id);
     }
     // Stage 200C2C1: default-off + feature-gated AArch64 LIVE reply-receive TIMEOUT retirement oracle.
     // Slot-5 selector 8 = timeout-wins, 9 = reply-wins (mutually exclusive with every other AArch64
