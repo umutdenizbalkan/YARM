@@ -71654,8 +71654,7 @@ mod stage195e_aarch64_futex_wait_drain {
             "futex_wait_reverify_blocked",
             "futex_wait_dispatch_step_mut",
             "d6_genuine_mark_running_via_task_seam",
-            "d2_recv_switch_incoming_asid",
-            "post_switch_restore_arch_thread_state",
+            "direct_dispatch_resume_incoming_core",
             "futex_wait_dispatch_clear",
             "maybe_log_futex_wait_retired",
             "AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK",
@@ -71877,7 +71876,7 @@ mod stage195f_aarch64_futex_wait_default_on {
             })
             .unwrap_or("");
         assert!(
-            idle_branch.contains("kernel.current_tid(), None | Some(0)"),
+            idle_branch.contains("matches!(shared.current_tid_split_read(cpu), None | Some(0))"),
             "the idle branch must verify current is None/idle"
         );
         assert!(
@@ -72078,8 +72077,7 @@ mod stage195g_aarch64_yield_dispatch {
             "yield_reverify_ready",
             "yield_dispatch_step_mut",
             "d6_genuine_mark_running_via_task_seam",
-            "d2_recv_switch_incoming_asid",
-            "post_switch_restore_arch_thread_state",
+            "direct_dispatch_resume_incoming_core",
             "yield_dispatch_clear",
             "maybe_log_yield_retired",
             "AARCH64_YIELD_DISPATCH_REVERIFY_OK",
@@ -105861,9 +105859,13 @@ mod stage199d_aarch64_offlock_dispatch {
             );
         }
 
+        // U3 (203C): the resume body was lifted into the NEUTRAL exact-token core so the
+        // AArch64 FutexWait/Yield drains can share it without inheriting direct-dispatch
+        // telemetry. The seams now live there; `direct_dispatch_resume_incoming` is a thin
+        // marker-emitting wrapper over it.
         let resume = code_only(
             AARCH64_TRAP
-                .split("pub(crate) fn direct_dispatch_resume_incoming(")
+                .split("pub(crate) fn direct_dispatch_resume_incoming_core(")
                 .nth(1)
                 .and_then(|s| s.split("\n}").next())
                 .expect("the arch resume primitive"),

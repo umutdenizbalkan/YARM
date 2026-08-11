@@ -133,39 +133,48 @@ pub(crate) fn enter_post_lock_dispatch_fatal(cpu: CpuId, incoming: u64, rolled_b
 ///
 /// Returns `false` when the incoming task has no saved context to restore, in which case the
 /// frame is left untouched and the caller fails closed.
-pub(crate) fn direct_dispatch_resume_incoming(
+/// U3 (canonical 203C) — which step of the exact-token resume refused.
+///
+/// The neutral core reports this so each caller can name the step in ITS OWN class telemetry;
+/// the core itself emits no class-specific marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeRefusal {
+    /// The exact ASID could not be activated (identity replaced, or no page-table root).
+    Ttbr0,
+    /// The exact saved EL0 context / TLS take refused.
+    Context,
+}
+
+/// U3 (canonical 203C) — the NEUTRAL exact-token incoming-resume transaction.
+///
+/// This is the body that used to live inline in [`direct_dispatch_resume_incoming`], lifted so
+/// the AArch64 FutexWait and Yield post-lock switch drains can share it instead of re-acquiring
+/// the broad lock. It is deliberately free of `AARCH64_DIRECT_DISPATCH_*` telemetry: those
+/// markers belong to the IPC-direct class, not to every resume, so the wrapper below re-emits
+/// them and FutexWait/Yield emit only their own class markers.
+///
+/// Every step names the incoming task by the mark TOKEN's exact incarnation — the `{tid, asid}`
+/// pair this transaction actually marked — never by bare numeric TID and never by re-reading
+/// `current`. If the TCB was replaced by a different incarnation that reused the TID, the step
+/// refuses: the replacement's address space is never activated and its context is never copied.
+///
+/// `AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED` stays here: it is resume-class behavior (the
+/// exact parked completion is consumed by whichever path resumes the task), not IPC-direct
+/// telemetry.
+///
+/// Returns the activated ASID on success, or which step refused.
+pub(crate) fn direct_dispatch_resume_incoming_core(
     shared: &crate::runtime::SharedKernel,
     token: crate::runtime::DispatchMarkToken,
     frame: &mut TrapFrame,
-) -> bool {
-    // Stage 199D-WA3A-R2-SEAL (item F): every step below names the incoming task by the mark
-    // TOKEN's exact incarnation — the `{tid, asid}` pair this transaction actually marked — and
-    // not by the bare numeric TID. If the TCB has since been replaced by a different
-    // incarnation that reused the TID, each step refuses and this returns `false`, so the
-    // caller takes its rollback/fatal path: the replacement's address space is never activated
-    // and its context is never copied into the frame.
+) -> Result<u16, ResumeRefusal> {
     let incoming = token.tid();
-    // (1) ASID / TTBR0, recorded against THIS CPU — an active address space is per-core state.
-    let Some(asid) = shared.direct_dispatch_activate_asid_split(token) else {
-        crate::yarm_log!(
-            "AARCH64_DIRECT_DISPATCH_IDENTITY_REFUSED tid={} step=ttbr0",
-            incoming
-        );
-        return false;
-    };
-    crate::yarm_log!(
-        "AARCH64_DIRECT_DISPATCH_TTBR0_OK tid={} asid={}",
-        incoming,
-        asid
-    );
-    // (2)+(3) Complete saved EL0 context and the TLS-restore take, one rank-2 acquisition.
-    let Some((context, tls)) = shared.direct_dispatch_restore_context_split(token) else {
-        crate::yarm_log!(
-            "AARCH64_DIRECT_DISPATCH_IDENTITY_REFUSED tid={} step=context",
-            incoming
-        );
-        return false;
-    };
+    let asid = shared
+        .direct_dispatch_activate_asid_split(token)
+        .ok_or(ResumeRefusal::Ttbr0)?;
+    let (context, tls) = shared
+        .direct_dispatch_restore_context_split(token)
+        .ok_or(ResumeRefusal::Context)?;
     frame.apply_user_context(context);
     frame.set_user_gpr(
         crate::arch::aarch64::syscall_abi::REG_X18_TLS,
@@ -178,7 +187,6 @@ pub(crate) fn direct_dispatch_resume_incoming(
             LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
         }
     }
-    // (4) The remotely-completed blocked syscall, consumed before the mirror below.
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     if let Some(done) = shared.direct_dispatch_take_completion_split(token) {
         frame.set_arg(0, done.result as usize);
@@ -195,8 +203,6 @@ pub(crate) fn direct_dispatch_resume_incoming(
         );
         crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
     }
-    // (5) The argument mirror — the same six named lanes, in the same order, as the
-    //     `!syscall_return` branch of `restore_arch_thread_state`.
     use crate::arch::aarch64::syscall_abi::{REG_X0, REG_X1, REG_X2, REG_X3, REG_X4, REG_X5};
     frame.set_user_gpr(REG_X0, frame.arg(0));
     frame.set_user_gpr(REG_X1, frame.arg(1));
@@ -204,7 +210,44 @@ pub(crate) fn direct_dispatch_resume_incoming(
     frame.set_user_gpr(REG_X3, frame.arg(3));
     frame.set_user_gpr(REG_X4, frame.arg(4));
     frame.set_user_gpr(REG_X5, frame.arg(5));
-    true
+    let _ = incoming;
+    Ok(asid)
+}
+
+pub(crate) fn direct_dispatch_resume_incoming(
+    shared: &crate::runtime::SharedKernel,
+    token: crate::runtime::DispatchMarkToken,
+    frame: &mut TrapFrame,
+) -> bool {
+    // U3: a THIN wrapper over the neutral core. Its marker contract is unchanged — the same
+    // `AARCH64_DIRECT_DISPATCH_IDENTITY_REFUSED tid=.. step=ttbr0|context` refusal distinction
+    // and the same `AARCH64_DIRECT_DISPATCH_TTBR0_OK` on success — so its existing direct caller
+    // sees exactly what it saw before.
+    let incoming = token.tid();
+    match direct_dispatch_resume_incoming_core(shared, token, frame) {
+        Ok(asid) => {
+            crate::yarm_log!(
+                "AARCH64_DIRECT_DISPATCH_TTBR0_OK tid={} asid={}",
+                incoming,
+                asid
+            );
+            true
+        }
+        Err(ResumeRefusal::Ttbr0) => {
+            crate::yarm_log!(
+                "AARCH64_DIRECT_DISPATCH_IDENTITY_REFUSED tid={} step=ttbr0",
+                incoming
+            );
+            false
+        }
+        Err(ResumeRefusal::Context) => {
+            crate::yarm_log!(
+                "AARCH64_DIRECT_DISPATCH_IDENTITY_REFUSED tid={} step=context",
+                incoming
+            );
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -983,20 +983,35 @@ pub fn handle_trap_entry_shared(
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK tid={}", inc);
                     // Arch restore: TTBR0/ASID switch + EL0 frame restore under a brief
                     // `with_cpu` re-acquire (global guard already dropped above).
-                    let restore = shared
-                        .with_cpu(cpu, |kernel| {
-                            let asid = kernel.task_asid(inc).map(|a| a.0).unwrap_or(0);
-                            kernel.d2_recv_switch_incoming_asid(inc);
-                            crate::yarm_log!(
-                                "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid={} asid={}",
-                                inc,
-                                asid
-                            );
-                            post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
-                        })
-                        .map_err(|err| TrapHandleError::Syscall(err.into()));
+                    // U3 (canonical 203C): the EXACT-TOKEN resume transaction — activate the
+                    // token's exact ASID, restore its exact EL0 context/TLS and consume its
+                    // exact parked completion through the rank-2 seams. No broad `with_cpu`
+                    // re-acquire and no broad-lock fallback. The shared core emits no
+                    // `AARCH64_DIRECT_DISPATCH_*` telemetry; only this class's markers below.
+                    //
+                    // A marked incoming task cannot be reported resumed without a real frame, so
+                    // a missing frame takes the same refusal path as an exact-identity refusal.
+                    let resumed = match frame.as_deref_mut() {
+                        Some(f) => super::aarch64::trap::direct_dispatch_resume_incoming_core(
+                            shared, token, f,
+                        )
+                        .ok(),
+                        None => None,
+                    };
                     crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
-                    restore??;
+                    let Some(asid) = resumed else {
+                        // Exact authority only: a `ContinuedCurrent` mark yields none, so no
+                        // rollback is fabricated. `rolled_back` is reported truthfully.
+                        let rolled_back = token
+                            .into_dequeued_authority()
+                            .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
+                        super::aarch64::trap::enter_post_lock_dispatch_fatal(cpu, inc, rolled_back);
+                    };
+                    crate::yarm_log!(
+                        "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid={} asid={}",
+                        inc,
+                        asid
+                    );
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid={}", inc);
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok");
                     crate::kernel::boot::maybe_log_futex_wait_retired();
@@ -1013,9 +1028,13 @@ pub fn handle_trap_entry_shared(
                     // Lock-dropped proof: re-acquiring `with_cpu` here is only possible because
                     // the broad guard was released above (a held guard would deadlock). Inside,
                     // confirm `current` is None/idle. We restore NO frame.
-                    let current_none = shared
-                        .with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))
-                        .unwrap_or(true);
+                    // U3 (canonical 203C): the rank-1 CPU-indexed scheduler read replaces the
+                    // broad re-acquire. This is a POST-LOCK read at an explicit `cpu`, not the
+                    // forbidden pre-global-lock x86 requester snapshot. Predicate preserved
+                    // exactly: `None` -> true, `Some(0)` -> true, live nonzero -> false; an
+                    // invalid/offline CPU yields `None`, matching the old `unwrap_or(true)`
+                    // error default. No broad-lock fallback.
+                    let current_none = matches!(shared.current_tid_split_read(cpu), None | Some(0));
                     crate::yarm_log!(
                         "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu={}",
                         cpu.0
@@ -1117,20 +1136,31 @@ pub fn handle_trap_entry_shared(
                         inc
                     );
                     crate::yarm_log!("AARCH64_YIELD_DISPATCH_RUNNING_OK tid={}", inc);
-                    let restore = shared
-                        .with_cpu(cpu, |kernel| {
-                            let asid = kernel.task_asid(inc).map(|a| a.0).unwrap_or(0);
-                            kernel.d2_recv_switch_incoming_asid(inc);
-                            crate::yarm_log!(
-                                "AARCH64_YIELD_DISPATCH_TTBR0_OK tid={} asid={}",
-                                inc,
-                                asid
-                            );
-                            post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
-                        })
-                        .map_err(|err| TrapHandleError::Syscall(err.into()));
+                    // U3 (canonical 203C): the EXACT-TOKEN resume transaction — activate the
+                    // token's exact ASID, restore its exact EL0 context/TLS and consume its
+                    // exact parked completion through the rank-2 seams. No broad `with_cpu`
+                    // re-acquire and no broad-lock fallback. The shared core emits no
+                    // `AARCH64_DIRECT_DISPATCH_*` telemetry; only this class's markers below.
+                    //
+                    // A marked incoming task cannot be reported resumed without a real frame, so
+                    // a missing frame takes the same refusal path as an exact-identity refusal.
+                    let resumed = match frame.as_deref_mut() {
+                        Some(f) => super::aarch64::trap::direct_dispatch_resume_incoming_core(
+                            shared, token, f,
+                        )
+                        .ok(),
+                        None => None,
+                    };
                     crate::kernel::boot::yield_dispatch_clear(cpu_idx);
-                    restore??;
+                    let Some(asid) = resumed else {
+                        // Exact authority only: a `ContinuedCurrent` mark yields none, so no
+                        // rollback is fabricated. `rolled_back` is reported truthfully.
+                        let rolled_back = token
+                            .into_dequeued_authority()
+                            .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
+                        super::aarch64::trap::enter_post_lock_dispatch_fatal(cpu, inc, rolled_back);
+                    };
+                    crate::yarm_log!("AARCH64_YIELD_DISPATCH_TTBR0_OK tid={} asid={}", inc, asid);
                     crate::yarm_log!("AARCH64_YIELD_DISPATCH_FRAME_OK tid={}", inc);
                     crate::yarm_log!("AARCH64_YIELD_DISPATCH_DONE result=ok");
                     crate::kernel::boot::maybe_log_yield_retired();
