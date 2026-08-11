@@ -73583,12 +73583,36 @@ mod stage196f_riscv_futex_wait_default_on_idle {
         ] {
             assert!(drain.contains(m), "the idle outcome must emit `{m}`");
         }
-        // Lock-dropped proof is a real `with_cpu` re-acquire that reads `current`.
+        // U3 (canonical 203C): the idle branch no longer re-acquires the broad lock. Its
+        // source position after the outer `with_cpu` closure is the lock-drop proof, and
+        // `current` is read through the authoritative rank-1 scheduler seam.
+        //
+        // The "must not appear" checks below run on CODE only: the branch's comments
+        // legitimately name the retired `with_cpu` read and its old `unwrap_or(true)` while
+        // explaining the substitution, and a prose mention must not be read as a live call.
+        let code_has = |needle: &str| {
+            drain
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains(needle))
+        };
         assert!(
-            drain.contains(
-                ".with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))"
-            ),
-            "the lock-dropped proof must be a genuine with_cpu re-acquire reading current"
+            !code_has(".with_cpu("),
+            "the FutexWait idle branch must acquire no broad lock"
+        );
+        assert!(
+            !code_has("shared.with(|") && !code_has(".with(|state|"),
+            "the FutexWait idle branch must not take the broad lock in the `with` form either"
+        );
+        assert!(
+            code_has("matches!(shared.current_tid_split_read(cpu), None | Some(0))"),
+            "the idle branch must read `current` through the rank-1 scheduler seam, \
+             preserving the None | Some(0) predicate"
+        );
+        // No broad-lock fallback when the split read declines: `None` already means idle.
+        assert!(
+            !code_has("unwrap_or(true)") && !code_has("current_tid_authoritative"),
+            "the idle branch must not fall back to a broad-lock read"
         );
         // NO frame is restored in the idle branch (no restore_arch_thread_state, no SRET_ARMED).
         assert!(

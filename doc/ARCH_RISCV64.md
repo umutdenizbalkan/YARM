@@ -418,8 +418,10 @@ floods): `RISCV_SHARED_TRAP_ENTRY_BEGIN`, `RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET`,
 **Genuine post-lock drain proof (Part 4).** A default-off oracle
 (`yarm.riscv64_post_lock_foundation_oracle=1`) publishes a one-shot post-work
 token (the requester tid) during the broad-lock phase, then after the guard
-drops consumes it and **re-acquires `with_cpu`** — a real re-acquisition that
-would deadlock if the broad guard were still held — before the trap `sret`s
+drops consumes it and re-reads `current` through the **authoritative rank-1
+scheduler seam** `current_tid_split_read(cpu)` — U3 retired the broad `with_cpu`
+re-acquisition that used to stand here; what proves the guard is gone is the
+source position, after the broad closure returned — before the trap `sret`s
 back to the same task. Markers: `RISCV_POST_LOCK_FOUNDATION_ORACLE_{PUBLISH_OK,
 LOCK_DROPPED_OK, DRAIN_OK, USER_RETURN_OK, DONE result=ok}`. It mutates no
 scheduler / capability / user-copy / task-switch state.
@@ -702,8 +704,10 @@ oracle knob, no one-shot consume latch in the kernel) and adds a genuine
     Running → real `write_satp` + `sfence.vma` + `restore_arch_thread_state` →
     `sret` (`..._DONE result=ok`).
   - **Idle** (no incoming): `RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING` →
-    `POST_LOCK_IDLE_BEGIN` → a fresh `with_cpu` re-acquire confirms `current` is
-    None (`POST_LOCK_IDLE_LOCK_DROPPED_OK`) → clear deferral → `..._DONE result=idle`
+    `POST_LOCK_IDLE_BEGIN` → the rank-1 scheduler seam `current_tid_split_read(cpu)`
+    confirms `current` is None/idle (U3 retired the broad `with_cpu` re-acquire here;
+    `POST_LOCK_IDLE_LOCK_DROPPED_OK` now attests reaching the post-broad-lock boundary,
+    not a fresh acquisition) → clear deferral → `..._DONE result=idle`
     → `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok` →
     `POST_LOCK_IDLE_ENTERED`. NO frame is restored and NO `sret` is attempted.
     **Stage 197B (typed idle):** the drain returns the explicit typed outcome
@@ -733,9 +737,11 @@ oracle knob, no one-shot consume latch in the kernel) and adds a genuine
 - **Normal core boot** may show ZERO FutexWait retirement markers if no production
   task naturally calls NR 9 — acceptable, since the mechanism is source- and
   test-proven default-on. NR 9 is still NOT in the pre-lock split gate.
-- **Trap-stack impact.** The idle branch adds only one bounded `with_cpu` re-acquire
-  (the lock-dropped proof) on the existing trap stack — no recursion, no second
-  frame, no meaningful new usage. The 2 MiB fix + TODO are preserved.
+- **Trap-stack impact.** Since U3 the idle branch takes no broad re-acquire at all —
+  its `current` check is a rank-1 scheduler seam read — so it adds no recursion, no
+  second frame and no meaningful new stack usage. The switch branch still takes its one
+  bounded `with_cpu` re-acquire for the real SATP + frame restore. The 2 MiB fix + TODO
+  are preserved.
 - **Still excluded:** Yield, NR 27, D2, IpcSend, VM/spawn/fork/cap-mint,
   ReapFaultedTask, RISC-V AP user dispatch. DebugLog + FutexWake stay live; the 196D
   foundation oracle stays green. Counts unchanged (32/23), no new kernel lock.

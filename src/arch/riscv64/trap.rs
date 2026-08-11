@@ -953,12 +953,24 @@ pub fn handle_riscv_trap_entry_shared(
                 // is fabricated, and no `sret` is attempted.
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu={}", cpu.0);
                 crate::yarm_log!("RISCV_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu={}", cpu.0);
-                // Lock-dropped proof: this `with_cpu` re-acquire is only possible because the broad
-                // guard was released above (a still-held guard would deadlock). Confirm `current`
-                // is None/idle.
-                let current_none = shared
-                    .with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))
-                    .unwrap_or(true);
+                // U3 (canonical 203C): confirm `current` is None/idle through the authoritative
+                // rank-1 scheduler seam. This is NOT a broad re-acquisition any more.
+                //
+                // What proves the broad guard is gone is the source position: Phase 2's
+                // `with_cpu(cpu, …)` closure has already returned above, so no broad
+                // `&mut KernelState` is alive here, and `cpu` is explicit and authoritative.
+                //
+                // Exact behavioral parity with the deleted `with_cpu` read. That read set
+                // `current_cpu = cpu` (already this `cpu`, set by Phase 2) and evaluated
+                // `matches!(kernel.current_tid(), None | Some(0))`, where `current_tid()`
+                // resolves `scheduler.current_tid_on(current_cpu)` under the scheduler lock;
+                // `current_tid_split_read(cpu)` resolves `scheduler.current_tid_on(cpu)` under
+                // that same rank-1 lock. So: `None` → true, `Some(0)` → true, `Some(nonzero)`
+                // → false, unchanged. The old `.unwrap_or(true)` covered a `with_cpu`
+                // validation failure (invalid/offline CPU); the split read yields `None` in
+                // exactly that case, which the `None` arm already maps to true. No broad-lock
+                // fallback is added if the read declines.
+                let current_none = matches!(shared.current_tid_split_read(cpu), None | Some(0));
                 crate::yarm_log!(
                     "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu={}",
                     cpu.0
@@ -970,8 +982,12 @@ pub fn handle_riscv_trap_entry_shared(
                 );
                 // Narrowly-gated idle-oracle attestation (default-off workload knob).
                 // `outgoing_blocked=1` because reverify_ok proved the caller is still
-                // `Blocked(Futex)`; `current_none` from the re-acquire; `lock_dropped=1` because
-                // that re-acquire succeeded.
+                // `Blocked(Futex)`; `current_none` from the rank-1 seam read above.
+                // `lock_dropped=1` is retained for smoke/contract compatibility, and since U3 it
+                // attests that execution REACHED this post-broad-lock boundary — the outer
+                // `with_cpu` closure returned — NOT that a fresh broad re-acquisition succeeded.
+                // The retirement evidence is the census deletion plus this oracle actually
+                // running; the marker field alone is not evidence.
                 if crate::kernel::boot::riscv_futex_wait_idle_oracle_enabled() {
                     crate::yarm_log!(
                         "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none={} outgoing_blocked=1",

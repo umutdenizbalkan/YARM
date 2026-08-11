@@ -127,10 +127,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **37** |
+| `SharedKernel::with_cpu` | **36** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **6** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **43** |
+| **Total broad-lock acquisition sites** | **42** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
@@ -138,7 +138,7 @@ lines excluded.
 |------|-------|-------|
 | `src/runtime.rs` | 12 | U1 deleted the obsolete `handle_trap_with_cpu` acquisition (13 → 12) |
 | `src/arch/trap_entry.rs` | 11 | 305, 429, 505, 701, 787, 817, 890, 948, 1198, 1345, 1438 |
-| `src/arch/riscv64/trap.rs` | 7 | U3 retired the post-lock foundation-oracle current-TID re-acquisition (8 → 7) |
+| `src/arch/riscv64/trap.rs` | 6 | U3 retired two read-only post-lock current-TID re-acquisitions: the foundation-oracle drain (8 → 7) and the FutexWait no-incoming idle branch (7 → 6). The FutexWait SATP/frame-restore switch branch still re-acquires. |
 | `src/arch/x86_64/smp.rs` | 4 | 2179, 2455, 2571, 2664 |
 | `src/arch/x86_64/descriptor_tables.rs` | 2 | 1249, 1305 |
 | `src/arch/riscv64/boot.rs` | 1 | 1048 |
@@ -201,7 +201,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **43** |
+| runtime-required | **42** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -222,7 +222,7 @@ and `SharedKernel::run_reply_timeout_completion` (no production caller; supersed
 `OffLockReplyTimeout` composition). Neither deletion changed runtime behavior, and the
 reply-timeout completion body itself was not touched.
 
-#### runtime-required (43)
+#### runtime-required (42)
 
 | Group | Sites | Enclosing fn |
 |-------|-------|--------------|
@@ -455,7 +455,7 @@ counts as done:
 
 | Stage | Scope | Status | Evidence and gap |
 |-------|-------|--------|------------------|
-| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 43 callsites enumerated with file, line and enclosing function. **0 boot-only, 0 test-only, 0 obsolete, 43 runtime-required, 0 undocumented.** (Stage 199D retired the AArch64 handled-split syscall return; U1 deleted the two obsolete acquisitions, 49 → 47; U2 relocated the three test-only ones, 47 → 44; U3 retired its first drain onto an authoritative seam, 44 → 43. The census is exactly the runtime-required set.) Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (6 tests), which recomputes the census from source and fails on any added or removed production callsite. |
+| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 42 callsites enumerated with file, line and enclosing function. **0 boot-only, 0 test-only, 0 obsolete, 42 runtime-required, 0 undocumented.** (Stage 199D retired the AArch64 handled-split syscall return; U1 deleted the two obsolete acquisitions, 49 → 47; U2 relocated the three test-only ones, 47 → 44; U3 has retired two read-only RISC-V drains onto an authoritative seam, 44 → 43 → 42. The census is exactly the runtime-required set.) Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (6 tests), which recomputes the census from source and fails on any added or removed production callsite. |
 | **204B** | Decompose `KernelState` ownership; `SharedKernel` may remain a container but must not serialize the kernel | **OPEN** — partial foundation | 11 ranked domain locks and a full seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`. |
 | **204C** | Remove fallback-to-global handlers | **OPEN** | Five families live: default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding | **OPEN** | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, one-shot class logging and the foundation oracles are all live. |
