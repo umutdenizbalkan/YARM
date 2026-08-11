@@ -140,6 +140,91 @@ fn restore_arch_thread_state(
     Ok(())
 }
 
+/// U3 (canonical 203C) — the shared EXACT-TOKEN resume transaction for the three RISC-V
+/// post-lock switch drains (queue-switch foundation, FutexWait switch-success, Yield
+/// switch-success). It is the RISC-V analogue of AArch64's `direct_dispatch_resume_incoming`
+/// and replaces the broad `with_cpu` re-acquire each of those drains used to perform.
+///
+/// Every step names the incoming task by the mark TOKEN's exact incarnation — the `{tid, asid}`
+/// pair this transaction actually marked — never by the bare numeric TID and never by re-reading
+/// `current`. If the TCB was replaced by a different incarnation that reused the TID, each step
+/// refuses and this returns `None`, so the caller rolls back with its exact dequeued authority
+/// and diverges: the replacement's address space is never activated and its context is never
+/// copied into the frame.
+///
+/// Ordering matches the in-lock `restore_arch_thread_state` path this replaces:
+///   1. real ASID activation (map kernel-shared → page-table root → `satp`, whose write issues
+///      the `sfence.vma`), performed inside `direct_dispatch_activate_asid_split`;
+///   2. the exact saved `UserRegisterContext` applied to the frame — RISC-V performs NO
+///      AArch64-style x0..x5 argument mirror, matching `apply_current_thread_to_frame`;
+///   3. under `ipc-reply-timeout-oracle-core`, the exact parked completion consumed LAST so the
+///      canonical result cannot be clobbered by the restored pre-block snapshot, encoding the
+///      same RISC-V lanes (`set_err`, a0, a1) and emitting the same delivery marker;
+///   4. the TLS-restore take recorded in `LAST_RESTORED_TLS_BASE`, as before. `tp`/TLS itself is
+///      left exactly as restored by the saved context — there is no separate TLS lane write.
+///
+/// Returns the activated ASID so each caller can emit its own class-specific SATP marker, or
+/// `None` on any exact-identity refusal — in which case the frame carries no partial success and
+/// the caller must NOT report FRAME_OK / SRET_ARMED.
+fn direct_dispatch_resume_incoming(
+    shared: &crate::runtime::SharedKernel,
+    token: crate::runtime::DispatchMarkToken,
+    frame: &mut TrapFrame,
+) -> Option<u16> {
+    let incoming = token.tid();
+    let cpu = token.cpu();
+    let asid = shared.direct_dispatch_activate_asid_split(token)?;
+    let (context, tls) = shared.direct_dispatch_restore_context_split(token)?;
+    frame.apply_user_context(context);
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    if let Some(done) = shared.direct_dispatch_take_completion_split(token) {
+        frame.set_err(done.result as usize);
+        frame.set_user_gpr(10, done.result as usize);
+        frame.set_user_gpr(11, 0);
+        crate::yarm_log!(
+            "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid={} class={:?} result=TimedOut code={} blocked_generation={} sepc=0x{:016x} final_a0={} final_a1={} result=ok",
+            incoming,
+            done.syscall_class,
+            done.result,
+            done.blocked_generation,
+            frame.saved_pc() as u64,
+            frame.user_gpr(10),
+            frame.user_gpr(11)
+        );
+        crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
+    }
+    let _ = incoming;
+    let idx = cpu.0 as usize;
+    if idx < MAX_CPUS {
+        LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
+    }
+    Some(asid)
+}
+
+/// U3 — the truthful terminal for a post-lock switch drain whose EXACT-token resume refused.
+/// This is NOT a torn dispatch (`dispatch_torn_fatal` would record a false reason): the mark
+/// succeeded and the dequeue is real, but the incoming task's identity, address space or saved
+/// context no longer matches the incarnation this transaction marked. The exact dequeued
+/// authority — and only that; a `ContinuedCurrent` mark never yields one — is rolled back, then
+/// we diverge. Returning through the outgoing task's frame, `ReturnToCurrent` or idle is
+/// forbidden: the address space may already have been switched.
+fn dispatch_resume_refused_fatal(
+    shared: &crate::runtime::SharedKernel,
+    token: crate::runtime::DispatchMarkToken,
+    cpu: CpuId,
+    incoming: u64,
+    site: &str,
+) -> ! {
+    if let Some(authority) = token.into_dequeued_authority() {
+        let _ = shared.direct_dispatch_rollback_split(authority);
+    }
+    panic!(
+        "{site}: exact-token resume refused for incoming tid={incoming} on cpu={} — \
+         dispatch rolled back; refusing to return through another task's frame",
+        cpu.0
+    );
+}
+
 pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
     let is_interrupt = (context.scause & INTERRUPT_BIT) != 0;
     let code = context.scause & SCAUSE_EXCEPTION_MASK;
@@ -749,8 +834,8 @@ pub fn handle_riscv_trap_entry_shared(
                 // explicitly. A refusal has already undone exactly what the selection did, so
                 // this drain returns to the unchanged current — except `RefusedTorn`, which is
                 // fatal and must never return to userspace or continue scheduling.
-                match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                    Mark::Marked(_) => {}
+                let token = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                    Mark::Marked(token) => token,
                     Mark::Idle => {
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
@@ -778,39 +863,31 @@ pub fn handle_riscv_trap_entry_shared(
                     Mark::RefusedTorn => {
                         dispatch_torn_fatal(cpu, inc, "riscv_queue_switch_foundation_dispatch")
                     }
-                }
+                };
                 crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}", inc);
-                // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore.
-                let restore = shared
-                    .with_cpu(cpu, |kernel| {
-                        // Incoming ASID / page-table root → construct + write SATP. `write_satp`
-                        // executes `csrw satp` THEN `sfence.vma x0, x0` (a global flush — see
-                        // below), so both the address-space activation and the required
-                        // ordering fence are real hardware operations, not markers.
-                        if let Some(asid) = kernel.task_asid(inc) {
-                            let _ =
-                                crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
-                            if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid)
-                            {
-                                crate::arch::riscv64::page_table::write_satp(satp);
-                                crate::yarm_log!(
-                                    "RISCV_QUEUE_SWITCH_FOUNDATION_SATP_OK incoming={} asid={}",
-                                    inc,
-                                    asid.0
-                                );
-                                crate::yarm_log!(
-                                    "RISCV_QUEUE_SWITCH_FOUNDATION_SFENCE_OK incoming={}",
-                                    inc
-                                );
-                            }
-                        }
-                        // Restore B's saved user frame (sepc/sstatus/GPRs) into the trap frame;
-                        // the bridge propagates it to the hardware frame and `sret`s into B.
-                        restore_arch_thread_state(kernel, cpu, Some(&mut *frame))
-                    })
-                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                // U3 (canonical 203C): the EXACT-TOKEN resume transaction — real
+                // `map_kernel_shared_into_asid` + page-table root + `write_satp` (which issues
+                // the `sfence.vma`) inside the rank-2 activation seam, then the exact saved
+                // context, the TLS take and any parked completion. No broad `with_cpu`
+                // re-acquire and no broad-lock fallback: an exact-identity refusal rolls the
+                // dequeue back and diverges rather than resuming another task's frame.
+                let Some(asid) = direct_dispatch_resume_incoming(shared, token, &mut *frame) else {
+                    crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
+                    dispatch_resume_refused_fatal(
+                        shared,
+                        token,
+                        cpu,
+                        inc,
+                        "riscv_queue_switch_foundation_dispatch",
+                    );
+                };
+                crate::yarm_log!(
+                    "RISCV_QUEUE_SWITCH_FOUNDATION_SATP_OK incoming={} asid={}",
+                    inc,
+                    asid
+                );
+                crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_SFENCE_OK incoming={}", inc);
                 crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
-                restore??;
                 crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_FRAME_OK incoming={}", inc);
                 crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_SRET_ARMED incoming={}", inc);
                 crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_DONE result=ok");
@@ -880,8 +957,8 @@ pub fn handle_riscv_trap_entry_shared(
                 // explicitly. A refusal has already undone exactly what the selection did, so
                 // this drain returns to the unchanged current — except `RefusedTorn`, which is
                 // fatal and must never return to userspace or continue scheduling.
-                match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                    Mark::Marked(_) => {}
+                let token = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                    Mark::Marked(token) => token,
                     Mark::Idle => {
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
@@ -907,34 +984,31 @@ pub fn handle_riscv_trap_entry_shared(
                         return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                     }
                     Mark::RefusedTorn => dispatch_torn_fatal(cpu, inc, "riscv_futex_wait_dispatch"),
-                }
+                };
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming={}", inc);
-                // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore
-                // (reused 196D machinery — no duplicate implementation).
-                let restore = shared
-                    .with_cpu(cpu, |kernel| {
-                        if let Some(asid) = kernel.task_asid(inc) {
-                            let _ =
-                                crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
-                            if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid)
-                            {
-                                crate::arch::riscv64::page_table::write_satp(satp);
-                                crate::yarm_log!(
-                                    "RISCV_FUTEX_WAIT_DISPATCH_SATP_OK incoming={} asid={}",
-                                    inc,
-                                    asid.0
-                                );
-                                crate::yarm_log!(
-                                    "RISCV_FUTEX_WAIT_DISPATCH_SFENCE_OK incoming={}",
-                                    inc
-                                );
-                            }
-                        }
-                        restore_arch_thread_state(kernel, cpu, Some(&mut *frame))
-                    })
-                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                // U3 (canonical 203C): the EXACT-TOKEN resume transaction — real
+                // `map_kernel_shared_into_asid` + page-table root + `write_satp` (which issues
+                // the `sfence.vma`) inside the rank-2 activation seam, then the exact saved
+                // context, the TLS take and any parked completion. No broad `with_cpu`
+                // re-acquire and no broad-lock fallback: an exact-identity refusal rolls the
+                // dequeue back and diverges rather than resuming another task's frame.
+                let Some(asid) = direct_dispatch_resume_incoming(shared, token, &mut *frame) else {
+                    crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                    dispatch_resume_refused_fatal(
+                        shared,
+                        token,
+                        cpu,
+                        inc,
+                        "riscv_futex_wait_dispatch",
+                    );
+                };
+                crate::yarm_log!(
+                    "RISCV_FUTEX_WAIT_DISPATCH_SATP_OK incoming={} asid={}",
+                    inc,
+                    asid
+                );
+                crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_SFENCE_OK incoming={}", inc);
                 crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
-                restore??;
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming={}", inc);
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED incoming={}", inc);
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_DONE result=ok");
@@ -1061,8 +1135,8 @@ pub fn handle_riscv_trap_entry_shared(
                 // explicitly. A refusal has already undone exactly what the selection did, so
                 // this drain returns to the unchanged current — except `RefusedTorn`, which is
                 // fatal and must never return to userspace or continue scheduling.
-                match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                    Mark::Marked(_) => {}
+                let token = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                    Mark::Marked(token) => token,
                     Mark::Idle => {
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
@@ -1088,31 +1162,25 @@ pub fn handle_riscv_trap_entry_shared(
                         return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                     }
                     Mark::RefusedTorn => dispatch_torn_fatal(cpu, inc, "riscv_yield_dispatch"),
-                }
+                };
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_RUNNING_OK incoming={}", inc);
-                // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore
-                // (reused 196D–196F machinery — no duplicate implementation).
-                let restore = shared
-                    .with_cpu(cpu, |kernel| {
-                        if let Some(asid) = kernel.task_asid(inc) {
-                            let _ =
-                                crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
-                            if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid)
-                            {
-                                crate::arch::riscv64::page_table::write_satp(satp);
-                                crate::yarm_log!(
-                                    "RISCV_YIELD_DISPATCH_SATP_OK incoming={} asid={}",
-                                    inc,
-                                    asid.0
-                                );
-                                crate::yarm_log!("RISCV_YIELD_DISPATCH_SFENCE_OK incoming={}", inc);
-                            }
-                        }
-                        restore_arch_thread_state(kernel, cpu, Some(&mut *frame))
-                    })
-                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                // U3 (canonical 203C): the EXACT-TOKEN resume transaction — real
+                // `map_kernel_shared_into_asid` + page-table root + `write_satp` (which issues
+                // the `sfence.vma`) inside the rank-2 activation seam, then the exact saved
+                // context, the TLS take and any parked completion. No broad `with_cpu`
+                // re-acquire and no broad-lock fallback: an exact-identity refusal rolls the
+                // dequeue back and diverges rather than resuming another task's frame.
+                let Some(asid) = direct_dispatch_resume_incoming(shared, token, &mut *frame) else {
+                    crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                    dispatch_resume_refused_fatal(shared, token, cpu, inc, "riscv_yield_dispatch");
+                };
+                crate::yarm_log!(
+                    "RISCV_YIELD_DISPATCH_SATP_OK incoming={} asid={}",
+                    inc,
+                    asid
+                );
+                crate::yarm_log!("RISCV_YIELD_DISPATCH_SFENCE_OK incoming={}", inc);
                 crate::kernel::boot::yield_dispatch_clear(cpu_idx);
-                restore??;
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_FRAME_OK incoming={}", inc);
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_SRET_ARMED incoming={}", inc);
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_DONE result=ok");

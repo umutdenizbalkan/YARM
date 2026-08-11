@@ -73054,12 +73054,20 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn satp_asid_sfence_is_real_riscv() {
         assert!(
-            RISCV_TRAP_SRC.contains("crate::arch::riscv64::page_table::cr3_for_asid(asid)")
-                && RISCV_TRAP_SRC.contains("crate::arch::riscv64::page_table::write_satp(satp)")
-                && RISCV_TRAP_SRC.contains(
+            RISCV_TRAP_SRC.contains("direct_dispatch_resume_incoming(shared, token, &mut *frame)"),
+            "the drain must activate + restore through the exact-token resume transaction"
+        );
+        // U3 (203C): the real RISC-V map/root/`write_satp` sequence moved INTO the exact-token
+        // activation seam; the drains reach it through `direct_dispatch_activate_asid_split`.
+        let seam = include_str!("../../runtime.rs");
+        assert!(
+            seam.contains("crate::arch::riscv64::page_table::cr3_for_asid(asid)?")
+                && seam.contains("crate::arch::riscv64::page_table::write_satp(satp)")
+                && seam.contains(
                     "crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid)"
                 ),
-            "the drain must construct + write the incoming task's SATP via the riscv64 page_table"
+            "the exact-token activation seam must construct + write the incoming SATP via the \
+             riscv64 page_table (write_satp issues the sfence.vma)"
         );
         assert!(
             RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_SATP_OK incoming={} asid={}")
@@ -73090,7 +73098,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn frame_restore_and_sret_armed() {
         assert!(
-            RISCV_TRAP_SRC.contains("restore_arch_thread_state(kernel, cpu, Some(&mut *frame))")
+            RISCV_TRAP_SRC.contains("direct_dispatch_resume_incoming(shared, token, &mut *frame)")
                 && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_FRAME_OK incoming={}")
                 && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_SRET_ARMED incoming={}")
                 && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_DONE result=ok"),
@@ -73360,17 +73368,25 @@ mod stage196e_riscv_futex_wait_retirement {
             .nth(1)
             .expect("196E drain block present");
         assert!(
-            drain.contains("crate::arch::riscv64::page_table::cr3_for_asid(asid)")
-                && drain.contains("crate::arch::riscv64::page_table::write_satp(satp)")
-                && drain.contains(
+            drain.contains("direct_dispatch_resume_incoming(shared, token, &mut *frame)"),
+            "the drain must activate + restore through the exact-token resume transaction"
+        );
+        // U3 (203C): the real RISC-V map/root/`write_satp` sequence moved INTO the exact-token
+        // activation seam; the drains reach it through `direct_dispatch_activate_asid_split`.
+        let seam = include_str!("../../runtime.rs");
+        assert!(
+            seam.contains("crate::arch::riscv64::page_table::cr3_for_asid(asid)?")
+                && seam.contains("crate::arch::riscv64::page_table::write_satp(satp)")
+                && seam.contains(
                     "crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid)"
                 ),
-            "the drain must construct + write the incoming task's SATP via the riscv64 page_table"
+            "the exact-token activation seam must construct + write the incoming SATP via the \
+             riscv64 page_table (write_satp issues the sfence.vma)"
         );
         assert!(
             drain.contains("RISCV_FUTEX_WAIT_DISPATCH_SATP_OK incoming={} asid={}")
                 && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_SFENCE_OK incoming={}")
-                && drain.contains("restore_arch_thread_state(kernel, cpu, Some(&mut *frame))")
+                && drain.contains("direct_dispatch_resume_incoming(shared, token, &mut *frame)")
                 && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming={}")
                 && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED incoming={}"),
             "the drain must emit SATP_OK/SFENCE_OK + restore the incoming frame + SRET_ARMED"
@@ -73673,7 +73689,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
             );
         }
         assert!(
-            drain.contains("crate::arch::riscv64::page_table::write_satp(satp)")
+            drain.contains("direct_dispatch_resume_incoming(shared, token, &mut *frame)")
                 && !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
                 && !RISCV_TRAP_SRC.contains("arch::aarch64::page_table"),
             "the switch must use the real riscv64 SATP write and no cross-arch logic"
@@ -73865,10 +73881,9 @@ mod stage196g_riscv_yield_default_on {
             "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
             "RISCV_YIELD_DISPATCH_CURRENT_SET_OK cpu={} incoming={}",
             "RISCV_YIELD_DISPATCH_RUNNING_OK incoming={}",
-            "crate::arch::riscv64::page_table::write_satp(satp)",
+            "direct_dispatch_resume_incoming(shared, token, &mut *frame)",
             "RISCV_YIELD_DISPATCH_SATP_OK incoming={} asid={}",
             "RISCV_YIELD_DISPATCH_SFENCE_OK incoming={}",
-            "restore_arch_thread_state(kernel, cpu, Some(&mut *frame))",
             "RISCV_YIELD_DISPATCH_FRAME_OK incoming={}",
             "RISCV_YIELD_DISPATCH_SRET_ARMED incoming={}",
             "RISCV_YIELD_DISPATCH_DONE result=ok",
@@ -74150,7 +74165,8 @@ mod stage197_first_cohort_seal {
     fn restore_hook_mapping() {
         // RISC-V uses SATP + real sfence.vma; never x86 CR3 / AArch64 TTBR0.
         assert!(
-            RISCV_TRAP_SRC.contains("crate::arch::riscv64::page_table::write_satp(satp)"),
+            include_str!("../../runtime.rs")
+                .contains("crate::arch::riscv64::page_table::write_satp(satp)"),
             "RISC-V must use write_satp"
         );
         assert!(
@@ -97842,14 +97858,13 @@ mod stage200d0d1_riscv_exit_prep {
                 "the trap wrapper must not commit the frame or return to U-mode ({forbidden})"
             );
         }
-        // `write_satp` DOES appear in the wrapper — the pre-existing 196D/196E/196G switch
-        // drains activate the incoming task's address space, which is correct and untouched.
-        // What must hold is that the EXIT path performs no address-space or frame write of its
-        // own: the in-lock bypass reuses the canonical restore, and the consumer re-applies
-        // nothing.
+        // U3 (203C): the 196D/196E/196G switch drains still activate the incoming task's
+        // address space, but through the exact-token seam — the real `write_satp` now lives in
+        // `direct_dispatch_activate_asid_split`, not in this wrapper. What must hold is
+        // unchanged: the EXIT path performs no address-space or frame write of its own.
         assert!(
-            code.contains("write_satp"),
-            "the existing switch drains are preserved"
+            code.contains("direct_dispatch_resume_incoming"),
+            "the existing switch drains are preserved (now via the exact-token seam)"
         );
         for src in [consumer_code(), bypass_code()] {
             for forbidden in ["write_satp", "frame.sepc =", "sret"] {

@@ -576,8 +576,8 @@ VM/spawn/fork/cap-mint, and ReapFaultedTask all stay global-lock-only.
   It then dequeues B via the rank-1 `yield_dispatch_step_mut` seam (`DEQUEUE_OK`),
   sets B `current` (`CURRENT_SET_OK`), and marks B Running via the rank-2
   `d6_genuine_mark_running_via_task_seam` (`RUNNING_OK`).
-- **Real SATP/`sfence.vma` + frame restore (fresh bounded re-acquire).** A brief
-  `with_cpu(cpu, …)` re-acquire constructs B's `satp` via
+- **Real SATP/`sfence.vma` + frame restore (exact-token seam; U3 retired the re-acquire).**
+  The exact-token activation seam `direct_dispatch_activate_asid_split` constructs B's `satp` via
   `riscv64::page_table::cr3_for_asid`, installs the shared kernel gigapage via
   `map_kernel_shared_into_asid`, and writes it via `write_satp` — which executes
   `csrw satp` THEN `sfence.vma x0, x0` (real hardware ops, not markers). NO x86
@@ -653,7 +653,7 @@ the canonical global-lock path.
   re-acquires the rank-2 task seam through the SharedKernel (impossible under a held
   guard → `LOCK_DROPPED_OK`) AND confirms the waiter is STILL `Blocked(Futex)`
   (guards the FutexWake race); then dequeue B (rank-1), set B current, mark B
-  Running (rank-2), and a fresh bounded `with_cpu` re-acquire does the REAL SATP
+  Running (rank-2), and — since U3 — the exact-token activation seam does the REAL SATP
   write + `sfence.vma` + frame restore + `sret` into B. Markers
   `RISCV_FUTEX_WAIT_DISPATCH_{DRAIN_BEGIN,LOCK_DROPPED_OK,REVERIFY_OK,DEQUEUE_OK,
   CURRENT_SET_OK,RUNNING_OK,SATP_OK,SFENCE_OK,FRAME_OK,SRET_ARMED,DONE}` +
@@ -675,7 +675,7 @@ the canonical global-lock path.
   (that stays NR 15 + NR 10); FutexWait's retirement is via the broad-lock handler +
   post-lock deferral, not `try_split_dispatch_into_frame`.
 - **Trap-stack impact.** The FutexWait drain adds only the same brief bounded
-  `with_cpu` re-acquire as the 196D switch drain (no recursion, no second frame);
+  exact-token activation seam as the 196D switch drain (no recursion, no second frame);
   measured boots stay well within the 2 MiB trap stack. The 2 MiB fix +
   measurement TODO are preserved.
 - **Still excluded / not yet claimed:** default-on FutexWait, post-lock idle /

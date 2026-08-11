@@ -1860,6 +1860,25 @@ impl SharedKernel {
                 .and_then(|t| t.asid)
                 .filter(|asid| *asid == expected)
         })?;
+        // U3 (canonical 203C), RISC-V only: perform the REAL address-space activation the
+        // three RISC-V post-lock switch drains used to do inside a broad `with_cpu`
+        // re-acquire — map the kernel-shared range into the incoming ASID, construct its
+        // page-table root, and write `satp` (whose implementation issues the required
+        // `sfence.vma` ordering). `hal_adapters::switch_address_space` deliberately DEFERS
+        // RISC-V paging (`RISCV_PAGING_DEFERRED`) and writes no `satp`, so routing RISC-V
+        // through it would silently drop a real hardware operation. Every other
+        // architecture and configuration keeps the existing generic path unchanged.
+        //
+        // Fail closed: a missing page-table root returns `None`, so the caller rolls back
+        // with its exact dequeued authority and diverges rather than resuming a task whose
+        // address space was never activated.
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+        {
+            let _ = crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
+            let satp = crate::arch::riscv64::page_table::cr3_for_asid(asid)?;
+            crate::arch::riscv64::page_table::write_satp(satp);
+        }
+        #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
         crate::arch::hal_adapters::switch_address_space(asid);
         crate::arch::hal::note_address_space_activated(cpu, asid);
         Some(asid.0)
