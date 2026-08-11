@@ -479,6 +479,26 @@ impl DequeuedDispatchMarkToken {
     }
 }
 
+/// The coherent rank-1 → rank-2 snapshot taken by
+/// [`SharedKernel::post_lock_exit_validation_split`].
+///
+/// Named fields rather than a positional tuple, so no consumer can silently transpose the two
+/// booleans. Every field is an observation of ONE exiting incarnation at ONE instant; nothing
+/// here is a mutation or a decision — the RISC-V exit consumer owns the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PostLockExitValidation {
+    /// Current TID on the exact CPU the trap entered on (rank 1).
+    pub(crate) current: Option<u64>,
+    /// The exiting TCB is absent, carries no ASID, or is still bound to the exact expected
+    /// ASID — i.e. this is not a different incarnation that reused the numeric TID (rank 2).
+    pub(crate) identity_ok: bool,
+    /// The exiting TCB is absent, `Exited(_)`, or `Dead` (rank 2).
+    pub(crate) terminal: bool,
+    /// The exiting TID is present in ANY CPU's runqueue or current slot — not merely the
+    /// trapping CPU's queue (rank 1).
+    pub(crate) in_runqueue: bool,
+}
+
 /// What a mark attempt did. Typed, so no caller has to infer it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
@@ -1969,6 +1989,84 @@ impl SharedKernel {
             tcb.ipc_timeout_fired = false;
             tcb.blocked_recv_state = None;
             Some(pending)
+        })
+    }
+
+    /// U3 (canonical 203C) — the RISC-V post-lock `CurrentTaskExited` validation snapshot.
+    ///
+    /// Replaces the brief broad `with_cpu` re-acquire the RISC-V exit consumer used to take to
+    /// answer four questions about one exiting incarnation. Those four facts live in two
+    /// domains, and reading them through two separated transactions could tear — the exiting
+    /// task could be re-enqueued between the scheduler read and the task read, and the
+    /// consumer would then attest absence that no longer holds. They are therefore taken as
+    /// ONE snapshot, with the rank-2 task acquisition NESTED inside the rank-1 scheduler
+    /// acquisition:
+    ///
+    /// * rank 1 (scheduler): current TID on the exact trapping CPU, and whether the exiting
+    ///   TID appears in ANY CPU's runqueue or current slot (`task_present_anywhere`, not this
+    ///   CPU's queue alone);
+    /// * rank 2 (task, nested while rank 1 is still held): the exact `{tid, asid}`
+    ///   incarnation and the terminal status.
+    ///
+    /// Canonical rank order is scheduler(1) → task(2), so this nesting is ascending and takes
+    /// the two backing locks in the documented direction. The nested read goes through the
+    /// rank-2 seam directly rather than through any `KernelState` accessor: an accessor such
+    /// as `current_tid`/`task_asid` would re-enter its own domain lock, and the rank-1
+    /// re-entry in particular would deadlock against the guard this transaction already holds.
+    ///
+    /// The three task-side answers are byte-for-byte the old `with_cpu` body's:
+    /// an absent TCB is identity-safe AND terminal (what `task_asid`/`task_status` returning
+    /// `None` meant), a TCB with no ASID is identity-safe (`task_asid` returned `None` there
+    /// too), and only `Exited(_)` / `Dead` are terminal.
+    ///
+    /// Read-only: nothing is mutated in either domain. `with_cpu` also wrote `current_cpu` as
+    /// a side effect of admission; that write is not reproduced and is not needed — the
+    /// Phase-2 broad-lock phase of this very trap already bound `current_cpu` to this same
+    /// CPU. The admission CHECK is preserved exactly, so an invalid or offline CPU still
+    /// yields the identical `KernelError` and the caller's existing failure path is unchanged.
+    pub(crate) fn post_lock_exit_validation_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Result<PostLockExitValidation, KernelError> {
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .map_err(crate::kernel::boot::map_scheduler_error)?;
+            let current = kernel_ref(&sched.scheduler)
+                .current_tid_on(cpu)
+                .map(|t| t.0);
+            let in_runqueue = kernel_ref(&sched.scheduler)
+                .task_present_anywhere(crate::kernel::ipc::ThreadId(tid));
+            // Rank 2 nested here, with the rank-1 guard above still held: the scheduler facts
+            // and the task facts are one coherent observation, not two that can tear.
+            let (identity_ok, terminal) = self.with_task_tcbs_split_mut(|tcbs| {
+                match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
+                    // FULL incarnation: a numeric TID match alone would let a restarted task
+                    // satisfy a stale disposition, so the ASID recorded at publication must
+                    // still be bound to that TID.
+                    Some(tcb) => (
+                        match tcb.asid {
+                            Some(bound) => bound == asid,
+                            None => true,
+                        },
+                        matches!(
+                            tcb.status,
+                            crate::kernel::task::TaskStatus::Exited(_)
+                                | crate::kernel::task::TaskStatus::Dead
+                        ),
+                    ),
+                    // TCB gone entirely: identity-safe and terminal.
+                    None => (true, true),
+                }
+            });
+            Ok(PostLockExitValidation {
+                current,
+                identity_ok,
+                terminal,
+                in_runqueue,
+            })
         })
     }
 

@@ -32,7 +32,12 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // to the exact-token rank-2 transaction: `direct_dispatch_activate_asid_split` (which
     // performs the real RISC-V map/root/`write_satp`+`sfence.vma` on this target) plus
     // `direct_dispatch_restore_context_split` and `direct_dispatch_take_completion_split`.
-    ("src/arch/riscv64/trap.rs", 3),
+    // U3 (203C): 3 -> 2. The post-lock `CurrentTaskExited` validation snapshot moved to
+    // `post_lock_exit_validation_split`, one coherent rank-1 (scheduler) transaction with the
+    // rank-2 (task) acquisition nested inside it. The two remaining acquisitions are the
+    // canonical broad trap phase and the deferred terminal-idle predicate; this file is NOT
+    // fully drained.
+    ("src/arch/riscv64/trap.rs", 2),
     // Stage 199D: 12 -> 11. The AArch64 handled-split return path no longer reacquires the
     // broad lock to finalize a syscall; it uses two bounded rank-2 task-domain transactions
     // (exact-incarnation TLS take, exact-incarnation context commit) instead.
@@ -82,7 +87,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 31; // U3: 38 -> 33 -> 31 (five RISC-V + two AArch64 drains)
+const AUDITED_WITH_CPU_TOTAL: usize = 30; // U3: 38 -> 33 -> 31 -> 30 (six RISC-V + two AArch64 drains)
 const AUDITED_WITH_BROAD_TOTAL: usize = 6; // U2: 9 -> 6 (three test-only acquisitions relocated)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -91,7 +96,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 37; // U3: 44 -> 39 -> 37 (seven drains retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 36; // U3: 44 -> 39 -> 37 -> 36 (eight drains retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

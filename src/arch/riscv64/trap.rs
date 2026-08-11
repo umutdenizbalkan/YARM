@@ -1264,30 +1264,28 @@ pub fn handle_riscv_trap_entry_shared(
             asid.0,
             cpu.0
         );
-        // Lock-dropped proof + identity read in one brief re-acquire. Reads only.
-        let (current, identity_ok, terminal, in_runqueue) = shared
-            .with_cpu(cpu, |kernel| {
-                let current = kernel.current_tid();
-                // FULL incarnation: a numeric TID match alone would let a restarted task satisfy
-                // a stale disposition, so the ASID recorded at publication must still be bound to
-                // that TID — or the TCB must be gone entirely.
-                let identity_ok = match kernel.task_asid(tid) {
-                    Some(bound) => bound == asid,
-                    None => true,
-                };
-                let terminal = matches!(
-                    kernel.task_status(tid),
-                    Some(crate::kernel::task::TaskStatus::Exited(_))
-                        | Some(crate::kernel::task::TaskStatus::Dead)
-                        | None
-                );
-                (
-                    current,
-                    identity_ok,
-                    terminal,
-                    kernel.task_present_in_any_runqueue(tid),
-                )
-            })
+        // Lock-dropped proof + identity read in ONE coherent split transaction.
+        //
+        // U3 (canonical 203C): this was a brief broad `with_cpu` re-acquire. It is now
+        // `post_lock_exit_validation_split`, which takes the SAME four read-only facts under
+        // the rank-1 scheduler lock with the rank-2 task lock NESTED inside it — canonical
+        // ascending rank order, one snapshot that cannot tear between the scheduler read and
+        // the task read. Every clause the consumer decides on below is unchanged: full
+        // `{tid, asid}` incarnation validation, an absent TCB meaning identity-safe AND
+        // terminal, absence from EVERY CPU's runqueue rather than this CPU's alone, and the
+        // identical `KernelError` for an invalid/offline CPU.
+        //
+        // The lock-dropped proof is undiminished: acquiring EITHER domain lock here is only
+        // possible because the Phase-2 broad guard was released far above — the broad
+        // `SpinLock<KernelState>` contains both domains, so a still-held guard would deadlock
+        // exactly as it would have against the old `with_cpu`.
+        let crate::runtime::PostLockExitValidation {
+            current,
+            identity_ok,
+            terminal,
+            in_runqueue,
+        } = shared
+            .post_lock_exit_validation_split(cpu, tid, asid)
             .map_err(|err| TrapHandleError::Syscall(err.into()))?;
         if current == Some(tid) {
             crate::yarm_log!(

@@ -127,10 +127,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **31** |
+| `SharedKernel::with_cpu` | **30** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **6** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **37** |
+| **Total broad-lock acquisition sites** | **36** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
@@ -138,7 +138,7 @@ lines excluded.
 |------|-------|-------|
 | `src/runtime.rs` | 12 | U1 deleted the obsolete `handle_trap_with_cpu` acquisition (13 → 12) |
 | `src/arch/trap_entry.rs` | 9 | U3 retired the AArch64 FutexWait and Yield switch-success restores (11 → 9). The FutexWait no-incoming idle current-TID read was restored: its live gate is unreachable behind the pre-existing SpawnV5 stall. |
-| `src/arch/riscv64/trap.rs` | 3 | U3 retired five: two read-only current-TID re-acquisitions (foundation-oracle drain 8 → 7, FutexWait no-incoming idle 7 → 6) and the three homologous switch/restore drains — queue-switch foundation, FutexWait switch-success, Yield switch-success (6 → 3) — onto the exact-token rank-2 transaction. |
+| `src/arch/riscv64/trap.rs` | 2 | U3 retired six: two read-only current-TID re-acquisitions (foundation-oracle drain 8 → 7, FutexWait no-incoming idle 7 → 6), the three homologous switch/restore drains — queue-switch foundation, FutexWait switch-success, Yield switch-success (6 → 3) — onto the exact-token rank-2 transaction, and the post-lock `CurrentTaskExited` validation snapshot onto `post_lock_exit_validation_split`, one coherent rank-1 scheduler transaction with the rank-2 task acquisition nested inside it (3 → 2). The two that remain are the canonical broad trap phase and the terminal-idle predicate, whose provenance arm has no live coverage at any accepted base and is deferred. |
 | `src/arch/x86_64/smp.rs` | 4 | 2179, 2455, 2571, 2664 |
 | `src/arch/x86_64/descriptor_tables.rs` | 2 | 1249, 1305 |
 | `src/arch/riscv64/boot.rs` | 1 | 1048 |
@@ -201,7 +201,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **37** |
+| runtime-required | **36** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -222,7 +222,7 @@ and `SharedKernel::run_reply_timeout_completion` (no production caller; supersed
 `OffLockReplyTimeout` composition). Neither deletion changed runtime behavior, and the
 reply-timeout completion body itself was not touched.
 
-#### runtime-required (37)
+#### runtime-required (36)
 
 | Group | Sites | Enclosing fn |
 |-------|-------|--------------|

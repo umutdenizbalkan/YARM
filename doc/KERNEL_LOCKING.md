@@ -51,10 +51,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **31** |
+| `SharedKernel::with_cpu` | **30** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **6** |
 | Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
-| **Total broad-lock acquisition sites** | **37** |
+| **Total broad-lock acquisition sites** | **36** |
 
 Canonical Stage **204A** additionally requires each site classified. That classification is
 complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
@@ -64,7 +64,7 @@ complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
 | boot-only | **0** | — |
 | test-only | **0** | U2 relocated all three into test-only modules (`ipc_recv_with_deadline_split_bridge` ×2; the `SharedKernel` control-plane cnode-slots wrapper ×1) |
 | obsolete | **0** | U1 deleted both (`handle_trap_with_cpu`, no in-tree caller at all; `run_reply_timeout_completion`, no production caller) |
-| runtime-required | **37** | the real retirement surface; U3 has retired seven post-lock drains — five on RISC-V and two on AArch64 (the FutexWait and Yield switch-success restores, onto the neutral exact-token resume core) |
+| runtime-required | **36** | the real retirement surface; U3 has retired eight post-lock drains — six on RISC-V (five switch/read drains plus the `CurrentTaskExited` validation snapshot, onto a coherent rank-1/rank-2 transaction) and two on AArch64 (the FutexWait and Yield switch-success restores, onto the neutral exact-token resume core) |
 | undocumented | **0** | every site enumerated with file, line and enclosing function |
 
 This table is machine-checked: `tests/broad_lock_census_guard.rs` recomputes the per-file

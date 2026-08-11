@@ -97658,11 +97658,13 @@ mod stage200d0c1_aarch64_exit_prep {
 /// none passes because a constant, feature, marker or function name exists.
 #[cfg(test)]
 mod stage200d0d1_riscv_exit_prep {
-    use crate::kernel::boot::PostLockTrapDisposition;
+    use crate::kernel::boot::{Bootstrap, PostLockTrapDisposition};
+    use crate::kernel::scheduler::CpuId;
     use crate::kernel::vm::Asid;
 
     const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
     const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -97690,6 +97692,22 @@ mod stage200d0d1_riscv_exit_prep {
     /// legitimately names teardown, claims and `publish_riscv_user_return` while doing none.
     fn consumer_code() -> alloc::string::String {
         consumer_block()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// U3 (203C): the comment-stripped body of `post_lock_exit_validation_split`, the coherent
+    /// rank-1/rank-2 snapshot that replaced the consumer's broad `with_cpu` re-acquire.
+    fn transaction_body() -> alloc::string::String {
+        RUNTIME_SRC
+            .split("pub(crate) fn post_lock_exit_validation_split(")
+            .nth(1)
+            .expect("the exit-validation transaction is present")
+            .split("\n    }")
+            .next()
+            .expect("transaction body is bounded")
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<alloc::vec::Vec<_>>()
@@ -97987,9 +98005,13 @@ mod stage200d0d1_riscv_exit_prep {
     #[test]
     fn r15_r16_identity_is_tid_and_asid() {
         let c = consumer_code();
-        assert!(c.contains("let identity_ok = match kernel.task_asid(tid) {"));
-        assert!(c.contains("Some(bound) => bound == asid,"));
+        // U3 (203C): the four facts now come from the coherent rank-1/rank-2 snapshot rather
+        // than an inline broad-lock body, but the consumer still decides on all four.
+        assert!(c.contains("post_lock_exit_validation_split(cpu, tid, asid)"));
+        assert!(c.contains("identity_ok,"));
         assert!(c.contains("if !identity_ok || !terminal || in_runqueue {"));
+        // And the exact-ASID comparison itself survived into the transaction.
+        assert!(RUNTIME_SRC.contains("Some(bound) => bound == asid,"));
         // Behavioural: the store round-trips the exact incarnation it was given.
         let cpu = 0usize;
         crate::kernel::boot::clear_post_lock_trap_disposition(cpu);
@@ -98304,9 +98326,13 @@ mod stage200d0d1_riscv_exit_prep {
     #[test]
     fn r28_absence_uses_full_identity() {
         let c = consumer_code();
-        assert!(c.contains("kernel.task_present_in_any_runqueue(tid)"));
-        assert!(c.contains("kernel.task_asid(tid)"));
-        assert!(c.contains("kernel.current_tid()"));
+        // U3 (203C): all three reads moved into `post_lock_exit_validation_split`, which the
+        // consumer calls exactly once. Absence is still ALL-runqueue, never this CPU's alone.
+        assert!(c.contains("post_lock_exit_validation_split(cpu, tid, asid)"));
+        let txn = transaction_body();
+        assert!(txn.contains("task_present_anywhere(crate::kernel::ipc::ThreadId(tid))"));
+        assert!(txn.contains("current_tid_on(cpu)"));
+        assert!(txn.contains("Some(bound) => bound == asid,"));
         assert!(c.contains("identity=tid_asid"));
         assert!(c.contains("frame_source=0"));
         assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
@@ -98394,6 +98420,236 @@ mod stage200d0d1_riscv_exit_prep {
         // Production paths are NOT oracle-gated.
         assert!(!consumer_block().contains("riscv-exit-current-task-oracle"));
         assert!(!bypass_code().contains("riscv-exit-current-task-oracle"));
+    }
+
+    // ── U3 (203C): the coherent rank-1/rank-2 exit-validation transaction ────────────────
+    //
+    // The consumer's four read-only facts used to come from a brief broad `with_cpu`
+    // re-acquire. They now come from `post_lock_exit_validation_split`, which holds the rank-1
+    // scheduler lock and nests the rank-2 task acquisition inside it. These tests pin the
+    // behaviour that must be identical either way, and the structure that makes it coherent.
+
+    const EXITING: u64 = 41;
+    const SURVIVOR: u64 = 42;
+
+    /// A kernel with `EXITING` registered and bound to its own ASID, and `SURVIVOR` alongside
+    /// it. Neither is enqueued and neither is current, which is the accepted post-exit shape.
+    fn validation_fixture() -> (crate::runtime::SharedKernel, Asid) {
+        let k = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            s.register_task(EXITING).expect("exiting task");
+            s.register_task(SURVIVOR).expect("survivor");
+            let (asid, _) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(EXITING, asid).expect("bind");
+            s.set_task_status_for_test(EXITING, crate::kernel::task::TaskStatus::Exited(0));
+            asid
+        });
+        (k, asid)
+    }
+
+    /// The exact `{tid, asid}` incarnation validates: identity ok, terminal, absent from every
+    /// runqueue, and not current.
+    #[test]
+    fn u3_exact_incarnation_validates() {
+        let (k, asid) = validation_fixture();
+        let v = k
+            .post_lock_exit_validation_split(CpuId(0), EXITING, asid)
+            .expect("cpu 0 is online");
+        assert!(v.identity_ok, "the exact recorded ASID is still bound");
+        assert!(v.terminal, "Exited is terminal");
+        assert!(!v.in_runqueue, "the exiting task is in no runqueue");
+        assert_ne!(v.current, Some(EXITING), "and it is not current");
+    }
+
+    /// TID reuse by a different incarnation is refused: the numeric TID still matches, the
+    /// recorded ASID no longer does.
+    #[test]
+    fn u3_stale_asid_after_tid_reuse_refuses() {
+        let (k, recorded) = validation_fixture();
+        let replacement = k.with(|s| {
+            let (fresh, _) = s.create_user_address_space().expect("second asid");
+            s.bind_task_asid(EXITING, fresh).expect("rebind");
+            fresh
+        });
+        assert_ne!(recorded, replacement, "the fixture must actually rebind");
+        let v = k
+            .post_lock_exit_validation_split(CpuId(0), EXITING, recorded)
+            .expect("cpu 0 is online");
+        assert!(
+            !v.identity_ok,
+            "a replacement incarnation must not satisfy a stale disposition"
+        );
+    }
+
+    /// An absent TCB is identity-safe AND terminal — exactly what `task_asid`/`task_status`
+    /// returning `None` meant in the retired broad-lock body. A TCB with no ASID is
+    /// identity-safe too, for the same reason.
+    #[test]
+    fn u3_absent_tcb_semantics_are_preserved() {
+        let (k, asid) = validation_fixture();
+        let gone = k
+            .post_lock_exit_validation_split(CpuId(0), 9999, asid)
+            .expect("cpu 0 is online");
+        assert!(
+            gone.identity_ok && gone.terminal,
+            "no TCB: safe and terminal"
+        );
+        // Registered but never bound to an address space: `task_asid` was `None` here too.
+        let unbound = k
+            .post_lock_exit_validation_split(CpuId(0), SURVIVOR, asid)
+            .expect("cpu 0 is online");
+        assert!(
+            unbound.identity_ok,
+            "a TCB with no ASID has no identity to contradict"
+        );
+    }
+
+    /// `Exited` and `Dead` are terminal; a live status is not.
+    #[test]
+    fn u3_terminal_statuses_are_exactly_exited_and_dead() {
+        let (k, asid) = validation_fixture();
+        let terminal_for = |status| {
+            k.with(|s| s.set_task_status_for_test(EXITING, status));
+            k.post_lock_exit_validation_split(CpuId(0), EXITING, asid)
+                .expect("cpu 0 is online")
+                .terminal
+        };
+        assert!(terminal_for(crate::kernel::task::TaskStatus::Exited(0)));
+        assert!(terminal_for(crate::kernel::task::TaskStatus::Exited(7)));
+        assert!(terminal_for(crate::kernel::task::TaskStatus::Dead));
+        assert!(!terminal_for(crate::kernel::task::TaskStatus::Runnable));
+        assert!(!terminal_for(crate::kernel::task::TaskStatus::Running));
+    }
+
+    /// Absence is checked across EVERY CPU's runqueue, not merely the trapping CPU's — an
+    /// exiting task left queued on another CPU must still be detected from CPU 0.
+    #[test]
+    fn u3_presence_in_any_cpu_runqueue_is_detected() {
+        let (k, asid) = validation_fixture();
+        let absent = k
+            .post_lock_exit_validation_split(CpuId(0), EXITING, asid)
+            .expect("cpu 0 is online");
+        assert!(!absent.in_runqueue, "baseline: absent everywhere");
+
+        k.with(|s| {
+            s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+            s.set_task_status_for_test(EXITING, crate::kernel::task::TaskStatus::Runnable);
+            s.enqueue_on_cpu(CpuId(1), EXITING)
+                .expect("enqueue on cpu 1");
+        });
+        let v = k
+            .post_lock_exit_validation_split(CpuId(0), EXITING, asid)
+            .expect("cpu 0 is online");
+        assert!(
+            v.in_runqueue,
+            "queued on CPU 1 must be visible from a CPU-0 validation"
+        );
+    }
+
+    /// "The exiting task is still current" is observable — the consumer's first fail-closed
+    /// branch depends on it.
+    #[test]
+    fn u3_exiting_still_current_is_observable() {
+        let (k, asid) = validation_fixture();
+        k.with(|s| {
+            s.set_task_status_for_test(EXITING, crate::kernel::task::TaskStatus::Runnable);
+            s.enqueue_on_cpu(CpuId(0), EXITING).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(CpuId(0)), Some(EXITING));
+        });
+        let v = k
+            .post_lock_exit_validation_split(CpuId(0), EXITING, asid)
+            .expect("cpu 0 is online");
+        assert_eq!(
+            v.current,
+            Some(EXITING),
+            "the consumer must be able to see the exiting task still current"
+        );
+    }
+
+    /// An invalid or offline CPU yields the same `KernelError` the retired `with_cpu` produced
+    /// through `set_current_cpu`, so the consumer's failure path is unchanged.
+    #[test]
+    fn u3_offline_or_invalid_cpu_fails_closed() {
+        let (k, asid) = validation_fixture();
+        assert!(
+            k.post_lock_exit_validation_split(CpuId(1), EXITING, asid)
+                .is_err(),
+            "CPU 1 is present but not online in the fixture"
+        );
+        assert!(
+            k.post_lock_exit_validation_split(CpuId(200), EXITING, asid)
+                .is_err(),
+            "an out-of-range CPU is refused, never silently answered"
+        );
+        // And the same CPU answers once brought online — the refusal is the CPU, not the task.
+        k.with(|s| s.bring_up_cpu(CpuId(1)).expect("cpu 1 online"));
+        assert!(
+            k.post_lock_exit_validation_split(CpuId(1), EXITING, asid)
+                .is_ok()
+        );
+    }
+
+    /// Structure: rank 1 is acquired FIRST and is still held when rank 2 is taken, so the four
+    /// facts are one snapshot. The nested read must not go through a `KernelState` accessor
+    /// that would re-enter the rank-1 lock.
+    #[test]
+    fn u3_rank1_precedes_rank2_and_both_stay_held() {
+        let txn = transaction_body();
+        let rank1 = txn
+            .find("with_scheduler_split_mut")
+            .expect("rank-1 scheduler acquisition");
+        let rank2 = txn
+            .find("with_task_tcbs_split_mut")
+            .expect("rank-2 task acquisition");
+        assert!(rank1 < rank2, "canonical order: scheduler(1) then task(2)");
+        // The rank-2 acquisition is INSIDE the rank-1 closure: the transaction's single
+        // `Ok(PostLockExitValidation` construction comes after it, still within that closure.
+        let result = txn
+            .find("Ok(PostLockExitValidation")
+            .expect("one typed result");
+        assert!(
+            rank2 < result,
+            "the task read happens before the snapshot is returned, under the scheduler guard"
+        );
+        // Re-entering rank 1 from inside would deadlock, so no broad/self-recursive accessor.
+        assert!(!txn.contains("current_tid_authoritative"));
+        assert!(!txn.contains(".with_cpu("));
+        assert!(!txn.contains(".with(|state|"));
+        // Read-only: the snapshot mutates neither domain.
+        assert!(!txn.contains("set_current_cpu"));
+    }
+
+    /// The retired acquisition is gone from the consumer, and the two RISC-V acquisitions that
+    /// intentionally remain are still present. `riscv64/trap.rs` is NOT fully drained.
+    #[test]
+    fn u3_consumer_is_broad_lock_free_and_the_other_two_remain() {
+        let c = consumer_code();
+        assert!(
+            !c.contains(".with_cpu(") && !c.contains(".with(|state|"),
+            "the exit consumer takes no broad lock"
+        );
+        let code_only: alloc::string::String = RV_TRAP_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code_only.matches(".with_cpu(").count(),
+            2,
+            "exactly two broad acquisitions remain in riscv64/trap.rs"
+        );
+        // 1. The canonical broad trap phase.
+        assert!(
+            code_only.contains("handle_trap_entry_with_fault_bookkeeping_mode("),
+            "the canonical in-lock trap phase must remain"
+        );
+        // 2. The deferred terminal-idle predicate, untouched by this increment.
+        assert!(
+            code_only.contains("kernel.runnable_count_on_cpu(cpu) == 0"),
+            "the terminal-idle predicate is deferred, not retired"
+        );
+        assert!(RV_TRAP_SRC.contains("RISCV_BLOCKED_IPC_IDLE_PROVENANCE_OK"));
+        assert!(RV_TRAP_SRC.contains("RISCV_BLOCKED_IDLE_NO_PROVENANCE"));
     }
 }
 
@@ -100619,6 +100875,7 @@ mod stage200d2b1c_arch_return {
     const X86: &str = include_str!("../../arch/x86_64/trap.rs");
     const SHARED: &str = include_str!("../../arch/trap_entry.rs");
     const RV: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
     const CMDLINE: &str = include_str!("../boot_command_line.rs");
     const INIT: &str = include_str!(
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
@@ -100649,16 +100906,35 @@ mod stage200d2b1c_arch_return {
             // compares it with the published one, treating a fully reaped TCB as safe. The
             // three ports bind the matched value under different names, so assert the
             // property rather than one port's spelling.
+            //
+            // U3 (203C): RISC-V no longer performs the comparison inline — its consumer
+            // delegates to `post_lock_exit_validation_split`, the coherent rank-1/rank-2
+            // snapshot that replaced its broad `with_cpu` re-acquire. The PROPERTY is
+            // unchanged, so follow the delegation to where the comparison now lives rather
+            // than weakening it. x86_64 and AArch64 still compare inline.
             let consumer = src
                 .split("CurrentTaskExited { tid, asid }")
                 .nth(1)
                 .expect("consumer");
+            let comparison_site = if consumer.contains("post_lock_exit_validation_split(") {
+                RUNTIME
+                    .split("pub(crate) fn post_lock_exit_validation_split(")
+                    .nth(1)
+                    .expect("the delegated transaction is present")
+                    .split("\n    }")
+                    .next()
+                    .expect("transaction body is bounded")
+            } else {
+                consumer
+            };
             assert!(
-                consumer.contains("kernel.task_asid(tid)") && consumer.contains("== asid"),
+                (comparison_site.contains("kernel.task_asid(tid)")
+                    || comparison_site.contains("tcb.asid"))
+                    && comparison_site.contains("== asid"),
                 "{arch} must compare the published ASID against the live binding"
             );
             assert!(
-                consumer.contains("None => true"),
+                comparison_site.contains("None => true"),
                 "{arch} must treat a fully reaped TCB as unimpersonatable"
             );
             assert!(
