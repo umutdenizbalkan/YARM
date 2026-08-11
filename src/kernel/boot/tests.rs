@@ -54435,18 +54435,21 @@ mod stage169_d2_send_genuine {
                 "the D2 {name} refusal diverges before any switch-success marker is emitted"
             );
         }
-        // Exactly seven broad acquisitions remain in the file, and the four this increment
-        // deliberately did not touch are among them.
+        // U3 (203C): 7 -> 5. The x86 FutexWait and Yield switch-success restores joined the
+        // same transaction; their classes and counters are untouched.
         assert_eq!(
             src.matches(".with_cpu(").count(),
-            7,
-            "trap_entry.rs retains exactly seven broad acquisitions"
+            5,
+            "trap_entry.rs retains exactly five broad acquisitions"
         );
         assert!(
             src.contains("FUTEX_WAIT_DISPATCH_COUNT"),
-            "x86 FutexWait remains"
+            "the x86 FutexWait class counter remains"
         );
-        assert!(src.contains("YIELD_DISPATCH_COUNT"), "x86 Yield remains");
+        assert!(
+            src.contains("YIELD_DISPATCH_COUNT"),
+            "the x86 Yield class counter remains"
+        );
         assert!(
             src.contains("D6_CONTROLLED_SWITCH_PROOF_STATE_CLEAR_OK"),
             "the D6 controlled proof restore remains"
@@ -61435,12 +61438,14 @@ mod stage192a_queue_advancing_dispatch {
             "the in-lock dispatch fallback must be preserved"
         );
         // The trap-entry drain mirrors the D2 recv drain.
+        // U3 (203C): the restore is no longer an inline broad re-acquire — the drain calls the
+        // shared exact-token transaction. Every other step of the chain is unchanged.
         assert!(
             TRAP_SRC.contains("futex_wait_was_deferred")
                 && TRAP_SRC.contains("shared.futex_wait_reverify_blocked(t)")
                 && TRAP_SRC.contains("shared.futex_wait_dispatch_step_mut(cpu)")
                 && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
-                && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
+                && TRAP_SRC.contains("x86_post_lock_resume_marked_incoming("),
             "the trap-entry futex drain must reverify + dispatch-step + mark-running + restore"
         );
     }
@@ -61613,6 +61618,158 @@ mod stage192a_queue_advancing_dispatch {
         assert!(!futex_wait_dispatch_is_deferred(0));
         assert_eq!(futex_wait_dispatch_outgoing(0), None);
     }
+
+    // ── U3 (203C): the FutexWait switch-success restore joins the shared transaction ──────
+
+    fn u3_code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The FutexWait switch-success region between `CURRENT_SET_OK` and the class counter,
+    /// comment-stripped so a structural guard reads CODE and not the prose explaining it.
+    fn u3_futex_switch_region() -> alloc::string::String {
+        let src = u3_code_only(TRAP_SRC);
+        // `trap_entry.rs` is shared across architectures and more than one drain logs a
+        // CURRENT_SET_OK marker, so select the slice unambiguously: exactly one candidate is
+        // the x86_64 switch-success body bounded by its own class marker.
+        let mut found: Option<alloc::string::String> = None;
+        for candidate in src.split("QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK").skip(1) {
+            let Some(region) = candidate.split("FUTEX_WAIT_SPLIT_DISPATCH_OK").next() else {
+                continue;
+            };
+            if region.contains("x86_post_lock_resume_marked_incoming(") {
+                assert!(
+                    found.is_none(),
+                    "the x86 futex switch region must be unique"
+                );
+                found = Some(region.into());
+            }
+        }
+        found.expect("the x86 futex switch-success region")
+    }
+
+    /// The caller passes its COMPLETE token to the delivered helper, takes no broad lock, and
+    /// settles refusal exactly as the D2 callers do.
+    #[test]
+    fn u3_futex_switch_success_uses_the_exact_token_transaction() {
+        let region = u3_futex_switch_region();
+        assert!(
+            !region.contains(".with_cpu(") && !region.contains(".with(|state|"),
+            "the FutexWait switch-success region must take no broad lock"
+        );
+        assert!(
+            region.contains("x86_post_lock_resume_marked_incoming(") && region.contains("token,"),
+            "it must pass the complete token to the delivered helper"
+        );
+        assert!(
+            !region.contains("d2_recv_switch_incoming_asid"),
+            "the retired inline ASID activation must be gone"
+        );
+        // Deferral cleared exactly once on this path.
+        assert_eq!(
+            region.matches("futex_wait_dispatch_clear(cpu_idx)").count(),
+            1,
+            "the deferral is cleared exactly once, on success and refusal alike"
+        );
+        // Rollback authority is exact, never fabricated.
+        assert!(
+            region.contains(".into_dequeued_authority()")
+                && region.contains("direct_dispatch_rollback_split"),
+            "refusal must roll back only with exact dequeued authority"
+        );
+        assert!(
+            !region.contains("DequeuedDispatchMarkToken("),
+            "refusal must not fabricate dequeue authority"
+        );
+        // Nothing succeeds after a refusal: the divergence precedes FRAME_OK and the counter.
+        let refusal = region.find("if resumed.is_err() {").expect("refusal arm");
+        let fatal = region
+            .find("enter_post_lock_dispatch_fatal(")
+            .expect("truthful divergence");
+        let frame_ok = region
+            .find("QUEUE_ADVANCING_DISPATCH_FRAME_OK")
+            .expect("frame marker");
+        let counter = region
+            .find("FUTEX_WAIT_DISPATCH_COUNT")
+            .expect("class counter");
+        assert!(
+            refusal < fatal && fatal < frame_ok && frame_ok < counter,
+            "a refusal diverges before FRAME_OK and before the counter bump"
+        );
+    }
+
+    /// The non-switch outcomes are untouched: the idle branch restores no frame and runs no
+    /// second dispatch, and the state-changed branch still only clears its deferral.
+    #[test]
+    fn u3_futex_idle_and_state_changed_paths_are_unchanged() {
+        let src = u3_code_only(TRAP_SRC);
+        let idle = src
+            .split("FUTEX_WAIT_SPLIT_DISPATCH_OK cpu={} incoming=idle")
+            .nth(1)
+            .expect("the idle branch")
+            .split("QUEUE_ADVANCING_DISPATCH_DEFERRED reason=state_changed")
+            .next()
+            .expect("bounded by the state-changed branch");
+        assert!(
+            !idle.contains("x86_post_lock_resume_marked_incoming(")
+                && !idle.contains("post_switch_restore_arch_thread_state")
+                && !idle.contains(".with_cpu("),
+            "the idle branch restores no frame"
+        );
+        assert!(
+            !idle.contains("dispatch_step_mut") && !idle.contains("FUTEX_WAIT_DISPATCH_COUNT"),
+            "the idle branch runs no second dispatch and bumps no switch counter"
+        );
+        assert!(
+            idle.contains("QUEUE_ADVANCING_DISPATCH_DONE result=ok")
+                && idle.contains("FUTEX_WAIT_SPLIT_DONE result=blocked")
+                && idle.contains("maybe_log_futex_wait_retired"),
+            "the idle branch keeps its existing markers"
+        );
+        let changed = src
+            .split("QUEUE_ADVANCING_DISPATCH_DEFERRED reason=state_changed")
+            .nth(1)
+            .expect("the state-changed branch");
+        let changed = &changed[..changed.len().min(400)];
+        assert!(
+            changed.contains("futex_wait_dispatch_clear(cpu_idx)")
+                && !changed.contains("x86_post_lock_resume_marked_incoming(")
+                && !changed.contains(".with_cpu("),
+            "the state-changed branch only clears its deferral"
+        );
+    }
+
+    /// All five WA3A mark outcomes stay explicit, and `RefusedTorn` stays fatal.
+    #[test]
+    fn u3_futex_mark_outcomes_remain_explicit() {
+        let src = u3_code_only(TRAP_SRC);
+        let arms = src
+            .split("shared.futex_wait_dispatch_step_mut(cpu)")
+            .nth(1)
+            .expect("the futex mark site")
+            .split("QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK")
+            .next()
+            .expect("bounded by the switch-success region");
+        for arm in [
+            "Mark::Marked(token)",
+            "Mark::Idle",
+            "Mark::RefusedRolledBack",
+            "Mark::RefusedNoSchedulerChange",
+            "Mark::RefusedTorn",
+        ] {
+            assert!(
+                arms.contains(arm),
+                "the futex drain must match {arm} explicitly"
+            );
+        }
+        assert!(
+            arms.contains("dispatch_torn_fatal("),
+            "RefusedTorn remains fatal"
+        );
+    }
 }
 
 // Stage 192B — YIELD QUEUE-ADVANCING OUT-OF-LOCK DISPATCH. Yield is the preempt sibling of
@@ -61647,12 +61804,14 @@ mod stage192b_yield_queue_advancing_dispatch {
                 && EXEC_SRC.contains("let selection = self.on_preempt_current_cpu_selection();"),
             "the in-lock on_preempt fallback must be preserved"
         );
+        // U3 (203C): same retirement as the FutexWait drain — the restore is the shared
+        // exact-token transaction, the rest of the chain is unchanged.
         assert!(
             TRAP_SRC.contains("yield_was_deferred")
                 && TRAP_SRC.contains("shared.yield_reverify_ready(cpu)")
                 && TRAP_SRC.contains("shared.yield_dispatch_step_mut(cpu)")
                 && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
-                && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
+                && TRAP_SRC.contains("x86_post_lock_resume_marked_incoming("),
             "the trap-entry yield drain must reverify + dispatch-step + mark-running + restore"
         );
     }
@@ -61818,6 +61977,150 @@ mod stage192b_yield_queue_advancing_dispatch {
             SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
                 && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
             "191A/191B retirements must remain"
+        );
+    }
+
+    // ── U3 (203C): the Yield switch-success restore joins the shared transaction ──────────
+
+    fn u3_code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn u3_yield_switch_region() -> alloc::string::String {
+        let src = u3_code_only(TRAP_SRC);
+        // The AArch64 Yield drain logs the same CURRENT_SET_OK marker, so select the x86_64
+        // switch-success body unambiguously rather than by position.
+        let mut found: Option<alloc::string::String> = None;
+        for candidate in src.split("YIELD_DISPATCH_CURRENT_SET_OK").skip(1) {
+            let Some(region) = candidate.split("YIELD_DISPATCH_DONE result=ok").next() else {
+                continue;
+            };
+            if region.contains("x86_post_lock_resume_marked_incoming(") {
+                assert!(
+                    found.is_none(),
+                    "the x86 yield switch region must be unique"
+                );
+                found = Some(region.into());
+            }
+        }
+        found.expect("the x86 yield switch-success region")
+    }
+
+    /// The Yield caller passes its COMPLETE token to the same delivered helper, takes no broad
+    /// lock, and settles refusal exactly as the FutexWait and D2 callers do.
+    #[test]
+    fn u3_yield_switch_success_uses_the_exact_token_transaction() {
+        let region = u3_yield_switch_region();
+        assert!(
+            !region.contains(".with_cpu(") && !region.contains(".with(|state|"),
+            "the Yield switch-success region must take no broad lock"
+        );
+        assert!(
+            region.contains("x86_post_lock_resume_marked_incoming(") && region.contains("token,"),
+            "it must pass the complete token to the delivered helper"
+        );
+        assert!(
+            !region.contains("d2_recv_switch_incoming_asid"),
+            "the retired inline ASID activation must be gone"
+        );
+        assert_eq!(
+            region.matches("yield_dispatch_clear(cpu_idx)").count(),
+            1,
+            "the deferral is cleared exactly once, on success and refusal alike"
+        );
+        assert!(
+            region.contains(".into_dequeued_authority()")
+                && region.contains("direct_dispatch_rollback_split"),
+            "refusal must roll back only with exact dequeued authority"
+        );
+        assert!(
+            !region.contains("DequeuedDispatchMarkToken("),
+            "refusal must not fabricate dequeue authority"
+        );
+        let refusal = region.find("if resumed.is_err() {").expect("refusal arm");
+        let fatal = region
+            .find("enter_post_lock_dispatch_fatal(")
+            .expect("truthful divergence");
+        let frame_ok = region
+            .find("YIELD_DISPATCH_FRAME_OK")
+            .expect("frame marker");
+        let counter = region.find("YIELD_DISPATCH_COUNT").expect("class counter");
+        assert!(
+            refusal < fatal && fatal < frame_ok && frame_ok < counter,
+            "a refusal diverges before FRAME_OK and before the counter bump"
+        );
+    }
+
+    /// The defensive idle branch and the state-changed branch are unchanged: no frame restore,
+    /// no second dispatch, no duplicate re-enqueue.
+    #[test]
+    fn u3_yield_defensive_idle_path_is_unchanged() {
+        let src = u3_code_only(TRAP_SRC);
+        let idle = src
+            .split("YIELD_DISPATCH_DONE result=ok cpu={} incoming=idle")
+            .nth(1)
+            .expect("the defensive idle branch")
+            .split("YIELD_DISPATCH_DEFERRED reason=state_changed")
+            .next()
+            .expect("bounded by the state-changed branch");
+        assert!(
+            !idle.contains("x86_post_lock_resume_marked_incoming(")
+                && !idle.contains("post_switch_restore_arch_thread_state")
+                && !idle.contains(".with_cpu("),
+            "the defensive idle branch restores no frame"
+        );
+        assert!(
+            !idle.contains("dispatch_step_mut")
+                && !idle.contains("YIELD_DISPATCH_COUNT")
+                && !idle.contains("preempt_reenqueue"),
+            "it runs no second dispatch and no duplicate re-enqueue"
+        );
+        assert!(
+            idle.contains("maybe_log_yield_retired"),
+            "the defensive idle branch keeps its retirement marker"
+        );
+        let changed = src
+            .split("YIELD_DISPATCH_DEFERRED reason=state_changed")
+            .nth(1)
+            .expect("the state-changed branch");
+        let changed = &changed[..changed.len().min(400)];
+        assert!(
+            changed.contains("yield_dispatch_clear(cpu_idx)")
+                && !changed.contains("x86_post_lock_resume_marked_incoming(")
+                && !changed.contains(".with_cpu("),
+            "the state-changed branch only clears its deferral"
+        );
+    }
+
+    /// All five WA3A mark outcomes stay explicit, and `RefusedTorn` stays fatal.
+    #[test]
+    fn u3_yield_mark_outcomes_remain_explicit() {
+        let src = u3_code_only(TRAP_SRC);
+        let arms = src
+            .split("shared.yield_dispatch_step_mut(cpu)")
+            .nth(1)
+            .expect("the yield mark site")
+            .split("YIELD_DISPATCH_CURRENT_SET_OK")
+            .next()
+            .expect("bounded by the switch-success region");
+        for arm in [
+            "Mark::Marked(token)",
+            "Mark::Idle",
+            "Mark::RefusedRolledBack",
+            "Mark::RefusedNoSchedulerChange",
+            "Mark::RefusedTorn",
+        ] {
+            assert!(
+                arms.contains(arm),
+                "the yield drain must match {arm} explicitly"
+            );
+        }
+        assert!(
+            arms.contains("dispatch_torn_fatal("),
+            "RefusedTorn remains fatal"
         );
     }
 }

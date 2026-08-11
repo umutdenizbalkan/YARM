@@ -49,7 +49,11 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // U3 (203C): 9 -> 7. The two homologous x86_64 D2 switch-success restores (blocking send
     // and blocking receive) were byte-identical broad re-acquires; both now run one neutral
     // exact-token transaction, `x86_post_lock_resume_marked_incoming`.
-    ("src/arch/trap_entry.rs", 7),
+    // U3 (203C): 7 -> 5. The x86_64 FutexWait and Yield switch-success restores were the same
+    // body again; both now reuse that transaction unchanged. The five that remain are the
+    // canonical broad trap phase, the AArch64 FutexWait no-incoming idle read, the D6
+    // controlled-proof restore, and the two AArch64 ExitCurrentTask acquisitions.
+    ("src/arch/trap_entry.rs", 5),
     ("src/arch/x86_64/descriptor_tables.rs", 2),
     ("src/arch/x86_64/smp.rs", 4),
     ("src/kernel/boot/thread_state.rs", 1),
@@ -90,7 +94,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 28; // U3: 38 -> 33 -> 31 -> 30 -> 28 (six RISC-V, two AArch64, two x86_64)
+const AUDITED_WITH_CPU_TOTAL: usize = 26; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 (six RISC-V, two AArch64, four x86_64)
 const AUDITED_WITH_BROAD_TOTAL: usize = 6; // U2: 9 -> 6 (three test-only acquisitions relocated)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -99,7 +103,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 34; // U3: 44 -> 39 -> 37 -> 36 -> 34 (ten drains retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 32; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 (twelve drains retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

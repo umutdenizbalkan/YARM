@@ -53,12 +53,12 @@ This file has exactly one status page: §0.3.
 Three methods acquire it — `lock` (test-only), `with`, `with_cpu`. Full unlock = no runtime
 guard exists (canonical **204E**), sealed cross-architecture (canonical **205D**).
 
-Current census: **34** production callsites — **28** through `with_cpu` and **6** through the
-broad `with(|state| …)` form — classified **34 runtime-required**, 0 test-only, 0 obsolete,
+Current census: **32** production callsites — **26** through `with_cpu` and **6** through the
+broad `with(|state| …)` form — classified **32 runtime-required**, 0 test-only, 0 obsolete,
 0 boot-only. See §0.5. U1 deleted the two obsolete acquisitions (49 → 47) and U2 relocated the
 three test-only ones (47 → 44), leaving the census exactly the runtime-required set — every
 counted acquisition is one a real boot performs. U3 is now retiring those and has delivered
-ten (44 → 39 → 37 → 36 → 34). The three raw `self.state.lock()` sites are the bodies of `lock` /
+twelve (44 → 39 → 37 → 36 → 34 → 32). The three raw `self.state.lock()` sites are the bodies of `lock` /
 `with` / `with_cpu` themselves, not callsites, and are deliberately excluded from the total.
 These figures are recomputed from source by `tests/broad_lock_census_guard.rs`, which fails if
 the tree and the published census drift apart.
@@ -130,7 +130,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 
 | Stage | Definition | Status | Evidence / what is missing |
 |-------|-----------|--------|----------------------------|
-| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 34 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 0 test-only, 0 obsolete, 34 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
+| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 32 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 0 test-only, 0 obsolete, 32 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
 | **204B** | Decompose `KernelState` ownership into per-CPU / task / scheduler / IPC / capability / VM / timer / IRQ / boot components. `SharedKernel` may remain a container but must not serialize the whole kernel. | **OPEN** (partial foundation) | `KernelState` already carries 11 ranked domain locks and a full set of `*_split_mut` / `*_split_read` seams — the substrate exists. But `with_cpu` still forms a broad `&mut KernelState`, so the container still serializes the kernel. |
 | **204C** | Remove fallback-to-global handlers. An unsupported configuration must use an explicitly supported localized path or fail with a clear diagnostic — never reacquire the monolithic lock. | **OPEN** | Five fallback families live: the default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, the drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, retirement-enable flags, old fallback dispatch, class-specific one-shot logging, obsolete foundation oracles, compatibility drain branches. Keep validation oracles, but validating production paths rather than enabling them. | **OPEN** | All of the named scaffolding is live. |
@@ -179,11 +179,11 @@ census (204A), which is documentation, not lock retirement.
 | boot-only | **0** | — |
 | test-only | **0** | none — U2 relocated all three into test-only modules the census excludes: `ipc_recv_with_deadline_split_bridge` (2 acquisitions, never a trap-seam path) and the `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1) |
 | obsolete | **0** | none — U1 deleted both (`SharedKernel::handle_trap_with_cpu`, which had no in-tree caller at all, and `SharedKernel::run_reply_timeout_completion`, which had no production caller) |
-| runtime-required | **34** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), the AArch64 split return path (`trap_entry.rs:1432`), 2 identity snapshots, 6 x86_64 AP paths, RISC-V resume, thread creation, and the recv/delivery boundary re-acquires |
+| runtime-required | **32** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), the AArch64 split return path (`trap_entry.rs:1432`), 2 identity snapshots, 6 x86_64 AP paths, RISC-V resume, thread creation, and the recv/delivery boundary re-acquires |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
 
-Classified total: **34** acquisition callsites (**28** `with_cpu` + **6** broad `with`), which
-is 0 + 0 + 0 + 34. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
+Classified total: **32** acquisition callsites (**26** `with_cpu` + **6** broad `with`), which
+is 0 + 0 + 0 + 32. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
 
 ### 0.6 Structural blockers
 
@@ -239,7 +239,7 @@ There is no longer any dead or test-only weight in the total, so **every further
 must retire real runtime work.** U1 and U2 served **204C** / **204D** / **204E** without
 completing any of them.
 
-**U3 — IN PROGRESS, ten drains retired (44 → 39 → 37 → 36 → 34).** U3 promotes existing rank-1
+**U3 — IN PROGRESS, twelve drains retired (44 → 39 → 37 → 36 → 34 → 32).** U3 promotes existing rank-1
 (scheduler) and rank-2 (task) seams from compatibility helpers to **authoritative**, deleting
 each corresponding post-lock drain re-acquisition **in the same increment** — a seam that is
 authoritative while its drain survives has retired nothing.
@@ -325,9 +325,21 @@ wake-capable idle halt rather than returning through the outgoing task's frame. 
 switch-success marker is emitted after a refusal. `frame == None` keeps its old contract
 exactly — activation happens, nothing else does, and it is not an error.
 
-*Remaining:* roughly 10 drain re-acquisitions, so the U3 target is **34 → approximately 24**.
-**Seven** acquisitions remain in `trap_entry.rs` and **two** in `riscv64/trap.rs`: the canonical
-broad trap phase and the deferred terminal-idle predicate. Neither file is fully drained.
+Two more x86_64 restores followed (34 → 32, taking `trap_entry.rs` 7 → 5): the **FutexWait**
+and **Yield** switch-success bodies. They were the same body a third and fourth time, so they
+**reuse `x86_post_lock_resume_marked_incoming` unchanged** — the transaction was not widened,
+extended or re-specified for them, which is the point: four callers, one implementation. Each
+retains its own class markers and counters, clears its own deferral exactly once, and on refusal
+rolls the dequeue back only through `token.into_dequeued_authority()` before diverging, emitting
+no `FRAME_OK`, no counter bump and no success marker. The non-switch outcomes are untouched:
+FutexWait's state-changed and idle branches, and Yield's defensive idle branch, restore no frame
+and run no extra dispatch.
+
+*Remaining:* roughly 8 drain re-acquisitions, so the U3 target is **32 → approximately 24**.
+**Five** acquisitions remain in `trap_entry.rs` — the canonical broad trap phase, the AArch64
+FutexWait no-incoming idle read, the D6 controlled-proof restore and the two AArch64
+`ExitCurrentTask` acquisitions — and **two** in `riscv64/trap.rs`: its canonical broad trap phase
+and the deferred terminal-idle predicate. Neither file is fully drained.
 This is the work canonical **203C** defines; U3 advances it and does **not** complete it —
 **203C remains OPEN**, and completing it additionally requires `d6_genuine_enabled()` to stop
 being compile-time x86_64-only (§0.6 blocker 3).

@@ -893,14 +893,30 @@ pub fn handle_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                let restore = shared
-                    .with_cpu(cpu, |kernel| {
-                        kernel.d2_recv_switch_incoming_asid(inc);
-                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
-                    })
-                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                // U3 (203C): the broad `with_cpu` re-acquire is retired onto the SAME neutral
+                // exact-token transaction the D2 send/recv switch-success restores already use
+                // — unchanged, not extended. The complete token carries the ASID, context, TLS
+                // and CR3 authority, so nothing here decides on a bare TID.
+                let resumed = crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming(
+                    shared,
+                    token,
+                    frame.as_deref_mut(),
+                );
                 crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
-                restore??;
+                if resumed.is_err() {
+                    // Refused after the scheduler was mutated: undo the dequeue with the
+                    // token's own narrowed authority (a `ContinuedCurrent` mark yields none,
+                    // and none is fabricated), then diverge. No FRAME_OK, no counter bump and
+                    // no success marker is emitted on this path.
+                    let rolled_back = token
+                        .into_dequeued_authority()
+                        .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
+                    crate::arch::x86_64::trap::enter_post_lock_dispatch_fatal(
+                        cpu,
+                        inc,
+                        rolled_back,
+                    );
+                }
                 crate::yarm_log!(
                     "QUEUE_ADVANCING_DISPATCH_FRAME_OK cpu={} tid={}",
                     cpu.0,
@@ -1269,14 +1285,24 @@ pub fn handle_trap_entry_shared(
             if let Some(token) = marked {
                 let inc = token.tid();
                 crate::yarm_log!("YIELD_DISPATCH_CURRENT_SET_OK cpu={} tid={}", cpu.0, inc);
-                let restore = shared
-                    .with_cpu(cpu, |kernel| {
-                        kernel.d2_recv_switch_incoming_asid(inc);
-                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
-                    })
-                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                // U3 (203C): same retirement as the FutexWait switch-success above and the two
+                // D2 restores before it — one shared exact-token transaction, reused unchanged.
+                let resumed = crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming(
+                    shared,
+                    token,
+                    frame.as_deref_mut(),
+                );
                 crate::kernel::boot::yield_dispatch_clear(cpu_idx);
-                restore??;
+                if resumed.is_err() {
+                    let rolled_back = token
+                        .into_dequeued_authority()
+                        .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
+                    crate::arch::x86_64::trap::enter_post_lock_dispatch_fatal(
+                        cpu,
+                        inc,
+                        rolled_back,
+                    );
+                }
                 crate::yarm_log!("YIELD_DISPATCH_FRAME_OK cpu={} tid={}", cpu.0, inc);
                 let n = crate::kernel::boot::YIELD_DISPATCH_COUNT
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
