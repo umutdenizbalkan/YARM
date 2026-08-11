@@ -101,7 +101,8 @@ pub(crate) trait ReplyTimeoutDomains {
 }
 
 /// The broad/hosted path: per-domain sub-locks on `&mut KernelState`. Used by
-/// `SharedKernel::run_reply_timeout_completion` (the hosted 200C1 wrapper).
+/// [`KernelState::run_reply_timeout_completion_locked`] (U1 deleted the obsolete
+/// `SharedKernel` broad-lock wrapper that used to call it).
 impl ReplyTimeoutDomains for KernelState {
     fn rtd_ipc<R>(&mut self, f: impl FnOnce(&mut IpcSubsystem) -> R) -> R {
         self.with_ipc_state_mut(f)
@@ -2679,8 +2680,10 @@ impl KernelState {
     }
 
     /// Stage 200C1/200C2A/200C2B — run the SINGLE reply-timeout completion body on a
-    /// broad `&mut KernelState` (the hosted `SharedKernel::run_reply_timeout_completion`
-    /// wrapper path). It delegates to the arch-neutral generic transaction
+    /// broad `&mut KernelState`. Callers already hold the broad lock (the in-lock timer
+    /// scan; hosted tests enter it via `SharedKernel::with`). U1 deleted the obsolete
+    /// `SharedKernel::run_reply_timeout_completion` wrapper, which had no production
+    /// caller; this body is unchanged. It delegates to the arch-neutral generic transaction
     /// [`complete_reply_timeout_over`], the SAME body the Stage 200C2B OFF-LOCK drain
     /// runs through `OffLockReplyTimeout` — so there is exactly ONE completion
     /// transaction, and neither path holds the broad lock across a user copy.

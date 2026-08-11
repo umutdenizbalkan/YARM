@@ -34,7 +34,9 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     ("src/arch/x86_64/descriptor_tables.rs", 2),
     ("src/arch/x86_64/smp.rs", 4),
     ("src/kernel/boot/thread_state.rs", 1),
-    ("src/runtime.rs", 13),
+    // U1: 13 -> 12. The obsolete `SharedKernel::handle_trap_with_cpu` wrapper had no
+    // in-tree caller at all and was deleted.
+    ("src/runtime.rs", 12),
 ];
 
 /// Per-file count of production broad `SharedKernel::with(|state| …)` callsites.
@@ -47,7 +49,10 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
 const EXPECTED_WITH_BROAD: &[(&str, usize)] = &[
     ("src/arch/x86_64/smp.rs", 2),
     ("src/kernel/boot/orchestrator_state.rs", 1),
-    ("src/runtime.rs", 8),
+    // U1: 8 -> 7. The obsolete `SharedKernel::run_reply_timeout_completion` wrapper had no
+    // production caller and was deleted; the single completion body
+    // (`KernelState::run_reply_timeout_completion_locked`) is unchanged.
+    ("src/runtime.rs", 7),
 ];
 
 /// Per-file count of raw `self.state.lock()` sites. All three are the bodies of
@@ -63,16 +68,16 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 39; // Stage 199D: 40 -> 39 (RISC-V trap-bridge SATP lookup)
-const AUDITED_WITH_BROAD_TOTAL: usize = 10;
+const AUDITED_WITH_CPU_TOTAL: usize = 38; // U1: 39 -> 38 (obsolete `handle_trap_with_cpu` deleted)
+const AUDITED_WITH_BROAD_TOTAL: usize = 9; // U1: 10 -> 9 (obsolete reply-timeout wrapper deleted)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
 
 /// Stage 204A classification totals, as published in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 3;
-const CLASS_OBSOLETE: usize = 2;
-const CLASS_RUNTIME_REQUIRED: usize = 44; // Stage 199D: 45 -> 44 (RISC-V trap-bridge SATP lookup)
+const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
+const CLASS_RUNTIME_REQUIRED: usize = 44;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

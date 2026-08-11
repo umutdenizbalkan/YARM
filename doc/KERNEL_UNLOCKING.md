@@ -53,9 +53,9 @@ This file has exactly one status page: §0.3.
 Three methods acquire it — `lock` (test-only), `with`, `with_cpu`. Full unlock = no runtime
 guard exists (canonical **204E**), sealed cross-architecture (canonical **205D**).
 
-Current census: **49** production callsites — **39** through `with_cpu` and **10** through the
-broad `with(|state| …)` form — classified **44 runtime-required**, 3 test-only, 2 obsolete,
-0 boot-only. See §0.5. The three raw `self.state.lock()` sites are the bodies of `lock` /
+Current census: **47** production callsites — **38** through `with_cpu` and **9** through the
+broad `with(|state| …)` form — classified **44 runtime-required**, 3 test-only, 0 obsolete,
+0 boot-only. See §0.5. U1 deleted the two obsolete acquisitions (49 → 47). The three raw `self.state.lock()` sites are the bodies of `lock` /
 `with` / `with_cpu` themselves, not callsites, and are deliberately excluded from the total.
 These figures are recomputed from source by `tests/broad_lock_census_guard.rs`, which fails if
 the tree and the published census drift apart.
@@ -78,7 +78,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 |-------|------------------------------|--------|----------------------------|
 | **199C** | **Blocking IpcSend.** Retire sender-waiter publication where endpoint policy blocks a sender: sender → `Blocked(IpcSend)`, waiter enqueued once, receiver later consumes sender, sender wakes once. Full sparse-queue and timeout parity. | **OPEN** | `handle_ipc_send` and its waiter publication run entirely inside the broad `with_cpu`. The only off-lock element is the x86_64 D2-send drain (`src/arch/trap_entry.rs:388`), which relocates the *queue-advancing dispatch* — **not** the waiter publication — and is compile-time absent on AArch64/RISC-V. Sparse-queue and send-timeout parity untouched. The 15 `IpcSend` live cells (plain / ordinary-cap / shared-region) prove **delivery**, not blocking-sender retirement. |
 | **199D** | **IpcCall and reply-object lifecycle** as one transaction: delivery → caller reply-blocked → reply object created → reply cap transferred → server replies → caller wakes → reply object destroyed. Required: no orphan reply object, no duplicate reply, no lost caller, no reply-cap rematerialization, timeout/cancellation cleanup, **server crash cleanup**. | **OPEN** (hosted foundation + knob-gated live proof) | Transaction exists off-lock: `src/kernel/ipccall_direct_txn.rs`, `syscall_split.rs:295/307`, reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 in both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) — but **default-OFF** (`ipccall_direct_proof_enabled()`, `src/kernel/boot/mod.rs:3095`), so **no production boot takes it**. Server-crash cleanup: the reverse-link accounting is **repaired**, and the **first live cell is EARNED on x86_64** — `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`, tree `e2fd0b5c`: scoped vector `[1;9]`, quiescent system balance `created=54 closed=54 live_links=0`, owner revalidation executed with a correct replacement return, zero `result=fail` in the log (`doc/IPC.md` §8.5). **1 of 3 architectures**; AArch64 and RISC-V cells unearned. Timeout/cancellation cleanup depends on 199E. |
-| **199E** | **IPC timeout and cancellation** off the broad lock: `IpcRecvTimeout`, **IpcSend timeout**, **IpcCall timeout**, reply timeout/cancellation. Bounded timer/deadline structures, subsystem-local cleanup. Known sparse sender-waiter behavior must remain fixed. | **OPEN** (partial) | Reply timeout is the only retired quarter: narrow completion transaction on all three arches, scan off-lock **x86_64 only** (`IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0`), 6 live cells (timeout-wins + reply-wins × 3 arches, `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`). `IpcRecvTimeout` pre-reads its deadline off-lock but the receive itself is broad. **IpcSend timeout and IpcCall timeout are not retired at all.** Broad fallback `run_reply_timeout_completion` (`src/runtime.rs:3725`) still present. |
+| **199E** | **IPC timeout and cancellation** off the broad lock: `IpcRecvTimeout`, **IpcSend timeout**, **IpcCall timeout**, reply timeout/cancellation. Bounded timer/deadline structures, subsystem-local cleanup. Known sparse sender-waiter behavior must remain fixed. | **OPEN** (partial) | Reply timeout is the only retired quarter: narrow completion transaction on all three arches, scan off-lock **x86_64 only** (`IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0`), 6 live cells (timeout-wins + reply-wins × 3 arches, `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`). `IpcRecvTimeout` pre-reads its deadline off-lock but the receive itself is broad. **IpcSend timeout and IpcCall timeout are not retired at all.** U1 deleted the callerless `SharedKernel::run_reply_timeout_completion` wrapper, but that retired a census entry, not the behavior: the single completion body `KernelState::run_reply_timeout_completion_locked` is unchanged and the in-lock scan still calls it on every architecture. |
 | **199F** | **Notification wait/signal parity**: signal, wait, wait-with-timeout, multi-signal accumulation, wake exactly once. No global lock in IRQ-originated notification delivery. | **OPEN** | Only `notification_waiter_count_split_read` (`src/runtime.rs:4341`) exists, and it is a read helper. `signal_notification` (`src/kernel/boot/ipc_state.rs:5196`) takes `&mut self` under the broad lock. IRQ-originated delivery runs inside `handle_trap_entry_shared`'s `with_cpu`. No seams for wait, wait-with-timeout, or multi-signal accumulation. |
 | **199G** | **Full IPC subsystem seal** — send, recv, call, reply, notifications, timeouts, capability transfer, shared-region transfer all operate with **zero** runtime broad-lock acquisitions. Major exit gate. | **OPEN** | Blocked on 199C–199F. The authoritative trap dispatch (`src/arch/trap_entry.rs:299`, `src/arch/riscv64/trap.rs:563`) still serves every non-split IPC syscall. |
 
@@ -127,7 +127,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 
 | Stage | Definition | Status | Evidence / what is missing |
 |-------|-----------|--------|----------------------------|
-| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 49 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 3 test-only, 2 obsolete, 44 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
+| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 47 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 3 test-only, 0 obsolete, 44 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
 | **204B** | Decompose `KernelState` ownership into per-CPU / task / scheduler / IPC / capability / VM / timer / IRQ / boot components. `SharedKernel` may remain a container but must not serialize the whole kernel. | **OPEN** (partial foundation) | `KernelState` already carries 11 ranked domain locks and a full set of `*_split_mut` / `*_split_read` seams — the substrate exists. But `with_cpu` still forms a broad `&mut KernelState`, so the container still serializes the kernel. |
 | **204C** | Remove fallback-to-global handlers. An unsupported configuration must use an explicitly supported localized path or fail with a clear diagnostic — never reacquire the monolithic lock. | **OPEN** | Five fallback families live: the default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, the drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, retirement-enable flags, old fallback dispatch, class-specific one-shot logging, obsolete foundation oracles, compatibility drain branches. Keep validation oracles, but validating production paths rather than enabling them. | **OPEN** | All of the named scaffolding is live. |
@@ -175,12 +175,12 @@ census (204A), which is documentation, not lock retirement.
 |-------|-------|-------|
 | boot-only | **0** | — |
 | test-only | **3** | `runtime.rs:1244`, `runtime.rs:1248` (`ipc_recv_with_deadline_split_bridge` — only test callers; its own doc says "not a standalone trap-seam path"); `runtime.rs:2654` (`control_plane_set_process_cnode_slots_via_syscall` — only test callers) |
-| obsolete | **2** | `runtime.rs:2644` (`SharedKernel::handle_trap_with_cpu` — **no in-tree caller at all**, only source-grep guards name it); `runtime.rs:3725` (`run_reply_timeout_completion` — no production caller; the off-lock `OffLockReplyTimeout` composition superseded it) |
+| obsolete | **0** | none — U1 deleted both (`SharedKernel::handle_trap_with_cpu`, which had no in-tree caller at all, and `SharedKernel::run_reply_timeout_completion`, which had no production caller) |
 | runtime-required | **44** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), the AArch64 split return path (`trap_entry.rs:1432`), 2 identity snapshots, 6 x86_64 AP paths, RISC-V resume, thread creation, and the recv/delivery boundary re-acquires |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
 
-Classified total: **49** acquisition callsites (**39** `with_cpu` + **10** broad `with`), which
-is 0 + 3 + 2 + 44. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
+Classified total: **47** acquisition callsites (**38** `with_cpu` + **9** broad `with`), which
+is 0 + 3 + 0 + 44. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
 
 ### 0.6 Structural blockers
 
@@ -205,34 +205,38 @@ is 0 + 3 + 2 + 44. `tests/broad_lock_census_guard.rs` recomputes all of these fr
 
 ### 0.7 Smallest next production stage
 
-The next two actions are **census subtractions**: they delete broad-lock callsites that no
-production path takes. Both are numbered unlocking directives, not canonical stages — the
-canonical stage definitions in §0.3 are unchanged, and neither U1 nor U2 renames, replaces, or
-adds one.
+These actions are **census subtractions**: they delete broad-lock callsites that no production
+path takes. They are numbered unlocking directives, not canonical stages — the canonical stage
+definitions in §0.3 are unchanged, and neither U1 nor U2 renames, replaces, or adds one.
 
-**U1 — the next production subtraction.** Delete the two **obsolete** broad-lock callsites
-recorded in §0.5: `runtime.rs:2644` (`SharedKernel::handle_trap_with_cpu` — no in-tree caller
-at all) and `runtime.rs:3725` (`run_reply_timeout_completion` — no production caller; the
-off-lock `OffLockReplyTimeout` composition superseded it). Neither is reachable from a live
-path, so removing them retires lock acquisition sites without changing runtime behavior.
-Expected census: **49 → 47**, classification becoming 0 boot-only / 3 test-only / **0
-obsolete** / 44 runtime-required.
+**U1 — DELIVERED.** Deleted the two **obsolete** broad-lock callsites: the
+`SharedKernel::handle_trap_with_cpu` wrapper (no in-tree caller at all) and the
+`SharedKernel::run_reply_timeout_completion` wrapper (no production caller; the off-lock
+`OffLockReplyTimeout` composition superseded it). Neither was reachable from a live path, so
+the deletions changed no runtime behavior. Census **49 → 47**; classification now 0 boot-only /
+3 test-only / **0 obsolete** / 44 runtime-required. What U1 did **not** do: it did not touch
+`KernelState::run_reply_timeout_completion_locked` (the single completion body), did not alter
+the accepted `OffLockReplyTimeout` production composition, and did not port the AArch64/RISC-V
+reply-timeout scans off-lock. Broad reply-timeout processing still happens on every
+architecture through the in-lock scan; canonical **199E** remains **OPEN**.
 
-**U2 — follows U1.** Remove the three **test-only** callsites from the production census:
+**U2 — the next directive.** Remove the three **test-only** callsites from the production
+census:
 `runtime.rs:1244` and `runtime.rs:1248` (`ipc_recv_with_deadline_split_bridge`) and
 `runtime.rs:2654` (`control_plane_set_process_cnode_slots_via_syscall`) — each has only test
 callers. Expected census: **47 → 44**, leaving the census exactly the runtime-required set.
 
 Together U1 and U2 make the published total mean one thing only: broad-lock acquisitions that
 a real boot actually performs. They serve **204C** / **204D** / **204E**; they do not complete
-any of them, and they retire no runtime-required site.
+any of them, and they retire no runtime-required site. After U2 the census is exactly the 44
+runtime-required acquisitions, and every further subtraction must retire real runtime work.
 
 **Standalone WA3C2 waiter-semantics investigation is *not* the next roadmap action.** It may
 resume only when it is tied to a numbered unlocking directive **and** a specific callsite
 retirement. Waiter-semantics work that retires no callsite does not move the one measurable
-definition in §0.1, and must not be scheduled ahead of U1/U2 on its own.
+definition in §0.1, and must not be scheduled ahead of U2 on its own.
 
-**Safety fact that U1 and U2 must preserve.** `ipccall_direct_production_enabled()`
+**Safety fact that U1 preserved and U2 must preserve.** `ipccall_direct_production_enabled()`
 (`src/kernel/boot/mod.rs:3222`) returns `false` on **every** architecture (Stage
 199D-WA1-GATE). Ordinary NR 6 / NR 7 traffic is admitted to the off-lock direct path on no
 architecture and takes the accepted legacy path; only an explicitly armed proof/oracle selector

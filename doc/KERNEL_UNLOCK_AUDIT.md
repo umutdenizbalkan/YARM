@@ -127,16 +127,16 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **39** |
-| `SharedKernel::with` (broad `&mut KernelState`) | **10** |
+| `SharedKernel::with_cpu` | **38** |
+| `SharedKernel::with` (broad `&mut KernelState`) | **9** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **49** |
+| **Total broad-lock acquisition sites** | **47** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
 | File | Count | Lines |
 |------|-------|-------|
-| `src/runtime.rs` | 13 | 402, 683, 1602, 1702, 1736, 1785, 1953, 1966, 2098, 2443, 2621, 2655, 2897 |
+| `src/runtime.rs` | 12 | U1 deleted the obsolete `handle_trap_with_cpu` acquisition (13 → 12) |
 | `src/arch/trap_entry.rs` | 11 | 305, 429, 505, 701, 787, 817, 890, 948, 1198, 1345, 1438 |
 | `src/arch/riscv64/trap.rs` | 8 | 563, 659, 727, 825, 870, 958, 1063, 1194 |
 | `src/arch/x86_64/smp.rs` | 4 | 2179, 2455, 2571, 2664 |
@@ -165,7 +165,7 @@ Structural reading of those 40:
 > replacement — unlike the drains above it takes no `with_cpu` at all — so this table is
 > unchanged at 40 across that increment.
 
-### 1.4 Broad `.with(|state| …)` — 10 production callsites
+### 1.4 Broad `.with(|state| …)` — 9 production callsites
 
 | File | Line | Purpose |
 |------|------|---------|
@@ -173,7 +173,6 @@ Structural reading of those 40:
 | `src/runtime.rs` | 1248 | `ipc_recv_until_deadline` |
 | `src/runtime.rs` | 2654 | trap handling helper |
 | `src/runtime.rs` | 3696 | `task_home_cpu` read |
-| `src/runtime.rs` | 3725 | `run_reply_timeout_completion_locked` — **broad-lock completion fallback** |
 | `src/runtime.rs` | 4013 | `reply_timeout_token_for_caller` read |
 | `src/runtime.rs` | 4017 | `disarm_deadline_after_terminal_completion` |
 | `src/runtime.rs` | 4025 | `set_task_home_cpu` |
@@ -184,12 +183,15 @@ Structural reading of those 40:
 `LOCK_ORDER_LAST_RANK.with(|last| …)` — a `thread_local!` accessor, **not** a broad-lock
 acquisition. It is excluded from the count.
 
-`runtime.rs:3725` (`run_reply_timeout_completion_locked`) is the surviving **legacy
-global-lock fallback handler** of the reply-timeout path. Its off-lock replacement —
+The `SharedKernel::run_reply_timeout_completion` broad-lock wrapper that used to occupy
+this table was **deleted by U1**: it had no production caller. Its off-lock counterpart,
 `OffLockReplyTimeout` (`runtime.rs:247`), which composes the same transaction from
-`with_ipc_split_mut` / `with_task_tcbs_split_mut` / `enqueue_reply_timeout_wake_split` —
-is the production path on x86_64. The broad-lock variant is retained as the fallback and
-has not been deleted.
+`with_ipc_split_mut` / `with_task_tcbs_split_mut` / `enqueue_reply_timeout_wake_split`, is
+the production path on x86_64 and is unchanged. **Broad reply-timeout processing did not
+disappear:** the single completion body `KernelState::run_reply_timeout_completion_locked`
+(`kernel/boot/ipc_state.rs`) is untouched, the in-lock timer scan still calls it directly on
+every architecture, and off-lock scanning remains x86_64-only. Canonical **199E** stays
+**OPEN**.
 
 ### 1.4a Per-callsite classification — the Stage 204A deliverable
 
@@ -201,7 +203,7 @@ Enclosing functions were resolved mechanically from source.
 |-------|-------|
 | boot-only | **0** |
 | test-only | **3** |
-| obsolete | **2** |
+| obsolete | **0** |
 | runtime-required | **44** |
 | undocumented | **0** |
 
@@ -213,14 +215,14 @@ Enclosing functions were resolved mechanically from source.
 | `runtime.rs:1248` | `ipc_recv_with_deadline_split_bridge` | same helper, deadline arm |
 | `runtime.rs:2654` | `control_plane_set_process_cnode_slots_via_syscall` | the `SharedKernel` wrapper's only callers are in the `runtime.rs` test module (lines 4962, 4986, 5495, 5682); production NR 8 goes through `control_plane_set_process_cnode_slots_split_mut` |
 
-#### obsolete (2)
+#### obsolete (0)
 
-| Site | Enclosing fn | Why |
-|------|--------------|-----|
-| `runtime.rs:2644` | `SharedKernel::handle_trap_with_cpu` | **no in-tree caller at all** — production, tests or otherwise. Only source-grep guards reference the name. Deletable. |
-| `runtime.rs:3725` | `run_reply_timeout_completion` | no production caller; superseded by the `OffLockReplyTimeout` composition (`runtime.rs:247`). Retained only until the AArch64/RISC-V reply-timeout scans are ported (canonical 199E). |
+**None.** U1 deleted both: `SharedKernel::handle_trap_with_cpu` (no in-tree caller at all)
+and `SharedKernel::run_reply_timeout_completion` (no production caller; superseded by the
+`OffLockReplyTimeout` composition). Neither deletion changed runtime behavior, and the
+reply-timeout completion body itself was not touched.
 
-#### runtime-required (46)
+#### runtime-required (44)
 
 | Group | Sites | Enclosing fn |
 |-------|-------|--------------|
@@ -453,7 +455,7 @@ counts as done:
 
 | Stage | Scope | Status | Evidence and gap |
 |-------|-------|--------|------------------|
-| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 50 callsites enumerated with file, line and enclosing function. **0 boot-only, 3 test-only, 2 obsolete, 45 runtime-required, 0 undocumented.** (Stage 199D retired one: the AArch64 handled-split syscall return.) Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (6 tests), which recomputes the census from source and fails on any added or removed production callsite. |
+| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 47 callsites enumerated with file, line and enclosing function. **0 boot-only, 3 test-only, 0 obsolete, 44 runtime-required, 0 undocumented.** (Stage 199D retired the AArch64 handled-split syscall return; U1 deleted the two obsolete acquisitions, 49 → 47.) Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (6 tests), which recomputes the census from source and fails on any added or removed production callsite. |
 | **204B** | Decompose `KernelState` ownership; `SharedKernel` may remain a container but must not serialize the kernel | **OPEN** — partial foundation | 11 ranked domain locks and a full seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`. |
 | **204C** | Remove fallback-to-global handlers | **OPEN** | Five families live: default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding | **OPEN** | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, one-shot class logging and the foundation oracles are all live. |
@@ -571,7 +573,7 @@ Because **no** Phase 2–6 stage is complete, the useful near-term sequencing is
 | 3 | RISC-V `ExitCurrentTask` runner re-run | 202D | pure execution debt; the kernel chain is already proven correct |
 | 4 | AArch64 + RISC-V ServerDies live cells | 199D | completes server-crash cleanup proof across architectures |
 | 5 | Flip `ipccall_direct_proof_enabled()` to production default | 199D | until this lands, the entire off-lock direct-IPC transaction benefits nothing |
-| 6 | AArch64 + RISC-V reply-timeout scan off-lock; delete `run_reply_timeout_completion` | 199E | removes one obsolete broad callsite (51 → 50) |
+| 6 | AArch64 + RISC-V reply-timeout scan off-lock | 199E | the wrapper deletion half is **delivered by U1** (49 → 47); the remaining, and larger, half is porting the AArch64/RISC-V scans off-lock, which U1 did **not** do |
 | 7 | `IpcSend` timeout + `IpcCall` timeout retirement | 199E | the two untouched quarters of 199E |
 | 8 | Blocking `IpcSend` sender-waiter publication | 199C | largest remaining Phase-2 item |
 | 9 | Notification signal/wait/timeout seams | 199F | last Phase-2 subsystem before the 199G seal |

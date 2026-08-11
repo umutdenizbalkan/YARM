@@ -23,9 +23,9 @@ Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **39** |
-| Production broad `SharedKernel::with` callsites | **10** |
-| **Total production broad-lock acquisition sites** | **49** |
+| Production `SharedKernel::with_cpu` callsites | **38** |
+| Production broad `SharedKernel::with` callsites | **9** |
+| **Total production broad-lock acquisition sites** | **47** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **x86_64 (live) + AArch64 (structural, proof-gated)** via `offlock_authoritative_dispatch_enabled()`; `d6_genuine_enabled()` itself remains compile-time x86_64-only. RISC-V not admitted. |
@@ -67,8 +67,9 @@ complete the canonical stage.**
 | **Total** | **1 of 35** | 12 | 22 |
 
 **No canonical stage in Phases 2–6 or 8 is complete.** The one complete stage, 204A
-(broad-lock callsite census), is documentation rather than lock retirement: 49 callsites
-classified as 0 boot-only, 3 test-only, 2 obsolete, 44 runtime-required, 0 undocumented.
+(broad-lock callsite census), is documentation rather than lock retirement: 47 callsites
+classified as 0 boot-only, 3 test-only, 0 obsolete, 44 runtime-required, 0 undocumented
+(U1 deleted the two obsolete acquisitions, 49 → 47).
 
 > **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
 > was the only row written without an `N of M` denominator, and the totals silently counted it
@@ -1310,7 +1311,8 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    wiring.
 5. **`FutexWait` off-lock seams landed helper-only** and were never wired.
 6. **Reply-timeout scan is off-lock on x86_64 only**; `IpcSend` and `IpcCall` timeouts are
-   untouched; the broad fallback `run_reply_timeout_completion` survives (199E).
+   untouched. U1 deleted the callerless `SharedKernel::run_reply_timeout_completion` wrapper,
+   but the in-lock scan and its completion body remain on every architecture (199E).
 7. **RISC-V `ExitCurrentTask` live cell** — kernel chain proven correct, runner bound
    corrected at `5488d8e`, re-run never executed (202D).
 8. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures** — keeps
@@ -1540,7 +1542,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **49** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **47** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there

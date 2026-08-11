@@ -13,7 +13,7 @@ use crate::kernel::lock::SpinLock;
 use crate::kernel::lock::SpinLockGuard;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::task::{FaultPolicy, TaskClass};
-use crate::kernel::trap::{FaultInfo, Trap};
+use crate::kernel::trap::FaultInfo;
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::{PAGE_SIZE, VirtAddr, VmError};
 #[cfg(any(debug_assertions, test))]
@@ -3545,18 +3545,6 @@ impl SharedKernel {
         Some(Ok(()))
     }
 
-    pub fn handle_trap_with_cpu(
-        &self,
-        cpu: CpuId,
-        trap: Trap,
-        frame: Option<&mut TrapFrame>,
-    ) -> Result<(), TrapHandleError> {
-        let result = self
-            .with_cpu(cpu, |kernel| kernel.handle_trap(trap, frame))
-            .map_err(|err| TrapHandleError::Syscall(err.into()))?;
-        result
-    }
-
     pub fn control_plane_set_process_cnode_slots_via_syscall(
         &self,
         target_pid: u64,
@@ -4916,34 +4904,17 @@ impl SharedKernel {
         self.with(|k| k.task_home_cpu(tid))
     }
 
-    // ── Stage 200C1: production reply-receive timeout completion transaction ─────
+    // ── Stage 200C1: reply-receive timeout completion transaction ────────────────
     //
-    // One OWNED, ordered completion plan composed of SHORT bounded domain claims —
-    // the deadline-queue claim, the terminal-ownership claim, the endpoint-waiter
-    // claim, the task-result completion and the scheduler enqueue are each acquired
-    // and released separately (never one broad critical section held across them,
-    // and never the deadline store lock held while claiming the waiter, mutating
-    // task state, invalidating reply aliases or enqueuing). No user-memory copy is
-    // performed. The scheduler enqueue is LAST and non-fallible.
-
-    /// Run the reply-receive timeout completion transaction for a due deadline token
-    /// (its exact `DeadlineTokenHandle`). The deadline QUEUE does not decide that
-    /// timeout won: this claims the exact due token, then the Timeout terminal
-    /// ownership, and only if BOTH succeed does it install the canonical timeout
-    /// result and wake the caller — with the terminal outcome `Completed(Timeout)`
-    /// and the reply aliases non-invokable BEFORE the enqueue.
-    ///
-    /// Stage 200C2A: this is a thin wrapper that runs the SINGLE completion body
-    /// (`KernelState::run_reply_timeout_completion_locked`) under the broad lock — so
-    /// the hosted proof and the production timer scan share ONE body (no duplication).
-    /// The scan calls the `_locked` body directly (it already holds the broad lock).
-    pub(crate) fn run_reply_timeout_completion(
-        &self,
-        handle: &crate::kernel::deadline_token::DeadlineTokenHandle,
-        now_tick: u64,
-    ) -> ReplyTimeoutOutcome {
-        self.with(|k| k.run_reply_timeout_completion_locked(handle, now_tick))
-    }
+    // The single completion body is `KernelState::run_reply_timeout_completion_locked`
+    // (`kernel/boot/ipc_state.rs`), which delegates to the arch-neutral
+    // `complete_reply_timeout_over`. U1 deleted the obsolete `SharedKernel`
+    // broad-lock wrapper that used to sit here: it had no production caller — the
+    // in-lock timer scan calls the `_locked` body directly (it already holds the
+    // broad lock) and the accepted off-lock composition below runs the same body.
+    // The body itself is unchanged, and broad reply-timeout processing has NOT
+    // disappeared: the in-lock scan remains, off-lock scanning is x86_64 only, and
+    // canonical 199E stays OPEN.
 
     // ── Stage 200C2B: OFF-LOCK reply-timeout collection + completion ────────────────
 

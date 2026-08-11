@@ -33123,9 +33123,9 @@ mod stage114_d3_vm_brk_shrink_live {
             .find("pub fn try_split_vm_brk_shrink_into_frame")
             .expect("fn present");
         let end = runtime_src[start..]
-            .find("pub fn handle_trap_with_cpu")
+            .find("pub fn control_plane_set_process_cnode_slots_via_syscall")
             .map(|rel| start + rel)
-            .expect("handle_trap_with_cpu must follow");
+            .expect("control_plane_set_process_cnode_slots_via_syscall must follow");
         let body = &runtime_src[start..end];
         assert!(
             !body.contains("self.with("),
@@ -33231,7 +33231,7 @@ mod stage114_d3_vm_brk_shrink_live {
             .find("pub fn try_split_vm_brk_shrink_into_frame")
             .expect("fn present");
         let end = runtime_src[start..]
-            .find("pub fn handle_trap_with_cpu")
+            .find("pub fn control_plane_set_process_cnode_slots_via_syscall")
             .map(|rel| start + rel)
             .expect("next fn present");
         let body = &runtime_src[start..end];
@@ -89462,7 +89462,8 @@ mod stage200c_reply_timeout_transaction {
     fn c04_due_entry_claims_exact_token() {
         let fx = caller_fixture();
         let (idx, rgen, _id, handle) = setup(&fx);
-        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        let out =
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW));
         assert_eq!(out, ReplyTimeoutOutcome::Woken);
         assert_eq!(
             fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
@@ -89477,8 +89478,10 @@ mod stage200c_reply_timeout_transaction {
     fn c05_duplicate_fires_one_owner() {
         let fx = caller_fixture();
         let (_idx, _rgen, _id, handle) = setup(&fx);
-        let first = fx.k.run_reply_timeout_completion(&handle, NOW);
-        let second = fx.k.run_reply_timeout_completion(&handle, NOW);
+        let first =
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW));
+        let second =
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW));
         assert_eq!(first, ReplyTimeoutOutcome::Woken);
         assert_eq!(
             second,
@@ -89498,7 +89501,8 @@ mod stage200c_reply_timeout_transaction {
             "reply wins"
         );
         // The late timeout fire finds the token disarmed / terminal owned → no win.
-        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        let out =
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW));
         assert!(matches!(
             out,
             ReplyTimeoutOutcome::StaleToken | ReplyTimeoutOutcome::LostToTerminal
@@ -89549,7 +89553,7 @@ mod stage200c_reply_timeout_transaction {
         let fx = caller_fixture();
         let (idx, _rgen, identity, handle) = setup(&fx);
         assert_eq!(
-            fx.k.run_reply_timeout_completion(&handle, NOW),
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW)),
             ReplyTimeoutOutcome::Woken
         );
         // A late reply reservation is rejected (terminal owned by timeout).
@@ -89570,7 +89574,7 @@ mod stage200c_reply_timeout_transaction {
         let fx = caller_fixture();
         let (idx, rgen, _id, handle) = setup(&fx);
         assert_eq!(
-            fx.k.run_reply_timeout_completion(&handle, NOW),
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW)),
             ReplyTimeoutOutcome::Woken
         );
         // BEFORE any dispatch: result installed + terminal Completed(Timeout) + reply
@@ -89596,7 +89600,7 @@ mod stage200c_reply_timeout_transaction {
         let fx = caller_fixture();
         let (idx, rgen, identity, handle) = setup(&fx);
         assert_eq!(
-            fx.k.run_reply_timeout_completion(&handle, NOW),
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW)),
             ReplyTimeoutOutcome::Woken
         );
         assert!(
@@ -89613,7 +89617,8 @@ mod stage200c_reply_timeout_transaction {
         let fx = caller_fixture();
         let (idx, rgen, _id, handle) = setup(&fx);
         fx.k.with(|s| s.mark_task_dead(1).expect("caller exits"));
-        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        let out =
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW));
         assert_eq!(out, ReplyTimeoutOutcome::CleanupNoWake);
         // Terminal completed Timeout (cleanup), record invalidated, no wake.
         assert_eq!(
@@ -89664,7 +89669,8 @@ mod stage200c_reply_timeout_transaction {
                 ipc.endpoint_generations[identity.reply_endpoint_index] = ng;
             });
         });
-        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        let out =
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW));
         assert_eq!(
             out,
             ReplyTimeoutOutcome::CleanupNoWake,
@@ -89692,7 +89698,8 @@ mod stage200c_reply_timeout_transaction {
                 )
             });
         });
-        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        let out =
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW));
         assert_eq!(out, ReplyTimeoutOutcome::CleanupNoWake);
         // The replacement waiter is untouched.
         assert!(fx.k.endpoint_waiter_is_split_read(
@@ -89710,7 +89717,8 @@ mod stage200c_reply_timeout_transaction {
         let (_idx, _rgen, _id, handle) = setup(&fx);
         // The caller unblocked + re-blocked (a new recv): brg advances.
         fx.k.with(|s| s.bump_blocked_recv_generation(1));
-        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        let out =
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW));
         assert_eq!(
             out,
             ReplyTimeoutOutcome::CleanupNoWake,
@@ -89739,7 +89747,8 @@ mod stage200c_reply_timeout_transaction {
         });
         assert!(fresh.is_ok());
         // The OLD handle cannot fire the reused slot.
-        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        let out =
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW));
         assert_eq!(out, ReplyTimeoutOutcome::StaleToken);
         teardown();
     }
@@ -89860,7 +89869,7 @@ mod stage200c_reply_timeout_transaction {
         let fx = caller_fixture();
         let (_idx, _rgen, _id, handle) = setup(&fx);
         assert_eq!(
-            fx.k.run_reply_timeout_completion(&handle, NOW),
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW)),
             ReplyTimeoutOutcome::Woken
         );
         // The canonical encoding: ipc_timeout_fired set → consumed → SyscallError::TimedOut.
@@ -89879,7 +89888,7 @@ mod stage200c_reply_timeout_transaction {
         let fx = caller_fixture();
         let (idx, _rgen, _id, handle) = setup(&fx);
         assert_eq!(
-            fx.k.run_reply_timeout_completion(&handle, NOW),
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, NOW)),
             ReplyTimeoutOutcome::Woken
         );
         assert!(
@@ -89934,7 +89943,9 @@ mod stage200c_reply_timeout_transaction {
                         .stack_size(8 * 1024 * 1024)
                         .spawn(move || {
                             b.wait();
-                            let out = k.run_reply_timeout_completion(&handle, NOW);
+                            let out = k.with(|state| {
+                                state.run_reply_timeout_completion_locked(&handle, NOW)
+                            });
                             *timeout_out.lock().unwrap() = Some(out);
                         })
                         .expect("spawn"),
@@ -90093,7 +90104,7 @@ mod stage200c_reply_timeout_seal {
             fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, DEADLINE))
                 .expect("register");
         assert_eq!(
-            fx.k.run_reply_timeout_completion(&handle, 200),
+            fx.k.with(|state| state.run_reply_timeout_completion_locked(&handle, 200)),
             ReplyTimeoutOutcome::Woken
         );
         fx.k.with(|s| {

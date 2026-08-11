@@ -51,10 +51,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **39** |
-| `SharedKernel::with` (broad `&mut KernelState`) | **10** |
+| `SharedKernel::with_cpu` | **38** |
+| `SharedKernel::with` (broad `&mut KernelState`) | **9** |
 | Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
-| **Total broad-lock acquisition sites** | **49** |
+| **Total broad-lock acquisition sites** | **47** |
 
 Canonical Stage **204A** additionally requires each site classified. That classification is
 complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
@@ -63,7 +63,7 @@ complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
 |-------|-------|------|
 | boot-only | **0** | — |
 | test-only | **3** | `runtime.rs:1244`, `1248` (`ipc_recv_with_deadline_split_bridge`), `runtime.rs:2654` |
-| obsolete | **2** | `runtime.rs:2644` (`handle_trap_with_cpu`, **no in-tree caller at all**); `runtime.rs:3725` (`run_reply_timeout_completion`, superseded by `OffLockReplyTimeout`) |
+| obsolete | **0** | U1 deleted both (`handle_trap_with_cpu`, no in-tree caller at all; `run_reply_timeout_completion`, no production caller) |
 | runtime-required | **44** | the real retirement surface |
 | undocumented | **0** | every site enumerated with file, line and enclosing function |
 
@@ -130,7 +130,7 @@ allocator. The residual correctness risk is therefore lock-domain **ordering** a
 |----------|------|---------|
 | Default-deny split dispatch | `src/kernel/syscall_split.rs:885` (`_ => None`) | every non-whitelisted syscall |
 | In-helper decline → broad lock | the four `try_split_*_into_frame` helpers return `None` for cases they cannot service | narrow-case miss |
-| Reply-timeout broad completion | `src/runtime.rs:3725` `run_reply_timeout_completion_locked` | non-x86_64, or off the off-lock collector |
+| Reply-timeout broad completion | `KernelState::run_reply_timeout_completion_locked` (`kernel/boot/ipc_state.rs`), called by the in-lock timer scan | non-x86_64, or off the off-lock collector |
 | Drain `reason=state_changed` | `src/arch/trap_entry.rs:445, 521, 876` | post-drain re-verify failed |
 | `d6_genuine_enabled()` compile-time false | `src/kernel/boot/mod.rs:766` | **AArch64 and RISC-V, always** |
 
