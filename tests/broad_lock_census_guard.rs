@@ -26,7 +26,10 @@ use std::path::{Path, PathBuf};
 
 /// Per-file count of production `SharedKernel::with_cpu` callsites.
 const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
-    ("src/arch/riscv64/trap.rs", 8),
+    // U3 (203C): 8 -> 7. The post-lock foundation-oracle drain reads the current task
+    // through the authoritative rank-1 scheduler seam (`current_tid_split_read`) instead of
+    // re-acquiring the broad lock. Read-only drain; the other RISC-V drains are untouched.
+    ("src/arch/riscv64/trap.rs", 7),
     // Stage 199D: 12 -> 11. The AArch64 handled-split return path no longer reacquires the
     // broad lock to finalize a syscall; it uses two bounded rank-2 task-domain transactions
     // (exact-incarnation TLS take, exact-incarnation context commit) instead.
@@ -71,7 +74,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 38; // U1: 39 -> 38 (obsolete `handle_trap_with_cpu` deleted)
+const AUDITED_WITH_CPU_TOTAL: usize = 37; // U3: 38 -> 37 (RISC-V foundation-oracle drain)
 const AUDITED_WITH_BROAD_TOTAL: usize = 6; // U2: 9 -> 6 (three test-only acquisitions relocated)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -80,7 +83,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 44;
+const CLASS_RUNTIME_REQUIRED: usize = 43; // U3: 44 -> 43 (first drain retired onto its seam)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

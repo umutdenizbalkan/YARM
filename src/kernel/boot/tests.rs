@@ -72459,11 +72459,42 @@ mod stage196a_riscv_shared_trap_foundation {
                 "foundation oracle must emit marker: {m}"
             );
         }
-        // The lock-dropped proof must be a REAL re-acquire of with_cpu after the drain.
+        // U3 (canonical 203C): the drain no longer proves lock-drop by re-acquiring the broad
+        // lock — its source position does, and the current task is read through the
+        // authoritative rank-1 scheduler seam. Assert on the drain body itself, so a future
+        // edit cannot quietly reintroduce a broad acquisition here.
+        let drain = RISCV_TRAP_SRC
+            .split("// Foundation-oracle DRAIN")
+            .nth(1)
+            .and_then(|s| {
+                s.split("RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG")
+                    .next()
+            })
+            .expect("the foundation-oracle drain");
         assert!(
-            RISCV_TRAP_SRC.contains("Lock-dropped proof: this re-acquire is only possible")
-                && RISCV_TRAP_SRC.contains(".with_cpu(cpu, |kernel| kernel.current_tid())"),
-            "lock-dropped proof must genuinely re-acquire with_cpu (deadlocks if still held)"
+            !drain.contains(".with_cpu("),
+            "the foundation-oracle drain must acquire no broad lock"
+        );
+        assert!(
+            !drain.contains("shared.with(|") && !drain.contains(".with(|state|"),
+            "the foundation-oracle drain must not take the broad lock in the `with` form either"
+        );
+        assert!(
+            drain.contains("shared.current_tid_split_read(cpu)"),
+            "the drain must read the current task through the rank-1 scheduler seam"
+        );
+        // No broad-lock fallback if the split read declines: `None` stays `None`.
+        assert!(
+            !drain.contains("unwrap_or_else") && !drain.contains("current_tid_authoritative"),
+            "the drain must not fall back to a broad-lock read when the split read returns None"
+        );
+        // Same-task vs task-switched outcome semantics are unchanged by the seam swap.
+        assert!(
+            drain.contains("if current_after == Some(published_tid)")
+                && drain.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_USER_RETURN_OK tid=")
+                && drain.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=ok")
+                && drain.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=task_switched"),
+            "the oracle's same-task and task-switched outcomes must retain their semantics"
         );
         // Publish stores only the tid token (a biased atomic), and the drain consumes it via swap
         // + a read-only current_tid re-read — no scheduler/cap/user mutation.

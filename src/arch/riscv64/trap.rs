@@ -660,19 +660,29 @@ pub fn handle_riscv_trap_entry_shared(
     // the same reason the collector above is — one driver per port.
     let _ = shared.drain_server_death_post_work(cpu);
 
-    // Foundation-oracle DRAIN — consume the token published in-lock, proving the
-    // outer guard is genuinely dropped by RE-ACQUIRING `with_cpu` here (a held
-    // guard would deadlock). Reads only `current_tid`; performs no mutation.
+    // Foundation-oracle DRAIN — consume the token published in-lock and re-read the
+    // current task. Reads only the scheduler's per-CPU current slot; performs no mutation.
+    //
+    // U3 (canonical 203C): this drain no longer re-acquires the broad lock. Its source
+    // position is what proves the outer guard is gone — Phase 2's `with_cpu(cpu, …)`
+    // closure has already returned above, so there is no broad `&mut KernelState` alive
+    // here, and `cpu` is explicit and authoritative at this boundary. The current task is
+    // now read through the authoritative rank-1 scheduler seam instead.
+    //
+    // The read is the same read: `with_cpu(cpu, |k| k.current_tid())` set `current_cpu =
+    // cpu` and then resolved `scheduler.current_tid_on(current_cpu)` under the scheduler
+    // lock; `current_tid_split_read(cpu)` resolves `scheduler.current_tid_on(cpu)` under
+    // that same rank-1 lock, without the broad guard and without re-setting `current_cpu`
+    // (Phase 2 already set it to this `cpu`). Any preceding post-lock dispatch, timeout or
+    // server-death work above is visible because the split read happens at the same program
+    // boundary and serializes on the scheduler domain. `None` stays `None` — an offline or
+    // unknown CPU yields `None` exactly as the old `.ok().flatten()` did, and there is
+    // deliberately NO broad-lock fallback if the read declines.
     if oracle_arm && cpu_idx < MAX_CPUS {
         let token = RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx].swap(0, Ordering::AcqRel);
         if token != 0 {
             let published_tid = token.wrapping_sub(1);
-            // Lock-dropped proof: this re-acquire is only possible because the
-            // broad guard above was released — a still-held guard deadlocks here.
-            let current_after = shared
-                .with_cpu(cpu, |kernel| kernel.current_tid())
-                .ok()
-                .flatten();
+            let current_after = shared.current_tid_split_read(cpu);
             crate::yarm_log!(
                 "RISCV_POST_LOCK_FOUNDATION_ORACLE_LOCK_DROPPED_OK cpu={}",
                 cpu.0
