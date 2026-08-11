@@ -14046,9 +14046,28 @@ fn init_shared_static_does_not_install_trap_state() {
 //
 // Part A: verify ipc_recv_until_deadline behaves identically to
 // ipc_recv_with_deadline for immediate sends and timer-tick wakeups.
-// Part B: verify the split-bridge helper (SharedKernel::ipc_recv_with_deadline_split_bridge)
-// does not nest a SharedKernel::with inside an already-held lock — call it
-// from outside any lock and assert the result is consistent with the direct path.
+// Part B: verify the split-bridge helper does not nest a SharedKernel::with inside an
+// already-held lock — call it from outside any lock and assert the result is consistent
+// with the direct path.
+//
+// U2: this helper used to be `SharedKernel::ipc_recv_with_deadline_split_bridge` in
+// `src/runtime.rs`. It was never a trap-seam path and had no production caller, so its two
+// broad-lock acquisitions were pure test cost inside the 204A census. The logic is
+// reproduced verbatim here (minus a log marker that nothing referenced), in a whole-file
+// test module the census excludes by filename, so these two tests keep their exact
+// coverage without charging production for it.
+fn ipc_recv_with_deadline_split_bridge(
+    shared: &crate::runtime::SharedKernel,
+    recv_cap: CapId,
+    timeout_ticks: u64,
+) -> Result<Option<Message>, KernelError> {
+    if timeout_ticks == 0 {
+        return shared.with(|state| state.try_ipc_recv(recv_cap));
+    }
+    let now = shared.scheduler_tick_now_split_read();
+    let deadline = now.wrapping_add(timeout_ticks);
+    shared.with(|state| state.ipc_recv_until_deadline(recv_cap, deadline))
+}
 
 #[test]
 fn ipc_recv_until_deadline_with_queued_message_succeeds_immediately() {
@@ -14170,7 +14189,7 @@ fn ipc_recv_with_deadline_split_bridge_returns_none_when_no_sender() {
             let shared = SharedKernel::new(Bootstrap::init().expect("init"));
             let (_eid, _send_cap, recv_cap) =
                 shared.with(|s| s.create_endpoint(2)).expect("endpoint");
-            let result = shared.ipc_recv_with_deadline_split_bridge(recv_cap, 1);
+            let result = ipc_recv_with_deadline_split_bridge(&shared, recv_cap, 1);
             assert!(
                 result.is_ok(),
                 "split bridge must not error with a valid cap"
@@ -14193,7 +14212,7 @@ fn ipc_recv_with_deadline_split_bridge_zero_ticks_returns_none() {
             let shared = SharedKernel::new(Bootstrap::init().expect("init"));
             let (_eid, _send_cap, recv_cap) =
                 shared.with(|s| s.create_endpoint(2)).expect("endpoint");
-            let result = shared.ipc_recv_with_deadline_split_bridge(recv_cap, 0);
+            let result = ipc_recv_with_deadline_split_bridge(&shared, recv_cap, 0);
             assert!(result.is_ok(), "zero-tick split bridge must not error");
             assert_eq!(result.unwrap(), None, "no sender; must return None");
         })
@@ -33123,9 +33142,9 @@ mod stage114_d3_vm_brk_shrink_live {
             .find("pub fn try_split_vm_brk_shrink_into_frame")
             .expect("fn present");
         let end = runtime_src[start..]
-            .find("pub fn control_plane_set_process_cnode_slots_via_syscall")
+            .find("pub fn task_asid_for_tid_split_read")
             .map(|rel| start + rel)
-            .expect("control_plane_set_process_cnode_slots_via_syscall must follow");
+            .expect("task_asid_for_tid_split_read must follow");
         let body = &runtime_src[start..end];
         assert!(
             !body.contains("self.with("),
@@ -33231,7 +33250,7 @@ mod stage114_d3_vm_brk_shrink_live {
             .find("pub fn try_split_vm_brk_shrink_into_frame")
             .expect("fn present");
         let end = runtime_src[start..]
-            .find("pub fn control_plane_set_process_cnode_slots_via_syscall")
+            .find("pub fn task_asid_for_tid_split_read")
             .map(|rel| start + rel)
             .expect("next fn present");
         let body = &runtime_src[start..end];

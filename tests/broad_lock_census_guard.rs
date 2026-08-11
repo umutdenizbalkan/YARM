@@ -52,7 +52,10 @@ const EXPECTED_WITH_BROAD: &[(&str, usize)] = &[
     // U1: 8 -> 7. The obsolete `SharedKernel::run_reply_timeout_completion` wrapper had no
     // production caller and was deleted; the single completion body
     // (`KernelState::run_reply_timeout_completion_locked`) is unchanged.
-    ("src/runtime.rs", 7),
+    // U2: 7 -> 4. The two test-only helpers were relocated into test-only modules:
+    // `ipc_recv_with_deadline_split_bridge` (2 acquisitions) and the
+    // `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1).
+    ("src/runtime.rs", 4),
 ];
 
 /// Per-file count of raw `self.state.lock()` sites. All three are the bodies of
@@ -69,13 +72,13 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
 const AUDITED_WITH_CPU_TOTAL: usize = 38; // U1: 39 -> 38 (obsolete `handle_trap_with_cpu` deleted)
-const AUDITED_WITH_BROAD_TOTAL: usize = 9; // U1: 10 -> 9 (obsolete reply-timeout wrapper deleted)
+const AUDITED_WITH_BROAD_TOTAL: usize = 6; // U2: 9 -> 6 (three test-only acquisitions relocated)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
 
 /// Stage 204A classification totals, as published in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
 const CLASS_BOOT_ONLY: usize = 0;
-const CLASS_TEST_ONLY: usize = 3;
+const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
 const CLASS_RUNTIME_REQUIRED: usize = 44;
 

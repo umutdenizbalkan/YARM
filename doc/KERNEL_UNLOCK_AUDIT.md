@@ -128,9 +128,9 @@ lines excluded.
 | Category | Production callsites |
 |----------|---------------------|
 | `SharedKernel::with_cpu` | **38** |
-| `SharedKernel::with` (broad `&mut KernelState`) | **9** |
+| `SharedKernel::with` (broad `&mut KernelState`) | **6** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **47** |
+| **Total broad-lock acquisition sites** | **44** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
@@ -165,13 +165,10 @@ Structural reading of those 40:
 > replacement — unlike the drains above it takes no `with_cpu` at all — so this table is
 > unchanged at 40 across that increment.
 
-### 1.4 Broad `.with(|state| …)` — 9 production callsites
+### 1.4 Broad `.with(|state| …)` — 6 production callsites
 
 | File | Line | Purpose |
 |------|------|---------|
-| `src/runtime.rs` | 1244 | `try_ipc_recv` fallback (hosted/non-deadline path) |
-| `src/runtime.rs` | 1248 | `ipc_recv_until_deadline` |
-| `src/runtime.rs` | 2654 | trap handling helper |
 | `src/runtime.rs` | 3696 | `task_home_cpu` read |
 | `src/runtime.rs` | 4013 | `reply_timeout_token_for_caller` read |
 | `src/runtime.rs` | 4017 | `disarm_deadline_after_terminal_completion` |
@@ -202,18 +199,21 @@ Enclosing functions were resolved mechanically from source.
 | Class | Count |
 |-------|-------|
 | boot-only | **0** |
-| test-only | **3** |
+| test-only | **0** |
 | obsolete | **0** |
 | runtime-required | **44** |
 | undocumented | **0** |
 
-#### test-only (3)
+#### test-only (0)
 
-| Site | Enclosing fn | Why |
-|------|--------------|-----|
-| `runtime.rs:1244` | `ipc_recv_with_deadline_split_bridge` | only callers are in `src/kernel/boot/tests.rs`; the helper's own doc says "falls back to global lock for recv; **not a standalone trap-seam path**" |
-| `runtime.rs:1248` | `ipc_recv_with_deadline_split_bridge` | same helper, deadline arm |
-| `runtime.rs:2654` | `control_plane_set_process_cnode_slots_via_syscall` | the `SharedKernel` wrapper's only callers are in the `runtime.rs` test module (lines 4962, 4986, 5495, 5682); production NR 8 goes through `control_plane_set_process_cnode_slots_split_mut` |
+**None.** U2 relocated all three into test-only modules the census excludes:
+`ipc_recv_with_deadline_split_bridge` (2 acquisitions — never a trap-seam path, only hosted
+callers) moved to `src/kernel/boot/tests.rs`, and the
+`SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1 acquisition —
+only callers were `runtime.rs`'s own test module) became a helper inside that
+`#[cfg(test)] mod tests`. The tests keep their exact coverage; production NR 8 is unchanged
+on `control_plane_set_process_cnode_slots_split_mut`, and the `KernelState` method of the
+same name is untouched.
 
 #### obsolete (0)
 
@@ -455,7 +455,7 @@ counts as done:
 
 | Stage | Scope | Status | Evidence and gap |
 |-------|-------|--------|------------------|
-| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 47 callsites enumerated with file, line and enclosing function. **0 boot-only, 3 test-only, 0 obsolete, 44 runtime-required, 0 undocumented.** (Stage 199D retired the AArch64 handled-split syscall return; U1 deleted the two obsolete acquisitions, 49 → 47.) Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (6 tests), which recomputes the census from source and fails on any added or removed production callsite. |
+| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 44 callsites enumerated with file, line and enclosing function. **0 boot-only, 0 test-only, 0 obsolete, 44 runtime-required, 0 undocumented.** (Stage 199D retired the AArch64 handled-split syscall return; U1 deleted the two obsolete acquisitions, 49 → 47; U2 relocated the three test-only ones, 47 → 44. The census is now exactly the runtime-required set.) Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (6 tests), which recomputes the census from source and fails on any added or removed production callsite. |
 | **204B** | Decompose `KernelState` ownership; `SharedKernel` may remain a container but must not serialize the kernel | **OPEN** — partial foundation | 11 ranked domain locks and a full seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`. |
 | **204C** | Remove fallback-to-global handlers | **OPEN** | Five families live: default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding | **OPEN** | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, one-shot class logging and the foundation oracles are all live. |

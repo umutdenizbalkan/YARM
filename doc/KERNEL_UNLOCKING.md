@@ -53,9 +53,11 @@ This file has exactly one status page: §0.3.
 Three methods acquire it — `lock` (test-only), `with`, `with_cpu`. Full unlock = no runtime
 guard exists (canonical **204E**), sealed cross-architecture (canonical **205D**).
 
-Current census: **47** production callsites — **38** through `with_cpu` and **9** through the
-broad `with(|state| …)` form — classified **44 runtime-required**, 3 test-only, 0 obsolete,
-0 boot-only. See §0.5. U1 deleted the two obsolete acquisitions (49 → 47). The three raw `self.state.lock()` sites are the bodies of `lock` /
+Current census: **44** production callsites — **38** through `with_cpu` and **6** through the
+broad `with(|state| …)` form — classified **44 runtime-required**, 0 test-only, 0 obsolete,
+0 boot-only. See §0.5. U1 deleted the two obsolete acquisitions (49 → 47) and U2 relocated the
+three test-only ones (47 → 44), so the census is now exactly the runtime-required set: every
+counted acquisition is one a real boot performs. The three raw `self.state.lock()` sites are the bodies of `lock` /
 `with` / `with_cpu` themselves, not callsites, and are deliberately excluded from the total.
 These figures are recomputed from source by `tests/broad_lock_census_guard.rs`, which fails if
 the tree and the published census drift apart.
@@ -127,7 +129,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 
 | Stage | Definition | Status | Evidence / what is missing |
 |-------|-----------|--------|----------------------------|
-| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 47 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 3 test-only, 0 obsolete, 44 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
+| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 44 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 0 test-only, 0 obsolete, 44 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
 | **204B** | Decompose `KernelState` ownership into per-CPU / task / scheduler / IPC / capability / VM / timer / IRQ / boot components. `SharedKernel` may remain a container but must not serialize the whole kernel. | **OPEN** (partial foundation) | `KernelState` already carries 11 ranked domain locks and a full set of `*_split_mut` / `*_split_read` seams — the substrate exists. But `with_cpu` still forms a broad `&mut KernelState`, so the container still serializes the kernel. |
 | **204C** | Remove fallback-to-global handlers. An unsupported configuration must use an explicitly supported localized path or fail with a clear diagnostic — never reacquire the monolithic lock. | **OPEN** | Five fallback families live: the default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, the drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, retirement-enable flags, old fallback dispatch, class-specific one-shot logging, obsolete foundation oracles, compatibility drain branches. Keep validation oracles, but validating production paths rather than enabling them. | **OPEN** | All of the named scaffolding is live. |
@@ -174,13 +176,13 @@ census (204A), which is documentation, not lock retirement.
 | Class | Count | Sites |
 |-------|-------|-------|
 | boot-only | **0** | — |
-| test-only | **3** | `runtime.rs:1244`, `runtime.rs:1248` (`ipc_recv_with_deadline_split_bridge` — only test callers; its own doc says "not a standalone trap-seam path"); `runtime.rs:2654` (`control_plane_set_process_cnode_slots_via_syscall` — only test callers) |
+| test-only | **0** | none — U2 relocated all three into test-only modules the census excludes: `ipc_recv_with_deadline_split_bridge` (2 acquisitions, never a trap-seam path) and the `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1) |
 | obsolete | **0** | none — U1 deleted both (`SharedKernel::handle_trap_with_cpu`, which had no in-tree caller at all, and `SharedKernel::run_reply_timeout_completion`, which had no production caller) |
 | runtime-required | **44** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), the AArch64 split return path (`trap_entry.rs:1432`), 2 identity snapshots, 6 x86_64 AP paths, RISC-V resume, thread creation, and the recv/delivery boundary re-acquires |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
 
-Classified total: **47** acquisition callsites (**38** `with_cpu` + **9** broad `with`), which
-is 0 + 3 + 0 + 44. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
+Classified total: **44** acquisition callsites (**38** `with_cpu` + **6** broad `with`), which
+is 0 + 0 + 0 + 44. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
 
 ### 0.6 Structural blockers
 
@@ -205,38 +207,52 @@ is 0 + 3 + 0 + 44. `tests/broad_lock_census_guard.rs` recomputes all of these fr
 
 ### 0.7 Smallest next production stage
 
-These actions are **census subtractions**: they delete broad-lock callsites that no production
-path takes. They are numbered unlocking directives, not canonical stages — the canonical stage
-definitions in §0.3 are unchanged, and neither U1 nor U2 renames, replaces, or adds one.
+U1 and U2 were **census subtractions**: they removed broad-lock callsites that no production
+path took. They were numbered unlocking directives, not canonical stages — the canonical stage
+definitions in §0.3 are unchanged, and none of U1/U2/U3 renames, replaces, or adds one.
 
 **U1 — DELIVERED.** Deleted the two **obsolete** broad-lock callsites: the
 `SharedKernel::handle_trap_with_cpu` wrapper (no in-tree caller at all) and the
 `SharedKernel::run_reply_timeout_completion` wrapper (no production caller; the off-lock
 `OffLockReplyTimeout` composition superseded it). Neither was reachable from a live path, so
-the deletions changed no runtime behavior. Census **49 → 47**; classification now 0 boot-only /
-3 test-only / **0 obsolete** / 44 runtime-required. What U1 did **not** do: it did not touch
-`KernelState::run_reply_timeout_completion_locked` (the single completion body), did not alter
-the accepted `OffLockReplyTimeout` production composition, and did not port the AArch64/RISC-V
-reply-timeout scans off-lock. Broad reply-timeout processing still happens on every
-architecture through the in-lock scan; canonical **199E** remains **OPEN**.
+the deletions changed no runtime behavior. Census **49 → 47**. What U1 did **not** do: it did
+not touch `KernelState::run_reply_timeout_completion_locked` (the single completion body), did
+not alter the accepted `OffLockReplyTimeout` production composition, and did not port the
+AArch64/RISC-V reply-timeout scans off-lock. Broad reply-timeout processing still happens on
+every architecture through the in-lock scan; canonical **199E** remains **OPEN**.
 
-**U2 — the next directive.** Remove the three **test-only** callsites from the production
-census:
-`runtime.rs:1244` and `runtime.rs:1248` (`ipc_recv_with_deadline_split_bridge`) and
-`runtime.rs:2654` (`control_plane_set_process_cnode_slots_via_syscall`) — each has only test
-callers. Expected census: **47 → 44**, leaving the census exactly the runtime-required set.
+**U2 — DELIVERED.** Removed the three **test-only** acquisitions from the production census by
+relocating their helpers into test-only modules the census excludes:
+`ipc_recv_with_deadline_split_bridge` (2 acquisitions — never a trap-seam path, only hosted
+callers) now lives in `src/kernel/boot/tests.rs`, and the
+`SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1 acquisition — only
+callers were `runtime.rs`'s own test module) is now a helper inside that `#[cfg(test)] mod
+tests`. The tests keep their exact coverage. Census **47 → 44**; classification now 0 boot-only
+/ **0 test-only** / 0 obsolete / 44 runtime-required. What U2 did **not** do: production NR 8
+still goes through `control_plane_set_process_cnode_slots_split_mut`, the `KernelState` method
+of the same name is untouched, and no production behavior changed — U2 subtracted source, not
+runtime work.
 
-Together U1 and U2 make the published total mean one thing only: broad-lock acquisitions that
-a real boot actually performs. They serve **204C** / **204D** / **204E**; they do not complete
-any of them, and they retire no runtime-required site. After U2 the census is exactly the 44
-runtime-required acquisitions, and every further subtraction must retire real runtime work.
+**The census now means one thing only:** broad-lock acquisitions a real boot actually performs.
+There is no longer any dead or test-only weight in the total, so **every further subtraction
+must retire real runtime work.** U1 and U2 served **204C** / **204D** / **204E** without
+completing any of them.
+
+**U3 — the next directive, starting from 44.** Promote the existing rank-1 (scheduler) and
+rank-2 (task) seams from compatibility helpers to **authoritative**, and delete each
+corresponding post-lock drain re-acquisition **in the same PR** — a seam that is authoritative
+while its drain survives has retired nothing. Roughly 20 of the 44 runtime-required sites are
+exactly those drain re-acquisitions (§0.5), so the target is **44 → approximately 24**. This is
+the work canonical **203C** defines; U3 advances it and does not complete it, and completing
+203C additionally requires `d6_genuine_enabled()` to stop being compile-time x86_64-only
+(§0.6 blocker 3).
 
 **Standalone WA3C2 waiter-semantics investigation is *not* the next roadmap action.** It may
 resume only when it is tied to a numbered unlocking directive **and** a specific callsite
 retirement. Waiter-semantics work that retires no callsite does not move the one measurable
-definition in §0.1, and must not be scheduled ahead of U2 on its own.
+definition in §0.1, and must not be scheduled ahead of U3 on its own.
 
-**Safety fact that U1 preserved and U2 must preserve.** `ipccall_direct_production_enabled()`
+**Safety fact that U1 and U2 preserved and U3 must preserve.** `ipccall_direct_production_enabled()`
 (`src/kernel/boot/mod.rs:3222`) returns `false` on **every** architecture (Stage
 199D-WA1-GATE). Ordinary NR 6 / NR 7 traffic is admitted to the off-lock direct path on no
 architecture and takes the accepted legacy path; only an explicitly armed proof/oracle selector

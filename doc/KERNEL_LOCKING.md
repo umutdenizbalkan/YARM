@@ -52,9 +52,9 @@ lines excluded.
 | Category | Production callsites |
 |----------|---------------------|
 | `SharedKernel::with_cpu` | **38** |
-| `SharedKernel::with` (broad `&mut KernelState`) | **9** |
+| `SharedKernel::with` (broad `&mut KernelState`) | **6** |
 | Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
-| **Total broad-lock acquisition sites** | **47** |
+| **Total broad-lock acquisition sites** | **44** |
 
 Canonical Stage **204A** additionally requires each site classified. That classification is
 complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
@@ -62,7 +62,7 @@ complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
 | Class | Count | Note |
 |-------|-------|------|
 | boot-only | **0** | — |
-| test-only | **3** | `runtime.rs:1244`, `1248` (`ipc_recv_with_deadline_split_bridge`), `runtime.rs:2654` |
+| test-only | **0** | U2 relocated all three into test-only modules (`ipc_recv_with_deadline_split_bridge` ×2; the `SharedKernel` control-plane cnode-slots wrapper ×1) |
 | obsolete | **0** | U1 deleted both (`handle_trap_with_cpu`, no in-tree caller at all; `run_reply_timeout_completion`, no production caller) |
 | runtime-required | **44** | the real retirement surface |
 | undocumented | **0** | every site enumerated with file, line and enclosing function |

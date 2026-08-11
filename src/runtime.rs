@@ -2141,22 +2141,12 @@ impl SharedKernel {
         })
     }
 
-    /// # Validation status
-    /// - LIVE_OFF_TRAP — pre-reads scheduler tick, then falls back to global lock for recv;
-    ///   not a standalone trap-seam path.
-    pub fn ipc_recv_with_deadline_split_bridge(
-        &self,
-        recv_cap: CapId,
-        timeout_ticks: u64,
-    ) -> Result<Option<Message>, KernelError> {
-        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2D path=ipc_recv_timeout_deadline_bridge");
-        if timeout_ticks == 0 {
-            return self.with(|state| state.try_ipc_recv(recv_cap));
-        }
-        let now = self.scheduler_tick_now_split_read();
-        let deadline = now.wrapping_add(timeout_ticks);
-        self.with(|state| state.ipc_recv_until_deadline(recv_cap, deadline))
-    }
+    // U2: `ipc_recv_with_deadline_split_bridge` used to sit here. It was never a
+    // trap-seam path — its own doc said so — and its only callers were hosted tests,
+    // so its two broad-lock acquisitions (zero-timeout `try_ipc_recv`, deadline
+    // `ipc_recv_until_deadline`) were pure test cost carried in the production census.
+    // The helper now lives beside the two tests that need it, in
+    // `kernel/boot/tests.rs`. No production path changed: nothing called it.
 
     /// # Validation status
     /// - LIVE_TRAP_SMOKE_X86_64 (Stage 32B) — now wired into the live trap seam via
@@ -3545,15 +3535,12 @@ impl SharedKernel {
         Some(Ok(()))
     }
 
-    pub fn control_plane_set_process_cnode_slots_via_syscall(
-        &self,
-        target_pid: u64,
-        slot_capacity: usize,
-    ) -> Result<(), TrapHandleError> {
-        self.with(|state| {
-            state.control_plane_set_process_cnode_slots_via_syscall(target_pid, slot_capacity)
-        })
-    }
+    // U2: the `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper
+    // used to sit here. Its only callers were this file's own hosted tests, so its broad
+    // acquisition was pure test cost in the production census. Production NR 8 is
+    // unchanged: it goes through `control_plane_set_process_cnode_slots_split_mut`. The
+    // `KernelState` method of the same name (`kernel/boot/fault_state.rs`) is untouched;
+    // the tests now reach it through `SharedKernel::with` in the test module below.
 
     pub fn task_asid_for_tid_split_read(&self, tid: u64) -> u64 {
         // Stage 4T+7 split-read: acquires task_state_lock (rank 2) only.
@@ -6212,6 +6199,22 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    /// U2: the production `SharedKernel::control_plane_set_process_cnode_slots_via_syscall`
+    /// wrapper was deleted (its only callers were these tests, so its broad-lock
+    /// acquisition was pure test cost in the 204A census). This test-local helper enters
+    /// the SAME untouched `KernelState` method through `SharedKernel::with`, so the tests
+    /// below exercise exactly the behavior they did before. It lives inside
+    /// `#[cfg(test)] mod tests`, past the census cutoff, so it adds no census entry.
+    fn control_plane_set_process_cnode_slots_via_syscall(
+        kernel: &SharedKernel,
+        target_pid: u64,
+        slot_capacity: usize,
+    ) -> Result<(), TrapHandleError> {
+        kernel.with(|state| {
+            state.control_plane_set_process_cnode_slots_via_syscall(target_pid, slot_capacity)
+        })
+    }
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::scheduler::CpuId;
@@ -6428,9 +6431,7 @@ mod tests {
             (cnode, before)
         });
         let requested = before.saturating_add(4);
-        kernel
-            .control_plane_set_process_cnode_slots_via_syscall(901, requested)
-            .expect("resize");
+        control_plane_set_process_cnode_slots_via_syscall(&kernel, 901, requested).expect("resize");
         let after = kernel.with(|state| state.cnode_slot_capacity(target_cnode));
         assert_eq!(after, Some(requested));
     }
@@ -6452,8 +6453,7 @@ mod tests {
             }
         });
 
-        let err = kernel
-            .control_plane_set_process_cnode_slots_via_syscall(911, 8)
+        let err = control_plane_set_process_cnode_slots_via_syscall(&kernel, 911, 8)
             .expect_err("must deny");
         assert_eq!(
             err,
@@ -6961,8 +6961,7 @@ mod tests {
             }
         });
         let requested_slots = 8usize;
-        kernel
-            .control_plane_set_process_cnode_slots_via_syscall(521, requested_slots)
+        control_plane_set_process_cnode_slots_via_syscall(&kernel, 521, requested_slots)
             .expect("create cnode");
 
         // After creation: split-read matches global.
@@ -7148,9 +7147,7 @@ mod tests {
                 state.yield_current().expect("switch");
             }
         });
-        kernel
-            .control_plane_set_process_cnode_slots_via_syscall(621, 8)
-            .expect("create cnode");
+        control_plane_set_process_cnode_slots_via_syscall(&kernel, 621, 8).expect("create cnode");
 
         let after_global = kernel.with(|state| {
             use crate::kernel::capabilities::CNodeId;
