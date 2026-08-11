@@ -42,6 +42,8 @@ Directive labels are stable across stages:
 > retained as historical design record; they are accurate about *mechanisms* and are **not**
 > a status page. Per-callsite evidence: `doc/KERNEL_UNLOCK_AUDIT.md`.
 
+This file has exactly one status page: §0.3.
+
 **Baseline:** commit `757993b` + this repair branch, tree audited at
 `1118b61b74588e73b0dc235dc96086ec7488257c`.
 
@@ -51,8 +53,12 @@ Directive labels are stable across stages:
 Three methods acquire it — `lock` (test-only), `with`, `with_cpu`. Full unlock = no runtime
 guard exists (canonical **204E**), sealed cross-architecture (canonical **205D**).
 
-Current census: **51** production callsites — **46 runtime-required**, 3 test-only,
-2 obsolete, 0 boot-only. See §0.5.
+Current census: **49** production callsites — **39** through `with_cpu` and **10** through the
+broad `with(|state| …)` form — classified **44 runtime-required**, 3 test-only, 2 obsolete,
+0 boot-only. See §0.5. The three raw `self.state.lock()` sites are the bodies of `lock` /
+`with` / `with_cpu` themselves, not callsites, and are deliberately excluded from the total.
+These figures are recomputed from source by `tests/broad_lock_census_guard.rs`, which fails if
+the tree and the published census drift apart.
 
 ### 0.2 Status vocabulary
 
@@ -114,14 +120,14 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 |-------|-----------|--------|----------------------------|
 | **203A** | Timer tick and deadline processing — scheduler tick, timeslice expiry, IPC timeout deadlines, futex deadlines, sleep timers. **No broad lock from timer interrupt context.** | **OPEN** (partial foundation) | The timer tick is handled inside `handle_trap_entry_with_fault_bookkeeping_mode`, i.e. inside `with_cpu`. `scheduler_tick_now_split_read` and the post-lock reply-timeout drain are partial foundations only. |
 | **203B** | IRQ delivery — acknowledgment, notification delivery, waiter wake, mask/unmask. IRQ fast paths must never acquire the broad lock. | **OPEN** | External IRQs enter the same broad trap closure. |
-| **203C** | Scheduler core — enqueue/dequeue, current assignment, preemption, blocking, wake, migration, idle transition, priority changes. The rank-1 scheduler and rank-2 task seams become **authoritative, not compatibility helpers**. | **OPEN** (partial) | The rank-1 seam **is** authoritative for queue-advancing dispatch on **x86_64 only** — `d6_genuine_enabled()` (`src/kernel/boot/mod.rs:766`) is `cfg!(target_arch = "x86_64") && …`, compile-time **false** on AArch64 and RISC-V. Roughly 20 of the 46 runtime-required broad callsites are drain re-acquisitions that exist precisely because the seams are not yet authoritative end to end. |
+| **203C** | Scheduler core — enqueue/dequeue, current assignment, preemption, blocking, wake, migration, idle transition, priority changes. The rank-1 scheduler and rank-2 task seams become **authoritative, not compatibility helpers**. | **OPEN** (partial) | The rank-1 seam **is** authoritative for queue-advancing dispatch on **x86_64 only** — `d6_genuine_enabled()` (`src/kernel/boot/mod.rs:766`) is `cfg!(target_arch = "x86_64") && …`, compile-time **false** on AArch64 and RISC-V. Roughly 20 of the 44 runtime-required broad callsites are drain re-acquisitions that exist precisely because the seams are not yet authoritative end to end. |
 | **203D** | Cross-CPU work — TLB shootdown mailboxes, reschedule IPIs, remote wake, cross-CPU placement, per-CPU current state. AArch64/RISC-V may remain BSP-only **provided APs are explicitly wake-only and no runnable task can be stranded there**. | **OPEN** (x86_64 live-proven, knob-gated) | x86_64: shootdown mailboxes, reschedule IPIs in both directions, remote wake, cross-CPU placement and per-CPU current all live-proven at SMP=2 — all under default-off knobs, production scheduler still BSP-only (`online_cpu_count() == 1`). The AArch64/RISC-V wake-only + no-stranding argument is **not documented**, which the stage requires. |
 
 #### Phase 7 — Remove the monolithic runtime path
 
 | Stage | Definition | Status | Evidence / what is missing |
 |-------|-----------|--------|----------------------------|
-| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 51 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
+| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 49 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 3 test-only, 2 obsolete, 44 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
 | **204B** | Decompose `KernelState` ownership into per-CPU / task / scheduler / IPC / capability / VM / timer / IRQ / boot components. `SharedKernel` may remain a container but must not serialize the whole kernel. | **OPEN** (partial foundation) | `KernelState` already carries 11 ranked domain locks and a full set of `*_split_mut` / `*_split_read` seams — the substrate exists. But `with_cpu` still forms a broad `&mut KernelState`, so the container still serializes the kernel. |
 | **204C** | Remove fallback-to-global handlers. An unsupported configuration must use an explicitly supported localized path or fail with a clear diagnostic — never reacquire the monolithic lock. | **OPEN** | Five fallback families live: the default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, the drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, retirement-enable flags, old fallback dispatch, class-specific one-shot logging, obsolete foundation oracles, compatibility drain branches. Keep validation oracles, but validating production paths rather than enabling them. | **OPEN** | All of the named scaffolding is live. |
@@ -131,7 +137,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 
 | Stage | Definition | Status | Evidence / what is missing |
 |-------|-----------|--------|----------------------------|
-| **205A** | **Complete syscall matrix** for all active syscall variants: architecture, syscall/class, locks acquired, blocking behavior, post-lock work, rollback, **address-space restore**, live proof. **Every runtime cell must be localized.** | **OPEN** (matrix drafted, localization false) | `doc/KERNEL_UNLOCK_AUDIT.md` §2 supplies the matrix across all three architectures with locks / blocking / post-lock / rollback / hosted / live columns. Two gaps: the **address-space restore** column is not populated per cell, and the stage's exit condition — every runtime cell localized — is false while 46 runtime-required broad callsites remain. **205A reports cells; it does not retire defects.** |
+| **205A** | **Complete syscall matrix** for all active syscall variants: architecture, syscall/class, locks acquired, blocking behavior, post-lock work, rollback, **address-space restore**, live proof. **Every runtime cell must be localized.** | **OPEN** (matrix drafted, localization false) | `doc/KERNEL_UNLOCK_AUDIT.md` §2 supplies the matrix across all three architectures with locks / blocking / post-lock / rollback / hosted / live columns. Two gaps: the **address-space restore** column is not populated per cell, and the stage's exit condition — every runtime cell localized — is false while 44 runtime-required broad callsites remain. **205A reports cells; it does not retire defects.** |
 | **205B** | Fault-injection matrix at every transactional boundary: allocation failure, slot exhaustion, copy fault, mapping failure, state-changed race, timeout race, task/process death, server crash, queue full, TLB/shootdown failure. No leak, duplicate wake, partial commit, or hidden fallback. | **OPEN** (isolated precedents only) | Existing precedents cover fragments: shared-region 12-case transaction-race seal, reply-cap 18-case negative seal, 24 deterministic ServerDies races. There is no unified matrix and no coverage of allocation failure, slot exhaustion, queue full, or shootdown failure. |
 | **205C** | Long-running concurrency torture across IPC / spawn / exit / reap / fork / VM / cap / futex / timeouts / IRQ / restart, requiring lock-rank violations, duplicate current task, duplicate queue membership, cap-refcount anomalies, transfer-envelope leaks, reply-object leaks, address-space leaks and fatals **all zero**. | **OPEN** | No sustained torture harness exists. Note the hosted suite cannot currently be used as one: under a parallel harness it produces 58–71 shared-state assertion failures (§0.6). |
 | **205D** | **Cross-architecture full-unlock seal** — `KERNEL_RUNTIME_GLOBAL_LOCK_CALLS arch=<a> count=0` for all three, `KERNEL_FULL_UNLOCK_SEAL arch=<a> result=ok` for all three, and `KERNEL_FULL_UNLOCK_CROSS_ARCH_SEAL arches=3 result=ok`. The real full-kernel-unlocking milestone. | **OPEN** | **None of the three marker families exists anywhere in the tree** (verified by grep across `src`, `crates`, `tests`, `scripts`). |
@@ -170,8 +176,11 @@ census (204A), which is documentation, not lock retirement.
 | boot-only | **0** | — |
 | test-only | **3** | `runtime.rs:1244`, `runtime.rs:1248` (`ipc_recv_with_deadline_split_bridge` — only test callers; its own doc says "not a standalone trap-seam path"); `runtime.rs:2654` (`control_plane_set_process_cnode_slots_via_syscall` — only test callers) |
 | obsolete | **2** | `runtime.rs:2644` (`SharedKernel::handle_trap_with_cpu` — **no in-tree caller at all**, only source-grep guards name it); `runtime.rs:3725` (`run_reply_timeout_completion` — no production caller; the off-lock `OffLockReplyTimeout` composition superseded it) |
-| runtime-required | **46** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), the AArch64 split return path (`trap_entry.rs:1432`), 2 identity snapshots, 6 x86_64 AP paths, RISC-V resume, thread creation, and the recv/delivery boundary re-acquires |
+| runtime-required | **44** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), the AArch64 split return path (`trap_entry.rs:1432`), 2 identity snapshots, 6 x86_64 AP paths, RISC-V resume, thread creation, and the recv/delivery boundary re-acquires |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
+
+Classified total: **49** acquisition callsites (**39** `with_cpu` + **10** broad `with`), which
+is 0 + 3 + 2 + 44. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
 
 ### 0.6 Structural blockers
 
@@ -196,27 +205,44 @@ census (204A), which is documentation, not lock retirement.
 
 ### 0.7 Smallest next production stage
 
-**The previous recommendation — the ServerDies reply-link accounting repair — has landed**
-as a canonical **199D** increment (server-crash cleanup) that also cleans up state canonical
-**202D** owns (reply-object cleanup). See `doc/IPC.md` §8.5. There is no longer a hard
-`result=fail` in the tree.
+The next two actions are **census subtractions**: they delete broad-lock callsites that no
+production path takes. Both are numbered unlocking directives, not canonical stages — the
+canonical stage definitions in §0.3 are unchanged, and neither U1 nor U2 renames, replaces, or
+adds one.
 
-Two follow-ons, of different kinds:
+**U1 — the next production subtraction.** Delete the two **obsolete** broad-lock callsites
+recorded in §0.5: `runtime.rs:2644` (`SharedKernel::handle_trap_with_cpu` — no in-tree caller
+at all) and `runtime.rs:3725` (`run_reply_timeout_completion` — no production caller; the
+off-lock `OffLockReplyTimeout` composition superseded it). Neither is reachable from a live
+path, so removing them retires lock acquisition sites without changing runtime behavior.
+Expected census: **49 → 47**, classification becoming 0 boot-only / 3 test-only / **0
+obsolete** / 44 runtime-required.
 
-* **Live proof, no production code:** the x86_64 ServerDies live cell. One clean boot earns
-  the first ServerDies cell **and** finally exercises `revalidate_idle_owner_after_drains`,
-  which has never run in QEMU (blocker 1 in §0.6).
-* **Smallest production change:** flip `ipccall_direct_proof_enabled()`
-  (`src/kernel/boot/mod.rs:3095`) from a default-OFF proof knob to the production default on
-  x86_64, so the landed, live-proven off-lock NR 6 / NR 7 transaction is actually taken by a
-  normal boot. One production path; expected broad-lock callsite reduction **0**.
+**U2 — follows U1.** Remove the three **test-only** callsites from the production census:
+`runtime.rs:1244` and `runtime.rs:1248` (`ipc_recv_with_deadline_split_bridge`) and
+`runtime.rs:2654` (`control_plane_set_process_cnode_slots_via_syscall`) — each has only test
+callers. Expected census: **47 → 44**, leaving the census exactly the runtime-required set.
 
-Neither completes canonical 199D, which additionally requires the transaction proven with no
-broad-lock fallback and server-crash cleanup proven live on all three architectures.
+Together U1 and U2 make the published total mean one thing only: broad-lock acquisitions that
+a real boot actually performs. They serve **204C** / **204D** / **204E**; they do not complete
+any of them, and they retire no runtime-required site.
+
+**Standalone WA3C2 waiter-semantics investigation is *not* the next roadmap action.** It may
+resume only when it is tied to a numbered unlocking directive **and** a specific callsite
+retirement. Waiter-semantics work that retires no callsite does not move the one measurable
+definition in §0.1, and must not be scheduled ahead of U1/U2 on its own.
+
+**Safety fact that U1 and U2 must preserve.** `ipccall_direct_production_enabled()`
+(`src/kernel/boot/mod.rs:3222`) returns `false` on **every** architecture (Stage
+199D-WA1-GATE). Ordinary NR 6 / NR 7 traffic is admitted to the off-lock direct path on no
+architecture and takes the accepted legacy path; only an explicitly armed proof/oracle selector
+admits it. No unlocking increment may flip that default, as a side effect or otherwise.
 
 ---
 
 ## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call, Stage 124 Rust tail-jump stack-shape fix, Stage 125 Rust entry bridge, Stage 126 kernel switch-stack mapping/backing gate, Stage 127 target-ASID stack mapping retry, Stage 128 active-CR3 shared switch-stack coverage, Stage 129 active-root VmFull on-demand repair, Stage 163P cross-arch accepted sender-wake regression oracle)
+
+> **HISTORICAL — NOT A STATUS PAGE.** Mechanisms described here are accurate. For status, see §0.3. For the next action, see §0.7.
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -2295,6 +2321,8 @@ unmodified; diag function gated on `not(feature = "hosted-dev")`.
 
 ## 2. Live paths and fallbacks
 
+> **HISTORICAL — NOT A STATUS PAGE.** Mechanisms described here are accurate. For status, see §0.3. For the next action, see §0.7.
+
 ### D1 + D5 (recv-side cap materialization)
 
 Router: `syscall.rs::materialize_received_message_cap_routed`, called from
@@ -2359,6 +2387,8 @@ sender-side blocking remain canonical.
 ---
 
 ## 3. Invariants kernel unlocking must not break
+
+> **HISTORICAL — NOT A STATUS PAGE.** Mechanisms described here are accurate. For status, see §0.3. For the next action, see §0.7.
 
 These are load-bearing for downstream FS / IPC behavior. Any unlocking change
 that violates one of them is a stop-ship bug.
@@ -2455,6 +2485,8 @@ re-enqueue after `dispatch_next_task` must remain intact. See
 
 ## 4. Recent correctness fixes to preserve
 
+> **HISTORICAL — NOT A STATUS PAGE.** Mechanisms described here are accurate. For status, see §0.3. For the next action, see §0.7.
+
 Landed in Stages 81–93 and earlier; addresses real hardware / scheduler bugs.
 Do not revert.
 
@@ -2501,6 +2533,8 @@ early timer arming.**
 ---
 
 ## 5. Stage 101 audit — source-of-truth for D1 and decomposition
+
+> **HISTORICAL — NOT A STATUS PAGE.** Mechanisms described here are accurate. For status, see §0.3. For the next action, see §0.7.
 
 The Stage 101 audit (the first stage of the unlocking restart) catalogued the
 syscall decomposition map and pre-audited D1 cap-transfer. The substantive
@@ -4723,6 +4757,8 @@ discipline is covered by the hosted-dev `YARM_LOCK_ORDER_WARN` tracker.
 
 ## 6. Decomposition scaffold status
 
+> **HISTORICAL — NOT A STATUS PAGE.** Mechanisms described here are accurate. For status, see §0.3. For the next action, see §0.7.
+
 Plan / scaffold types tracked here (replaces the former
 `DECOMPOSITION_SCAFFOLD_STATUS.md`). Status labels: **live**, **helper-only**,
 **fallback-only**, **deferred**, **obsolete**.
@@ -4824,76 +4860,12 @@ maintenance stage either live-wires it or removes it.
 
 ## 7. Remaining work
 
-Ordered per the Cycle 12 roadmap review (2026-06-16). Immediate items are
-administrative cleanup with no behavior change; Next items are the
-seam-routing and D4 follow-on work; Concurrent/gated items remain open but
-may not jump ahead of Immediate or bypass their own gates.
-
-**Immediate (Stage 110 — complete, this revision):**
-
-1. **D7-A — smoke acceptance cleanup.** Remove the stale `NOT
-   SMOKE-ACCEPTED` disclosures from `cap_transfer_split.rs` (D1/D5) and
-   `recv_waiter_split.rs` (D2) now that the required smokes have actually
-   run against this live-wired code. See the Stage 110 note in §1.
-2. **D7-B — `D2_PUBLISH_RACE_UNWIND` smoke grep.** Add a hard reject for
-   this marker to every architecture's smoke scripts. See the Stage 110
-   note in §1.
-
-**Next:**
-
-3. **D-NEXT-1 PR-A — D2 publish → task/scheduler seams.** Stage 111 (§1)
-   landed the preparatory phase split (Outcome B); calling
-   `with_task_tcbs_split_mut` / `with_scheduler_split_mut` directly
-   (Outcome A) is deferred to a follow-on PR scoped to relocating the
-   blocking-recv entry point ahead of `SharedKernel::with_cpu` in trap
-   dispatch — see §1 Stage 111 for the architectural reason. The
-   helper-only fence for those two seams remains in force until that PR.
-4. **D-NEXT-1 PR-B — D3 shrink → vm/memory seams.** Route
-   `vm_brk_shrink_two_phase` through `with_vm_user_spaces_split_mut` /
-   `with_memory_split_mut`, deleting the helper-only fence for those two
-   seams in the same PR. Smoke-gated.
-5. **D-NEXT-1 PR-C — D6 dispatch → scheduler seam.** Stage 113 (§1) landed
-   the preparatory phase-boundary documentation/telemetry (Outcome B);
-   calling `with_scheduler_split_mut` directly (Outcome A) is deferred to
-   the same follow-on PR that relocates the D2/D3 entry points ahead of
-   `SharedKernel::with_cpu` in trap dispatch — see §1 Stage 113 for the
-   architectural reason. The helper-only fence for this seam remains in
-   force until that PR.
-6. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction.** Complete: NR 30
-   helpers/handler now live in `src/kernel/syscall/recv_shared_v3.rs`;
-   `syscall.rs` keeps the unchanged dispatch arm.
-
-**Concurrent / gated:**
-
-7. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
-   Per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
-   behind a default-off knob; then `-smp ≥ 2` smoke acceptance. Still
-   high priority — it unblocks per-CPU runqueue lock sharding (D6) and the
-   lock-free `await_tlb_shootdown_ack` design (D3) — but must not bypass
-   D7-A/D7-B and must not jump ahead of the Next items above without an
-   explicit gating review.
-8. **D4 mechanical decomposition — COMPLETE (Stage 152).** D4 steps 1–4 plus
-   Stage 145/146/149/150/151 landed all 10 submodules
-   (`recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`, `vm.rs`, `ipc.rs`,
-   `helpers.rs`, `ipc_abi.rs`, `debug.rs`, `initramfs.rs`). Stage 152 audits the
-   decomposition as complete to its irreducible IPC/cap dispatch core: the only
-   implementation left in `syscall.rs` is the dispatch table, ABI types/shims,
-   and the IPC/cap cross-boundary seams that the hard rules + existing
-   source-guards pin in place. No further low-risk module remains to peel off
-   (§5.1).
-9. **D3-FULL / D6-full / D2-B** — full `VmAnonMap` two-phase live,
-   per-CPU runqueue lock sharding, and any shared-region cap-transfer
-   split (D1/D5 extension) — remain gated on item 7 (AP scheduler-online)
-   and on items 3–5 (seam progress) landing first.
-
-RISC-V64 is included in the global unlocking smoke matrix
-(`scripts/qemu-riscv64-smoke-matrix.sh`, §7.1.3/§7.1.4) and is a required
-gate alongside x86_64 and AArch64. RPi5 remains a diagnostic / high-half
-bring-up track only (`doc/RPI5_BRINGUP.md`) and is **not** part of the
-global unlocking smoke gate. No future live-wire PR may leave a stale
-`NOT SMOKE-ACCEPTED` sentinel behind after its required smokes have
-actually run and passed — enforced by
-`kernel::boot::tests::no_stale_not_smoke_accepted_sentinels_in_src` (§8).
+> **HISTORICAL POINTER — NOT CURRENT.** The Cycle 12 (2026-06-16) "Remaining work" roadmap
+> and its Immediate / Next / Concurrent task lists stood here and have been removed: they were
+> obsolete, and a stale task list reads as a live plan. Everything numbered §7.x below —
+> including the §7.1 readiness audit and its per-stage records — is retained as historical
+> evidence only; it describes what was done, not what is current or what to do next.
+> **Current status: §0.3. Next action: §0.7.**
 
 ---
 
