@@ -34626,7 +34626,9 @@ mod stage118_production_switch_frame_init {
     fn stage118_trap_entry_post_switch_restore_is_pub_crate() {
         assert!(
             TRAP_ENTRY_SRC.contains("pub(crate) fn post_switch_restore_arch_thread_state"),
-            "trap_entry.rs must make post_switch_restore_arch_thread_state pub(crate) for trampoline access"
+            "trap_entry.rs must keep post_switch_restore_arch_thread_state pub(crate) for the \
+             retained D6 restore/cleanup acquisition (U3/203C retired the first-resume caller, \
+             whose frame=None call was a proven no-op)"
         );
     }
 
@@ -119878,6 +119880,426 @@ mod u3_ap_block_current_transaction {
         assert!(
             !code.contains("k.block_current_on_cpu(cpu)"),
             "the converted acquisition is gone from this file"
+        );
+    }
+}
+
+/// U3 (canonical 203C) — the x86_64 D6 first-resume CPU-binding transaction.
+///
+/// `SharedKernel::bind_current_cpu_split` replaces the broad
+/// `with_cpu(ctx.cpu_id, |kernel| …)` re-acquire in the D6 first-resume trampoline
+/// (`yarm_kernel_thread_switch_trampoline_rust_real`). The retirement rests on one literal
+/// source fact: the broad body's single call was
+/// `post_switch_restore_arch_thread_state(kernel, cpu, None)`, and with `frame == None` the
+/// x86_64 `restore_arch_thread_state` returns `Ok(())` on its first statement — so the only
+/// `KernelState` effect the acquisition ever had was the CPU validate-and-bind `with_cpu`
+/// performs on entry.
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod u3_d6_first_resume_bind_transaction {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskClass;
+    use crate::runtime::SharedKernel;
+
+    const AP: u8 = 1;
+
+    fn kernel() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| s.bring_up_cpu(CpuId(AP)).expect("AP online"));
+        k
+    }
+
+    fn make_current(k: &SharedKernel, cpu: CpuId, tid: u64) {
+        k.with(|s| {
+            s.register_task_with_class(tid, TaskClass::App)
+                .expect("register");
+        });
+        k.with_cpu(cpu, |s| {
+            s.enqueue_on_cpu(cpu, tid).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
+        })
+        .expect("admitted");
+    }
+
+    fn current_cpu(k: &SharedKernel) -> CpuId {
+        k.with(|s| s.current_cpu())
+    }
+
+    // ── the semantic fact the whole retirement rests on ───────────────────────────────────
+
+    const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const THREAD_STATE: &str = include_str!("thread_state.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn u3_bind_x86_restore_with_no_frame_returns_before_every_kernel_state_access() {
+        let body = code_of(
+            X86_TRAP
+                .split("pub(crate) fn restore_arch_thread_state")
+                .nth(1)
+                .expect("the x86_64 restore exists")
+                .split("\n/// ")
+                .next()
+                .expect("bounded by the next doc comment"),
+        );
+        // The `frame == None` early return is the FIRST statement of the body, and its arm
+        // returns Ok(()) and does nothing else.
+        let early = body
+            .find("let Some(frame) = frame else {")
+            .expect("the frame-absent early return");
+        let sig = ") -> Result<(), TrapHandleError> {";
+        let sig_end = body.find(sig).expect("signature") + sig.len();
+        let between = body[sig_end..early].trim();
+        assert!(
+            between.is_empty(),
+            "nothing may execute before the frame-absent early return; found: {between:?}"
+        );
+        let else_arm = body[early..]
+            .split_once('{')
+            .expect("the else block opens")
+            .1
+            .split_once('}')
+            .expect("the else block closes")
+            .0
+            .trim();
+        assert_eq!(
+            else_arm, "return Ok(());",
+            "the frame-absent arm must return Ok(()) and do nothing else"
+        );
+        // Every kernel-state access lives strictly after it.
+        for after in [
+            "resume_current_thread_with_frame",
+            "restore_fs_base_if_needed",
+            "kernel.current_tid()",
+            "kernel.task_asid(tid)",
+            "ensure_user_return_cr3",
+        ] {
+            let at = body
+                .find(after)
+                .unwrap_or_else(|| panic!("`{after}` must be present"));
+            assert!(
+                early < at,
+                "`{after}` must come AFTER the frame-absent early return — with frame=None it \
+                 is never reached, which is why the broad acquisition had no state effect"
+            );
+        }
+        // And the x86_64 delegation is the one the trampoline used.
+        assert!(
+            code_of(TRAP_ENTRY)
+                .contains("super::x86_64::trap::restore_arch_thread_state(kernel, cpu, frame)"),
+            "post_switch_restore_arch_thread_state delegates to it on x86_64"
+        );
+    }
+
+    // ── binding semantics ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_bind_valid_online_cpu_binds() {
+        let k = kernel();
+        k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+        assert_eq!(k.bind_current_cpu_split(CpuId(AP)), Ok(()));
+        assert_eq!(current_cpu(&k), CpuId(AP));
+    }
+
+    #[test]
+    fn u3_bind_succeeds_with_no_current_task_and_reads_no_tid() {
+        let k = kernel();
+        k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CpuId(AP))),
+            None,
+            "fixture precondition: the AP has no current task"
+        );
+        assert_eq!(
+            k.bind_current_cpu_split(CpuId(AP)),
+            Ok(()),
+            "a valid CPU with no current task must SUCCEED — not be conflated with refusal"
+        );
+        assert_eq!(current_cpu(&k), CpuId(AP));
+    }
+
+    #[test]
+    fn u3_bind_invalid_cpu_returns_the_legacy_error_and_leaves_the_binding() {
+        let k = kernel();
+        k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+        for bad in [CpuId(7), CpuId(200)] {
+            let err = k.bind_current_cpu_split(bad).expect_err("refused");
+            assert_eq!(
+                err,
+                k.with(|s| s.set_current_cpu(bad).unwrap_err()),
+                "the same failure class `set_current_cpu` (and thus `with_cpu`) produced"
+            );
+            assert_eq!(
+                current_cpu(&k),
+                CpuId(0),
+                "a refused bind leaves the previous binding unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn u3_bind_changes_no_current_task_queue_or_topology() {
+        let k = kernel();
+        make_current(&k, CpuId(0), 400);
+        make_current(&k, CpuId(AP), 401);
+        k.with(|s| {
+            s.register_task_with_class(402, TaskClass::App)
+                .expect("r402");
+        });
+        k.with_cpu(CpuId(AP), |s| {
+            s.enqueue_on_cpu(CpuId(AP), 402).expect("q402");
+        })
+        .expect("admitted");
+
+        let before = k.with(|s| {
+            (
+                s.current_tid_on_cpu(CpuId(0)),
+                s.current_tid_on_cpu(CpuId(AP)),
+                s.runnable_count_on_cpu(CpuId(0)),
+                s.runnable_count_on_cpu(CpuId(AP)),
+                s.online_cpu_count(),
+                s.task_status(401),
+                s.task_status(402),
+            )
+        });
+        assert_eq!(k.bind_current_cpu_split(CpuId(AP)), Ok(()));
+        let after = k.with(|s| {
+            (
+                s.current_tid_on_cpu(CpuId(0)),
+                s.current_tid_on_cpu(CpuId(AP)),
+                s.runnable_count_on_cpu(CpuId(0)),
+                s.runnable_count_on_cpu(CpuId(AP)),
+                s.online_cpu_count(),
+                s.task_status(401),
+                s.task_status(402),
+            )
+        });
+        assert_eq!(
+            before, after,
+            "binding changes current_cpu and nothing else — no current task, run queue, \
+             membership, topology or task status moves, on this CPU or any other"
+        );
+    }
+
+    #[test]
+    fn u3_bind_matches_the_retired_broad_binding() {
+        // The retired body was `with_cpu(cpu, |_| ())` in effect: validate, bind, run a no-op.
+        for cpu in [CpuId(0), CpuId(AP), CpuId(7), CpuId(200)] {
+            let a = kernel();
+            make_current(&a, CpuId(AP), 410);
+            a.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+            let legacy = a.with_cpu(cpu, |_kernel| ());
+
+            let b = kernel();
+            make_current(&b, CpuId(AP), 410);
+            b.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+            let split = b.bind_current_cpu_split(cpu);
+
+            assert_eq!(legacy, split, "cpu {}: same result", cpu.0);
+            assert_eq!(
+                current_cpu(&a),
+                current_cpu(&b),
+                "cpu {}: same binding",
+                cpu.0
+            );
+            assert_eq!(
+                a.with(|s| s.current_tid_on_cpu(CpuId(AP))),
+                b.with(|s| s.current_tid_on_cpu(CpuId(AP))),
+                "cpu {}: same current task",
+                cpu.0
+            );
+            assert_eq!(
+                a.with(|s| s.runnable_count_on_cpu(CpuId(AP))),
+                b.with(|s| s.runnable_count_on_cpu(CpuId(AP))),
+                "cpu {}: same queue depth",
+                cpu.0
+            );
+        }
+    }
+
+    // ── lock shape and caller conversion ──────────────────────────────────────────────────
+
+    fn transaction_body() -> alloc::string::String {
+        code_of(
+            RUNTIME
+                .split("pub(crate) fn bind_current_cpu_split")
+                .nth(1)
+                .expect("the transaction exists")
+                .split("\n    /// ")
+                .next()
+                .expect("bounded by the next doc comment"),
+        )
+    }
+
+    #[test]
+    fn u3_bind_transaction_is_rank_one_only() {
+        let body = transaction_body();
+        assert!(
+            !body.contains(".with_cpu(") && !body.contains("self.with(|"),
+            "no broad acquisition"
+        );
+        assert_eq!(
+            body.matches("with_scheduler_split_mut").count(),
+            1,
+            "exactly one rank-1 scheduler acquisition"
+        );
+        for other_domain in [
+            "with_task_tcbs_split_mut",
+            "with_task_return_split_mut",
+            "with_task_enqueue_policy_split_mut",
+            "with_ipc_split_mut",
+            "with_capability_state_split_mut",
+            "with_vm_user_spaces_split_mut",
+            "with_memory_split_mut",
+            "with_tcbs",
+        ] {
+            assert!(
+                !body.contains(other_domain),
+                "`{other_domain}`: no domain beyond rank 1 may be touched"
+            );
+        }
+        let validate = body.find("validate_online_cpu").expect("validation");
+        let bind = body.find("sched.current_cpu = cpu").expect("the bind");
+        assert!(validate < bind, "validate before bind");
+        for forbidden in [
+            "current_tid",
+            "block_current",
+            "dispatch_next",
+            "enqueue_on",
+            "TaskStatus",
+            "switch_address_space",
+            "cr3",
+            "data_ptr()",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "`{forbidden}` must not appear: the binding reads no current TID, moves no \
+                 queue or task state, activates no address space, writes no CR3, and caches \
+                 no raw pointer"
+            );
+        }
+    }
+
+    fn trampoline_body() -> alloc::string::String {
+        let f = THREAD_STATE
+            .split("pub extern \"C\" fn yarm_kernel_thread_switch_trampoline_rust_real()")
+            .nth(1)
+            .expect("the converted caller exists");
+        code_of(&f[..f.find("\n}\n").expect("function end")])
+    }
+
+    #[test]
+    fn u3_bind_caller_is_converted_and_markers_are_unchanged() {
+        let body = trampoline_body();
+        assert!(
+            body.contains("if shared.bind_current_cpu_split(ctx.cpu_id).is_ok() {"),
+            "the caller uses the rank-1 binding as its success test"
+        );
+        assert!(
+            !body.contains(".with_cpu(") && !body.contains("shared.with(|"),
+            "no broad acquisition remains and no broad fallback was added"
+        );
+        assert!(
+            !body.contains("post_switch_restore_arch_thread_state"),
+            "the proven frame-absent no-op call is removed rather than replaced by a fake \
+             split restore helper"
+        );
+        // The exact marker strings, in the exact order.
+        let order = [
+            "D6_FIRST_RESUME_STASH_OK",
+            "D6_FIRST_RESUME_ENTER tid={} cpu={}",
+            "D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN",
+            "D6_FIRST_RESUME_LOCK_REACQUIRE_DONE",
+            "D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN",
+            "D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE",
+            "D6_PROOF_CR3_AFTER_FIRST_RESUME cr3=0x{:016x}",
+        ];
+        let mut last = 0usize;
+        for marker in order {
+            let at = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("marker `{marker}` must be preserved verbatim"));
+            assert!(at > last, "marker `{marker}` is out of order");
+            last = at;
+        }
+        // BEGIN gates the rest: a refused bind emits none of DONE/restore/CR3.
+        let begin = body
+            .find("D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN")
+            .expect("BEGIN");
+        let guard = body
+            .find("if shared.bind_current_cpu_split(ctx.cpu_id).is_ok() {")
+            .expect("the guard");
+        assert!(
+            begin < guard,
+            "BEGIN is emitted before the bind, as it was before the broad acquisition"
+        );
+        // Execution still continues to the switch-back either way, with no panic path.
+        let switch_back = body.find("switch_frames(").expect("the switch-back");
+        assert!(
+            last < switch_back,
+            "the switch-back still follows the marker block"
+        );
+        assert!(
+            !body.contains("panic!") && !body.contains(".expect(") && !body.contains(".unwrap()"),
+            "a refused bind must not introduce a new panic or fatal path"
+        );
+        // Nothing is held across the hardware CR3 read.
+        assert!(
+            !body[guard..].contains("with_scheduler_split_mut"),
+            "the rank-1 guard is released before marker emission and the hardware CR3 read"
+        );
+        // FirstResumeContext is unchanged in shape at this site.
+        assert!(
+            body.contains("ctx.incoming_frame_ptr")
+                && body.contains("ctx.outgoing_frame_ptr")
+                && body.contains("ctx.outgoing_stack_top"),
+            "the first-resume context fields are used exactly as before"
+        );
+    }
+
+    #[test]
+    fn u3_bind_thread_state_has_no_production_broad_acquisition() {
+        let code = code_of(THREAD_STATE);
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            0,
+            "thread_state.rs holds NO production broad acquisition"
+        );
+        assert_eq!(
+            code.matches(".with(|").count(),
+            0,
+            "and no broad `with` either"
+        );
+    }
+
+    #[test]
+    fn u3_bind_real_d6_restore_acquisition_is_deliberately_retained() {
+        let code = code_of(TRAP_ENTRY);
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            5,
+            "trap_entry.rs keeps its five acquisitions — this cohort touches none of them"
+        );
+        // The retained D6 restore/cleanup acquisition passes a REAL frame, so unlike the
+        // retired first-resume call it genuinely restores context and is NOT a no-op.
+        assert!(
+            code.contains(
+                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
+            ),
+            "the real D6 restore/cleanup acquisition passes a live frame and stays broad"
+        );
+        assert!(
+            code.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE"),
+            "its cleanup path is untouched"
         );
     }
 }

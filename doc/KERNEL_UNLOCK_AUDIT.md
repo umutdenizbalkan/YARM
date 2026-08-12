@@ -127,10 +127,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **21** |
+| `SharedKernel::with_cpu` | **20** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **1** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **22** |
+| **Total broad-lock acquisition sites** | **21** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
@@ -141,7 +141,6 @@ lines excluded.
 | `src/arch/riscv64/trap.rs` | 2 | U3 retired six: two read-only current-TID re-acquisitions (foundation-oracle drain 8 → 7, FutexWait no-incoming idle 7 → 6), the three homologous switch/restore drains — queue-switch foundation, FutexWait switch-success, Yield switch-success (6 → 3) — onto the exact-token rank-2 transaction, and the post-lock `CurrentTaskExited` validation snapshot onto `post_lock_exit_validation_split`, one coherent rank-1 scheduler transaction with the rank-2 task acquisition nested inside it (3 → 2). The two that remain are the canonical broad trap phase and the terminal-idle predicate, whose provenance arm has no live coverage at any accepted base and is deferred. |
 | `src/arch/x86_64/smp.rs` | 2 | 2466, 2688 — U3 retired the AP saved-resume enqueue→dispatch placement onto `enqueue_then_dispatch_on_cpu_split` (4 → 3), then the AP return-to-idle `block_current_on_cpu` onto `block_current_on_cpu_split` (3 → 2) |
 | `src/arch/riscv64/boot.rs` | 1 | 1048 |
-| `src/kernel/boot/thread_state.rs` | 1 | 232 |
 
 Structural reading of those 40:
 
@@ -158,7 +157,8 @@ Structural reading of those 40:
   `current_tid_authoritative(cpu)`, which is now itself broad-lock-free. That file has **0**
   broad acquisitions.
 * The remainder are SMP bring-up (`x86_64/smp.rs`), RISC-V resume
-  (`riscv64/boot.rs:1048`) and thread creation (`thread_state.rs:232`).
+  (`riscv64/boot.rs:1048`). Thread creation is **gone**: U3 retired the D6 first-resume
+  binding, and `thread_state.rs` now holds **0**.
 
 > The AArch64 split-return site that used to sit at `trap_entry.rs:1432` is **gone**: Stage 199D
 > removed it when readiness blocker 2 was closed (§6.1.12), taking `trap_entry.rs` from 12 to 11
@@ -233,7 +233,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **22** |
+| runtime-required | **21** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -254,7 +254,7 @@ and `SharedKernel::run_reply_timeout_completion` (no production caller; supersed
 `OffLockReplyTimeout` composition). Neither deletion changed runtime behavior, and the
 reply-timeout completion body itself was not touched.
 
-#### runtime-required (22)
+#### runtime-required (21)
 
 | Group | Sites | Enclosing fn |
 |-------|-------|--------------|
@@ -264,7 +264,6 @@ reply-timeout completion body itself was not touched.
 | AArch64 split return path | `trap_entry.rs:1432` | `finalize_split_handled_syscall` |
 | x86_64 AP paths (knob-gated at runtime, still compiled in) | `smp.rs:2453, 2466, 2688` | `c2c_bsp_saved_frame_resume`, `ap_sched_next_or_idle` — U3 retired the AP saved-context broad read onto `ap_saved_resume_context_split` (6 → 5), the AP saved-resume enqueue→dispatch placement onto `enqueue_then_dispatch_on_cpu_split` (5 → 4), and the AP return-to-idle `block_current_on_cpu` onto the rank-1 `block_current_on_cpu_split` (4 → 3). `ap_saved_frame_resume` and `ap_seal_return_to_idle` now hold NO broad lock; all three remaining sites are on paths that are not live-reached. |
 | RISC-V resume | `riscv64/boot.rs:1048` | `yarm_riscv64_trap_bridge` |
-| Thread creation | `thread_state.rs:232` | `yarm_kernel_thread_switch_trampoline_rust_real` |
 | Recv / delivery boundary | `runtime.rs:1350, 1450, 1484, 1533, 1701, 1714, 1846, 2190, 2368, 2402` | `try_split_ipc_recv_queued_plain_into_frame`, `complete_recv_boundary_user_copy`, `complete_recv_boundary_ordinary_cap`, `execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`, `execute_blocked_waiter_ordinary_cap_delivery` |
 | Identity / SMP / deadline helpers | `runtime.rs:389, 670, 3696, 4013, 4017, 4025` | `current_tid_authoritative`, `revalidate_idle_owner_after_drains`, `smp_request_wake_target_split_read`, `disarm_reply_deadline_on_reply_win`, `smp_assign_task_home_cpu` |
 
@@ -466,7 +465,7 @@ counts as done:
 
 | Stage | Scope | Status | Evidence and gap |
 |-------|-------|--------|------------------|
-| **202A** | Thread creation + admission; x86 naked-trampoline fix generalized as an explicit **entry ABI contract** | **OPEN** | `thread_state.rs:232` still takes `with_cpu`. The trampoline fix exists but has not been generalized into a stated contract. |
+| **202A** | Thread creation + admission; x86 naked-trampoline fix generalized as an explicit **entry ABI contract** | **OPEN** | `thread_state.rs` no longer takes `with_cpu` — U3 retired the D6 first-resume binding onto `bind_current_cpu_split` — but thread creation + admission itself is untouched and the trampoline fix has still not been generalized into a stated contract. |
 | **202B** | Process spawn with rollback; no partially visible process | **OPEN** | NR 23 / 24 / 26 / 29 broad-lock only. |
 | **202C** | Fork/COW transaction; child published only after commit | **OPEN** | Blocked on 201E and 202B. |
 | **202D** | Exit + normal reap: thread/process exit, scheduler removal, IPC waiter cancellation, **reply-object cleanup**, VM teardown, cap teardown, parent notification | **OPEN** — partial foundation, 2/3 live cells for one sub-path | `ExitCurrentTask` (NR 16) ABI + non-returning disposition landed; live cells x86_64 (`0b5e98f`) and AArch64; **RISC-V unearned** (runner bound corrected `5488d8e`, re-run never executed). NR 16 still runs **inside** the broad lock with post-lock drains; the other seven elements are not retired. The ServerDies link-accounting defect — this stage's **reply-object-cleanup** element, overlapping 199D's server-crash cleanup — is **repaired** (`doc/IPC.md` §8.5); the rest of the stage is untouched. |

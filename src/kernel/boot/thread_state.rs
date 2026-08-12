@@ -229,23 +229,31 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline_rust_real() -> ! {
             }
         };
         crate::yarm_log!("D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN");
-        let _ = shared.with_cpu(ctx.cpu_id, |kernel| {
+        // U3 (canonical 203C): one rank-1 scheduler binding instead of the broad
+        // `with_cpu(ctx.cpu_id, |kernel| …)` re-acquire. The broad body's only KernelState
+        // effect was the CPU validation-and-bind `with_cpu` performs on entry: its single
+        // call, `post_switch_restore_arch_thread_state(kernel, cpu, None)`, delegates on
+        // x86_64 to `restore_arch_thread_state`, which returns `Ok(())` on its first
+        // statement when `frame` is `None` — before any current-TID read, TCB access,
+        // context/TLS restore, ASID activation, CR3 check or domain lock. Refusal keeps its
+        // historical shape: the DONE/restore/CR3 markers are skipped and execution still
+        // falls through to the switch-back below (the old `let _ =` ignored the error too).
+        if shared.bind_current_cpu_split(ctx.cpu_id).is_ok() {
             crate::yarm_log!("D6_FIRST_RESUME_LOCK_REACQUIRE_DONE");
+            // These two markers delimit the established frame-absent no-op boundary: with
+            // `frame == None` there was never any restoration to perform between them.
             crate::yarm_log!("D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN");
-            let r = crate::arch::trap_entry::post_switch_restore_arch_thread_state(
-                kernel, ctx.cpu_id, None,
-            );
             crate::yarm_log!("D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE");
             // Stage 139: capture hardware CR3 after post-switch restore so the
             // cleanup diagnostics can track any CR3 divergence introduced by
-            // the proof's lock-drop switch.
+            // the proof's lock-drop switch. Read with no guard held — it is an
+            // architectural observation, not KernelState.
             #[cfg(not(feature = "hosted-dev"))]
             {
                 let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
                 crate::yarm_log!("D6_PROOF_CR3_AFTER_FIRST_RESUME cr3=0x{:016x}", hw_cr3);
             }
-            r
-        });
+        }
         // Switch back to the outgoing task. In production, execution never returns
         // from switch_frames here — it jumps to the outgoing task's POINT 2.
         // In test builds (switch_frames is a no-op), we fall through to the spin.

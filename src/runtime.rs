@@ -2214,6 +2214,47 @@ impl SharedKernel {
         })
     }
 
+    /// U3 (canonical 203C) — bind this CPU as the scheduler's current CPU, as ONE rank-1
+    /// critical section.
+    ///
+    /// Replaces the broad `with_cpu(ctx.cpu_id, |kernel| …)` re-acquire in the x86_64 D6
+    /// first-resume trampoline. That acquisition existed to run
+    /// `post_switch_restore_arch_thread_state(kernel, cpu, None)` — but with `frame == None`
+    /// the x86_64 `restore_arch_thread_state` returns `Ok(())` on its very first statement,
+    /// before reading the current TID, before touching a TCB, before restoring context or TLS,
+    /// before activating an ASID, before checking or writing CR3, and before taking any domain
+    /// lock. So the ONLY `KernelState` effect the broad body ever had was the CPU
+    /// validation-and-bind that `with_cpu` itself performs on entry. That is exactly, and only,
+    /// what this transaction does.
+    ///
+    /// Semantics are the broad path's:
+    ///
+    /// 1. rank 1 (scheduler) is acquired exactly once;
+    /// 2. `cpu` is validated with `validate_online_cpu` — the SAME predicate
+    ///    `KernelState::set_current_cpu` uses;
+    /// 3. on failure the same `KernelError` class is returned and `scheduler.current_cpu` is
+    ///    left unchanged, with no scheduler state mutated at all;
+    /// 4. on success `scheduler.current_cpu = cpu` is bound, and it succeeds whether or not
+    ///    that CPU has a current task — no current TID is read or required.
+    ///
+    /// This deliberately does NOT go through `current_tid_authoritative`: that helper's
+    /// `Option` conflates "valid CPU with no current task" with refusal, and it performs a
+    /// current-TID read this binding has no use for.
+    ///
+    /// The guard is released when this returns, before the caller's marker emission and its
+    /// hardware-CR3 observation.
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn bind_current_cpu_split(&self, cpu: CpuId) -> Result<(), KernelError> {
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .map_err(crate::kernel::boot::map_scheduler_error)?;
+            sched.current_cpu = cpu;
+            Ok(())
+        })
+    }
+
     /// U3 (canonical 203C) — the authoritative return-to-scheduler transaction for an x86_64 AP,
     /// taken as ONE rank-1 critical section.
     ///
