@@ -2589,11 +2589,24 @@ fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
         _ => return, // nothing to resume — fall through to idle
     };
     // Read the committed saved continuation (asid/cr3/rip/rsp/gprs/fs) + validate RunnableSaved.
-    let (asid, cr3, rip, rsp, gprs, fs_base, runnable_saved) =
-        match shared.with(|k| k.ap_saved_resume_context(tid)) {
-            Some(v) => v,
-            None => return,
-        };
+    // U3 (canonical 203C): one authoritative rank-2 snapshot instead of the broad
+    // `shared.with(|k| k.ap_saved_resume_context(tid))` re-acquire. The whole continuation —
+    // ASID, status, register context and TLS — is taken under a single task-domain acquisition,
+    // and the ASID→CR3 resolution runs after that lock is released. No fallback: a refusal here
+    // declines the resume exactly as the broad read's `None` did.
+    let saved = match shared.ap_saved_resume_context_split(tid) {
+        Some(v) => v,
+        None => return,
+    };
+    let crate::runtime::ApSavedResumeContext {
+        asid,
+        cr3,
+        rip,
+        rsp,
+        gprs,
+        fs_base,
+        runnable_saved,
+    } = saved;
     if !runnable_saved || rip == 0 || rsp == 0 {
         // Not a valid saved frame — never resume from a partial/uncommitted continuation.
         return;

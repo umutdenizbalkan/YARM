@@ -128,9 +128,9 @@ lines excluded.
 | Category | Production callsites |
 |----------|---------------------|
 | `SharedKernel::with_cpu` | **23** |
-| `SharedKernel::with` (broad `&mut KernelState`) | **2** |
+| `SharedKernel::with` (broad `&mut KernelState`) | **1** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **25** |
+| **Total broad-lock acquisition sites** | **24** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
@@ -166,12 +166,11 @@ Structural reading of those 40:
 > replacement — unlike the drains above it takes no `with_cpu` at all — so this table is
 > unchanged at 40 across that increment.
 
-### 1.4 Broad `.with(|state| …)` — 2 production callsites
+### 1.4 Broad `.with(|state| …)` — 1 production callsite
 
 | File | Line | Purpose |
 |------|------|---------|
-| `src/arch/x86_64/smp.rs` | 2453 | `ap_saved_resume_context` read |
-| `src/arch/x86_64/smp.rs` | 2593 | `ap_saved_resume_context` read |
+| `src/arch/x86_64/smp.rs` | 2453 | `ap_saved_resume_context` read (`c2c_bsp_saved_frame_resume`) — retained: path not live-reached at this base |
 
 **U3 retired all four `src/runtime.rs` broad acquisitions (6 → 2).** The two home-CPU
 wrappers (`smp_request_wake_target_split_read`, `smp_assign_task_home_cpu`) now read and
@@ -185,9 +184,29 @@ generation and epoch remain the stale-disarm protection. **Caller-census honesty
 four acquisitions were compiled in production source, but at the retirement base none of
 the three enclosing `SharedKernel` wrappers had a production caller — two were reached only
 by hosted tests and one had no caller at all. No live production path moved. The underlying
-`KernelState` methods are untouched and keep their other uses. The two remaining x86 SMP
-reads are out of scope: their `ap_saved_resume_context` transaction combines exact task
-context with ASID→CR3 resolution and needs a separate concurrency design.
+`KernelState` methods are untouched and keep their other uses.
+
+**U3 then retired the AP one of the two x86 SMP reads (2 → 1), as a REDUCED cohort.**
+`ap_saved_frame_resume` now calls `SharedKernel::ap_saved_resume_context_split`, one
+authoritative rank-2 transaction: a single task-domain acquisition copies the ASID, the
+status, the full `UserRegisterContext` and the TLS pointer out by value; the guard is
+released; only then is the ASID resolved to a page-table root through
+`x86_64::page_table::cr3_for_asid`, whose `PAGE_TABLE_STATE` is an independent, unranked
+lock that must not be held under the task lock. This is stronger than the legacy
+`KernelState::ap_saved_resume_context` body, which answered the same question across four
+separate reads (`task_asid`, `cr3_for_asid`, `task_status`, `with_tcbs`) and so could not
+state that the ASID, the status and the register context belonged to one incarnation. The
+refusal set is byte-for-byte unchanged: absent TCB, absent ASID, and absent page-table root
+each return `None`; `runnable_saved` is still `Runnable | Running` AND a complete
+(`rip != 0 && rsp != 0`) frame. It claims no exact-incarnation authority the caller does not
+hold — the task is still located by numeric TID, with its ASID taken from the same snapshot.
+
+**The BSP read at 2453 is deliberately NOT converted.** Baseline reachability at
+`f7e25f2` showed `c2c_bsp_saved_frame_resume` is never live-reached: across five runs of
+`qemu-x86_64-ap-cross-cpu-reply-smoke.sh` the chain dies before the reply is delivered, so
+`X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved` never fires (0/5). An unreached site is not
+retired merely because it is homologous to a reached one, so it keeps the broad read and
+`KernelState::ap_saved_resume_context` is retained for it.
 
 `src/kernel/boot/orchestrator_state.rs:47` matches the same textual pattern but is
 `LOCK_ORDER_LAST_RANK.with(|last| …)` — a `thread_local!` accessor, **not** a broad-lock
@@ -214,7 +233,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **25** |
+| runtime-required | **24** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -235,7 +254,7 @@ and `SharedKernel::run_reply_timeout_completion` (no production caller; supersed
 `OffLockReplyTimeout` composition). Neither deletion changed runtime behavior, and the
 reply-timeout completion body itself was not touched.
 
-#### runtime-required (25)
+#### runtime-required (24)
 
 | Group | Sites | Enclosing fn |
 |-------|-------|--------------|
@@ -243,7 +262,7 @@ reply-timeout completion body itself was not touched.
 | Post-lock drain re-acquisitions | `trap_entry.rs:423, 499, 558, 644, 674, 747, 805`; `riscv64/trap.rs:659, 727, 825, 870, 958, 1063, 1194` | same two functions |
 | First-resume trampoline | `trap_entry.rs:1055, 1202, 1295` | `yarm_kernel_thread_switch_trampoline` |
 | AArch64 split return path | `trap_entry.rs:1432` | `finalize_split_handled_syscall` |
-| x86_64 AP paths (knob-gated at runtime, still compiled in) | `smp.rs:2179, 2442, 2455, 2571, 2582, 2664` | `ap_seal_return_to_idle`, `c2c_bsp_saved_frame_resume`, `ap_saved_frame_resume`, `ap_sched_next_or_idle` |
+| x86_64 AP paths (knob-gated at runtime, still compiled in) | `smp.rs:2179, 2453, 2466, 2582, 2675` | `ap_seal_return_to_idle`, `c2c_bsp_saved_frame_resume`, `ap_saved_frame_resume`, `ap_sched_next_or_idle` — U3 retired the AP saved-context broad read onto `ap_saved_resume_context_split` (6 → 5) |
 | RISC-V resume | `riscv64/boot.rs:1048` | `yarm_riscv64_trap_bridge` |
 | Thread creation | `thread_state.rs:232` | `yarm_kernel_thread_switch_trampoline_rust_real` |
 | Recv / delivery boundary | `runtime.rs:1350, 1450, 1484, 1533, 1701, 1714, 1846, 2190, 2368, 2402` | `try_split_ipc_recv_queued_plain_into_frame`, `complete_recv_boundary_user_copy`, `complete_recv_boundary_ordinary_cap`, `execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`, `execute_blocked_waiter_ordinary_cap_delivery` |

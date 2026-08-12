@@ -73,7 +73,14 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
 /// mechanical, and subtracted by [`THREAD_LOCAL_FALSE_POSITIVES`] to reach the audited
 /// figure.
 const EXPECTED_WITH_BROAD: &[(&str, usize)] = &[
-    ("src/arch/x86_64/smp.rs", 2),
+    // U3 (203C): 2 -> 1. The AP saved-frame resume's broad read became one authoritative rank-2
+    // snapshot transaction (`SharedKernel::ap_saved_resume_context_split`): a single task-domain
+    // acquisition copies ASID + status + full `UserRegisterContext` + TLS by value, and the
+    // ASID -> CR3 resolution runs only after that guard is released. The BSP counterpart is
+    // deliberately NOT converted: its path is not live-reached at this base (the cross-CPU reply
+    // oracle never emits `X86_BSP_SAVED_DISPATCH_OK`), and an unreached site is never retired
+    // merely because it is homologous to a reached one.
+    ("src/arch/x86_64/smp.rs", 1),
     ("src/kernel/boot/orchestrator_state.rs", 1),
     // U1: 8 -> 7. The obsolete `SharedKernel::run_reply_timeout_completion` wrapper had no
     // production caller and was deleted; the single completion body
@@ -101,7 +108,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
 const AUDITED_WITH_CPU_TOTAL: usize = 23; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 (+ the three current-identity acquisitions)
-const AUDITED_WITH_BROAD_TOTAL: usize = 2; // U3: 6 -> 2 (runtime.rs fully drained; the x86 SMP pair remains)
+const AUDITED_WITH_BROAD_TOTAL: usize = 1; // U3: 6 -> 2 -> 1 (runtime.rs fully drained; the reached x86 AP SMP read retired)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
 
@@ -109,7 +116,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 25; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 (nineteen retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 24; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 (twenty retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -87286,9 +87286,15 @@ mod stage199a2d2c2b3_guards {
     // BSP/current CR3.
     #[test]
     fn saved_resume_loads_server_cr3() {
-        // ap_saved_resume_context sources cr3 from cr3_for_asid(server asid); the resume loads it.
+        // The saved-context snapshot sources cr3 from cr3_for_asid(server asid); the resume
+        // loads it. U3 (203C): the AP resume now takes that snapshot through the rank-2
+        // transaction `SharedKernel::ap_saved_resume_context_split` instead of a broad read —
+        // the CR3 source is unchanged, only the acquisition is.
         assert!(EXEC.contains("let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;"));
-        assert!(SMP.contains("shared.with(|k| k.ap_saved_resume_context(tid))"));
+        assert!(
+            RUNTIME.contains("let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;")
+        );
+        assert!(SMP.contains("shared.ap_saved_resume_context_split(tid)"));
         assert!(SMP.contains("core::arch::asm!(\"mov cr3, {}\", in(reg) cr3"));
     }
 
@@ -90321,8 +90327,14 @@ mod stage200c_reply_timeout_transaction {
         );
     }
 
+    /// U3 (203C) — the x86 SMP saved-context cohort landed as a REDUCED cohort: the AP
+    /// saved-frame resume converted onto `SharedKernel::ap_saved_resume_context_split`; the BSP
+    /// one did not, because its path is not live-reached at this base (the cross-CPU reply
+    /// oracle never emits `X86_BSP_SAVED_DISPATCH_OK`). One broad read therefore remains, and it
+    /// is deliberately the unreached one — an unreached site is never retired merely because it
+    /// is homologous to a reached one.
     #[test]
-    fn u3_x86_smp_broad_reads_remain_untouched() {
+    fn u3_x86_smp_broad_read_is_the_unreached_bsp_site_only() {
         const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
         let code: alloc::string::String = SMP_SRC
             .lines()
@@ -90331,13 +90343,18 @@ mod stage200c_reply_timeout_transaction {
             .join("\n");
         assert_eq!(
             code.matches(".with(|").count(),
-            2,
-            "the two x86 SMP broad reads are deferred to a separate cohort, not retired here"
+            1,
+            "one broad read remains — the unreached BSP saved-frame resume"
+        );
+        assert!(
+            code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
+            "the retained broad read is the BSP site, not the converted AP one"
         );
         assert_eq!(
-            code.matches("ap_saved_resume_context").count(),
-            2,
-            "both remaining broad reads are the ap_saved_resume_context transaction"
+            code.matches("shared.ap_saved_resume_context_split(tid)")
+                .count(),
+            1,
+            "the AP site runs the narrow rank-2 transaction"
         );
     }
 
@@ -118484,6 +118501,394 @@ mod stage199d_wa3c1_waiter_record {
         assert!(
             phase_c.contains("plan.wait_generation"),
             "Phase C must publish the generation THREADED from Phase B, not re-read it by TID"
+        );
+    }
+}
+
+/// U3 (canonical 203C) — the x86_64 AP saved-context snapshot transaction.
+///
+/// `SharedKernel::ap_saved_resume_context_split` replaces the broad
+/// `shared.with(|k| k.ap_saved_resume_context(tid))` read that `ap_saved_frame_resume` used to
+/// take. These pin the two things that matter: the DATA the resume gets is exactly what the
+/// legacy `KernelState` body produced, and the LOCK SHAPE is one rank-2 acquisition with the
+/// ASID→CR3 resolution outside it.
+///
+/// The BSP counterpart (`c2c_bsp_saved_frame_resume`) is deliberately NOT converted: its path is
+/// unreachable at this base (the cross-CPU reply oracle never reaches
+/// `X86_BSP_SAVED_DISPATCH_OK`), so it keeps the legacy broad read and
+/// `KernelState::ap_saved_resume_context` is retained for it.
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod u3_ap_saved_context_snapshot {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::vm::{Asid, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const TID: u64 = 4242;
+    const ASID: u16 = 6;
+    const RIP: u64 = 0x2000_0026;
+    const RSP: u64 = 0x2001_0ff0;
+    const TLS: u64 = 0x3000_1000;
+    /// Distinct per-register values, so a transposed or truncated copy is visible.
+    fn gpr(i: usize) -> u64 {
+        0xA000_0000 + (i as u64) * 0x11
+    }
+
+    struct Fx {
+        status: TaskStatus,
+        asid: Option<u16>,
+        rip: u64,
+        rsp: u64,
+        tls: Option<u64>,
+    }
+
+    impl Default for Fx {
+        fn default() -> Self {
+            Self {
+                status: TaskStatus::Runnable,
+                asid: Some(ASID),
+                rip: RIP,
+                rsp: RSP,
+                tls: Some(TLS),
+            }
+        }
+    }
+
+    fn kernel_with(fx: Fx) -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(TID).expect("task");
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == TID).unwrap();
+                tcb.status = fx.status;
+                tcb.asid = fx.asid.map(Asid);
+                tcb.tls_ptr = fx.tls.map(VirtAddr);
+                tcb.user_context.instruction_ptr = VirtAddr(fx.rip);
+                tcb.user_context.stack_ptr = VirtAddr(fx.rsp);
+                for (i, g) in tcb.user_context.user_gprs.iter_mut().enumerate().take(15) {
+                    *g = gpr(i) as usize;
+                }
+            });
+        });
+        k
+    }
+
+    // ── data equivalence ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_snapshot_carries_exact_asid_rip_rsp_gprs_and_tls() {
+        let k = kernel_with(Fx::default());
+        let got = k
+            .ap_saved_resume_context_split(TID)
+            .expect("a Runnable task with an ASID and a complete frame resolves");
+        assert_eq!(got.asid, ASID, "exact ASID");
+        assert_eq!(got.rip, RIP, "exact post-syscall RIP");
+        assert_eq!(got.rsp, RSP, "exact post-syscall RSP");
+        assert_eq!(got.fs_base, TLS, "TLS/FS restoration data");
+        for i in 0..15 {
+            assert_eq!(got.gprs[i], gpr(i), "GPR {i} must survive in order");
+        }
+        assert!(got.runnable_saved, "Runnable + complete frame");
+        // The legacy body resolved CR3 from the SAME ASID; a resolved root is non-zero.
+        assert_ne!(got.cr3, 0, "cr3 resolved for the snapshotted ASID");
+    }
+
+    #[test]
+    fn u3_absent_tls_maps_to_zero_fs_base() {
+        let k = kernel_with(Fx {
+            tls: None,
+            ..Fx::default()
+        });
+        let got = k.ap_saved_resume_context_split(TID).expect("resolves");
+        assert_eq!(
+            got.fs_base, 0,
+            "a task with no TLS resumes with FS.base = 0"
+        );
+        assert!(got.runnable_saved);
+    }
+
+    // ── runnable_saved acceptance / rejection ─────────────────────────────────────────────
+
+    #[test]
+    fn u3_runnable_and_running_are_accepted() {
+        for status in [TaskStatus::Runnable, TaskStatus::Running] {
+            let k = kernel_with(Fx {
+                status,
+                ..Fx::default()
+            });
+            let got = k.ap_saved_resume_context_split(TID).expect("resolves");
+            assert!(got.runnable_saved, "{status:?} must be resumable");
+        }
+    }
+
+    #[test]
+    fn u3_non_runnable_statuses_are_rejected_as_runnable_saved() {
+        for status in [
+            TaskStatus::Blocked(WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(1),
+            )),
+            TaskStatus::Faulted,
+            TaskStatus::Exited(0),
+            TaskStatus::Dead,
+            TaskStatus::Reserved,
+        ] {
+            let k = kernel_with(Fx {
+                status,
+                ..Fx::default()
+            });
+            let got = k
+                .ap_saved_resume_context_split(TID)
+                .expect("the snapshot still resolves; only the verdict changes");
+            assert!(
+                !got.runnable_saved,
+                "{status:?} must never be reported resumable"
+            );
+        }
+    }
+
+    #[test]
+    fn u3_zero_rip_or_zero_rsp_is_not_a_committed_frame() {
+        for (rip, rsp, what) in [
+            (0, RSP, "zero RIP"),
+            (RIP, 0, "zero RSP"),
+            (0, 0, "both zero"),
+        ] {
+            let k = kernel_with(Fx {
+                rip,
+                rsp,
+                ..Fx::default()
+            });
+            let got = k.ap_saved_resume_context_split(TID).expect("resolves");
+            assert!(
+                !got.runnable_saved,
+                "{what}: a partial/uncommitted continuation is never resumable"
+            );
+        }
+    }
+
+    // ── None refusals ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_absent_tcb_returns_none() {
+        let k = kernel_with(Fx::default());
+        assert!(
+            k.ap_saved_resume_context_split(TID + 1).is_none(),
+            "an unknown TID has no snapshot"
+        );
+    }
+
+    #[test]
+    fn u3_absent_asid_returns_none() {
+        let k = kernel_with(Fx {
+            asid: None,
+            ..Fx::default()
+        });
+        assert!(
+            k.ap_saved_resume_context_split(TID).is_none(),
+            "a TCB with no ASID refuses before any CR3 resolution"
+        );
+    }
+
+    #[test]
+    fn u3_missing_page_table_root_returns_none() {
+        use crate::arch::x86_64::page_table::{cr3_for_asid, remove_asid_root};
+        // `ensure_asid` creates a root lazily, so an unresolvable ASID has to be produced by
+        // exhausting the finite ASID-root table. Every root this test creates is removed again
+        // afterwards, so the shared `PAGE_TABLE_STATE` is left exactly as it was found.
+        let k = kernel_with(Fx::default());
+        let mut created = alloc::vec::Vec::new();
+        let mut unresolvable = None;
+        for raw in 1000u16..u16::MAX {
+            let asid = Asid(raw);
+            if cr3_for_asid(asid).is_none() {
+                unresolvable = Some(raw);
+                break;
+            }
+            created.push(asid);
+        }
+        let unresolvable = unresolvable
+            .expect("the ASID-root table is finite; exhausting it must yield an ASID with no root");
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == TID).unwrap();
+                tcb.asid = Some(Asid(unresolvable));
+            });
+        });
+        let got = k.ap_saved_resume_context_split(TID);
+        for asid in created {
+            remove_asid_root(asid);
+        }
+        assert!(
+            got.is_none(),
+            "a missing CR3/root refuses the whole snapshot — the resume never proceeds into an \
+             unresolved address space"
+        );
+    }
+
+    // ── lock shape ────────────────────────────────────────────────────────────────────────
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn transaction_body() -> alloc::string::String {
+        code_of(
+            RUNTIME
+                .split("pub(crate) fn ap_saved_resume_context_split")
+                .nth(1)
+                .expect("the transaction exists")
+                .split("\n    /// ")
+                .next()
+                .expect("bounded by the next doc comment"),
+        )
+    }
+
+    #[test]
+    fn u3_transaction_takes_rank_two_once_and_resolves_cr3_after_releasing_it() {
+        let body = transaction_body();
+        assert!(
+            !body.contains(".with_cpu(") && !body.contains("self.with(|"),
+            "the transaction must hold no broad acquisition"
+        );
+        assert_eq!(
+            body.matches("with_task_tcbs_split_mut").count(),
+            1,
+            "exactly one rank-2 task acquisition"
+        );
+        let seam = body
+            .find("with_task_tcbs_split_mut")
+            .expect("rank-2 acquisition");
+        let seam_closes = body[seam..]
+            .find("})?;")
+            .map(|rel| seam + rel)
+            .expect("the rank-2 closure must end before anything else runs");
+        let cr3 = body.find("cr3_for_asid").expect("CR3 resolution");
+        assert!(
+            seam_closes < cr3,
+            "ASID -> CR3 resolution must happen AFTER the rank-2 guard is released; \
+             PAGE_TABLE_STATE is an independent, unranked lock and must not be taken \
+             while the task lock is held"
+        );
+        // Every task-owned field is read inside the ONE acquisition.
+        let phase_a = &body[seam..seam_closes];
+        for field in ["tcb.asid", "tcb.status", "tcb.tls_ptr", "tcb.user_context"] {
+            assert!(
+                phase_a.contains(field),
+                "`{field}` must be snapshotted inside the single rank-2 acquisition"
+            );
+        }
+        // Read-only in both domains.
+        for forbidden in [
+            "dispatch_next",
+            "enqueue_on_cpu",
+            "on_preempt_prefer",
+            "take_blocked_syscall_completion",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the snapshot must not contain `{forbidden}` — it consumes and mutates nothing"
+            );
+        }
+    }
+
+    fn ap_resume_body() -> alloc::string::String {
+        let f = SMP
+            .split("fn ap_saved_frame_resume(")
+            .nth(1)
+            .expect("the converted caller exists");
+        code_of(&f[..f.find("\n}\n").expect("function end")])
+    }
+
+    #[test]
+    fn u3_converted_caller_has_no_broad_fallback_and_no_second_tcb_read() {
+        let body = ap_resume_body();
+        assert!(
+            body.contains("shared.ap_saved_resume_context_split(tid)"),
+            "the converted caller calls the narrow transaction directly"
+        );
+        assert!(
+            !body.contains("shared.with(|"),
+            "no broad acquisition may remain on the converted path"
+        );
+        assert_eq!(
+            body.matches("ap_saved_resume_context_split").count(),
+            1,
+            "exactly one snapshot — never a second TCB read"
+        );
+        // The four scheduler-mutating acquisitions are a separate cohort; this caller keeps
+        // exactly its own one (enqueue + dispatch_next_on_cpu).
+        assert_eq!(
+            body.matches(".with_cpu(").count(),
+            1,
+            "the caller's own scheduler-mutating with_cpu is untouched"
+        );
+        assert!(
+            body.contains("k.enqueue_on_cpu(cpu, expected)")
+                && body.contains("k.dispatch_next_on_cpu(cpu)"),
+            "that acquisition is still the enqueue + dispatch selection, unchanged"
+        );
+    }
+
+    #[test]
+    fn u3_converted_caller_diverges_only_after_the_complete_snapshot() {
+        let body = ap_resume_body();
+        let snapshot = body
+            .find("shared.ap_saved_resume_context_split(tid)")
+            .expect("snapshot");
+        let validate = body
+            .find("if !runnable_saved || rip == 0 || rsp == 0")
+            .expect("validation");
+        let committed = body
+            .find("X86_AP_SAVED_FRAME_COMMITTED")
+            .expect("commit attestation");
+        let wrmsr = body.find("wrmsr").expect("FS restoration");
+        let frame = body.find("ApSavedResumeFrame").expect("frame construction");
+        let diverge = body
+            .find("resume_user_mode_iret(&frame)")
+            .expect("divergence");
+        assert!(
+            snapshot < validate
+                && validate < committed
+                && committed < wrmsr
+                && wrmsr < frame
+                && frame < diverge,
+            "snapshot -> validate -> attest -> FS -> frame -> iretq order is unchanged"
+        );
+        // No lock or guard is held across any of the divergence steps.
+        let after = &body[snapshot..];
+        assert!(
+            !after.contains("with_task_tcbs_split_mut")
+                && !after.contains(".with_cpu(")
+                && !after.contains("shared.with("),
+            "nothing after the snapshot may acquire a lock — wrmsr, CR3 load, frame \
+             construction, logging and iretq all run guard-free"
+        );
+    }
+
+    #[test]
+    fn u3_unreached_bsp_site_keeps_the_legacy_broad_read() {
+        let code = code_of(SMP);
+        assert_eq!(
+            code.matches(".with(|").count(),
+            1,
+            "exactly one broad read remains: the BSP saved-frame resume, whose path is not \
+             live-reached at this base and is therefore not converted"
+        );
+        assert!(
+            code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
+            "the retained broad read is the BSP one"
+        );
+        const EXEC: &str = include_str!("exec_state.rs");
+        assert!(
+            EXEC.contains("pub(crate) fn ap_saved_resume_context("),
+            "KernelState::ap_saved_resume_context is retained for that unconverted caller"
         );
     }
 }

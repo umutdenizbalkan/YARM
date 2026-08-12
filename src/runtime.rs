@@ -499,6 +499,40 @@ pub(crate) struct PostLockExitValidation {
     pub(crate) in_runqueue: bool,
 }
 
+/// The coherent rank-2 saved-context snapshot taken by
+/// [`SharedKernel::ap_saved_resume_context_split`].
+///
+/// Named fields rather than the legacy positional seven-element tuple, so no consumer can
+/// silently transpose `rip`/`rsp`, or read `fs_base` where `cr3` was meant. Every task-owned
+/// field is an observation of ONE incarnation at ONE instant, copied by value while the rank-2
+/// task lock was held; `cr3` is resolved afterwards, with that lock released.
+///
+/// The only production constructor and the only production consumer are both freestanding-x86
+/// (`ap_saved_frame_resume`), so a hosted build sees no live construction; the type is kept
+/// compiled there — rather than cfg'd away — so the behavioural tests below can exercise the
+/// real transaction rather than a hosted-only re-implementation of it.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApSavedResumeContext {
+    /// The address space the snapshotted incarnation was bound to (rank 2).
+    pub(crate) asid: u16,
+    /// The page-table root for `asid`, resolved from `PAGE_TABLE_STATE` after rank 2 was
+    /// released. Never observed under the task lock.
+    pub(crate) cr3: u64,
+    /// Exact post-syscall user instruction pointer captured when the task last left ring 3.
+    pub(crate) rip: u64,
+    /// Exact post-syscall user stack pointer.
+    pub(crate) rsp: u64,
+    /// The 15 saved user GPRs (rax..r15), in the existing order.
+    pub(crate) gprs: [u64; 15],
+    /// The task's saved TLS base for `IA32_FS_BASE`; a task with no TLS resumes with 0.
+    pub(crate) fs_base: u64,
+    /// `status is Runnable | Running` AND the saved frame is complete (`rip != 0 && rsp != 0`).
+    /// A resume must never proceed from a partial or uncommitted continuation.
+    pub(crate) runnable_saved: bool,
+}
+
 /// What a mark attempt did. Typed, so no caller has to infer it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
@@ -2107,6 +2141,79 @@ impl SharedKernel {
                 terminal,
                 in_runqueue,
             })
+        })
+    }
+
+    /// U3 (canonical 203C) — the authoritative saved-context snapshot for an x86_64 AP
+    /// saved-frame resume, taken through the rank-2 task seam only.
+    ///
+    /// Replaces the broad `shared.with(|k| k.ap_saved_resume_context(tid))` re-acquire that
+    /// `ap_saved_frame_resume` used to take. The legacy `KernelState` body answered the same
+    /// question across FOUR separate reads — `task_asid`, then `cr3_for_asid`, then
+    /// `task_status`, then `with_tcbs` for the context — each of which re-entered the task
+    /// domain on its own. Under the broad lock that was safe but incoherent by construction:
+    /// nothing in its shape says the ASID, the status and the register context belong to the
+    /// same incarnation. This transaction takes all of them in ONE rank-2 acquisition, so a
+    /// resume can never mix one incarnation's ASID with another's saved frame.
+    ///
+    /// Lock ordering, and why CR3 resolution is deliberately outside:
+    ///
+    /// 1. rank 2 (task) is acquired exactly once and every task-owned field — ASID, status,
+    ///    the full `UserRegisterContext`, and the TLS pointer — is copied by value;
+    /// 2. rank 2 is released completely when the seam closure returns;
+    /// 3. only then is `asid` resolved to a page-table root through
+    ///    `x86_64::page_table::cr3_for_asid`, which takes `PAGE_TABLE_STATE` — an INDEPENDENT,
+    ///    unranked lock. Holding the task lock across it would couple two lock orders that the
+    ///    rank system says nothing about, so it is not held.
+    ///
+    /// The refusal set is byte-for-byte the legacy body's: an absent TCB, a TCB with no ASID,
+    /// and an ASID with no page-table root each return `None`. `runnable_saved` is likewise
+    /// unchanged — `Runnable | Running` AND a complete (`rip != 0 && rsp != 0`) saved frame;
+    /// `Blocked`, `Faulted`, `Exited`, `Dead` and `Reserved` are all rejected. TLS absent maps
+    /// to `fs_base = 0`.
+    ///
+    /// Identity contract — deliberately NOT strengthened: like the legacy body, this locates
+    /// the task by numeric TID and reports the ASID it finds bound to that TID in the same
+    /// snapshot. The callers do not hold a generation-bearing or exact-incarnation token, so
+    /// this claims no exact-incarnation authority they could not honour.
+    ///
+    /// Read-only in both domains: no dispatch, no enqueue, no status write, no context
+    /// consumption.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn ap_saved_resume_context_split(&self, tid: u64) -> Option<ApSavedResumeContext> {
+        // Phase 1 — ONE rank-2 acquisition. Everything task-owned is copied out by value, so
+        // nothing below observes the TCB array after the guard drops.
+        let (asid, context, runnable, fs_base) = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == tid)?;
+            let asid = tcb.asid?;
+            let runnable = matches!(
+                tcb.status,
+                crate::kernel::task::TaskStatus::Runnable
+                    | crate::kernel::task::TaskStatus::Running
+            );
+            // Stage 199A2D2C2B: FS base comes from the SELECTED TASK's saved TLS state, never a
+            // hardcoded constant; a task with no TLS resumes with FS.base = 0.
+            let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);
+            Some((asid, tcb.user_context, runnable, fs_base))
+        })?;
+        // Phase 2 — rank 2 is released. `PAGE_TABLE_STATE` is an independent, unranked lock and
+        // must not be taken while the task lock is held.
+        let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;
+        let mut gprs = [0u64; 15];
+        for (i, g) in gprs.iter_mut().enumerate() {
+            *g = context.user_gprs[i] as u64;
+        }
+        let rip = context.instruction_ptr.0;
+        let rsp = context.stack_ptr.0;
+        let has_saved = rip != 0 && rsp != 0;
+        Some(ApSavedResumeContext {
+            asid: asid.0,
+            cr3,
+            rip,
+            rsp,
+            gprs,
+            fs_base,
+            runnable_saved: runnable && has_saved,
         })
     }
 

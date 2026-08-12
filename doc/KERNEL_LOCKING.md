@@ -52,9 +52,9 @@ lines excluded.
 | Category | Production callsites |
 |----------|---------------------|
 | `SharedKernel::with_cpu` | **23** |
-| `SharedKernel::with` (broad `&mut KernelState`) | **2** |
+| `SharedKernel::with` (broad `&mut KernelState`) | **1** |
 | Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
-| **Total broad-lock acquisition sites** | **25** |
+| **Total broad-lock acquisition sites** | **24** |
 
 Canonical Stage **204A** additionally requires each site classified. That classification is
 complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
@@ -64,7 +64,7 @@ complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
 | boot-only | **0** | — |
 | test-only | **0** | U2 relocated all three into test-only modules (`ipc_recv_with_deadline_split_bridge` ×2; the `SharedKernel` control-plane cnode-slots wrapper ×1) |
 | obsolete | **0** | U1 deleted both (`handle_trap_with_cpu`, no in-tree caller at all; `run_reply_timeout_completion`, no production caller) |
-| runtime-required | **28** | the real retirement surface; U3 has retired twelve post-lock drains — six on RISC-V (five switch/read drains plus the `CurrentTaskExited` validation snapshot, onto a coherent rank-1/rank-2 transaction), two on AArch64 (the FutexWait and Yield switch-success restores, onto the neutral exact-token resume core) and four on x86_64 (the D2 blocking-send/blocking-receive and the FutexWait/Yield switch-success restores, all onto one neutral exact-token transaction) — plus all four broad `with` wrappers in `runtime.rs`, onto the rank-2 task seam and a sequential rank-2 → rank-3 disarm |
+| runtime-required | **24** | the real retirement surface; U3 has retired twelve post-lock drains — six on RISC-V (five switch/read drains plus the `CurrentTaskExited` validation snapshot, onto a coherent rank-1/rank-2 transaction), two on AArch64 (the FutexWait and Yield switch-success restores, onto the neutral exact-token resume core) and four on x86_64 (the D2 blocking-send/blocking-receive and the FutexWait/Yield switch-success restores, all onto one neutral exact-token transaction) — plus the three current-identity acquisitions, all four broad `with` wrappers in `runtime.rs` (onto the rank-2 task seam and a sequential rank-2 → rank-3 disarm), and the x86_64 AP saved-context read (onto the rank-2 `ap_saved_resume_context_split` snapshot). The BSP saved-context read is retained: its path is not live-reached at this base |
 | undocumented | **0** | every site enumerated with file, line and enclosing function |
 
 This table is machine-checked: `tests/broad_lock_census_guard.rs` recomputes the per-file
