@@ -78,7 +78,10 @@ const EXPECTED_WITH_BROAD: &[(&str, usize)] = &[
     // U2: 7 -> 4. The two test-only helpers were relocated into test-only modules:
     // `ipc_recv_with_deadline_split_bridge` (2 acquisitions) and the
     // `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1).
-    ("src/runtime.rs", 4),
+    // U3 (203C): 4 -> 0. The last four broad acquisitions in this file moved onto existing
+    // rank-domain seams: the two home-CPU wrappers onto the rank-2 task seam, and the reply-win
+    // deadline disarm onto rank 2 (handle read) followed by rank 3 (exact token disarm), taken
+    // sequentially and never nested. `src/runtime.rs` now has NO production broad acquisition.
 ];
 
 /// Per-file count of raw `self.state.lock()` sites. All three are the bodies of
@@ -95,7 +98,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
 const AUDITED_WITH_CPU_TOTAL: usize = 26; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 (six RISC-V, two AArch64, four x86_64)
-const AUDITED_WITH_BROAD_TOTAL: usize = 6; // U2: 9 -> 6 (three test-only acquisitions relocated)
+const AUDITED_WITH_BROAD_TOTAL: usize = 2; // U3: 6 -> 2 (runtime.rs fully drained; the x86 SMP pair remains)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
 
@@ -103,7 +106,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 32; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 (twelve drains retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 28; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 (sixteen retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

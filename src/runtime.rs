@@ -5004,8 +5004,24 @@ impl SharedKernel {
     /// server's authoritative home CPU (assigned via `set_task_home_cpu`). The accepted NR6
     /// transaction enqueues the woken server on this CPU (its captured affinity), so the woken
     /// server lands on its HOME run queue, never the enqueueing/BSP CPU. `None` when unpinned.
+    ///
+    /// U3 (203C): reads the affinity through the rank-2 task seam instead of the broad lock.
+    /// `KernelState::task_home_cpu` is `task_cpu_affinity(tid).ok().flatten()`, so exactly three
+    /// inputs answer `None` — the idle TID, an absent TCB (`Err(TaskMissing)` swallowed by
+    /// `.ok()`), and a present-but-unpinned TCB (`Ok(None)` flattened) — and a pinned TCB answers
+    /// its exact `cpu_affinity`. That is reproduced here verbatim. Calling `task_home_cpu` would
+    /// require re-forming a broad `&mut KernelState`, which is the acquisition being retired.
+    /// Read-only: no scheduler acquisition, no mutation, no broad fallback.
     pub(crate) fn smp_request_wake_target_split_read(&self, tid: u64) -> Option<CpuId> {
-        self.with(|k| k.task_home_cpu(tid))
+        if tid == 0 {
+            return None;
+        }
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.cpu_affinity)
+        })
     }
 
     // ── Stage 200C1: reply-receive timeout completion transaction ────────────────
@@ -5305,19 +5321,53 @@ impl SharedKernel {
         caller_tid: u64,
         caller_asid: crate::kernel::vm::Asid,
     ) -> bool {
-        let Some(handle) = self.with(|s| s.reply_timeout_token_for_caller(caller_tid, caller_asid))
-        else {
+        // U3 (203C): two SEQUENTIAL narrow acquisitions replace the two broad ones. Rank 2 reads
+        // the exact `{caller_tid, caller_asid}` incarnation's handle and is fully released before
+        // rank 3 is taken — the two are never nested, so no task lock is held while the deadline
+        // store is touched and no lock of either rank is held during a user copy.
+        //
+        // The old body already dropped the broad lock between its two `self.with(...)` calls, so
+        // this conversion keeps the SAME inter-operation window. The exact token generation and
+        // epoch carried by the handle remain the stale-disarm protection: a handle read here can
+        // never disarm a newer registration.
+        let handle = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == caller_tid && t.asid == Some(caller_asid))
+                .and_then(|t| t.reply_timeout_token)
+        });
+        let Some(handle) = handle else {
             return false;
         };
-        self.with(|s| s.disarm_deadline_after_terminal_completion(&handle))
+        self.with_ipc_split_mut(|ipc| {
+            ipc.reply_deadline_tokens
+                .get(handle.token_index())
+                .is_some_and(|t| {
+                    t.disarm_after_terminal_completion(handle.identity(), handle.epoch())
+                })
+        })
     }
 
     /// Stage 199A2D2A: assign a task's authoritative home CPU (internal placement only; not a
     /// syscall). The x86_64 SMP cross-CPU request oracle binds its server to CPU 1 with this before
     /// the server blocks in recv-v2, so the accepted NR6 transaction's affinity-targeted enqueue
     /// remotely places the woken server on CPU 1's run queue.
+    ///
+    /// U3 (203C): assigns through the rank-2 task seam instead of the broad lock, matching
+    /// `KernelState::set_task_home_cpu` exactly — find by numeric TID, set `cpu_affinity`, and
+    /// report success only when the TCB exists (`Err(TaskMissing)` → `false`). No online-CPU
+    /// validation is added, the placement policy is unchanged, the scheduler lock is not taken,
+    /// and there is no broad fallback.
     pub(crate) fn smp_assign_task_home_cpu(&self, tid: u64, cpu: CpuId) -> bool {
-        self.with(|k| k.set_task_home_cpu(tid, cpu).is_ok())
+        self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                Some(tcb) => {
+                    tcb.cpu_affinity = Some(cpu);
+                    true
+                }
+                None => false,
+            }
+        })
     }
 
     /// Origin-neutral finalize + wake for a shared-region delivery, entirely off-lock. For a blocked

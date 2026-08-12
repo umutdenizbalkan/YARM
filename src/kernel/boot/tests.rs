@@ -86074,6 +86074,72 @@ mod stage199a2d2a_smp_request {
         teardown();
     }
 
+    // ── U3 (203C): both home-CPU wrappers now read/write through the rank-2 task seam ──────
+    //
+    // The wrappers used to take the broad lock and delegate to `KernelState::task_home_cpu` /
+    // `set_task_home_cpu`. These pin the four read outcomes and the two write outcomes that
+    // must be preserved byte-for-byte, and that the seam form still agrees with the
+    // `KernelState` methods (which are unchanged and keep their other uses).
+
+    #[test]
+    fn u3_home_cpu_split_read_preserves_all_four_outcomes() {
+        let fx = smp_server_fixture();
+        // Idle TID is never pinned.
+        assert_eq!(fx.k.smp_request_wake_target_split_read(0), None, "tid 0");
+        // A TID with no TCB at all.
+        assert_eq!(
+            fx.k.smp_request_wake_target_split_read(9999),
+            None,
+            "missing TCB"
+        );
+        // Pinned: the exact affinity, and identical to the KernelState method.
+        assert_eq!(fx.k.smp_request_wake_target_split_read(2), Some(CPU1));
+        assert_eq!(
+            fx.k.smp_request_wake_target_split_read(2),
+            fx.k.with(|s| s.task_home_cpu(2)),
+            "the seam read agrees with KernelState::task_home_cpu"
+        );
+        // Present but unpinned reads None, not a default CPU.
+        fx.k.with(|s| {
+            s.with_tcb_mut(2, |tcb| tcb.cpu_affinity = None)
+                .expect("server tcb");
+        });
+        assert_eq!(
+            fx.k.smp_request_wake_target_split_read(2),
+            None,
+            "an unpinned TCB is None"
+        );
+        assert_eq!(fx.k.with(|s| s.task_home_cpu(2)), None);
+        teardown();
+    }
+
+    #[test]
+    fn u3_home_cpu_split_assign_preserves_both_outcomes() {
+        let fx = smp_server_fixture();
+        // Present TID: assigns the exact CPU and reports success.
+        assert!(fx.k.smp_assign_task_home_cpu(2, CPU0));
+        assert_eq!(fx.k.smp_request_wake_target_split_read(2), Some(CPU0));
+        assert_eq!(
+            fx.k.with(|s| s.task_home_cpu(2)),
+            Some(CPU0),
+            "the seam write is visible through KernelState::task_home_cpu"
+        );
+        // Reassignment is idempotent in shape and overwrites exactly.
+        assert!(fx.k.smp_assign_task_home_cpu(2, CPU1));
+        assert_eq!(fx.k.smp_request_wake_target_split_read(2), Some(CPU1));
+        // Missing TID: no panic, no mutation elsewhere, reports failure.
+        assert!(
+            !fx.k.smp_assign_task_home_cpu(9999, CPU0),
+            "a missing TCB reports false"
+        );
+        assert_eq!(
+            fx.k.smp_request_wake_target_split_read(2),
+            Some(CPU1),
+            "a failed assignment changes nothing"
+        );
+        teardown();
+    }
+
     // (9.8) The acknowledgement contains the CPU-1 server identity.
     #[test]
     fn ack_carries_cpu1_server_identity() {
@@ -90133,6 +90199,220 @@ mod stage200c_reply_timeout_transaction {
 
     fn caller(fx: &CallerFx) -> ReceiverWaiterIdentity {
         ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(1), fx.caller_asid)
+    }
+
+    const U3_RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    // ── U3 (203C): `src/runtime.rs` holds no production broad acquisition ────────────
+    //
+    // The four remaining broad `self.with(|…|)` acquisitions in this file were retired onto
+    // existing rank-domain seams. This guard is whole-file, so it also prevents a new one
+    // being reintroduced anywhere in `runtime.rs`, not merely in the three converted bodies.
+
+    /// Comment-stripped production body of `runtime.rs` (everything before its inline
+    /// `#[cfg(test)] mod tests`), matching the census guard's own collection method.
+    fn u3_runtime_production_code() -> alloc::string::String {
+        let lines: alloc::vec::Vec<&str> = U3_RUNTIME_SRC.lines().collect();
+        let mut cut = lines.len();
+        for (i, l) in lines.iter().enumerate() {
+            let t = l.trim();
+            if (t.starts_with("mod tests") || t.starts_with("pub mod tests"))
+                && t.ends_with('{')
+                && i > 0
+                && lines[i - 1].contains("#[cfg(test)]")
+            {
+                cut = i;
+                break;
+            }
+        }
+        lines[..cut]
+            .iter()
+            .filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with('*') || t.starts_with("/*"))
+            })
+            .copied()
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn u3_runtime_rs_has_no_production_broad_with() {
+        let code = u3_runtime_production_code();
+        assert_eq!(
+            code.matches(".with(|").count(),
+            0,
+            "src/runtime.rs must contain no production broad `.with(|…|)` acquisition"
+        );
+        // The three raw `self.state.lock()` sites are the BODIES of `lock` / `with` /
+        // `with_cpu` themselves and must remain — the lock is not being deleted.
+        assert_eq!(code.matches("self.state.lock()").count(), 3);
+    }
+
+    #[test]
+    fn u3_retired_wrappers_use_rank_domain_seams_without_fallback() {
+        let code = u3_runtime_production_code();
+        let body_of = |name: &str| -> alloc::string::String {
+            code.split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} present"))
+                .split("\n    pub(crate) fn ")
+                .next()
+                .unwrap()
+                .split("\n    pub fn ")
+                .next()
+                .unwrap()
+                .into()
+        };
+        // A. + B. Both home-CPU wrappers go through the rank-2 TCB seam, with no fallback.
+        for name in [
+            "fn smp_request_wake_target_split_read",
+            "fn smp_assign_task_home_cpu",
+        ] {
+            let body = body_of(name);
+            assert!(
+                body.contains("with_task_tcbs_split_mut"),
+                "{name} must use the rank-2 task seam"
+            );
+            assert!(
+                !body.contains(".with(|") && !body.contains(".with_cpu("),
+                "{name} must have no broad fallback"
+            );
+            assert!(
+                !body.contains("with_scheduler_split_mut"),
+                "{name} must not acquire the scheduler lock"
+            );
+        }
+        // The read is read-only; the assignment is the only one that writes affinity.
+        let read = body_of("fn smp_request_wake_target_split_read");
+        assert!(read.contains("if tid == 0"), "tid 0 stays None");
+        assert!(
+            !read.contains("cpu_affinity ="),
+            "the split read must not mutate"
+        );
+        assert!(body_of("fn smp_assign_task_home_cpu").contains("tcb.cpu_affinity = Some(cpu)"));
+
+        // C. The disarm takes rank 2 BEFORE rank 3 and does not nest them: the rank-2 seam
+        // call closes (`});`) before the rank-3 seam call begins.
+        let disarm = body_of("fn disarm_reply_deadline_on_reply_win");
+        let rank2 = disarm
+            .find("with_task_tcbs_split_mut")
+            .expect("rank-2 handle read");
+        let rank3 = disarm.find("with_ipc_split_mut").expect("rank-3 disarm");
+        assert!(rank2 < rank3, "rank 2 must precede rank 3");
+        let between = &disarm[rank2..rank3];
+        assert!(
+            between.contains("});"),
+            "the rank-2 acquisition must close before rank 3 opens — the two are never nested"
+        );
+        assert!(
+            !disarm.contains(".with(|") && !disarm.contains(".with_cpu("),
+            "the disarm must have no broad fallback"
+        );
+        assert_eq!(
+            disarm.matches("with_task_tcbs_split_mut").count(),
+            1,
+            "exactly one rank-2 acquisition"
+        );
+        assert_eq!(
+            disarm.matches("with_ipc_split_mut").count(),
+            1,
+            "exactly one rank-3 acquisition"
+        );
+    }
+
+    #[test]
+    fn u3_x86_smp_broad_reads_remain_untouched() {
+        const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+        let code: alloc::string::String = SMP_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches(".with(|").count(),
+            2,
+            "the two x86 SMP broad reads are deferred to a separate cohort, not retired here"
+        );
+        assert_eq!(
+            code.matches("ap_saved_resume_context").count(),
+            2,
+            "both remaining broad reads are the ap_saved_resume_context transaction"
+        );
+    }
+
+    // ── U3 (203C): the reply-win disarm is now rank 2 then rank 3, sequential ──────────────
+    //
+    // The hook used to take the broad lock twice. It now reads the exact
+    // `{caller_tid, caller_asid}` handle through the rank-2 task seam, releases it, and
+    // disarms the exact token through the rank-3 IPC seam. These pin the refusal contract
+    // that must survive that conversion.
+
+    #[test]
+    fn u3_disarm_exact_success_then_duplicate_refusal() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        assert!(
+            fx.k.disarm_reply_deadline_on_reply_win(1, fx.caller_asid),
+            "the exact caller incarnation disarms its own armed token"
+        );
+        assert!(
+            !fx.k.disarm_reply_deadline_on_reply_win(1, fx.caller_asid),
+            "a second disarm of an already-disarmed token refuses"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn u3_disarm_refuses_wrong_asid_and_missing_caller() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        let wrong = crate::kernel::vm::Asid(fx.caller_asid.0.wrapping_add(7));
+        assert!(
+            !fx.k.disarm_reply_deadline_on_reply_win(1, wrong),
+            "a replacement incarnation (different ASID) must not disarm"
+        );
+        assert!(
+            !fx.k
+                .disarm_reply_deadline_on_reply_win(9999, fx.caller_asid),
+            "a caller with no TCB must not disarm"
+        );
+        // Neither refusal touched the real token: the exact caller still can.
+        assert!(fx.k.disarm_reply_deadline_on_reply_win(1, fx.caller_asid));
+        teardown();
+    }
+
+    #[test]
+    fn u3_disarm_refuses_a_stale_handle_and_a_missing_token() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, _identity, handle) = setup(&fx);
+        // A stale handle aimed at the SAME slot but carrying a different identity/epoch
+        // cannot disarm the live registration.
+        let stale = DeadlineTokenHandle::test_new(handle.token_index(), 9_999);
+        fx.k.with(|s| {
+            s.with_tcb_mut(1, |tcb| tcb.reply_timeout_token = Some(stale))
+                .expect("caller tcb");
+        });
+        assert!(
+            !fx.k.disarm_reply_deadline_on_reply_win(1, fx.caller_asid),
+            "a stale handle must not disarm a newer registration"
+        );
+        // The real registration is untouched — restoring the true handle still disarms.
+        fx.k.with(|s| {
+            s.with_tcb_mut(1, |tcb| tcb.reply_timeout_token = Some(handle))
+                .expect("caller tcb");
+        });
+        assert!(fx.k.disarm_reply_deadline_on_reply_win(1, fx.caller_asid));
+        // With no token published at all, the rank-2 read short-circuits to false.
+        fx.k.with(|s| {
+            s.with_tcb_mut(1, |tcb| tcb.reply_timeout_token = None)
+                .expect("caller tcb");
+        });
+        assert!(
+            !fx.k.disarm_reply_deadline_on_reply_win(1, fx.caller_asid),
+            "a TCB with no token refuses without touching the deadline store"
+        );
+        teardown();
     }
 
     /// A minimal reply-success completion (models the accepted NR7 win + the exact

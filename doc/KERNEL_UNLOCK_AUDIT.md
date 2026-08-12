@@ -128,9 +128,9 @@ lines excluded.
 | Category | Production callsites |
 |----------|---------------------|
 | `SharedKernel::with_cpu` | **26** |
-| `SharedKernel::with` (broad `&mut KernelState`) | **6** |
+| `SharedKernel::with` (broad `&mut KernelState`) | **2** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **32** |
+| **Total broad-lock acquisition sites** | **28** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
@@ -165,16 +165,28 @@ Structural reading of those 40:
 > replacement — unlike the drains above it takes no `with_cpu` at all — so this table is
 > unchanged at 40 across that increment.
 
-### 1.4 Broad `.with(|state| …)` — 6 production callsites
+### 1.4 Broad `.with(|state| …)` — 2 production callsites
 
 | File | Line | Purpose |
 |------|------|---------|
-| `src/runtime.rs` | 3696 | `task_home_cpu` read |
-| `src/runtime.rs` | 4013 | `reply_timeout_token_for_caller` read |
-| `src/runtime.rs` | 4017 | `disarm_deadline_after_terminal_completion` |
-| `src/runtime.rs` | 4025 | `set_task_home_cpu` |
-| `src/arch/x86_64/smp.rs` | 2442 | `ap_saved_resume_context` read |
-| `src/arch/x86_64/smp.rs` | 2582 | `ap_saved_resume_context` read |
+| `src/arch/x86_64/smp.rs` | 2453 | `ap_saved_resume_context` read |
+| `src/arch/x86_64/smp.rs` | 2593 | `ap_saved_resume_context` read |
+
+**U3 retired all four `src/runtime.rs` broad acquisitions (6 → 2).** The two home-CPU
+wrappers (`smp_request_wake_target_split_read`, `smp_assign_task_home_cpu`) now read and
+write `cpu_affinity` through the rank-2 task seam, reproducing
+`KernelState::task_home_cpu` / `set_task_home_cpu` exactly. The reply-win disarm
+(`disarm_reply_deadline_on_reply_win`) became two SEQUENTIAL narrow acquisitions — rank 2
+for the exact `{caller_tid, caller_asid}` handle read, fully released, then rank 3 for the
+exact token disarm — never nested. The old body already dropped the broad lock between its
+two `self.with(...)` calls, so the inter-operation window is unchanged; the token's
+generation and epoch remain the stale-disarm protection. **Caller-census honesty:** these
+four acquisitions were compiled in production source, but at the retirement base none of
+the three enclosing `SharedKernel` wrappers had a production caller — two were reached only
+by hosted tests and one had no caller at all. No live production path moved. The underlying
+`KernelState` methods are untouched and keep their other uses. The two remaining x86 SMP
+reads are out of scope: their `ap_saved_resume_context` transaction combines exact task
+context with ASID→CR3 resolution and needs a separate concurrency design.
 
 `src/kernel/boot/orchestrator_state.rs:47` matches the same textual pattern but is
 `LOCK_ORDER_LAST_RANK.with(|last| …)` — a `thread_local!` accessor, **not** a broad-lock
@@ -201,7 +213,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **32** |
+| runtime-required | **28** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -222,7 +234,7 @@ and `SharedKernel::run_reply_timeout_completion` (no production caller; supersed
 `OffLockReplyTimeout` composition). Neither deletion changed runtime behavior, and the
 reply-timeout completion body itself was not touched.
 
-#### runtime-required (32)
+#### runtime-required (28)
 
 | Group | Sites | Enclosing fn |
 |-------|-------|--------------|
