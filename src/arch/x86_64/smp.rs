@@ -2175,9 +2175,12 @@ pub(crate) fn ap_seal_syscall_ok(cpu: CpuId, nr: u64) {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(crate) fn ap_seal_return_to_idle(shared: &crate::runtime::SharedKernel, cpu: CpuId, _nr: u64) {
     use super::ap_dispatch;
-    let blocked = shared
-        .with_cpu(cpu, |k| k.block_current_on_cpu(cpu))
-        .unwrap_or(None);
+    // U3 (canonical 203C): one authoritative rank-1 scheduler transaction instead of the broad
+    // `with_cpu(cpu, |k| k.block_current_on_cpu(cpu))` re-acquire. Same validation predicate,
+    // same `current_cpu` bind, the same `block_current_on` primitive, and the same
+    // `.unwrap_or(None)` on a refused CPU. No broad fallback; the guard is released before the
+    // marker below.
+    let blocked = shared.block_current_on_cpu_split(cpu).unwrap_or(None);
     crate::kernel::printk::printk_emit_sync(format_args!(
         "{} cpu={} tid={}",
         ap_dispatch::MARK_YIELD_RETURN_TO_SCHED_OK,

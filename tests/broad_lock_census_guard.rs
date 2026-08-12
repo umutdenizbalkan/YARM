@@ -64,7 +64,15 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // existing workload reaches its success body, so it keeps its acquisition byte-for-byte. The
     // three that remain are that one, the AP return-to-idle `block_current_on_cpu`, and the BSP
     // `on_preempt_prefer_on_cpu`.
-    ("src/arch/x86_64/smp.rs", 3),
+    // U3 (203C): 3 -> 2. The AP return-to-idle `with_cpu(cpu, |k| k.block_current_on_cpu(cpu))`
+    // became `SharedKernel::block_current_on_cpu_split`, one rank-1 scheduler transaction: the
+    // whole acquisition existed to do a single scheduler-domain thing — take this CPU's `current`
+    // and drop its membership entry — so rank 1 is acquired once, the CPU is validated with the
+    // same predicate `set_current_cpu` uses, `current_cpu` is bound, and the existing
+    // `block_current_on` primitive runs inside that guard. Rank 2 is never taken and no task
+    // status changes. The two that remain are the BSP `on_preempt_prefer_on_cpu` and the
+    // unreached ED-2 next-task placement, neither of which is live-reached.
+    ("src/arch/x86_64/smp.rs", 2),
     ("src/kernel/boot/thread_state.rs", 1),
     // U1: 13 -> 12. The obsolete `SharedKernel::handle_trap_with_cpu` wrapper had no
     // in-tree caller at all and was deleted.
@@ -117,7 +125,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 22; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 (+ the AP enqueue/dispatch transaction)
+const AUDITED_WITH_CPU_TOTAL: usize = 21; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 (+ the AP block-current transaction)
 const AUDITED_WITH_BROAD_TOTAL: usize = 1; // U3: 6 -> 2 -> 1 (runtime.rs fully drained; the reached x86 AP SMP read retired)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -126,7 +134,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 23; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 (twenty-one retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 22; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 (twenty-two retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

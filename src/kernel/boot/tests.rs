@@ -60357,9 +60357,11 @@ mod stage190a_ap_sched_loop {
         );
         assert!(
             SMP_SRC.contains("fn ap_seal_return_to_idle(")
-                && SMP_SRC.contains("k.block_current_on_cpu(cpu)")
+                && SMP_SRC.contains("shared.block_current_on_cpu_split(cpu).unwrap_or(None)")
                 && SMP_SRC.contains("MARK_YIELD_RETURN_TO_SCHED_OK"),
-            "return-to-idle must block the probe on the AP (run-queue-consistent) + mark it"
+            "return-to-idle must block the probe on the AP (run-queue-consistent) + mark it. \
+             U3 (203C) moved the removal onto the rank-1 transaction \
+             `SharedKernel::block_current_on_cpu_split`; the claim is unchanged."
         );
     }
 
@@ -60367,9 +60369,17 @@ mod stage190a_ap_sched_loop {
     // block_current_on (removes membership), not by ad-hoc mutation.
     #[test]
     fn return_to_idle_uses_scheduler_block_for_consistency() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
         assert!(
             SCHED_STATE_SRC.contains("pub fn block_current_on_cpu(&mut self, cpu: CpuId)")
                 && SCHED_STATE_SRC.contains(".block_current_on(cpu)"),
+            "the KernelState wrapper still routes through the scheduler's block_current_on"
+        );
+        // U3 (203C): the AP probe's own removal is the rank-1 transaction, which calls the SAME
+        // scheduler primitive — the membership algorithm is never reproduced outside it.
+        assert!(
+            RUNTIME_SRC.contains("pub(crate) fn block_current_on_cpu_split(")
+                && RUNTIME_SRC.contains(".block_current_on(cpu)"),
             "the AP probe must be removed via the scheduler's block_current_on (consistent run queue)"
         );
     }
@@ -60394,9 +60404,18 @@ mod stage190a_ap_sched_loop {
     // syscall; return-to-idle blocks under `with_cpu` (the global lock).
     #[test]
     fn no_global_lock_retirement() {
+        // U3 (203C): return-to-idle itself no longer takes the global lock — it runs one rank-1
+        // scheduler transaction. The NON-OVERCLAIM this test exists to protect is unchanged and
+        // still true: the global lock is NOT retired. The AP's syscall still enters it, and
+        // `smp.rs` still holds broad acquisitions on the paths this cohort did not convert.
         assert!(
-            SMP_SRC.contains(".with_cpu(cpu, |k| k.block_current_on_cpu(cpu))"),
-            "return-to-idle must operate under the global lock (with_cpu); lock is not retired"
+            SMP_SRC.contains(".with_cpu(") && SMP_SRC.contains("shared.with(|k|"),
+            "the global lock is NOT retired: smp.rs still holds broad acquisitions"
+        );
+        assert!(
+            SMP_SRC.contains("shared.block_current_on_cpu_split(cpu)"),
+            "return-to-idle operates through the rank-1 scheduler transaction, with no broad \
+             fallback beside it"
         );
         assert!(
             !SMP_SRC.contains("UNLOCK_GRADUATED_FALLBACK") && !SMP_SRC.contains("emergency_optout"),
@@ -119410,11 +119429,13 @@ mod u3_ap_enqueue_dispatch_transaction {
     #[test]
     fn u3_ed2_site_is_retained_byte_for_byte() {
         let code = code_of(SMP);
+        // U3 (203C) has since retired the AP return-to-idle `block_current_on_cpu` acquisition
+        // as well, onto `block_current_on_cpu_split`.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            3,
-            "three with_cpu acquisitions remain: block_current_on_cpu, on_preempt_prefer_on_cpu, \
-             and the unreached ED-2 next-task placement"
+            2,
+            "two with_cpu acquisitions remain: on_preempt_prefer_on_cpu and the unreached ED-2 \
+             next-task placement"
         );
         // ED-2's exact historical body, unchanged — including its distinct refusal policy.
         assert!(
@@ -119426,11 +119447,437 @@ mod u3_ap_enqueue_dispatch_transaction {
         );
         // The retained deliberately-excluded acquisitions.
         assert!(
-            code.contains("k.block_current_on_cpu(cpu)")
-                && code.contains("k.on_preempt_prefer_on_cpu(cpu, client_tid)")
+            code.contains("k.on_preempt_prefer_on_cpu(cpu, client_tid)")
                 && code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
-            "the block-current, BSP preempt and BSP saved-context acquisitions are out of \
-             this cohort and stay exactly as they were"
+            "the BSP preempt and BSP saved-context acquisitions are out of this cohort and \
+             stay exactly as they were"
+        );
+    }
+}
+
+/// U3 (canonical 203C) — the x86_64 AP return-to-scheduler transaction.
+///
+/// `SharedKernel::block_current_on_cpu_split` replaces the broad
+/// `with_cpu(cpu, |k| k.block_current_on_cpu(cpu))` re-acquire in `ap_seal_return_to_idle`.
+/// The whole retirement rests on one claim: taking this CPU's scheduler `current` and dropping
+/// its membership entry is a rank-1 mutation and nothing more. These tests pin that — the
+/// binding semantics, the removal semantics, and everything that must NOT change.
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod u3_ap_block_current_transaction {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskClass, TaskStatus};
+    use crate::runtime::SharedKernel;
+
+    const AP: u8 = 1;
+
+    /// One differential case: a name, the setup applied to both kernels, and the CPU to block on.
+    type BlockScenario = (&'static str, fn(&SharedKernel), CpuId);
+
+    fn kernel() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| s.bring_up_cpu(CpuId(AP)).expect("AP online"));
+        k
+    }
+
+    /// Register `tid`, place it on `cpu` and make it that CPU's `current`.
+    fn make_current(k: &SharedKernel, cpu: CpuId, tid: u64) {
+        k.with(|s| {
+            s.register_task_with_class(tid, TaskClass::App)
+                .expect("register");
+        });
+        k.with_cpu(cpu, |s| {
+            s.enqueue_on_cpu(cpu, tid).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid), "made current");
+        })
+        .expect("admitted");
+    }
+
+    fn current_on(k: &SharedKernel, cpu: CpuId) -> Option<u64> {
+        k.with(|s| s.current_tid_on_cpu(cpu))
+    }
+
+    fn current_cpu(k: &SharedKernel) -> CpuId {
+        k.with(|s| s.current_cpu())
+    }
+
+    // ── binding + removal ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_bc_valid_cpu_is_bound_and_the_current_task_is_removed() {
+        let k = kernel();
+        make_current(&k, CpuId(AP), 300);
+        // Bind to a DIFFERENT cpu first, so the bind under test is observable.
+        k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+        assert_eq!(current_cpu(&k), CpuId(0));
+
+        let removed = k
+            .block_current_on_cpu_split(CpuId(AP))
+            .expect("an online CPU is admitted");
+        assert_eq!(removed, Some(300), "the removed TID is returned verbatim");
+        assert_eq!(
+            current_cpu(&k),
+            CpuId(AP),
+            "the transaction binds current_cpu before removing"
+        );
+        assert_eq!(current_on(&k, CpuId(AP)), None, "nothing is left running");
+    }
+
+    #[test]
+    fn u3_bc_no_current_task_returns_none_and_still_binds() {
+        let k = kernel();
+        k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+        let removed = k.block_current_on_cpu_split(CpuId(AP)).expect("admitted");
+        assert_eq!(removed, None, "no current task -> None");
+        assert_eq!(
+            current_cpu(&k),
+            CpuId(AP),
+            "current_cpu is bound even when that CPU has no current task"
+        );
+    }
+
+    #[test]
+    fn u3_bc_current_tid_zero_is_preserved_not_collapsed_to_none() {
+        let k = kernel();
+        // TID 0 is the idle/supervisor sentinel; it can be enqueued and made current, and
+        // `Some(0)` must survive as `Some(0)` — the caller's `blocked.unwrap_or(0)` cannot
+        // distinguish it, but the transaction must not be the thing that loses it.
+        k.with_cpu(CpuId(AP), |s| {
+            s.enqueue_on_cpu(CpuId(AP), 0)
+                .expect("enqueue idle sentinel");
+            assert_eq!(s.dispatch_next_on_cpu(CpuId(AP)), Some(0));
+        })
+        .expect("admitted");
+        let removed = k.block_current_on_cpu_split(CpuId(AP)).expect("admitted");
+        assert_eq!(removed, Some(0), "TID 0 is returned as Some(0), never None");
+    }
+
+    #[test]
+    fn u3_bc_invalid_cpu_returns_the_legacy_error_and_changes_nothing() {
+        let k = kernel();
+        make_current(&k, CpuId(AP), 301);
+        k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+
+        for bad in [CpuId(7), CpuId(200)] {
+            let err = k
+                .block_current_on_cpu_split(bad)
+                .expect_err("an offline / out-of-range CPU is refused");
+            assert_eq!(
+                err,
+                k.with(|s| s.set_current_cpu(bad).unwrap_err()),
+                "the same failure class the broad path produced"
+            );
+            assert_eq!(
+                current_cpu(&k),
+                CpuId(0),
+                "a refused transaction leaves the binding unchanged"
+            );
+            assert_eq!(
+                current_on(&k, CpuId(AP)),
+                Some(301),
+                "a refused transaction removes no current task"
+            );
+        }
+    }
+
+    // ── what must NOT change ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_bc_membership_is_cleared_so_the_task_can_be_re_enqueued() {
+        let k = kernel();
+        make_current(&k, CpuId(AP), 302);
+        assert_eq!(k.block_current_on_cpu_split(CpuId(AP)), Ok(Some(302)));
+        // Membership removal is what makes a later re-enqueue land; if the entry had leaked,
+        // this would refuse or double-count.
+        k.with_cpu(CpuId(AP), |s| {
+            s.enqueue_on_cpu(CpuId(AP), 302)
+                .expect("re-enqueue after removal");
+            assert_eq!(
+                s.dispatch_next_on_cpu(CpuId(AP)),
+                Some(302),
+                "selectable again"
+            );
+        })
+        .expect("admitted");
+    }
+
+    #[test]
+    fn u3_bc_does_not_mutate_task_status() {
+        let k = kernel();
+        make_current(&k, CpuId(AP), 303);
+        let before = k.with(|s| s.task_status(303));
+        assert_eq!(k.block_current_on_cpu_split(CpuId(AP)), Ok(Some(303)));
+        assert_eq!(
+            k.with(|s| s.task_status(303)),
+            before,
+            "clearing scheduler `current` is NOT a task-state transition"
+        );
+        assert_ne!(
+            before,
+            Some(TaskStatus::Blocked(crate::kernel::task::WaitReason::Poll))
+        );
+    }
+
+    #[test]
+    fn u3_bc_dispatches_and_dequeues_nothing() {
+        let k = kernel();
+        make_current(&k, CpuId(AP), 304);
+        // Two more tasks waiting on the AP queue.
+        k.with(|s| {
+            s.register_task_with_class(305, TaskClass::App)
+                .expect("r305");
+            s.register_task_with_class(306, TaskClass::App)
+                .expect("r306");
+        });
+        k.with_cpu(CpuId(AP), |s| {
+            s.enqueue_on_cpu(CpuId(AP), 305).expect("q305");
+            s.enqueue_on_cpu(CpuId(AP), 306).expect("q306");
+        })
+        .expect("admitted");
+        let queued_before = k.with(|s| s.runnable_count_on_cpu(CpuId(AP)));
+
+        assert_eq!(k.block_current_on_cpu_split(CpuId(AP)), Ok(Some(304)));
+
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(CpuId(AP))),
+            queued_before,
+            "no queue entry is dispatched or dequeued — only `current` is taken"
+        );
+        assert_eq!(
+            current_on(&k, CpuId(AP)),
+            None,
+            "and no replacement task is made current"
+        );
+    }
+
+    #[test]
+    fn u3_bc_leaves_other_cpus_untouched() {
+        let k = kernel();
+        make_current(&k, CpuId(0), 307);
+        make_current(&k, CpuId(AP), 308);
+        let bsp_queue = k.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+
+        assert_eq!(k.block_current_on_cpu_split(CpuId(AP)), Ok(Some(308)));
+
+        assert_eq!(
+            current_on(&k, CpuId(0)),
+            Some(307),
+            "the other CPU's current task is untouched"
+        );
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            bsp_queue,
+            "the other CPU's run queue is untouched"
+        );
+    }
+
+    // ── differential against the retired broad body ───────────────────────────────────────
+
+    #[test]
+    fn u3_bc_matches_the_retired_broad_body() {
+        // Each scenario is applied to two identically constructed kernels: one runs the exact
+        // retired body, the other the transaction. Removed TID, resulting binding, resulting
+        // `current` and the AP queue depth must all agree.
+        let scenarios: [BlockScenario; 4] = [
+            (
+                "current user task",
+                |k| make_current(k, CpuId(AP), 310),
+                CpuId(AP),
+            ),
+            ("no current task", |_| {}, CpuId(AP)),
+            (
+                "current idle sentinel",
+                |k| {
+                    k.with_cpu(CpuId(AP), |s| {
+                        s.enqueue_on_cpu(CpuId(AP), 0).expect("q0");
+                        s.dispatch_next_on_cpu(CpuId(AP));
+                    })
+                    .expect("admitted");
+                },
+                CpuId(AP),
+            ),
+            ("offline CPU", |k| make_current(k, CpuId(AP), 311), CpuId(7)),
+        ];
+        for (name, setup, cpu) in scenarios {
+            let a = kernel();
+            setup(&a);
+            a.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+            let legacy = a.with_cpu(cpu, |s| s.block_current_on_cpu(cpu));
+
+            let b = kernel();
+            setup(&b);
+            b.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+            let split = b.block_current_on_cpu_split(cpu);
+
+            assert_eq!(
+                legacy, split,
+                "{name}: removed TID / error class must match"
+            );
+            assert_eq!(
+                legacy.unwrap_or(None),
+                split.unwrap_or(None),
+                "{name}: the caller's `.unwrap_or(None)` sees the same value"
+            );
+            assert_eq!(current_cpu(&a), current_cpu(&b), "{name}: same binding");
+            assert_eq!(
+                current_on(&a, CpuId(AP)),
+                current_on(&b, CpuId(AP)),
+                "{name}: same resulting current"
+            );
+            assert_eq!(
+                a.with(|s| s.runnable_count_on_cpu(CpuId(AP))),
+                b.with(|s| s.runnable_count_on_cpu(CpuId(AP))),
+                "{name}: same AP queue depth"
+            );
+        }
+    }
+
+    // ── lock shape and caller conversion ──────────────────────────────────────────────────
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn transaction_body() -> alloc::string::String {
+        code_of(
+            RUNTIME
+                .split("pub(crate) fn block_current_on_cpu_split")
+                .nth(1)
+                .expect("the transaction exists")
+                .split("\n    /// ")
+                .next()
+                .expect("bounded by the next doc comment"),
+        )
+    }
+
+    #[test]
+    fn u3_bc_transaction_is_rank_one_only() {
+        let body = transaction_body();
+        assert!(
+            !body.contains(".with_cpu(") && !body.contains("self.with(|"),
+            "no broad acquisition"
+        );
+        assert_eq!(
+            body.matches("with_scheduler_split_mut").count(),
+            1,
+            "exactly one rank-1 scheduler acquisition"
+        );
+        for rank2 in [
+            "with_task_tcbs_split_mut",
+            "with_task_return_split_mut",
+            "with_task_enqueue_policy_split_mut",
+            "with_tcbs",
+        ] {
+            assert!(
+                !body.contains(rank2),
+                "`{rank2}`: rank 2 must never be taken — this is a scheduler-only mutation"
+            );
+        }
+        let validate = body.find("validate_online_cpu").expect("CPU validation");
+        let bind = body.find("sched.current_cpu = cpu").expect("the bind");
+        let block = body
+            .find("block_current_on(cpu)")
+            .expect("the existing primitive");
+        assert!(
+            validate < bind && bind < block,
+            "chronology must be: validate -> bind -> existing block primitive"
+        );
+        // Nothing beyond the scheduler mutation.
+        for forbidden in [
+            "TaskStatus",
+            "enqueue_on",
+            "dispatch_next",
+            "rollback",
+            "wake",
+            "waiter",
+            "membership_remove",
+            "data_ptr()",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "`{forbidden}` must not appear: no task-state change, no enqueue/dispatch, no \
+                 ownership/wake/barrier logic, no reimplemented membership algorithm, no cached \
+                 raw pointer"
+            );
+        }
+    }
+
+    fn seal_body() -> alloc::string::String {
+        let f = SMP
+            .split("pub(crate) fn ap_seal_return_to_idle(")
+            .nth(1)
+            .expect("the converted caller exists");
+        code_of(&f[..f.find("\n}\n").expect("function end")])
+    }
+
+    #[test]
+    fn u3_bc_caller_is_converted_and_its_marker_is_unchanged() {
+        let body = seal_body();
+        assert!(
+            body.contains("shared.block_current_on_cpu_split(cpu).unwrap_or(None)"),
+            "the caller uses the transaction and keeps `.unwrap_or(None)`"
+        );
+        assert!(
+            !body.contains(".with_cpu(") && !body.contains("shared.with(|"),
+            "no broad acquisition remains, and no broad fallback was added"
+        );
+        assert!(
+            body.contains("MARK_YIELD_RETURN_TO_SCHED_OK") && body.contains("blocked.unwrap_or(0)"),
+            "the exact marker text and `blocked.unwrap_or(0)` behaviour are unchanged"
+        );
+        // The guard is released before the caller's telemetry.
+        let seam = body
+            .find("block_current_on_cpu_split")
+            .expect("the transaction call");
+        let emit = body.find("printk_emit_sync").expect("the marker emission");
+        assert!(
+            seam < emit,
+            "the transaction completes before any telemetry"
+        );
+        assert!(
+            !body[seam..].contains("with_scheduler_split_mut"),
+            "no guard is held across the marker"
+        );
+    }
+
+    #[test]
+    fn u3_bc_the_three_retained_smp_acquisitions_are_untouched() {
+        let code = code_of(SMP);
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            2,
+            "two with_cpu acquisitions remain: the BSP preferred dispatch and the unreached \
+             ED-2 next-task placement"
+        );
+        assert_eq!(
+            code.matches(".with(|").count(),
+            1,
+            "one broad read remains: the unreached BSP saved-context read"
+        );
+        assert!(
+            code.contains("k.on_preempt_prefer_on_cpu(cpu, client_tid)"),
+            "the BSP preferred-dispatch acquisition is retained verbatim"
+        );
+        assert!(
+            code.contains("k.enqueue_on_cpu(cpu, next_tid)")
+                && code.contains("Ok(()) => k.dispatch_next_on_cpu(cpu),")
+                && code.contains("Err(_) => None,"),
+            "the unreached ED-2 site is retained verbatim, including its refusal policy"
+        );
+        assert!(
+            code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
+            "the unreached BSP saved-context broad read is retained verbatim"
+        );
+        assert!(
+            !code.contains("k.block_current_on_cpu(cpu)"),
+            "the converted acquisition is gone from this file"
         );
     }
 }

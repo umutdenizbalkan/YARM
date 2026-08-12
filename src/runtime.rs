@@ -2214,6 +2214,49 @@ impl SharedKernel {
         })
     }
 
+    /// U3 (canonical 203C) — the authoritative return-to-scheduler transaction for an x86_64 AP,
+    /// taken as ONE rank-1 critical section.
+    ///
+    /// Replaces the broad `with_cpu(cpu, |k| k.block_current_on_cpu(cpu))` re-acquire in
+    /// `ap_seal_return_to_idle`. That acquisition took the whole `KernelState` lock to do one
+    /// scheduler-domain thing: take this CPU's `current` and drop its membership entry. Nothing
+    /// it touched lives outside rank 1.
+    ///
+    /// Semantics are the broad path's, step for step:
+    ///
+    /// 1. rank 1 (scheduler) is acquired exactly once, for the whole transaction;
+    /// 2. `cpu` is validated with `validate_online_cpu` — the SAME predicate
+    ///    `KernelState::set_current_cpu` uses, which is what `with_cpu` called on entry;
+    /// 3. on validation failure the same `KernelError` class is returned, `current_cpu` is left
+    ///    UNCHANGED, and NO current task is removed — `with_cpu` never ran its closure either;
+    /// 4. on success `scheduler.current_cpu = cpu` is bound, exactly as `with_cpu` did, and
+    ///    unconditionally — including when that CPU has no current task to remove;
+    /// 5. the existing `block_current_on(cpu)` primitive runs inside that same guard, so the
+    ///    membership-table removal is the scheduler's own, not reproduced here.
+    ///
+    /// This is a scheduler-only mutation and deliberately nothing more: rank 2 is never taken,
+    /// no `TaskStatus` is read or written, nothing is enqueued or dispatched, and clearing
+    /// `current` is NOT treated as a task-state transition — there is no rollback, ownership,
+    /// waiter, wake or barrier logic here. The removed TID is returned verbatim, `Some(0)`
+    /// included, and `None` when the CPU has no current task. The guard is released when this
+    /// returns, before the caller's `printk_emit_sync`.
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn block_current_on_cpu_split(
+        &self,
+        cpu: CpuId,
+    ) -> Result<Option<u64>, KernelError> {
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .map_err(crate::kernel::boot::map_scheduler_error)?;
+            sched.current_cpu = cpu;
+            Ok(kernel_mut(&mut sched.scheduler)
+                .block_current_on(cpu)
+                .map(|tid| tid.0))
+        })
+    }
+
     /// U3 (canonical 203C) — the authoritative enqueue→dispatch transaction for an x86_64 AP
     /// placement, taken as ONE rank-1 → rank-2 critical section.
     ///
