@@ -51,10 +51,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **26** |
+| `SharedKernel::with_cpu` | **23** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **2** |
 | Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
-| **Total broad-lock acquisition sites** | **28** |
+| **Total broad-lock acquisition sites** | **25** |
 
 Canonical Stage **204A** additionally requires each site classified. That classification is
 complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
@@ -10731,9 +10731,13 @@ result-writeback — `stage29_split_result_ok_encodes_same_as_old_path`,
 scheduler's per-CPU current slot under the scheduler lock WITHOUT first binding
 `current_cpu`. At the pre-global-lock x86_64 trap point this is stale — it can
 return tid 0 (the previous occupant) instead of the running requester. Trap-seam
-requester identity MUST use `current_tid_authoritative(cpu)`, which takes the
-global lock just long enough to set `current_cpu` and read `current_tid()`. The
-split-dispatch *mutation* still runs lock-free via the per-domain split-mut helper.
+requester identity MUST use `current_tid_authoritative(cpu)`, which validates the
+CPU, sets `current_cpu` and reads `current_tid()`. **U3 (203C):** it no longer takes
+the global lock to do so — it is one rank-1 scheduler transaction — but it still
+BINDS `current_cpu`, and that binding, not the lock, is what makes it authoritative.
+Substituting the non-binding `current_tid_split_read` here is the reverted Stage 4T+6
+experiment. The split-dispatch *mutation* still runs lock-free via the per-domain
+split-mut helper.
 
 x86_64 SMP still deferred. RAMFS/FAT spawning still deferred.
 
@@ -10977,7 +10981,7 @@ a future stage that first extracts the capability-resolution and user-copy domai
 ### 49.6 Lock order
 
 ```
-[no lock] → current_tid_authoritative (takes+releases global) →
+[no lock] → current_tid_authoritative (rank-1 scheduler; binds current_cpu) →
             ipc_state_lock (rank 3, via ipc_try_recv_queued_plain_endpoint_only) →
             [release] → [no lock]
 ```

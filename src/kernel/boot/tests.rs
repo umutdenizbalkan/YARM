@@ -109400,15 +109400,26 @@ mod stage199d_riscv_production_readiness_audit {
     }
 
     /// **Blocker 2 — the decisive finding, now CLOSED.** The bridge used to call
-    /// `current_tid_authoritative` (which is `self.with_cpu(..)`) for the entering and resume
-    /// identities and take a third `with_cpu` for the SATP asid. All three are gone; the record
-    /// of the finding stays, and this guard now pins the closure rather than the defect.
+    /// `current_tid_authoritative` (which WAS `self.with_cpu(..)`) for the entering and resume
+    /// identities and take a third `with_cpu` for the SATP asid. All three are gone from the
+    /// bridge; the record of the finding stays, and this guard pins the closure, not the defect.
+    ///
+    /// U3 (203C): the helper itself is no longer a broad acquisition either — it became one
+    /// rank-1 scheduler transaction that still binds `current_cpu`. The historical premise
+    /// ("using it meant entering the broad lock") is therefore recorded here as history, and
+    /// the guard now pins the CURRENT truth: broad-lock-free, but still binding.
     #[test]
     fn blocker_two_is_closed_the_bridge_takes_no_broad_lock() {
+        let authoritative = function_body(RUNTIME, "pub fn current_tid_authoritative");
         assert!(
-            function_body(RUNTIME, "pub fn current_tid_authoritative").contains("self.with_cpu("),
-            "`current_tid_authoritative` IS a broad-lock acquisition — that is why the bridge's \
-             former use of it was the blocker"
+            !authoritative.contains("self.with_cpu(") && !authoritative.contains("self.with("),
+            "`current_tid_authoritative` is no longer a broad-lock acquisition"
+        );
+        assert!(
+            authoritative.contains("with_scheduler_split_mut")
+                && authoritative.contains("sched.current_cpu = cpu"),
+            "it must still BIND current_cpu — the binding, not the lock, is what made the \
+             bridge's former use authoritative"
         );
         let bridge = function_body(RISCV_BRIDGE, "extern \"C\" fn yarm_riscv64_trap_bridge");
         for l in code_lines(&bridge) {

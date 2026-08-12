@@ -1239,14 +1239,18 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64");
         }
         let fault_rip = frame.rip;
-        // Stage 4T+6R: reverted to conservative with_cpu→current_tid path.
-        // Stage 4T+6 converted this to current_tid_split_read(cpu), which has
-        // equivalent return-value semantics but broke the x86_64 service chain
-        // in smoke testing (service_entries=0, repeated SCHED_ENTER_IDLE_HLT).
-        // The unit-test value-equivalence proof was insufficient: smoke behavior
-        // is the acceptance criterion. Both entering_tid and exiting_tid reads
-        // are restored to the global-lock with_cpu path (Class F).
-        let entering_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
+        // Stage 4T+6R history, and why THIS is not a repeat of it: Stage 4T+6 converted
+        // both snapshots to `current_tid_split_read(cpu)`, which has equivalent
+        // return-value semantics but does NOT bind `scheduler_state.current_cpu` — and
+        // the x86_64 service chain disappeared in smoke (service_entries=0, repeated
+        // SCHED_ENTER_IDLE_HLT). The unit-test value-equivalence proof was insufficient;
+        // smoke behavior is the acceptance criterion.
+        //
+        // U3 (203C): both snapshots now call `current_tid_authoritative(cpu)`, which KEEPS
+        // the binding side effect (validate → set `current_cpu` → read) and only moves it
+        // off the broad lock into one rank-1 scheduler transaction. It is emphatically not
+        // `current_tid_split_read`, which stays intentionally non-binding.
+        let entering_tid: Option<u64> = shared.current_tid_authoritative(cpu);
         // Stage 189D: AP user-dispatch SEAL — a normal syscall issued by a live AP
         // probe task entering the NORMAL global-lock dispatch path (not the magic
         // probe fast path). Gated on the per-CPU seal-probe flag so this is inert on
@@ -1300,9 +1304,11 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
                 crate::arch::x86_64::smp::ap_seal_return_to_idle(shared, cpu, ap_seal_nr);
             }
         }
-        // Stage 4T+6R: reverted to conservative with_cpu→current_tid path.
-        // See entering_tid comment above for the revert rationale.
-        let exiting_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
+        // U3 (203C): the same authoritative binding helper as the entering snapshot. Its
+        // position is unchanged — after trap dispatch and after AP-seal handling — and so
+        // is the switch classification below. See the entering_tid comment above for why
+        // this is not the Stage 4T+6 substitution.
+        let exiting_tid: Option<u64> = shared.current_tid_authoritative(cpu);
         let task_switched = entering_tid != exiting_tid;
         // Stage 199A2D2C2C: on CPU 0 (BSP), drive the reverse-direction saved-frame resume of the
         // remotely-woken oracle client on EVERY trap return (not only the idle transition), because in

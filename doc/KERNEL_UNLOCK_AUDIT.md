@@ -127,10 +127,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **26** |
+| `SharedKernel::with_cpu` | **23** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **2** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **28** |
+| **Total broad-lock acquisition sites** | **25** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
@@ -140,7 +140,6 @@ lines excluded.
 | `src/arch/trap_entry.rs` | 5 | U3 retired the AArch64 FutexWait and Yield switch-success restores (11 → 9), then the two homologous x86_64 D2 switch-success restores — blocking send and blocking receive — onto one neutral exact-token transaction, `x86_post_lock_resume_marked_incoming` (9 → 7), then the x86_64 FutexWait and Yield switch-success restores, which reuse that same transaction unchanged (7 → 5). The five that remain are the canonical broad trap phase, the AArch64 FutexWait no-incoming idle current-TID read (restored: its live gate is unreachable behind the pre-existing SpawnV5 stall), the D6 controlled-proof restore, and the two AArch64 `ExitCurrentTask` acquisitions. |
 | `src/arch/riscv64/trap.rs` | 2 | U3 retired six: two read-only current-TID re-acquisitions (foundation-oracle drain 8 → 7, FutexWait no-incoming idle 7 → 6), the three homologous switch/restore drains — queue-switch foundation, FutexWait switch-success, Yield switch-success (6 → 3) — onto the exact-token rank-2 transaction, and the post-lock `CurrentTaskExited` validation snapshot onto `post_lock_exit_validation_split`, one coherent rank-1 scheduler transaction with the rank-2 task acquisition nested inside it (3 → 2). The two that remain are the canonical broad trap phase and the terminal-idle predicate, whose provenance arm has no live coverage at any accepted base and is deferred. |
 | `src/arch/x86_64/smp.rs` | 4 | 2179, 2455, 2571, 2664 |
-| `src/arch/x86_64/descriptor_tables.rs` | 2 | 1249, 1305 |
 | `src/arch/riscv64/boot.rs` | 1 | 1048 |
 | `src/kernel/boot/thread_state.rs` | 1 | 232 |
 
@@ -154,8 +153,10 @@ Structural reading of those 40:
   `with_cpu` briefly to perform the arch thread-state restore after the authoritative
   dispatch already ran off-lock. These are short and bounded, but they are still broad
   acquisitions and still count.
-* **2 are identity snapshots** — `descriptor_tables.rs:1249/1305` read `current_tid()` under
-  the broad lock purely to compute `entering_tid`/`exiting_tid`.
+* **The 2 identity snapshots are gone.** `descriptor_tables.rs` used to read `current_tid()`
+  under the broad lock purely to compute `entering_tid`/`exiting_tid`; U3 moved both onto
+  `current_tid_authoritative(cpu)`, which is now itself broad-lock-free. That file has **0**
+  broad acquisitions.
 * The remainder are SMP bring-up (`x86_64/smp.rs`), RISC-V resume
   (`riscv64/boot.rs:1048`) and thread creation (`thread_state.rs:232`).
 
@@ -213,7 +214,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **28** |
+| runtime-required | **25** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -234,7 +235,7 @@ and `SharedKernel::run_reply_timeout_completion` (no production caller; supersed
 `OffLockReplyTimeout` composition). Neither deletion changed runtime behavior, and the
 reply-timeout completion body itself was not touched.
 
-#### runtime-required (28)
+#### runtime-required (25)
 
 | Group | Sites | Enclosing fn |
 |-------|-------|--------------|
@@ -242,7 +243,6 @@ reply-timeout completion body itself was not touched.
 | Post-lock drain re-acquisitions | `trap_entry.rs:423, 499, 558, 644, 674, 747, 805`; `riscv64/trap.rs:659, 727, 825, 870, 958, 1063, 1194` | same two functions |
 | First-resume trampoline | `trap_entry.rs:1055, 1202, 1295` | `yarm_kernel_thread_switch_trampoline` |
 | AArch64 split return path | `trap_entry.rs:1432` | `finalize_split_handled_syscall` |
-| Identity snapshots | `descriptor_tables.rs:1249, 1305` | `yarm_x86_dispatch_trap_from_stub` |
 | x86_64 AP paths (knob-gated at runtime, still compiled in) | `smp.rs:2179, 2442, 2455, 2571, 2582, 2664` | `ap_seal_return_to_idle`, `c2c_bsp_saved_frame_resume`, `ap_saved_frame_resume`, `ap_sched_next_or_idle` |
 | RISC-V resume | `riscv64/boot.rs:1048` | `yarm_riscv64_trap_bridge` |
 | Thread creation | `thread_state.rs:232` | `yarm_kernel_thread_switch_trampoline_rust_real` |
@@ -1609,10 +1609,13 @@ The RISC-V trap **wrapper** is clean: `handle_riscv_trap_entry_shared` Phase 1 r
 * `.current_tid_authoritative(cpu)` for `resume_tid` — **after** the handler returns;
 * `.with_cpu(cpu, |k| k.task_asid(resume_tid))` — the SATP asid lookup, also after.
 
-`current_tid_authoritative` is `self.with_cpu(cpu, |kernel| kernel.current_tid())` — a broad-lock
-acquisition. All three are outside the wrapper, so the Phase-1 early return does not avoid any of
-them: **a handled RISC-V NR6/NR7 enters the broad lock three times**, even though the transaction
-it performs is entirely broad-lock-free. This is the RISC-V analogue of AArch64 readiness blocker
+`current_tid_authoritative` **was** `self.with_cpu(cpu, |kernel| kernel.current_tid())` — a
+broad-lock acquisition — when this blocker was written. **U3 (203C) retired that acquisition:** it
+is now one rank-1 scheduler transaction that still validates the CPU and binds `current_cpu`
+before reading, so the two identity reads above no longer enter the broad lock. The remaining
+broad entry on this path is the `with_cpu(cpu, |k| k.task_asid(resume_tid))` SATP asid lookup, so
+**a handled RISC-V NR6/NR7 now enters the broad lock once, not three times.** The residual blocker
+is that one lookup, still outside the wrapper and still unavoided by the Phase-1 early return. This is the RISC-V analogue of AArch64 readiness blocker
 (ii) — same class of defect, different site.
 
 #### What is NOT a blocker: post-lock dispatch

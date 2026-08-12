@@ -657,10 +657,50 @@ impl SharedKernel {
     /// `current_tid(kernel)`. It performs NO dispatch, yield, or task switch — it is
     /// a read-only current-task snapshot. The split-dispatch *mutation* still runs
     /// lock-free via the per-domain split-mut helper after this read releases.
+    ///
+    /// U3 (203C): this is now the AUTHORITATIVE rank-1 transaction — the broad `with_cpu`
+    /// is retired, but **the binding side effect is not**. That distinction is the whole
+    /// point. `current_tid_split_read` reads a per-CPU slot and deliberately does NOT bind
+    /// `scheduler_state.current_cpu`; substituting it here is exactly the Stage 4T+6R
+    /// experiment that made the live x86 service chain disappear. So this helper still
+    /// validates the CPU and writes `current_cpu` before reading — it just does all of it
+    /// inside ONE rank-1 acquisition instead of the broad lock:
+    ///
+    /// 1. validate with the same online predicate `KernelState::set_current_cpu` applies
+    ///    (`validate_online_cpu`), returning `None` and leaving `current_cpu` UNCHANGED on
+    ///    failure — the old `with_cpu` propagated that error to `.ok().flatten()`;
+    /// 2. bind `sched.current_cpu = cpu`, which happens even when the validated CPU has no
+    ///    current task;
+    /// 3. read the authoritative current TID.
+    ///
+    /// The lookup CPU is resolved exactly as `KernelState::current_tid` resolved it, which
+    /// is NOT uniformly the caller's `cpu`: on freestanding AArch64 `KernelState::current_cpu`
+    /// derives it from `MPIDR_EL1`, so the hardware-derived value is preserved rather than
+    /// silently replaced by an unverified caller CPU; everywhere else it is the field just
+    /// bound, i.e. `cpu`. No task lock, no dispatch, no enqueue, no status mutation, no
+    /// broad fallback.
     pub fn current_tid_authoritative(&self, cpu: CpuId) -> Option<u64> {
-        self.with_cpu(cpu, |kernel| kernel.current_tid())
-            .ok()
-            .flatten()
+        self.with_scheduler_split_mut(|sched| {
+            if kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .is_err()
+            {
+                return None;
+            }
+            sched.current_cpu = cpu;
+            // `KernelState::current_tid()` reads `self.current_cpu()`, whose AArch64
+            // freestanding branch is MPIDR-derived rather than the bound field.
+            #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+            let lookup = {
+                let mpidr = crate::arch::aarch64::read_mpidr_el1();
+                CpuId((mpidr & 0xff) as u8)
+            };
+            #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
+            let lookup = sched.current_cpu;
+            kernel_ref(&sched.scheduler)
+                .current_tid_on(lookup)
+                .map(|tid| tid.0)
+        })
     }
 
     /// # Validation status
@@ -6931,6 +6971,219 @@ mod tests {
         assert_eq!(
             entering_tid, None,
             "offline CPU must return None from with_cpu→current_tid"
+        );
+    }
+
+    // ── U3 (203C): `current_tid_authoritative` is the authoritative rank-1 transaction ──
+    //
+    // The x86_64 entering/exiting snapshots now call this helper instead of `with_cpu`.
+    // The Stage 4T+6R revert above is the reason these tests exist: value equivalence is
+    // NOT the property that matters — the BINDING side effect is. Each test below pins a
+    // behaviour that the reverted `current_tid_split_read` substitution did not have.
+
+    #[test]
+    fn u3_authoritative_binds_cpu_and_reads_the_current_tid() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.register_task(77).expect("task77");
+            state.enqueue_current_cpu(77).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), Some(77));
+        assert_eq!(
+            kernel.with(|s| s.current_cpu()),
+            CpuId(0),
+            "a successful call binds current_cpu"
+        );
+    }
+
+    #[test]
+    fn u3_authoritative_binds_even_with_no_current_task() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| s.bring_up_cpu(CpuId(1)).expect("cpu 1 online"));
+        // CPU 1 is online but idle: the read is None and the binding still happens.
+        assert_eq!(kernel.current_tid_authoritative(CpuId(1)), None);
+        assert_eq!(
+            kernel.with(|s| s.current_cpu()),
+            CpuId(1),
+            "binding occurs even when the validated CPU has no current task"
+        );
+    }
+
+    #[test]
+    fn u3_authoritative_offline_cpu_returns_none_and_leaves_the_binding() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        // Establish a known binding first (the value itself is whatever the bootstrap
+        // scheduler holds; what matters is that the binding is CPU 0 and stays there).
+        let baseline = kernel.current_tid_authoritative(CpuId(0));
+        assert_eq!(kernel.with(|s| s.current_cpu()), CpuId(0));
+        // Offline and out-of-range CPUs both refuse WITHOUT rebinding.
+        for bad in [CpuId(7), CpuId(200)] {
+            assert_eq!(
+                kernel.current_tid_authoritative(bad),
+                None,
+                "an invalid/offline CPU returns None"
+            );
+            assert_eq!(
+                kernel.with(|s| s.current_cpu()),
+                CpuId(0),
+                "a refused call must not change the prior binding"
+            );
+        }
+        // And the still-valid CPU still answers exactly as before the refusals.
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), baseline);
+    }
+
+    #[test]
+    fn u3_authoritative_entering_exiting_switch_classification() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        kernel.with(|state| {
+            state.register_task(31).expect("task31");
+            state.register_task(32).expect("task32");
+            state.enqueue_current_cpu(31).expect("enqueue31");
+            state.enqueue_current_cpu(32).expect("enqueue32");
+            state.dispatch_next_task().expect("dispatch to 31");
+        });
+        // No switch: the two snapshots around a no-op are equal.
+        let entering = kernel.current_tid_authoritative(cpu);
+        let exiting = kernel.current_tid_authoritative(cpu);
+        assert_eq!(entering, Some(31));
+        assert_eq!(entering, exiting, "no switch leaves the snapshots equal");
+        assert!(!(entering != exiting), "task_switched must be false");
+        // A real switch (the same mechanism the established with_cpu test uses)
+        // changes the exiting snapshot.
+        let entering = kernel.current_tid_authoritative(cpu);
+        kernel.with(|state| state.yield_current().expect("yield 31"));
+        let exiting = kernel.current_tid_authoritative(cpu);
+        assert_ne!(
+            entering, exiting,
+            "task_switched must be true after a yield"
+        );
+    }
+
+    // ── U3 (203C): source guards against the Stage 4T+6 regression ─────────────────────
+
+    fn u3_code_lines(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn u3_authoritative_body() -> alloc::string::String {
+        let src = include_str!("runtime.rs");
+        u3_code_lines(
+            src.split("pub fn current_tid_authoritative")
+                .nth(1)
+                .expect("helper present")
+                .split("\n    /// ")
+                .next()
+                .expect("bounded by the next doc comment"),
+        )
+    }
+
+    #[test]
+    fn u3_authoritative_is_broad_lock_free_and_still_binds() {
+        let body = u3_authoritative_body();
+        assert!(
+            !body.contains(".with_cpu(") && !body.contains("self.with(|"),
+            "current_tid_authoritative must hold no broad acquisition"
+        );
+        // One rank-1 acquisition covers BOTH the bind and the read.
+        assert_eq!(
+            body.matches("with_scheduler_split_mut").count(),
+            1,
+            "exactly one rank-1 scheduler acquisition"
+        );
+        let validate = body
+            .find("validate_online_cpu")
+            .expect("same online predicate set_current_cpu uses");
+        let bind = body
+            .find("sched.current_cpu = cpu")
+            .expect("binds current_cpu");
+        let read = body.find("current_tid_on(").expect("reads the current tid");
+        assert!(
+            validate < bind,
+            "validation must precede any change to current_cpu"
+        );
+        assert!(bind < read, "the bind must precede the read");
+        // The AArch64 lookup-source policy is preserved structurally: the freestanding
+        // AArch64 branch derives the lookup CPU from MPIDR, not from the caller's `cpu`.
+        assert!(
+            body.contains("read_mpidr_el1")
+                && body.contains("target_arch = \"aarch64\"")
+                && body.contains("let lookup = sched.current_cpu"),
+            "the MPIDR-derived AArch64 lookup must not be replaced by the caller CPU"
+        );
+        // It is a read-only identity snapshot: no dispatch, enqueue or status mutation.
+        for forbidden in [
+            "dispatch_next",
+            "enqueue_",
+            "status =",
+            "with_task_tcbs_split_mut",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "current_tid_authoritative must not contain `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn u3_split_read_remains_intentionally_non_binding() {
+        let src = include_str!("runtime.rs");
+        let body = u3_code_lines(
+            src.split("pub fn current_tid_split_read")
+                .nth(1)
+                .expect("helper present")
+                .split("\n    /// ")
+                .next()
+                .expect("bounded"),
+        );
+        assert!(
+            !body.contains("current_cpu ="),
+            "current_tid_split_read must stay non-binding — binding here would erase the \
+             distinction the Stage 4T+6R revert established"
+        );
+        assert!(body.contains("current_tid_on(cpu)"));
+    }
+
+    #[test]
+    fn u3_descriptor_snapshots_use_the_authoritative_binding_helper() {
+        const DESC: &str = include_str!("arch/x86_64/descriptor_tables.rs");
+        let code = u3_code_lines(DESC);
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            0,
+            "descriptor_tables.rs must contain no broad acquisition"
+        );
+        assert_eq!(
+            code.matches("current_tid_authoritative(cpu)").count(),
+            2,
+            "both identity snapshots use the authoritative binding helper"
+        );
+        assert!(
+            !code.contains("current_tid_split_read"),
+            "neither snapshot may use the non-binding split read (Stage 4T+6 regression)"
+        );
+        // Ordering around dispatch is unchanged: entering before the dispatch call,
+        // exiting after it and after AP-seal handling, then the switch classification.
+        let entering = code
+            .find("let entering_tid: Option<u64> = shared.current_tid_authoritative(cpu);")
+            .expect("entering snapshot");
+        let ap_seal = code
+            .find("ap_seal_return_to_idle")
+            .expect("AP-seal handling");
+        let exiting = code
+            .find("let exiting_tid: Option<u64> = shared.current_tid_authoritative(cpu);")
+            .expect("exiting snapshot");
+        let switched = code
+            .find("let task_switched = entering_tid != exiting_tid;")
+            .expect("switch classification");
+        assert!(
+            entering < ap_seal && ap_seal < exiting && exiting < switched,
+            "entering -> dispatch/AP-seal -> exiting -> task_switched order is unchanged"
         );
     }
 

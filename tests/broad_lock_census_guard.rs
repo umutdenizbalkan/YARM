@@ -54,12 +54,15 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // canonical broad trap phase, the AArch64 FutexWait no-incoming idle read, the D6
     // controlled-proof restore, and the two AArch64 ExitCurrentTask acquisitions.
     ("src/arch/trap_entry.rs", 5),
-    ("src/arch/x86_64/descriptor_tables.rs", 2),
     ("src/arch/x86_64/smp.rs", 4),
     ("src/kernel/boot/thread_state.rs", 1),
     // U1: 13 -> 12. The obsolete `SharedKernel::handle_trap_with_cpu` wrapper had no
     // in-tree caller at all and was deleted.
-    ("src/runtime.rs", 12),
+    // U3 (203C): 12 -> 11. `current_tid_authoritative` became the authoritative rank-1
+    // scheduler transaction. It still VALIDATES the CPU and BINDS `current_cpu` before
+    // reading — only the broad lock went away — which is what distinguishes it from the
+    // reverted Stage 4T+6 substitution onto the non-binding `current_tid_split_read`.
+    ("src/runtime.rs", 11),
 ];
 
 /// Per-file count of production broad `SharedKernel::with(|state| …)` callsites.
@@ -97,7 +100,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 26; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 (six RISC-V, two AArch64, four x86_64)
+const AUDITED_WITH_CPU_TOTAL: usize = 23; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 (+ the three current-identity acquisitions)
 const AUDITED_WITH_BROAD_TOTAL: usize = 2; // U3: 6 -> 2 (runtime.rs fully drained; the x86 SMP pair remains)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -106,7 +109,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 28; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 (sixteen retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 25; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 (nineteen retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
