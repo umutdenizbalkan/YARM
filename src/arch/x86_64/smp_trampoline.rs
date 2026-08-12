@@ -929,17 +929,23 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         // can no longer lose the race against the AP's fast stage transitions
         // (the 183.5 host failure: RECV printed for ~ms while the AP passed the
         // transient stage 28 and parked at 30, so a 28|17|18 poll always missed).
+        "mov dx, 0xE9", // late breadcrumb -> debugcon, NOT structured COM1
         "mov al, 0x61", // 'a'
         "out dx, al",
+        "mov dx, 0x3F8",                // restore COM1 for later code assuming rdx
         "mov dword ptr gs:[116], 1",    // irq_ack = 1 (persistent)
         "mov dword ptr [rdi + 48], 36", // IRQ_ACK_WRITTEN
+        "mov dx, 0xE9",                 // late breadcrumb -> debugcon
         "mov al, 0x64",                 // 'd'
         "out dx, al",
+        "mov dx, 0x3F8", // restore COM1
         // 'v' / stage 28 (inc.4): smoke handled (handler counted + EOI'd + iretq'd
         // back into the window). Interrupts are masked again; fall through to the
         // MANAGED scheduler-owned idle loop (183.5) — NOT a bare cli/hlt park.
+        "mov dx, 0xE9", // late breadcrumb -> debugcon
         "mov al, 0x76", // 'v'
         "out dx, al",
+        "mov dx, 0x3F8", // restore COM1
         "mov dword ptr [rdi + 48], 28",
         // 'q' / stage 30 (183.5): scheduler-owned idle. The BSP installs
         // current=idle(tid 0) for this CPU and brings it scheduler-online; this
@@ -947,8 +953,10 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         // pending-IPI delivery), wake-capable (vector 0xF1 handler increments
         // gs:[108]), and it RETURNS TO IDLE after every observed wake, publishing
         // the re-entry count into [rdi+132] for the BSP's lost/dup-wake grading.
+        "mov dx, 0xE9", // late breadcrumb -> debugcon
         "mov al, 0x71", // 'q'
         "out dx, al",
+        "mov dx, 0x3F8", // restore COM1
         // Publish sched-idle state BOTH into the low handoff stage word (boot-CR3
         // trace) AND the per-CPU record via gs: (kernel .bss — the ONLY thing the
         // post-boot admission polls: the low identity VAs are unmapped on the task
@@ -1015,8 +1023,10 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         // 'z' / stage 31 (183.5): remote wake observed — publish the re-entry
         // evidence (low trace + gs mirrors), then return to the scheduler idle
         // state.
+        "mov dx, 0xE9", // late breadcrumb -> debugcon
         "mov al, 0x7A", // 'z'
         "out dx, al",
+        "mov dx, 0x3F8", // restore COM1
         "mov dword ptr [rdi + 48], 31",
         "mov dword ptr gs:[120], 31",   // sched_stage mirror
         "add dword ptr [rdi + 132], 1", // wake_reenter_out++

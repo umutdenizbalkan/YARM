@@ -302,3 +302,147 @@ fn ap_gs_ready_is_never_faked() {
         "X86_AP_GS_READY must not be emitted until a real GS-base write + readback lands"
     );
 }
+
+// ── Late AP breadcrumbs are isolated from structured COM1 ────────────────────────
+//
+// The late naked-assembly breadcrumbs ('a' persistent IRQ ack, 'd' ack follow-up,
+// 'v' IRQ-smoke completion, 'q' scheduler-owned idle, 'z' remote-wake re-entry)
+// execute AFTER AP admission, while the BSP is concurrently emitting structured
+// `yarm_log!` lines on COM1. Sharing the port let raw bytes splice into the middle
+// of marker lines and corrupt them. They now go to the independent x86 debugcon
+// port (0xE9), which `arch/x86_64/console.rs` already uses as a secondary channel.
+//
+// The EARLY ladder is deliberately untouched: it emits as one contiguous run that
+// completes before the BSP resumes formatted admission logging, and was never
+// observed splitting a structured line.
+
+const TRAMPOLINE: &str = include_str!("../src/arch/x86_64/smp_trampoline.rs");
+
+/// Each late breadcrumb still emits its byte, but selects debugcon first and
+/// restores the COM1 port immediately afterwards for the code that assumes `rdx`.
+#[test]
+fn late_ap_breadcrumbs_go_to_debugcon_and_restore_com1() {
+    for (byte, what) in [
+        ("0x61", "'a' persistent IRQ ack"),
+        ("0x64", "'d' ack follow-up"),
+        ("0x76", "'v' IRQ-smoke completion"),
+        ("0x71", "'q' scheduler-owned idle"),
+        ("0x7A", "'z' remote-wake re-entry"),
+    ] {
+        let needle = format!("\"mov al, {byte}\"");
+        let at = TRAPOLINE_FIND(&needle, what);
+        // The debugcon selection must immediately precede the byte load.
+        let before = &TRAMPOLINE[..at];
+        let prev = before
+            .rfind("\"mov dx, ")
+            .expect("a port selection precedes the breadcrumb");
+        assert!(
+            TRAMPOLINE[prev..at].contains("0xE9"),
+            "{what}: must select debugcon (0xE9), not COM1"
+        );
+        // ... and COM1 must be restored right after the `out`.
+        let after = &TRAMPOLINE[at..];
+        let out = after.find("\"out dx, al\"").expect("the byte is emitted");
+        let tail = &after[out..];
+        let restore = tail
+            .find("\"mov dx, 0x3F8\"")
+            .expect("COM1 must be restored after the redirected out");
+        assert!(
+            restore < 200,
+            "{what}: COM1 restore must follow the redirected out immediately"
+        );
+    }
+}
+
+#[allow(non_snake_case)]
+fn TRAPOLINE_FIND(needle: &str, what: &str) -> usize {
+    TRAMPOLINE
+        .find(needle)
+        .unwrap_or_else(|| panic!("{what}: breadcrumb byte must still be emitted"))
+}
+
+/// The authoritative non-serial evidence for each late breadcrumb is untouched:
+/// the stage words, the persistent IRQ acknowledgement, the scheduler-stage
+/// mirrors and the wake counters all remain.
+#[test]
+fn late_ap_breadcrumb_state_publications_are_unchanged() {
+    for publication in [
+        "\"mov dword ptr gs:[116], 1\"",    // irq_ack (persistent) — 'a'
+        "\"mov dword ptr [rdi + 48], 36\"", // IRQ_ACK_WRITTEN — 'd'
+        "\"mov dword ptr [rdi + 48], 28\"", // IRQ_SMOKE_DONE — 'v'
+        "\"mov dword ptr [rdi + 48], 30\"", // SCHED_IDLE — 'q'
+        "\"mov dword ptr gs:[120], 30\"",   // sched_stage mirror — 'q'
+        "\"mov dword ptr [rdi + 48], 31\"", // SCHED_WAKE_REENTER — 'z'
+        "\"mov dword ptr gs:[120], 31\"",   // sched_stage mirror — 'z'
+        "\"add dword ptr [rdi + 132], 1\"", // wake_reenter_out++ — 'z'
+        "\"add dword ptr gs:[124], 1\"",    // wake_reenter mirror++ — 'z'
+    ] {
+        assert!(
+            TRAMPOLINE.contains(publication),
+            "authoritative publication must remain: {publication}"
+        );
+    }
+}
+
+/// The early breadcrumb ladder still writes to COM1 — it is not the corruption
+/// source and must not be redirected.
+#[test]
+fn early_ap_breadcrumb_ladder_still_uses_com1() {
+    // The ladder's first byte is emitted right after the COM1 port is selected.
+    let at = TRAMPOLINE
+        .find("\"mov al, 0x40\"")
+        .expect("'@' entry breadcrumb");
+    let before = &TRAMPOLINE[..at];
+    let prev = before.rfind("\"mov dx, ").expect("port selection");
+    assert!(
+        TRAMPOLINE[prev..at].contains("0x3F8"),
+        "the early ladder must keep using COM1"
+    );
+    for byte in ["0x48", "0x56", "0x57", "0x4F", "0x4B", "0x79", "0x75"] {
+        assert!(
+            TRAMPOLINE.contains(&format!("\"mov al, {byte}\"")),
+            "early ladder byte {byte} must remain"
+        );
+    }
+}
+
+/// The AP dispatch and TLB-shootdown regions are untouched by this repair.
+#[test]
+fn ap_dispatch_and_shootdown_regions_are_unchanged() {
+    for anchor in [
+        "\"call yarm_x86_ap_user_dispatch_entry\"",
+        "\"mov eax, dword ptr gs:[160]\"",  // ap_dispatch_request
+        "\"mov r10d, dword ptr gs:[128]\"", // tlb_req_gen
+        "\"mov dword ptr gs:[132], r10d\"", // tlb_ack_gen published
+        "\"invlpg [rax]\"",
+        "\"mov r8d, dword ptr gs:[108]\"", // remote_wake_count
+    ] {
+        assert!(
+            TRAMPOLINE.contains(anchor),
+            "must remain unchanged: {anchor}"
+        );
+    }
+}
+
+/// The strict smoke gate carries no reconstruction/normalization helper.
+#[test]
+fn smoke_gate_uses_strict_literal_matching_only() {
+    const COMMON: &str = include_str!("../scripts/qemu-smoke-common.sh");
+    const CORE: &str = include_str!("../scripts/qemu-x86_64-core-smoke.sh");
+    for forbidden in [
+        "log_has_semantic_marker",
+        "log_marker_semantic_count",
+        "marker_line_matches",
+        "icr_written_line_matches",
+        "advq",
+    ] {
+        assert!(
+            !COMMON.contains(forbidden) && !CORE.contains(forbidden),
+            "no reconstruction helper may remain in the smoke gate: {forbidden}"
+        );
+    }
+    assert!(
+        CORE.contains("\"X86_IPI_FIXED_ICR_WRITTEN\" \\"),
+        "the ICR marker must be asserted literally again"
+    );
+}
