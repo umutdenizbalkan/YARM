@@ -34,6 +34,23 @@ pub(crate) type TaskReturnSplitPtrs = (
     *mut KernelStorage<[Option<ThreadId>; MAX_TASKS]>,
 );
 
+/// U3 (canonical 203C) — raw projection of the task (rank 2) domain needed to resolve an
+/// ENQUEUE POLICY: `(task_state_lock, tcbs, task_classes)`.
+///
+/// `KernelState::enqueue_on_cpu` answers two task-domain questions before it touches the
+/// scheduler — "is this TID a spawn reservation?" (`tcbs`) and "what priority does its class
+/// carry?" (`task_classes`) — through two separate `with_tcbs` acquisitions. Both storages are
+/// serialized by the same `task_state_lock`, so an enqueue transaction can resolve the whole
+/// policy under ONE rank-2 acquisition instead of straddling two.
+// Names the return type of a projector whose only caller is x86_64-gated; a hosted `lib` build
+// compiles no route to it, exactly like the sibling `*_from_raw` projectors.
+#[allow(dead_code)]
+pub(crate) type TaskEnqueuePolicySplitPtrs = (
+    *const crate::kernel::lock::SpinLockIrq<()>,
+    *mut KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
+    *mut KernelStorage<[Option<TaskClass>; MAX_TASKS]>,
+);
+
 impl KernelState {
     fn lock_domain_rank(domain: &'static str) -> u8 {
         match domain {
@@ -1446,6 +1463,28 @@ impl KernelState {
                 core::ptr::addr_of!((*state).task_state_lock),
                 core::ptr::addr_of_mut!((*state).tcbs),
                 core::ptr::addr_of_mut!((*state).tls_restore_pending),
+            )
+        }
+    }
+
+    /// U3 (canonical 203C) — task (rank 2) seam projector for the ENQUEUE POLICY.
+    ///
+    /// Returns [`TaskEnqueuePolicySplitPtrs`]: `(task_state_lock, tcbs, task_classes)`.
+    ///
+    /// Exposes the TCB array **and** the task-class table under the SAME task lock, because the
+    /// spawn-reservation refusal and the class→priority derivation are one decision about one
+    /// task and must not straddle two acquisitions.
+    pub(crate) unsafe fn task_enqueue_policy_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> TaskEnqueuePolicySplitPtrs {
+        // SAFETY: see module pattern note above. `task_classes` lives in the task domain
+        // alongside `tcbs` — `KernelState::task_class` reads it from inside `with_tcbs`, i.e.
+        // already under `task_state_lock` — and is serialized by that same lock.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).task_state_lock),
+                core::ptr::addr_of_mut!((*state).tcbs),
+                core::ptr::addr_of_mut!((*state).task_classes),
             )
         }
     }

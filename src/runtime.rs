@@ -533,6 +533,48 @@ pub(crate) struct ApSavedResumeContext {
     pub(crate) runnable_saved: bool,
 }
 
+/// U3 (canonical 203C) — what an enqueue REFUSAL licenses, for
+/// [`SharedKernel::enqueue_then_dispatch_on_cpu_split`].
+///
+/// The two x86_64 AP placement sites have always disagreed about this, and the disagreement is
+/// deliberate, so it is spelled as a type rather than left to an unexplained boolean. Collapsing
+/// them into one behaviour would change one of the two live paths.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnqueueRefusalPolicy {
+    /// The saved-resume placement (`ap_saved_frame_resume`): the task it wants may ALREADY be
+    /// queued or current, so a refused enqueue is not a reason to skip selection — dispatch runs
+    /// regardless, and the caller decides from the selected TID whether to resume. This is the
+    /// `let _ = k.enqueue_on_cpu(...)` shape.
+    DispatchAnyway,
+    /// The controlled next-task placement (`ap_sched_next_or_idle`): the task is being placed for
+    /// the first time, so a refused enqueue means there is nothing to select and no dispatch may
+    /// happen. This is the `Err(_) => None` shape.
+    ///
+    /// No production caller yet: that site is not live-reached by any existing workload, so it
+    /// keeps its broad acquisition byte-for-byte. This variant exists so the transaction states
+    /// both policies explicitly and the tests can pin that they stay different.
+    Decline,
+}
+
+/// U3 (canonical 203C) — the outcome of one
+/// [`SharedKernel::enqueue_then_dispatch_on_cpu_split`] transaction.
+///
+/// Named fields rather than a positional tuple: the enqueue verdict and the selected TID are
+/// independent facts, and under [`EnqueueRefusalPolicy::DispatchAnyway`] a refused enqueue with a
+/// successful selection is a normal, expected outcome that a bare `Option<u64>` would erase.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CpuEnqueueDispatch {
+    /// Exactly what `KernelState::enqueue_on_cpu` would have returned for this TID.
+    pub(crate) enqueued: Result<(), KernelError>,
+    /// The TID made current on `cpu`, if any. Always `None` when the policy is
+    /// [`EnqueueRefusalPolicy::Decline`] and `enqueued` is an error.
+    pub(crate) selected: Option<u64>,
+}
+
 /// What a mark attempt did. Typed, so no caller has to infer it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
@@ -1653,6 +1695,34 @@ impl SharedKernel {
         })
     }
 
+    /// U3 (canonical 203C): task (rank 2) split-mut seam exposing the TCB array and the
+    /// task-class table together — see `KernelState::task_enqueue_policy_split_mut_ptrs_from_raw`.
+    ///
+    /// Callers must not already hold a lock of rank ≥ 2. It is legal — and is the point — to
+    /// hold rank 1 (scheduler) across this, because 1 → 2 is the canonical ascending direction.
+    #[cfg(target_arch = "x86_64")]
+    fn with_task_enqueue_policy_split_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut [Option<crate::kernel::task::ThreadControlBlock>],
+            &mut [Option<crate::kernel::task::TaskClass>],
+        ) -> R,
+    ) -> R {
+        // SAFETY: same pattern as `with_task_tcbs_split_mut` — the task lock serializes both
+        // storages, which live in the same domain.
+        let (task_lock, tcbs, classes) = unsafe {
+            KernelState::task_enqueue_policy_split_mut_ptrs_from_raw(self.state.data_ptr())
+        };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let tcbs = unsafe { &mut *tcbs };
+        let classes = unsafe { &mut *classes };
+        f(
+            kernel_mut(tcbs).as_mut_slice(),
+            kernel_mut(classes).as_mut_slice(),
+        )
+    }
+
     /// Stage 108: task/TCB (rank 2) split-mut seam.
     ///
     /// # Validation status
@@ -2141,6 +2211,166 @@ impl SharedKernel {
                 terminal,
                 in_runqueue,
             })
+        })
+    }
+
+    /// U3 (canonical 203C) — the authoritative enqueue→dispatch transaction for an x86_64 AP
+    /// placement, taken as ONE rank-1 → rank-2 critical section.
+    ///
+    /// Replaces the broad `with_cpu(cpu, |k| { enqueue_on_cpu(..); dispatch_next_on_cpu(..) })`
+    /// re-acquire. `KernelState::enqueue_on_cpu` resolves its task-domain policy through two
+    /// separate `with_tcbs` acquisitions (the spawn-reservation refusal, then the class→priority
+    /// derivation) and only afterwards takes the scheduler lock to mutate the run queue. Under
+    /// the broad lock nothing could interleave, but the shape itself is torn: the policy the
+    /// enqueue acts on is read in a critical section that has already been released by the time
+    /// the queue is touched. This transaction closes that.
+    ///
+    /// Lock ordering — canonical ascending 1 → 2, acquired once each:
+    ///
+    /// 1. rank 1 (scheduler) is acquired exactly once, for the whole transaction;
+    /// 2. the CPU is validated with `validate_online_cpu` — the SAME predicate
+    ///    `KernelState::set_current_cpu` uses, which is what `with_cpu` called on entry. On
+    ///    failure the same `KernelError` class is returned and `current_cpu` is left UNCHANGED;
+    /// 3. on success `scheduler.current_cpu = cpu` is bound, exactly as `with_cpu` did, and
+    ///    unconditionally — including when no task is selected below;
+    /// 4. rank 2 (task) is nested INSIDE the still-held rank-1 guard, and resolves the entire
+    ///    enqueue policy — idle-TID shortcut, task existence, class → priority,
+    ///    spawn-reservation refusal — in one acquisition;
+    /// 5. the existing scheduler primitives run under the rank-1 guard already held:
+    ///    `enqueue_on_with_priority`, then `dispatch_next_on` per the typed policy.
+    ///
+    /// Neither nested step re-enters its domain through a `KernelState` accessor: `task_priority`
+    /// and `refuse_enqueue_of_spawn_reservation` would each re-take the task lock, and
+    /// `current_cpu()` / `scheduler_state()` would re-take the scheduler lock this transaction
+    /// already holds. The policy is therefore recomputed here from the same fields those
+    /// accessors read, with identical semantics — including the first-user CPU-pinning invariant
+    /// and every existing error mapping. Eligibility is NOT strengthened: there is deliberately
+    /// no `Runnable` requirement, so an already-queued or already-current task refuses exactly
+    /// where it refused before and nowhere else.
+    ///
+    /// Every guard is released when this returns; the caller does its logging, CR3 work, frame
+    /// construction, register writes and `iretq` with nothing held.
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn enqueue_then_dispatch_on_cpu_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        policy: EnqueueRefusalPolicy,
+    ) -> Result<CpuEnqueueDispatch, KernelError> {
+        use crate::kernel::boot::map_scheduler_error;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::TaskClass;
+
+        // BOOTSTRAP_FIRST_USER_TID / DEBUG_DISPATCH_CONTEXT_LOG mirror the private constants in
+        // `scheduler_state.rs`; the invariant they guard is reproduced below unchanged.
+        const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
+        const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
+
+        self.with_scheduler_split_mut(|sched| {
+            // (2) Same admission predicate `set_current_cpu` uses. A refusal leaves
+            // `current_cpu` exactly as it was — nothing below has run.
+            kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .map_err(map_scheduler_error)?;
+            // (3) Bind, unconditionally, before any selection can fail.
+            sched.current_cpu = cpu;
+
+            // (4) One rank-2 acquisition, nested while rank 1 is held (ascending 1 -> 2),
+            // resolving the whole task-domain policy `enqueue_on_cpu` reads across two.
+            //
+            // `task_priority`: TID 0 is the idle/supervisor sentinel and is Normal WITHOUT a
+            // TCB lookup; every other TID needs a class, and a missing class is `TaskMissing`.
+            // `refuse_enqueue_of_spawn_reservation`: a reservation is not a live task.
+            let policy_result: Result<TaskPriority, KernelError> =
+                self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                    let slot = tcbs.iter().position(|slot| {
+                        slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid)
+                    });
+                    if let Some(idx) = slot
+                        && tcbs[idx]
+                            .as_ref()
+                            .is_some_and(|tcb| tcb.is_spawn_reservation())
+                    {
+                        crate::yarm_log!(
+                            "ENQUEUE_REFUSED tid={} reason=spawn_reservation_not_live",
+                            tid
+                        );
+                        return Err(KernelError::WrongObject);
+                    }
+                    if tid == 0 {
+                        return Ok(TaskPriority::Normal);
+                    }
+                    let class = slot
+                        .and_then(|idx| classes[idx])
+                        .ok_or(KernelError::TaskMissing)?;
+                    Ok(match class {
+                        TaskClass::SystemServer => TaskPriority::High,
+                        TaskClass::Driver | TaskClass::App => TaskPriority::Normal,
+                    })
+                });
+
+            // (5) The scheduler primitives, under the rank-1 guard already held. The enqueue
+            // verdict is composed exactly as `enqueue_on_cpu` composes it: the policy errors
+            // above short-circuit, otherwise the queue primitive's own mapped error stands.
+            let enqueued: Result<(), KernelError> = match policy_result {
+                Err(err) => Err(err),
+                Ok(priority) => {
+                    if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                        crate::yarm_log!(
+                            "ENQUEUE_CALL cpu_current={} cpu_target={} tid={}",
+                            cpu.0,
+                            cpu.0,
+                            tid
+                        );
+                    }
+                    // First-user CPU pinning: TID 1 must only ever be placed on the bootstrap
+                    // CPU. Reproduced verbatim, asserts included.
+                    if tid == BOOTSTRAP_FIRST_USER_TID
+                        && cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+                        && cfg!(not(feature = "hosted-dev"))
+                    {
+                        crate::yarm_log!(
+                            "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
+                            cpu.0,
+                            tid,
+                            cpu.0
+                        );
+                        assert_eq!(cpu.0, crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+                        assert_eq!(
+                            cpu.0 as usize,
+                            crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize
+                        );
+                    }
+                    let placed = kernel_mut(&mut sched.scheduler)
+                        .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
+                        .map_err(map_scheduler_error);
+                    if placed.is_ok()
+                        && tid == BOOTSTRAP_FIRST_USER_TID
+                        && cfg!(not(feature = "hosted-dev"))
+                    {
+                        let q = |c: u8| kernel_ref(&sched.scheduler).runnable_count_on(CpuId(c));
+                        crate::yarm_log!(
+                            "BOOTSTRAP_ENQUEUE_VERIFY tid=1 queue0_len={} queue1_len={} queue2_len={} queue3_len={}",
+                            q(0),
+                            q(1),
+                            q(2),
+                            q(3)
+                        );
+                    }
+                    placed
+                }
+            };
+
+            // The one place the two historical policies differ, and the only place they may.
+            let selected = match (policy, &enqueued) {
+                (EnqueueRefusalPolicy::Decline, Err(_)) => None,
+                _ => kernel_mut(&mut sched.scheduler)
+                    .dispatch_next_on(cpu)
+                    .map(|t| t.0),
+            };
+            Ok(CpuEnqueueDispatch { enqueued, selected })
         })
     }
 

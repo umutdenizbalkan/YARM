@@ -2577,12 +2577,20 @@ fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
     // Select the RunnableSaved task from CPU 1's REAL run queue (scheduler-selected). The proof task
     // yielded, so re-arm it on CPU 1's queue (the existing generic wake/finalization seam) and select
     // it via `dispatch_next_on_cpu` — never a hardcoded proof-TID dispatch bypass.
+    // U3 (canonical 203C): one authoritative rank-1 -> rank-2 enqueue/dispatch transaction
+    // instead of the broad `with_cpu(cpu, |k| { let _ = k.enqueue_on_cpu(..); ..dispatch.. })`
+    // re-acquire. `DispatchAnyway` is this site's historical policy verbatim — the enqueue
+    // result was discarded with `let _`, because the proof task may already be queued, and the
+    // selection ran either way. No fallback: a validation failure or a non-`expected` selection
+    // declines the resume exactly as `.unwrap_or(None)` plus the match arm did.
     let expected = ap_workload_base_tid(cpu);
     let tid = match shared
-        .with_cpu(cpu, |k| {
-            let _ = k.enqueue_on_cpu(cpu, expected);
-            k.dispatch_next_on_cpu(cpu)
-        })
+        .enqueue_then_dispatch_on_cpu_split(
+            cpu,
+            expected,
+            crate::runtime::EnqueueRefusalPolicy::DispatchAnyway,
+        )
+        .map(|outcome| outcome.selected)
         .unwrap_or(None)
     {
         Some(t) if t == expected => t,

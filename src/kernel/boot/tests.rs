@@ -86653,8 +86653,12 @@ mod stage199a2d2c2a_guards {
             "one-shot latch present"
         );
         assert!(
-            smp.contains("dispatch_next_on_cpu(cpu)"),
-            "selects from CPU 1's real run queue"
+            smp.contains(".enqueue_then_dispatch_on_cpu_split(")
+                && smp.contains("EnqueueRefusalPolicy::DispatchAnyway"),
+            "selects from CPU 1's real run queue — U3 (203C) moved this selection onto the \
+             rank-1 -> rank-2 enqueue/dispatch transaction; the literal `dispatch_next_on_cpu`
+             now survives only at the unconverted next-task site, so asserting it here would \
+             prove nothing about this one"
         );
         assert!(
             smp.contains("resume_user_mode_iret(&frame)"),
@@ -87199,7 +87203,9 @@ mod stage199a2d2c2b2_guards {
     // (13) CPU 1 selects the EXACT server from its OWN run queue, never a hardcoded TID or CPU 0.
     #[test]
     fn cpu1_selects_exact_server_from_own_queue() {
-        assert!(SMP.contains("k.dispatch_next_on_cpu(cpu)"));
+        // U3 (203C): the selection moved onto the enqueue/dispatch transaction. The exact-TID
+        // check is what makes it "the EXACT server from its OWN run queue", and is unchanged.
+        assert!(SMP.contains(".enqueue_then_dispatch_on_cpu_split("));
         assert!(SMP.contains("Some(t) if t == expected => t,"));
     }
 
@@ -118822,17 +118828,19 @@ mod u3_ap_saved_context_snapshot {
             1,
             "exactly one snapshot — never a second TCB read"
         );
-        // The four scheduler-mutating acquisitions are a separate cohort; this caller keeps
-        // exactly its own one (enqueue + dispatch_next_on_cpu).
+        // U3 (203C): the caller's own enqueue -> dispatch acquisition has since been retired
+        // too, onto `enqueue_then_dispatch_on_cpu_split`. This caller now holds NO broad lock.
         assert_eq!(
             body.matches(".with_cpu(").count(),
-            1,
-            "the caller's own scheduler-mutating with_cpu is untouched"
+            0,
+            "the caller's scheduler-mutating with_cpu is retired onto the rank-1 -> rank-2 \
+             enqueue/dispatch transaction"
         );
         assert!(
-            body.contains("k.enqueue_on_cpu(cpu, expected)")
-                && body.contains("k.dispatch_next_on_cpu(cpu)"),
-            "that acquisition is still the enqueue + dispatch selection, unchanged"
+            body.contains(".enqueue_then_dispatch_on_cpu_split(")
+                && body.contains("EnqueueRefusalPolicy::DispatchAnyway"),
+            "the placement is still an enqueue + dispatch selection, with this site's own \
+             historical refusal policy"
         );
     }
 
@@ -118889,6 +118897,540 @@ mod u3_ap_saved_context_snapshot {
         assert!(
             EXEC.contains("pub(crate) fn ap_saved_resume_context("),
             "KernelState::ap_saved_resume_context is retained for that unconverted caller"
+        );
+    }
+}
+
+/// U3 (canonical 203C) — the x86_64 AP enqueue→dispatch transaction.
+///
+/// `SharedKernel::enqueue_then_dispatch_on_cpu_split` replaces the broad
+/// `with_cpu(cpu, |k| { enqueue_on_cpu(..); dispatch_next_on_cpu(..) })` re-acquire in
+/// `ap_saved_frame_resume` (ED-1). The homologous ED-2 site in `ap_sched_next_or_idle` is NOT
+/// converted: no existing workload reaches its success body, because every script that sets
+/// `yarm.ap_user_dispatch=1` also sets `yarm.ipccall_direct_smp_oracle=1`, which pins
+/// `ap_workload_task_count()` to 1 — so `AP_DISPATCH_COUNT < count` is false after the first
+/// ring-3 entry and `X86_AP_NEXT_TASK_DISPATCH_BEGIN` never fires.
+///
+/// These pin the three things that matter: the lock CHRONOLOGY (rank 1 once, bind, rank 2
+/// nested), the POLICY EQUIVALENCE with `KernelState::enqueue_on_cpu`, and the fact that the
+/// two enqueue-refusal policies stay different.
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod u3_ap_enqueue_dispatch_transaction {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::boot::types::KernelError;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskClass, TaskStatus};
+    use crate::runtime::{CpuEnqueueDispatch, EnqueueRefusalPolicy, SharedKernel};
+
+    const AP: u8 = 1;
+
+    fn kernel() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| s.bring_up_cpu(CpuId(AP)).expect("AP online"));
+        k
+    }
+
+    fn register(k: &SharedKernel, tid: u64, class: TaskClass) {
+        k.with(|s| s.register_task_with_class(tid, class).expect("register"));
+    }
+
+    fn current_cpu(k: &SharedKernel) -> CpuId {
+        k.with(|s| s.current_cpu())
+    }
+
+    // ── CPU validation and binding ────────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_ed_valid_cpu_binds_current_cpu_and_selects() {
+        let k = kernel();
+        register(&k, 90, TaskClass::App);
+        let out = k
+            .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 90, EnqueueRefusalPolicy::DispatchAnyway)
+            .expect("an online CPU is admitted");
+        assert_eq!(out.enqueued, Ok(()), "the enqueue succeeded");
+        assert_eq!(
+            out.selected,
+            Some(90),
+            "a successful enqueue selects that task"
+        );
+        assert_eq!(
+            current_cpu(&k),
+            CpuId(AP),
+            "the transaction binds current_cpu"
+        );
+    }
+
+    #[test]
+    fn u3_ed_binds_even_when_no_user_task_is_selected() {
+        let k = kernel();
+        // An empty run queue: the enqueue refuses (unknown TID, no class) and, under the ED-2
+        // policy, no dispatch runs — so nothing is selected. The bind must still have happened.
+        let out = k
+            .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 7_777, EnqueueRefusalPolicy::Decline)
+            .expect("admitted");
+        assert_eq!(out.enqueued, Err(KernelError::TaskMissing));
+        assert_eq!(out.selected, None, "an empty selection is not a failure");
+        assert_eq!(
+            current_cpu(&k),
+            CpuId(AP),
+            "current_cpu is bound unconditionally, including when no task is selected"
+        );
+    }
+
+    #[test]
+    fn u3_ed_invalid_or_offline_cpu_leaves_the_binding_unchanged() {
+        let k = kernel();
+        register(&k, 91, TaskClass::App);
+        // Establish a known binding first.
+        k.enqueue_then_dispatch_on_cpu_split(CpuId(0), 91, EnqueueRefusalPolicy::DispatchAnyway)
+            .expect("CPU 0 is online");
+        assert_eq!(current_cpu(&k), CpuId(0));
+        for bad in [CpuId(7), CpuId(200)] {
+            let err = k
+                .enqueue_then_dispatch_on_cpu_split(bad, 91, EnqueueRefusalPolicy::DispatchAnyway)
+                .expect_err("an offline / out-of-range CPU is refused");
+            assert_eq!(
+                err,
+                k.with(|s| s.set_current_cpu(bad).unwrap_err()),
+                "the same failure class `set_current_cpu` produces"
+            );
+            assert_eq!(
+                current_cpu(&k),
+                CpuId(0),
+                "a refused transaction must not change the prior binding"
+            );
+        }
+    }
+
+    // ── task policy resolved coherently under rank 2 ──────────────────────────────────────
+
+    #[test]
+    fn u3_ed_missing_task_and_missing_class_refuse_as_task_missing() {
+        let k = kernel();
+        let out = k
+            .enqueue_then_dispatch_on_cpu_split(
+                CpuId(AP),
+                4_242,
+                EnqueueRefusalPolicy::DispatchAnyway,
+            )
+            .expect("admitted; the refusal is the enqueue's, not the CPU's");
+        assert_eq!(
+            out.enqueued,
+            Err(KernelError::TaskMissing),
+            "an unknown TID has no class, exactly as `task_priority` reports"
+        );
+    }
+
+    #[test]
+    fn u3_ed_reserved_task_is_refused_as_wrong_object() {
+        let k = kernel();
+        register(&k, 92, TaskClass::App);
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 92).unwrap();
+                tcb.status = TaskStatus::Reserved;
+                assert!(tcb.is_spawn_reservation());
+            });
+        });
+        let out = k
+            .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 92, EnqueueRefusalPolicy::DispatchAnyway)
+            .expect("admitted");
+        assert_eq!(
+            out.enqueued,
+            Err(KernelError::WrongObject),
+            "a spawn reservation is not a live task"
+        );
+    }
+
+    /// The transaction must produce exactly what the retired broad body produced. Rather than
+    /// re-deriving scheduler ordering here, each scenario is run on two identically-built
+    /// kernels — one through `with_cpu { enqueue_on_cpu; dispatch_next_on_cpu }` (the exact
+    /// ED-1 body) and one through the transaction — and the two outcomes are compared.
+    fn legacy_ed1(
+        k: &SharedKernel,
+        cpu: CpuId,
+        tid: u64,
+    ) -> (Result<(), KernelError>, Option<u64>) {
+        k.with_cpu(cpu, |s| {
+            let enqueued = s.enqueue_on_cpu(cpu, tid);
+            (enqueued, s.dispatch_next_on_cpu(cpu))
+        })
+        .expect("admitted")
+    }
+
+    /// Build a kernel, apply `setup`, then place `tid` — once the legacy way, once the new way.
+    fn differential(setup: impl Fn(&SharedKernel), tid: u64) {
+        let a = kernel();
+        setup(&a);
+        let (legacy_enqueued, legacy_selected) = legacy_ed1(&a, CpuId(AP), tid);
+
+        let b = kernel();
+        setup(&b);
+        let out = b
+            .enqueue_then_dispatch_on_cpu_split(
+                CpuId(AP),
+                tid,
+                EnqueueRefusalPolicy::DispatchAnyway,
+            )
+            .expect("admitted");
+
+        assert_eq!(
+            out.enqueued, legacy_enqueued,
+            "tid {tid}: the enqueue verdict must match `KernelState::enqueue_on_cpu` exactly"
+        );
+        assert_eq!(
+            out.selected, legacy_selected,
+            "tid {tid}: the selected task must match the retired broad body exactly"
+        );
+        assert_eq!(current_cpu(&b), current_cpu(&a), "same resulting binding");
+    }
+
+    #[test]
+    fn u3_ed_matches_the_retired_broad_body_across_the_policy_surface() {
+        // Priority comes from the task class; a missing class, a reservation and the idle
+        // sentinel each have their own verdict. All of them must agree with the legacy body.
+        differential(|k| register(k, 93, TaskClass::App), 93);
+        differential(|k| register(k, 94, TaskClass::SystemServer), 94);
+        differential(|k| register(k, 95, TaskClass::Driver), 95);
+        differential(|_| {}, 0); // idle sentinel
+        differential(|_| {}, 4_242); // no task, no class
+        differential(
+            |k| {
+                register(k, 92, TaskClass::App);
+                k.with(|s| {
+                    s.with_tcbs_mut(|tcbs| {
+                        let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 92).unwrap();
+                        tcb.status = TaskStatus::Reserved;
+                    });
+                });
+            },
+            92,
+        );
+        // A task already placed and current: the enqueue refuses, and ED-1 still dispatches.
+        differential(
+            |k| {
+                register(k, 96, TaskClass::App);
+                let _ = k.enqueue_then_dispatch_on_cpu_split(
+                    CpuId(AP),
+                    96,
+                    EnqueueRefusalPolicy::DispatchAnyway,
+                );
+            },
+            96,
+        );
+    }
+
+    #[test]
+    fn u3_ed_idle_tid_zero_needs_no_tcb() {
+        let k = kernel();
+        let out = k
+            .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 0, EnqueueRefusalPolicy::DispatchAnyway)
+            .expect("admitted");
+        assert!(
+            out.enqueued.is_ok() || out.enqueued.is_err(),
+            "TID 0 reaches the queue primitive; it is never refused for a missing class"
+        );
+        assert_ne!(
+            out.enqueued,
+            Err(KernelError::TaskMissing),
+            "the idle sentinel is Normal WITHOUT a TCB lookup"
+        );
+    }
+
+    // ── the two policies must stay different ──────────────────────────────────────────────
+
+    #[test]
+    fn u3_ed1_dispatches_after_an_enqueue_refusal() {
+        let k = kernel();
+        register(&k, 96, TaskClass::App);
+        k.enqueue_then_dispatch_on_cpu_split(CpuId(AP), 96, EnqueueRefusalPolicy::DispatchAnyway)
+            .expect("admitted");
+        // Ask to place an UNKNOWN tid: the enqueue refuses, but the ED-1 policy still runs the
+        // selection. This is exactly the `let _ = k.enqueue_on_cpu(..)` shape.
+        let out = k
+            .enqueue_then_dispatch_on_cpu_split(
+                CpuId(AP),
+                4_243,
+                EnqueueRefusalPolicy::DispatchAnyway,
+            )
+            .expect("admitted");
+        assert!(out.enqueued.is_err(), "the unknown TID refuses");
+        assert!(
+            out.selected.is_some(),
+            "DispatchAnyway runs the selection despite the refusal"
+        );
+        // The identical state under the ED-2 policy selects nothing — the policies differ.
+        let k2 = kernel();
+        register(&k2, 96, TaskClass::App);
+        k2.enqueue_then_dispatch_on_cpu_split(CpuId(AP), 96, EnqueueRefusalPolicy::DispatchAnyway)
+            .expect("admitted");
+        let out2 = k2
+            .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 4_243, EnqueueRefusalPolicy::Decline)
+            .expect("admitted");
+        assert_eq!(out2.enqueued, out.enqueued, "same refusal");
+        assert_eq!(
+            out2.selected, None,
+            "Decline declines the selection on the SAME state DispatchAnyway dispatches on"
+        );
+    }
+
+    #[test]
+    fn u3_ed2_does_not_dispatch_after_an_enqueue_refusal() {
+        let k = kernel();
+        register(&k, 98, TaskClass::App);
+        k.enqueue_then_dispatch_on_cpu_split(CpuId(AP), 98, EnqueueRefusalPolicy::Decline)
+            .expect("admitted");
+        register(&k, 99, TaskClass::App);
+        k.enqueue_then_dispatch_on_cpu_split(CpuId(AP), 99, EnqueueRefusalPolicy::Decline)
+            .expect("admitted");
+        let out = k
+            .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 4_244, EnqueueRefusalPolicy::Decline)
+            .expect("admitted");
+        assert!(out.enqueued.is_err(), "the unknown TID refuses");
+        assert_eq!(
+            out.selected, None,
+            "Decline performs NO dispatch when the enqueue refused — the policies must not \
+             collapse into one behaviour"
+        );
+    }
+
+    #[test]
+    fn u3_ed_the_two_policies_agree_whenever_the_enqueue_succeeds() {
+        for policy in [
+            EnqueueRefusalPolicy::DispatchAnyway,
+            EnqueueRefusalPolicy::Decline,
+        ] {
+            let k = kernel();
+            register(&k, 100, TaskClass::App);
+            let out = k
+                .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 100, policy)
+                .expect("admitted");
+            assert_eq!(
+                out,
+                CpuEnqueueDispatch {
+                    enqueued: Ok(()),
+                    selected: Some(100)
+                },
+                "{policy:?}: the policies differ ONLY on the refusal path"
+            );
+        }
+    }
+
+    // ── lock shape and caller conversion ──────────────────────────────────────────────────
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const ORCH: &str = include_str!("orchestrator_state.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn transaction_body() -> alloc::string::String {
+        code_of(
+            RUNTIME
+                .split("pub(crate) fn enqueue_then_dispatch_on_cpu_split")
+                .nth(1)
+                .expect("the transaction exists")
+                .split("\n    /// ")
+                .next()
+                .expect("bounded by the next doc comment"),
+        )
+    }
+
+    #[test]
+    fn u3_ed_transaction_takes_rank_one_once_then_nests_rank_two() {
+        let body = transaction_body();
+        assert!(
+            !body.contains(".with_cpu(") && !body.contains("self.with(|"),
+            "the transaction must hold no broad acquisition"
+        );
+        assert_eq!(
+            body.matches("with_scheduler_split_mut").count(),
+            1,
+            "exactly one rank-1 scheduler acquisition"
+        );
+        assert_eq!(
+            body.matches("with_task_enqueue_policy_split_mut").count(),
+            1,
+            "exactly one rank-2 task acquisition — never a second task read"
+        );
+        let rank1 = body.find("with_scheduler_split_mut").expect("rank 1");
+        let validate = body.find("validate_online_cpu").expect("CPU validation");
+        let bind = body
+            .find("sched.current_cpu = cpu")
+            .expect("the current_cpu bind");
+        let rank2 = body
+            .find("with_task_enqueue_policy_split_mut")
+            .expect("rank 2");
+        let enqueue = body
+            .find("enqueue_on_with_priority")
+            .expect("the existing enqueue primitive");
+        let dispatch = body
+            .find("dispatch_next_on(cpu)")
+            .expect("the existing dispatch primitive");
+        assert!(
+            rank1 < validate
+                && validate < bind
+                && bind < rank2
+                && rank2 < enqueue
+                && enqueue < dispatch,
+            "chronology must be: rank 1 -> validate -> bind -> rank 2 (nested, ascending) -> \
+             enqueue -> dispatch"
+        );
+        // The primitives are the existing ones, not reimplementations.
+        assert!(
+            !body.contains("enqueue_on_cpu(") && !body.contains("dispatch_next_on_cpu("),
+            "the transaction must not re-enter the KernelState accessors whose domain locks \
+             it already holds"
+        );
+        for reentrant in [
+            "self.current_cpu()",
+            "scheduler_state()",
+            "task_priority(",
+            "refuse_enqueue_of_spawn_reservation(",
+            "with_tcbs(",
+        ] {
+            assert!(
+                !body.contains(reentrant),
+                "`{reentrant}` would re-take a domain lock this transaction already holds"
+            );
+        }
+        // Eligibility is NOT strengthened.
+        assert!(
+            !body.contains("TaskStatus::Runnable"),
+            "no general Runnable requirement may be invented — an already-queued or \
+             already-current task must refuse exactly where it refused before"
+        );
+        // The first-user pinning invariant survives.
+        assert!(
+            body.contains("BOOTSTRAP_FIRST_USER_TID")
+                && body.contains("FIRST_USER_PIN_VIOLATION")
+                && body.contains("BOOTSTRAP_ENQUEUE_VERIFY"),
+            "the first-user CPU-pinning invariant and its markers are preserved"
+        );
+        // No cached raw pointer: the seam recomputes from the live state each call.
+        assert!(
+            !body.contains("static ") && !body.contains("data_ptr()"),
+            "the transaction adds no cached raw pointer of its own"
+        );
+    }
+
+    #[test]
+    fn u3_ed_rank_two_seam_projects_from_the_live_state_each_call() {
+        let seam = code_of(
+            RUNTIME
+                .split("fn with_task_enqueue_policy_split_mut")
+                .nth(1)
+                .expect("the rank-2 seam exists")
+                .split("\n    /// ")
+                .next()
+                .expect("bounded"),
+        );
+        assert!(
+            seam.contains("task_enqueue_policy_split_mut_ptrs_from_raw(self.state.data_ptr())"),
+            "raw domain pointers are recomputed from the live SharedKernel state, as every \
+             sibling seam does"
+        );
+        assert!(
+            seam.contains("task_lock.lock()"),
+            "the seam takes the task (rank 2) lock, not a new lock primitive"
+        );
+        // The projector exposes both storages under the SAME task lock.
+        let proj = code_of(
+            ORCH.split("pub(crate) unsafe fn task_enqueue_policy_split_mut_ptrs_from_raw")
+                .nth(1)
+                .expect("the projector exists")
+                .split("\n    /// ")
+                .next()
+                .expect("bounded"),
+        );
+        assert!(
+            proj.contains("(*state).task_state_lock")
+                && proj.contains("(*state).tcbs")
+                && proj.contains("(*state).task_classes"),
+            "tcbs and task_classes are projected under the one task_state_lock"
+        );
+    }
+
+    fn ap_resume_body() -> alloc::string::String {
+        let f = SMP
+            .split("fn ap_saved_frame_resume(")
+            .nth(1)
+            .expect("the converted caller exists");
+        code_of(&f[..f.find("\n}\n").expect("function end")])
+    }
+
+    #[test]
+    fn u3_ed1_caller_is_converted_with_no_broad_fallback() {
+        let body = ap_resume_body();
+        assert!(
+            body.contains(".enqueue_then_dispatch_on_cpu_split(")
+                && body.contains("EnqueueRefusalPolicy::DispatchAnyway"),
+            "ED-1 calls the narrow transaction with its own historical policy"
+        );
+        assert!(
+            !body.contains(".with_cpu(") && !body.contains("shared.with(|"),
+            "no broad acquisition may remain on the converted path"
+        );
+        assert!(
+            body.contains("Some(t) if t == expected => t,") && body.contains("_ => return,"),
+            "the caller's selection check and decline path are unchanged"
+        );
+        // Nothing is held across the architectural resume work.
+        let after = body
+            .find(".enqueue_then_dispatch_on_cpu_split(")
+            .expect("the transaction call");
+        let tail = &body[after..];
+        assert!(
+            !tail.contains("with_scheduler_split_mut")
+                && !tail.contains("with_task_enqueue_policy_split_mut")
+                && !tail.contains(".with_cpu(")
+                && !tail.contains("shared.with("),
+            "every guard is released before the caller's logging, CR3 load, frame construction, \
+             register writes and iretq"
+        );
+        for step in [
+            "X86_AP_SAVED_FRAME_COMMITTED",
+            "wrmsr",
+            "ApSavedResumeFrame",
+            "resume_user_mode_iret(&frame)",
+        ] {
+            assert!(
+                tail.contains(step),
+                "`{step}` still runs, guard-free, after the seam"
+            );
+        }
+    }
+
+    #[test]
+    fn u3_ed2_site_is_retained_byte_for_byte() {
+        let code = code_of(SMP);
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            3,
+            "three with_cpu acquisitions remain: block_current_on_cpu, on_preempt_prefer_on_cpu, \
+             and the unreached ED-2 next-task placement"
+        );
+        // ED-2's exact historical body, unchanged — including its distinct refusal policy.
+        assert!(
+            code.contains("k.enqueue_on_cpu(cpu, next_tid)")
+                && code.contains("Ok(()) => k.dispatch_next_on_cpu(cpu),")
+                && code.contains("Err(_) => None,"),
+            "the ED-2 site keeps its broad acquisition and its `Err(_) => None` policy verbatim: \
+             no existing workload reaches its success body"
+        );
+        // The retained deliberately-excluded acquisitions.
+        assert!(
+            code.contains("k.block_current_on_cpu(cpu)")
+                && code.contains("k.on_preempt_prefer_on_cpu(cpu, client_tid)")
+                && code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
+            "the block-current, BSP preempt and BSP saved-context acquisitions are out of \
+             this cohort and stay exactly as they were"
         );
     }
 }

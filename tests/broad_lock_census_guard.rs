@@ -54,7 +54,17 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // canonical broad trap phase, the AArch64 FutexWait no-incoming idle read, the D6
     // controlled-proof restore, and the two AArch64 ExitCurrentTask acquisitions.
     ("src/arch/trap_entry.rs", 5),
-    ("src/arch/x86_64/smp.rs", 4),
+    // U3 (203C): 4 -> 3. The AP saved-resume placement's `with_cpu(cpu, |k| { enqueue; dispatch })`
+    // became one authoritative rank-1 -> rank-2 transaction,
+    // `SharedKernel::enqueue_then_dispatch_on_cpu_split`: rank 1 acquired once, CPU validated with
+    // the same predicate `set_current_cpu` uses, `current_cpu` bound, then rank 2 nested (ascending)
+    // to resolve the whole enqueue policy — reservation refusal, existence, class -> priority — in
+    // ONE acquisition instead of the two `with_tcbs` reads `enqueue_on_cpu` takes before touching
+    // the queue. The homologous next-task placement in `ap_sched_next_or_idle` is NOT converted: no
+    // existing workload reaches its success body, so it keeps its acquisition byte-for-byte. The
+    // three that remain are that one, the AP return-to-idle `block_current_on_cpu`, and the BSP
+    // `on_preempt_prefer_on_cpu`.
+    ("src/arch/x86_64/smp.rs", 3),
     ("src/kernel/boot/thread_state.rs", 1),
     // U1: 13 -> 12. The obsolete `SharedKernel::handle_trap_with_cpu` wrapper had no
     // in-tree caller at all and was deleted.
@@ -107,7 +117,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 23; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 (+ the three current-identity acquisitions)
+const AUDITED_WITH_CPU_TOTAL: usize = 22; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 (+ the AP enqueue/dispatch transaction)
 const AUDITED_WITH_BROAD_TOTAL: usize = 1; // U3: 6 -> 2 -> 1 (runtime.rs fully drained; the reached x86 AP SMP read retired)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -116,7 +126,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 24; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 (twenty retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 23; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 (twenty-one retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
