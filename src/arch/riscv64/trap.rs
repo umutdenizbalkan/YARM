@@ -1394,12 +1394,12 @@ pub fn handle_riscv_trap_entry_shared(
     // switches (`switched=true`) or keeps `current` and never idles.
     if !switched {
         let provenance = crate::kernel::boot::blocked_syscall_idle_provenance_take(cpu_idx);
-        let terminal_idle = shared
-            .with_cpu(cpu, |kernel| {
-                matches!(kernel.current_tid(), None | Some(0))
-                    && kernel.runnable_count_on_cpu(cpu) == 0
-            })
-            .unwrap_or(false);
+        // U3 (canonical 203C): the broad re-acquire is retired. `terminal_idle_on_cpu_split`
+        // answers the identical predicate — `matches!(current, None | Some(0)) && runnable == 0`
+        // — inside ONE rank-1 acquisition that validates and binds `cpu` exactly as `with_cpu`
+        // did, so the two reads can no longer tear. A refused CPU returns the same `Err` class
+        // and `.unwrap_or(false)` reports the same `false`.
+        let terminal_idle = shared.terminal_idle_on_cpu_split(cpu).unwrap_or(false);
         match (provenance, terminal_idle) {
             (Some((blocked_tid, class)), true) => {
                 crate::yarm_log!(

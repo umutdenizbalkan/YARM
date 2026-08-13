@@ -35,9 +35,14 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // U3 (203C): 3 -> 2. The post-lock `CurrentTaskExited` validation snapshot moved to
     // `post_lock_exit_validation_split`, one coherent rank-1 (scheduler) transaction with the
     // rank-2 (task) acquisition nested inside it. The two remaining acquisitions are the
-    // canonical broad trap phase and the deferred terminal-idle predicate; this file is NOT
-    // fully drained.
-    ("src/arch/riscv64/trap.rs", 2),
+    // canonical broad trap phase and the deferred terminal-idle predicate.
+    // U3 (203C): 2 -> 1. The post-lock blocked-syscall TERMINAL-IDLE predicate moved to
+    // `terminal_idle_on_cpu_split`, ONE coherent rank-1 scheduler snapshot: validate + bind
+    // `current_cpu` (as `with_cpu` did), then `current_tid_on(cpu)` and `runnable_count_on(cpu)`
+    // under that single guard, so the predicate can no longer tear between two separately
+    // locked reads. **This file is now fully drained of reacquisitions**: its ONE remaining
+    // production `with_cpu` is the canonical broad Phase-2 trap handler itself.
+    ("src/arch/riscv64/trap.rs", 1),
     // Stage 199D: 12 -> 11. The AArch64 handled-split return path no longer reacquires the
     // broad lock to finalize a syscall; it uses two bounded rank-2 task-domain transactions
     // (exact-incarnation TLS take, exact-incarnation context commit) instead.
@@ -156,7 +161,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 14; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 (+ the two recv copy-fault completions)
+const AUDITED_WITH_CPU_TOTAL: usize = 13; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 (+ the RISC-V terminal-idle snapshot)
 const AUDITED_WITH_BROAD_TOTAL: usize = 1; // U3: 6 -> 2 -> 1 (runtime.rs fully drained; the reached x86 AP SMP read retired)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -165,7 +170,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 15; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 (twenty-nine retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 14; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 (thirty retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

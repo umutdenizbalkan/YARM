@@ -2730,6 +2730,55 @@ impl SharedKernel {
         })
     }
 
+    /// U3 (canonical 203C) — the RISC-V post-lock TERMINAL-IDLE predicate, taken as ONE
+    /// coherent rank-1 scheduler snapshot.
+    ///
+    /// Replaces the broad re-acquire the blocked-syscall idle branch of
+    /// `handle_riscv_trap_entry_shared` performed:
+    ///
+    /// ```ignore
+    /// shared.with_cpu(cpu, |k| {
+    ///     matches!(k.current_tid(), None | Some(0)) && k.runnable_count_on_cpu(cpu) == 0
+    /// }).unwrap_or(false)
+    /// ```
+    ///
+    /// That acquisition took the WHOLE `KernelState` lock to answer one scheduler-domain
+    /// question. Its two reads (`current_tid`, `runnable_count_on_cpu`) each took the scheduler
+    /// lock separately; the broad guard is what made them coherent. Here they are one
+    /// acquisition, so the predicate cannot tear between them — which is why this is not
+    /// `current_tid_authoritative` followed by a second runnable-count read.
+    ///
+    /// Semantics are the broad path's, step for step:
+    ///
+    /// 1. rank 1 (scheduler) is acquired exactly once, for the whole transaction;
+    /// 2. `cpu` is validated with `validate_online_cpu` — the SAME predicate
+    ///    `KernelState::set_current_cpu` uses, so a refusal returns the same `KernelError` class
+    ///    the broad `with_cpu` returned and leaves `scheduler.current_cpu` — and everything else
+    ///    — untouched. The caller's `.unwrap_or(false)` then reports the same `false`;
+    /// 3. on success `scheduler.current_cpu = cpu` is bound, exactly as `with_cpu` did on entry;
+    /// 4. `current_tid_on(cpu)` and `runnable_count_on(cpu)` are read under that one guard, and
+    ///    the verdict is the identical `matches!(current, None | Some(0)) && runnable == 0`.
+    ///
+    /// The broad body read `current_tid()`, which resolves to `current_tid_on(current_cpu)`
+    /// after the bind — the same value `current_tid_on(cpu)` names directly here.
+    ///
+    /// Nothing else happens: no task lock, no `TaskStatus`, no dispatch, dequeue or enqueue, no
+    /// ownership token, no provenance mutation, and no fallback. The provenance take stays where
+    /// it was, ahead of this call.
+    pub(crate) fn terminal_idle_on_cpu_split(&self, cpu: CpuId) -> Result<bool, KernelError> {
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .map_err(crate::kernel::boot::map_scheduler_error)?;
+            sched.current_cpu = cpu;
+            let current = kernel_ref(&sched.scheduler)
+                .current_tid_on(cpu)
+                .map(|t| t.0);
+            let runnable = kernel_ref(&sched.scheduler).runnable_count_on(cpu);
+            Ok(matches!(current, None | Some(0)) && runnable == 0)
+        })
+    }
+
     /// U3 (canonical 203C) — the authoritative enqueue→dispatch transaction for an x86_64 AP
     /// placement, taken as ONE rank-1 → rank-2 critical section.
     ///

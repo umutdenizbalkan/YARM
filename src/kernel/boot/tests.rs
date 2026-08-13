@@ -75800,12 +75800,20 @@ mod stage198a_second_cohort_plain_parity {
                 && RISCV_TRAP_SRC.contains("blocked_syscall_idle_provenance_take(cpu_idx)"),
             "the Ok-path idle branch must consume the authoritative blocking-syscall provenance"
         );
-        // Typed idle uses the BlockedIpcNoRunnable provenance + the terminal quiescence predicate.
+        // Typed idle uses the BlockedIpcNoRunnable provenance + the terminal quiescence
+        // predicate. U3 (203C) moved the predicate itself out of the broad re-entry and into
+        // `SharedKernel::terminal_idle_on_cpu_split`, so it is asserted where it now lives —
+        // still the SAME predicate, and still combined with the provenance here.
         assert!(
             RISCV_TRAP_SRC.contains("RiscvIdleReason::BlockedIpcNoRunnable")
                 && RISCV_TRAP_SRC.contains("RISCV_BLOCKED_IPC_IDLE_PROVENANCE_OK tid=")
-                && RISCV_TRAP_SRC.contains("runnable_count_on_cpu(cpu) == 0"),
+                && RISCV_TRAP_SRC.contains("terminal_idle_on_cpu_split(cpu)"),
             "typed idle must combine BlockedIpcNoRunnable provenance with the quiescence predicate"
+        );
+        assert!(
+            include_str!("../../runtime.rs")
+                .contains("matches!(current, None | Some(0)) && runnable == 0"),
+            "the quiescence predicate itself must survive verbatim in the split transaction"
         );
         // Terminal state WITHOUT provenance takes the defensive canonical error path, NEVER idle.
         // Scope to the no-provenance match arm so the defensive marker + Err are co-located.
@@ -99646,10 +99654,12 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(!txn.contains("set_current_cpu"));
     }
 
-    /// The retired acquisition is gone from the consumer, and the two RISC-V acquisitions that
-    /// intentionally remain are still present. `riscv64/trap.rs` is NOT fully drained.
+    /// The retired acquisition is gone from the consumer. U3 (203C) then retired the
+    /// terminal-idle predicate too, so `riscv64/trap.rs` is now fully drained of
+    /// reacquisitions: exactly ONE production `with_cpu` remains, the canonical broad
+    /// Phase-2 trap handler.
     #[test]
-    fn u3_consumer_is_broad_lock_free_and_the_other_two_remain() {
+    fn u3_consumer_is_broad_lock_free_and_only_the_canonical_phase_remains() {
         let c = consumer_code();
         assert!(
             !c.contains(".with_cpu(") && !c.contains(".with(|state|"),
@@ -99662,18 +99672,23 @@ mod stage200d0d1_riscv_exit_prep {
             .join("\n");
         assert_eq!(
             code_only.matches(".with_cpu(").count(),
-            2,
-            "exactly two broad acquisitions remain in riscv64/trap.rs"
+            1,
+            "exactly one broad acquisition remains in riscv64/trap.rs"
         );
-        // 1. The canonical broad trap phase.
+        // 1. The canonical broad trap phase — the sole survivor.
         assert!(
             code_only.contains("handle_trap_entry_with_fault_bookkeeping_mode("),
             "the canonical in-lock trap phase must remain"
         );
-        // 2. The deferred terminal-idle predicate, untouched by this increment.
+        // 2. The terminal-idle predicate is RETIRED, not deleted: its decision still runs, now
+        // through the coherent rank-1 snapshot instead of a broad re-entry.
         assert!(
-            code_only.contains("kernel.runnable_count_on_cpu(cpu) == 0"),
-            "the terminal-idle predicate is deferred, not retired"
+            !code_only.contains("kernel.runnable_count_on_cpu(cpu) == 0"),
+            "the terminal-idle predicate no longer runs under a broad re-entry"
+        );
+        assert!(
+            code_only.contains("terminal_idle_on_cpu_split(cpu)"),
+            "the terminal-idle decision must still be taken, through the split transaction"
         );
         assert!(RV_TRAP_SRC.contains("RISCV_BLOCKED_IPC_IDLE_PROVENANCE_OK"));
         assert!(RV_TRAP_SRC.contains("RISCV_BLOCKED_IDLE_NO_PROVENANCE"));
@@ -122120,5 +122135,414 @@ mod u3_recv_copy_fault_completion {
             !bind.contains("target_arch") && !bind.contains("x86"),
             "its body names no architecture"
         );
+    }
+}
+
+/// U3 (canonical 203C) — the RISC-V post-lock TERMINAL-IDLE snapshot.
+///
+/// `handle_riscv_trap_entry_shared`'s blocked-syscall idle branch re-entered the broad lock to
+/// evaluate `matches!(current_tid(), None | Some(0)) && runnable_count_on_cpu(cpu) == 0`. Those
+/// two reads each took the scheduler lock separately and were coherent only because the broad
+/// guard held. `terminal_idle_on_cpu_split` answers the identical predicate inside ONE rank-1
+/// acquisition, so it cannot tear.
+mod u3_riscv_terminal_idle_snapshot {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskClass, TaskStatus};
+    use crate::runtime::SharedKernel;
+
+    const A: u64 = 900;
+    const B: u64 = 901;
+
+    /// A kernel with CPU 1 online and two registered runnable tasks, none queued or current.
+    fn fixture() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.bring_up_cpu(CpuId(1)).expect("cpu1");
+            for tid in [A, B] {
+                s.register_task_with_class(tid, TaskClass::App)
+                    .expect("task");
+            }
+            s.with_tcbs_mut(|tcbs| {
+                for tcb in tcbs.iter_mut().flatten() {
+                    if tcb.tid.0 == A || tcb.tid.0 == B {
+                        tcb.status = TaskStatus::Runnable;
+                    }
+                }
+            });
+        });
+        k
+    }
+
+    /// The six valid decision-matrix rows, as builders that leave CPU 0 in the named state.
+    ///
+    /// `Bootstrap::init()` leaves CPU 0 holding the idle sentinel (TID 0) with an empty queue,
+    /// which is the `Some(0) + 0` row; the others are derived from it.
+    type Row = (&'static str, fn() -> SharedKernel, bool);
+    fn rows() -> [Row; 6] {
+        [
+            // current = Some(0) (the idle sentinel), runnable = 0  -> true
+            ("idle sentinel + zero runnable", fixture, true),
+            // current = None, runnable = 0  -> true
+            (
+                "none + zero runnable",
+                || {
+                    let k = fixture();
+                    k.with(|s| {
+                        s.block_current_on_cpu(CpuId(0));
+                    });
+                    k
+                },
+                true,
+            ),
+            // current = Some(real tid), runnable = 0  -> false
+            (
+                "real current + zero runnable",
+                || {
+                    let k = fixture();
+                    k.with(|s| {
+                        s.enqueue_on_cpu(CpuId(0), A).expect("queue A");
+                        assert_eq!(s.dispatch_next_on_cpu(CpuId(0)), Some(A));
+                    });
+                    k
+                },
+                false,
+            ),
+            // current = None, runnable > 0  -> false
+            (
+                "none + runnable work",
+                || {
+                    let k = fixture();
+                    k.with(|s| {
+                        s.block_current_on_cpu(CpuId(0));
+                        s.enqueue_on_cpu(CpuId(0), A).expect("queue A");
+                    });
+                    k
+                },
+                false,
+            ),
+            // current = Some(0), runnable > 0  -> false
+            (
+                "idle sentinel + runnable work",
+                || {
+                    let k = fixture();
+                    k.with(|s| s.enqueue_on_cpu(CpuId(0), A).expect("queue A"));
+                    k
+                },
+                false,
+            ),
+            // current = Some(real tid), runnable > 0  -> false
+            (
+                "real current + runnable work",
+                || {
+                    let k = fixture();
+                    k.with(|s| {
+                        s.enqueue_on_cpu(CpuId(0), A).expect("queue A");
+                        assert_eq!(s.dispatch_next_on_cpu(CpuId(0)), Some(A));
+                        s.enqueue_on_cpu(CpuId(0), B).expect("queue B");
+                    });
+                    k
+                },
+                false,
+            ),
+        ]
+    }
+
+    /// The exact retired body.
+    fn legacy(k: &SharedKernel, cpu: CpuId) -> bool {
+        k.with_cpu(cpu, |kernel| {
+            matches!(kernel.current_tid(), None | Some(0)) && kernel.runnable_count_on_cpu(cpu) == 0
+        })
+        .unwrap_or(false)
+    }
+
+    /// The caller's shape, verbatim.
+    fn candidate(k: &SharedKernel, cpu: CpuId) -> bool {
+        k.terminal_idle_on_cpu_split(cpu).unwrap_or(false)
+    }
+
+    // ── the decision matrix, and the differential over every valid row ────────────────────
+
+    #[test]
+    fn the_decision_matrix_is_exact() {
+        for (name, build, expected) in rows() {
+            let k = build();
+            // Sanity: the row really established the state it names.
+            let (current, runnable) = k.with(|s| {
+                (
+                    s.current_tid_on_cpu(CpuId(0)),
+                    s.runnable_count_on_cpu(CpuId(0)),
+                )
+            });
+            assert_eq!(
+                candidate(&k, CpuId(0)),
+                expected,
+                "{name}: current={current:?} runnable={runnable} must give {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_against_the_retired_broad_predicate() {
+        for (name, build, _) in rows() {
+            for cpu in [CpuId(0), CpuId(1)] {
+                let old = build();
+                let ro = legacy(&old, cpu);
+                let obs_old = observe(&old);
+
+                let new = build();
+                let rn = candidate(&new, cpu);
+                let obs_new = observe(&new);
+
+                assert_eq!(ro, rn, "{name} on cpu {}: verdict diverged", cpu.0);
+                assert_eq!(obs_old, obs_new, "{name} on cpu {}: state diverged", cpu.0);
+            }
+        }
+    }
+
+    /// Everything the snapshot may legitimately change — which is only the CPU binding.
+    type Observed = (
+        CpuId,       // bound current_cpu
+        Option<u64>, // current on cpu 0
+        Option<u64>, // current on cpu 1
+        usize,       // cpu 0 queue depth
+        usize,       // cpu 1 queue depth
+        Option<TaskStatus>,
+        Option<TaskStatus>,
+    );
+
+    fn observe(k: &SharedKernel) -> Observed {
+        k.with(|s| {
+            let st = |tid: u64| {
+                s.with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|t| t.tid.0 == tid)
+                        .map(|t| t.status)
+                })
+            };
+            (
+                s.current_cpu(),
+                s.current_tid_on_cpu(CpuId(0)),
+                s.current_tid_on_cpu(CpuId(1)),
+                s.runnable_count_on_cpu(CpuId(0)),
+                s.runnable_count_on_cpu(CpuId(1)),
+                st(A),
+                st(B),
+            )
+        })
+    }
+
+    // ── binding, refusal, and the absence of any other mutation ───────────────────────────
+
+    #[test]
+    fn an_online_idle_cpu_succeeds_and_binds_current_cpu() {
+        let k = fixture();
+        assert_eq!(k.terminal_idle_on_cpu_split(CpuId(1)), Ok(true));
+        assert_eq!(k.with(|s| s.current_cpu()), CpuId(1), "the CPU is bound");
+    }
+
+    fn refusal_changes_nothing(cpu: CpuId, label: &str) {
+        let k = fixture();
+        k.with(|s| s.enqueue_on_cpu(CpuId(1), B).expect("queue B on cpu1"));
+        let before = observe(&k);
+        let r = k.terminal_idle_on_cpu_split(cpu);
+        assert!(r.is_err(), "{label}: the CPU must be refused");
+        assert_eq!(observe(&k), before, "{label}: nothing may move");
+        // The caller's shape turns that refusal into the same `false` the broad path produced.
+        assert!(!candidate(&k, cpu), "{label}: unwrap_or(false)");
+    }
+
+    #[test]
+    fn an_offline_cpu_refuses_and_mutates_nothing() {
+        refusal_changes_nothing(CpuId(3), "offline cpu");
+    }
+
+    #[test]
+    fn an_out_of_range_cpu_refuses_and_mutates_nothing() {
+        refusal_changes_nothing(CpuId(200), "out-of-range cpu");
+    }
+
+    #[test]
+    fn a_successful_snapshot_mutates_nothing_but_the_cpu_binding() {
+        let k = fixture();
+        k.with(|s| s.enqueue_on_cpu(CpuId(1), B).expect("queue B on cpu1"));
+        let before = observe(&k);
+        assert_eq!(k.terminal_idle_on_cpu_split(CpuId(0)), Ok(true));
+        let after = observe(&k);
+        assert_eq!(before.1, after.1, "cpu 0 current unchanged");
+        assert_eq!(before.2, after.2, "cpu 1 current unchanged");
+        assert_eq!(before.3, after.3, "cpu 0 queue unchanged");
+        assert_eq!(before.4, after.4, "cpu 1 queue unchanged");
+        assert_eq!(before.5, after.5, "A's status unchanged");
+        assert_eq!(before.6, after.6, "B's status unchanged");
+    }
+
+    #[test]
+    fn the_snapshot_is_repeatable_and_never_consumes_anything() {
+        // A predicate, not a take: asking twice gives the same answer and leaves the same state.
+        let k = fixture();
+        assert_eq!(k.terminal_idle_on_cpu_split(CpuId(0)), Ok(true));
+        let after_first = observe(&k);
+        assert_eq!(k.terminal_idle_on_cpu_split(CpuId(0)), Ok(true));
+        assert_eq!(observe(&k), after_first);
+    }
+
+    // ── source guards ────────────────────────────────────────────────────────────────────
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of(src: &str, name: &str) -> alloc::string::String {
+        let tail = src
+            .split(name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{name}` must exist"));
+        code_of(tail.split_once("\n    }\n").expect("the method closes").0)
+    }
+
+    #[test]
+    fn the_target_acquisition_is_gone_and_riscv_trap_keeps_only_its_canonical_phase() {
+        let code = code_of(RISCV_TRAP);
+        // The retired body is absent in every form.
+        assert!(
+            !code.contains("runnable_count_on_cpu"),
+            "the terminal-idle predicate must no longer be evaluated under a broad re-entry"
+        );
+        // EXACTLY one production `with_cpu` remains in the file.
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            1,
+            "riscv64/trap.rs must retain exactly one production acquisition"
+        );
+        // …and it is the canonical broad Phase-2 trap handler, untouched.
+        let remaining = code.split(".with_cpu(").nth(1).expect("the survivor");
+        assert!(
+            remaining.contains("handle_trap_entry_with_fault_bookkeeping_mode("),
+            "the survivor must be the canonical broad Phase-2 trap handler"
+        );
+        // The split transaction is used at the exact terminal-idle site.
+        assert!(
+            code.contains(
+                "let terminal_idle = shared.terminal_idle_on_cpu_split(cpu).unwrap_or(false);"
+            ),
+            "the terminal-idle site must call the split transaction and keep unwrap_or(false)"
+        );
+    }
+
+    #[test]
+    fn the_provenance_take_still_precedes_the_snapshot_and_the_matrix_is_intact() {
+        let code = code_of(RISCV_TRAP);
+        let take = code
+            .find("blocked_syscall_idle_provenance_take(cpu_idx)")
+            .expect("the provenance take");
+        let snap = code
+            .find("terminal_idle_on_cpu_split(cpu)")
+            .expect("the snapshot");
+        assert!(take < snap, "provenance is consumed BEFORE the snapshot");
+        assert_eq!(
+            code.matches("blocked_syscall_idle_provenance_take(")
+                .count(),
+            1,
+            "provenance is consumed exactly once"
+        );
+        // The complete decision matrix survives: both terminal arms and the fall-through.
+        assert!(code.contains("(Some((blocked_tid, class)), true) => {"));
+        assert!(code.contains("RISCV_BLOCKED_IPC_IDLE_PROVENANCE_OK"));
+        assert!(code.contains("RiscvIdleReason::BlockedIpcNoRunnable"));
+        assert!(code.contains("(None, true) => {"));
+        assert!(code.contains("RISCV_BLOCKED_IDLE_NO_PROVENANCE"));
+        assert!(code.contains("SyscallError::Internal"));
+        // The earlier typed-idle paths are untouched.
+        assert!(code.contains("RiscvIdleReason::FutexWaitNoIncoming"));
+        assert!(code.contains("RiscvIdleReason::ExitCurrentTaskNoRunnable"));
+    }
+
+    #[test]
+    fn the_transaction_takes_rank_one_once_and_enters_no_other_domain() {
+        let t = body_of(RUNTIME, "pub(crate) fn terminal_idle_on_cpu_split");
+        assert!(
+            !t.contains(".with_cpu(") && !t.contains("self.with(|"),
+            "no broad acquisition and no fallback"
+        );
+        assert_eq!(
+            t.matches("with_scheduler_split_mut").count(),
+            1,
+            "rank 1 exactly once — one coherent snapshot, not two locked reads"
+        );
+        for other in [
+            "with_task_",
+            "with_ipc_",
+            "with_capability_",
+            "with_vm_",
+            "with_memory_",
+            "with_fault_",
+        ] {
+            assert!(!t.contains(other), "no `{other}` domain may be entered");
+        }
+        // Validate, then bind, then the two reads — and nothing else is mutated.
+        let v = t.find("validate_online_cpu").expect("validate");
+        let bind = t.find("current_cpu = cpu").expect("bind");
+        let cur = t.find("current_tid_on(cpu)").expect("current read");
+        let run = t.find("runnable_count_on(cpu)").expect("runnable read");
+        assert!(v < bind && bind < cur && cur < run);
+        assert_eq!(t.matches("current_cpu = cpu").count(), 1);
+        for forbidden in [
+            "dispatch_next_on",
+            "block_current_on",
+            "enqueue_on_with_priority",
+            ".status =",
+            "waiter_ownership",
+        ] {
+            assert!(
+                !t.contains(forbidden),
+                "the snapshot must not `{forbidden}`"
+            );
+        }
+        // The exact predicate.
+        assert!(t.contains("matches!(current, None | Some(0)) && runnable == 0"));
+        // Not the two primitives the directive rules out.
+        assert!(!t.contains("current_tid_split_read") && !t.contains("current_tid_authoritative"));
+    }
+
+    #[test]
+    fn the_out_of_scope_runtime_acquisitions_are_unchanged() {
+        let code = code_of(RUNTIME);
+        assert_eq!(
+            code.matches("rollback_materialized_recv_cap(").count(),
+            3,
+            "the dependency-blocked capability-rollback callsites are untouched"
+        );
+        let ordinary = body_of(RUNTIME, "fn complete_recv_boundary_ordinary_cap");
+        assert!(
+            ordinary.contains(".with_cpu("),
+            "the deferred ordinary-cap sender-wake acquisition remains"
+        );
+    }
+
+    #[test]
+    fn no_ownership_primitive_gained_a_production_caller() {
+        let t = body_of(RUNTIME, "pub(crate) fn terminal_idle_on_cpu_split");
+        let riscv = code_of(RISCV_TRAP);
+        for op in [
+            "waiter_ownership_arm_current",
+            "waiter_ownership_claim",
+            "waiter_ownership_consume",
+            "waiter_ownership_restore",
+            "waiter_ownership_cancel",
+            "waiter_ownership_retire_current",
+        ] {
+            assert!(
+                !t.contains(op) && !riscv.contains(op),
+                "`{op}` must gain no caller in this drain"
+            );
+        }
     }
 }
