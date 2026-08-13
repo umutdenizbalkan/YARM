@@ -284,6 +284,39 @@ pub(crate) enum OwnerRevalidation {
     RestoreFailed { tid: u64, rolled_back: bool },
 }
 
+/// U3 (canonical 203C) — what the owner-revalidation transaction's rank-1 phase actually
+/// proved, carried forward instead of an unauthenticated bare TID.
+///
+/// The fields describe this transaction and nothing else: `cpu` is the CPU that passed
+/// `validate_online_cpu` and was bound as `current_cpu`, and `tid` is the task THIS
+/// transaction's single `dispatch_next_on(cpu)` committed as that CPU's `current`. It is
+/// deliberately **not** a [`DispatchMarkToken`]: no incarnation ASID was proved here (the
+/// legacy body never proved one, and treating a task with no ASID as a refusal would be a
+/// strengthening), and no dispatch mark was minted. Every later phase keys off these two
+/// fields rather than re-reading `current`, which is strictly more exact than the legacy
+/// body's `current_tid()` re-reads.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerRevalidationSelection {
+    pub(crate) cpu: CpuId,
+    pub(crate) tid: u64,
+}
+
+/// U3 (canonical 203C) — everything the arch restore needs, read in ONE rank-2 acquisition.
+///
+/// Existing only means the legacy `thread_user_context(tid).is_some()` verdict was true.
+/// `asid` keeps the legacy's OPTIONAL semantics: `None` skips the pre-IRET CR3 block and
+/// still restores, exactly as `if let Some(task_asid) = kernel.task_asid(tid)` did.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnerRevalidationSnapshot {
+    pub(crate) context: crate::kernel::task::UserRegisterContext,
+    pub(crate) tls: Option<usize>,
+    pub(crate) asid: Option<crate::kernel::vm::Asid>,
+}
+
 /// What the x86_64 trap epilogue must do with an [`OwnerRevalidation`].
 ///
 /// Kept as a pure function of the outcome so the fail-closed rule is directly testable rather
@@ -1049,48 +1082,205 @@ impl SharedKernel {
     /// running on it — on no run queue and on no CPU, stranded exactly as the Stage 200D-2B1D4
     /// caller was. The failure is therefore rolled back here, and reported distinctly from
     /// genuine idle so the caller can fail closed if the rollback itself could not complete.
+    ///
+    /// U3 (canonical 203C) — the broad re-acquisition is retired. The body is now one
+    /// rank-ordered, CPU-local transaction with no `&mut KernelState` anywhere:
+    ///
+    /// 1. **rank 1** — `validate_online_cpu` (the same predicate `with_cpu` applied through
+    ///    `set_current_cpu`), then bind `current_cpu = cpu`, then the SAME single
+    ///    `dispatch_next_on(cpu)` advance. A validation refusal returns before the bind, so
+    ///    nothing is mutated and the outcome is `Idle` — exactly what `with_cpu`'s `Err` did
+    ///    through `.unwrap_or(Idle)`. The selection leaves this phase as a typed
+    ///    [`OwnerRevalidationSelection`], not a bare TID, so every step below is keyed to the
+    ///    CPU this transaction authenticated and the TID this transaction itself committed.
+    /// 2. **rank 1 is fully released** before any task-domain work.
+    /// 3. Idle / TID 0 short-circuit, unchanged.
+    /// 4. **rank 2**, ONE acquisition — the restorability decision and the whole restore
+    ///    payload come from the same look at the TCB: `user_context` (what
+    ///    `thread_user_context` read), the pending TLS-restore request (what
+    ///    `take_tls_restore_request` consumed, taken here so it is consumed exactly once),
+    ///    and `tcb.asid` with its **optional** semantics preserved. No `TaskStatus` is
+    ///    written. Fusing the two reads is strictly more coherent than the legacy pair, which
+    ///    read the TCB twice; it is not a strengthening — a task with no ASID still restores,
+    ///    it only skips the CR3 block, exactly as before.
+    /// 5. **rank 2 is fully released** before the frame, MSR, page-table and CR3 work.
+    /// 6. The arch application (frame, FS base, `LAST_RESTORED_TLS_BASE`, and the complete
+    ///    `ensure_user_return_cr3` behavior through its existing split twin) runs with NO lock
+    ///    held — see `x86_apply_owner_revalidation_restore`.
+    /// 7. Rollback re-takes **rank 1** alone.
+    ///
+    /// **Why the restore step is infallible, and why the requeue arm is kept anyway.** The
+    /// legacy condition was `restorable && restore_arch_thread_state(..).is_ok()`. Every error
+    /// path inside that call — `apply_current_thread_to_frame`'s two lookups and the
+    /// `current_tid()` re-read — produces `KernelError::TaskMissing`, which the function maps
+    /// to `Ok(())`; `take_tls_restore_request` cannot fail at all. So on this path
+    /// `restore_arch_thread_state` always returned `Ok`, the composite condition was exactly
+    /// `restorable`, and `RestoreFailed` was only ever reached with `restorable == false` —
+    /// where `!restorable` short-circuits the requeue. The transaction reproduces that
+    /// reachable behavior exactly. The `restorable` requeue arm below is nevertheless kept and
+    /// implemented, because the twelve-point contract requires a still-live task to go back on
+    /// THIS cpu's queue, and a future fallible restore step must not silently strand it.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn revalidate_idle_owner_after_drains(
         &self,
         cpu: CpuId,
         frame: &mut crate::kernel::trapframe::TrapFrame,
     ) -> OwnerRevalidation {
-        self.with_cpu(cpu, |kernel| {
-            let Some(next) = kernel.dispatch_next_on_cpu(cpu) else {
-                return OwnerRevalidation::Idle;
+        // (1) rank 1: authenticate, bind, advance THIS cpu's queue exactly once.
+        let Some(selection) = self.owner_revalidation_select_split(cpu) else {
+            // Either the CPU failed the same admission predicate `with_cpu` applied — nothing
+            // was mutated and `dispatch_next_on` never ran — or the queue yielded nothing.
+            return OwnerRevalidation::Idle;
+        };
+        // (3) The scheduler's idle/supervisor sentinel owns no user context. Nothing was
+        // committed — `dispatch_next` returns the sentinel it was already holding.
+        let next = selection.tid;
+        if next == 0 {
+            return OwnerRevalidation::Idle;
+        }
+        // (4) rank 2, one acquisition. `None` is the legacy `thread_user_context(next).is_none()`
+        // verdict: a task still in a run queue whose TCB has been reaped must be a restore
+        // failure, never a silent return into ring 3 on the previous task's frame.
+        let snapshot = self.owner_revalidation_snapshot_split(selection);
+        if let Some(snapshot) = snapshot {
+            // (6) No lock held: frame, FS base, per-CPU TLS record, pre-IRET CR3 invariant.
+            crate::arch::x86_64::trap::x86_apply_owner_revalidation_restore(
+                self, cpu, next, snapshot, frame,
+            );
+            return OwnerRevalidation::Replacement(next);
+        }
+        // (7) Undo the queue advance. Clearing `current` is mandatory; re-enqueueing is only
+        // meaningful for a task that still exists — a reaped one has nothing to run and must
+        // not be resurrected into a run queue.
+        self.owner_revalidation_rollback_split(selection, snapshot.is_some())
+    }
+
+    /// U3 (203C) — phase 1 of [`Self::revalidate_idle_owner_after_drains`], rank 1 only.
+    ///
+    /// Returns `None` for BOTH legacy no-owner cases, which the caller reports identically:
+    /// the CPU failed `validate_online_cpu` (so `with_cpu` returned `Err` and nothing ran), or
+    /// `dispatch_next_on` selected nothing. The bind happens only after a successful
+    /// validation and before the advance, matching `set_current_cpu` followed by the closure.
+    #[cfg(target_arch = "x86_64")]
+    fn owner_revalidation_select_split(&self, cpu: CpuId) -> Option<OwnerRevalidationSelection> {
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler).validate_online_cpu(cpu).ok()?;
+            sched.current_cpu = cpu;
+            let tid = kernel_mut(&mut sched.scheduler).dispatch_next_on(cpu)?;
+            Some(OwnerRevalidationSelection { cpu, tid: tid.0 })
+        })
+    }
+
+    /// U3 (203C) — phase 2, rank 2 only, ONE acquisition, no `TaskStatus` write.
+    ///
+    /// `Some` iff the legacy `thread_user_context(tid).is_some()` was true. The TLS-restore
+    /// request is TAKEN here, exactly as `take_tls_restore_request` took it, and only when the
+    /// TCB was found — so a rolled-back selection leaves the request pending for the task's
+    /// real resume, which is what the legacy short-circuit did.
+    #[cfg(target_arch = "x86_64")]
+    fn owner_revalidation_snapshot_split(
+        &self,
+        selection: OwnerRevalidationSelection,
+    ) -> Option<OwnerRevalidationSnapshot> {
+        let tid = selection.tid;
+        self.with_task_return_split_mut(|tcbs, tls_pending| {
+            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == tid)?;
+            let context = tcb.user_context;
+            let asid = tcb.asid;
+            // `take_tls_restore_request`: clear the pending slot and answer with the task's
+            // `tls_ptr`, or `None` when nothing was pending. `thread_tls_base` reads the same
+            // field this reads.
+            let tls_base = tcb.tls_ptr.map(|ptr| ptr.0 as usize);
+            let pending = tls_pending
+                .iter()
+                .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == tid));
+            let tls = match pending {
+                Some(idx) => {
+                    tls_pending[idx] = None;
+                    tls_base
+                }
+                None => None,
             };
-            if next == 0 {
-                // The scheduler's idle/supervisor sentinel owns no user context. Nothing was
-                // committed — `dispatch_next` returns the sentinel it was already holding.
-                return OwnerRevalidation::Idle;
-            }
-            // `restore_arch_thread_state` maps `KernelError::TaskMissing` to `Ok(())` so early
-            // boot (no user task scheduled yet) restores nothing and still returns cleanly.
-            // That is correct for its other callers and WRONG here: a task that is still in a
-            // run queue but whose TCB has been reaped would report success with the frame left
-            // holding the PREVIOUS task's context, and the epilogue would iret into ring 3 on
-            // the exited task's frame. Establish restorability first, so a missing TCB is a
-            // restore failure rather than a silent bad user return.
-            let restorable = kernel.thread_user_context(next).is_some();
-            if restorable
-                && crate::arch::x86_64::trap::restore_arch_thread_state(kernel, cpu, Some(frame))
-                    .is_ok()
-            {
-                return OwnerRevalidation::Replacement(next);
-            }
-            // Undo the queue advance. Clearing `current` is mandatory; re-enqueueing is only
-            // meaningful for a task that still exists — a reaped one has nothing to run and
-            // must not be resurrected into a run queue.
-            let cleared = kernel.block_current_on_cpu(cpu) == Some(next);
-            let requeued = !restorable || kernel.enqueue_on_cpu(cpu, next).is_ok();
+            Some(OwnerRevalidationSnapshot { context, tls, asid })
+        })
+    }
+
+    /// U3 (203C) — phase 3, the restore-failure rollback, rank 1 (with the enqueue policy's
+    /// rank 2 nested inside it, ascending 1 → 2).
+    ///
+    /// `cleared` and `requeued` are composed exactly as the legacy body composed them from
+    /// `block_current_on_cpu` and `enqueue_on_cpu`, including `enqueue_on_cpu`'s own
+    /// spawn-reservation refusal, class → priority derivation and first-user CPU pin.
+    #[cfg(target_arch = "x86_64")]
+    fn owner_revalidation_rollback_split(
+        &self,
+        selection: OwnerRevalidationSelection,
+        restorable: bool,
+    ) -> OwnerRevalidation {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::TaskClass;
+
+        const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
+        let OwnerRevalidationSelection { cpu, tid } = selection;
+        self.with_scheduler_split_mut(|sched| {
+            let cleared = kernel_mut(&mut sched.scheduler)
+                .block_current_on(cpu)
+                .map(|t| t.0)
+                == Some(tid);
+            // A reaped task is never resurrected: `!restorable` short-circuits before any
+            // queue mutation, exactly as `!restorable || enqueue_on_cpu(..)` did.
+            let requeued = if !restorable {
+                true
+            } else {
+                // `enqueue_on_cpu`'s task-domain policy, in one nested rank-2 acquisition.
+                let priority: Option<TaskPriority> =
+                    self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                        let idx = tcbs
+                            .iter()
+                            .position(|slot| slot.as_ref().is_some_and(|t| t.tid.0 == tid))?;
+                        if tcbs[idx].as_ref().is_some_and(|t| t.is_spawn_reservation()) {
+                            crate::yarm_log!(
+                                "ENQUEUE_REFUSED tid={} reason=spawn_reservation_not_live",
+                                tid
+                            );
+                            return None;
+                        }
+                        if tid == 0 {
+                            return Some(TaskPriority::Normal);
+                        }
+                        Some(match classes[idx]? {
+                            TaskClass::SystemServer => TaskPriority::High,
+                            TaskClass::Driver | TaskClass::App => TaskPriority::Normal,
+                        })
+                    });
+                match priority {
+                    None => false,
+                    Some(priority) => {
+                        // First-user CPU pinning, reproduced verbatim from `enqueue_on_cpu`.
+                        if tid == BOOTSTRAP_FIRST_USER_TID
+                            && cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+                            && cfg!(not(feature = "hosted-dev"))
+                        {
+                            crate::yarm_log!(
+                                "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
+                                cpu.0,
+                                tid,
+                                cpu.0
+                            );
+                            assert_eq!(cpu.0, crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+                        }
+                        kernel_mut(&mut sched.scheduler)
+                            .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
+                            .is_ok()
+                    }
+                }
+            };
             OwnerRevalidation::RestoreFailed {
-                tid: next,
+                tid,
                 rolled_back: cleared && requeued,
             }
         })
-        // A failed guard acquisition means `dispatch_next_on_cpu` never ran, so nothing was
-        // committed and idling is consistent.
-        .unwrap_or(OwnerRevalidation::Idle)
     }
 
     /// Stage 168 (D6-GENUINE-B): the authoritative **mutating** dispatch step,

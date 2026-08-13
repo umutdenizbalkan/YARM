@@ -96,7 +96,14 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // `complete_blocked_waiter_delivery_split` — rank 1 (validate + bind), rank 2 (return-register
     // clear, wake-TID ASID read), rank 3 (identity-keyed `clear_endpoint_waiter_if_identity`),
     // then the rank-2/rank-1 wake — so no seam is entered while a rank >= its own is held.
-    ("src/runtime.rs", 8),
+    // U3 (203C): 8 -> 7. `revalidate_idle_owner_after_drains` became a CPU-local rank-1/rank-2
+    // transaction: rank 1 (`validate_online_cpu` + bind `current_cpu` + the same single
+    // `dispatch_next_on`) is fully released before the rank-2 snapshot (user context, the
+    // pending TLS-restore request, and the task's OPTIONAL asid in ONE acquisition, no
+    // `TaskStatus` write), which is fully released before the frame / FS-base / CR3 work.
+    // Rollback re-takes rank 1 alone. The proven-infallible legacy restore is why the
+    // `restorable` requeue arm stays unreachable there, exactly as it was under the broad lock.
+    ("src/runtime.rs", 7),
 ];
 
 /// Per-file count of production broad `SharedKernel::with(|state| …)` callsites.
@@ -141,7 +148,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 17; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 (+ the three blocked-waiter Phase-C completions)
+const AUDITED_WITH_CPU_TOTAL: usize = 16; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 (+ the post-drain idle-owner revalidation)
 const AUDITED_WITH_BROAD_TOTAL: usize = 1; // U3: 6 -> 2 -> 1 (runtime.rs fully drained; the reached x86 AP SMP read retired)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -150,7 +157,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 18; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 (twenty-six retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 17; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 (twenty-seven retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

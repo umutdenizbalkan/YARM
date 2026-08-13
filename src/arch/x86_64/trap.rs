@@ -361,6 +361,50 @@ pub(crate) fn x86_post_lock_resume_marked_incoming(
     Ok(())
 }
 
+/// U3 (canonical 203C) — the arch half of the owner-revalidation transaction, with NO lock
+/// held. The scheduler (rank 1) and task (rank 2) guards are both released before this runs.
+///
+/// This is the tail of [`restore_arch_thread_state`] for the one caller whose broad
+/// re-acquisition was retired, reproduced step for step from the already-captured snapshot:
+///
+/// * `frame.apply_user_context(context)` — what `apply_current_thread_to_frame` did with the
+///   value `thread_user_context` returned;
+/// * `restore_fs_base_if_needed(tls.unwrap_or(0))` and the per-CPU `LAST_RESTORED_TLS_BASE`
+///   store, both against the value `take_tls_restore_request` yielded — including `None`,
+///   which still stores 0 exactly as `tls.unwrap_or(0)` did;
+/// * the pre-IRET CR3 invariant through [`ensure_user_return_cr3_split`], which carries the
+///   rare stack-bound lookup and repair and the fail-safe skip that leaves hardware CR3
+///   untouched when the return context cannot be mapped.
+///
+/// The two legacy guards on the CR3 block are preserved with the same meaning: `tid != 0`,
+/// and an ASID actually bound to the task. A task with no ASID restores and skips the block —
+/// `if let Some(task_asid) = kernel.task_asid(tid)` was never a refusal, and is not made one.
+///
+/// Unlike [`x86_post_lock_resume_marked_incoming`] this performs **no ASID activation** and
+/// takes **no `DispatchMarkToken`**: the body it replaces activated nothing, and inventing an
+/// activation or an incarnation proof here would change behavior rather than preserve it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn x86_apply_owner_revalidation_restore(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    tid: u64,
+    snapshot: crate::runtime::OwnerRevalidationSnapshot,
+    frame: &mut TrapFrame,
+) {
+    frame.apply_user_context(snapshot.context);
+    let tls = snapshot.tls.unwrap_or(0);
+    restore_fs_base_if_needed(tls);
+    let idx = cpu.0 as usize;
+    if idx < MAX_CPUS {
+        LAST_RESTORED_TLS_BASE[idx].store(tls, Ordering::Relaxed);
+    }
+    if tid != 0
+        && let Some(task_asid) = snapshot.asid
+    {
+        ensure_user_return_cr3_split(shared, tid, task_asid);
+    }
+}
+
 /// The estimate used when no TCB owns a kernel stack containing `rsp`.
 ///
 /// U3 (203C): lifted out of [`find_kernel_stack_bounds_containing_rsp`] so the broad-lock

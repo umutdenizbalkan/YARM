@@ -102823,26 +102823,41 @@ mod stage200d2b1d5a_owner_revalidation {
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
     const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
 
-    fn seam() -> &'static str {
-        RUNTIME_SRC
-            .split("pub(crate) fn revalidate_idle_owner_after_drains(")
-            .nth(1)
-            .expect("the revalidation seam must exist")
-            .split("\n    /// ")
-            .next()
-            .expect("bounded body")
+    /// U3 (203C): the seam is no longer one broad closure — it is the composed body plus the
+    /// three rank-ordered phases it calls. The guards below reason about the WHOLE
+    /// transaction, so `seam()` is their concatenation; splitting a step out into a phase
+    /// method must not let any assertion below stop applying to it.
+    fn seam() -> alloc::string::String {
+        let one = |name: &str| -> &'static str {
+            RUNTIME_SRC
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{name}` must exist"))
+                .split_once("\n    }\n")
+                .expect("bounded body")
+                .0
+        };
+        [
+            one("pub(crate) fn revalidate_idle_owner_after_drains("),
+            one("fn owner_revalidation_select_split("),
+            one("fn owner_revalidation_snapshot_split("),
+            one("fn owner_revalidation_rollback_split("),
+        ]
+        .join("\n")
     }
 
     /// The seam advances the run queue through the EXISTING authority, exactly once.
     #[test]
     fn g01_seam_uses_the_existing_dispatch_and_advances_once() {
         let body = seam();
+        // U3 (203C): `dispatch_next_on_cpu` was `scheduler_state()` + `dispatch_next_on(cpu)`.
+        // The rank-1 phase calls that same primitive directly, under the seam it holds.
         assert!(
-            body.contains("let Some(next) = kernel.dispatch_next_on_cpu(cpu) else {"),
-            "the seam must use the existing dispatch_next_on_cpu"
+            body.contains("kernel_mut(&mut sched.scheduler).dispatch_next_on(cpu)"),
+            "the seam must advance through the existing scheduler dispatch primitive"
         );
         assert_eq!(
-            body.matches("dispatch_next_on_cpu(").count(),
+            body.matches("dispatch_next_on(").count(),
             1,
             "exactly one queue advance per revalidation"
         );
@@ -102861,20 +102876,25 @@ mod stage200d2b1d5a_owner_revalidation {
     fn g02_seam_is_cpu_local() {
         let body = seam();
         assert!(
-            body.contains("dispatch_next_on_cpu(cpu)"),
+            body.contains("dispatch_next_on(cpu)"),
             "the seam must pop from this CPU's own run queue"
         );
         // The Stage 200D-2B1D5B rollback is CPU-local too: it must undo the advance on the very
-        // CPU that made it, never park the task somewhere else.
+        // CPU that made it, never park the task somewhere else. U3 (203C) reaches the same two
+        // scheduler primitives `block_current_on_cpu` / `enqueue_on_cpu` wrapped, under rank 1.
         assert!(
-            body.contains("block_current_on_cpu(cpu)")
-                && body.contains("enqueue_on_cpu(cpu, next)"),
+            body.contains("block_current_on(cpu)")
+                && body.contains("enqueue_on_with_priority(cpu, ThreadId(tid), priority)"),
             "the rollback must clear and requeue on the caller's own CPU"
         );
         assert!(
-            !body.contains("CpuId(0)") && !body.contains("current_cpu"),
+            !body.contains("CpuId(0)"),
             "the seam must not substitute another CPU for the caller's"
         );
+        // `current_cpu` appears exactly once, and only to BIND the caller's own CPU — the bind
+        // `with_cpu` performed through `set_current_cpu`. It is never read as a different CPU.
+        assert_eq!(body.matches("current_cpu").count(), 1);
+        assert!(body.contains("sched.current_cpu = cpu;"));
         // `dispatch_next_on_cpu` itself is per-CPU by construction.
         let prim = include_str!("scheduler_state.rs")
             .split("pub fn dispatch_next_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {")
@@ -102898,8 +102918,10 @@ mod stage200d2b1d5a_owner_revalidation {
             body.contains("return OwnerRevalidation::Replacement(next);"),
             "only a restored task may be reported as a committed replacement"
         );
+        // U3 (203C): the arch tail moved to `x86_apply_owner_revalidation_restore`, which
+        // applies the snapshot the rank-2 phase captured — with no lock held.
         assert!(
-            body.contains("restore_arch_thread_state(kernel, cpu, Some(frame))"),
+            body.contains("x86_apply_owner_revalidation_restore("),
             "the seam must restore the selected task's arch state into the caller's frame"
         );
     }
@@ -103148,14 +103170,27 @@ mod stage200d2b1d5b_restore_contract {
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
     const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
 
-    fn seam() -> &'static str {
-        RUNTIME_SRC
-            .split("pub(crate) fn revalidate_idle_owner_after_drains(")
-            .nth(1)
-            .expect("the revalidation seam must exist")
-            .split("\n    /// ")
-            .next()
-            .expect("bounded body")
+    /// U3 (203C): the seam is no longer one broad closure — it is the composed body plus the
+    /// three rank-ordered phases it calls. The guards below reason about the WHOLE
+    /// transaction, so `seam()` is their concatenation; splitting a step out into a phase
+    /// method must not let any assertion below stop applying to it.
+    fn seam() -> alloc::string::String {
+        let one = |name: &str| -> &'static str {
+            RUNTIME_SRC
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{name}` must exist"))
+                .split_once("\n    }\n")
+                .expect("bounded body")
+                .0
+        };
+        [
+            one("pub(crate) fn revalidate_idle_owner_after_drains("),
+            one("fn owner_revalidation_select_split("),
+            one("fn owner_revalidation_snapshot_split("),
+            one("fn owner_revalidation_rollback_split("),
+        ]
+        .join("\n")
     }
 
     /// Register `tid`, give it a distinguishable user context, and make it runnable on `cpu`.
@@ -103423,8 +103458,12 @@ mod stage200d2b1d5b_restore_contract {
     #[test]
     fn h08_seam_establishes_restorability_before_reporting_success() {
         let body = seam();
+        // U3 (203C): restorability is now the rank-2 snapshot's OWN verdict — `None` is
+        // exactly `thread_user_context(next).is_none()`, decided in the same acquisition that
+        // captures the payload, so the two can no longer disagree. `Replacement` is reachable
+        // only through that `Some`, which is a stronger gate than the old ordered pair.
         let check = body
-            .find("let restorable = kernel.thread_user_context(next).is_some();")
+            .find("let snapshot = self.owner_revalidation_snapshot_split(selection);")
             .expect("the seam must establish restorability");
         let ok = body
             .find("return OwnerRevalidation::Replacement(next);")
@@ -103434,22 +103473,24 @@ mod stage200d2b1d5b_restore_contract {
             "restorability must be established before success"
         );
         assert!(
-            body.contains("if restorable\n") || body.contains("if restorable "),
+            body.contains("if let Some(snapshot) = snapshot {"),
             "the success path must be gated on restorability"
         );
-        // Restorability alone is not success: the restore must actually be ATTEMPTED, and its
-        // result must gate the replacement commit. Without this, dropping the call would leave
-        // the frame holding the PREVIOUS task's context while reporting `Replacement`.
+        // Restorability alone is not success: the captured context must actually be APPLIED
+        // before the commit. Without this, dropping the call would leave the frame holding the
+        // PREVIOUS task's context while reporting `Replacement`.
         let restore_call = body
-            .find("restore_arch_thread_state(kernel, cpu, Some(frame))")
-            .expect("the seam must attempt the arch restore");
+            .find("x86_apply_owner_revalidation_restore(")
+            .expect("the seam must apply the captured arch state");
         assert!(
             check < restore_call && restore_call < ok,
-            "order must be: establish restorability -> attempt restore -> report success"
+            "order must be: establish restorability -> apply the restore -> report success"
         );
+        // The snapshot's `None` arm is the ONLY route to the rollback, so an unrestorable
+        // selection can never reach the replacement commit.
         assert!(
-            body[restore_call..ok].contains(".is_ok()"),
-            "the replacement commit must require the restore to have SUCCEEDED"
+            body.contains("self.owner_revalidation_rollback_split(selection, snapshot.is_some())"),
+            "an unrestorable selection must fall through to the rollback"
         );
         // And the swallow it defends against is really there.
         let restore = include_str!("../../arch/x86_64/trap.rs")
@@ -103467,14 +103508,18 @@ mod stage200d2b1d5b_restore_contract {
     #[test]
     fn h09_rollback_clears_current_and_requeues_only_live_tasks() {
         let body = seam();
+        // U3 (203C): the same two halves, composed under one rank-1 acquisition.
+        // Whitespace-insensitive: `cargo fmt` may wrap either expression across lines.
+        let dense: alloc::string::String = body.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            body.contains("let cleared = kernel.block_current_on_cpu(cpu) == Some(next);"),
+            dense.contains(
+                "letcleared=kernel_mut(&mutsched.scheduler).block_current_on(cpu).map(|t|t.0)==Some(tid);"
+            ),
             "the rollback must take the committed task back off `current`"
         );
         assert!(
-            body.contains(
-                "let requeued = !restorable || kernel.enqueue_on_cpu(cpu, next).is_ok();"
-            ),
+            dense.contains("letrequeued=if!restorable{true}else{")
+                && dense.contains("enqueue_on_with_priority(cpu,ThreadId(tid),priority)"),
             "a live task is returned to its run queue; a reaped one is not resurrected"
         );
         assert!(
@@ -120942,5 +120987,632 @@ mod u3_blocked_waiter_completion_transaction {
             );
             let _ = &code;
         }
+    }
+}
+
+/// U3 (canonical 203C) — the x86_64 post-drain idle-owner revalidation transaction.
+///
+/// `SharedKernel::revalidate_idle_owner_after_drains` used to re-enter the broad lock. Its
+/// body is now rank 1 (validate + bind + one `dispatch_next_on`) → released → rank 2 (one
+/// acquisition: restorability verdict, `user_context`, the pending TLS-restore request, and
+/// the OPTIONAL asid) → released → frame / FS base / CR3 with nothing held, and a rank-1-only
+/// rollback. These tests pin the twelve legacy facts, not the shape of the code.
+#[cfg(target_arch = "x86_64")]
+mod u3_owner_revalidation_transaction {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskClass, TaskStatus};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, VirtAddr};
+    use crate::runtime::{OwnerRevalidation, SharedKernel};
+
+    const A: u64 = 700;
+    const B: u64 = 701;
+
+    fn frame() -> TrapFrame {
+        TrapFrame::new(0, [0; 6])
+    }
+
+    /// A kernel with CPU 1 online and task `A` registered, runnable and queued on CPU 0 with a
+    /// recognisable user context. Nothing is current anywhere.
+    fn fixture() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.bring_up_cpu(CpuId(1)).expect("cpu1");
+            s.register_task_with_class(A, TaskClass::App).expect("A");
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == A).unwrap();
+                t.status = TaskStatus::Runnable;
+                t.asid = Some(Asid(7));
+                t.user_context.instruction_ptr = VirtAddr(0x4141_0000);
+                t.user_context.stack_ptr = VirtAddr(0x4242_0000);
+                t.user_context.arg0 = 0xA0;
+                t.user_context.arg1 = 0xA1;
+                t.user_context.user_gprs[3] = 0xA3;
+                t.user_context.user_gprs[9] = 0xA9;
+            });
+            s.enqueue_on_cpu(CpuId(0), A).expect("queue A");
+        });
+        k
+    }
+
+    fn status_of(k: &SharedKernel, tid: u64) -> Option<TaskStatus> {
+        k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .map(|t| t.status)
+            })
+        })
+    }
+
+    fn queue_len(k: &SharedKernel, cpu: CpuId) -> usize {
+        k.with(|s| s.runnable_count_on_cpu(cpu))
+    }
+
+    fn current_on(k: &SharedKernel, cpu: CpuId) -> Option<u64> {
+        k.with(|s| s.current_tid_on_cpu(cpu))
+    }
+
+    // ── fact 11: CPU authentication failure mutates nothing and reports Idle ──────────────
+
+    #[test]
+    fn offline_cpu_mutates_nothing_and_reports_idle() {
+        let k = fixture();
+        let before_q0 = queue_len(&k, CpuId(0));
+        let before_status = status_of(&k, A);
+        let before_cpu = k.with(|s| s.current_cpu());
+        let before_current = current_on(&k, CpuId(0));
+        let mut f = frame();
+        // CPU 3 was never brought up, so it fails the same `validate_online_cpu` predicate
+        // `with_cpu` applied through `set_current_cpu`.
+        assert_eq!(
+            k.revalidate_idle_owner_after_drains(CpuId(3), &mut f),
+            OwnerRevalidation::Idle
+        );
+        assert_eq!(queue_len(&k, CpuId(0)), before_q0, "no queue advance");
+        assert_eq!(status_of(&k, A), before_status, "no status change");
+        assert_eq!(
+            k.with(|s| s.current_cpu()),
+            before_cpu,
+            "a refused CPU is never bound"
+        );
+        assert_eq!(
+            current_on(&k, CpuId(0)),
+            before_current,
+            "no CPU-local current changed"
+        );
+        assert_eq!(f, frame(), "the frame is untouched");
+    }
+
+    // ── fact 3: no runnable replacement, and the TID-0 sentinel, are both Idle ────────────
+
+    #[test]
+    fn no_runnable_replacement_reports_idle() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut f = frame();
+        assert_eq!(
+            k.revalidate_idle_owner_after_drains(CpuId(0), &mut f),
+            OwnerRevalidation::Idle
+        );
+        assert_eq!(f, frame(), "an idle verdict never touches the frame");
+    }
+
+    #[test]
+    fn idle_sentinel_tid_zero_reports_idle_and_does_not_restore() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task_with_class(0, TaskClass::App).ok();
+            let _ = s.enqueue_on_cpu(CpuId(0), 0);
+        });
+        let mut f = frame();
+        assert_eq!(
+            k.revalidate_idle_owner_after_drains(CpuId(0), &mut f),
+            OwnerRevalidation::Idle
+        );
+        assert_eq!(
+            f,
+            frame(),
+            "TID 0 owns no user context; nothing is restored"
+        );
+    }
+
+    // ── facts 2/4/5/6: the success path ──────────────────────────────────────────────────
+
+    #[test]
+    fn successful_replacement_restores_the_exact_context_and_binds_the_cpu() {
+        let k = fixture();
+        let mut f = frame();
+        assert_eq!(
+            k.revalidate_idle_owner_after_drains(CpuId(0), &mut f),
+            OwnerRevalidation::Replacement(A)
+        );
+        // fact 5 — the selected task's EXACT user context reached the frame.
+        assert_eq!(f.saved_pc, 0x4141_0000);
+        assert_eq!(f.saved_sp, 0x4242_0000);
+        assert_eq!(f.args[0], 0xA0);
+        assert_eq!(f.args[1], 0xA1);
+        assert_eq!(f.user_gprs[3], 0xA3);
+        assert_eq!(f.user_gprs[9], 0xA9);
+        // fact 1 — the CPU was authenticated and bound; fact 2 — its queue advanced.
+        assert_eq!(k.with(|s| s.current_cpu()), CpuId(0));
+        assert_eq!(current_on(&k, CpuId(0)), Some(A));
+        assert_eq!(queue_len(&k, CpuId(0)), 0, "exactly one advance");
+    }
+
+    #[test]
+    fn a_task_with_no_asid_still_restores_and_is_not_refused() {
+        // fact: the legacy skipped the CR3 block for a task with no ASID — it never refused
+        // the restore. Strengthening that into a refusal is explicitly out of contract.
+        let k = fixture();
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == A)
+                    .unwrap()
+                    .asid = None;
+            })
+        });
+        let mut f = frame();
+        assert_eq!(
+            k.revalidate_idle_owner_after_drains(CpuId(0), &mut f),
+            OwnerRevalidation::Replacement(A)
+        );
+        assert_eq!(f.saved_pc, 0x4141_0000, "the context was still applied");
+    }
+
+    #[test]
+    fn the_pending_tls_restore_request_is_consumed_exactly_once() {
+        let k = fixture();
+        k.with(|s| {
+            // The production writer: it sets `tls_ptr` AND arms the pending restore request.
+            s.set_thread_tls_base(A, 0x5000).expect("tls base");
+        });
+        assert_eq!(k.with(|s| s.tls_restore_pending(A)), Some(true));
+        let mut f = frame();
+        assert_eq!(
+            k.revalidate_idle_owner_after_drains(CpuId(0), &mut f),
+            OwnerRevalidation::Replacement(A)
+        );
+        assert_eq!(
+            k.with(|s| s.tls_restore_pending(A)),
+            Some(false),
+            "taken exactly once, as `take_tls_restore_request` took it"
+        );
+    }
+
+    // ── facts 7/9/10: the rollback path ──────────────────────────────────────────────────
+
+    /// The scheduler selects a queued TID whose TCB has been reaped. The legacy verdict is
+    /// "not restorable" — a restore would have iret'd into ring 3 on the PREVIOUS task's
+    /// frame — so the advance is rolled back and the task is NOT resurrected.
+    fn reaped_selection() -> SharedKernel {
+        let k = fixture();
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let slot = tcbs
+                    .iter_mut()
+                    .position(|slot| slot.as_ref().is_some_and(|t| t.tid.0 == A))
+                    .unwrap();
+                tcbs[slot] = None;
+            })
+        });
+        k
+    }
+
+    #[test]
+    fn a_reaped_task_is_rolled_back_and_never_resurrected() {
+        let k = reaped_selection();
+        let mut f = frame();
+        let outcome = k.revalidate_idle_owner_after_drains(CpuId(0), &mut f);
+        assert_eq!(
+            outcome,
+            OwnerRevalidation::RestoreFailed {
+                tid: A,
+                rolled_back: true
+            }
+        );
+        // fact 7 — `current` was cleared.
+        assert_eq!(current_on(&k, CpuId(0)), None, "rollback clears current");
+        // fact 9 — nothing was put back on a run queue.
+        assert_eq!(queue_len(&k, CpuId(0)), 0, "a reaped task is not requeued");
+        assert_eq!(f, frame(), "a failed restore never touches the frame");
+    }
+
+    #[test]
+    fn rollback_reports_completion_and_leaves_the_other_cpu_alone() {
+        let k = reaped_selection();
+        k.with(|s| {
+            s.register_task_with_class(B, TaskClass::App).expect("B");
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == B)
+                    .unwrap()
+                    .status = TaskStatus::Runnable;
+            });
+            s.enqueue_on_cpu(CpuId(1), B).expect("queue B on cpu1");
+        });
+        let before_q1 = queue_len(&k, CpuId(1));
+        let mut f = frame();
+        // fact 10 — the outcome reports whether the rollback completed.
+        assert!(matches!(
+            k.revalidate_idle_owner_after_drains(CpuId(0), &mut f),
+            OwnerRevalidation::RestoreFailed {
+                rolled_back: true,
+                ..
+            }
+        ));
+        // CPU-local only: another CPU's queue and current are untouched.
+        assert_eq!(queue_len(&k, CpuId(1)), before_q1, "cpu1 queue unchanged");
+        assert_eq!(current_on(&k, CpuId(1)), None, "cpu1 current unchanged");
+        assert_eq!(status_of(&k, B), Some(TaskStatus::Runnable));
+    }
+
+    #[test]
+    fn a_task_runnable_only_on_another_cpu_is_never_stolen() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.bring_up_cpu(CpuId(1)).expect("cpu1");
+            s.register_task_with_class(B, TaskClass::App).expect("B");
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == B)
+                    .unwrap()
+                    .status = TaskStatus::Runnable;
+            });
+            s.enqueue_on_cpu(CpuId(1), B).expect("queue B on cpu1");
+        });
+        let mut f = frame();
+        assert_eq!(
+            k.revalidate_idle_owner_after_drains(CpuId(0), &mut f),
+            OwnerRevalidation::Idle,
+            "`dispatch_next_on(cpu)` pops from THIS cpu's queue only"
+        );
+        assert_eq!(queue_len(&k, CpuId(1)), 1, "cpu1's task stays on cpu1");
+    }
+
+    // ── fact 12: no TaskStatus is written, on either outcome ──────────────────────────────
+
+    #[test]
+    fn no_task_status_is_written_on_success_or_on_rollback() {
+        let k = fixture();
+        let before = status_of(&k, A);
+        let mut f = frame();
+        assert_eq!(
+            k.revalidate_idle_owner_after_drains(CpuId(0), &mut f),
+            OwnerRevalidation::Replacement(A)
+        );
+        assert_eq!(
+            status_of(&k, A),
+            before,
+            "success writes no TaskStatus — no Runnable -> Running transition is introduced"
+        );
+
+        let k2 = fixture();
+        k2.with(|s| {
+            s.register_task_with_class(B, TaskClass::App).expect("B");
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == B)
+                    .unwrap()
+                    .status = TaskStatus::Runnable;
+            });
+        });
+        let b_before = status_of(&k2, B);
+        let mut f2 = frame();
+        let _ = k2.revalidate_idle_owner_after_drains(CpuId(0), &mut f2);
+        assert_eq!(status_of(&k2, B), b_before, "bystanders are untouched");
+    }
+
+    // ── differential against the retired broad body ───────────────────────────────────────
+
+    /// Everything the revalidation may legitimately change, as one comparable value.
+    type Observed = (
+        OwnerRevalidation,
+        TrapFrame,
+        Option<u64>,        // current on cpu 0
+        Option<u64>,        // current on cpu 1
+        usize,              // cpu 0 queue length
+        usize,              // cpu 1 queue length
+        Option<TaskStatus>, // A's status
+        CpuId,              // bound current_cpu
+        Option<bool>,       // A's pending TLS-restore request
+    );
+
+    fn observe(k: &SharedKernel, outcome: OwnerRevalidation, f: TrapFrame) -> Observed {
+        (
+            outcome,
+            f,
+            current_on(k, CpuId(0)),
+            current_on(k, CpuId(1)),
+            queue_len(k, CpuId(0)),
+            queue_len(k, CpuId(1)),
+            status_of(k, A),
+            k.with(|s| s.current_cpu()),
+            k.with(|s| s.tls_restore_pending(A)),
+        )
+    }
+
+    /// The exact retired body.
+    fn legacy(k: &SharedKernel, cpu: CpuId, f: &mut TrapFrame) -> OwnerRevalidation {
+        k.with_cpu(cpu, |kernel| {
+            let Some(next) = kernel.dispatch_next_on_cpu(cpu) else {
+                return OwnerRevalidation::Idle;
+            };
+            if next == 0 {
+                return OwnerRevalidation::Idle;
+            }
+            let restorable = kernel.thread_user_context(next).is_some();
+            if restorable
+                && crate::arch::x86_64::trap::restore_arch_thread_state(kernel, cpu, Some(f))
+                    .is_ok()
+            {
+                return OwnerRevalidation::Replacement(next);
+            }
+            let cleared = kernel.block_current_on_cpu(cpu) == Some(next);
+            let requeued = !restorable || kernel.enqueue_on_cpu(cpu, next).is_ok();
+            OwnerRevalidation::RestoreFailed {
+                tid: next,
+                rolled_back: cleared && requeued,
+            }
+        })
+        .unwrap_or(OwnerRevalidation::Idle)
+    }
+
+    #[test]
+    fn differential_against_the_retired_broad_body() {
+        type Case = (&'static str, fn() -> SharedKernel, CpuId);
+        let cases: [Case; 5] = [
+            ("plain replacement", fixture, CpuId(0)),
+            ("reaped selection", reaped_selection, CpuId(0)),
+            (
+                "empty queue",
+                || SharedKernel::new(Bootstrap::init().expect("init")),
+                CpuId(0),
+            ),
+            ("offline cpu", fixture, CpuId(3)),
+            (
+                "no-asid task",
+                || {
+                    let k = fixture();
+                    k.with(|s| {
+                        s.with_tcbs_mut(|tcbs| {
+                            tcbs.iter_mut()
+                                .flatten()
+                                .find(|t| t.tid.0 == A)
+                                .unwrap()
+                                .asid = None;
+                        })
+                    });
+                    k
+                },
+                CpuId(0),
+            ),
+        ];
+        for (name, build, cpu) in cases {
+            let old = build();
+            let mut fo = frame();
+            let ro = legacy(&old, cpu, &mut fo);
+            let obs_old = observe(&old, ro, fo);
+
+            let new = build();
+            let mut fn_ = frame();
+            let rn = new.revalidate_idle_owner_after_drains(cpu, &mut fn_);
+            let obs_new = observe(&new, rn, fn_);
+
+            assert_eq!(obs_old, obs_new, "{name}: the transaction diverged");
+        }
+    }
+
+    #[test]
+    fn differential_with_a_pending_tls_restore_request() {
+        let arm = |k: &SharedKernel| {
+            k.with(|s| {
+                s.set_thread_tls_base(A, 0x5000).expect("tls base");
+            });
+        };
+        let old = fixture();
+        arm(&old);
+        let mut fo = frame();
+        let ro = legacy(&old, CpuId(0), &mut fo);
+
+        let new = fixture();
+        arm(&new);
+        let mut fn_ = frame();
+        let rn = new.revalidate_idle_owner_after_drains(CpuId(0), &mut fn_);
+
+        assert_eq!(observe(&old, ro, fo), observe(&new, rn, fn_));
+    }
+
+    // ── source guards ────────────────────────────────────────────────────────────────────
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// Bound a body at its own closing brace. `indent` is that brace's column, so a
+    /// module-level free function (column 0) is bounded correctly rather than over-running
+    /// into whatever follows it.
+    fn body_at(src: &str, name: &str, indent: &str) -> alloc::string::String {
+        let tail = src
+            .split(name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{name}` must exist"));
+        let close = alloc::format!("\n{indent}}}\n");
+        code_of(tail.split_once(close.as_str()).expect("the fn closes").0)
+    }
+
+    fn body_of(src: &str, name: &str) -> alloc::string::String {
+        body_at(src, name, "    ")
+    }
+
+    #[test]
+    fn the_target_holds_no_broad_lock_and_keeps_no_fallback() {
+        for name in [
+            "pub(crate) fn revalidate_idle_owner_after_drains",
+            "fn owner_revalidation_select_split",
+            "fn owner_revalidation_snapshot_split",
+            "fn owner_revalidation_rollback_split",
+        ] {
+            let body = body_of(RUNTIME, name);
+            assert!(
+                !body.contains(".with_cpu(")
+                    && !body.contains("self.with(|")
+                    && !body.contains("borrow_kernel_for_boot"),
+                "{name}: no broad acquisition, and no broad compatibility fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn the_phases_are_rank_ordered_and_each_takes_exactly_one_acquisition() {
+        let select = body_of(RUNTIME, "fn owner_revalidation_select_split");
+        assert_eq!(
+            select.matches("with_scheduler_split_mut").count(),
+            1,
+            "rank 1, one acquisition"
+        );
+        assert!(
+            !select.contains("split_mut(|tcbs") && !select.contains("with_task_"),
+            "the selection phase takes no task lock"
+        );
+        // Validation precedes the bind, which precedes the advance.
+        let v = select.find("validate_online_cpu").expect("validate");
+        let bind = select.find("current_cpu = cpu").expect("bind");
+        let adv = select.find("dispatch_next_on(").expect("advance");
+        assert!(v < bind && bind < adv, "validate -> bind -> advance");
+
+        let snap = body_of(RUNTIME, "fn owner_revalidation_snapshot_split");
+        assert_eq!(
+            snap.matches("with_task_return_split_mut").count(),
+            1,
+            "rank 2, ONE acquisition covering the verdict and the payload"
+        );
+        assert!(
+            !snap.contains("with_scheduler_split_mut"),
+            "rank 1 is released before rank 2 is taken"
+        );
+        assert!(
+            !snap.contains(".status ="),
+            "the snapshot writes no TaskStatus"
+        );
+
+        // The composed body: rank 1 fully released before rank 2, which is fully released
+        // before the arch application.
+        let outer = body_of(RUNTIME, "pub(crate) fn revalidate_idle_owner_after_drains");
+        let sel = outer
+            .find("owner_revalidation_select_split")
+            .expect("select");
+        let sn = outer
+            .find("owner_revalidation_snapshot_split")
+            .expect("snapshot");
+        let apply = outer
+            .find("x86_apply_owner_revalidation_restore")
+            .expect("apply");
+        let rb = outer
+            .find("owner_revalidation_rollback_split")
+            .expect("rollback");
+        assert!(sel < sn && sn < apply && apply < rb);
+        assert!(
+            !outer.contains(".status ="),
+            "the transaction writes no TaskStatus"
+        );
+    }
+
+    #[test]
+    fn the_arch_application_holds_no_lock_and_keeps_the_optional_asid_semantics() {
+        let apply = body_at(
+            X86_TRAP,
+            "pub(crate) fn x86_apply_owner_revalidation_restore",
+            "",
+        );
+        for forbidden in [
+            "with_cpu(",
+            "split_mut(",
+            "with_tcbs",
+            "state.lock()",
+            "with_scheduler",
+        ] {
+            assert!(
+                !apply.contains(forbidden),
+                "the frame/MSR/CR3 phase must hold no lock (`{forbidden}`)"
+            );
+        }
+        // The complete CR3 behavior, through the existing split twin — not a reimplementation.
+        assert!(apply.contains("ensure_user_return_cr3_split"));
+        // Both legacy guards, with the legacy meaning: a task with no ASID skips the block.
+        let normalized = apply
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains("if tid != 0 && let Some(task_asid) = snapshot.asid"),
+            "both legacy guards, with the legacy meaning"
+        );
+        // No activation and no token: the retired body did neither.
+        assert!(
+            !apply.contains("activate_asid") && !apply.contains("DispatchMarkToken"),
+            "no ASID activation is added and no dispatch token is forged"
+        );
+    }
+
+    #[test]
+    fn no_dispatch_mark_token_is_forged_anywhere_in_the_transaction() {
+        for name in [
+            "pub(crate) fn revalidate_idle_owner_after_drains",
+            "fn owner_revalidation_select_split",
+            "fn owner_revalidation_snapshot_split",
+            "fn owner_revalidation_rollback_split",
+        ] {
+            assert!(
+                !body_of(RUNTIME, name).contains("DispatchMarkToken"),
+                "{name} must use its own owner-revalidation selection, not a dispatch token"
+            );
+        }
+    }
+
+    #[test]
+    fn every_owner_revalidation_variant_and_marker_survives() {
+        for variant in ["Idle", "Replacement(", "RestoreFailed {"] {
+            assert!(
+                RUNTIME.contains(variant),
+                "`OwnerRevalidation::{variant}` must survive the conversion"
+            );
+        }
+        // The rollback reproduces `enqueue_on_cpu`'s own refusal and pin markers.
+        let rb = body_of(RUNTIME, "fn owner_revalidation_rollback_split");
+        assert!(rb.contains("ENQUEUE_REFUSED"));
+        assert!(rb.contains("FIRST_USER_PIN_VIOLATION"));
+        // The still-live requeue arm is present, guarded by restorability (fact 8), and the
+        // reaped short-circuit is present (fact 9).
+        assert!(rb.contains("if !restorable"));
+        assert!(rb.contains("enqueue_on_with_priority"));
+    }
+
+    #[test]
+    fn the_out_of_scope_broad_acquisitions_are_untouched() {
+        // The rollback family stopped at the previous increment, and the D6 restore/cleanup
+        // acquisition, must all still be broad — this increment converted none of them.
+        let code = code_of(RUNTIME);
+        assert!(
+            code.contains("rollback_materialized_recv_cap("),
+            "the queued-recv capability rollback stays exactly as it was"
+        );
+        assert_eq!(
+            code.matches("rollback_materialized_recv_cap(").count(),
+            3,
+            "all three legacy rollback call sites remain"
+        );
     }
 }
