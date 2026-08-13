@@ -242,7 +242,7 @@ There is no longer any dead or test-only weight in the total, so **every further
 must retire real runtime work.** U1 and U2 served **204C** / **204D** / **204E** without
 completing any of them.
 
-**U4 — CROSS-ARCH QUEUE-ADVANCING DISPATCH: DELIVERED (four cells), CENSUS-DELTA 0.** U4 is not
+**U4 — CROSS-ARCH QUEUE-ADVANCING DISPATCH: DELIVERED, CENSUS-DELTA 0.** U4 is not
 a census increment: it retires no acquisition. It moves a named production predicate and four
 architecture-readiness cells, so blocking `IpcRecv` and blocking `IpcSend` now perform their
 queue-advancing dispatch OUTSIDE the broad lock on **x86_64, AArch64 and RISC-V** rather than on
@@ -288,8 +288,31 @@ gained homologous D2 drains that reuse its existing exact-token
 fire only when a deferral OF THAT EXACT CLASS is genuinely pending — the fifth and sixth members
 of the established 196D/196E/196G family, with no generic "skip restore" flag.
 
-*Live-evidence limits, stated honestly.* See §0 and `doc/STATUS.md` for which of the four cells
-carry live enclosing evidence and which rest on hosted execution of the real production entry.
+*Evidence, stated exactly.*
+
+* **Blocking receive — live 3/3.** Reached on x86_64 (117 balanced cycles), AArch64 (5) and
+  RISC-V (116), each with `DISPATCH_DEFERRED` = `NO_INLOCK_DISPATCH` = `GLOBAL_DROPPED` =
+  `DISPATCH_REVERIFY_OK` = `DISPATCH_ENTER` = `DISPATCH_DONE`. AArch64 and RISC-V were at **zero**
+  before U4.
+* **Blocking send — live QEMU 0/3.** `D2_SEND_GENUINE_DISPATCH_DEFERRED` appears in no log, at
+  the accepted base or after, on ANY architecture **including x86_64**: no existing workload
+  fills a sender queue. That is a pre-existing property of the workload set, not something U4
+  changed. **No workload or oracle was invented to manufacture it.**
+* **Blocking send — real-entry hosted 2/2 origins.** U4-CLOSE executes both genuine producer
+  branches through the real `KernelState::ipc_send_with_deadline` under the ordinary broad trap
+  phase — synchronous endpoint with no receiver waiter, and buffered endpoint filled to its real
+  capacity through the same production entry — each returning `Err(WouldBlock)`, then completes
+  the established post-lock protocol through its real seams (`d2_send_reverify_blocked`, the one
+  `d2_send_dispatch_step_mut` dequeue, `d6_genuine_mark_running_via_task_seam` yielding a token
+  that names the exact `{tid, asid, cpu}`, deferral cleared exactly once).
+  `block_current_on_send_with_deadline` is never called directly and the deferral is never
+  published by the test.
+
+*The cross-architecture inference, stated precisely.* The hosted binary compiles ONE target and
+does not independently execute three. What is proven is: the blocking-send producer is **one
+architecture-neutral body**; both of its real branches execute under hosted tests; source
+recomputation proves that same producer and its drain protocol are compiled and drained on all
+three architectures; and the freestanding builds prove every target accepts that routing.
 
 **U3 — IN PROGRESS, nineteen retired (44 → 39 → 37 → 36 → 34 → 32 → 28 → 25).** U3 promotes existing rank-1
 (scheduler) and rank-2 (task) seams from compatibility helpers to **authoritative**, deleting

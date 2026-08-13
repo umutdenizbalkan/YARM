@@ -123663,6 +123663,386 @@ mod u4_cross_arch_queue_advancing_dispatch {
         }
     }
 
+    // ── U4-CLOSE: the two genuine blocking-send origins, through the REAL production entry ──
+    //
+    // These execute `KernelState::ipc_send_with_deadline` — the ordinary production send entry —
+    // under the ordinary broad trap phase, and let the broad closure RETURN before any drain
+    // step runs. Nothing is simulated: `block_current_on_send_with_deadline` is reached from the
+    // real entry, never called directly, and the D2-send deferral is published by production
+    // code, never by the test.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::boot::types::KernelError;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::{EndpointMode, Message};
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::runtime::{DispatchMarkOutcome as Mark, SharedKernel};
+
+    const SENDER: u64 = 6100;
+    const INCOMING: u64 = 6101;
+
+    /// Every test-global latch this module touches, cleared on entry AND exit so a failure
+    /// cannot leak a deferral into another test.
+    fn reset_latches(cpu_idx: usize) {
+        crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
+        crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A kernel with CPU 0 as the single dispatching CPU, `SENDER` current and Running, and a
+    /// different `INCOMING` task Runnable and queued behind it.
+    fn send_fixture(mode: EndpointMode, depth: usize) -> (SharedKernel, usize, CapId) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (eidx, send_cap) = k.with(|s| {
+            for tid in [SENDER, INCOMING] {
+                s.register_task_with_class(tid, TaskClass::App)
+                    .expect("task");
+                // A real user address space: the rank-2 mark resolves an EXACT `{tid, asid}`
+                // incarnation and refuses a non-idle task that has none, so a task without a
+                // bound ASID could never be dispatched in production either.
+                let (asid, _map) = s.create_user_address_space().expect("asid");
+                s.bind_task_asid(tid, asid).expect("bind asid");
+                s.with_tcbs_mut(|tcbs| {
+                    tcbs.iter_mut()
+                        .flatten()
+                        .find(|t| t.tid.0 == tid)
+                        .unwrap()
+                        .status = TaskStatus::Runnable;
+                });
+            }
+            let (eidx, send_root, _recv) =
+                s.create_endpoint_with_mode(depth, mode).expect("endpoint");
+            // The sender holds a REAL send capability in its own cspace.
+            let send_cap = s
+                .grant_capability_task_to_task(0, send_root, SENDER)
+                .expect("grant send cap");
+            // Queue both, then dispatch SENDER so it is current and Running with INCOMING
+            // still queued behind it.
+            s.enqueue_on_cpu(CpuId(0), SENDER).expect("queue sender");
+            s.enqueue_on_cpu(CpuId(0), INCOMING)
+                .expect("queue incoming");
+            assert_eq!(s.dispatch_next_on_cpu(CpuId(0)), Some(SENDER));
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == SENDER)
+                    .unwrap()
+                    .status = TaskStatus::Running;
+            });
+            (eidx, send_cap)
+        });
+        assert_eq!(
+            k.with(|s| s.dispatching_cpu_count()),
+            1,
+            "single dispatcher"
+        );
+        (k, eidx, send_cap)
+    }
+
+    fn status_of(k: &SharedKernel, tid: u64) -> Option<TaskStatus> {
+        k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .map(|t| t.status)
+            })
+        })
+    }
+
+    fn sender_waiters(k: &SharedKernel, eidx: usize) -> alloc::vec::Vec<(u64, usize)> {
+        k.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.endpoint_sender_waiters[eidx]
+                    .iter()
+                    .flatten()
+                    .map(|w| (w.tid.0, w.msg.as_slice().len()))
+                    .collect::<alloc::vec::Vec<_>>()
+            })
+        })
+    }
+
+    fn queued_messages(k: &SharedKernel, eidx: usize) -> usize {
+        k.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.endpoints[eidx]
+                    .as_ref()
+                    .map(|e| e.queued())
+                    .unwrap_or(0)
+            })
+        })
+    }
+
+    /// Drive the REAL production send entry under the ordinary broad trap phase, exactly as a
+    /// trap wrapper does: mark the drainer active, run `with_cpu`, let the closure RETURN.
+    fn real_entry_blocking_send(
+        k: &SharedKernel,
+        cpu: CpuId,
+        send_cap: CapId,
+        msg: Message,
+    ) -> Result<(), KernelError> {
+        let cpu_idx = cpu.0 as usize;
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        let r = k
+            .with_cpu(cpu, |kernel| {
+                kernel.ipc_send_with_deadline(send_cap, msg, 5_000)
+            })
+            .expect("the broad phase itself must succeed");
+        // The broad closure has RETURNED: the guard is dropped before any drain step below.
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+        r
+    }
+
+    /// Everything both origins must agree on, asserted immediately after the broad phase.
+    fn assert_blocked_and_deferred(k: &SharedKernel, cpu: CpuId, eidx: usize, send_cap: CapId) {
+        let cpu_idx = cpu.0 as usize;
+        // The exact outgoing task, blocked in the exact class, carrying the exact cap.
+        assert_eq!(
+            status_of(k, SENDER),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap))),
+            "the sender must be Blocked(EndpointSend(send_cap))"
+        );
+        // Exactly one sender waiter, and it is ours.
+        let waiters = sender_waiters(k, eidx);
+        assert_eq!(
+            waiters.len(),
+            1,
+            "the sender waiter is published exactly once"
+        );
+        assert_eq!(waiters[0].0, SENDER, "and it names the exact sender");
+        // The deferral is pending exactly once and records the exact outgoing TID.
+        assert!(
+            crate::kernel::boot::d2_send_dispatch_is_deferred(cpu_idx),
+            "the D2-send deferral must be pending"
+        );
+        assert_eq!(
+            crate::kernel::boot::d2_send_dispatch_outgoing(cpu_idx),
+            Some(SENDER),
+            "the deferral records the EXACT outgoing tid"
+        );
+        assert!(
+            !crate::kernel::boot::d2_send_dispatch_try_defer(cpu_idx, SENDER),
+            "a second publication refuses — exactly once"
+        );
+        // No in-lock dispatch: `current` is clear and the incoming task is still QUEUED.
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(cpu)),
+            None,
+            "current must be clear — the block cleared it and nothing dispatched in-lock"
+        );
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(cpu)),
+            1,
+            "the incoming task is still queued — no in-lock dequeue"
+        );
+        assert_eq!(
+            status_of(k, INCOMING),
+            Some(TaskStatus::Runnable),
+            "no task is spuriously Running"
+        );
+        // The waiter's deadline rode with the block, and nothing timed out.
+        let (deadline, fired) = k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                let t = tcbs.iter().flatten().find(|t| t.tid.0 == SENDER).unwrap();
+                (t.ipc_timeout_deadline, t.ipc_timeout_fired)
+            })
+        });
+        assert!(deadline.is_some(), "the deadline rode with the block");
+        assert!(!fired, "no timeout fired prematurely");
+    }
+
+    /// Complete the established post-lock D2-send protocol through its REAL production seams,
+    /// then assert the committed outcome.
+    fn complete_post_lock_send_protocol(k: &SharedKernel, cpu: CpuId) {
+        let cpu_idx = cpu.0 as usize;
+        // 1. Re-verification succeeds against the exact outgoing TID.
+        let outgoing = crate::kernel::boot::d2_send_dispatch_outgoing(cpu_idx).expect("outgoing");
+        assert!(
+            k.d2_send_reverify_blocked(outgoing),
+            "the outgoing sender must still be Blocked(EndpointSend)"
+        );
+        // 2. THE one rank-1 dequeue.
+        let dispatch = k.d2_send_dispatch_step_mut(cpu);
+        assert_eq!(
+            dispatch.tid().map(|t| t.0),
+            Some(INCOMING),
+            "the single queue-advancing dequeue selects the incoming task"
+        );
+        // 3/4. The rank-2 mark returns a token naming the exact incarnation.
+        let token = match k.d6_genuine_mark_running_via_task_seam(dispatch) {
+            Mark::Marked(t) => t,
+            other => panic!("the mark must succeed, got {other:?}"),
+        };
+        assert_eq!(
+            token.tid(),
+            INCOMING,
+            "the token names the exact incoming tid"
+        );
+        assert_eq!(token.cpu(), cpu, "…on the exact cpu");
+        let expected_asid = k.with(|s| s.task_asid(INCOMING));
+        assert_eq!(token.expect_asid(), expected_asid, "…and the exact asid");
+        // 5. Clear the deferral exactly once.
+        crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
+        assert!(!crate::kernel::boot::d2_send_dispatch_is_deferred(cpu_idx));
+        assert_eq!(
+            crate::kernel::boot::d2_send_dispatch_outgoing(cpu_idx),
+            None
+        );
+        // 6. The committed outcome.
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(cpu)),
+            Some(INCOMING),
+            "the incoming task is current"
+        );
+        assert_eq!(
+            status_of(k, INCOMING),
+            Some(TaskStatus::Running),
+            "…and Running"
+        );
+        assert!(
+            matches!(
+                status_of(k, SENDER),
+                Some(TaskStatus::Blocked(WaitReason::EndpointSend(_)))
+            ),
+            "the outgoing sender remains Blocked(EndpointSend)"
+        );
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(cpu)),
+            0,
+            "the incoming task was dequeued exactly once and the sender is on no run queue"
+        );
+    }
+
+    /// **Case A — synchronous endpoint, no receiver waiter.** The real entry finds an empty
+    /// waiter slot, blocks the sender and returns `WouldBlock`.
+    #[test]
+    fn real_entry_blocking_send_synchronous_no_waiter() {
+        let cpu = CpuId(0);
+        reset_latches(cpu.0 as usize);
+        let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 4);
+        assert!(
+            sender_waiters(&k, eidx).is_empty() && queued_messages(&k, eidx) == 0,
+            "the receiver-waiter slot and the queue both start empty"
+        );
+        let msg = Message::new(0, b"syncblock").expect("msg");
+        let r = real_entry_blocking_send(&k, cpu, send_cap, msg);
+        assert_eq!(
+            r,
+            Err(KernelError::WouldBlock),
+            "a blocking send returns WouldBlock"
+        );
+
+        assert_blocked_and_deferred(&k, cpu, eidx, send_cap);
+        // Origin-specific endpoint state: the message lives in the SENDER WAITER, and the
+        // synchronous endpoint queued nothing.
+        assert_eq!(sender_waiters(&k, eidx)[0].1, b"syncblock".len());
+        assert_eq!(
+            queued_messages(&k, eidx),
+            0,
+            "a synchronous no-waiter block queues no message"
+        );
+
+        complete_post_lock_send_protocol(&k, cpu);
+        reset_latches(cpu.0 as usize);
+    }
+
+    /// **Case B — buffered endpoint full.** The queue is filled to its real capacity through
+    /// the ordinary production send path; the next send from the genuine sender blocks.
+    #[test]
+    fn real_entry_blocking_send_buffered_full() {
+        let cpu = CpuId(0);
+        reset_latches(cpu.0 as usize);
+        const DEPTH: usize = 2;
+        let (k, eidx, send_cap) = send_fixture(EndpointMode::Buffered, DEPTH);
+        // Fill to capacity through SUPPORTED send behavior — the same production entry, which
+        // returns Ok while the queue has room. No queue internals are edited.
+        for i in 0..DEPTH {
+            let filler = Message::new(0, b"fill").expect("msg");
+            let r = k
+                .with_cpu(cpu, |kernel| {
+                    kernel.ipc_send_with_deadline(send_cap, filler, 5_000)
+                })
+                .expect("broad phase");
+            assert_eq!(
+                r,
+                Ok(()),
+                "fill {i} must be accepted while the queue has room"
+            );
+        }
+        assert_eq!(queued_messages(&k, eidx), DEPTH, "the queue is at capacity");
+        assert!(
+            sender_waiters(&k, eidx).is_empty(),
+            "filling to capacity blocks nobody"
+        );
+        assert!(
+            !crate::kernel::boot::d2_send_dispatch_is_deferred(cpu.0 as usize),
+            "and publishes no deferral"
+        );
+
+        // Now the genuine blocking send.
+        let msg = Message::new(0, b"bufblock").expect("msg");
+        let r = real_entry_blocking_send(&k, cpu, send_cap, msg);
+        assert_eq!(
+            r,
+            Err(KernelError::WouldBlock),
+            "a full queue blocks the sender"
+        );
+
+        assert_blocked_and_deferred(&k, cpu, eidx, send_cap);
+        // Origin-specific endpoint state: the EXISTING queue stays full and the NEW message
+        // lives in the sender waiter — it was not dropped and did not displace a queued one.
+        assert_eq!(
+            queued_messages(&k, eidx),
+            DEPTH,
+            "the existing queue remains full"
+        );
+        assert_eq!(sender_waiters(&k, eidx)[0].1, b"bufblock".len());
+
+        complete_post_lock_send_protocol(&k, cpu);
+        reset_latches(cpu.0 as usize);
+    }
+
+    /// Both origins reach the SAME blocking producer and therefore the same scheduler/deferral
+    /// contract, while retaining their different endpoint-message states.
+    #[test]
+    fn both_blocking_send_origins_share_one_producer_and_contract() {
+        // One architecture-neutral production body publishes the deferral for both origins.
+        assert_eq!(
+            IPC_STATE
+                .matches(
+                    "block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)"
+                )
+                .count(),
+            2,
+            "exactly two producer call sites - the two genuine blocking-send origins"
+        );
+        assert_eq!(
+            IPC_STATE
+                .matches("fn block_current_on_send_with_deadline")
+                .count(),
+            1,
+            "reaching ONE producer body, not two"
+        );
+        // And that one body carries the architecture-neutral publication.
+        let producer = IPC_STATE
+            .split("fn block_current_on_send_with_deadline")
+            .nth(1)
+            .expect("producer")
+            .split("\n    fn ")
+            .next()
+            .expect("bounded");
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                producer.contains(&alloc::format!("target_arch = \"{arch}\"")),
+                "the one producer publishes on {arch}"
+            );
+        }
+    }
+
     /// U4's EXIT CONDITION, recomputed from source: for each of the four cells the production
     /// route must exist end to end — the canonical predicate admits the architecture, the
     /// in-lock publication is compiled for it, its wrapper drains that class, and the drain
@@ -123720,6 +124100,49 @@ mod u4_cross_arch_queue_advancing_dispatch {
             delivered.len(),
             3,
             "all three architectures are accounted for"
+        );
+
+        // ── U4-CLOSE (B): both genuine blocking-send origins are EXECUTED through the real
+        // production entry, not merely routed. This module registers a test per origin, each
+        // driving `KernelState::ipc_send_with_deadline` under `with_cpu` and asserting
+        // `Err(WouldBlock)`; a rename or deletion breaks this guard.
+        let this_module = include_str!("tests.rs")
+            .split("mod u4_cross_arch_queue_advancing_dispatch {")
+            .nth(1)
+            .expect("this module");
+        for origin in [
+            "fn real_entry_blocking_send_synchronous_no_waiter()",
+            "fn real_entry_blocking_send_buffered_full()",
+        ] {
+            assert!(
+                this_module.contains(origin),
+                "U4-CLOSE: the real-entry test for `{origin}` must be registered"
+            );
+        }
+        // No RECEIVER-CALL form anywhere in this module: the producer is reached from the real
+        // entry, never invoked directly. (The sibling source guard quotes its name inside string
+        // literals, which carry no `.` receiver prefix and are therefore not calls.)
+        assert!(
+            !this_module.contains(".block_current_on_send_with_deadline("),
+            "the producer must be REACHED from the real entry, never called directly"
+        );
+        assert!(
+            this_module.contains("kernel.ipc_send_with_deadline(send_cap, msg, 5_000)"),
+            "both origins go through the real production send entry"
+        );
+
+        // ── The valid cross-arch inference, stated exactly. The blocking-send PRODUCER is one
+        // architecture-neutral body; both of its real branches execute under these hosted
+        // tests; source recomputation proves that same producer and its drain protocol are
+        // compiled for all three architectures; and the freestanding builds prove every target
+        // accepts that routing. The hosted binary compiles ONE target — it does not
+        // independently execute three — and nothing here claims otherwise.
+        assert_eq!(
+            IPC_STATE
+                .matches("fn block_current_on_send_with_deadline")
+                .count(),
+            1,
+            "one producer body is what makes the cross-architecture inference valid"
         );
     }
 }
