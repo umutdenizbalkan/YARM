@@ -781,6 +781,42 @@ pub(crate) fn d6_genuine_enabled() -> bool {
     cfg!(target_arch = "x86_64") && !d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()
 }
 
+/// U4 — the CANONICAL production predicate for **queue-advancing blocking dispatch**: may this
+/// architecture run the authoritative `dispatch_next_on` for a blocking IpcRecv / IpcSend
+/// OUTSIDE the broad `SpinLock<KernelState>`?
+///
+/// This is deliberately a DIFFERENT question from [`d6_genuine_enabled`], which stays
+/// x86_64-only and byte-identical. That predicate gates the queue-NEUTRAL D6 observation slice
+/// and three `exec_state` decisions whose x86_64 semantics must not change; widening it would
+/// silently alter AArch64 FutexWait/Yield behavior and x86-specific `exec_state` paths. U4
+/// widens only the queue-ADVANCING blocking-dispatch question, which is what the D2 recv/send
+/// deferral protocol actually asks.
+///
+/// Semantics:
+///
+/// * **true on x86_64, AArch64 and RISC-V** in an ordinary production build. On x86_64 the
+///   result is byte-equivalent to the accepted `d6_genuine_enabled()` it replaces at the D2
+///   sites: both reduce to "no D6 switch diagnostic owns the switch path".
+/// * **false while a mutually exclusive controlled D6 diagnostic owns the switch path**
+///   (`d6_switch_proof` / `d6_switch_a`), on every architecture — those category-D knobs are
+///   x86_64-only in practice, and reading them here keeps the exclusion uniform rather than
+///   arch-conditional.
+/// * **no runtime fallback or opt-out knob** — there is no production route back to the old
+///   in-lock queue-advancing dispatch on an eligible path.
+/// * **no dependency on direct-IpcCall admission.** It deliberately does NOT go through
+///   [`offlock_authoritative_dispatch_enabled`], whose AArch64 arm is
+///   `ipccall_direct_admission_enabled()`: that belongs to the proof-gated direct NR6/NR7
+///   transaction, and ordinary blocking IpcRecv/IpcSend must not become coupled to direct
+///   production. `ipccall_direct_production_enabled()` remains an unconditional `false` and
+///   cannot influence this predicate.
+/// * **no dependency on waiter ownership.**
+///
+/// The remaining per-CPU eligibility (a trap-entry drainer is active, and this is the single
+/// dispatching CPU) is unchanged and still applied at each publication site.
+pub(crate) fn queue_advancing_dispatch_enabled() -> bool {
+    !d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()
+}
+
 /// Stage 199D — the CANONICAL replacement for [`d6_genuine_enabled`] as the "may this
 /// architecture run the authoritative queue-advancing dispatch outside the broad lock?"
 /// question, now that AArch64 readiness blocker 3 is structurally closed.
@@ -890,8 +926,11 @@ pub(crate) fn d6_genuine_dispatch_clear_deferred(cpu_idx: usize) -> bool {
 /// [`d6_genuine_enabled`]). The `yarm.d2_recv_genuine` knob + `AtomicBool`/setter were
 /// deleted; the graduated blocking-recv seam is the only x86_64 `-smp 1` path, with no
 /// runtime opt-out to the old in-lock production path.
+/// U4: delegates to the canonical [`queue_advancing_dispatch_enabled`], which admits AArch64
+/// and RISC-V as well. On x86_64 the value is unchanged — both reduce to "no D6 switch
+/// diagnostic owns the switch path".
 pub(crate) fn d2_recv_genuine_enabled() -> bool {
-    d6_genuine_enabled()
+    queue_advancing_dispatch_enabled()
 }
 
 /// Stage 168B (D2-GENUINE-RECV completion): global count of blocking-recv
@@ -2128,8 +2167,9 @@ pub(crate) fn maybe_log_ipc_send_ordinary_cap_enqueue_retired() {
 /// [`d6_genuine_enabled`]). The `yarm.d2_send_genuine` knob + `AtomicBool`/setter were
 /// deleted; the graduated blocking-send seam is the only x86_64 `-smp 1` path, with no
 /// runtime opt-out to the old in-lock production path.
+/// U4: delegates to the canonical [`queue_advancing_dispatch_enabled`] (see the recv sibling).
 pub(crate) fn d2_send_genuine_enabled() -> bool {
-    d6_genuine_enabled()
+    queue_advancing_dispatch_enabled()
 }
 
 /// Stage 169: global count of blocking-send queue-advancing dispatches that ran

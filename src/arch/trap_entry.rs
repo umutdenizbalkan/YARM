@@ -380,9 +380,10 @@ pub fn handle_trap_entry_shared(
     // Stage 168B/169: capture the D2 recv/send deferral state once — the drains
     // below clear it, and the D6 block must know a D2 drain ran so it does not
     // also run a spurious observation this cycle.
-    #[cfg(target_arch = "x86_64")]
+    // U4: captured on every architecture this shared entry serves.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let d2_recv_was_deferred = crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx);
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let d2_send_was_deferred = crate::kernel::boot::d2_send_dispatch_is_deferred(cpu_idx);
     // Stage 192A: capture the FutexWait queue-advancing dispatch deferral state (set by the
     // in-lock `futex_wait_current`); its drain below clears it.
@@ -393,9 +394,81 @@ pub fn handle_trap_entry_shared(
     #[cfg(target_arch = "x86_64")]
     let yield_was_deferred = crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
 
+    // ── U4: the architecture adapters for the shared D2 recv/send drains ────────────────
+    //
+    // Everything above the resume — the deferral take, the outgoing re-verification, the ONE
+    // rank-1 dequeue, the rank-2 mark transition and all five WA3A outcomes — is shared
+    // scheduler policy and stays in one place. Only the final resume, the post-mutation fatal
+    // terminal and the idle settlement are architecture-specific, and each delegates to the
+    // per-architecture transaction that already exists.
+
+    /// Resume the marked incarnation. `true` iff the incoming task's frame is now armed.
+    ///
+    /// x86_64 uses the neutral exact-token resume core (ASID activation, context/TLS, FS base,
+    /// pre-IRET CR3). AArch64 uses ITS neutral exact-token core — TTBR0 activation, saved EL0
+    /// context, x18 TLS, parked completion and the x0..x5 argument mirror — deliberately the
+    /// `_core` form, so this ordinary D2 path emits NO `AARCH64_DIRECT_DISPATCH_*` telemetry:
+    /// those markers belong to the direct NR6/NR7 class, not to blocking recv/send.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[allow(unused_variables)]
+    fn d2_resume_marked_incoming(
+        shared: &crate::runtime::SharedKernel,
+        token: crate::runtime::DispatchMarkToken,
+        frame: Option<&mut TrapFrame>,
+    ) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming(shared, token, frame)
+                .is_ok()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            match frame {
+                Some(f) => crate::arch::aarch64::trap::direct_dispatch_resume_incoming_core(
+                    shared, token, f,
+                )
+                .is_ok(),
+                // No frame to arm: the scheduler is already mutated, so this is a refusal, not
+                // a decline. The caller rolls back and diverges.
+                None => false,
+            }
+        }
+    }
+
+    /// The post-mutation resume-refusal terminal. Never returns: the scheduler believes the
+    /// incoming task is running, so returning through any frame is forbidden.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn d2_resume_refused_fatal(cpu: CpuId, incoming: u64, rolled_back: bool) -> ! {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::arch::x86_64::trap::enter_post_lock_dispatch_fatal(cpu, incoming, rolled_back)
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::arch::aarch64::trap::enter_post_lock_dispatch_fatal(cpu, incoming, rolled_back)
+        }
+    }
+
+    /// Settle a D2 drain that selected no incoming task — a typed SUCCESS, never an error.
+    ///
+    /// On x86_64 this returns: the accepted epilogue already owns the idle decision for this
+    /// CPU, and U4 does not move it. On AArch64 it must NOT return — the block commit cleared
+    /// `current`, so the frame the vector epilogue would `eret` through belongs to a parked
+    /// task; it enters the ESTABLISHED post-lock idle terminal instead, the same one the
+    /// direct-dispatch drain uses for its no-incoming settlement.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[allow(unused_variables)]
+    fn d2_settle_idle(cpu: CpuId, outgoing: Option<u64>) {
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(
+            cpu,
+            outgoing.unwrap_or(u64::MAX),
+        );
+    }
+
     // Stage 169 (D2-GENUINE-SEND): drain the deferred blocking-SEND queue-
     // advancing dispatch OUTSIDE the global lock (mirrors the recv drain below).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
         && !crate::kernel::boot::d6_switch_a_enabled()
         && d2_send_was_deferred
@@ -466,26 +539,18 @@ pub fn handle_trap_entry_shared(
                 // COMPLETE token is carried into one neutral exact-token transaction, so the
                 // ASID, context, TLS and CR3 authority all come from the marked incarnation
                 // rather than from a bare TID re-reading `current`.
-                let resumed = crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming(
-                    shared,
-                    token,
-                    frame.as_deref_mut(),
-                );
+                let resumed = d2_resume_marked_incoming(shared, token, frame.as_deref_mut());
                 // The deferral is cleared exactly once, on both outcomes, before anything else
                 // — exactly where the old code cleared it.
                 crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
-                if resumed.is_err() {
+                if !resumed {
                     // Refused AFTER the scheduler was mutated: undo the dequeue with the
                     // token's own narrowed authority (a `ContinuedCurrent` mark yields none,
                     // and none is fabricated), then diverge. No success marker is emitted.
                     let rolled_back = token
                         .into_dequeued_authority()
                         .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
-                    crate::arch::x86_64::trap::enter_post_lock_dispatch_fatal(
-                        cpu,
-                        inc,
-                        rolled_back,
-                    );
+                    d2_resume_refused_fatal(cpu, inc, rolled_back);
                 }
                 let n = crate::kernel::boot::D2_SEND_DISPATCH_COUNT
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
@@ -499,6 +564,8 @@ pub fn handle_trap_entry_shared(
             } else {
                 crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
                 crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_DONE result=idle cpu={}", cpu.0);
+                // Typed successful terminal, never an error. On AArch64 this does not return.
+                d2_settle_idle(cpu, outgoing);
             }
         } else {
             crate::yarm_log!(
@@ -508,7 +575,7 @@ pub fn handle_trap_entry_shared(
             crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
         }
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
         && !crate::kernel::boot::d6_switch_a_enabled()
         && d2_recv_was_deferred
@@ -589,21 +656,13 @@ pub fn handle_trap_entry_shared(
                 // neutral exact-token transaction the homologous blocking-send switch-success
                 // uses — the two were byte-identical bodies, and they now share one
                 // implementation rather than two copies that could drift.
-                let resumed = crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming(
-                    shared,
-                    token,
-                    frame.as_deref_mut(),
-                );
+                let resumed = d2_resume_marked_incoming(shared, token, frame.as_deref_mut());
                 crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
-                if resumed.is_err() {
+                if !resumed {
                     let rolled_back = token
                         .into_dequeued_authority()
                         .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
-                    crate::arch::x86_64::trap::enter_post_lock_dispatch_fatal(
-                        cpu,
-                        inc,
-                        rolled_back,
-                    );
+                    d2_resume_refused_fatal(cpu, inc, rolled_back);
                 }
                 let n = crate::kernel::boot::D2_RECV_DISPATCH_COUNT
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
@@ -617,6 +676,8 @@ pub fn handle_trap_entry_shared(
             } else {
                 crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
                 crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_DONE result=idle cpu={}", cpu.0);
+                // Typed successful terminal, never an error. On AArch64 this does not return.
+                d2_settle_idle(cpu, outgoing);
             }
         } else {
             crate::yarm_log!(

@@ -242,6 +242,55 @@ There is no longer any dead or test-only weight in the total, so **every further
 must retire real runtime work.** U1 and U2 served **204C** / **204D** / **204E** without
 completing any of them.
 
+**U4 — CROSS-ARCH QUEUE-ADVANCING DISPATCH: DELIVERED (four cells), CENSUS-DELTA 0.** U4 is not
+a census increment: it retires no acquisition. It moves a named production predicate and four
+architecture-readiness cells, so blocking `IpcRecv` and blocking `IpcSend` now perform their
+queue-advancing dispatch OUTSIDE the broad lock on **x86_64, AArch64 and RISC-V** rather than on
+x86_64 alone.
+
+*The predicate.* U4 introduces one accurately named canonical gate,
+`queue_advancing_dispatch_enabled()`: true on all three architectures in an ordinary production
+build, false while a mutually exclusive controlled D6 diagnostic (`d6_switch_proof` /
+`d6_switch_a`) owns the switch path, with no runtime opt-out. `d2_recv_genuine_enabled()` and
+`d2_send_genuine_enabled()` now delegate to it, so on x86_64 the value is unchanged — both
+reduce to "no D6 switch diagnostic owns the switch path".
+
+`d6_genuine_enabled()` deliberately stays **x86_64-only and byte-identical**: it gates the
+queue-NEUTRAL D6 observation slice and three `exec_state` decisions, and widening it would
+silently alter AArch64 FutexWait/Yield and x86-specific `exec_state` behavior. U4 widens only
+the queue-ADVANCING question, which is what the D2 deferral protocol actually asks. The gate is
+also deliberately NOT `offlock_authoritative_dispatch_enabled()`, whose AArch64 arm is
+`ipccall_direct_admission_enabled()`: ordinary blocking recv/send must not become coupled to
+direct NR6/NR7 admission. `ipccall_direct_production_enabled()` remains an unconditional
+`false` and cannot influence the new predicate.
+
+*The lifecycle, unchanged and now shared.* The in-lock syscall phase commits the block, marks
+the exact outgoing task `Blocked(EndpointReceive)` / `Blocked(EndpointSend)`, clears `current`,
+publishes ONE per-CPU deferral and performs NO queue-advancing dispatch. After the canonical
+broad phase returns, the architecture wrapper takes that exact deferral, re-verifies the
+outgoing blocked class, performs exactly one rank-1 dequeue, carries the complete `CpuDispatch`
+into the rank-2 mark transition, retains the complete `DispatchMarkToken`, resumes the selected
+exact incarnation and clears the deferral exactly once. Idle is a typed successful terminal;
+`RefusedTorn` stays fatal; a post-mutation refusal rolls back only through
+`into_dequeued_authority()` and then diverges.
+
+*What is shared and what is per-architecture.* The scheduler policy, the re-verification, the
+dequeue, the mark transition and all five WA3A outcomes live in one place per wrapper — no
+second scheduler implementation was created. Only the final resume adapter is
+architecture-specific, and each delegates to the transaction that already existed: x86_64 keeps
+`x86_post_lock_resume_marked_incoming`; AArch64 uses the **neutral** exact-token core
+`direct_dispatch_resume_incoming_core` (TTBR0 activation, saved EL0 context, x18 TLS, parked
+completion, x0–x5 argument mirror) and therefore emits **no `AARCH64_DIRECT_DISPATCH_*`
+telemetry** — this is ordinary D2, not direct NR6/NR7; RISC-V, whose trap wrapper is separate,
+gained homologous D2 drains that reuse its existing exact-token
+`direct_dispatch_resume_incoming` (real `map_kernel_shared_into_asid` → page-table root →
+`write_satp`, whose write issues the `sfence.vma`) plus two narrow in-lock-return bypasses that
+fire only when a deferral OF THAT EXACT CLASS is genuinely pending — the fifth and sixth members
+of the established 196D/196E/196G family, with no generic "skip restore" flag.
+
+*Live-evidence limits, stated honestly.* See §0 and `doc/STATUS.md` for which of the four cells
+carry live enclosing evidence and which rest on hosted execution of the real production entry.
+
 **U3 — IN PROGRESS, nineteen retired (44 → 39 → 37 → 36 → 34 → 32 → 28 → 25).** U3 promotes existing rank-1
 (scheduler) and rank-2 (task) seams from compatibility helpers to **authoritative**, deleting
 each corresponding post-lock drain re-acquisition **in the same increment** — a seam that is

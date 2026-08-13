@@ -53699,24 +53699,41 @@ mod stage168b_d2_recv_genuine_completion {
         );
     }
 
-    // Task D: the deferral is x86_64-only and default-off (gate + cfg).
+    // Task D → U4: the deferral infrastructure exists and is admitted on ALL THREE
+    // architectures. Stage 168B pinned it as x86_64-only; U4 widened exactly that, so the
+    // guard now pins the widened routing rather than the retired restriction. The
+    // default-off property it protected is unchanged and is asserted where it now lives:
+    // the canonical predicate is false whenever a D6 switch diagnostic owns the path, and
+    // publication still requires a live trap drainer and a single dispatching CPU.
     #[test]
-    fn stage168b_x86_only_default_off() {
+    fn stage168b_deferral_is_admitted_on_all_three_architectures() {
         assert!(
             MOD_SRC.contains("D2_RECV_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;")
                 && MOD_SRC.contains("fn d2_recv_dispatch_try_defer"),
             "the D2 recv dispatch deferral infra must exist"
         );
-        // ipc_state defer block is x86_64-only.
+        // The ipc_state defer block admits x86_64, AArch64 and RISC-V.
         let defer_idx = IPC_STATE_SRC
             .find("d2_recv_dispatch_try_defer")
             .expect("defer call");
-        let before = &IPC_STATE_SRC[defer_idx.saturating_sub(1400)..defer_idx];
+        let before = &IPC_STATE_SRC[defer_idx.saturating_sub(1600)..defer_idx];
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                before.contains(&alloc::format!("target_arch = \"{arch}\"")),
+                "the recv dispatch deferral must be admitted on {arch}"
+            );
+        }
         assert!(
-            before.contains("#[cfg(target_arch = \"x86_64\")]"),
-            "the recv dispatch deferral must be x86_64-only"
+            !before.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "the retired x86_64-only restriction must be gone, not merely widened alongside"
         );
-        // runtime seam methods are x86_64-only.
+        // The eligibility that made it default-off is still applied at the site.
+        assert!(
+            before.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+                && before.contains("dispatching_cpu_count() <= 1"),
+            "publication still requires a live trap drainer and a single dispatching CPU"
+        );
+        // The runtime seam methods carry no architecture gate.
         for m in [
             "fn d2_recv_dispatch_step_mut",
             "fn d2_recv_reverify_blocked",
@@ -53724,10 +53741,10 @@ mod stage168b_d2_recv_genuine_completion {
             let idx = RUNTIME_SRC
                 .find(m)
                 .unwrap_or_else(|| panic!("{m} must exist"));
-            let b = &RUNTIME_SRC[idx.saturating_sub(80)..idx];
+            let b = &RUNTIME_SRC[idx.saturating_sub(200)..idx];
             assert!(
-                b.contains("#[cfg(target_arch = \"x86_64\")]"),
-                "{m} must be x86_64-only"
+                !b.contains("#[cfg(target_arch = \"x86_64\")]"),
+                "{m} must be architecture-neutral"
             );
         }
     }
@@ -53952,9 +53969,29 @@ mod stage169_d2_send_genuine {
         // re-acquire. The drain now calls the SHARED neutral exact-token transaction — the
         // same one the homologous blocking-recv drain calls — so there is still exactly one
         // restore mechanism, not a new one.
+        // U4: the shared drain now serves x86_64 AND AArch64, so the resume goes through the
+        // architecture adapter — which delegates to each architecture's neutral exact-token
+        // core and to nothing else. There is still exactly one restore mechanism per
+        // architecture, and no new one.
         assert!(
-            drain.contains("x86_post_lock_resume_marked_incoming("),
+            drain.contains("d2_resume_marked_incoming("),
             "the send drain must reuse the shared exact-token resume transaction"
+        );
+        let adapter = TRAP_ENTRY_SRC
+            .split("fn d2_resume_marked_incoming(")
+            .nth(1)
+            .expect("the adapter")
+            .split("\n    }\n")
+            .next()
+            .expect("adapter body");
+        assert!(
+            adapter.contains("x86_post_lock_resume_marked_incoming(")
+                && adapter.contains("direct_dispatch_resume_incoming_core("),
+            "the adapter must delegate to each architecture's existing exact-token core"
+        );
+        assert!(
+            !adapter.contains("AARCH64_DIRECT_DISPATCH_"),
+            "ordinary D2 recv/send must emit no direct NR6/NR7 telemetry"
         );
         assert!(
             !drain.contains("switch_frames("),
@@ -54420,7 +54457,7 @@ mod stage169_d2_send_genuine {
                 "the D2 {name} switch-success region must take no broad lock"
             );
             assert!(
-                region.contains("x86_post_lock_resume_marked_incoming("),
+                region.contains("d2_resume_marked_incoming("),
                 "the D2 {name} region must use the shared exact-token transaction"
             );
             // Rollback authority is never fabricated, and no success marker follows a refusal.
@@ -54433,9 +54470,12 @@ mod stage169_d2_send_genuine {
                 !region.contains("DequeuedDispatchMarkToken("),
                 "the D2 {name} refusal must not fabricate dequeue authority"
             );
-            let refusal = region.find("if resumed.is_err() {").expect("refusal arm");
+            // U4: the resume adapter returns a bool, and the fatal terminal is the
+            // architecture adapter — which itself delegates to each architecture's
+            // `enter_post_lock_dispatch_fatal`. The ordering property is unchanged.
+            let refusal = region.find("if !resumed {").expect("refusal arm");
             let fatal = region
-                .find("enter_post_lock_dispatch_fatal(")
+                .find("d2_resume_refused_fatal(")
                 .expect("truthful divergence");
             let success = region
                 .find("DISPATCH_DONE result=switch")
@@ -54445,6 +54485,22 @@ mod stage169_d2_send_genuine {
                 "the D2 {name} refusal diverges before any switch-success marker is emitted"
             );
         }
+        // U4: the fatal adapter diverges through each architecture's established terminal —
+        // it invents no new one and never returns.
+        let fatal_adapter = src
+            .split("fn d2_resume_refused_fatal(")
+            .nth(1)
+            .expect("the fatal adapter")
+            .split("\n    }\n")
+            .next()
+            .expect("adapter body");
+        assert_eq!(
+            fatal_adapter
+                .matches("enter_post_lock_dispatch_fatal(")
+                .count(),
+            2,
+            "the fatal adapter must reach both architectures' established terminals"
+        );
         // U3 (203C): 7 -> 5. The x86 FutexWait and Yield switch-success restores joined the
         // same transaction; their classes and counters are untouched.
         assert_eq!(
@@ -72731,12 +72787,26 @@ mod stage195g_aarch64_yield_dispatch {
             "the FutexWait bypass and normal idle must remain intact"
         );
         // Stage 200D-0C1 added a THIRD member of this family (the accepted-NR16 exit
-        // bypass). The invariant this guard protects is unchanged: the restore-skip must
-        // cover EVERY bypass, and the Yield term must still be one of them.
+        // bypass); U4 added the FOURTH and FIFTH (blocking IpcRecv / IpcSend). The invariant
+        // this guard protects is unchanged and is asserted as MEMBERSHIP rather than an exact
+        // three-term literal: the restore-skip must cover EVERY bypass, and the Yield term
+        // must still be one of them.
+        let bypass_expr = body
+            .split("let post_lock_bypass = ")
+            .nth(1)
+            .and_then(|t| t.split_once(';'))
+            .map(|(e, _)| e)
+            .expect("the folded bypass expression");
         assert!(
-            body.contains(
-                "let post_lock_bypass = futex_wait_bypass || yield_bypass || exit_disposition_bypass;"
-            ),
+            [
+                "futex_wait_bypass",
+                "yield_bypass",
+                "exit_disposition_bypass",
+                "d2_recv_bypass",
+                "d2_send_bypass"
+            ]
+            .iter()
+            .all(|term| bypass_expr.contains(term)),
             "the restore-skip must cover every bypass, including Yield"
         );
     }
@@ -75453,10 +75523,14 @@ mod stage197b_riscv_typed_idle_outcome {
         // Stage 200D-0D1 raised this from 2 to 3: the exit consumer's REPLACEMENT arm also
         // selects `ReturnToIncoming`, because the resumed task differs from the trap's entering
         // task. Its idle arm returns typed idle instead and sets nothing.
+        // U4 raises it to 5: the two new D2 drains (blocking IpcSend, blocking IpcReceive) each
+        // set it on their switch-success branch, and each returns a typed SUCCESSFUL idle —
+        // setting nothing — when the dequeue selects no incoming task.
         assert_eq!(
             RISCV_TRAP_SRC.matches("switched = true;").count(),
-            3,
-            "the FutexWait switch, Yield switch and accepted-exit replacement branches set switched=true"
+            5,
+            "the FutexWait switch, Yield switch, accepted-exit replacement and the two D2 \
+             switch branches set switched=true"
         );
         assert!(
             RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToIncoming")
@@ -98106,9 +98180,15 @@ mod stage200d0c1_aarch64_exit_prep {
         assert!(body.contains(
             "let exit_disposition_bypass = {\n        let idx = cpu.0 as usize;\n        idx < crate::kernel::scheduler::MAX_CPUS\n            && crate::kernel::boot::post_lock_trap_disposition_pending(idx)\n    };"
         ));
-        assert!(body.contains(
-            "let post_lock_bypass = futex_wait_bypass || yield_bypass || exit_disposition_bypass;"
-        ));
+        // U4: membership, not an exact literal — the family grew to five members and the
+        // exit-disposition term must still be one of them.
+        let bypass_expr = body
+            .split("let post_lock_bypass = ")
+            .nth(1)
+            .and_then(|t| t.split_once(';'))
+            .map(|(e, _)| e)
+            .expect("the folded bypass expression");
+        assert!(bypass_expr.contains("exit_disposition_bypass"));
         // …and `post_lock_bypass` is what suppresses the in-lock restore.
         assert!(body.contains("if !switch_pending && !post_lock_bypass {"));
         let gate = body
@@ -123105,6 +123185,541 @@ mod u3_ordinary_cap_sender_wake {
                 "pub const fn ipccall_direct_production_enabled() -> bool {\n    false\n}"
             ),
             "direct production must remain an unconditional false"
+        );
+    }
+}
+
+/// U4 — the CROSS-ARCH QUEUE-ADVANCING DISPATCH cohort.
+///
+/// Blocking `IpcRecv` and blocking `IpcSend` now defer their queue-advancing dispatch out of
+/// the broad lock and drain it post-lock on x86_64, AArch64 and RISC-V. These guards prove the
+/// production ROUTING from source — the predicate, the publication, the per-architecture drain
+/// and the per-architecture resume — rather than searching for marker strings in a log.
+#[cfg(test)]
+mod u4_cross_arch_queue_advancing_dispatch {
+    use crate::kernel::boot::{
+        d2_recv_dispatch_clear, d2_recv_dispatch_is_deferred, d2_recv_dispatch_outgoing,
+        d2_recv_dispatch_try_defer, d2_recv_genuine_enabled, d2_send_dispatch_clear,
+        d2_send_dispatch_is_deferred, d2_send_dispatch_outgoing, d2_send_dispatch_try_defer,
+        d2_send_genuine_enabled, ipccall_direct_production_enabled,
+        queue_advancing_dispatch_enabled,
+    };
+
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    fn body_of(src: &str, name: &str, close: &str) -> alloc::string::String {
+        use alloc::string::ToString;
+        src.split(name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{name}` must exist"))
+            .split_once(close)
+            .unwrap_or_else(|| panic!("`{name}` must close"))
+            .0
+            .to_string()
+    }
+
+    // ── 1/2/3: the canonical predicate ───────────────────────────────────────────────────
+
+    /// It admits all three architectures in ordinary production configuration. This is a
+    /// SOURCE property — a hosted run only ever compiles one target — so it is proven from the
+    /// predicate's own body: it carries no `target_arch` term at all.
+    #[test]
+    fn the_canonical_predicate_admits_all_three_architectures() {
+        let body = body_of(
+            MOD_SRC,
+            "fn queue_advancing_dispatch_enabled() -> bool {",
+            "\n}\n",
+        );
+        assert!(
+            !body.contains("target_arch") && !body.contains("cfg!("),
+            "the queue-advancing predicate must not be architecture-conditional"
+        );
+        // Ordinary production configuration: no diagnostic owns the switch path.
+        assert!(
+            queue_advancing_dispatch_enabled(),
+            "ordinary production must admit queue-advancing dispatch"
+        );
+        // And it is exactly the two diagnostic exclusions, nothing else.
+        assert!(
+            body.contains("!d6_controlled_switch_proof_enabled()")
+                && body.contains("!d6_switch_a_enabled()"),
+            "the predicate is the D6-diagnostic exclusion"
+        );
+    }
+
+    /// `d6_genuine_enabled` stays x86_64-only: widening it would silently move AArch64
+    /// FutexWait/Yield and x86-specific `exec_state` behavior, which U4 does not touch.
+    #[test]
+    fn d6_genuine_remains_x86_64_specific() {
+        let body = body_of(MOD_SRC, "fn d6_genuine_enabled() -> bool {", "\n}\n");
+        assert!(
+            body.contains("cfg!(target_arch = \"x86_64\")"),
+            "d6_genuine_enabled must remain x86_64-specific"
+        );
+    }
+
+    /// Both D2 gates delegate to the canonical predicate — one source of truth, not three.
+    #[test]
+    fn both_d2_gates_delegate_to_the_canonical_predicate() {
+        for f in ["fn d2_recv_genuine_enabled", "fn d2_send_genuine_enabled"] {
+            let body = body_of(MOD_SRC, &alloc::format!("{f}() -> bool {{"), "\n}\n");
+            assert!(
+                body.contains("queue_advancing_dispatch_enabled()"),
+                "{f} must delegate to the canonical predicate"
+            );
+            assert!(
+                !body.contains("d6_genuine_enabled()"),
+                "{f} must no longer be the x86-only D6 question"
+            );
+        }
+        assert!(d2_recv_genuine_enabled() && d2_send_genuine_enabled());
+    }
+
+    /// Controlled D6 proof/switch modes remain mutually exclusive with queue-advancing
+    /// dispatch, on every architecture.
+    #[test]
+    fn controlled_d6_modes_remain_mutually_exclusive() {
+        use core::sync::atomic::Ordering;
+        for flag in [
+            &crate::kernel::boot::D6_CONTROLLED_SWITCH_PROOF_ENABLED,
+            &crate::kernel::boot::D6_SWITCH_A_ENABLED,
+        ] {
+            flag.store(true, Ordering::Release);
+            assert!(
+                !queue_advancing_dispatch_enabled(),
+                "a controlled D6 diagnostic must exclude queue-advancing dispatch"
+            );
+            assert!(!d2_recv_genuine_enabled() && !d2_send_genuine_enabled());
+            flag.store(false, Ordering::Release);
+        }
+        assert!(queue_advancing_dispatch_enabled(), "restored");
+    }
+
+    /// Direct production stays false and cannot influence the new predicate: the predicate does
+    /// not consult direct admission at all, unlike `offlock_authoritative_dispatch_enabled`.
+    #[test]
+    fn direct_production_is_off_and_cannot_affect_the_predicate() {
+        assert!(!ipccall_direct_production_enabled());
+        assert!(
+            MOD_SRC.contains(
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    false\n}"
+            ),
+            "direct production must remain an unconditional false"
+        );
+        let body = body_of(
+            MOD_SRC,
+            "fn queue_advancing_dispatch_enabled() -> bool {",
+            "\n}\n",
+        );
+        for coupling in [
+            "ipccall_direct",
+            "offlock_authoritative_dispatch_enabled",
+            "waiter_ownership",
+        ] {
+            assert!(
+                !body.contains(coupling),
+                "the queue-advancing predicate must not depend on `{coupling}`"
+            );
+        }
+        // The proof-gated direct predicate is still the one coupled to admission — untouched.
+        let offlock = body_of(
+            MOD_SRC,
+            "fn offlock_authoritative_dispatch_enabled() -> bool {",
+            "\n}\n",
+        );
+        assert!(offlock.contains("ipccall_direct_admission_enabled()"));
+    }
+
+    // ── 4/5/6: the deferral protocol ─────────────────────────────────────────────────────
+
+    /// Each class publishes exactly one deferral, records its exact outgoing TID, and a second
+    /// attempt on the same CPU refuses rather than publishing twice.
+    #[test]
+    fn each_class_publishes_exactly_one_exact_deferral_and_clears_once() {
+        const CPU: usize = 3;
+        for (try_defer, is_deferred, outgoing, clear, tid) in [
+            (
+                d2_recv_dispatch_try_defer as fn(usize, u64) -> bool,
+                d2_recv_dispatch_is_deferred as fn(usize) -> bool,
+                d2_recv_dispatch_outgoing as fn(usize) -> Option<u64>,
+                d2_recv_dispatch_clear as fn(usize),
+                4141u64,
+            ),
+            (
+                d2_send_dispatch_try_defer,
+                d2_send_dispatch_is_deferred,
+                d2_send_dispatch_outgoing,
+                d2_send_dispatch_clear,
+                4242u64,
+            ),
+        ] {
+            clear(CPU);
+            assert!(!is_deferred(CPU), "starts clear");
+            assert!(try_defer(CPU, tid), "publishes once");
+            assert!(is_deferred(CPU));
+            assert_eq!(outgoing(CPU), Some(tid), "the EXACT outgoing tid");
+            assert!(!try_defer(CPU, tid + 1), "a second publication refuses");
+            assert_eq!(outgoing(CPU), Some(tid), "and does not overwrite");
+            clear(CPU);
+            assert!(!is_deferred(CPU), "cleared exactly once");
+            assert_eq!(outgoing(CPU), None, "the outgoing record clears with it");
+        }
+    }
+
+    /// The two classes are independent: publishing one never implies the other.
+    #[test]
+    fn the_two_class_deferrals_are_independent() {
+        const CPU: usize = 2;
+        d2_recv_dispatch_clear(CPU);
+        d2_send_dispatch_clear(CPU);
+        assert!(d2_recv_dispatch_try_defer(CPU, 7));
+        assert!(d2_recv_dispatch_is_deferred(CPU));
+        assert!(!d2_send_dispatch_is_deferred(CPU), "send is unaffected");
+        d2_recv_dispatch_clear(CPU);
+        assert!(d2_send_dispatch_try_defer(CPU, 8));
+        assert!(d2_send_dispatch_is_deferred(CPU));
+        assert!(!d2_recv_dispatch_is_deferred(CPU), "recv is unaffected");
+        d2_send_dispatch_clear(CPU);
+    }
+
+    /// An eligible publication SKIPS the in-lock dispatch: the publication arm returns before
+    /// reaching any queue-advancing call.
+    #[test]
+    fn an_eligible_publication_performs_no_in_lock_dispatch() {
+        for defer in ["d2_recv_dispatch_try_defer", "d2_send_dispatch_try_defer"] {
+            let idx = IPC_STATE.find(defer).expect("the publication");
+            let after = &IPC_STATE[idx..idx + 1200];
+            let ret = after.find("return Ok(").expect("the early return");
+            let head = &after[..ret];
+            for advancing in ["dispatch_next", "local_dispatch_step"] {
+                assert!(
+                    !head.contains(advancing),
+                    "{defer}: an eligible publication must not `{advancing}` in-lock"
+                );
+            }
+        }
+    }
+
+    /// Publication is admitted on all three architectures and gated by the same eligibility.
+    #[test]
+    fn publication_is_admitted_on_all_three_architectures() {
+        for defer in ["d2_recv_dispatch_try_defer", "d2_send_dispatch_try_defer"] {
+            let idx = IPC_STATE.find(defer).expect("the publication");
+            let before = &IPC_STATE[idx.saturating_sub(1600)..idx];
+            for arch in ["x86_64", "aarch64", "riscv64"] {
+                assert!(
+                    before.contains(&alloc::format!("target_arch = \"{arch}\"")),
+                    "{defer} must be admitted on {arch}"
+                );
+            }
+            assert!(
+                before.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+                    && before.contains("dispatching_cpu_count() <= 1"),
+                "{defer} keeps the drainer + single-dispatcher eligibility"
+            );
+        }
+    }
+
+    // ── 7/8/13: per-architecture drains, re-verification and the RISC-V bypasses ──────────
+
+    /// Every architecture consumes and clears each deferral, and re-verifies the EXACT blocked
+    /// class before dispatching.
+    #[test]
+    fn every_architecture_drains_both_classes_and_reverifies_the_exact_class() {
+        for (name, src) in [
+            ("shared (x86_64+aarch64)", TRAP_ENTRY),
+            ("riscv64", RISCV_TRAP),
+        ] {
+            for (class, reverify, clear) in [
+                ("recv", "d2_recv_reverify_blocked", "d2_recv_dispatch_clear"),
+                ("send", "d2_send_reverify_blocked", "d2_send_dispatch_clear"),
+            ] {
+                assert!(
+                    src.contains(reverify),
+                    "{name}: the {class} drain must re-verify the outgoing blocked class"
+                );
+                assert!(
+                    src.contains(clear),
+                    "{name}: the {class} drain must clear its deferral"
+                );
+                assert!(
+                    src.contains(&alloc::format!("d2_{class}_dispatch_step_mut")),
+                    "{name}: the {class} drain must perform the rank-1 dequeue"
+                );
+            }
+        }
+        // Re-verification really asserts the class, not merely "blocked".
+        assert!(
+            RUNTIME.contains("EndpointReceive") || RUNTIME.contains("d2_recv_reverify_blocked"),
+            "recv re-verification exists"
+        );
+        let recv_rv = body_of(RUNTIME, "fn d2_recv_reverify_blocked", "\n    }\n");
+        let send_rv = body_of(RUNTIME, "fn d2_send_reverify_blocked", "\n    }\n");
+        assert!(
+            recv_rv.contains("EndpointReceive"),
+            "recv must re-verify Blocked(EndpointReceive)"
+        );
+        assert!(
+            send_rv.contains("EndpointSend"),
+            "send must re-verify Blocked(EndpointSend)"
+        );
+    }
+
+    /// The RISC-V in-lock-return bypasses are class-specific and require an ACTUAL pending
+    /// deferral of their own class — never a generic "skip restore" flag.
+    #[test]
+    fn the_riscv_bypasses_are_class_specific_and_require_a_pending_deferral() {
+        for class in ["recv", "send"] {
+            let marker = alloc::format!("RISCV_D2_{}_HANDLER_BYPASS_BEGIN", class.to_uppercase());
+            let idx = RISCV_TRAP
+                .find(marker.as_str())
+                .unwrap_or_else(|| panic!("the {class} bypass must exist"));
+            let before = &RISCV_TRAP[idx.saturating_sub(400)..idx];
+            assert!(
+                before.contains(&alloc::format!("d2_{class}_dispatch_is_deferred(cpu_idx)")),
+                "the {class} bypass must require ITS OWN pending deferral"
+            );
+            // It must not key off the other class.
+            let other = if class == "recv" { "send" } else { "recv" };
+            assert!(
+                !before.contains(&alloc::format!("d2_{other}_dispatch_is_deferred")),
+                "the {class} bypass must not key off the {other} deferral"
+            );
+        }
+        for generic in ["skip_restore", "SKIP_RESTORE", "bypass_all"] {
+            assert!(
+                !RISCV_TRAP.contains(generic),
+                "no generic `{generic}` flag may exist"
+            );
+        }
+    }
+
+    // ── 10/11/12: the WA3A outcomes ──────────────────────────────────────────────────────
+
+    /// Every WA3A outcome stays explicit in every D2 drain, `RefusedTorn` is fatal, and a
+    /// post-mutation refusal rolls back only through `into_dequeued_authority()` then diverges.
+    #[test]
+    fn every_wa3a_outcome_is_explicit_and_refused_torn_is_fatal() {
+        for (name, src, torn_site) in [
+            ("shared", TRAP_ENTRY, "dispatch_torn_fatal("),
+            ("riscv64", RISCV_TRAP, "dispatch_torn_fatal("),
+        ] {
+            for outcome in [
+                "Mark::Marked(token)",
+                "Mark::Idle",
+                "Mark::RefusedRolledBack",
+                "Mark::RefusedNoSchedulerChange",
+                "Mark::RefusedTorn",
+            ] {
+                assert!(
+                    src.contains(outcome),
+                    "{name}: `{outcome}` must be matched explicitly"
+                );
+            }
+            assert!(
+                src.contains(torn_site),
+                "{name}: RefusedTorn must reach the fatal terminal"
+            );
+        }
+        // `dispatch_torn_fatal` diverges.
+        assert!(
+            RUNTIME.contains(
+                "pub(crate) fn dispatch_torn_fatal(cpu: CpuId, tid: u64, site: &'static str) -> !"
+            ),
+            "the torn terminal must be divergent"
+        );
+        // Post-mutation refusal: exact authority only, then divergence.
+        for (name, src, fatal) in [
+            ("shared", TRAP_ENTRY, "d2_resume_refused_fatal("),
+            ("riscv64", RISCV_TRAP, "dispatch_resume_refused_fatal("),
+        ] {
+            assert!(
+                src.contains(fatal),
+                "{name}: a refused resume must diverge through the established terminal"
+            );
+        }
+        let rv_fatal = body_of(RISCV_TRAP, "fn dispatch_resume_refused_fatal(", "\n}\n");
+        assert!(
+            rv_fatal.contains("into_dequeued_authority()")
+                && rv_fatal.contains("direct_dispatch_rollback_split"),
+            "the RISC-V refusal rolls back only with exact dequeued authority"
+        );
+        assert!(
+            !rv_fatal.contains("DequeuedDispatchMarkToken("),
+            "authority is never fabricated"
+        );
+    }
+
+    // ── 9/14: exact-incarnation resume, per architecture ─────────────────────────────────
+
+    /// Each architecture resumes through ITS existing exact-token transaction, which refuses a
+    /// replacement incarnation that reused the TID; and the AArch64 D2 path emits no direct
+    /// NR6/NR7 telemetry.
+    #[test]
+    fn each_architecture_resumes_through_its_exact_token_transaction() {
+        let adapter = body_of(TRAP_ENTRY, "fn d2_resume_marked_incoming(", "\n    }\n");
+        assert!(
+            adapter.contains("x86_post_lock_resume_marked_incoming("),
+            "x86_64 keeps its accepted resume core"
+        );
+        assert!(
+            adapter.contains("direct_dispatch_resume_incoming_core("),
+            "AArch64 uses the NEUTRAL exact-token core"
+        );
+        assert!(
+            !adapter.contains("AARCH64_DIRECT_DISPATCH_"),
+            "ordinary D2 recv/send is not the direct NR6/NR7 class"
+        );
+        // The neutral core is the one without the direct telemetry; the wrapper keeps it.
+        let core = body_of(
+            AARCH64_TRAP,
+            "fn direct_dispatch_resume_incoming_core(",
+            "\n}\n",
+        );
+        assert!(
+            !core.contains("AARCH64_DIRECT_DISPATCH_"),
+            "the neutral core carries no direct-class telemetry"
+        );
+        // Exact incarnation: every architecture resolves by TOKEN, and refuses otherwise.
+        for (name, body) in [
+            ("aarch64", core),
+            (
+                "riscv64",
+                body_of(RISCV_TRAP, "fn direct_dispatch_resume_incoming(", "\n}\n"),
+            ),
+        ] {
+            assert!(
+                body.contains("direct_dispatch_activate_asid_split(token)")
+                    && body.contains("direct_dispatch_restore_context_split(token)"),
+                "{name} must resolve by the mark TOKEN's exact incarnation"
+            );
+        }
+        // The token-keyed seams refuse a mismatched incarnation.
+        let restore = body_of(
+            RUNTIME,
+            "fn direct_dispatch_restore_context_split",
+            "\n    }\n",
+        );
+        assert!(
+            restore.contains("t.asid == Some(expected)"),
+            "a replacement incarnation that reused the TID must be refused"
+        );
+        // RISC-V performs the REAL address-space work through the same shared seam.
+        assert!(
+            RISCV_TRAP.contains("direct_dispatch_resume_incoming(shared, token"),
+            "the RISC-V D2 drains reuse the existing exact-token resume"
+        );
+        assert_eq!(
+            RISCV_TRAP
+                .matches("fn direct_dispatch_resume_incoming(")
+                .count(),
+            1,
+            "no second RISC-V address-space or register-restore implementation"
+        );
+    }
+
+    /// Idle is a typed successful terminal on every architecture — never an arbitrary error.
+    #[test]
+    fn idle_is_a_typed_successful_terminal_on_every_architecture() {
+        // Shared: the adapter settles idle; on AArch64 through the ESTABLISHED post-lock idle
+        // terminal, on x86_64 by returning to the accepted epilogue.
+        let idle = body_of(TRAP_ENTRY, "fn d2_settle_idle(", "\n    }\n");
+        assert!(
+            idle.contains("enter_post_lock_idle_after_direct_dispatch("),
+            "AArch64 idle must use the established post-lock idle terminal"
+        );
+        assert!(
+            TRAP_ENTRY.contains("D2_RECV_GENUINE_DISPATCH_DONE result=idle")
+                && TRAP_ENTRY.contains("D2_SEND_GENUINE_DISPATCH_DONE result=idle"),
+            "idle is reported as a DONE result, not a failure"
+        );
+        assert!(
+            RISCV_TRAP.contains("D2_RECV_GENUINE_DISPATCH_DONE result=idle")
+                && RISCV_TRAP.contains("D2_SEND_GENUINE_DISPATCH_DONE result=idle"),
+            "the RISC-V drains report idle as a DONE result too"
+        );
+    }
+
+    // ── 16/17: scope ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn no_waiter_ownership_primitive_gains_a_production_caller() {
+        for src in [MOD_SRC, IPC_STATE, TRAP_ENTRY, RISCV_TRAP, RUNTIME] {
+            for op in [
+                ".waiter_ownership_arm_current(",
+                ".waiter_ownership_claim(",
+                ".waiter_ownership_consume(",
+                ".waiter_ownership_restore(",
+                ".waiter_ownership_cancel(",
+                ".waiter_ownership_retire_current(",
+            ] {
+                assert!(!src.contains(op), "`{op}` must gain no production caller");
+            }
+        }
+    }
+
+    /// U4's EXIT CONDITION, recomputed from source: for each of the four cells the production
+    /// route must exist end to end — the canonical predicate admits the architecture, the
+    /// in-lock publication is compiled for it, its wrapper drains that class, and the drain
+    /// resumes through that architecture's exact-token transaction.
+    #[test]
+    fn u4_exit_condition_is_recomputed_from_production_routing() {
+        let predicate_neutral = {
+            let b = body_of(
+                MOD_SRC,
+                "fn queue_advancing_dispatch_enabled() -> bool {",
+                "\n}\n",
+            );
+            !b.contains("target_arch")
+        };
+        let published_for = |arch: &str| -> bool {
+            ["d2_recv_dispatch_try_defer", "d2_send_dispatch_try_defer"]
+                .iter()
+                .all(|d| {
+                    let i = IPC_STATE.find(d).expect("publication");
+                    IPC_STATE[i.saturating_sub(1600)..i]
+                        .contains(&alloc::format!("target_arch = \"{arch}\""))
+                })
+        };
+        // Which wrapper serves which architecture, and does it drain BOTH classes?
+        let shared_drains_both = TRAP_ENTRY.contains("d2_recv_dispatch_step_mut")
+            && TRAP_ENTRY.contains("d2_send_dispatch_step_mut")
+            && TRAP_ENTRY.contains("target_arch = \"aarch64\"");
+        let riscv_drains_both = RISCV_TRAP.contains("d2_recv_dispatch_step_mut")
+            && RISCV_TRAP.contains("d2_send_dispatch_step_mut");
+        let resumes = |arch: &str| -> bool {
+            match arch {
+                "x86_64" => TRAP_ENTRY.contains("x86_post_lock_resume_marked_incoming("),
+                "aarch64" => TRAP_ENTRY.contains("direct_dispatch_resume_incoming_core("),
+                _ => RISCV_TRAP.contains("direct_dispatch_resume_incoming(shared, token"),
+            }
+        };
+        let mut delivered = alloc::vec::Vec::new();
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            let wrapper_ok = if arch == "riscv64" {
+                riscv_drains_both
+            } else {
+                shared_drains_both
+            };
+            let cell = predicate_neutral && published_for(arch) && wrapper_ok && resumes(arch);
+            delivered.push((arch, cell));
+        }
+        for (arch, ok) in &delivered {
+            assert!(
+                *ok,
+                "U4 cell missing: {arch} has no complete production route for blocking \
+                 recv/send queue-advancing dispatch"
+            );
+        }
+        assert_eq!(
+            delivered.len(),
+            3,
+            "all three architectures are accounted for"
         );
     }
 }

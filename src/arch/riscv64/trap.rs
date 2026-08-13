@@ -346,6 +346,37 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         crate::yarm_log!("RISCV_YIELD_HANDLER_BYPASS_DONE cpu={}", cpu.0);
         return Ok(());
     }
+    // U4 (D2 IN-LOCK BYPASSES): the fifth and sixth members of the 196D/196E/196G family, and
+    // exactly as narrow. The in-lock `block_current_on_{receive,send}_with_deadline` published
+    // the waiter, marked the caller `Blocked(Endpoint{Receive,Send})` and cleared `current`, so
+    // the canonical restore below has NO current task and would either error (→ spurious
+    // idle/halt) or restore stale state. Skip ONLY the in-lock restore + ret-lane export and
+    // return cleanly; the wrapper's post-lock D2 drain performs the authoritative dispatch, the
+    // real SATP/sfence.vma and the frame restore for the INCOMING task.
+    //
+    // Each requires an ACTUAL pending deferral OF ITS OWN CLASS — there is no generic "skip
+    // restore" flag — and both are inert for every other syscall and for an ineligible blocking
+    // recv/send (no drainer, or multiple dispatching CPUs ⇒ no deferral ⇒ in-lock fallback).
+    if crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx) {
+        let outgoing = crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx).unwrap_or(0);
+        crate::yarm_log!(
+            "RISCV_D2_RECV_HANDLER_BYPASS_BEGIN cpu={} outgoing={}",
+            cpu.0,
+            outgoing
+        );
+        crate::yarm_log!("RISCV_D2_RECV_HANDLER_BYPASS_DONE cpu={}", cpu.0);
+        return Ok(());
+    }
+    if crate::kernel::boot::d2_send_dispatch_is_deferred(cpu_idx) {
+        let outgoing = crate::kernel::boot::d2_send_dispatch_outgoing(cpu_idx).unwrap_or(0);
+        crate::yarm_log!(
+            "RISCV_D2_SEND_HANDLER_BYPASS_BEGIN cpu={} outgoing={}",
+            cpu.0,
+            outgoing
+        );
+        crate::yarm_log!("RISCV_D2_SEND_HANDLER_BYPASS_DONE cpu={}", cpu.0);
+        return Ok(());
+    }
     // ── Stage 200D-0D1 (EXITCURRENTTASK IN-LOCK BYPASS) ────────────────────────────────
     //
     // The fourth member of the 196D/196E/196G bypass family, and deliberately the NARROWEST.
@@ -908,6 +939,216 @@ pub fn handle_riscv_trap_entry_shared(
                 "RISCV_QUEUE_SWITCH_FOUNDATION_FAIL reason=state_changed cpu={}",
                 cpu.0
             );
+        }
+    }
+
+    // ── U4: queue-advancing D2 SEND drain (blocking IpcSend) ──────────────────────
+    //
+    // The RISC-V homologue of the shared x86_64/AArch64 D2 send drain. The in-lock
+    // `block_current_on_send_with_deadline` published the waiter, marked the caller
+    // `Blocked(EndpointSend)`, cleared `current` and declined the in-lock dispatch. Now that the
+    // broad guard is released we re-verify the outgoing caller is STILL blocked in that exact
+    // class (rank-2 task seam), perform the ONE authoritative queue-advancing dequeue (rank-1
+    // scheduler seam), carry the complete `CpuDispatch` into the exact rank-2 mark transition,
+    // and resume the marked incarnation through the EXISTING RISC-V exact-token transaction —
+    // real `map_kernel_shared_into_asid` + page-table root + `write_satp` (whose write issues the
+    // `sfence.vma`), then the exact saved context, the TLS take and any parked completion. No
+    // scheduler policy, address-space or register-restore implementation is duplicated: this is
+    // the same `direct_dispatch_resume_incoming` the FutexWait/Yield drains use.
+    //
+    // The deferral is cleared exactly once on every path. An exact-identity refusal rolls the
+    // dequeue back through the token's own authority and diverges rather than `sret`-ing through
+    // another task's frame. `RefusedTorn` is fatal and never returns.
+    if cpu_idx < MAX_CPUS && crate::kernel::boot::d2_send_dispatch_is_deferred(cpu_idx) {
+        crate::yarm_log!("D2_SEND_GENUINE_GLOBAL_DROPPED cpu={}", cpu.0);
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendBlocking");
+        let outgoing = crate::kernel::boot::d2_send_dispatch_outgoing(cpu_idx);
+        let reverify_ok = outgoing
+            .map(|t| shared.d2_send_reverify_blocked(t))
+            .unwrap_or(false);
+        if reverify_ok {
+            if let Some(out) = outgoing {
+                crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_REVERIFY_OK tid={}", out);
+            }
+            crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
+            let dispatch = shared.d2_send_dispatch_step_mut(cpu);
+            // All five WA3A outcomes matched explicitly, each with its own evidence.
+            let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                Mark::Marked(token) => Some(token),
+                Mark::Idle => {
+                    crate::yarm_log!(
+                        "D2_SEND_GENUINE_DISPATCH_DECLINED cpu={} reason=idle",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedRolledBack => {
+                    crate::yarm_log!(
+                        "D2_SEND_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedNoSchedulerChange => {
+                    crate::yarm_log!(
+                        "D2_SEND_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedTorn => dispatch_torn_fatal(
+                    cpu,
+                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+                    "riscv_d2_send_dispatch",
+                ),
+            };
+            if let Some(token) = marked {
+                let inc = token.tid();
+                let Some(asid) = direct_dispatch_resume_incoming(shared, token, &mut *frame) else {
+                    crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
+                    dispatch_resume_refused_fatal(
+                        shared,
+                        token,
+                        cpu,
+                        inc,
+                        "riscv_d2_send_dispatch",
+                    );
+                };
+                crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
+                let n = crate::kernel::boot::D2_SEND_DISPATCH_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                crate::yarm_log!(
+                    "D2_SEND_GENUINE_DISPATCH_DONE result=switch cpu={} incoming={} count={}",
+                    cpu.0,
+                    inc,
+                    n
+                );
+                crate::yarm_log!(
+                    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendBlocking result=ok asid={}",
+                    asid
+                );
+                // An incoming task was dispatched and its frame/SATP armed → the tail return is
+                // the typed ReturnToIncoming, never idle and never an error.
+                switched = true;
+            } else {
+                // Typed SUCCESSFUL idle: the outgoing caller stays blocked in its class,
+                // `current` stays clear, no frame is restored and no `sret` is attempted. The
+                // wrapper's existing terminal-idle handling produces the typed idle outcome.
+                crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
+                crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_DONE result=idle cpu={}", cpu.0);
+            }
+        } else {
+            crate::yarm_log!(
+                "D2_SEND_GENUINE_FALLBACK reason=state_changed cpu={}",
+                cpu.0
+            );
+            crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
+        }
+    }
+
+    // ── U4: queue-advancing D2 RECV drain (blocking IpcReceive) ──────────────────────
+    //
+    // The RISC-V homologue of the shared x86_64/AArch64 D2 recv drain. The in-lock
+    // `block_current_on_receive_with_deadline` published the waiter, marked the caller
+    // `Blocked(EndpointReceive)`, cleared `current` and declined the in-lock dispatch. Now that the
+    // broad guard is released we re-verify the outgoing caller is STILL blocked in that exact
+    // class (rank-2 task seam), perform the ONE authoritative queue-advancing dequeue (rank-1
+    // scheduler seam), carry the complete `CpuDispatch` into the exact rank-2 mark transition,
+    // and resume the marked incarnation through the EXISTING RISC-V exact-token transaction —
+    // real `map_kernel_shared_into_asid` + page-table root + `write_satp` (whose write issues the
+    // `sfence.vma`), then the exact saved context, the TLS take and any parked completion. No
+    // scheduler policy, address-space or register-restore implementation is duplicated: this is
+    // the same `direct_dispatch_resume_incoming` the FutexWait/Yield drains use.
+    //
+    // The deferral is cleared exactly once on every path. An exact-identity refusal rolls the
+    // dequeue back through the token's own authority and diverges rather than `sret`-ing through
+    // another task's frame. `RefusedTorn` is fatal and never returns.
+    if cpu_idx < MAX_CPUS && crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx) {
+        crate::yarm_log!("D2_RECV_GENUINE_GLOBAL_DROPPED cpu={}", cpu.0);
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcReceiveBlocking");
+        let outgoing = crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx);
+        let reverify_ok = outgoing
+            .map(|t| shared.d2_recv_reverify_blocked(t))
+            .unwrap_or(false);
+        if reverify_ok {
+            if let Some(out) = outgoing {
+                crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid={}", out);
+            }
+            crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
+            let dispatch = shared.d2_recv_dispatch_step_mut(cpu);
+            // All five WA3A outcomes matched explicitly, each with its own evidence.
+            let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
+                Mark::Marked(token) => Some(token),
+                Mark::Idle => {
+                    crate::yarm_log!(
+                        "D2_RECV_GENUINE_DISPATCH_DECLINED cpu={} reason=idle",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedRolledBack => {
+                    crate::yarm_log!(
+                        "D2_RECV_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedNoSchedulerChange => {
+                    crate::yarm_log!(
+                        "D2_RECV_GENUINE_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
+                        cpu.0
+                    );
+                    None
+                }
+                Mark::RefusedTorn => dispatch_torn_fatal(
+                    cpu,
+                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+                    "riscv_d2_recv_dispatch",
+                ),
+            };
+            if let Some(token) = marked {
+                let inc = token.tid();
+                let Some(asid) = direct_dispatch_resume_incoming(shared, token, &mut *frame) else {
+                    crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+                    dispatch_resume_refused_fatal(
+                        shared,
+                        token,
+                        cpu,
+                        inc,
+                        "riscv_d2_recv_dispatch",
+                    );
+                };
+                crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+                let n = crate::kernel::boot::D2_RECV_DISPATCH_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                crate::yarm_log!(
+                    "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu={} incoming={} count={}",
+                    cpu.0,
+                    inc,
+                    n
+                );
+                crate::yarm_log!(
+                    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReceiveBlocking result=ok asid={}",
+                    asid
+                );
+                // An incoming task was dispatched and its frame/SATP armed → the tail return is
+                // the typed ReturnToIncoming, never idle and never an error.
+                switched = true;
+            } else {
+                // Typed SUCCESSFUL idle: the outgoing caller stays blocked in its class,
+                // `current` stays clear, no frame is restored and no `sret` is attempted. The
+                // wrapper's existing terminal-idle handling produces the typed idle outcome.
+                crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+                crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_DONE result=idle cpu={}", cpu.0);
+            }
+        } else {
+            crate::yarm_log!(
+                "D2_RECV_GENUINE_FALLBACK reason=state_changed cpu={}",
+                cpu.0
+            );
+            crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
         }
     }
 

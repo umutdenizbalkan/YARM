@@ -3363,7 +3363,15 @@ impl KernelState {
         // runs the single authoritative `dispatch_next_on` under only the
         // scheduler seam and the arch thread-state restore via the hardened
         // D6-SWITCH-A path. Ineligible cases keep the in-lock dispatch fallback.
-        #[cfg(target_arch = "x86_64")]
+        // U4: the publication is architecture-neutral. `d2_recv_genuine_enabled()` is the
+        // canonical `queue_advancing_dispatch_enabled()`, which admits x86_64, AArch64 and
+        // RISC-V; each has a post-lock drain that consumes this deferral. The per-CPU
+        // eligibility below (trap drainer active, single dispatching CPU) is unchanged.
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))]
         if crate::kernel::boot::d2_recv_genuine_enabled()
             && !crate::kernel::boot::d6_controlled_switch_proof_enabled()
             && !crate::kernel::boot::d6_switch_a_enabled()
@@ -3538,7 +3546,12 @@ impl KernelState {
         // that follows genuinely advances the run queue. When eligible, record a
         // per-CPU deferral drained by the trap entry after the global guard drops
         // and SKIP the in-lock authoritative dispatch entirely.
-        #[cfg(target_arch = "x86_64")]
+        // U4: architecture-neutral, exactly as the recv sibling above.
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))]
         if crate::kernel::boot::d2_send_genuine_enabled()
             && !crate::kernel::boot::d6_controlled_switch_proof_enabled()
             && !crate::kernel::boot::d6_switch_a_enabled()

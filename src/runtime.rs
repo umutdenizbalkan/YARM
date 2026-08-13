@@ -1568,7 +1568,9 @@ impl SharedKernel {
     /// an in-lock fallback superseded it). Single-CPU + IRQ-off means nothing
     /// mutates between the in-lock commit and this check, but the re-verify is
     /// the correctness fence the spec requires before dispatching.
-    #[cfg(target_arch = "x86_64")]
+    // U4: architecture-neutral. Nothing in the body is x86-specific — it was gated
+    // only because the D2 drains were. All three architectures now drain D2.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn d2_recv_reverify_blocked(&self, tid: u64) -> bool {
         self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()
@@ -1594,7 +1596,9 @@ impl SharedKernel {
     /// next runnable task here — the queue-advancing step Stage 168A had to
     /// fall back on. Returns the incoming TID (`None` ⇒ idle). Emits
     /// `D2_RECV_GENUINE_DISPATCH_STEP_SPLIT`. Default-off (gated by the caller).
-    #[cfg(target_arch = "x86_64")]
+    // U4: architecture-neutral. Nothing in the body is x86-specific — it was gated
+    // only because the D2 drains were. All three architectures now drain D2.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn d2_recv_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
@@ -1638,7 +1642,9 @@ impl SharedKernel {
     /// the rank-2 task seam — that the deferred blocking-SEND task is STILL
     /// `Blocked(EndpointSend(_))` before the out-of-lock queue-advancing dispatch
     /// drain runs. Same correctness fence as the recv reverify.
-    #[cfg(target_arch = "x86_64")]
+    // U4: architecture-neutral. Nothing in the body is x86-specific — it was gated
+    // only because the D2 drains were. All three architectures now drain D2.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn d2_send_reverify_blocked(&self, tid: u64) -> bool {
         self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()
@@ -1662,7 +1668,9 @@ impl SharedKernel {
     /// drain. The blocked sender was removed from `current` (Phase A
     /// `block_current`), so `dispatch_next_on` genuinely dequeues the next
     /// runnable task here. Emits `D2_SEND_GENUINE_DISPATCH_STEP_SPLIT`.
-    #[cfg(target_arch = "x86_64")]
+    // U4: architecture-neutral. Nothing in the body is x86-specific — it was gated
+    // only because the D2 drains were. All three architectures now drain D2.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn d2_send_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
@@ -1874,7 +1882,9 @@ impl SharedKernel {
     /// initialized == false), so this returns false for the recv workload; it
     /// gates the dormant `switch_frames` (D2_RECV_GENUINE_SWITCH_*) variant that
     /// would reuse the hardened D6-SWITCH-A stash for a kernel-thread incoming.
-    #[cfg(target_arch = "x86_64")]
+    // U4: architecture-neutral. Nothing in the body is x86-specific — it was gated
+    // only because the D2 drains were. All three architectures now drain D2.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn d2_recv_incoming_has_kernel_switch_ctx(&self, tid: u64) -> bool {
         self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()

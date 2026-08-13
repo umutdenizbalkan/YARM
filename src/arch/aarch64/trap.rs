@@ -756,7 +756,30 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
             entering_tid.unwrap_or(0)
         );
     }
-    let post_lock_bypass = futex_wait_bypass || yield_bypass || exit_disposition_bypass;
+    // U4 (AARCH64 D2 HANDLER BYPASSES): the fourth and fifth members of the same family, and
+    // required for the same reason. A committed blocking IpcRecv / IpcSend deferral marks the
+    // caller `Blocked(Endpoint{Receive,Send})` and clears `current` on purpose, relocating the
+    // queue-advancing dispatch to the post-lock trap-entry drain. Without these bypasses the
+    // `current == None` case below enters `idle_no_eret_loop()` INSIDE `with_cpu` and never
+    // returns, so the D2 drain could never run at all — the CPU would halt holding a published
+    // deferral while a runnable task waited. Each is strictly ITS OWN class's deferral: any
+    // other `current == None|Some(0)` keeps the exact idle behavior, and every other trap on
+    // every other path is bit-identical to before.
+    let d2_recv_bypass = {
+        let idx = cpu.0 as usize;
+        idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::d2_recv_dispatch_is_deferred(idx)
+    };
+    let d2_send_bypass = {
+        let idx = cpu.0 as usize;
+        idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::d2_send_dispatch_is_deferred(idx)
+    };
+    let post_lock_bypass = futex_wait_bypass
+        || yield_bypass
+        || exit_disposition_bypass
+        || d2_recv_bypass
+        || d2_send_bypass;
     if matches!(exiting_tid, None | Some(0)) {
         if exit_disposition_bypass {
             // No in-lock idle: the post-lock consumer names the idle outcome and enters the
@@ -775,6 +798,18 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         } else if yield_bypass {
             crate::yarm_log!(
                 "AARCH64_YIELD_HANDLER_BYPASS_BEGIN cpu={} outgoing_tid={}",
+                cpu.0,
+                entering_tid.unwrap_or(0)
+            );
+        } else if d2_recv_bypass {
+            crate::yarm_log!(
+                "AARCH64_D2_RECV_HANDLER_BYPASS_BEGIN cpu={} outgoing_tid={}",
+                cpu.0,
+                entering_tid.unwrap_or(0)
+            );
+        } else if d2_send_bypass {
+            crate::yarm_log!(
+                "AARCH64_D2_SEND_HANDLER_BYPASS_BEGIN cpu={} outgoing_tid={}",
                 cpu.0,
                 entering_tid.unwrap_or(0)
             );
@@ -848,6 +883,10 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         crate::yarm_log!("AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu={}", cpu.0);
     } else if yield_bypass {
         crate::yarm_log!("AARCH64_YIELD_HANDLER_BYPASS_DONE cpu={}", cpu.0);
+    } else if d2_recv_bypass {
+        crate::yarm_log!("AARCH64_D2_RECV_HANDLER_BYPASS_DONE cpu={}", cpu.0);
+    } else if d2_send_bypass {
+        crate::yarm_log!("AARCH64_D2_SEND_HANDLER_BYPASS_DONE cpu={}", cpu.0);
     }
 
     if !task_switched && matches!(event, TrapEvent::Syscall) {
