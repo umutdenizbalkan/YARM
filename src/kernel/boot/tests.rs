@@ -121616,3 +121616,509 @@ mod u3_owner_revalidation_transaction {
         );
     }
 }
+
+/// U3 (canonical 203C) — the shared recv copy-fault completion transaction.
+///
+/// The plain `CopyFault` arm and the recv-v2 `PayloadCopyFault` arm of
+/// `SharedKernel::complete_recv_boundary_user_copy` each re-entered the broad lock with the
+/// byte-identical body `recv_boundary_record_user_fault(kernel, frame, user_ptr)`. Both now
+/// call one class-neutral transaction: rank 1 (`bind_current_cpu_split`) fully released, then
+/// rank 8 (`record_fault_split_mut`) fully released, then the frame error with nothing held.
+mod u3_recv_copy_fault_completion {
+    use crate::arch::trap::{FaultAccess, FaultInfo};
+    use crate::kernel::boot::{Bootstrap, TrapHandleError};
+    use crate::kernel::ipc::Message;
+    use crate::kernel::recv_core::{RecvBoundaryUserCopySnapshot, RecvWritebackPlan};
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::task::{TaskClass, TaskStatus};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const RECEIVER: u64 = 800;
+    const FAULT_ADDR: usize = 0xDEAD_B000;
+
+    fn frame() -> TrapFrame {
+        TrapFrame::new(0, [0; 6])
+    }
+
+    /// A kernel with CPU 1 online and a registered receiver. Nothing is faulted yet.
+    fn fixture() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.bring_up_cpu(CpuId(1)).expect("cpu1");
+            s.register_task_with_class(RECEIVER, TaskClass::App)
+                .expect("receiver");
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == RECEIVER)
+                    .unwrap()
+                    .status = TaskStatus::Runnable;
+            });
+        });
+        k
+    }
+
+    /// Everything the transaction may legitimately change.
+    type Observed = (
+        Option<FaultInfo>, // last_fault
+        bool,              // last_fault_frame present
+        TrapFrame,         // the caller's frame
+        CpuId,             // bound current_cpu
+        Option<TaskStatus>,
+        Option<u64>, // current on cpu 0
+        usize,       // cpu 0 queue depth
+        usize,       // cpu 1 queue depth
+    );
+
+    fn observe(k: &SharedKernel, f: &TrapFrame) -> Observed {
+        k.with(|s| {
+            (
+                s.last_fault(),
+                s.last_fault_frame().is_some(),
+                f.clone(),
+                s.current_cpu(),
+                s.with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|t| t.tid.0 == RECEIVER)
+                        .map(|t| t.status)
+                }),
+                s.current_tid_on_cpu(CpuId(0)),
+                s.runnable_count_on_cpu(CpuId(0)),
+                s.runnable_count_on_cpu(CpuId(1)),
+            )
+        })
+    }
+
+    /// The exact retired body.
+    fn legacy(k: &SharedKernel, cpu: CpuId, f: &mut TrapFrame, addr: usize) {
+        let _ = k.with_cpu(cpu, |kernel| {
+            crate::kernel::syscall::recv_boundary_record_user_fault(kernel, f, addr);
+        });
+    }
+
+    // ── differential against the retired broad body ───────────────────────────────────────
+
+    #[test]
+    fn differential_against_the_retired_broad_record_body() {
+        for (name, cpu) in [
+            ("online cpu 0", CpuId(0)),
+            ("online cpu 1", CpuId(1)),
+            ("offline cpu 3", CpuId(3)),
+            ("out-of-range cpu 200", CpuId(200)),
+        ] {
+            let old = fixture();
+            let mut fo = frame();
+            legacy(&old, cpu, &mut fo, FAULT_ADDR);
+            let obs_old = observe(&old, &fo);
+
+            let new = fixture();
+            let mut fnew = frame();
+            let _ = new.record_recv_boundary_user_fault_split_for_test(cpu, &mut fnew, FAULT_ADDR);
+            let obs_new = observe(&new, &fnew);
+
+            assert_eq!(obs_old, obs_new, "{name}: the transaction diverged");
+        }
+    }
+
+    // ── the recorded fault and the frame encoding ─────────────────────────────────────────
+
+    #[test]
+    fn records_a_write_fault_at_the_exact_address_and_sets_page_fault() {
+        let k = fixture();
+        let mut f = frame();
+        assert!(
+            k.record_recv_boundary_user_fault_split_for_test(CpuId(0), &mut f, FAULT_ADDR)
+                .is_ok()
+        );
+        assert_eq!(
+            k.with(|s| s.last_fault()),
+            Some(FaultInfo {
+                addr: VirtAddr(FAULT_ADDR as u64),
+                access: FaultAccess::Write,
+            }),
+            "exact address, and Write access — never Read or Execute"
+        );
+        assert_eq!(f.error, SyscallError::PageFault.code());
+        // The transaction records no frame SNAPSHOT — `record_user_fault` never did.
+        assert!(
+            k.with(|s| s.last_fault_frame()).is_none(),
+            "no fault-frame snapshot is taken"
+        );
+    }
+
+    #[test]
+    fn binds_current_cpu_on_success() {
+        let k = fixture();
+        let mut f = frame();
+        assert!(
+            k.record_recv_boundary_user_fault_split_for_test(CpuId(1), &mut f, FAULT_ADDR)
+                .is_ok()
+        );
+        assert_eq!(k.with(|s| s.current_cpu()), CpuId(1));
+    }
+
+    #[test]
+    fn a_valid_idle_cpu_succeeds_without_any_current_tid() {
+        // The rank-1 phase validates and binds; it never reads a current TID, so a CPU with no
+        // current task is not a refusal. This is exactly why `current_tid_authoritative` is the
+        // wrong primitive here — its `Option` would conflate this with validation failure.
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| s.bring_up_cpu(CpuId(1)).expect("cpu1"));
+        assert_eq!(k.with(|s| s.current_tid_on_cpu(CpuId(1))), None);
+        let mut f = frame();
+        assert!(
+            k.record_recv_boundary_user_fault_split_for_test(CpuId(1), &mut f, FAULT_ADDR)
+                .is_ok()
+        );
+        assert_eq!(k.with(|s| s.current_cpu()), CpuId(1));
+        assert_eq!(f.error, SyscallError::PageFault.code());
+    }
+
+    // ── refusal: nothing may move ─────────────────────────────────────────────────────────
+
+    fn refusal_changes_nothing(cpu: CpuId, label: &str) {
+        let k = fixture();
+        // Give the fault slot a distinguishable prior value so a refusal that overwrote it
+        // would be visible rather than hidden behind `None`.
+        let prior = FaultInfo {
+            addr: VirtAddr(0x1234),
+            access: FaultAccess::Read,
+        };
+        k.with(|s| s.record_fault(prior));
+        let before_cpu = k.with(|s| s.current_cpu());
+        let before_frame_snapshot = k.with(|s| s.last_fault_frame());
+        let mut f = frame();
+        let r = k.record_recv_boundary_user_fault_split_for_test(cpu, &mut f, FAULT_ADDR);
+        assert!(r.is_err(), "{label}: the CPU must be refused");
+        assert_eq!(
+            k.with(|s| s.last_fault()),
+            Some(prior),
+            "{label}: last_fault"
+        );
+        assert_eq!(
+            k.with(|s| s.last_fault_frame()).is_some(),
+            before_frame_snapshot.is_some(),
+            "{label}: last_fault_frame"
+        );
+        assert_eq!(
+            k.with(|s| s.current_cpu()),
+            before_cpu,
+            "{label}: current_cpu"
+        );
+        assert_eq!(f, frame(), "{label}: the frame is untouched");
+    }
+
+    #[test]
+    fn an_offline_cpu_refuses_and_mutates_nothing() {
+        refusal_changes_nothing(CpuId(3), "offline cpu");
+    }
+
+    #[test]
+    fn an_out_of_range_cpu_refuses_and_mutates_nothing() {
+        refusal_changes_nothing(CpuId(200), "out-of-range cpu");
+    }
+
+    // ── nothing outside the fault slot and the CPU binding moves ──────────────────────────
+
+    #[test]
+    fn no_task_status_runqueue_or_current_task_changes() {
+        let k = fixture();
+        k.with(|s| s.enqueue_on_cpu(CpuId(1), RECEIVER).expect("queue"));
+        let before = observe(&k, &frame());
+        let mut f = frame();
+        assert!(
+            k.record_recv_boundary_user_fault_split_for_test(CpuId(0), &mut f, FAULT_ADDR)
+                .is_ok()
+        );
+        let after = observe(&k, &frame());
+        assert_eq!(before.4, after.4, "no TaskStatus change");
+        assert_eq!(before.5, after.5, "no current-task change");
+        assert_eq!(before.6, after.6, "cpu 0 queue depth unchanged");
+        assert_eq!(before.7, after.7, "cpu 1 queue depth unchanged");
+    }
+
+    // ── the full production entry reaches both converted arms ─────────────────────────────
+
+    fn plain_snapshot(asid: Option<Asid>, ptr: usize) -> RecvBoundaryUserCopySnapshot {
+        RecvBoundaryUserCopySnapshot {
+            asid,
+            receiver_tid: RECEIVER,
+            msg: Message::new(0, b"hello").expect("msg"),
+            writeback: RecvWritebackPlan::UserMemory {
+                ptr,
+                user_buf_len: 64,
+                sender_tid: 3,
+            },
+            materialized_cap: None,
+            is_reply_cap: false,
+        }
+    }
+
+    fn v2_snapshot(
+        asid: Option<Asid>,
+        ptr: usize,
+        meta_ptr: usize,
+    ) -> RecvBoundaryUserCopySnapshot {
+        RecvBoundaryUserCopySnapshot {
+            asid,
+            receiver_tid: RECEIVER,
+            msg: Message::new(0, b"hello").expect("msg"),
+            writeback: RecvWritebackPlan::UserMemoryV2 {
+                ptr,
+                user_buf_len: 64,
+                sender_tid: 3,
+                meta_ptr,
+                meta_len: 40,
+            },
+            materialized_cap: None,
+            is_reply_cap: false,
+        }
+    }
+
+    /// A receiver ASID with ONE page mapped at `0x2000`, so a copy there succeeds and a copy
+    /// to any other page faults.
+    fn mapped_fixture() -> (SharedKernel, Asid) {
+        let k = fixture();
+        let asid = k.with(|s| {
+            let (asid, map_cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(RECEIVER, asid).expect("bind");
+            s.map_user_page(
+                map_cap,
+                VirtAddr(0x2000),
+                Mapping {
+                    phys: PhysAddr(0x6000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map");
+            asid
+        });
+        (k, asid)
+    }
+
+    #[test]
+    fn the_plain_production_entry_reaches_copy_fault_and_returns_ok() {
+        // A missing ASID is exactly how the legacy `copy_to_current_user` faulted, and the
+        // boundary executor maps it to `CopyFault { user_ptr: ptr }` — the converted arm.
+        let k = fixture();
+        let mut f = frame();
+        let snap = plain_snapshot(None, 0x9000);
+        assert!(
+            matches!(
+                k.test_complete_recv_boundary_user_copy(CpuId(0), &mut f, &snap),
+                Ok(())
+            ),
+            "the plain payload copy-fault arm returns Ok(()) — no rollback, no Err"
+        );
+        assert_eq!(
+            k.with(|s| s.last_fault()),
+            Some(FaultInfo {
+                addr: VirtAddr(0x9000),
+                access: FaultAccess::Write,
+            })
+        );
+        assert_eq!(f.error, SyscallError::PageFault.code());
+    }
+
+    #[test]
+    fn the_recv_v2_production_entry_reaches_payload_copy_fault_after_meta_success() {
+        // Meta lands on the mapped page; the payload pointer is unmapped, so the executor
+        // returns `PayloadCopyFault` only AFTER the meta copy succeeded (§55 meta-first).
+        let (k, asid) = mapped_fixture();
+        let mut f = frame();
+        let snap = v2_snapshot(Some(asid), 0x9000, 0x2000);
+        assert!(
+            matches!(
+                k.test_complete_recv_boundary_user_copy(CpuId(0), &mut f, &snap),
+                Ok(())
+            ),
+            "the recv-v2 payload copy-fault arm returns Ok(()) — no rollback, no Err"
+        );
+        assert_eq!(
+            k.with(|s| s.last_fault()),
+            Some(FaultInfo {
+                addr: VirtAddr(0x9000),
+                access: FaultAccess::Write,
+            })
+        );
+        assert_eq!(f.error, SyscallError::PageFault.code());
+        // The meta really did land first — proving this is the payload arm, not the meta arm.
+        // (`Ok(())` already distinguishes them: `MetaCopyFault` returns `Err`.) The encoded
+        // payload length is a field only the meta encoder writes.
+        let meta = k
+            .with(|s| s.read_user_memory_for_asid(asid, 0x2000, 40))
+            .expect("meta was written before the payload faulted");
+        assert_eq!(
+            u32::from_le_bytes(meta[12..16].try_into().expect("payload_len")),
+            b"hello".len() as u32,
+            "the 40-byte recv-v2 meta landed before the payload copy faulted"
+        );
+    }
+
+    #[test]
+    fn the_recv_v2_meta_fault_arm_is_untouched_and_still_errs() {
+        // A missing ASID surfaces at the FIRST copy: `MetaCopyFault` — the arm this increment
+        // did NOT convert. It must still return Err(PageFault).
+        let k = fixture();
+        let mut f = frame();
+        let snap = v2_snapshot(None, 0x9000, 0x2000);
+        assert!(
+            matches!(
+                k.test_complete_recv_boundary_user_copy(CpuId(0), &mut f, &snap),
+                Err(TrapHandleError::Syscall(SyscallError::PageFault))
+            ),
+            "the meta-fault arm keeps its rollback + Err(PageFault) contract"
+        );
+    }
+
+    // ── source guards ────────────────────────────────────────────────────────────────────
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of(name: &str) -> alloc::string::String {
+        let tail = RUNTIME
+            .split(name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{name}` must exist"));
+        code_of(tail.split_once("\n    }\n").expect("the method closes").0)
+    }
+
+    #[test]
+    fn both_target_acquisitions_are_gone_and_only_the_rollback_re_entry_remains() {
+        let body = body_of("fn complete_recv_boundary_user_copy");
+        // The two converted arms hold no acquisition and no borrow.
+        assert!(
+            !body.contains("recv_boundary_record_user_fault"),
+            "neither fault arm may re-enter the broad lock to record"
+        );
+        assert!(
+            !body.contains("self.with(|") && !body.contains("|kernel| {\n                        crate::kernel::syscall::recv_boundary_record_user_fault"),
+            "no broad `with`, no fallback"
+        );
+        // EXACTLY one `with_cpu` survives in the method: the dependency-blocked capability
+        // rollback. Not zero (that would mean the rollback was touched), not two.
+        assert_eq!(
+            body.matches(".with_cpu(").count(),
+            1,
+            "only the capability-rollback re-entry may remain"
+        );
+        let remaining = body
+            .split(".with_cpu(")
+            .nth(1)
+            .expect("the surviving acquisition");
+        assert!(
+            remaining.contains("rollback_materialized_recv_cap("),
+            "the surviving acquisition must be the capability rollback, unchanged"
+        );
+        // The shared transaction is used by BOTH arms.
+        assert_eq!(
+            body.matches("self.record_recv_boundary_user_fault_split(cpu, frame, user_ptr)")
+                .count(),
+            2,
+            "one shared transaction, called from both converted arms"
+        );
+    }
+
+    #[test]
+    fn the_transaction_is_rank_ordered_and_takes_each_domain_once() {
+        let t = body_of("fn record_recv_boundary_user_fault_split");
+        assert!(
+            !t.contains(".with_cpu(") && !t.contains("self.with(|"),
+            "no broad acquisition and no fallback"
+        );
+        // rank 1 strictly before rank 8, each taken exactly once, and the frame error last.
+        let bind = t.find("bind_current_cpu_split").expect("rank 1");
+        let record = t.find("record_fault_split_mut").expect("rank 8");
+        let set_err = t.find("frame.set_err").expect("the frame error");
+        assert!(
+            bind < record && record < set_err,
+            "rank 1 -> rank 8 -> frame error, with the record before the frame error"
+        );
+        assert_eq!(t.matches("bind_current_cpu_split").count(), 1);
+        assert_eq!(t.matches("record_fault_split_mut").count(), 1);
+        // The rank-1 guard is released by `bind_current_cpu_split` returning: the transaction
+        // never nests the fault seam inside a scheduler closure.
+        assert!(
+            !t.contains("with_scheduler_split_mut"),
+            "the binding is delegated, never re-implemented or held open"
+        );
+        // Exactly the legacy record, and no frame snapshot.
+        assert!(t.contains("access: FaultAccess::Write"));
+        assert!(t.contains("addr: VirtAddr(addr as u64)"));
+        assert!(!t.contains("record_fault_frame_snapshot"));
+        // The refusal propagates before anything else runs.
+        assert!(t.contains("self.bind_current_cpu_split(cpu)?;"));
+    }
+
+    #[test]
+    fn the_dependency_blocked_and_deferred_acquisitions_all_remain() {
+        let code = code_of(RUNTIME);
+        assert_eq!(
+            code.matches("rollback_materialized_recv_cap(").count(),
+            3,
+            "all three dependency-blocked capability-rollback callsites remain"
+        );
+        // The deferred ordinary-cap sender-wake acquisition is untouched.
+        let ordinary = body_of("fn complete_recv_boundary_ordinary_cap");
+        assert!(
+            ordinary.contains(".with_cpu("),
+            "the ordinary-cap acquisition set is not part of this increment"
+        );
+    }
+
+    #[test]
+    fn no_ownership_primitive_gained_a_production_caller() {
+        let t = body_of("fn record_recv_boundary_user_fault_split");
+        let body = body_of("fn complete_recv_boundary_user_copy");
+        for op in [
+            "waiter_ownership_arm_current",
+            "waiter_ownership_claim",
+            "waiter_ownership_consume",
+            "waiter_ownership_restore",
+            "waiter_ownership_cancel",
+            "waiter_ownership_retire_current",
+        ] {
+            assert!(
+                !t.contains(op) && !body.contains(op),
+                "`{op}` must gain no caller in this cohort"
+            );
+        }
+    }
+
+    #[test]
+    fn the_promoted_binding_transaction_is_architecture_neutral_and_unduplicated() {
+        // `bind_current_cpu_split` lost its x86_64 gate because nothing in it is
+        // architecture-specific — and no second CPU-binding implementation appeared.
+        let decl = RUNTIME
+            .split("pub(crate) fn bind_current_cpu_split")
+            .next()
+            .expect("the declaration prefix");
+        let attrs = &decl[decl.len().saturating_sub(200)..];
+        assert!(
+            !attrs.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "the binding transaction must be architecture-neutral"
+        );
+        assert_eq!(
+            RUNTIME.matches("fn bind_current_cpu_split").count(),
+            1,
+            "exactly one CPU-binding transaction exists"
+        );
+        let bind = body_of("pub(crate) fn bind_current_cpu_split");
+        assert!(bind.contains("validate_online_cpu(cpu)") && bind.contains("current_cpu = cpu"));
+        assert!(
+            !bind.contains("target_arch") && !bind.contains("x86"),
+            "its body names no architecture"
+        );
+    }
+}

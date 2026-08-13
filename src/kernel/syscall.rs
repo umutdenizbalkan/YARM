@@ -1832,6 +1832,12 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
 /// addr, Write)` call the legacy queued-split writeback performed. Called from
 /// `SharedKernel` (runtime.rs) inside a brief `with_cpu` re-entry — this
 /// function itself calls NO seam helper (the broad borrow is live here).
+/// U3 (203C): both production call sites — the plain `CopyFault` arm and the recv-v2
+/// `PayloadCopyFault` arm of `complete_recv_boundary_user_copy` — now reach this operation
+/// through `SharedKernel::record_recv_boundary_user_fault_split`, which holds no broad lock.
+/// This body is retained as the reference the focused differential compares that transaction
+/// against, so the two cannot drift; it has no remaining production caller.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn recv_boundary_record_user_fault(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,

@@ -103,7 +103,15 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // `TaskStatus` write), which is fully released before the frame / FS-base / CR3 work.
     // Rollback re-takes rank 1 alone. The proven-infallible legacy restore is why the
     // `restorable` requeue arm stays unreachable there, exactly as it was under the broad lock.
-    ("src/runtime.rs", 7),
+    // U3 (203C): 7 -> 5. The two homologous recv copy-fault completions in
+    // `complete_recv_boundary_user_copy` — the plain `CopyFault` arm and the recv-v2
+    // `PayloadCopyFault` arm — each re-entered the broad lock with the byte-identical body
+    // `recv_boundary_record_user_fault(k, frame, user_ptr)`. Both now call ONE class-neutral
+    // transaction, `record_recv_boundary_user_fault_split`: rank 1 (the existing
+    // `bind_current_cpu_split`, promoted to architecture-neutral) then rank 8 (the existing
+    // `record_fault_split_mut`), then the frame error with no lock held. No new seam. The
+    // capability-rollback re-entry in the same method is dependency-blocked and untouched.
+    ("src/runtime.rs", 5),
 ];
 
 /// Per-file count of production broad `SharedKernel::with(|state| …)` callsites.
@@ -148,7 +156,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 16; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 (+ the post-drain idle-owner revalidation)
+const AUDITED_WITH_CPU_TOTAL: usize = 14; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 (+ the two recv copy-fault completions)
 const AUDITED_WITH_BROAD_TOTAL: usize = 1; // U3: 6 -> 2 -> 1 (runtime.rs fully drained; the reached x86 AP SMP read retired)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -157,7 +165,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 17; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 (twenty-seven retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 15; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 (twenty-nine retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

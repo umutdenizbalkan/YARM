@@ -23,9 +23,9 @@ Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **16** |
+| Production `SharedKernel::with_cpu` callsites | **14** |
 | Production broad `SharedKernel::with` callsites | **1** |
-| **Total production broad-lock acquisition sites** | **17** |
+| **Total production broad-lock acquisition sites** | **15** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **x86_64 (live) + AArch64 (structural, proof-gated)** via `offlock_authoritative_dispatch_enabled()`; `d6_genuine_enabled()` itself remains compile-time x86_64-only. RISC-V not admitted. |
@@ -1357,7 +1357,7 @@ exec-load policy, and capability-materialization rules.
 | D6 switch proof harness | 🧪 default-off diagnostic only (`yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`); mutually exclusive with the production D6-genuine path. Historical bring-up detail (Stages 120–132) is in `doc/PROJECT_HISTORY.md` |
 | AP scheduler participation | 🧪 **proof-gated live** — `X86_AP_GENERIC_RETURN_SEAL`, `X86_AP_SAVED_RETURN_SEAL`, `X86_AP_RECV_V2_BLOCK_SEAL` and the cross-CPU NR6/NR7 seals all earned live at SMP=2 under default-off knobs; the **production** scheduler is still BSP-only (`online_cpu_count()` == 1) |
 | Timer interrupts on APs | ❌ not enabled on the production path |
-| Restore-owner selection | ⚠️ resolved **in-lock** (identity-coherent) and revalidated after the drains by `revalidate_idle_owner_after_drains`; that revalidation is **hosted-proven only, never run in QEMU** |
+| Restore-owner selection | ⚠️ resolved **in-lock** (identity-coherent) and revalidated after the drains by `revalidate_idle_owner_after_drains`. **Corrected at U3 (203C):** that revalidation IS live in QEMU — `scripts/qemu-x86_64-server-dies-smoke.sh` reaches `EXIT_TASK_OWNER_REVALIDATED arch=x86_64 … prepared=idle committed=replacement advances=1 broad_lock=0 result=ok` on every run, and the increment that retired its broad re-acquisition was accepted against five consecutive such runs. The earlier "never run in QEMU" claim was stale |
 
 See `doc/ARCH_X86_64.md` for the safety fences, AP marker sequence, BT2
 LAPIC timer discipline, and the ordered next-target list before AP
@@ -1547,13 +1547,15 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **17** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **15** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there
    is no hard `result=fail` left in the tree. Two follow-ons, of different kinds: the
-   **x86_64 ServerDies live cell** (a runner act — one clean boot earns the first cell and
-   finally exercises `revalidate_idle_owner_after_drains`, which has never run in QEMU), and
+   **x86_64 ServerDies live cell** (a runner act — one clean boot earns the first cell. The
+   parenthetical that `revalidate_idle_owner_after_drains` "has never run in QEMU" was stale
+   and is corrected at U3 (203C): the runner reaches it live, and its broad re-acquisition was
+   retired against five consecutive runs), and
    the **smallest production change**, flipping `ipccall_direct_proof_enabled()` to the
    production default on x86_64 so the landed off-lock NR 6 / NR 7 transaction is actually
    taken by a normal boot. Neither completes 199D. See `doc/KERNEL_UNLOCKING.md` §0 and

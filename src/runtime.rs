@@ -2669,7 +2669,13 @@ impl SharedKernel {
     ///
     /// The guard is released when this returns, before the caller's marker emission and its
     /// hardware-CR3 observation.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// U3 (203C) — **architecture-neutral**. This was introduced `#[cfg(target_arch = "x86_64")]`
+    /// only because its first caller was the x86_64 D6 first-resume path. Nothing in the body is
+    /// architecture-specific: `validate_online_cpu` is the portable scheduler predicate
+    /// `KernelState::set_current_cpu` applies on every architecture, and `sched.current_cpu` is the
+    /// portable stored binding. The recv copy-fault completion transaction reaches it on every
+    /// architecture, so the gate is gone rather than a second CPU-binding implementation existing.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn bind_current_cpu_split(&self, cpu: CpuId) -> Result<(), KernelError> {
         self.with_scheduler_split_mut(|sched| {
@@ -3382,14 +3388,10 @@ impl SharedKernel {
                         Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))
                     }
                     RecvUserWritebackOutcome::CopyFault { user_ptr } => {
-                        // No rollback on payload copy fault (§54/§58) — fault
-                        // record + frame error under a brief re-entry, identical
-                        // to the legacy record_user_fault call.
-                        let _ = self.with_cpu(cpu, |kernel| {
-                            crate::kernel::syscall::recv_boundary_record_user_fault(
-                                kernel, frame, user_ptr,
-                            );
-                        });
+                        // No rollback on payload copy fault (§54/§58) — fault record + frame
+                        // error. U3 (203C): the rank-1 -> rank-8 transaction below replaces the
+                        // broad re-entry; same record, same frame encoding, same ignored result.
+                        let _ = self.record_recv_boundary_user_fault_split(cpu, frame, user_ptr);
                         Ok(())
                     }
                 }
@@ -3432,13 +3434,11 @@ impl SharedKernel {
                         Err(TrapHandleError::Syscall(SyscallError::PageFault))
                     }
                     RecvV2WritebackOutcome::PayloadCopyFault { user_ptr } => {
-                        // No rollback on payload copy fault (§55/§58).
+                        // No rollback on payload copy fault (§55/§58). U3 (203C): the SAME
+                        // class-neutral transaction the plain arm uses — the two fault records
+                        // were byte-identical and now share one implementation.
                         crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_fault");
-                        let _ = self.with_cpu(cpu, |kernel| {
-                            crate::kernel::syscall::recv_boundary_record_user_fault(
-                                kernel, frame, user_ptr,
-                            );
-                        });
+                        let _ = self.record_recv_boundary_user_fault_split(cpu, frame, user_ptr);
                         Ok(())
                     }
                 }
@@ -3447,6 +3447,54 @@ impl SharedKernel {
                 unreachable!("KernelRegister writeback completes in Phase A, never deferred")
             }
         }
+    }
+
+    /// U3 (canonical 203C) — the class-neutral recv-boundary user-fault completion, replacing
+    /// the two homologous broad re-entries the plain and recv-v2 payload copy-fault arms used
+    /// to make. Both ran the byte-identical body
+    /// `with_cpu(cpu, |k| recv_boundary_record_user_fault(k, frame, user_ptr))`, which is
+    /// `record_user_fault(.., FaultAccess::Write)`: record the fault, then set `PageFault` on
+    /// the frame. Nothing in it needed the whole `KernelState`.
+    ///
+    /// Rank-ordered, ascending, with each guard fully released before the next step:
+    ///
+    /// 1. **rank 1** — [`Self::bind_current_cpu_split`], which is exactly the CPU
+    ///    validate-and-bind `with_cpu` performed on entry through `set_current_cpu`: the same
+    ///    `validate_online_cpu` predicate, `scheduler.current_cpu` left untouched on refusal,
+    ///    bound unconditionally on success. No second binding implementation is introduced.
+    /// 2. **rank 8** — the existing `record_fault_split_mut`, recording the identical
+    ///    `FaultInfo { addr: VirtAddr(addr as u64), access: FaultAccess::Write }`.
+    /// 3. **no lock held** — `frame.set_err(SyscallError::PageFault.code())`.
+    ///
+    /// The record precedes the frame error, exactly as `record_user_fault` ordered them.
+    ///
+    /// A refused CPU propagates the same `KernelError` class the broad `with_cpu` returned and
+    /// mutates **nothing**: no fault is recorded and the frame is untouched — the broad body's
+    /// closure never ran either. Callers ignore the result exactly as they ignored `with_cpu`'s.
+    ///
+    /// This adds no seam: it composes the existing rank-1 binding transaction with the existing
+    /// rank-8 fault seam. It records no frame snapshot, touches no `TaskStatus`, and performs no
+    /// scheduler, IPC, capability, VM, memory, ownership or notification work.
+    fn record_recv_boundary_user_fault_split(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        addr: usize,
+    ) -> Result<(), KernelError> {
+        use crate::arch::trap::{FaultAccess, FaultInfo};
+        use crate::kernel::syscall::SyscallError;
+        use crate::kernel::vm::VirtAddr;
+
+        // (1) rank 1 — the CPU authentication and binding `with_cpu` performed on entry.
+        self.bind_current_cpu_split(cpu)?;
+        // (2) rank 8 — the fault record, identical to `record_user_fault`'s.
+        self.record_fault_split_mut(FaultInfo {
+            addr: VirtAddr(addr as u64),
+            access: FaultAccess::Write,
+        });
+        // (3) no lock held — the frame error, after the record, as `record_user_fault` ordered.
+        frame.set_err(SyscallError::PageFault.code());
+        Ok(())
     }
 
     /// Stage 198B — emit the AUTHORITATIVE ordinary-cap object-identity proof for a freshly
@@ -8606,6 +8654,29 @@ pub(crate) static FORCE_POST_COPY_MEMBERSHIP: core::sync::atomic::AtomicU8 =
 impl SharedKernel {
     /// Inject the membership the hook asks for, immediately before a direct transaction's final
     /// rank-1 enqueue. One-shot: it clears itself so a retry of the same transaction succeeds.
+    /// U3 (203C) — test-only entry to the PRIVATE recv-boundary Phase B/C completion, so the
+    /// focused tests drive the real production body (both copy-fault arms included) instead of
+    /// re-implementing it. `#[cfg(test)]`: no shipped kernel has it, and it adds no acquisition.
+    /// U3 (203C) — test-only entry to the PRIVATE fault-record transaction, so the focused
+    /// differential can compare it against the retired broad body directly.
+    pub(crate) fn record_recv_boundary_user_fault_split_for_test(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        addr: usize,
+    ) -> Result<(), KernelError> {
+        self.record_recv_boundary_user_fault_split(cpu, frame, addr)
+    }
+
+    pub(crate) fn test_complete_recv_boundary_user_copy(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        pending: &crate::kernel::recv_core::RecvBoundaryUserCopySnapshot,
+    ) -> Result<(), crate::kernel::boot::TrapHandleError> {
+        self.complete_recv_boundary_user_copy(cpu, frame, pending)
+    }
+
     pub(crate) fn test_force_post_copy_membership(&self, tid: u64, affinity: Option<CpuId>) {
         use core::sync::atomic::Ordering;
         let mode = FORCE_POST_COPY_MEMBERSHIP.swap(0, Ordering::Relaxed);
