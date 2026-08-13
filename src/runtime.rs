@@ -2492,7 +2492,45 @@ impl SharedKernel {
         });
 
         // (4)/(5) — the wake, reproducing `apply_scheduler_wake_plan(Wake(tid))`.
-        self.wake_blocked_waiter_split(cpu, wake_tid)
+        self.wake_tid_to_runnable_split(cpu, wake_tid)
+    }
+
+    /// U3 (canonical 203C) — the split form of
+    /// `with_cpu(cpu, |k| k.apply_split_sender_wake_plan(tid))`, the deferred ordinary-cap
+    /// sender wake on the recv boundary.
+    ///
+    /// The broad body was a two-line composition: `IPC_RECV_SPLIT_REFILL_WAKE_APPLY`, then
+    /// `apply_scheduler_wake_plan(Wake(tid))` — which is `wake_tid_to_runnable(tid)`. It took
+    /// the whole `KernelState` lock for the CPU validate-and-bind `with_cpu` performs on entry
+    /// plus one scheduler/task wake. This reproduces it step for step:
+    ///
+    /// 1. **rank 1** — [`Self::bind_current_cpu_split`]: the same `validate_online_cpu`
+    ///    predicate `set_current_cpu` applies. A refusal returns the same `KernelError` class,
+    ///    leaves `current_cpu` and every task/scheduler field untouched, and — exactly as the
+    ///    broad closure that never ran — emits NO marker and performs NO wake. Released.
+    /// 2. The marker, with identical text and fields, only after a successful bind.
+    /// 3. **rank 2 then rank 1** — the SHARED [`Self::wake_tid_to_runnable_split`], the one
+    ///    body this transaction and the blocked-waiter completion both use. No wake logic is
+    ///    duplicated here.
+    ///
+    /// This is deliberately NOT routed through `complete_blocked_waiter_delivery_split`: that
+    /// transaction also clears the receiver's return registers and the endpoint waiter slot,
+    /// neither of which is part of sender-wake semantics.
+    ///
+    /// Nothing is strengthened: no endpoint identity, ASID, wait generation, `WaiterKey` or
+    /// ownership state is consulted. This stays the existing generic sender wake.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn apply_split_sender_wake_plan_split(
+        &self,
+        cpu: CpuId,
+        sender_tid: crate::kernel::ipc::ThreadId,
+    ) -> Result<(), KernelError> {
+        // (1) rank 1 — the CPU authentication and binding `with_cpu` performed on entry.
+        self.bind_current_cpu_split(cpu)?;
+        // (2) the marker `KernelState::apply_split_sender_wake_plan` emitted, unchanged.
+        crate::yarm_log!("IPC_RECV_SPLIT_REFILL_WAKE_APPLY tid={}", sender_tid.0);
+        // (3) the shared wake body — `apply_scheduler_wake_plan(Wake(tid))`.
+        self.wake_tid_to_runnable_split(cpu, sender_tid)
     }
 
     /// U3 (canonical 203C) — the split form of `KernelState::wake_tid_to_runnable`.
@@ -2508,8 +2546,14 @@ impl SharedKernel {
     ///
     /// The rank-2 half is one acquisition and the rank-1 enqueue is a separate later one, so no
     /// lock is held across the other.
+    ///
+    /// **It does NOT bind `current_cpu`** — every caller has already authenticated and bound the
+    /// CPU it passes. U3 (203C) gave it a second production caller, the ordinary-cap deferred
+    /// sender wake (through [`Self::apply_split_sender_wake_plan_split`]), and renamed it from
+    /// `wake_blocked_waiter_split` to name the operation rather than the first caller: it is the
+    /// single split form of `wake_tid_to_runnable`, and there is exactly one body.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn wake_blocked_waiter_split(
+    fn wake_tid_to_runnable_split(
         &self,
         cpu: CpuId,
         tid: crate::kernel::ipc::ThreadId,
@@ -3712,7 +3756,10 @@ impl SharedKernel {
         // Step 3 — deferred sender wake (AFTER materialize, BEFORE writeback:
         // §56/§58 order). Brief global re-entry; no seam inside.
         if let Some(wake_tid) = pending.wake_tid {
-            let _ = self.with_cpu(cpu, |kernel| kernel.apply_split_sender_wake_plan(wake_tid));
+            // U3 (canonical 203C): the broad re-entry is retired. Same order, same marker, same
+            // wake, and the result stays ignored exactly as `let _ = self.with_cpu(...)` ignored
+            // it — including a CPU refusal, which wakes nothing and emits nothing.
+            let _ = self.apply_split_sender_wake_plan_split(cpu, wake_tid);
             crate::yarm_log!(
                 "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
                 wake_tid.0
@@ -8706,6 +8753,27 @@ impl SharedKernel {
     /// U3 (203C) — test-only entry to the PRIVATE recv-boundary Phase B/C completion, so the
     /// focused tests drive the real production body (both copy-fault arms included) instead of
     /// re-implementing it. `#[cfg(test)]`: no shipped kernel has it, and it adds no acquisition.
+    /// U3 (203C) — test-only entries to the PRIVATE ordinary-cap completion and to the split
+    /// sender-wake composition, so the focused tests drive the real production bodies instead
+    /// of re-implementing them. `#[cfg(test)]`: no shipped kernel has them, and they add no
+    /// acquisition.
+    pub(crate) fn test_complete_recv_boundary_ordinary_cap(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        pending: crate::kernel::recv_core::RecvBoundaryOrdinaryCapSnapshot,
+    ) -> Result<(), crate::kernel::boot::TrapHandleError> {
+        self.complete_recv_boundary_ordinary_cap(cpu, frame, pending)
+    }
+
+    pub(crate) fn test_apply_split_sender_wake_plan_split(
+        &self,
+        cpu: CpuId,
+        sender_tid: crate::kernel::ipc::ThreadId,
+    ) -> Result<(), KernelError> {
+        self.apply_split_sender_wake_plan_split(cpu, sender_tid)
+    }
+
     /// U3 (203C) — test-only entry to the PRIVATE fault-record transaction, so the focused
     /// differential can compare it against the retired broad body directly.
     pub(crate) fn record_recv_boundary_user_fault_split_for_test(

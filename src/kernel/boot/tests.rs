@@ -114801,7 +114801,7 @@ mod stage199d_wa2a_ownership_boundary {
             ("src/kernel/spawn_reservation.rs", 2),
             ("src/kernel/task.rs", 2),
             ("src/kernel/task_transition.rs", 1),
-            // U3 (203C): 5 -> 6. `wake_blocked_waiter_split` is the split form of
+            // U3 (203C): 5 -> 6. `wake_tid_to_runnable_split` is the split form of
             // `wake_tid_to_runnable`'s `Blocked|Running -> Runnable` transition, added when the
             // three blocked-waiter Phase-C completions retired their broad acquisitions. It is a
             // WAKE owner of exactly the same class as the in-lock writer it mirrors.
@@ -115300,7 +115300,7 @@ mod stage199d_wa2b_wake_owner_census {
         // as the in-lock writer it mirrors, so it carries the same verdict.
         (
             "src/runtime.rs",
-            "wake_blocked_waiter_split",
+            "wake_tid_to_runnable_split",
             1,
             Verdict::Can,
         ),
@@ -115706,7 +115706,7 @@ mod stage199d_wa2b_wake_owner_census {
         ),
         (
             "src/runtime.rs",
-            "wake_blocked_waiter_split",
+            "wake_tid_to_runnable_split",
             "tcb.status",
             "TaskStatus::Runnable",
             "if !matches!(old_status, TaskStatus::Runnable) {",
@@ -115828,7 +115828,7 @@ mod stage199d_wa2b_wake_owner_census {
         assert_eq!(
             sites.len(),
             30,
-            "30 raw writes: U3 (203C) added `wake_blocked_waiter_split`, the split form of \
+            "30 raw writes: U3 (203C) added `wake_tid_to_runnable_split`, the split form of \
              `wake_tid_to_runnable`'s transition, when the blocked-waiter Phase-C completions \
              retired their broad acquisitions"
         );
@@ -115892,14 +115892,14 @@ mod stage199d_wa2b_wake_owner_census {
         // `ThreadControlBlock::reserved` — the non-live reservation constructor this stage
         // requires — is a genuinely NEW fresh-constructor writer. Reporting 38 is the honest
         // result; forcing 37 would mean hiding one of the two.
-        // U3 (203C) raises it to 39: `wake_blocked_waiter_split` is the split form of the
+        // U3 (203C) raises it to 39: `wake_tid_to_runnable_split` is the split form of the
         // `wake_tid_to_runnable` transition the blocked-waiter Phase-C completions used to
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
             39,
             "37 pinned by WA2A-R1, `ThreadControlBlock::reserved`, and U3 (203C)'s \
-             `wake_blocked_waiter_split`"
+             `wake_tid_to_runnable_split`"
         );
         assert_eq!(
             FINGERPRINTS.len()
@@ -116082,7 +116082,7 @@ mod stage199d_wa2b_wake_owner_census {
                     // `execute_dispatch_post_work` — are GONE from this set. They reached
                     // `apply_scheduler_wake_plan` only through the broad `with_cpu` re-entry
                     // this stage retired; they now go through the rank-ordered completion
-                    // transaction, whose wake phase is `wake_blocked_waiter_split`. The
+                    // transaction, whose wake phase is `wake_tid_to_runnable_split`. The
                     // shrinkage IS the retirement: no wake origin was removed, it moved off the
                     // broad lock.
                 ],
@@ -116214,7 +116214,7 @@ mod stage199d_wa2b_wake_owner_census {
         // one-shot reservation protocol, and added ONE new fresh-constructor writer
         // (`ThreadControlBlock::reserved`). Hence 38, not 37: the two movements the stage
         // predicted hold exactly, and the extra site is disclosed rather than absorbed.
-        // U3 (203C) adds ONE row, `wake_blocked_waiter_split`, to CAN: the split form of the
+        // U3 (203C) adds ONE row, `wake_tid_to_runnable_split`, to CAN: the split form of the
         // `wake_tid_to_runnable` transition the blocked-waiter Phase-C completions previously
         // reached under the retired broad acquisition. Same class, new seam — so CAN moves
         // 12 → 13 and nothing else moves.
@@ -120868,7 +120868,7 @@ mod u3_blocked_waiter_completion_transaction {
     #[test]
     fn u3_bw_transaction_lock_trace_is_canonical_and_has_no_broad_acquisition() {
         let outer = body_of("pub(crate) fn complete_blocked_waiter_delivery_split");
-        let wake = body_of("fn wake_blocked_waiter_split");
+        let wake = body_of("fn wake_tid_to_runnable_split");
         for (name, body) in [("completion", &outer), ("wake", &wake)] {
             assert!(
                 !body.contains(".with_cpu(") && !body.contains("self.with(|"),
@@ -120881,7 +120881,7 @@ mod u3_blocked_waiter_completion_transaction {
             .find("with_task_tcbs_split_mut")
             .expect("rank 2 register clear");
         let ipc = outer.find("with_ipc_split_mut").expect("rank 3");
-        let wake_call = outer.find("wake_blocked_waiter_split").expect("the wake");
+        let wake_call = outer.find("wake_tid_to_runnable_split").expect("the wake");
         assert!(
             sched < task && task < ipc && ipc < wake_call,
             "rank 1 -> rank 2 -> rank 3 -> wake, matching the legacy order"
@@ -120969,7 +120969,7 @@ mod u3_blocked_waiter_completion_transaction {
         }
         let outer = body_of("pub(crate) fn complete_blocked_waiter_delivery_split");
         // No class-specific telemetry and no class name inside the seam. (The helper it calls
-        // is `wake_blocked_waiter_split`, which is class-neutral despite the shared substring.)
+        // is `wake_tid_to_runnable_split`, which is class-neutral despite the shared substring.)
         assert!(
             !outer.contains("kind=blocked_waiter_")
                 && !outer.contains("DISPATCH_POST_WORK_")
@@ -120987,7 +120987,7 @@ mod u3_blocked_waiter_completion_transaction {
         // This cohort arms, claims, consumes, cancels, restores and retires nothing.
         let code = code_of(RUNTIME);
         let outer = body_of("pub(crate) fn complete_blocked_waiter_delivery_split");
-        let wake = body_of("fn wake_blocked_waiter_split");
+        let wake = body_of("fn wake_tid_to_runnable_split");
         for op in [
             "arm_waiter_ownership",
             "claim_waiter_ownership",
@@ -122544,5 +122544,567 @@ mod u3_riscv_terminal_idle_snapshot {
                 "`{op}` must gain no caller in this drain"
             );
         }
+    }
+}
+
+/// U3 (canonical 203C) — the ordinary-cap DEFERRED SENDER WAKE.
+///
+/// `SharedKernel::complete_recv_boundary_ordinary_cap` re-entered the broad lock to run
+/// `apply_split_sender_wake_plan(tid)` — the `IPC_RECV_SPLIT_REFILL_WAKE_APPLY` marker, then
+/// `apply_scheduler_wake_plan(Wake(tid))`, which is `wake_tid_to_runnable`. It now calls
+/// `apply_split_sender_wake_plan_split`: rank 1 (`bind_current_cpu_split`) released, the same
+/// marker, then the SHARED `wake_tid_to_runnable_split` body.
+mod u3_ordinary_cap_sender_wake {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::{CapId, CapObject, CapRights};
+    use crate::kernel::ipc::{Message, ThreadId};
+    use crate::kernel::recv_core::{RecvBoundaryOrdinaryCapSnapshot, RecvWritebackPlan};
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const RECEIVER: u64 = 1000;
+    const SENDER: u64 = 1001;
+
+    fn frame() -> crate::kernel::trapframe::TrapFrame {
+        crate::kernel::trapframe::TrapFrame::new(0, [0; 6])
+    }
+
+    /// A kernel with CPU 1 online, a receiver holding a mapped user page, and a `SENDER` task
+    /// in `status`, optionally pinned.
+    fn fixture(status: TaskStatus, affinity: Option<CpuId>) -> (SharedKernel, Asid, CapObject) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, object) = k.with(|s| {
+            s.bring_up_cpu(CpuId(1)).expect("cpu1");
+            s.register_task_with_class(RECEIVER, TaskClass::App)
+                .expect("receiver");
+            s.register_task_with_class(SENDER, TaskClass::App)
+                .expect("sender");
+            let (asid, map_cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(RECEIVER, asid).expect("bind");
+            s.map_user_page(
+                map_cap,
+                VirtAddr(0x2000),
+                Mapping {
+                    phys: PhysAddr(0x6000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map");
+            s.with_tcbs_mut(|tcbs| {
+                for tcb in tcbs.iter_mut().flatten() {
+                    if tcb.tid.0 == SENDER {
+                        tcb.status = status;
+                        tcb.cpu_affinity = affinity;
+                        tcb.ipc_timeout_deadline = Some(4242);
+                        tcb.ipc_timeout_fired = true;
+                    }
+                }
+            });
+            // A REAL endpoint, so the transferred object is live and resolvable after the mint.
+            let (_idx, send_cap, _recv_cap) = s.create_endpoint(4).expect("endpoint");
+            let root = s.task_cnode(0).expect("root cnode");
+            let object = s
+                .capability_for_cnode(root, send_cap)
+                .expect("live endpoint cap")
+                .object;
+            (asid, object)
+        });
+        (k, asid, object)
+    }
+
+    fn snapshot(
+        k: &SharedKernel,
+        asid: Asid,
+        object: CapObject,
+        wake_tid: Option<ThreadId>,
+    ) -> RecvBoundaryOrdinaryCapSnapshot {
+        let cnode = k.with(|s| s.task_cnode(RECEIVER).expect("cnode"));
+        RecvBoundaryOrdinaryCapSnapshot {
+            receiver_cnode: cnode,
+            // A live Endpoint object: an ordinary (non-reply, non-shared-region) transfer.
+            object,
+            rights: CapRights::SEND,
+            source_tid: SENDER,
+            source_cap: CapId(7),
+            wake_tid,
+            asid: Some(asid),
+            receiver_tid: RECEIVER,
+            msg: Message::new(0, b"hi").expect("msg"),
+            writeback: RecvWritebackPlan::UserMemory {
+                ptr: 0x2000,
+                user_buf_len: 64,
+                sender_tid: SENDER as usize,
+            },
+        }
+    }
+
+    /// Everything a sender wake may legitimately change.
+    type Observed = (
+        CpuId,              // bound current_cpu
+        Option<TaskStatus>, // SENDER status
+        Option<u64>,        // SENDER ipc_timeout_deadline
+        bool,               // SENDER ipc_timeout_fired
+        Option<TaskStatus>, // RECEIVER status (bystander)
+        Option<u64>,        // current on cpu 0
+        Option<u64>,        // current on cpu 1
+        usize,              // cpu 0 queue depth
+        usize,              // cpu 1 queue depth
+    );
+
+    fn observe(k: &SharedKernel) -> Observed {
+        k.with(|s| {
+            let f = |tid: u64| {
+                s.with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|t| t.tid.0 == tid)
+                        .map(|t| (t.status, t.ipc_timeout_deadline, t.ipc_timeout_fired))
+                })
+            };
+            let sender = f(SENDER);
+            (
+                s.current_cpu(),
+                sender.map(|x| x.0),
+                sender.and_then(|x| x.1),
+                sender.map(|x| x.2).unwrap_or(false),
+                f(RECEIVER).map(|x| x.0),
+                s.current_tid_on_cpu(CpuId(0)),
+                s.current_tid_on_cpu(CpuId(1)),
+                s.runnable_count_on_cpu(CpuId(0)),
+                s.runnable_count_on_cpu(CpuId(1)),
+            )
+        })
+    }
+
+    /// The exact retired body.
+    fn legacy(k: &SharedKernel, cpu: CpuId, tid: ThreadId) {
+        let _ = k.with_cpu(cpu, |kernel| kernel.apply_split_sender_wake_plan(tid));
+    }
+
+    fn candidate(k: &SharedKernel, cpu: CpuId, tid: ThreadId) {
+        let _ = k.test_apply_split_sender_wake_plan_split(cpu, tid);
+    }
+
+    // ── 8. the differential, over the meaningful status/affinity cases ────────────────────
+
+    #[test]
+    fn differential_against_the_retired_broad_wake_body() {
+        type Case = (&'static str, TaskStatus, Option<CpuId>);
+        let cases: [Case; 8] = [
+            (
+                "blocked, unpinned",
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+                None,
+            ),
+            (
+                "blocked, pinned to cpu 1",
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+                Some(CpuId(1)),
+            ),
+            (
+                "blocked, pinned to cpu 0",
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+                Some(CpuId(0)),
+            ),
+            ("already runnable", TaskStatus::Runnable, None),
+            ("running", TaskStatus::Running, None),
+            ("running, pinned", TaskStatus::Running, Some(CpuId(1))),
+            ("faulted (refused)", TaskStatus::Faulted, None),
+            ("spawn reservation", TaskStatus::Reserved, None),
+        ];
+        for (name, status, affinity) in cases {
+            for cpu in [CpuId(0), CpuId(1), CpuId(3), CpuId(200)] {
+                let (old, ..) = fixture(status, affinity);
+                legacy(&old, cpu, ThreadId(SENDER));
+                let obs_old = observe(&old);
+
+                let (new, ..) = fixture(status, affinity);
+                candidate(&new, cpu, ThreadId(SENDER));
+                let obs_new = observe(&new);
+
+                assert_eq!(obs_old, obs_new, "{name} on cpu {}: diverged", cpu.0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_task_behaves_exactly_as_the_retired_body_did() {
+        let (old, ..) = fixture(TaskStatus::Runnable, None);
+        old.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let i = tcbs
+                    .iter()
+                    .position(|slot| slot.as_ref().is_some_and(|t| t.tid.0 == SENDER))
+                    .unwrap();
+                tcbs[i] = None;
+            })
+        });
+        legacy(&old, CpuId(0), ThreadId(SENDER));
+        let obs_old = observe(&old);
+
+        let (new, ..) = fixture(TaskStatus::Runnable, None);
+        new.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let i = tcbs
+                    .iter()
+                    .position(|slot| slot.as_ref().is_some_and(|t| t.tid.0 == SENDER))
+                    .unwrap();
+                tcbs[i] = None;
+            })
+        });
+        candidate(&new, CpuId(0), ThreadId(SENDER));
+        assert_eq!(obs_old, observe(&new));
+        assert_eq!(
+            new.test_apply_split_sender_wake_plan_split(CpuId(0), ThreadId(SENDER)),
+            Err(crate::kernel::boot::types::KernelError::TaskMissing)
+        );
+    }
+
+    // ── 2/3/4/5: the wake itself ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_blocked_sender_becomes_runnable_and_its_timeout_clears_exactly_once() {
+        let (k, ..) = fixture(
+            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            None,
+        );
+        assert!(
+            k.test_apply_split_sender_wake_plan_split(CpuId(0), ThreadId(SENDER))
+                .is_ok()
+        );
+        let o = observe(&k);
+        assert_eq!(o.1, Some(TaskStatus::Runnable), "Blocked -> Runnable");
+        assert_eq!(o.2, None, "ipc_timeout_deadline cleared");
+        assert!(!o.3, "ipc_timeout_fired cleared");
+        assert_eq!(o.7, 1, "enqueued exactly once on the bound cpu");
+        assert_eq!(o.8, 0, "and nowhere else");
+    }
+
+    #[test]
+    fn an_already_runnable_sender_matches_legacy_and_does_not_double_transition() {
+        let (old, ..) = fixture(TaskStatus::Runnable, None);
+        legacy(&old, CpuId(0), ThreadId(SENDER));
+        let (new, ..) = fixture(TaskStatus::Runnable, None);
+        candidate(&new, CpuId(0), ThreadId(SENDER));
+        assert_eq!(observe(&old), observe(&new));
+        assert_eq!(observe(&new).1, Some(TaskStatus::Runnable));
+    }
+
+    #[test]
+    fn a_running_sender_already_current_on_the_bound_cpu_is_not_enqueued_again() {
+        let (k, ..) = fixture(TaskStatus::Runnable, None);
+        k.with(|s| {
+            s.enqueue_on_cpu(CpuId(0), SENDER).expect("queue");
+            assert_eq!(s.dispatch_next_on_cpu(CpuId(0)), Some(SENDER));
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == SENDER)
+                    .unwrap()
+                    .status = TaskStatus::Running;
+            });
+        });
+        let before_q = observe(&k).7;
+        assert!(
+            k.test_apply_split_sender_wake_plan_split(CpuId(0), ThreadId(SENDER))
+                .is_ok()
+        );
+        let o = observe(&k);
+        assert_eq!(o.7, before_q, "already current on this CPU: no re-enqueue");
+        assert_eq!(o.5, Some(SENDER), "still current");
+    }
+
+    #[test]
+    fn a_pinned_sender_lands_on_its_pinned_cpu_not_the_bound_one() {
+        let (k, ..) = fixture(
+            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            Some(CpuId(1)),
+        );
+        assert!(
+            k.test_apply_split_sender_wake_plan_split(CpuId(0), ThreadId(SENDER))
+                .is_ok()
+        );
+        let o = observe(&k);
+        assert_eq!(o.7, 0, "not placed on the bound cpu");
+        assert_eq!(o.8, 1, "placed on its pinned cpu");
+    }
+
+    // ── 7. CPU refusal ───────────────────────────────────────────────────────────────────
+
+    fn refusal_changes_nothing(cpu: CpuId, label: &str) {
+        let (k, ..) = fixture(
+            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            None,
+        );
+        let before = observe(&k);
+        let r = k.test_apply_split_sender_wake_plan_split(cpu, ThreadId(SENDER));
+        assert!(r.is_err(), "{label}: the CPU must be refused");
+        assert_eq!(observe(&k), before, "{label}: nothing may move");
+        // The legacy `with_cpu` refusal produced the same KernelError class.
+        assert_eq!(
+            r,
+            k.with_cpu(cpu, |kernel| kernel
+                .apply_split_sender_wake_plan(ThreadId(SENDER)))
+                .map(|_| ()),
+            "{label}: same error class as the retired broad body"
+        );
+    }
+
+    #[test]
+    fn an_offline_cpu_refuses_without_waking_or_marking() {
+        refusal_changes_nothing(CpuId(3), "offline cpu");
+    }
+
+    #[test]
+    fn an_out_of_range_cpu_refuses_without_waking_or_marking() {
+        refusal_changes_nothing(CpuId(200), "out-of-range cpu");
+    }
+
+    // ── 1/2: the full ordinary-cap production entry, both wake_tid arms ───────────────────
+
+    #[test]
+    fn wake_tid_none_binds_nothing_and_wakes_nothing() {
+        let (k, asid, object) = fixture(
+            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            None,
+        );
+        let before = observe(&k);
+        let mut f = frame();
+        let snap = snapshot(&k, asid, object, None);
+        assert!(
+            matches!(
+                k.test_complete_recv_boundary_ordinary_cap(CpuId(1), &mut f, snap),
+                Ok(())
+            ),
+            "the ordinary-cap completion still succeeds"
+        );
+        let after = observe(&k);
+        assert_eq!(after.0, before.0, "no CPU bind when wake_tid is None");
+        assert_eq!(after.1, before.1, "no status mutation");
+        assert_eq!(after.7, before.7, "no enqueue on cpu 0");
+        assert_eq!(after.8, before.8, "no enqueue on cpu 1");
+        // The transferred capability was still materialized and encoded.
+        assert_ne!(f.ret2, 0, "a receiver-local cap was encoded into the frame");
+    }
+
+    #[test]
+    fn wake_tid_some_wakes_the_exact_sender_and_preserves_the_transferred_cap() {
+        let (k, asid, object) = fixture(
+            TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1))),
+            None,
+        );
+        let mut f = frame();
+        let snap = snapshot(&k, asid, object, Some(ThreadId(SENDER)));
+        assert!(matches!(
+            k.test_complete_recv_boundary_ordinary_cap(CpuId(0), &mut f, snap),
+            Ok(())
+        ));
+        let o = observe(&k);
+        assert_eq!(o.1, Some(TaskStatus::Runnable), "the exact sender woke");
+        assert_eq!(o.2, None, "timeout cleared exactly once");
+        assert!(!o.3);
+        assert_eq!(o.7 + o.8, 1, "enqueued exactly once, total");
+        assert_eq!(o.4, before_receiver_status(), "the receiver is untouched");
+        // The freshly minted receiver-local cap is live in the receiver's cnode: identity is
+        // preserved, and nothing leaked.
+        let encoded = f.ret2 as u64;
+        assert_ne!(encoded, 0);
+        let resolved = k.with(|s| {
+            let cnode = s.task_cnode(RECEIVER).expect("cnode");
+            s.capability_for_cnode(cnode, CapId(encoded))
+                .map(|c| c.object)
+        });
+        assert_eq!(
+            resolved,
+            Some(object),
+            "the transferred object identity is preserved under a FRESH receiver-local CapId"
+        );
+    }
+
+    fn before_receiver_status() -> Option<TaskStatus> {
+        // The fixture never changes the receiver; `register_task_with_class` leaves it Blocked
+        // on nothing in particular, so read it from a pristine twin rather than hardcoding.
+        let (k, ..) = fixture(TaskStatus::Runnable, None);
+        observe(&k).4
+    }
+
+    // ── 9. source and ordering guards ────────────────────────────────────────────────────
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of(name: &str) -> alloc::string::String {
+        let tail = RUNTIME
+            .split(name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{name}` must exist"));
+        code_of(tail.split_once("\n    }\n").expect("the method closes").0)
+    }
+
+    #[test]
+    fn the_target_acquisition_is_gone_and_the_order_is_preserved() {
+        let body = body_of("fn complete_recv_boundary_ordinary_cap");
+        assert!(
+            !body.contains("apply_split_sender_wake_plan(wake_tid)"),
+            "the sender wake must no longer run under a broad re-entry"
+        );
+        assert_eq!(
+            body.matches("apply_split_sender_wake_plan_split(cpu, wake_tid)")
+                .count(),
+            1,
+            "the target calls the split composition exactly once"
+        );
+        // EXACTLY one `with_cpu` remains in the method: the encode-failure capability rollback,
+        // which is dependency-blocked and out of scope.
+        assert_eq!(
+            body.matches(".with_cpu(").count(),
+            1,
+            "only the encode-failure capability rollback may remain"
+        );
+        let remaining = body.split(".with_cpu(").nth(1).expect("the survivor");
+        assert!(
+            remaining.contains("rollback_materialized_recv_cap("),
+            "the survivor must be the capability rollback, unchanged"
+        );
+        // materialize < encode < wake < writeback.
+        let mint = body
+            .find("materialize_received_message_cap_routed_with_delegation_split")
+            .expect("materialize");
+        let encode = body
+            .find("recv_boundary_encode_transfer_cap_ret(frame, Some(local_cap))")
+            .expect("encode");
+        let wake = body
+            .find("apply_split_sender_wake_plan_split")
+            .expect("wake");
+        let order_marker = body
+            .find("IPC_RECV_V2_SENDER_WAKE_ORDER_OK")
+            .expect("order marker");
+        let writeback = body
+            .find("complete_recv_boundary_user_copy(cpu, frame, &user_copy)")
+            .expect("writeback");
+        assert!(
+            mint < encode && encode < wake && wake < order_marker && order_marker < writeback,
+            "materialize -> encode -> wake -> order marker -> writeback"
+        );
+        // The wake is still gated on `wake_tid` being Some.
+        assert!(body.contains("if let Some(wake_tid) = pending.wake_tid {"));
+    }
+
+    #[test]
+    fn the_composition_binds_then_marks_then_calls_the_one_shared_wake_body() {
+        let t = body_of("fn apply_split_sender_wake_plan_split");
+        assert!(
+            !t.contains(".with_cpu(") && !t.contains("self.with(|"),
+            "no broad acquisition and no fallback"
+        );
+        let bind = t.find("bind_current_cpu_split(cpu)?").expect("rank 1 bind");
+        let marker = t
+            .find("IPC_RECV_SPLIT_REFILL_WAKE_APPLY tid={}")
+            .expect("the marker, with identical text");
+        let wake = t
+            .find("wake_tid_to_runnable_split(cpu, sender_tid)")
+            .expect("the shared wake body");
+        assert!(
+            bind < marker && marker < wake,
+            "bind (and only on success) -> marker -> shared wake"
+        );
+        // The refusal short-circuits before the marker: `?` on the bind.
+        assert!(t.contains("self.bind_current_cpu_split(cpu)?;"));
+        // No duplicated wake logic, no ownership, no endpoint waiter work.
+        for forbidden in [
+            "with_task_enqueue_policy_split_mut",
+            "with_ipc_split_mut",
+            "clear_endpoint_waiter",
+            "clear_blocked_recv_return_regs",
+            "waiter_ownership",
+            "SCHED_WAKE_",
+        ] {
+            assert!(
+                !t.contains(forbidden),
+                "the composition must not contain `{forbidden}` — the shared body owns it"
+            );
+        }
+        // Not routed through the blocked-waiter completion.
+        assert!(!t.contains("complete_blocked_waiter_delivery_split"));
+    }
+
+    #[test]
+    fn there_is_exactly_one_shared_wake_body_with_two_production_callers() {
+        assert_eq!(
+            RUNTIME.matches("fn wake_tid_to_runnable_split").count(),
+            1,
+            "one body, not two"
+        );
+        assert!(
+            !RUNTIME.contains("fn wake_blocked_waiter_split"),
+            "the old caller-named form is gone"
+        );
+        let code = code_of(RUNTIME);
+        assert_eq!(
+            code.matches("self.wake_tid_to_runnable_split(").count(),
+            2,
+            "exactly two production callers: the blocked-waiter completion and the sender wake"
+        );
+        // The blocked-waiter completion still binds the CPU itself — it must not bind twice.
+        let bw = body_of("pub(crate) fn complete_blocked_waiter_delivery_split");
+        assert!(
+            !bw.contains("bind_current_cpu_split"),
+            "the blocked-waiter completion binds in its own rank-1 phase; no double bind"
+        );
+        assert!(bw.contains("self.wake_tid_to_runnable_split(cpu, wake_tid)"));
+    }
+
+    #[test]
+    fn the_out_of_scope_acquisitions_all_remain() {
+        let code = code_of(RUNTIME);
+        assert_eq!(
+            code.matches("rollback_materialized_recv_cap(").count(),
+            3,
+            "the three dependency-blocked capability-rollback callsites remain"
+        );
+        // The queued-receive Phase-A broad acquisition.
+        assert!(
+            code.contains("RecvQueuedSplitPhaseA::"),
+            "the Phase-A queued-receive path is untouched"
+        );
+        // The single canonical RISC-V broad trap phase.
+        let rv = code_of(RISCV_TRAP);
+        assert_eq!(rv.matches(".with_cpu(").count(), 1);
+        assert!(rv.contains("handle_trap_entry_with_fault_bookkeeping_mode("));
+    }
+
+    #[test]
+    fn no_ownership_caller_is_added_and_direct_production_stays_off() {
+        let t = body_of("fn apply_split_sender_wake_plan_split");
+        let target = body_of("fn complete_recv_boundary_ordinary_cap");
+        for op in [
+            "waiter_ownership_arm_current",
+            "waiter_ownership_claim",
+            "waiter_ownership_consume",
+            "waiter_ownership_restore",
+            "waiter_ownership_cancel",
+            "waiter_ownership_retire_current",
+        ] {
+            assert!(
+                !t.contains(op) && !target.contains(op),
+                "`{op}` gains no caller"
+            );
+        }
+        let mod_rs = include_str!("mod.rs");
+        assert!(
+            mod_rs.contains(
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    false\n}"
+            ),
+            "direct production must remain an unconditional false"
+        );
     }
 }
