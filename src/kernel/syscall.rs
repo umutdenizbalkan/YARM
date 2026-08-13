@@ -1762,7 +1762,7 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                 // (queued split recv ordering, §56).
                 crate::yarm_log!(
                     "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
-                    wake_tid.0
+                    wake_tid.tid.0
                 );
             }
 

@@ -4,6 +4,35 @@
 use crate::arch::syscall_abi;
 pub use yarm_kernel::ipc::{IpcError, Message, SharedMemoryRegion, ThreadId, TransferCapId};
 
+/// U6 §7 — the identity of ONE blocking-send cycle, carried from the endpoint's sender-waiter
+/// queue to the site that wakes that sender.
+///
+/// Every path that removes a `SenderWaiter` and wakes it now carries this instead of a bare
+/// `ThreadId`, because waking is no longer the whole job: the sender's saved frame still holds
+/// the producer's `WouldBlock`, so the waker must first PUBLISH the completion that makes the
+/// woken sender's result true. A numeric TID cannot identify which cycle to complete — a
+/// replacement incarnation reuses the number, and the same incarnation may have blocked more
+/// than once — so the `{asid, send_generation}` pair rides along and is revalidated at
+/// publication.
+///
+/// `asid` is `Option` only because a task with no bound address space has no incarnation to
+/// name; such a sender is woken exactly as it was before U6 and completes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenderWakeTarget {
+    pub tid: ThreadId,
+    pub asid: Option<crate::kernel::vm::Asid>,
+    pub send_generation: u64,
+}
+
+impl SenderWakeTarget {
+    /// The exact `{tid, asid, send_generation}` triple, or `None` for an ASID-less sender.
+    #[must_use]
+    pub fn exact(&self) -> Option<(u64, crate::kernel::vm::Asid, u64)> {
+        self.asid
+            .map(|asid| (self.tid.0, asid, self.send_generation))
+    }
+}
+
 pub const IPC_REGISTER_WORDS: usize = syscall_abi::IPC_REGISTER_WORDS;
 pub const IPC_REGISTER_BYTES: usize = IPC_REGISTER_WORDS * core::mem::size_of::<usize>();
 

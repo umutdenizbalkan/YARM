@@ -21,7 +21,8 @@ mod ipc_state;
 // body are re-exported so the OFF-LOCK drain in `crate::runtime` can run the SAME body
 // through the `SharedKernel` split-mut seams (no duplicated transaction).
 pub(crate) use ipc_state::{
-    DetachOutcome, ReplyTimeoutDomains, complete_reply_timeout_over, complete_server_death_over,
+    BlockingSendProducerOutcome, DetachOutcome, ReplyTimeoutDomains, complete_reply_timeout_over,
+    complete_server_death_over,
 };
 mod memory_lifecycle_state;
 mod memory_state;
@@ -87,9 +88,9 @@ const MAX_ENDPOINTS: usize = 256;
 pub(crate) const ENDPOINT_WAITER_SLOTS: usize = MAX_ENDPOINTS;
 
 #[cfg(feature = "hosted-dev")]
-const MAX_ENDPOINT_SENDER_WAITERS: usize = 8;
+pub(crate) const MAX_ENDPOINT_SENDER_WAITERS: usize = 8;
 #[cfg(not(feature = "hosted-dev"))]
-const MAX_ENDPOINT_SENDER_WAITERS: usize = 4;
+pub(crate) const MAX_ENDPOINT_SENDER_WAITERS: usize = 4;
 
 // Keep task capacity consistent across hosted-dev and freestanding builds so
 // capacity-sensitive tests match deployed behavior.
@@ -124,7 +125,7 @@ pub(crate) enum IpcEndpointRecvResult {
     /// Stage 4D: plain recv with sender-waiter refill.
     /// Endpoint mutation (dequeue + refill) already done under ipc_state_lock.
     /// Caller must apply the wake plan outside the lock via apply_split_sender_wake_plan.
-    ReceivedWithSenderWake(Message, ThreadId),
+    ReceivedWithSenderWake(Message, crate::kernel::ipc::SenderWakeTarget),
     Ineligible(IpcEndpointSplitRejectReason),
 }
 
@@ -149,7 +150,7 @@ pub(crate) enum IpcSchedulerPlan {
     None,
     /// Wake a sender whose message was refilled into the endpoint queue under ipc_state_lock.
     /// Apply with apply_split_sender_wake_plan outside any ipc/endpoint lock.
-    WakeSender(ThreadId),
+    WakeSender(crate::kernel::ipc::SenderWakeTarget),
     /// Stage 4F: wake a receiver whose waiter slot was cleared under ipc_state_lock.
     /// Apply with apply_split_receiver_wake_plan outside any ipc/endpoint lock.
     WakeReceiver(ThreadId),
@@ -659,6 +660,17 @@ impl PerCpuDispatchPostWorkStash {
         &self,
     ) -> Option<crate::kernel::dispatch_post_work::DispatchPostWork> {
         unsafe { (*self.inner.get()).take() }
+    }
+
+    /// U6 §5 — `true` iff an item is already stashed.
+    ///
+    /// A producer checks this before storing so a publication can never displace another
+    /// handler's post-work (the stash holds exactly one item, and `store` would overwrite).
+    ///
+    /// # Safety
+    /// Caller must ensure no concurrent access (interrupts disabled, single CPU).
+    pub(crate) unsafe fn is_occupied(&self) -> bool {
+        unsafe { (*self.inner.get()).is_some() }
     }
 }
 
@@ -7614,9 +7626,9 @@ const MAX_DRIVER_DMA_CAPS: usize = 16;
 const MAX_DRIVER_DMA_CAPS: usize = 8;
 
 #[cfg(feature = "hosted-dev")]
-const MAX_TRANSFER_ENVELOPES: usize = 256;
+pub(crate) const MAX_TRANSFER_ENVELOPES: usize = 256;
 #[cfg(not(feature = "hosted-dev"))]
-const MAX_TRANSFER_ENVELOPES: usize = 64;
+pub(crate) const MAX_TRANSFER_ENVELOPES: usize = 64;
 pub(crate) const MAX_REPLY_CAPS: usize = MAX_TASKS;
 /// Stage 200B — bounded capacity of the single deadline-registration store
 /// (`IpcSubsystem::reply_deadline_tokens`). Small on purpose: this stage supports

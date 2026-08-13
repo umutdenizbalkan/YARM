@@ -95,6 +95,20 @@ pub(crate) enum DispatchPostWork {
     /// changes security, classification, mapping, rollback, lifecycle, or wake semantics.
     #[cfg_attr(not(test), allow(dead_code))]
     BlockedWaiterSharedRegionDelivery(BlockedWaiterSharedRegionDeliverySnapshot),
+    /// U6 §4 — a BLOCKING-SEND COMMIT deferred past the broad borrow.
+    ///
+    /// Structurally different from every variant above, and deliberately so. The others
+    /// complete work for a blocked THIRD PARTY (a waiting receiver) and never touch the
+    /// caller's own syscall result; this one commits the CALLER's own transition from running
+    /// to `Blocked(EndpointSend)`, which is why the drain had to grow a typed disposition the
+    /// trap wrapper acts on (see `DispatchPostWorkDisposition`).
+    ///
+    /// It carries everything the off-lock transaction needs and nothing it does not — by
+    /// value, like every other variant, with no `&mut KernelState` and no borrowed subsystem:
+    /// the CPU the commit is authorised for, the exact `{tid, asid}` sender incarnation, the
+    /// `{endpoint index, generation}` the producer resolved, the send capability, the OWNED
+    /// message, the optional deadline, and the envelope-cleanup authority for a refusal.
+    BlockingSendCommit(BlockingSendCommitSnapshot),
 }
 
 impl DispatchPostWork {
@@ -113,8 +127,90 @@ impl DispatchPostWork {
             Self::BlockedWaiterOrdinaryCapDelivery(_) => "blocked_waiter_ordinary_cap",
             Self::BlockedWaiterReplyCapDelivery(_) => "blocked_waiter_reply_cap",
             Self::BlockedWaiterSharedRegionDelivery(_) => "blocked_waiter_shared_region",
+            Self::BlockingSendCommit(_) => "blocking_send_commit",
         }
     }
+}
+
+/// U6 §4 — by-value snapshot of a blocking-send commit deferred past the broad borrow.
+///
+/// The producer resolved every coordinate under the broad lock and mutated NOTHING; the
+/// consumer re-validates each of them under the ranked split seams before it mutates anything.
+/// That is what makes the deferral safe: the snapshot is a *proposal*, never a promise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockingSendCommitSnapshot {
+    /// The CPU whose broad lock the producer held. The transaction refuses unless this is
+    /// still the authoritative dispatch CPU and still runs the sender.
+    pub(crate) cpu: crate::kernel::scheduler::CpuId,
+    /// The exact sender thread id.
+    pub(crate) sender_tid: u64,
+    /// The exact sender incarnation. A replacement task that reused the numeric TID carries a
+    /// different ASID and is refused.
+    pub(crate) sender_asid: Asid,
+    /// Endpoint slot the sender is parking on.
+    pub(crate) endpoint_idx: usize,
+    /// The endpoint slot's generation at proposal time. A destroyed-and-reused slot advances
+    /// it, so the waiter can never be published into a different endpoint's queue.
+    pub(crate) endpoint_generation: u64,
+    /// The capability the block reason records (`WaitReason::EndpointSend`).
+    pub(crate) send_cap: CapId,
+    /// The message, owned. It rides with the waiter exactly as the in-lock route's does.
+    pub(crate) msg: Message,
+    /// Absolute deadline tick, or `None` for an untimed block.
+    pub(crate) deadline: Option<u64>,
+    /// U6 §4 — ENVELOPE CLEANUP AUTHORITY for the refusal path.
+    ///
+    /// `Some` iff the message carries a transferred capability, in which case a refusal owes
+    /// the same envelope cleanup the in-lock error path performs before returning a canonical
+    /// error. Carrying the handle and the bound receiver explicitly is what lets the off-lock
+    /// refusal be exactly as complete as the in-lock one, instead of leaking a stashed
+    /// envelope on a path the producer can no longer reach.
+    pub(crate) transfer_envelope: Option<BlockingSendEnvelopeCleanup>,
+}
+
+/// U6 §4 — the envelope a refused blocking-send commit must take back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockingSendEnvelopeCleanup {
+    /// The transferred capability handle stashed by the producer.
+    pub(crate) handle: u64,
+    /// The endpoint the envelope was stashed against.
+    pub(crate) endpoint_idx: usize,
+    /// The bound receiver the envelope was stashed for (the sender itself when unbound),
+    /// matching the in-lock cleanup's `stash_bound_receiver_tid.unwrap_or(sender)` choice.
+    pub(crate) cleanup_tid: ThreadId,
+}
+
+/// U6 §4 — what a drained [`DispatchPostWork`] item requires of the TRAP WRAPPER that drained
+/// it.
+///
+/// Before U6 the drain was `Result<(), TrapHandleError>`: every variant finished its own work
+/// and the wrapper had nothing to decide. `BlockingSendCommit` breaks that, because the
+/// transaction's outcome determines what the CALLER's syscall returns — and the caller is the
+/// task whose frame the wrapper is holding. Encoding that as a typed disposition keeps the
+/// decision explicit and total, rather than smuggling it through an error code or a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchPostWorkDisposition {
+    /// Nothing is asked of the caller. Every pre-U6 variant produces this, as does an empty
+    /// stash, so the wrapper's behaviour on every existing path is unchanged.
+    NoCallerAction,
+    /// The sender was committed `Blocked(EndpointSend)` and is no longer this CPU's current
+    /// task. The wrapper must NOT write a syscall result into the frame: the frame belongs to
+    /// a parked task now, and its result will be supplied by the completion its waker
+    /// publishes. The queue-advancing dispatch is performed by the D2-send drain, which the
+    /// transaction armed.
+    SenderCommittedBlocked {
+        /// The committed sender, for the wrapper's telemetry only.
+        tid: u64,
+    },
+    /// The commit was refused before any mutation. The caller is still running and still owns
+    /// its frame, so the wrapper encodes this canonical error and returns immediately — the
+    /// same error, in the same lane, the in-lock route would have returned.
+    ImmediateReturn {
+        /// The canonical error to encode — the SAME `KernelError` the in-lock route returns
+        /// for the same condition, converted at the frame boundary exactly as every other
+        /// syscall error is.
+        error: crate::kernel::boot::KernelError,
+    },
 }
 
 /// By-value snapshot of a shared-region blocked-receiver / queued-dequeue delivery (Stage 198E3).

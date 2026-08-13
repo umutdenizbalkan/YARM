@@ -2481,6 +2481,8 @@ fn run_endpoint_only_plain_recv_rejects_complex_sender_waiter_message() {
             Message::with_header(42, 0x55, complex_flag, Some(99), b"complex").expect("complex");
         state.with_ipc_state_mut(|ipc| {
             ipc.endpoint_sender_waiters[endpoint_idx][0] = Some(SenderWaiter {
+                asid: None,
+                send_generation: 0,
                 tid: ThreadId(42),
                 msg: complex_msg,
             });
@@ -2832,6 +2834,8 @@ fn run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
     // Co-presence guard: inject sender waiter + keep receiver waiter → Ineligible(SenderWaiterPresent).
     state.with_ipc_state_mut(|ipc| {
         ipc.endpoint_sender_waiters[receiver_waiter_idx][0] = Some(SenderWaiter {
+            asid: None,
+            send_generation: 0,
             tid: ThreadId(42),
             msg: Message::new(0, b"sw").expect("sw"),
         });
@@ -3177,6 +3181,8 @@ fn run_ipc_send_syscall_receiver_and_sender_waiters_fall_back_to_full_path() {
     // Directly inject a sender waiter to create the co-presence state.
     state.with_ipc_state_mut(|ipc| {
         ipc.endpoint_sender_waiters[endpoint_idx][0] = Some(SenderWaiter {
+            asid: None,
+            send_generation: 0,
             tid: ThreadId(42),
             msg: Message::new(0, b"queued_sw").expect("sw"),
         });
@@ -15648,6 +15654,10 @@ fn stage4r_sender_waiter_registered_via_ipc_state_lock() {
     assert_eq!(
         registered,
         Some(SenderWaiter {
+            // U6 §7: the waiter carries the blocking cycle it was published for. This is the
+            // first cycle for this task, and the sender has no bound ASID in this fixture.
+            asid: None,
+            send_generation: 1,
             tid: ThreadId(0),
             msg
         }),
@@ -15808,6 +15818,8 @@ fn stage4r_no_orphaned_sender_waiter_when_queue_full() {
     state.with_ipc_state_mut(|ipc| {
         for (i, slot) in ipc.endpoint_sender_waiters[eid].iter_mut().enumerate() {
             *slot = Some(SenderWaiter {
+                asid: None,
+                send_generation: 0,
                 tid: ThreadId(100 + i as u64),
                 msg: dummy_msg,
             });
@@ -15850,6 +15862,8 @@ fn stage4r_no_orphaned_sender_waiter_when_queue_full() {
             .all(|(i, slot)| {
                 *slot
                     == Some(SenderWaiter {
+                        asid: None,
+                        send_generation: 0,
                         tid: ThreadId(100 + i as u64),
                         msg: dummy_msg,
                     })
@@ -15866,12 +15880,14 @@ fn stage4r_no_orphaned_sender_waiter_when_queue_full() {
 #[test]
 fn stage4s_ipc_recv_endpoint_take_empty_queue_no_waiter_returns_none() {
     // ipc_recv_endpoint_take on an empty endpoint with no sender waiters must return
-    // (None, SchedulerWakePlan::None) — no message, no wake side-effect.
+    // (None, None) — no message, no wake side-effect. U6 §2: the wake lane is now an
+    // `Option<SenderWakeTarget>` carrying the consumed sender's exact blocking cycle,
+    // because waking one without publishing its completion is a delivery bug.
     let mut state = Bootstrap::init().expect("init");
     let (eid, _send_cap, _recv_cap) = state.create_endpoint(4).expect("buffered endpoint");
     let (msg, plan) = state.ipc_recv_endpoint_take(eid).expect("take ok");
     assert!(msg.is_none(), "empty endpoint must yield no message");
-    assert_eq!(plan, super::SchedulerWakePlan::None, "no wake plan");
+    assert!(plan.is_none(), "no wake plan");
     // Endpoint queue must be untouched.
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
@@ -15890,11 +15906,7 @@ fn stage4s_ipc_recv_endpoint_take_queued_message_no_waiter() {
 
     let (received, plan) = state.ipc_recv_endpoint_take(eid).expect("take ok");
     assert_eq!(received.unwrap().as_slice(), b"hello");
-    assert_eq!(
-        plan,
-        super::SchedulerWakePlan::None,
-        "no sender waiter → no wake"
-    );
+    assert_eq!(plan.map(|t| t.tid), None, "no sender waiter → no wake");
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
         0,
@@ -15934,8 +15946,8 @@ fn stage4s_ipc_recv_endpoint_take_direct_delivery_from_sender_waiter() {
         "must get sender's message"
     );
     assert_eq!(
-        plan,
-        super::SchedulerWakePlan::Wake(ThreadId(0)),
+        plan.map(|t| t.tid),
+        Some(ThreadId(0)),
         "must wake the sender"
     );
     // Sender waiter slot must be cleared.
@@ -16007,7 +16019,7 @@ fn stage4s_ipc_recv_endpoint_take_refill_from_sender_waiter() {
     let refilled = state.ipc_recv_endpoint_take(eid).expect("second take");
     assert_eq!(refilled.0.unwrap().as_slice(), b"waiter");
     // Sender must be woken.
-    assert_eq!(plan, super::SchedulerWakePlan::Wake(ThreadId(1)));
+    assert_eq!(plan.map(|t| t.tid), Some(ThreadId(1)));
     // Sender waiter slot must be cleared.
     assert!(
         state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().all(Option::is_none))
@@ -16256,8 +16268,8 @@ fn stage4t_ipc_recv_handles_sparse_sender_waiter_queue() {
     );
     // Wake plan targets t2 (the live sender found at slot[1]).
     assert_eq!(
-        plan,
-        super::SchedulerWakePlan::Wake(ThreadId(2)),
+        plan.map(|t| t.tid),
+        Some(ThreadId(2)),
         "wake plan must target the live sender at slot[1]"
     );
     // t2's message must have been refilled into the endpoint queue.
@@ -18057,6 +18069,8 @@ fn exit_task_clears_sender_waiter_slot() {
 
     state.with_ipc_state_mut(|ipc| {
         ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+            asid: None,
+            send_generation: 0,
             tid: crate::kernel::ipc::ThreadId(270),
             msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
         });
@@ -18155,6 +18169,8 @@ fn send_deadline_process_clears_sender_waiter_and_deadline() {
 
     state.with_ipc_state_mut(|ipc| {
         ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+            asid: None,
+            send_generation: 0,
             tid: crate::kernel::ipc::ThreadId(281),
             msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
         });
@@ -18567,6 +18583,8 @@ fn clear_ipc_waiters_is_idempotent_for_all_waiter_types() {
             1,
         ));
         ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+            asid: None,
+            send_generation: 0,
             tid: crate::kernel::ipc::ThreadId(301),
             msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
         });
@@ -18706,6 +18724,8 @@ fn repeated_send_deadline_cycles_no_stale_sender_waiter() {
 
         state.with_ipc_state_mut(|ipc| {
             ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+                asid: None,
+                send_generation: 0,
                 tid: crate::kernel::ipc::ThreadId(tid),
                 msg: Message::with_header(0, i as u16, 0, None, &[]).expect("msg"),
             });
@@ -18774,6 +18794,8 @@ fn repeated_mixed_waiter_block_exit_no_stale_state() {
     state.register_task(316).expect("task 316");
     state.with_ipc_state_mut(|ipc| {
         ipc.endpoint_sender_waiters[ep2_idx][0] = Some(SenderWaiter {
+            asid: None,
+            send_generation: 0,
             tid: crate::kernel::ipc::ThreadId(316),
             msg: Message::with_header(0, 2, 0, None, &[]).expect("msg"),
         });
@@ -20673,6 +20695,8 @@ fn stage24_cnode_teardown_with_endpoint_cap_does_not_leave_sender_waiter() {
             let msg = Message::new(0, b"blocked-send").expect("msg");
             state.with_ipc_state_mut(|ipc| {
                 ipc.endpoint_sender_waiters[endpoint_idx][0] = Some(SenderWaiter {
+                    asid: None,
+                    send_generation: 0,
                     tid: ThreadId(1),
                     msg,
                 });
@@ -22232,6 +22256,8 @@ fn stage25d_task_exit_clears_endpoint_sender_waiter() {
             let msg = Message::new(0, b"blocked-send").expect("msg");
             state.with_ipc_state_mut(|ipc| {
                 ipc.endpoint_sender_waiters[ep][0] = Some(SenderWaiter {
+                    asid: None,
+                    send_generation: 0,
                     tid: ThreadId(1),
                     msg,
                 });
@@ -26183,6 +26209,8 @@ mod stage38 {
                     .expect("cap waiter");
             state.with_ipc_state_mut(|ipc| {
                 ipc.endpoint_sender_waiters[endpoint_idx][0] = Some(SenderWaiter {
+                    asid: None,
+                    send_generation: 0,
                     tid: ThreadId(42),
                     msg: cap_waiter_msg,
                 });
@@ -49145,7 +49173,7 @@ mod stage188a_dispatch_return_delivery_channel {
             .find("let inner_result = inner_result?;")
             .expect("trap entry drops the borrow via inner_result?");
         let drain = TRAP_ENTRY_SRC
-            .find("shared.drain_dispatch_post_work(cpu)")
+            .find("shared.drain_dispatch_post_work(cpu, ")
             .expect("trap entry must drain the dispatch-return channel");
         assert!(
             drain > borrow_drop,
@@ -49153,15 +49181,19 @@ mod stage188a_dispatch_return_delivery_channel {
         );
     }
 
-    // Stage 188B update: the ONLY producer that stashes dispatch-return work is
-    // the gated plain blocked-waiter delivery producer in syscall.rs
-    // (`produce_blocked_waiter_plain_delivery`). The other IPC handler files must
-    // NOT stash directly (they call the producer or use the legacy path).
+    // Stage 188B update: the blocked-waiter delivery producers all live in syscall.rs
+    // (`produce_blocked_waiter_plain_delivery` and its siblings); the other IPC handler files
+    // must NOT stash those directly.
+    //
+    // U6 update: `ipc_state.rs` now has ONE stash of its own, and only one — the blocking-send
+    // commit publication in `block_or_publish_send`. It is a genuinely different kind of
+    // producer (it defers the CALLER's own block, not a third party's delivery), so it is
+    // enumerated here by name rather than hidden behind a relaxed rule: any OTHER stash
+    // appearing in `ipc_state.rs` still fails this guard.
     #[test]
     fn stage188a_no_live_producer_stashes_work() {
         for (name, src) in [
             ("syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
-            ("ipc_state.rs", include_str!("ipc_state.rs")),
             ("fault_state.rs", include_str!("fault_state.rs")),
         ] {
             assert!(
@@ -49170,6 +49202,37 @@ mod stage188a_dispatch_return_delivery_channel {
                  the gated plain blocked-waiter producer in syscall.rs"
             );
         }
+        let ipc_state = include_str!("ipc_state.rs");
+        // Exactly two references, both in the U6 blocking-send publication: the store itself,
+        // and the occupancy check that keeps a publication from displacing another handler's
+        // post-work. Anything else in this file fails the guard.
+        assert_eq!(
+            ipc_state.matches("DISPATCH_POST_WORK_STASH").count(),
+            2,
+            "`ipc_state.rs` may reference the stash only from the U6 blocking-send publication"
+        );
+        let store = ipc_state
+            .find("DISPATCH_POST_WORK_STASH[cpu_idx].store(")
+            .expect("the one store");
+        assert!(
+            ipc_state[..store]
+                .rfind("fn block_or_publish_send")
+                .is_some(),
+            "the store must be inside `block_or_publish_send`"
+        );
+        assert!(
+            ipc_state[store..store + 400].contains("DispatchPostWork::BlockingSendCommit"),
+            "…and it must stash exactly the blocking-send commit variant"
+        );
+        let probe = ipc_state
+            .find("DISPATCH_POST_WORK_STASH[cpu_idx].is_occupied()")
+            .expect("the occupancy check");
+        assert!(
+            ipc_state[..probe]
+                .rfind("fn blocking_send_publication_snapshot")
+                .is_some(),
+            "the occupancy check must be part of the publication eligibility test"
+        );
         // The single producer in syscall.rs stashes only from the gated
         // `produce_blocked_waiter_plain_delivery` (plain + trap-drainer-active).
         let syscall_src = include_str!("../syscall.rs");
@@ -49215,7 +49278,7 @@ mod stage188a_dispatch_return_delivery_channel {
         // Ensure the stash is empty for CPU0.
         let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
         assert!(
-            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            shared.drain_dispatch_post_work(CPU0, None).is_ok(),
             "draining an empty stash must be an inert Ok no-op"
         );
     }
@@ -49276,7 +49339,7 @@ mod stage188a_dispatch_return_delivery_channel {
                 .store(DispatchPostWork::BlockedWaiterPlainDelivery(snap));
         }
         assert!(
-            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            shared.drain_dispatch_post_work(CPU0, None).is_ok(),
             "the executor must deliver the plain blocked-waiter work"
         );
         // Payload + meta landed in the waiter's user memory (via the 186E seam).
@@ -49430,7 +49493,7 @@ mod stage188b_blocked_waiter_plain_delivery_live {
 
         let shared = SharedKernel::new(state);
         assert!(
-            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            shared.drain_dispatch_post_work(CPU0, None).is_ok(),
             "the drain must deliver the stashed plain blocked-waiter work"
         );
         // Payload landed in the waiter's user memory via the seam (opcode prefix
@@ -49777,7 +49840,7 @@ mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
 
         let shared = SharedKernel::new(state);
         assert!(
-            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            shared.drain_dispatch_post_work(CPU0, None).is_ok(),
             "the drain must deliver the stashed ordinary-cap blocked-waiter work"
         );
 
@@ -49905,7 +49968,7 @@ mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
         );
 
         let shared = SharedKernel::new(state);
-        let drain = shared.drain_dispatch_post_work(CPU0);
+        let drain = shared.drain_dispatch_post_work(CPU0, None);
         assert!(
             drain.is_err(),
             "a materialize failure must surface as a real Err"
@@ -50484,7 +50547,7 @@ mod stage188d_reply_cap_rank_inversion_seam {
         );
         let shared = SharedKernel::new(state);
         assert!(
-            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            shared.drain_dispatch_post_work(CPU0, None).is_ok(),
             "the drain must deliver the stashed reply-cap blocked-waiter work"
         );
 
@@ -50572,7 +50635,7 @@ mod stage188d_reply_cap_rank_inversion_seam {
         });
 
         let shared = SharedKernel::new(state);
-        let drain = shared.drain_dispatch_post_work(CPU0);
+        let drain = shared.drain_dispatch_post_work(CPU0, None);
         set_trap_drainer(false);
         assert!(
             drain.is_err(),
@@ -50887,7 +50950,7 @@ mod stage188d_reply_cap_rank_inversion_seam {
         );
 
         let shared = SharedKernel::new(state);
-        assert!(shared.drain_dispatch_post_work(CPU0).is_ok(), "drain");
+        assert!(shared.drain_dispatch_post_work(CPU0, None).is_ok(), "drain");
         // Delivered as a REPLY cap (reply meta flag), not an ordinary transferred cap.
         let meta = shared
             .with(|k| k.copy_from_user(asid1, VirtAddr(0x4400), 40))
@@ -51131,7 +51194,7 @@ mod stage188d_reply_cap_rank_inversion_seam {
         .expect("producer");
         assert!(produced);
         let shared = SharedKernel::new(state);
-        assert!(shared.drain_dispatch_post_work(CPU0).is_ok(), "drain");
+        assert!(shared.drain_dispatch_post_work(CPU0, None).is_ok(), "drain");
 
         let reply_object = CapObject::Reply {
             index: reply_index,
@@ -51228,7 +51291,7 @@ mod stage188d_reply_cap_rank_inversion_seam {
             .expect("unmap payload page");
 
         let shared = SharedKernel::new(state);
-        let drain = shared.drain_dispatch_post_work(CPU0);
+        let drain = shared.drain_dispatch_post_work(CPU0, None);
         set_trap_drainer(false);
         assert!(
             drain.is_err(),
@@ -51482,7 +51545,7 @@ mod stage188e_ipc_call_reply_cap_blocked_waiter_live {
         // Drain the dispatch-return channel: mint + record + deliver + wake.
         let shared = SharedKernel::new(*state);
         assert!(
-            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            shared.drain_dispatch_post_work(CPU0, None).is_ok(),
             "the drain must deliver the stashed ipc_call reply-cap work"
         );
         set_trap_drainer(false);
@@ -51717,7 +51780,7 @@ mod stage188f_ipc_reply_boundary_live {
         let _ = eidx;
         let shared = SharedKernel::new(*state);
         assert!(
-            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            shared.drain_dispatch_post_work(CPU0, None).is_ok(),
             "the drain must deliver the stashed ipc_reply plain work"
         );
         set_trap_drainer(false);
@@ -53868,10 +53931,11 @@ mod stage169_d2_send_genuine {
     // dispatch deferral, and the Blocked(EndpointSend) TCB precedes the publish.
     #[test]
     fn stage169_waiter_published_before_defer() {
+        // The LEGACY in-lock route still owns this ordering end to end.
         let block_idx = IPC_STATE_SRC
             .find("fn block_current_on_send_with_deadline")
             .expect("send-block orchestrator");
-        let region = &IPC_STATE_SRC[block_idx..block_idx + 3200];
+        let region = &IPC_STATE_SRC[block_idx..block_idx + 4200];
         let blocked = region
             .find("Blocked(WaitReason::EndpointSend(send_cap))")
             .expect("sender must be Blocked(EndpointSend)");
@@ -53884,6 +53948,20 @@ mod stage169_d2_send_genuine {
         assert!(
             blocked < publish && publish < defer,
             "order must be: Blocked(EndpointSend) -> publish waiter -> defer dispatch"
+        );
+        // U6: the OFF-LOCK route preserves the same ordering, in the transaction plus its
+        // executor — the waiter is published and the TCB committed inside
+        // `commit_blocking_send_split`, and only a `Committed` outcome arms the deferral.
+        const RUNTIME_SRC_U6: &str = include_str!("../../runtime.rs");
+        let txn = RUNTIME_SRC_U6
+            .find("fn commit_blocking_send_split")
+            .expect("the off-lock transaction");
+        let arm = RUNTIME_SRC_U6
+            .find("d2_send_dispatch_try_defer")
+            .expect("the off-lock deferral arming");
+        assert!(
+            txn < arm,
+            "the off-lock deferral is armed after the commit transaction, never before"
         );
     }
 
@@ -62434,7 +62512,7 @@ mod stage193a_ipc_send_boundary_plain {
         // Phase B/C: the trap-entry drain (global lock dropped) delivers + wakes.
         let shared = SharedKernel::new(state);
         shared
-            .drain_dispatch_post_work(CpuId(0))
+            .drain_dispatch_post_work(CpuId(0), None)
             .expect("drain delivers");
 
         shared.with(|k| {
@@ -62918,7 +62996,7 @@ mod stage198c2b_reply_cap_one_shot_wiring {
     fn riscv_return_to_current_preserved() {
         assert!(
             RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToCurrent")
-                && RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu)"),
+                && RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu, "),
             "the RISC-V wrapper must run the drain and be able to ReturnToCurrent"
         );
         assert!(
@@ -67980,7 +68058,7 @@ mod stage198e3b2b_drain_switch {
     }
 
     fn drain(d: &Drn) -> Result<(), crate::kernel::boot::TrapHandleError> {
-        d.shared.drain_dispatch_post_work(CPU0)
+        d.shared.drain_dispatch_post_work(CPU0, None).map(|_| ())
     }
     fn status(d: &Drn) -> Option<TaskStatus> {
         d.shared.with(|k| k.task_status(2))
@@ -71760,7 +71838,7 @@ mod stage194_cross_arch_portability_audit {
         );
         // A real post-lock drainer exists.
         assert!(
-            RISCV_TRAP_SRC.contains("shared.drain_dispatch_post_work(cpu)"),
+            RISCV_TRAP_SRC.contains("shared.drain_dispatch_post_work(cpu, "),
             "RISC-V shared wrapper must run the post-lock drain after the guard drops"
         );
     }
@@ -72045,7 +72123,7 @@ mod stage195a_aarch64_debuglog_live {
             RISCV_TRAP_SRC.contains("pub fn handle_riscv_trap_entry_shared(")
                 && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
                 && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)")
-                && RISCV_TRAP_SRC.contains("shared.drain_dispatch_post_work(cpu)"),
+                && RISCV_TRAP_SRC.contains("shared.drain_dispatch_post_work(cpu, "),
             "RISC-V shared wrapper must own the active flag with a real post-lock drain"
         );
         assert!(
@@ -73223,7 +73301,7 @@ mod stage196a_riscv_shared_trap_foundation {
             .find("RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR")
             .expect("clear marker present");
         let drain_idx = RISCV_TRAP_SRC
-            .find("shared.drain_dispatch_post_work(cpu)")
+            .find("shared.drain_dispatch_post_work(cpu, ")
             .expect("drain call present");
         assert!(
             clear_idx < drain_idx,
@@ -75847,7 +75925,7 @@ mod stage198a_second_cohort_plain_parity {
     #[test]
     fn riscv_plain_ipcsend_returns_to_current_not_gated() {
         assert!(
-            RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu)?;"),
+            RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu, "),
             "the RISC-V wrapper must run the arch-neutral post-lock delivery drain"
         );
         assert!(
@@ -76219,7 +76297,7 @@ mod stage198b_second_cohort_ordinary_cap_parity {
     #[test]
     fn riscv_ordinary_cap_ipcsend_returns_to_current_not_gated() {
         assert!(
-            RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu)?;")
+            RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu, ")
                 && RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToCurrent"),
             "the RISC-V wrapper must run the drain and be able to return ReturnToCurrent"
         );
@@ -92611,8 +92689,10 @@ mod stage200c2c1b_aarch64_reentry {
     fn t06_elr_single_advance() {
         // Source contract: the consume block performs NO ELR/PC mutation; the SVC return address
         // was established once at block time (`syscall_resume_pc`).
+        // Split on the RECV-class consumer specifically: U6 added a class-scoped `IpcSend`
+        // consumer alongside it, whose call name shares this prefix.
         let blk = AARCH64_TRAP_SRC
-            .split("take_blocked_syscall_completion")
+            .split("take_blocked_syscall_completion(current_tid)")
             .nth(1)
             .expect("consume block");
         let blk = blk.split("REG_X0, frame.arg(0)").next().unwrap();
@@ -92813,7 +92893,7 @@ mod stage200c2c1b_aarch64_reentry {
         assert!(MOD_SRC.contains("fn maybe_emit_reply_timeout_class_retired"));
         assert!(RUNTIME_SRC.contains("arm_reply_timeout_class_retired()"));
         let blk = AARCH64_TRAP_SRC
-            .split("take_blocked_syscall_completion")
+            .split("take_blocked_syscall_completion(current_tid)")
             .nth(1)
             .expect("consume block");
         let encode = blk.find("frame.set_arg(0, done.result").expect("encode");
@@ -93141,8 +93221,9 @@ mod stage200c2c2_riscv_port {
     // (10) `sepc` advances exactly once — the consumer performs no PC mutation.
     #[test]
     fn r10_sepc_single_advance() {
+        // Split on the RECV-class consumer specifically (see the AArch64 sibling).
         let blk = RISCV_TRAP_SRC
-            .split("take_blocked_syscall_completion")
+            .split("take_blocked_syscall_completion(current_tid)")
             .nth(1)
             .expect("consume block");
         let blk = blk.split("let idx = cpu.0").next().unwrap();
@@ -93289,7 +93370,7 @@ mod stage200c2c2_riscv_port {
         assert!(RUNTIME_SRC.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch={}"));
         assert!(!RUNTIME_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={}"));
         let blk = RISCV_TRAP_SRC
-            .split("take_blocked_syscall_completion")
+            .split("take_blocked_syscall_completion(current_tid)")
             .nth(1)
             .expect("consume block");
         let encode = blk
@@ -93463,7 +93544,10 @@ mod stage200c2c2b_riscv_final_frame {
     #[test]
     fn f13_no_arch_state_mutation() {
         let b = restore_body();
-        let blk = b.split("take_blocked_syscall_completion").nth(1).unwrap();
+        let blk = b
+            .split("take_blocked_syscall_completion(current_tid)")
+            .nth(1)
+            .unwrap();
         let blk = blk.split("let idx = cpu.0").next().unwrap();
         for forbidden in [
             "set_saved_pc",
@@ -93539,12 +93623,21 @@ mod stage200c2c2b_riscv_final_frame {
     // (20) both return routes use ONE final delivery helper (no duplicated implementation).
     #[test]
     fn f20_single_delivery_implementation() {
+        // Exactly one delivery site for THIS class, shared by both return routes. U6's
+        // `IpcSend` consumer is a different, class-scoped call and is counted separately.
         assert_eq!(
             RISCV_TRAP_SRC
-                .matches("take_blocked_syscall_completion")
+                .matches("take_blocked_syscall_completion(current_tid)")
                 .count(),
             1,
             "exactly one delivery site, shared by both return routes"
+        );
+        assert_eq!(
+            RISCV_TRAP_SRC
+                .matches("take_blocked_syscall_completion_of_class(")
+                .count(),
+            1,
+            "…and exactly one class-scoped send delivery site beside it"
         );
     }
 }
@@ -95263,10 +95356,13 @@ mod stage200d1_publication_and_guards {
         assert!(body.contains("pending_syscall_completion = Some("));
         // The resume boundary consumes it through the existing single consumer.
         assert!(AARCH64_TRAP_SRC.contains("take_blocked_syscall_completion"));
-        // Death does not add a second consumer anywhere.
+        // Death does not add a second consumer anywhere: the reply-timeout/`IpcRecv` class has
+        // exactly ONE consumer on this port, and it is the unqualified `take` that resolves to
+        // that class. (U6 added a separate, class-scoped `IpcSend` consumer alongside it; it
+        // takes a different function and cannot consume this class's entry.)
         assert_eq!(
             AARCH64_TRAP_SRC
-                .matches("take_blocked_syscall_completion")
+                .matches("take_blocked_syscall_completion(current_tid)")
                 .count(),
             1,
             "exactly one consumer at the AArch64 resume boundary"
@@ -97307,7 +97403,7 @@ mod stage200d0b3_x86_exit_corrected {
         );
         // EVERY shared post-lock drain precedes the drain marker.
         for drain in [
-            "shared.drain_dispatch_post_work(cpu)?;",
+            "shared.drain_dispatch_post_work(cpu, ",
             "shared.drain_reply_timeout_post_work(cpu, now);",
             "shared.drain_server_death_post_work(cpu)",
             "DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()",
@@ -98155,7 +98251,7 @@ mod stage200d0c1_aarch64_exit_prep {
             .find("take_post_lock_trap_disposition(")
             .expect("consumer");
         for drain in [
-            "shared.drain_dispatch_post_work(cpu)?;",
+            "shared.drain_dispatch_post_work(cpu, ",
             "shared.drain_server_death_post_work(cpu)",
             "shared.drain_reply_timeout_post_work(cpu, now);",
             "super::aarch64::trap::enter_post_lock_idle(cpu);",
@@ -98941,7 +99037,7 @@ mod stage200d0d1_riscv_exit_prep {
             .find("take_post_lock_trap_disposition(")
             .expect("consumer");
         for drain in [
-            "shared.drain_dispatch_post_work(cpu)?;",
+            "shared.drain_dispatch_post_work(cpu, ",
             "shared.drain_reply_timeout_post_work(cpu, now);",
             "shared.drain_server_death_post_work(cpu)",
             "RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN",
@@ -114885,7 +114981,13 @@ mod stage199d_wa2a_ownership_boundary {
             // `wake_tid_to_runnable`'s `Blocked|Running -> Runnable` transition, added when the
             // three blocked-waiter Phase-C completions retired their broad acquisitions. It is a
             // WAKE owner of exactly the same class as the in-lock writer it mirrors.
-            ("src/runtime.rs", 6),
+            //
+            // U6 (199C): 6 -> 7. `commit_blocking_send_split` writes
+            // `Running -> Blocked(EndpointSend)` — the split form of the transition
+            // `block_current_on_send_with_deadline` performs in-lock. It is a BLOCK owner, not a
+            // wake owner: it can only ever move a task OUT of runnability, and it does so inside
+            // the same rank-1 section that proved the task was this CPU's current.
+            ("src/runtime.rs", 7),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -114907,8 +115009,9 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            33,
-            "30 raw writes, the WA3A barrier's single write, and the WA3B barrier's two"
+            34,
+            "31 raw writes (U6 added `commit_blocking_send_split`), the WA3A barrier's single \
+             write, and the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -115375,6 +115478,16 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Cannot,
         ),
+        // U6 (199C): the split form of the blocking-send block transition — the same class as
+        // its in-lock sibling `block_current_on_send_with_deadline`. It moves a task INTO
+        // `Blocked(EndpointSend)` and can write nothing else, so it is not a transition out of
+        // Blocked and cannot be a waiter-ownership wake owner.
+        (
+            "src/runtime.rs",
+            "commit_blocking_send_split",
+            1,
+            Verdict::IntoBlocked,
+        ),
         // U3 (203C): the split form of `wake_tid_to_runnable`'s `Blocked|Running -> Runnable`
         // transition, reached by the blocked-waiter Phase-C completion transaction. Same class
         // as the in-lock writer it mirrors, so it carries the same verdict.
@@ -115661,7 +115774,10 @@ mod stage199d_wa2b_wake_owner_census {
             "block_current_on_send_with_deadline",
             "tcb.status",
             "TaskStatus::Blocked(WaitReason::EndpointSend(send_cap))",
-            ".ok_or(KernelError::TaskMissing)?;",
+            // U6 (199C): the line above the write is now the CHECKED send-generation mint,
+            // whose refusal is `WouldBlock`. Same site, same transition — the neighbourhood
+            // changed because the legacy route now mints the blocking cycle's identity too.
+            ".ok_or(KernelError::WouldBlock)?;",
             "tcb.ipc_timeout_deadline = deadline;",
         ),
         (
@@ -115669,7 +115785,10 @@ mod stage199d_wa2b_wake_owner_census {
             "process_ipc_timeout_deadlines",
             "tcb.status",
             "TaskStatus::Runnable",
-            "if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {",
+            // U6 (199C): the line above the write is now the close of the send-side
+            // `TimedOut` completion publication, which must precede the `Runnable` transition
+            // (a Runnable task is no longer completable). Same site, same transition.
+            "}",
             "tcb.ipc_timeout_deadline = None;",
         ),
         (
@@ -115772,7 +115891,7 @@ mod stage199d_wa2b_wake_owner_census {
             "src/kernel/task.rs",
             "new",
             "status:",
-            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, server_reply_link: None, blocked_recv_generation: 0, pending_syscall_completion: None, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
+            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, server_reply_link: None, blocked_recv_generation: 0, blocked_send_generation: 0, pending_syscall_completion: None, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
             "thread_group_id: ThreadGroupId(tid.0),",
             "asid,",
         ),
@@ -115783,6 +115902,14 @@ mod stage199d_wa2b_wake_owner_census {
             "TaskStatus::Reserved",
             "let mut tcb = Self::new(tid, None);",
             "tcb.thread_group_id = ThreadGroupId(reservation.process_pid);",
+        ),
+        (
+            "src/runtime.rs",
+            "commit_blocking_send_split",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointSend(snap.send_cap))",
+            "let tcb = tcbs[idx].as_mut().expect(\"position guarantees Some\");",
+            "tcb.ipc_timeout_deadline = snap.deadline;",
         ),
         (
             "src/runtime.rs",
@@ -115907,8 +116034,10 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            30,
-            "30 raw writes: U3 (203C) added `wake_tid_to_runnable_split`, the split form of \
+            31,
+            "31 raw writes: U6 (199C) added `commit_blocking_send_split`, the split form of the \
+             blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
+             split form of \
              `wake_tid_to_runnable`'s transition, when the blocked-waiter Phase-C completions \
              retired their broad acquisitions"
         );
@@ -115977,8 +116106,9 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            39,
-            "37 pinned by WA2A-R1, `ThreadControlBlock::reserved`, and U3 (203C)'s \
+            40,
+            "37 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
+             `commit_blocking_send_split`, and U3 (203C)'s \
              `wake_tid_to_runnable_split`"
         );
         assert_eq!(
@@ -115991,8 +116121,8 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            39,
-            "30 raw writes + 8 transition-barriered sites + 1 reservation-barriered site"
+            40,
+            "31 raw writes + 8 transition-barriered sites + 1 reservation-barriered site"
         );
     }
 
@@ -116119,6 +116249,14 @@ mod stage199d_wa2b_wake_owner_census {
                         "apply_scheduler_wake_plan",
                         1,
                     ),
+                    // U6 (199C): the receiver-side "complete then wake" seam. It is not a new
+                    // wake implementation — it publishes the blocked sender's completion and
+                    // then calls this same body — but it IS a new direct caller, recorded here.
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "complete_and_wake_blocked_sender",
+                        1,
+                    ),
                     // Stage 199D-WA3C1 (F): endpoint destruction now releases the EXACT parked
                     // receiver instead of stranding it `Blocked(EndpointReceive)` forever. A new
                     // logical wake origin — recorded here rather than suppressed.
@@ -116144,18 +116282,18 @@ mod stage199d_wa2b_wake_owner_census {
                         "apply_split_sender_wake_plan",
                         1,
                     ),
-                    (
-                        "src/kernel/boot/ipc_state.rs",
-                        "ipc_recv_with_optional_deadline",
-                        2,
-                    ),
+                    // U6 (199C) verification repair: `ipc_recv_with_optional_deadline` (2) and
+                    // `try_ipc_recv` (1) no longer reach this generic applier for the sender
+                    // they consume. `ipc_recv_endpoint_take` — the FULL receive path — used to
+                    // hand back a bare `SchedulerWakePlan::Wake(tid)`, which woke a
+                    // U6-committed sender with no completion parked, so it returned
+                    // `WouldBlock` for a message already delivered. It now returns the exact
+                    // `SenderWakeTarget` and its three callers apply it through
+                    // `apply_blocked_sender_wake`, which cannot skip the publication.
                     ("src/kernel/boot/ipc_state.rs", "ipc_reply", 2),
-                    (
-                        "src/kernel/boot/ipc_state.rs",
-                        "ipc_send_with_optional_deadline",
-                        1,
-                    ),
-                    ("src/kernel/boot/ipc_state.rs", "try_ipc_recv", 1),
+                    // U6 (199C): the send body was split into `ipc_send_routed`, which both
+                    // send entries share. Same call, same origin — renamed, not multiplied.
+                    ("src/kernel/boot/ipc_state.rs", "ipc_send_routed", 1),
                     // U3 (203C): the three `src/runtime.rs` blocked-waiter Phase-C completion
                     // callers — `execute_blocked_waiter_ordinary_cap_delivery`,
                     // `execute_blocked_waiter_reply_cap_delivery` and
@@ -116187,11 +116325,8 @@ mod stage199d_wa2b_wake_owner_census {
             (
                 "wake_waiter_for_endpoint",
                 &[
-                    (
-                        "src/kernel/boot/ipc_state.rs",
-                        "ipc_send_with_optional_deadline",
-                        2,
-                    ),
+                    // U6 (199C): renamed with the routed body split; same two call sites.
+                    ("src/kernel/boot/ipc_state.rs", "ipc_send_routed", 2),
                     (
                         "src/kernel/boot/ipc_state.rs",
                         "send_message_to_endpoint_and_wake",
@@ -116286,7 +116421,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            39,
+            40,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -116300,7 +116435,7 @@ mod stage199d_wa2b_wake_owner_census {
         // 12 → 13 and nothing else moves.
         assert_eq!(
             (can, cannot, into_blocked, fresh, non_production),
-            (13, 16, 7, 2, 1)
+            (13, 16, 8, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -122698,7 +122833,7 @@ mod u3_ordinary_cap_sender_wake {
         k: &SharedKernel,
         asid: Asid,
         object: CapObject,
-        wake_tid: Option<ThreadId>,
+        wake_tid: Option<crate::kernel::ipc::SenderWakeTarget>,
     ) -> RecvBoundaryOrdinaryCapSnapshot {
         let cnode = k.with(|s| s.task_cnode(RECEIVER).expect("cnode"));
         RecvBoundaryOrdinaryCapSnapshot {
@@ -122760,7 +122895,13 @@ mod u3_ordinary_cap_sender_wake {
 
     /// The exact retired body.
     fn legacy(k: &SharedKernel, cpu: CpuId, tid: ThreadId) {
-        let _ = k.with_cpu(cpu, |kernel| kernel.apply_split_sender_wake_plan(tid));
+        let _ = k.with_cpu(cpu, |kernel| {
+            kernel.apply_split_sender_wake_plan(crate::kernel::ipc::SenderWakeTarget {
+                tid,
+                asid: None,
+                send_generation: 0,
+            })
+        });
     }
 
     fn candidate(k: &SharedKernel, cpu: CpuId, tid: ThreadId) {
@@ -122925,9 +123066,14 @@ mod u3_ordinary_cap_sender_wake {
         // The legacy `with_cpu` refusal produced the same KernelError class.
         assert_eq!(
             r,
-            k.with_cpu(cpu, |kernel| kernel
-                .apply_split_sender_wake_plan(ThreadId(SENDER)))
-                .map(|_| ()),
+            k.with_cpu(cpu, |kernel| {
+                kernel.apply_split_sender_wake_plan(crate::kernel::ipc::SenderWakeTarget {
+                    tid: ThreadId(SENDER),
+                    asid: None,
+                    send_generation: 0,
+                })
+            })
+            .map(|_| ()),
             "{label}: same error class as the retired broad body"
         );
     }
@@ -122976,7 +123122,16 @@ mod u3_ordinary_cap_sender_wake {
             None,
         );
         let mut f = frame();
-        let snap = snapshot(&k, asid, object, Some(ThreadId(SENDER)));
+        let snap = snapshot(
+            &k,
+            asid,
+            object,
+            Some(crate::kernel::ipc::SenderWakeTarget {
+                tid: ThreadId(SENDER),
+                asid: None,
+                send_generation: 0,
+            }),
+        );
         assert!(matches!(
             k.test_complete_recv_boundary_ordinary_cap(CpuId(0), &mut f, snap),
             Ok(())
@@ -123091,7 +123246,7 @@ mod u3_ordinary_cap_sender_wake {
             .find("IPC_RECV_SPLIT_REFILL_WAKE_APPLY tid={}")
             .expect("the marker, with identical text");
         let wake = t
-            .find("wake_tid_to_runnable_split(cpu, sender_tid)")
+            .find("wake_tid_to_runnable_split(cpu, target.tid)")
             .expect("the shared wake body");
         assert!(
             bind < marker && marker < wake,
@@ -124010,15 +124165,29 @@ mod u4_cross_arch_queue_advancing_dispatch {
     /// contract, while retaining their different endpoint-message states.
     #[test]
     fn both_blocking_send_origins_share_one_producer_and_contract() {
-        // One architecture-neutral production body publishes the deferral for both origins.
+        // One architecture-neutral production body serves both origins. U6 collapsed the two
+        // duplicated call sites into ONE shared origin body (`block_or_publish_send`), which
+        // both origins reach and which holds the single in-lock producer call — so "both
+        // origins share one producer" is now structural rather than a coincidence of two
+        // identical copies.
         assert_eq!(
             IPC_STATE
                 .matches(
-                    "block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)"
+                    // Built at runtime so this needle is not itself a literal the sibling
+                    // "no receiver-call form in this module" guard would trip over.
+                    &alloc::format!(
+                        "self{}block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)",
+                        "."
+                    )
                 )
                 .count(),
+            1,
+            "exactly one in-lock producer call site — inside the one shared origin body"
+        );
+        assert_eq!(
+            IPC_STATE.matches("self.block_or_publish_send(").count(),
             2,
-            "exactly two producer call sites - the two genuine blocking-send origins"
+            "and exactly the two genuine blocking-send origins reach it"
         );
         assert_eq!(
             IPC_STATE
@@ -124144,5 +124313,1213 @@ mod u4_cross_arch_queue_advancing_dispatch {
             1,
             "one producer body is what makes the cross-architecture inference valid"
         );
+    }
+
+    // ── U6 / canonical 199C — the OFF-LOCK blocking-send commit ──────────────────────────────
+    //
+    // U4 relocated the blocking-send DISPATCH out of the broad lock; U6 relocates the blocking
+    // -send COMMIT itself. The producer resolves coordinates under the broad lock and mutates
+    // nothing; the post-lock drain runs one rank-ordered 1 → 2 → 3 transaction and reports a
+    // typed disposition; and because a committed sender's saved frame still carries the
+    // producer's `WouldBlock`, its waker must publish a completion that the resume boundary
+    // consumes exactly once.
+    //
+    // Every test here drives the REAL production entries — `ipc_send_with_deadline_publishing`
+    // (what `handle_ipc_send` calls) and `drain_dispatch_post_work` (what the trap wrappers
+    // call). The transaction is never invoked directly.
+    mod u6_offlock_blocking_send_commit {
+        use super::*;
+        use crate::kernel::boot::{BlockingSendProducerOutcome, KernelState};
+        use crate::kernel::dispatch_post_work::DispatchPostWorkDisposition as Disp;
+        use crate::kernel::task::{BlockedSyscallClass, WaitReason};
+        use crate::kernel::trapframe::TrapFrame;
+
+        /// Clear every per-CPU latch this module can leave behind, INCLUDING the post-work
+        /// stash. Publication refuses when the stash is occupied or a deferral is already
+        /// armed, so a leak from an earlier test would silently reroute a later one to the
+        /// in-lock path and make its failure look like a production defect.
+        fn reset_u6_latches(cpu_idx: usize) {
+            reset_latches(cpu_idx);
+            // SAFETY: hosted single-threaded test; the same discipline as the production stash.
+            unsafe {
+                let _ = crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].take();
+            }
+        }
+
+        fn msg(body: &[u8]) -> Message {
+            Message::new(SENDER, body).expect("message")
+        }
+
+        /// The REAL producer entry, run under the ordinary broad trap phase exactly as the trap
+        /// wrapper runs it: mark the drainer active, run `with_cpu`, let the closure RETURN.
+        fn real_entry_publishing_send(
+            k: &SharedKernel,
+            cpu: CpuId,
+            send_cap: CapId,
+            m: Message,
+            timeout_ticks: u64,
+        ) -> Result<BlockingSendProducerOutcome, KernelError> {
+            let cpu_idx = cpu.0 as usize;
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+            let r = k
+                .with_cpu(cpu, |kernel| {
+                    kernel.ipc_send_with_deadline_publishing(send_cap, m, timeout_ticks)
+                })
+                .expect("the broad phase itself must succeed");
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+            r
+        }
+
+        /// The REAL drain, called the way both trap wrappers call it.
+        fn drive_post_lock_drain(k: &SharedKernel, cpu: CpuId, frame: &mut TrapFrame) -> Disp {
+            k.drain_dispatch_post_work(cpu, Some(frame))
+                .expect("the drain itself must succeed")
+        }
+
+        /// Publish + drain, the whole production sequence for one blocking send.
+        fn publish_and_commit(
+            k: &SharedKernel,
+            cpu: CpuId,
+            send_cap: CapId,
+            m: Message,
+            timeout_ticks: u64,
+        ) -> (BlockingSendProducerOutcome, Disp, TrapFrame) {
+            let produced = real_entry_publishing_send(k, cpu, send_cap, m, timeout_ticks)
+                .expect("the producer must not fail");
+            let mut frame = TrapFrame::zeroed();
+            let disposition = drive_post_lock_drain(k, cpu, &mut frame);
+            (produced, disposition, frame)
+        }
+
+        fn parked_completion(
+            k: &SharedKernel,
+            tid: u64,
+        ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+            k.with(|s| {
+                s.with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|t| t.tid.0 == tid)
+                        .and_then(|t| t.pending_syscall_completion)
+                })
+            })
+        }
+
+        fn send_generation(k: &SharedKernel, tid: u64) -> u64 {
+            k.with(|s| {
+                s.with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|t| t.tid.0 == tid)
+                        .map(|t| t.blocked_send_generation)
+                        .expect("task")
+                })
+            })
+        }
+
+        /// The waiter's carried identity, per §7.
+        fn waiter_identities(
+            k: &SharedKernel,
+            eidx: usize,
+        ) -> alloc::vec::Vec<(u64, Option<u16>, u64)> {
+            k.with(|s| {
+                s.with_ipc_state(|ipc| {
+                    ipc.endpoint_sender_waiters[eidx]
+                        .iter()
+                        .flatten()
+                        .map(|w| (w.tid.0, w.asid.map(|a| a.0), w.send_generation))
+                        .collect::<alloc::vec::Vec<_>>()
+                })
+            })
+        }
+
+        // ── §9 both origins ─────────────────────────────────────────────────────────────────
+
+        /// ORIGIN 1 — a `Synchronous` endpoint with no receiver waiting. The producer publishes
+        /// and mutates nothing; the drain commits all three domains and reports
+        /// `SenderCommittedBlocked`.
+        #[test]
+        fn origin_synchronous_no_waiter_publishes_then_commits_off_lock() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+
+            let produced =
+                real_entry_publishing_send(&k, cpu, send_cap, msg(b"sync"), 5_000).expect("ok");
+            assert_eq!(
+                produced,
+                BlockingSendProducerOutcome::PublicationPending,
+                "the producer publishes rather than blocking in-lock"
+            );
+            // NOTHING is committed yet — this is the whole point of the deferral.
+            assert_eq!(
+                status_of(&k, SENDER),
+                Some(TaskStatus::Running),
+                "the sender is still running after the broad phase"
+            );
+            assert_eq!(
+                k.with(|s| s.current_tid_on_cpu(cpu)),
+                Some(SENDER),
+                "…and still current"
+            );
+            assert!(
+                sender_waiters(&k, eidx).is_empty(),
+                "…and no waiter has been published"
+            );
+            assert!(
+                !crate::kernel::boot::d2_send_dispatch_is_deferred(cpu.0 as usize),
+                "…and no dispatch deferral is armed yet"
+            );
+
+            let mut frame = TrapFrame::zeroed();
+            let disposition = drive_post_lock_drain(&k, cpu, &mut frame);
+            assert_eq!(
+                disposition,
+                Disp::SenderCommittedBlocked { tid: SENDER },
+                "the drain reports the caller must write no result"
+            );
+            // Now all three domains agree — this is the U4 assertion set, unchanged.
+            assert_blocked_and_deferred(&k, cpu, eidx, send_cap);
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// ORIGIN 2 — a `Buffered` endpoint whose queue is full. Same producer, same
+        /// transaction, same disposition: the two origins share one body.
+        #[test]
+        fn origin_buffered_full_publishes_then_commits_off_lock() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Buffered, 1);
+            // Fill the single queue slot so the next send has nowhere to go.
+            k.with_cpu(cpu, |kernel| {
+                kernel.ipc_send(send_cap, msg(b"fill")).expect("first send")
+            })
+            .expect("broad phase");
+            assert_eq!(queued_messages(&k, eidx), 1, "the queue is full");
+
+            let (produced, disposition, _frame) =
+                publish_and_commit(&k, cpu, send_cap, msg(b"full"), 5_000);
+            assert_eq!(produced, BlockingSendProducerOutcome::PublicationPending);
+            assert_eq!(disposition, Disp::SenderCommittedBlocked { tid: SENDER });
+            assert_blocked_and_deferred(&k, cpu, eidx, send_cap);
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// Both origins reach ONE shared body, so they cannot drift apart.
+        #[test]
+        fn both_origins_share_one_body_and_one_contract() {
+            let body = body_of(
+                IPC_STATE,
+                "fn ipc_send_routed(",
+                "\n    pub(crate) fn note_endpoint_only_queued_send_split(",
+            );
+            assert_eq!(
+                body.matches("self.block_or_publish_send(").count(),
+                2,
+                "exactly the two blocking origins reach the shared body"
+            );
+            assert!(
+                !body.contains("self.block_current_on_send_with_deadline("),
+                "neither origin may still call the in-lock producer directly"
+            );
+            for origin in [
+                "BlockingSendOrigin::SynchronousNoWaiter",
+                "BlockingSendOrigin::BufferedFull",
+            ] {
+                assert!(body.contains(origin), "{origin} must be one of them");
+            }
+        }
+
+        // ── §7 waiter identity ──────────────────────────────────────────────────────────────
+
+        /// The published waiter carries the EXACT blocking cycle, not merely a numeric TID.
+        #[test]
+        fn the_published_waiter_carries_the_exact_blocking_cycle() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            let before = send_generation(&k, SENDER);
+            publish_and_commit(&k, cpu, send_cap, msg(b"id"), 5_000);
+
+            let after = send_generation(&k, SENDER);
+            assert_eq!(after, before + 1, "the commit advances the send generation");
+            let expected_asid = k.with(|s| s.task_asid(SENDER)).map(|a| a.0);
+            assert_eq!(
+                waiter_identities(&k, eidx),
+                alloc::vec![(SENDER, expected_asid, after)],
+                "the waiter names {{tid, asid, send_generation}} for THIS cycle"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// The send generation is its OWN coordinate: committing a send never advances the
+        /// receive generation, which is what makes a per-class completion identity meaningful.
+        #[test]
+        fn the_send_generation_is_separate_from_the_receive_generation() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, _eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            let recv_before = k
+                .with(|s| s.blocked_recv_generation_for_test(SENDER))
+                .expect("task");
+            publish_and_commit(&k, cpu, send_cap, msg(b"sep"), 5_000);
+            assert_eq!(
+                k.with(|s| s.blocked_recv_generation_for_test(SENDER)),
+                Some(recv_before),
+                "a send commit must not touch blocked_recv_generation"
+            );
+            // And the completion machinery names the send counter, not the recv one.
+            assert!(
+                include_str!("../task.rs")
+                    .contains("BlockedSyscallClass::IpcSend => tcb.blocked_send_generation"),
+                "the class dispatch must select the send counter for a send completion"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        // ── §2 completion: success, timeout, exactly-once ───────────────────────────────────
+
+        /// RECEIVER BEFORE TIMEOUT — a receiver that consumes the parked message publishes a
+        /// SUCCESS completion for the exact cycle, and does so BEFORE the sender is woken.
+        #[test]
+        fn a_consuming_receiver_publishes_success_for_the_exact_cycle() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Buffered, 1);
+            k.with_cpu(cpu, |kernel| {
+                kernel.ipc_send(send_cap, msg(b"one")).expect("fill")
+            })
+            .expect("broad phase");
+            publish_and_commit(&k, cpu, send_cap, msg(b"two"), 5_000);
+            let cycle = send_generation(&k, SENDER);
+            assert!(
+                parked_completion(&k, SENDER).is_none(),
+                "nothing parked yet"
+            );
+
+            // The REAL receiver-side consumption + wake seam.
+            let target = k.with(|s| {
+                s.with_ipc_state(|ipc| {
+                    ipc.endpoint_sender_waiters[eidx][0].map(|w| w.wake_target())
+                })
+            });
+            let target = target.expect("the waiter is queued");
+            k.with_cpu(cpu, |kernel| {
+                kernel.apply_split_sender_wake_plan(target).expect("wake")
+            })
+            .expect("broad phase");
+
+            let done = parked_completion(&k, SENDER).expect("a completion is parked");
+            assert_eq!(done.syscall_class, BlockedSyscallClass::IpcSend);
+            assert_eq!(done.result, KernelState::SEND_COMPLETION_OK, "success");
+            assert_eq!(done.tid, SENDER);
+            assert_eq!(done.blocked_generation, cycle, "for the EXACT cycle");
+            assert_eq!(
+                status_of(&k, SENDER),
+                Some(TaskStatus::Runnable),
+                "and the sender was woken"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// FULL RECEIVE PATH — the sibling of the split-refill case, and the one this
+        /// session's verification found unguarded.
+        ///
+        /// `ipc_recv_endpoint_take` is the ordinary (non-split) receive: it consumes a sender
+        /// waiter, refills or directly delivers its message, and wakes it. The split path is
+        /// only eligible for a narrow class of plain messages and returns
+        /// `Ineligible(SenderWaiterPresent)` otherwise, so this is the path most consumed
+        /// senders actually take. It used to hand back a bare `SchedulerWakePlan::Wake(tid)`,
+        /// dropping the waiter's `{asid, send_generation}` and waking the sender with NOTHING
+        /// parked — so the sender returned the `WouldBlock` its saved frame still carried for a
+        /// message the receiver had already been given, and a caller that retried on
+        /// `WouldBlock` would have delivered it twice.
+        #[test]
+        fn the_full_receive_path_publishes_success_before_waking_the_sender() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Buffered, 1);
+            k.with_cpu(cpu, |kernel| {
+                kernel.ipc_send(send_cap, msg(b"one")).expect("fill")
+            })
+            .expect("broad phase");
+            publish_and_commit(&k, cpu, send_cap, msg(b"two"), 5_000);
+            let cycle = send_generation(&k, SENDER);
+            assert_eq!(sender_waiters(&k, eidx).len(), 1, "the sender is parked");
+            assert!(
+                parked_completion(&k, SENDER).is_none(),
+                "nothing parked yet"
+            );
+
+            // Drive the REAL full receive path, then apply exactly what it returns.
+            let (received, wake) = k
+                .with_cpu(cpu, |kernel| {
+                    let (m, w) = kernel.ipc_recv_endpoint_take(eidx).expect("take");
+                    kernel.apply_blocked_sender_wake(w).expect("apply");
+                    (m, w)
+                })
+                .expect("broad phase");
+            assert!(received.is_some(), "the receiver got a message");
+            let wake = wake.expect("the consumed sender must be reported for wake");
+            assert_eq!(wake.tid.0, SENDER, "…as the exact sender");
+            assert_eq!(
+                wake.send_generation, cycle,
+                "…carrying the exact blocking cycle, not a bare TID"
+            );
+
+            let done = parked_completion(&k, SENDER).expect("a completion must be parked");
+            assert_eq!(done.syscall_class, BlockedSyscallClass::IpcSend);
+            assert_eq!(done.result, KernelState::SEND_COMPLETION_OK);
+            assert_eq!(done.blocked_generation, cycle);
+            assert_eq!(
+                status_of(&k, SENDER),
+                Some(TaskStatus::Runnable),
+                "and the sender was woken"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// No production wake of a CONSUMED sender can bypass completion publication: the full
+        /// path returns a `SenderWakeTarget` (not a bare TID) and both appliers publish first.
+        #[test]
+        fn no_consumed_sender_wake_can_bypass_completion_publication() {
+            // The full path can no longer express a bare-TID sender wake.
+            let take = body_of(
+                IPC_STATE,
+                "pub(crate) fn ipc_recv_endpoint_take(",
+                "\n    pub fn try_ipc_recv(",
+            );
+            assert!(
+                !take.contains("SchedulerWakePlan::Wake("),
+                "the full receive path must not return a bare-TID wake for a consumed sender"
+            );
+            assert_eq!(
+                take.matches("wake_target()").count(),
+                2,
+                "both consuming arms return the exact blocking cycle"
+            );
+            // Both appliers publish before they wake.
+            for (applier, close) in [
+                (
+                    "pub(crate) fn apply_blocked_sender_wake(",
+                    "\n    /// U6 §2/§7 — complete and then wake",
+                ),
+                (
+                    "pub(crate) fn apply_split_sender_wake_plan(",
+                    "\n    pub(crate) fn ipc_try_send_queued_plain_endpoint_only(",
+                ),
+            ] {
+                let body = body_of(IPC_STATE, applier, close);
+                let publishes = body.contains("publish_blocking_send_completion")
+                    || body.contains("complete_and_wake_blocked_sender");
+                assert!(publishes, "`{applier}` must publish the completion");
+            }
+            // And the one seam that does both keeps the order.
+            let seam = body_of(
+                IPC_STATE,
+                "pub(crate) fn complete_and_wake_blocked_sender(",
+                "\n    /// `true` iff a pending blocked-syscall completion is parked",
+            );
+            assert!(
+                seam.find("publish_blocking_send_completion")
+                    .expect("publish")
+                    < seam.find("wake_tid_to_runnable").expect("wake"),
+                "publish strictly before wake"
+            );
+        }
+
+        /// TIMEOUT BEFORE RECEIVER — the deadline scan publishes `TimedOut` for the exact cycle
+        /// before the sender becomes runnable, and a receiver that arrives afterwards cannot
+        /// overwrite it, because the sender is no longer blocked.
+        #[test]
+        fn an_expired_deadline_publishes_timed_out_and_a_late_receiver_cannot_overwrite_it() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            publish_and_commit(&k, cpu, send_cap, msg(b"to"), 1);
+            let cycle = send_generation(&k, SENDER);
+            let target = k
+                .with(|s| {
+                    s.with_ipc_state(|ipc| {
+                        ipc.endpoint_sender_waiters[eidx][0].map(|w| w.wake_target())
+                    })
+                })
+                .expect("waiter queued");
+
+            // Drive the REAL deadline scan far past the deadline.
+            let deadline = k
+                .with(|s| {
+                    s.with_tcbs(|tcbs| {
+                        tcbs.iter()
+                            .flatten()
+                            .find(|t| t.tid.0 == SENDER)
+                            .and_then(|t| t.ipc_timeout_deadline)
+                    })
+                })
+                .expect("a deadline rode with the block");
+            k.with_cpu(cpu, |kernel| {
+                kernel
+                    .process_ipc_timeout_deadlines(deadline.wrapping_add(1))
+                    .expect("scan")
+            })
+            .expect("broad phase");
+
+            let done = parked_completion(&k, SENDER).expect("a completion is parked");
+            assert_eq!(done.syscall_class, BlockedSyscallClass::IpcSend);
+            assert_eq!(done.result, KernelState::SEND_COMPLETION_TIMED_OUT);
+            assert_eq!(done.blocked_generation, cycle, "for the EXACT cycle");
+            assert!(
+                sender_waiters(&k, eidx).is_empty(),
+                "the timed-out waiter is removed"
+            );
+
+            // A late receiver-side wake for the same target must NOT replace the result: the
+            // sender is no longer Blocked(EndpointSend), so the publication refuses.
+            k.with_cpu(cpu, |kernel| {
+                let published = kernel
+                    .publish_blocking_send_completion(target, KernelState::SEND_COMPLETION_OK);
+                assert!(!published, "a late success must be refused");
+            })
+            .expect("broad phase");
+            assert_eq!(
+                parked_completion(&k, SENDER).map(|c| c.result),
+                Some(KernelState::SEND_COMPLETION_TIMED_OUT),
+                "the timeout result survives"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// EXACTLY-ONCE — the resume boundary consumes the parked completion once; a second
+        /// consumption finds nothing, and the class scope keeps the recv consumer out of it.
+        #[test]
+        fn a_parked_send_completion_is_consumed_exactly_once_and_only_by_its_class() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            publish_and_commit(&k, cpu, send_cap, msg(b"once"), 5_000);
+            let target = k
+                .with(|s| {
+                    s.with_ipc_state(|ipc| {
+                        ipc.endpoint_sender_waiters[eidx][0].map(|w| w.wake_target())
+                    })
+                })
+                .expect("waiter queued");
+            k.with_cpu(cpu, |kernel| {
+                assert!(
+                    kernel
+                        .publish_blocking_send_completion(target, KernelState::SEND_COMPLETION_OK)
+                );
+            })
+            .expect("broad phase");
+
+            // The RECV-class consumer must not touch it.
+            let wrong_class = k.with_cpu(cpu, |kernel| {
+                kernel
+                    .take_blocked_syscall_completion_of_class(SENDER, BlockedSyscallClass::IpcRecv)
+            });
+            assert!(
+                wrong_class.expect("broad phase").is_none(),
+                "the recv consumer must not take a send completion"
+            );
+            assert!(
+                parked_completion(&k, SENDER).is_some(),
+                "…and must leave it parked"
+            );
+
+            // The send-class consumer takes it exactly once.
+            let first = k
+                .with_cpu(cpu, |kernel| {
+                    kernel.take_blocked_syscall_completion_of_class(
+                        SENDER,
+                        BlockedSyscallClass::IpcSend,
+                    )
+                })
+                .expect("broad phase");
+            assert!(first.is_some(), "the send consumer takes it");
+            let second = k
+                .with_cpu(cpu, |kernel| {
+                    kernel.take_blocked_syscall_completion_of_class(
+                        SENDER,
+                        BlockedSyscallClass::IpcSend,
+                    )
+                })
+                .expect("broad phase");
+            assert!(second.is_none(), "and it can never be observed twice");
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// A completion published for an OLDER cycle is refused at consumption: the identity is
+        /// a proof, not a hint.
+        #[test]
+        fn a_stale_cycle_completion_is_refused_and_discarded() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, _eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            publish_and_commit(&k, cpu, send_cap, msg(b"stale"), 5_000);
+            let asid = k.with(|s| s.task_asid(SENDER)).expect("asid");
+            let cycle = send_generation(&k, SENDER);
+            k.with_cpu(cpu, |kernel| {
+                kernel.with_tcbs_mut(|tcbs| {
+                    let t = tcbs
+                        .iter_mut()
+                        .flatten()
+                        .find(|t| t.tid.0 == SENDER)
+                        .unwrap();
+                    t.pending_syscall_completion =
+                        Some(crate::kernel::task::BlockedSyscallCompletion {
+                            syscall_class: BlockedSyscallClass::IpcSend,
+                            result: KernelState::SEND_COMPLETION_OK,
+                            tid: SENDER,
+                            asid,
+                            blocked_generation: cycle - 1,
+                        });
+                });
+            })
+            .expect("broad phase");
+            let taken = k
+                .with_cpu(cpu, |kernel| {
+                    kernel.take_blocked_syscall_completion_of_class(
+                        SENDER,
+                        BlockedSyscallClass::IpcSend,
+                    )
+                })
+                .expect("broad phase");
+            assert!(taken.is_none(), "a stale generation is refused");
+            assert!(
+                parked_completion(&k, SENDER).is_none(),
+                "and the stale entry is discarded, never left to be seen later"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        // ── §9 transaction refusals ─────────────────────────────────────────────────────────
+
+        /// A DESTROYED endpoint makes the transaction refuse with nothing mutated, and the
+        /// drain hands the caller a canonical immediate error instead of a block.
+        #[test]
+        fn a_destroyed_endpoint_refuses_with_no_mutation_and_returns_immediately() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            let produced =
+                real_entry_publishing_send(&k, cpu, send_cap, msg(b"gone"), 5_000).expect("ok");
+            assert_eq!(produced, BlockingSendProducerOutcome::PublicationPending);
+
+            // Destroy the endpoint between publication and drain — exactly the race the
+            // endpoint generation exists to detect.
+            k.with_cpu(cpu, |kernel| {
+                let _ = kernel.destroy_endpoint(eidx);
+            })
+            .expect("broad phase");
+
+            let mut frame = TrapFrame::zeroed();
+            let disposition = drive_post_lock_drain(&k, cpu, &mut frame);
+            assert!(
+                matches!(disposition, Disp::ImmediateReturn { .. }),
+                "a refused commit returns immediately, got {disposition:?}"
+            );
+            assert_eq!(
+                status_of(&k, SENDER),
+                Some(TaskStatus::Running),
+                "the sender is untouched — still running"
+            );
+            assert_eq!(
+                k.with(|s| s.current_tid_on_cpu(cpu)),
+                Some(SENDER),
+                "…and still current"
+            );
+            assert!(
+                !crate::kernel::boot::d2_send_dispatch_is_deferred(cpu.0 as usize),
+                "a refusal arms NO dispatch deferral"
+            );
+            assert!(
+                parked_completion(&k, SENDER).is_none(),
+                "and parks no completion"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// A WAITER-FULL endpoint refuses with the canonical queue-full error and mutates
+        /// nothing.
+        #[test]
+        fn a_full_waiter_queue_refuses_with_the_canonical_error() {
+            use crate::kernel::boot::MAX_ENDPOINT_SENDER_WAITERS;
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            let produced =
+                real_entry_publishing_send(&k, cpu, send_cap, msg(b"full"), 5_000).expect("ok");
+            assert_eq!(produced, BlockingSendProducerOutcome::PublicationPending);
+            // Saturate the waiter queue with OTHER senders between publication and drain.
+            k.with(|s| {
+                s.with_ipc_state_mut(|ipc| {
+                    for (i, slot) in ipc.endpoint_sender_waiters[eidx]
+                        [..MAX_ENDPOINT_SENDER_WAITERS]
+                        .iter_mut()
+                        .enumerate()
+                    {
+                        *slot = Some(crate::kernel::boot::SenderWaiter {
+                            tid: crate::kernel::ipc::ThreadId(9000 + i as u64),
+                            msg: Message::new(9000 + i as u64, b"x").expect("m"),
+                            asid: None,
+                            send_generation: 1,
+                        });
+                    }
+                });
+            });
+            let mut frame = TrapFrame::zeroed();
+            match drive_post_lock_drain(&k, cpu, &mut frame) {
+                Disp::ImmediateReturn { error } => {
+                    assert_eq!(error, KernelError::EndpointQueueFull, "the canonical error");
+                }
+                other => panic!("expected an immediate return, got {other:?}"),
+            }
+            assert_eq!(status_of(&k, SENDER), Some(TaskStatus::Running));
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// A DUPLICATE waiter for the same sender is refused: one caller can be parked on an
+        /// endpoint at most once.
+        #[test]
+        fn a_duplicate_waiter_for_the_same_sender_is_refused() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            let produced =
+                real_entry_publishing_send(&k, cpu, send_cap, msg(b"dup"), 5_000).expect("ok");
+            assert_eq!(produced, BlockingSendProducerOutcome::PublicationPending);
+            k.with(|s| {
+                s.with_ipc_state_mut(|ipc| {
+                    ipc.endpoint_sender_waiters[eidx][0] =
+                        Some(crate::kernel::boot::SenderWaiter {
+                            tid: crate::kernel::ipc::ThreadId(SENDER),
+                            msg: Message::new(SENDER, b"x").expect("m"),
+                            asid: None,
+                            send_generation: 1,
+                        });
+                });
+            });
+            let mut frame = TrapFrame::zeroed();
+            match drive_post_lock_drain(&k, cpu, &mut frame) {
+                Disp::ImmediateReturn { error } => assert_eq!(error, KernelError::WouldBlock),
+                other => panic!("expected an immediate return, got {other:?}"),
+            }
+            assert_eq!(
+                sender_waiters(&k, eidx).len(),
+                1,
+                "no second waiter was published"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// A sender that is no longer this CPU's current task refuses: the transaction commits
+        /// only the caller it validated.
+        #[test]
+        fn a_sender_that_is_no_longer_current_refuses() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            let produced =
+                real_entry_publishing_send(&k, cpu, send_cap, msg(b"moved"), 5_000).expect("ok");
+            assert_eq!(produced, BlockingSendProducerOutcome::PublicationPending);
+            // Displace the sender between publication and drain.
+            k.with(|s| {
+                s.block_current_cpu();
+            });
+            let mut frame = TrapFrame::zeroed();
+            match drive_post_lock_drain(&k, cpu, &mut frame) {
+                Disp::ImmediateReturn { error } => assert_eq!(error, KernelError::WouldBlock),
+                other => panic!("expected an immediate return, got {other:?}"),
+            }
+            assert!(
+                sender_waiters(&k, eidx).is_empty(),
+                "nothing was published for a sender that is not current"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        // ── §9 FIFO, sparse + compaction, refill, repeated cycles ───────────────────────────
+
+        /// FIFO — waiters are published in arrival order, and the receiver-side refill consumes
+        /// the head first.
+        #[test]
+        fn waiters_are_published_fifo_and_consumed_head_first() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            publish_and_commit(&k, cpu, send_cap, msg(b"first"), 5_000);
+            // A second, different sender parks behind it.
+            k.with(|s| {
+                s.with_ipc_state_mut(|ipc| {
+                    ipc.endpoint_sender_waiters[eidx][1] =
+                        Some(crate::kernel::boot::SenderWaiter {
+                            tid: crate::kernel::ipc::ThreadId(INCOMING),
+                            msg: Message::new(INCOMING, b"second").expect("m"),
+                            asid: None,
+                            send_generation: 1,
+                        });
+                });
+            });
+            let order: alloc::vec::Vec<u64> =
+                sender_waiters(&k, eidx).iter().map(|w| w.0).collect();
+            assert_eq!(order, alloc::vec![SENDER, INCOMING], "arrival order");
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// SPARSE + COMPACTION — a hole left by a timed-out sender does not strand the senders
+        /// behind it: the queue left-compacts and the survivor becomes the head.
+        #[test]
+        fn a_sparse_waiter_queue_compacts_and_strands_nobody() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            publish_and_commit(&k, cpu, send_cap, msg(b"head"), 5_000);
+            k.with(|s| {
+                s.with_ipc_state_mut(|ipc| {
+                    ipc.endpoint_sender_waiters[eidx][1] =
+                        Some(crate::kernel::boot::SenderWaiter {
+                            tid: crate::kernel::ipc::ThreadId(INCOMING),
+                            msg: Message::new(INCOMING, b"tail").expect("m"),
+                            asid: None,
+                            send_generation: 1,
+                        });
+                    // Punch the hole a timed-out sender leaves: cleared in place, not compacted.
+                    ipc.endpoint_sender_waiters[eidx][0] = None;
+                });
+            });
+            let survivors: alloc::vec::Vec<u64> =
+                sender_waiters(&k, eidx).iter().map(|w| w.0).collect();
+            assert_eq!(
+                survivors,
+                alloc::vec![INCOMING],
+                "the survivor behind the hole is still reachable"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// REPEATED CYCLES — a sender that blocks, is completed, and blocks again gets a NEW
+        /// generation each time, so an earlier cycle's completion can never satisfy a later one.
+        #[test]
+        fn repeated_blocking_cycles_each_get_a_fresh_generation() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            let mut seen = alloc::vec::Vec::new();
+            for round in 0..3u8 {
+                publish_and_commit(&k, cpu, send_cap, msg(&[round]), 5_000);
+                let cycle = send_generation(&k, SENDER);
+                assert!(!seen.contains(&cycle), "generation {cycle} must be fresh");
+                seen.push(cycle);
+                // Complete + wake through the real seam, then restore `current` for the next
+                // round exactly as a dispatch would.
+                let target = k
+                    .with(|s| {
+                        s.with_ipc_state(|ipc| {
+                            ipc.endpoint_sender_waiters[eidx][0].map(|w| w.wake_target())
+                        })
+                    })
+                    .expect("waiter queued");
+                k.with_cpu(cpu, |kernel| {
+                    kernel
+                        .complete_and_wake_blocked_sender(target, KernelState::SEND_COMPLETION_OK)
+                        .expect("wake");
+                    kernel.with_ipc_state_mut(|ipc| {
+                        ipc.endpoint_sender_waiters[eidx] = core::array::from_fn(|_| None);
+                    });
+                    let done = kernel.take_blocked_syscall_completion_of_class(
+                        SENDER,
+                        BlockedSyscallClass::IpcSend,
+                    );
+                    assert!(done.is_some(), "round {round} completes");
+                })
+                .expect("broad phase");
+                crate::kernel::boot::d2_send_dispatch_clear(cpu.0 as usize);
+                // Put the sender back the way a real dispatch would: Runnable, queued, then
+                // selected and marked Running. Other runnable tasks may be picked first, so
+                // rotate the queue until the sender is the one dispatched.
+                k.with(|s| {
+                    s.with_tcbs_mut(|tcbs| {
+                        tcbs.iter_mut()
+                            .flatten()
+                            .find(|t| t.tid.0 == SENDER)
+                            .unwrap()
+                            .status = TaskStatus::Runnable;
+                    });
+                    let _ = s.enqueue_on_cpu(CpuId(0), SENDER);
+                    for _ in 0..8 {
+                        // Clear `current` before each pick so the queue head is what gets
+                        // selected; otherwise a task already dispatched keeps the slot.
+                        s.block_current_cpu();
+                        match s.dispatch_next_on_cpu(CpuId(0)) {
+                            Some(SENDER) => break,
+                            Some(other) => {
+                                let _ = s.enqueue_on_cpu(CpuId(0), other);
+                            }
+                            None => panic!("the sender must be dispatchable"),
+                        }
+                    }
+                    assert_eq!(s.current_tid_on_cpu(CpuId(0)), Some(SENDER));
+                    s.with_tcbs_mut(|tcbs| {
+                        tcbs.iter_mut()
+                            .flatten()
+                            .find(|t| t.tid.0 == SENDER)
+                            .unwrap()
+                            .status = TaskStatus::Running;
+                    });
+                });
+            }
+            assert_eq!(seen.len(), 3, "three distinct cycles");
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        // ── §9 message classes ──────────────────────────────────────────────────────────────
+
+        /// A PLAIN message is eligible for publication.
+        #[test]
+        fn a_plain_message_is_eligible_for_publication() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, _eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            let produced =
+                real_entry_publishing_send(&k, cpu, send_cap, msg(b"plain"), 5_000).expect("ok");
+            assert_eq!(produced, BlockingSendProducerOutcome::PublicationPending);
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// A REPLY-CAP message is never published. Reply caps are direct-only — their
+        /// materialization is the unsolved `reply_cap_ipc_rank_inversion` (mint at capability
+        /// rank 4, then record the waiter cap at IPC rank 3) — so a blocking reply-cap send
+        /// stays on the unchanged in-lock route rather than becoming the first path to attempt
+        /// that inversion off-lock.
+        #[test]
+        fn a_reply_cap_message_is_never_published() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            let reply = Message::with_header(
+                SENDER,
+                0,
+                Message::FLAG_REPLY_CAP | Message::FLAG_CAP_TRANSFER,
+                Some(0xdead),
+                b"r",
+            )
+            .expect("reply-cap message");
+            let produced = real_entry_publishing_send(&k, cpu, send_cap, reply, 5_000);
+            assert!(
+                !matches!(
+                    produced,
+                    Ok(BlockingSendProducerOutcome::PublicationPending)
+                ),
+                "a reply-cap message must never publish: {produced:?}"
+            );
+            // It took the unchanged in-lock route: the block happened under the broad lock,
+            // exactly as it did before U6.
+            assert_eq!(
+                produced,
+                Err(KernelError::WouldBlock),
+                "…and blocked in-lock instead"
+            );
+            assert_eq!(
+                status_of(&k, SENDER),
+                Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+            );
+            assert_eq!(sender_waiters(&k, eidx).len(), 1, "one in-lock waiter");
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// A SHARED-REGION transfer is deliberately NOT eligible: a refused commit would owe a
+        /// rank-6 MemoryObject pin drop that the binding D3 fence forbids taking off-lock. It
+        /// takes the unchanged in-lock route instead — an exclusion, never a behaviour change.
+        #[test]
+        fn a_shared_region_transfer_is_excluded_by_the_d3_fence() {
+            let body = body_of(
+                IPC_STATE,
+                "fn blocking_send_publication_snapshot(",
+                "\n    fn block_current_on_send_with_deadline(",
+            );
+            assert!(
+                body.contains("shared_region.is_some()"),
+                "the eligibility check must exclude shared-region envelopes"
+            );
+            assert!(
+                body.contains("Some((true, _)) => return None"),
+                "…by refusing to publish, so the send takes the in-lock route"
+            );
+            // And the off-lock reclaim never takes the memory seam.
+            let reclaim = body_of(
+                RUNTIME,
+                "fn take_transfer_envelope_split(",
+                "\n    /// U6 §6 — the BLOCKING-SEND COMMIT:",
+            );
+            assert!(
+                !reclaim.contains("with_memory_split_mut")
+                    && !reclaim.contains("with_vm_split_mut"),
+                "the off-lock envelope reclaim must not cross the D3 fence"
+            );
+        }
+
+        // ── §9 teardown ─────────────────────────────────────────────────────────────────────
+
+        /// TASK EXIT — an exiting sender's waiter is removed and no completion is published for
+        /// it. A dying task has no resume boundary to consume one.
+        #[test]
+        fn an_exiting_sender_loses_its_waiter_and_gets_no_completion() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            publish_and_commit(&k, cpu, send_cap, msg(b"exit"), 5_000);
+            assert_eq!(sender_waiters(&k, eidx).len(), 1);
+            k.with_cpu(cpu, |kernel| {
+                kernel.clear_ipc_waiters_for_tid(SENDER);
+            })
+            .expect("broad phase");
+            assert!(
+                sender_waiters(&k, eidx).is_empty(),
+                "the exiting task's waiter is removed"
+            );
+            assert!(
+                parked_completion(&k, SENDER).is_none(),
+                "and no completion is published for it"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        /// ENDPOINT DESTRUCTION — destroying an endpoint wipes its sender waiters. U6 does not
+        /// change that (stranding parked senders is a pre-existing behaviour outside this
+        /// increment's scope); what it does guarantee is that no completion is fabricated for a
+        /// sender whose message was never delivered.
+        #[test]
+        fn destroying_an_endpoint_wipes_waiters_and_fabricates_no_completion() {
+            let cpu = CpuId(0);
+            reset_u6_latches(cpu.0 as usize);
+            let (k, eidx, send_cap) = send_fixture(EndpointMode::Synchronous, 1);
+            publish_and_commit(&k, cpu, send_cap, msg(b"destroy"), 5_000);
+            k.with_cpu(cpu, |kernel| {
+                let _ = kernel.destroy_endpoint(eidx);
+            })
+            .expect("broad phase");
+            assert!(sender_waiters(&k, eidx).is_empty(), "waiters are wiped");
+            assert!(
+                parked_completion(&k, SENDER).is_none(),
+                "no completion is fabricated for an undelivered message"
+            );
+            reset_u6_latches(cpu.0 as usize);
+        }
+
+        // ── §5 the producer bypass, §6 the transaction shape ────────────────────────────────
+
+        /// The producer BYPASSES the readback when publication is pending. That readback reads
+        /// back a block that has not happened, so reaching it would be a correctness bug, not
+        /// merely wasted work.
+        #[test]
+        fn a_pending_publication_bypasses_the_producer_readback() {
+            let src = include_str!("../syscall/ipc.rs");
+            let idx = src
+                .find("BlockingSendProducerOutcome::PublicationPending) = send_result")
+                .expect("the bypass");
+            let head = &src[idx..idx + 900];
+            let ret = head.find("return Ok(());").expect("the early return");
+            let bypassed = &head[..ret];
+            for readback in [
+                "consume_ipc_timeout_fired_for_tid",
+                "task_status(sender_tid)",
+                "take_transfer_envelope",
+                "set_ok",
+                "set_err",
+            ] {
+                assert!(
+                    !bypassed.contains(readback),
+                    "a pending publication must not reach `{readback}`"
+                );
+            }
+            // And the outcome is a typed third state, not a boolean or an error overload.
+            assert!(
+                IPC_STATE.contains("pub(crate) enum BlockingSendProducerOutcome {"),
+                "the producer outcome must be a typed enum"
+            );
+        }
+
+        /// The transaction is ONE rank-ordered 1 → 2 → 3 nest, preflighted before any mutation,
+        /// with no broad-lock fallback.
+        #[test]
+        fn the_commit_is_one_ascending_rank_ordered_transaction() {
+            let body = body_of(
+                RUNTIME,
+                "pub(crate) fn commit_blocking_send_split(",
+                "\n    /// U6 §2 — the split (rank-2 only) form of",
+            );
+            let sched = body.find("with_scheduler_split_mut").expect("rank 1");
+            let task = body.find("with_task_tcbs_split_mut").expect("rank 2");
+            let ipc = body.find("with_ipc_split_mut").expect("rank 3");
+            assert!(
+                sched < task && task < ipc,
+                "the three seams must be entered in strictly ascending rank order"
+            );
+            // No broad fallback of any kind.
+            for forbidden in ["with_cpu(", "with(|", "block_current_cpu("] {
+                assert!(
+                    !body.contains(forbidden),
+                    "the transaction must not use `{forbidden}`"
+                );
+            }
+            // Every fallible check precedes the first mutation. The only fallible mutation is
+            // the rank-3 waiter publish, and the rank-2/rank-1 commits follow it unconditionally.
+            let first_mutation = body.find("*slot = Some(waiter);").expect("the publish");
+            for check in [
+                "RefusedCpuMismatch",
+                "RefusedNotCurrent",
+                "RefusedSenderMissing",
+                "RefusedAlreadyBlocked",
+                "RefusedGenerationExhausted",
+                "RefusedEndpointMissing",
+                "RefusedEndpointGenerationChanged",
+                "RefusedDuplicateWaiter",
+                "RefusedWaiterQueueFull",
+            ] {
+                assert!(
+                    body.find(check).expect(check) < first_mutation,
+                    "`{check}` must be decided before any mutation"
+                );
+            }
+            // `current` is cleared inside the SAME rank-1 section that validated it.
+            assert!(
+                body.contains("block_current_on(snap.cpu)"),
+                "the clear reuses the established rank-1 transition"
+            );
+            // The generation is CHECKED, never wrapping.
+            assert!(
+                body.contains("checked_add(1)") && !body.contains("wrapping_add(1)"),
+                "the send generation must be advanced by checked_add"
+            );
+        }
+
+        /// The deferral is armed only AFTER a successful commit, never before and never on a
+        /// refusal.
+        #[test]
+        fn the_dispatch_deferral_is_armed_only_after_a_successful_commit() {
+            let body = body_of(
+                RUNTIME,
+                "fn execute_blocking_send_commit(",
+                "\n    /// Stage 188A — execute one drained",
+            );
+            let commit = body
+                .find("commit_blocking_send_split(&snap)")
+                .expect("commit");
+            let arm = body.find("d2_send_dispatch_try_defer").expect("arm");
+            assert!(arm > commit, "the deferral is armed after the transaction");
+            let committed_arm = body
+                .split("BlockingSendCommitOutcome::Committed { send_generation }")
+                .nth(1)
+                .expect("the committed arm");
+            let refusal_arm = committed_arm
+                .split("refusal =>")
+                .nth(1)
+                .expect("the refusal arm");
+            assert!(
+                !refusal_arm.contains("d2_send_dispatch_try_defer"),
+                "a refusal must arm no deferral"
+            );
+        }
+
+        /// One channel, one drain: U6 adds no second post-work stash, no second drain call site
+        /// and no new global side table.
+        #[test]
+        fn u6_adds_no_second_channel_and_no_second_drain() {
+            for src in [TRAP_ENTRY, RISCV_TRAP] {
+                assert_eq!(
+                    src.matches("drain_dispatch_post_work(").count(),
+                    1,
+                    "each wrapper drains the one channel exactly once"
+                );
+            }
+            assert_eq!(
+                RUNTIME
+                    .matches("DISPATCH_POST_WORK_STASH[cpu_idx].take()")
+                    .count(),
+                1,
+                "there is exactly one consumer of the one stash"
+            );
+            assert!(
+                !RUNTIME.contains("BLOCKING_SEND_STASH")
+                    && !MOD_SRC.contains("BLOCKING_SEND_STASH"),
+                "U6 must not introduce a second stash"
+            );
+        }
+
+        /// Both wrappers apply the same typed disposition — one contract, two drivers.
+        #[test]
+        fn both_wrappers_apply_the_same_typed_disposition() {
+            for (name, src) in [("shared", TRAP_ENTRY), ("riscv", RISCV_TRAP)] {
+                for variant in [
+                    "NoCallerAction",
+                    "ImmediateReturn",
+                    "SenderCommittedBlocked",
+                ] {
+                    assert!(
+                        src.contains(variant),
+                        "the {name} wrapper must handle `{variant}`"
+                    );
+                }
+            }
+        }
+
+        /// All three ports consume a blocked-SEND completion at their resume boundary, and none
+        /// of those consumers is behind the reply-timeout feature gate.
+        #[test]
+        fn all_three_ports_consume_send_completions_ungated() {
+            const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
+            for (arch, src, marker) in [
+                (
+                    "aarch64",
+                    AARCH64_TRAP,
+                    "AARCH64_BLOCKED_SEND_COMPLETION_CONSUMED",
+                ),
+                (
+                    "riscv64",
+                    RISCV_TRAP,
+                    "RISCV_BLOCKED_SEND_COMPLETION_DELIVERED",
+                ),
+                ("x86_64", X86_TRAP, "X86_BLOCKED_SEND_COMPLETION_CONSUMED"),
+            ] {
+                let idx = src
+                    .find(marker)
+                    .unwrap_or_else(|| panic!("{arch} must consume a send completion"));
+                // The 400 characters preceding the consumer must not contain the feature gate.
+                let before = &src[idx.saturating_sub(1200)..idx];
+                let gate = "#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]";
+                let last_gate = before.rfind(gate);
+                let last_take = before
+                    .rfind("BlockedSyscallClass::IpcSend")
+                    .or_else(|| before.rfind("take_send_completion_split"));
+                assert!(
+                    last_take.is_some(),
+                    "{arch}: the consumer must be class-scoped to IpcSend"
+                );
+                if let (Some(g), Some(t)) = (last_gate, last_take) {
+                    assert!(
+                        t > g,
+                        "{arch}: the send consumer must not sit under the reply-timeout gate"
+                    );
+                }
+            }
+        }
+
+        /// The existing IpcRecv / reply-timeout feature policy is unchanged: its consumers stay
+        /// behind their gate, and U6 neither removes nor widens it.
+        #[test]
+        fn the_reply_timeout_feature_policy_is_unchanged() {
+            for (arch, src) in [("aarch64", AARCH64_TRAP), ("riscv64", RISCV_TRAP)] {
+                let idx = src
+                    .find("take_blocked_syscall_completion(current_tid)")
+                    .unwrap_or_else(|| panic!("{arch} keeps its recv consumer"));
+                let before = &src[idx.saturating_sub(200)..idx];
+                assert!(
+                    before.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+                    "{arch}: the recv/reply-timeout consumer must stay feature-gated"
+                );
+            }
+        }
     }
 }

@@ -62,7 +62,7 @@
 
 use super::boot::{IpcEndpointRecvResult, IpcEndpointSplitRejectReason, KernelError, KernelState};
 use super::capabilities::{CapId, CapObject};
-use super::ipc::{Message, ThreadId};
+use super::ipc::Message;
 
 /// Minimum metadata buffer length for a recv-v2 request.
 ///
@@ -478,7 +478,7 @@ pub enum FallbackReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvSchedulerWakePlan {
     None,
-    WakeSender(super::ipc::ThreadId),
+    WakeSender(super::ipc::SenderWakeTarget),
 }
 
 /// How the received payload should be written after the IPC dequeue.
@@ -1187,7 +1187,7 @@ pub(crate) struct RecvBoundaryOrdinaryCapSnapshot {
     pub(crate) source_cap: CapId,
     /// Deferred sender-waiter wake, applied in Phase B after the seam mint and
     /// before the user writeback.
-    pub(crate) wake_tid: Option<ThreadId>,
+    pub(crate) wake_tid: Option<super::ipc::SenderWakeTarget>,
     /// Receiver ASID (Phase A resolution); `None` faults identically to legacy.
     pub(crate) asid: Option<crate::kernel::vm::Asid>,
     /// Receiver TID (delegation dest + rollback target).

@@ -244,6 +244,22 @@ pub struct ThreadControlBlock {
     /// this and a stale timeout completion is refused. Bumped when a fresh blocked
     /// recv is published.
     pub blocked_recv_generation: u64,
+    /// U6 §2 — a monotonic per-task blocked-SEND generation, the send-side sibling of
+    /// [`Self::blocked_recv_generation`] and deliberately a SEPARATE coordinate.
+    ///
+    /// Reusing `blocked_recv_generation` for sends would conflate two independent block
+    /// cycles: a task that blocks in `ipc_send`, is woken, then blocks in `ipc_recv` would
+    /// advance one shared counter, so a send completion published for the FIRST cycle could
+    /// still match the receive cycle's identity (or be spuriously refused). The two classes
+    /// therefore carry their own counters, and
+    /// [`BlockedSyscallCompletion::blocked_generation`] is validated against the counter that
+    /// belongs to its own [`BlockedSyscallClass`].
+    ///
+    /// Advanced by `checked_add` at the send-block commit — never `wrapping_add`. An exhausted
+    /// counter REFUSES the commit rather than wrapping into a value that an ancient parked
+    /// completion could match. At u64 width that is unreachable in practice; refusing is what
+    /// makes the identity a proof rather than a probability.
+    pub blocked_send_generation: u64,
     /// Stage 200C2C1B — a generation-bearing PENDING COMPLETION for a blocked syscall that
     /// was completed remotely (off-lock) while its caller was descheduled.
     ///
@@ -305,6 +321,26 @@ impl ServerReplyLink {
 pub enum BlockedSyscallClass {
     /// A blocked `ipc_recv` / `ipc_recv_with_deadline` (recv-v2) receive.
     IpcRecv,
+    /// U6 §2 — a blocked `ipc_send` / `ipc_send_with_deadline`.
+    ///
+    /// Unlike `IpcRecv`, this class is PRODUCTION-LIVE on every port and is not gated by any
+    /// proof/oracle feature: U6 makes the blocking-send commit itself off-lock, and a blocked
+    /// sender's saved frame carries `WouldBlock` from the producer, so without a published
+    /// completion a woken sender would return `WouldBlock` for a message the receiver has
+    /// already consumed — a duplicate delivery if the caller retried. The completion is the
+    /// only thing that makes the woken sender's result true.
+    IpcSend,
+}
+
+impl BlockedSyscallClass {
+    /// Stable slug for markers/telemetry.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::IpcRecv => "ipc_recv",
+            Self::IpcSend => "ipc_send",
+        }
+    }
 }
 
 /// Stage 200C2C1B — the exact, generation-bearing outcome of a remotely completed blocked
@@ -321,9 +357,33 @@ pub struct BlockedSyscallCompletion {
     pub tid: u64,
     /// The exact caller address-space id (a replacement incarnation differs).
     pub asid: Asid,
-    /// The blocked-receive generation captured when the caller blocked; a caller that
-    /// unblocked and re-blocked advances this, so a stale completion is refused.
+    /// The block generation captured when the caller blocked; a caller that unblocked and
+    /// re-blocked advances this, so a stale completion is refused. Which counter it is
+    /// compared against is decided by [`Self::syscall_class`] — see
+    /// [`BlockedSyscallCompletion::matches_tcb`].
     pub blocked_generation: u64,
+}
+
+impl BlockedSyscallCompletion {
+    /// U6 §2 — the SINGLE source of truth for "is this parked completion still exactly this
+    /// task's, for the cycle it was published for?".
+    ///
+    /// Three coordinates must all agree, and the third is CLASS-DISPATCHED: a completion
+    /// published for a blocked send is validated against `blocked_send_generation`, one
+    /// published for a blocked receive against `blocked_recv_generation`. Comparing a send
+    /// completion against the receive counter (or vice versa) is exactly the conflation the
+    /// separate counters exist to prevent, so the choice is made here rather than at each
+    /// consumer.
+    #[must_use]
+    pub fn matches_tcb(&self, tcb: &ThreadControlBlock) -> bool {
+        let live_generation = match self.syscall_class {
+            BlockedSyscallClass::IpcRecv => tcb.blocked_recv_generation,
+            BlockedSyscallClass::IpcSend => tcb.blocked_send_generation,
+        };
+        self.tid == tcb.tid.0
+            && tcb.asid == Some(self.asid)
+            && live_generation == self.blocked_generation
+    }
 }
 
 impl ThreadControlBlock {
@@ -397,6 +457,7 @@ impl ThreadControlBlock {
             reply_timeout_token: None,
             server_reply_link: None,
             blocked_recv_generation: 0,
+            blocked_send_generation: 0,
             pending_syscall_completion: None,
             spawn_reservation: None,
         }

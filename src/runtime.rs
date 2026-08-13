@@ -367,6 +367,86 @@ pub(crate) struct SplitReturnIdentity {
     pub(crate) asid: crate::kernel::vm::Asid,
 }
 
+/// U6 §6 — the total outcome of one [`SharedKernel::commit_blocking_send_split`] transaction.
+///
+/// Every refusal names the coordinate that failed and means the SAME thing: nothing at all was
+/// mutated, in any of the three domains. That is what lets the caller treat a refusal as an
+/// ordinary immediate syscall return rather than as a partially-committed block to unwind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockingSendCommitOutcome {
+    /// The sender is now `Blocked(EndpointSend)`, one waiter bearing `send_generation` is
+    /// queued on the endpoint, and the CPU has no current task.
+    Committed { send_generation: u64 },
+    /// The snapshot's CPU is not the authoritative dispatch CPU.
+    RefusedCpuMismatch {
+        requested: CpuId,
+        authoritative: CpuId,
+    },
+    /// The sender is no longer this CPU's current task.
+    RefusedNotCurrent {
+        expected: u64,
+        observed: Option<u64>,
+    },
+    /// No live `{tid, asid}` incarnation matches the sender (a replacement task reused the
+    /// numeric TID, or the sender is gone).
+    RefusedSenderMissing,
+    /// The sender is already blocked — a second commit for one caller is impossible.
+    RefusedAlreadyBlocked,
+    /// `blocked_send_generation` cannot be advanced without wrapping. Refusing keeps the
+    /// generation a proof of identity rather than a probability.
+    RefusedGenerationExhausted,
+    /// The endpoint slot is empty.
+    RefusedEndpointMissing,
+    /// The endpoint slot was destroyed (and possibly reused) since the producer resolved it.
+    RefusedEndpointGenerationChanged,
+    /// A waiter for this TID is already queued on the endpoint.
+    RefusedDuplicateWaiter,
+    /// The endpoint's sender-waiter queue is full.
+    RefusedWaiterQueueFull,
+}
+
+impl BlockingSendCommitOutcome {
+    /// Stable slug for markers/telemetry.
+    pub(crate) const fn slug(&self) -> &'static str {
+        match self {
+            Self::Committed { .. } => "committed",
+            Self::RefusedCpuMismatch { .. } => "refused_cpu_mismatch",
+            Self::RefusedNotCurrent { .. } => "refused_not_current",
+            Self::RefusedSenderMissing => "refused_sender_missing",
+            Self::RefusedAlreadyBlocked => "refused_already_blocked",
+            Self::RefusedGenerationExhausted => "refused_generation_exhausted",
+            Self::RefusedEndpointMissing => "refused_endpoint_missing",
+            Self::RefusedEndpointGenerationChanged => "refused_endpoint_generation_changed",
+            Self::RefusedDuplicateWaiter => "refused_duplicate_waiter",
+            Self::RefusedWaiterQueueFull => "refused_waiter_queue_full",
+        }
+    }
+
+    /// The canonical syscall error a refusal returns to the still-running caller.
+    ///
+    /// These are the SAME errors the in-lock route produces for the same conditions, so a
+    /// caller cannot tell from its result which route ran: a vanished endpoint is
+    /// `WrongObject`, a full waiter queue is `EndpointQueueFull` (what
+    /// `enqueue_sender_waiter` returns), a missing task is `TaskMissing`, and every
+    /// scheduling-state refusal is `WouldBlock` — the retryable answer, which is exactly what
+    /// a caller that is still running and still holds its message should see.
+    pub(crate) const fn immediate_error(&self) -> Option<KernelError> {
+        match self {
+            Self::Committed { .. } => None,
+            Self::RefusedEndpointMissing | Self::RefusedEndpointGenerationChanged => {
+                Some(KernelError::WrongObject)
+            }
+            Self::RefusedWaiterQueueFull => Some(KernelError::EndpointQueueFull),
+            Self::RefusedSenderMissing => Some(KernelError::TaskMissing),
+            Self::RefusedCpuMismatch { .. }
+            | Self::RefusedNotCurrent { .. }
+            | Self::RefusedAlreadyBlocked
+            | Self::RefusedGenerationExhausted
+            | Self::RefusedDuplicateWaiter => Some(KernelError::WouldBlock),
+        }
+    }
+}
+
 /// Stage 199D-WA3A-R2-SEAL (item D) — a `DispatchSelection` bound to the CPU whose
 /// **authoritative** runqueue actually produced it.
 ///
@@ -2327,15 +2407,59 @@ impl SharedKernel {
                 .flatten()
                 .find(|t| t.tid.0 == incoming && t.asid == Some(expected))?;
             let pending = tcb.pending_syscall_completion?;
-            let exact = pending.tid == incoming
-                && tcb.asid == Some(pending.asid)
-                && tcb.blocked_recv_generation == pending.blocked_generation;
+            // U6 §2: class-scoped — a parked `IpcSend` completion belongs to
+            // `direct_dispatch_take_send_completion_split` and is left untouched here.
+            if pending.syscall_class != crate::kernel::task::BlockedSyscallClass::IpcRecv {
+                return None;
+            }
+            let exact = pending.matches_tcb(tcb);
             tcb.pending_syscall_completion = None;
             if !exact {
                 return None;
             }
             tcb.ipc_timeout_fired = false;
             tcb.blocked_recv_state = None;
+            Some(pending)
+        })
+    }
+
+    /// U6 §8 — the PRODUCTION-LIVE, class-scoped split consumer of a blocked SENDER's parked
+    /// completion, for the post-lock resume boundaries.
+    ///
+    /// Deliberately separate from `direct_dispatch_take_completion_split`, which is compiled
+    /// only under the reply-timeout oracle feature and takes `IpcRecv` completions. Two things
+    /// follow from keeping them apart, and both are required:
+    ///
+    /// * U6 must not production-enable any proof-gated `IpcRecv` reply-timeout behaviour, so it
+    ///   cannot simply ungate the existing consumer; and
+    /// * on a build where both exist, neither may discard the other's work — hence the class
+    ///   check, which leaves a non-matching entry parked exactly where it is.
+    ///
+    /// Identity is the mark TOKEN's exact incarnation, and the parked entry must additionally
+    /// match on `{tid, asid, blocked_send_generation}`. A replacement incarnation that reused
+    /// the numeric TID is not this transaction's task, so its completion is neither taken nor
+    /// consumed here.
+    pub(crate) fn direct_dispatch_take_send_completion_split(
+        &self,
+        token: DispatchMarkToken,
+    ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        let incoming = token.tid();
+        let expected = token.expect_asid()?;
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == incoming && t.asid == Some(expected))?;
+            let pending = tcb.pending_syscall_completion?;
+            if pending.syscall_class != crate::kernel::task::BlockedSyscallClass::IpcSend {
+                return None;
+            }
+            let exact = pending.matches_tcb(tcb);
+            tcb.pending_syscall_completion = None;
+            if !exact {
+                return None;
+            }
+            tcb.ipc_timeout_fired = false;
             Some(pending)
         })
     }
@@ -2533,14 +2657,324 @@ impl SharedKernel {
     fn apply_split_sender_wake_plan_split(
         &self,
         cpu: CpuId,
-        sender_tid: crate::kernel::ipc::ThreadId,
+        target: crate::kernel::ipc::SenderWakeTarget,
     ) -> Result<(), KernelError> {
         // (1) rank 1 — the CPU authentication and binding `with_cpu` performed on entry.
         self.bind_current_cpu_split(cpu)?;
         // (2) the marker `KernelState::apply_split_sender_wake_plan` emitted, unchanged.
-        crate::yarm_log!("IPC_RECV_SPLIT_REFILL_WAKE_APPLY tid={}", sender_tid.0);
+        crate::yarm_log!(
+            "IPC_RECV_SPLIT_REFILL_WAKE_APPLY tid={} send_generation={}",
+            target.tid.0,
+            target.send_generation
+        );
+        // (2b) U6 §2/§7 — publish the success completion BEFORE the wake, exactly as the
+        // in-lock sibling `KernelState::apply_split_sender_wake_plan` does. The sender's
+        // message was already refilled into the endpoint under `ipc_state_lock`, so its send
+        // succeeded; the completion is what makes the woken sender return that instead of the
+        // `WouldBlock` its saved frame still carries.
+        self.publish_blocking_send_completion_split(
+            target,
+            crate::kernel::boot::KernelState::SEND_COMPLETION_OK,
+        );
         // (3) the shared wake body — `apply_scheduler_wake_plan(Wake(tid))`.
-        self.wake_tid_to_runnable_split(cpu, sender_tid)
+        self.wake_tid_to_runnable_split(cpu, target.tid)
+    }
+
+    /// U6 §4 — take back a stashed transfer envelope after a REFUSED blocking-send commit,
+    /// through the rank-3 IPC seam alone.
+    ///
+    /// This is the off-lock form of the cleanup the in-lock error path performs
+    /// (`take_transfer_envelope(handle, endpoint, cleanup_tid)`), and it performs the same
+    /// validation: the handle's generation must still match the slot's, the envelope must name
+    /// the same endpoint, a bound receiver must match, and the state transition to `Released`
+    /// must be legal. A failure at any of those leaves the store untouched.
+    ///
+    /// **It handles NON-SHARED envelopes only, by construction.** A shared-region envelope
+    /// additionally owes a `-1` MemoryObject pin, which lives in the rank-6 memory subsystem;
+    /// reaching it off-lock would require `with_memory_split_mut`, which the binding D3 fence
+    /// (`doc/AI_AGENT_RULES.md §14.4`) forbids without the lock-free TLB-shootdown-ack design
+    /// and its multi-CPU evidence. Rather than half-perform the cleanup, U6 refuses to publish
+    /// a blocking send whose envelope carries a shared region at all
+    /// (`blocking_send_publication_eligible`), so such a send takes the unchanged in-lock route
+    /// and this function never sees one. The `shared_region` check below is therefore a
+    /// belt-and-braces refusal, not a live path.
+    ///
+    /// Returns `true` iff an envelope was consumed.
+    fn take_transfer_envelope_split(
+        &self,
+        handle: u64,
+        endpoint_idx: usize,
+        receiver_tid: crate::kernel::ipc::ThreadId,
+    ) -> bool {
+        use crate::kernel::boot::{MAX_TRANSFER_ENVELOPES, TransferState};
+        let Ok(idx) = usize::try_from(handle & 0xFFFF) else {
+            return false;
+        };
+        if idx >= MAX_TRANSFER_ENVELOPES {
+            return false;
+        }
+        let generation = handle >> 16;
+        if generation == 0 {
+            return false;
+        }
+        self.with_ipc_split_mut(|ipc| {
+            if ipc.transfer_envelope_generations[idx] != generation {
+                return false;
+            }
+            let Some(envelope) = ipc.transfer_envelopes[idx] else {
+                return false;
+            };
+            // The endpoint the envelope was stashed against, matched by the slot the producer
+            // resolved — the same object identity the in-lock cleanup matches on.
+            let endpoint_matches = ipc
+                .endpoints
+                .get(endpoint_idx)
+                .and_then(Option::as_ref)
+                .is_some_and(|_| {
+                    matches!(envelope.endpoint,
+                        crate::kernel::capabilities::CapObject::Endpoint { index, .. }
+                            if index == endpoint_idx)
+                });
+            if !endpoint_matches {
+                return false;
+            }
+            if let Some(bound_receiver) = envelope.receiver_tid
+                && bound_receiver != receiver_tid
+            {
+                return false;
+            }
+            // A pinned shared-region envelope owes a rank-6 pin drop this seam may not take.
+            if envelope.shared_region.is_some() {
+                return false;
+            }
+            if envelope.transition(TransferState::Released).is_none() {
+                return false;
+            }
+            ipc.telemetry.transfer_records_materialized = ipc
+                .telemetry
+                .transfer_records_materialized
+                .saturating_add(1);
+            ipc.transfer_envelopes[idx] = None;
+            true
+        })
+    }
+
+    /// U6 §6 — the BLOCKING-SEND COMMIT: one architecture-neutral, rank-ordered transaction
+    /// shared by both blocking-send origins, run entirely outside the broad lock.
+    ///
+    /// # Why one transaction, and why nested
+    ///
+    /// Committing a blocking send touches three domains that must agree at a single instant:
+    /// the sender must still be this CPU's current task (scheduler, rank 1); it must become
+    /// `Blocked(EndpointSend)` carrying a fresh block generation and deadline (task, rank 2);
+    /// and exactly one waiter bearing that generation must appear on the endpoint (IPC, rank
+    /// 3). Split into three separately-acquired sections these could tear — the sender could be
+    /// preempted between the scheduler check and the task write, or the endpoint could be
+    /// destroyed between the task write and the waiter publish, leaving a task blocked forever
+    /// on a queue that no longer exists.
+    ///
+    /// They are therefore taken as ONE transaction with rank 2 nested inside rank 1 and rank 3
+    /// nested inside rank 2. That is strictly ASCENDING rank order, which is the documented
+    /// direction (`doc/CAPABILITY_MODEL.md §3`: "always acquire locks in strictly ascending
+    /// rank order"; a seam of rank N must not be entered while holding a lock of rank ≥ N).
+    /// The same ascending nesting is what the accepted RISC-V exit snapshot
+    /// (`riscv_exit_validation_snapshot_split`) uses for its rank-1 → rank-2 pair.
+    ///
+    /// # Preflight, then mutate
+    ///
+    /// Every fallible condition is checked BEFORE anything is written:
+    ///
+    /// * rank 1 — the snapshot's CPU is the authoritative dispatch CPU, and the exact
+    ///   `sender_tid` is its current task;
+    /// * rank 2 — a live `{tid, asid}` incarnation exists, it is not already blocked, and its
+    ///   `blocked_send_generation` can be advanced by `checked_add`;
+    /// * rank 3 — the endpoint slot is present, its generation still matches the one the
+    ///   producer resolved, no waiter for this TID is already queued (no duplicate), and the
+    ///   waiter queue has a free slot.
+    ///
+    /// Only then does it mutate, and the mutations are ordered so that none of them can fail:
+    /// publish the waiter (rank 3), commit the blocked TCB (rank 2), clear `current` (rank 1) —
+    /// the clear happening inside the SAME rank-1 section that validated it, so nothing can
+    /// observe a sender that is blocked yet still current, or current yet already queued as a
+    /// waiter. There is no broad-lock fallback and nothing to roll back.
+    ///
+    /// Returns the minted send generation on success.
+    pub(crate) fn commit_blocking_send_split(
+        &self,
+        snap: &crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot,
+    ) -> BlockingSendCommitOutcome {
+        use crate::kernel::boot::MAX_ENDPOINT_SENDER_WAITERS;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::task::{TaskStatus, WaitReason};
+
+        self.with_scheduler_split_mut(|sched| {
+            // ── rank 1 preflight ────────────────────────────────────────────────────────────
+            if sched.current_cpu != snap.cpu {
+                return BlockingSendCommitOutcome::RefusedCpuMismatch {
+                    requested: snap.cpu,
+                    authoritative: sched.current_cpu,
+                };
+            }
+            let current = kernel_ref(&sched.scheduler)
+                .current_tid_on(snap.cpu)
+                .map(|t| t.0);
+            if current != Some(snap.sender_tid) {
+                return BlockingSendCommitOutcome::RefusedNotCurrent {
+                    expected: snap.sender_tid,
+                    observed: current,
+                };
+            }
+
+            self.with_task_tcbs_split_mut(|tcbs| {
+                // ── rank 2 preflight (no mutation yet) ──────────────────────────────────────
+                let Some(idx) = tcbs.iter().position(|slot| {
+                    slot.as_ref().is_some_and(|t| {
+                        t.tid.0 == snap.sender_tid && t.asid == Some(snap.sender_asid)
+                    })
+                }) else {
+                    return BlockingSendCommitOutcome::RefusedSenderMissing;
+                };
+                {
+                    let tcb = tcbs[idx].as_ref().expect("position guarantees Some");
+                    if matches!(tcb.status, TaskStatus::Blocked(_)) {
+                        return BlockingSendCommitOutcome::RefusedAlreadyBlocked;
+                    }
+                }
+                let Some(next_generation) = tcbs[idx]
+                    .as_ref()
+                    .expect("position guarantees Some")
+                    .blocked_send_generation
+                    .checked_add(1)
+                else {
+                    return BlockingSendCommitOutcome::RefusedGenerationExhausted;
+                };
+
+                // ── rank 3 preflight + the ONLY fallible mutation ───────────────────────────
+                let waiter = crate::kernel::boot::SenderWaiter {
+                    tid: ThreadId(snap.sender_tid),
+                    msg: snap.msg,
+                    asid: Some(snap.sender_asid),
+                    send_generation: next_generation,
+                };
+                let ipc_outcome = self.with_ipc_split_mut(|ipc| {
+                    if ipc
+                        .endpoints
+                        .get(snap.endpoint_idx)
+                        .and_then(Option::as_ref)
+                        .is_none()
+                    {
+                        return Err(BlockingSendCommitOutcome::RefusedEndpointMissing);
+                    }
+                    if ipc.endpoint_generations.get(snap.endpoint_idx).copied()
+                        != Some(snap.endpoint_generation)
+                    {
+                        return Err(BlockingSendCommitOutcome::RefusedEndpointGenerationChanged);
+                    }
+                    let queue = &mut ipc.endpoint_sender_waiters[snap.endpoint_idx];
+                    if queue[..MAX_ENDPOINT_SENDER_WAITERS]
+                        .iter()
+                        .flatten()
+                        .any(|w| w.tid.0 == snap.sender_tid)
+                    {
+                        return Err(BlockingSendCommitOutcome::RefusedDuplicateWaiter);
+                    }
+                    let Some(slot) = queue[..MAX_ENDPOINT_SENDER_WAITERS]
+                        .iter_mut()
+                        .find(|s| s.is_none())
+                    else {
+                        return Err(BlockingSendCommitOutcome::RefusedWaiterQueueFull);
+                    };
+                    *slot = Some(waiter);
+                    Ok(())
+                });
+                if let Err(refusal) = ipc_outcome {
+                    // Nothing was mutated in any domain: rank 3 refused before writing, and
+                    // ranks 2 and 1 have not been touched.
+                    return refusal;
+                }
+
+                // ── infallible commit: rank 2, then rank 1, both still held ─────────────────
+                {
+                    let tcb = tcbs[idx].as_mut().expect("position guarantees Some");
+                    tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(snap.send_cap));
+                    tcb.ipc_timeout_deadline = snap.deadline;
+                    tcb.ipc_timeout_fired = false;
+                    tcb.blocked_send_generation = next_generation;
+                }
+                // `block_current_on` is the SAME rank-1 transition the in-lock route's
+                // `block_current_cpu` performs — this adds no second `current` writer — and it
+                // runs inside the rank-1 section that validated `current` above, so the
+                // blocked-but-still-current window never exists.
+                let cleared = kernel_mut(&mut sched.scheduler).block_current_on(snap.cpu);
+                sched.timer.reset_quantum();
+                debug_assert_eq!(
+                    cleared.map(|t| t.0),
+                    Some(snap.sender_tid),
+                    "rank-1 preflight already proved the sender is current"
+                );
+                crate::yarm_log!("SCHED_BLOCK tid={}", snap.sender_tid);
+                BlockingSendCommitOutcome::Committed {
+                    send_generation: next_generation,
+                }
+            })
+        })
+    }
+
+    /// U6 §2 — the split (rank-2 only) form of
+    /// `KernelState::publish_blocking_send_completion`, for the post-lock wake sites.
+    ///
+    /// Byte-for-byte the same decision as the in-lock body: refused with NO mutation unless the
+    /// target's `{tid, asid, send_generation}` still names a live incarnation blocked in
+    /// `EndpointSend`. One acquisition, no other domain touched.
+    fn publish_blocking_send_completion_split(
+        &self,
+        target: crate::kernel::ipc::SenderWakeTarget,
+        result: u64,
+    ) -> bool {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let Some((tid, asid, send_generation)) = target.exact() else {
+            return false;
+        };
+        let published = self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid && t.asid == Some(asid))
+            else {
+                return false;
+            };
+            if tcb.blocked_send_generation != send_generation {
+                return false;
+            }
+            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {
+                return false;
+            }
+            tcb.pending_syscall_completion = Some(crate::kernel::task::BlockedSyscallCompletion {
+                syscall_class: crate::kernel::task::BlockedSyscallClass::IpcSend,
+                result,
+                tid,
+                asid,
+                blocked_generation: send_generation,
+            });
+            true
+        });
+        if published {
+            crate::yarm_log!(
+                "U6_SEND_COMPLETION_PUBLISHED tid={} asid={} send_generation={} result={} result=ok",
+                tid,
+                asid.0,
+                send_generation,
+                result
+            );
+        } else {
+            crate::yarm_log!(
+                "U6_SEND_COMPLETION_REFUSED_STALE tid={} asid={} send_generation={}",
+                tid,
+                asid.0,
+                send_generation
+            );
+        }
+        published
     }
 
     /// U3 (canonical 203C) — the split form of `KernelState::wake_tid_to_runnable`.
@@ -3772,7 +4206,7 @@ impl SharedKernel {
             let _ = self.apply_split_sender_wake_plan_split(cpu, wake_tid);
             crate::yarm_log!(
                 "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
-                wake_tid.0
+                wake_tid.tid.0
             );
         }
 
@@ -3815,10 +4249,25 @@ impl SharedKernel {
     /// `&mut KernelState` is live when the 186E `copy_to_user_split` seam derives
     /// its `&mut Subsystem` from `data_ptr()` (Stage 186D4's blocker does not
     /// apply here). It touches no `ipc_state_lock`.
-    pub(crate) fn drain_dispatch_post_work(&self, cpu: CpuId) -> Result<(), TrapHandleError> {
+    ///
+    /// # U6 §4 — the typed disposition
+    ///
+    /// The drain now RETURNS what it requires of its caller, instead of always returning `()`.
+    /// Every pre-U6 variant answers `NoCallerAction`, so no existing wrapper behaviour
+    /// changes; only the `BlockingSendCommit` variant can answer otherwise, because only it
+    /// decides the fate of the CALLER's own frame. `frame` is threaded in for the same reason:
+    /// a refused commit encodes its canonical error into the still-running caller's frame here,
+    /// in the same place and the same lane the in-lock route would have.
+    pub(crate) fn drain_dispatch_post_work(
+        &self,
+        cpu: CpuId,
+        frame: Option<&mut TrapFrame>,
+    ) -> Result<crate::kernel::dispatch_post_work::DispatchPostWorkDisposition, TrapHandleError>
+    {
+        use crate::kernel::dispatch_post_work::DispatchPostWorkDisposition;
         let cpu_idx = cpu.0 as usize;
         if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-            return Ok(());
+            return Ok(DispatchPostWorkDisposition::NoCallerAction);
         }
         // One-shot readiness marker (honest boot-log evidence; additive). Stage
         // 188B wires a live producer (plain blocked-waiter reply delivery), so the
@@ -3832,9 +4281,109 @@ impl SharedKernel {
         // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` drain.
         let work = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].take() };
         let Some(work) = work else {
-            return Ok(()); // inert in Stage 188A: no live producer.
+            // Nothing stashed — the common case on every ordinary trap.
+            return Ok(DispatchPostWorkDisposition::NoCallerAction);
         };
+        // U6 §4: the blocking-send commit is the one variant whose outcome the caller must act
+        // on, and the one variant that needs the caller's frame. It is dispatched here rather
+        // than inside `execute_dispatch_post_work` so that function keeps its exact pre-U6
+        // signature and every existing arm keeps its exact pre-U6 behaviour.
+        if let crate::kernel::dispatch_post_work::DispatchPostWork::BlockingSendCommit(snap) = work
+        {
+            return Ok(self.execute_blocking_send_commit(cpu, snap, frame));
+        }
         self.execute_dispatch_post_work(cpu, work)
+            .map(|()| DispatchPostWorkDisposition::NoCallerAction)
+    }
+
+    /// U6 §4/§6 — run one deferred blocking-send commit and report what the trap wrapper owes.
+    ///
+    /// Ordering is the whole point of this function:
+    ///
+    /// 1. run the rank-ordered transaction ([`Self::commit_blocking_send_split`]), which either
+    ///    commits all three domains or mutates nothing at all;
+    /// 2. on success, and ONLY after the commit, arm the U4 D2-send deferral so the drain that
+    ///    runs immediately after this one performs the queue-advancing dispatch. Arming before
+    ///    the commit would let that drain observe a CPU whose `current` had not yet been
+    ///    cleared;
+    /// 3. on refusal, take back the transfer envelope the producer stashed — the same cleanup
+    ///    the in-lock error path performs — and hand the canonical error back for the caller's
+    ///    frame.
+    fn execute_blocking_send_commit(
+        &self,
+        cpu: CpuId,
+        snap: crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot,
+        frame: Option<&mut TrapFrame>,
+    ) -> crate::kernel::dispatch_post_work::DispatchPostWorkDisposition {
+        use crate::kernel::dispatch_post_work::DispatchPostWorkDisposition;
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocking_send_commit tid={} endpoint={}",
+            snap.sender_tid,
+            snap.endpoint_idx
+        );
+        crate::yarm_log!("DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocking_send_commit");
+        let outcome = self.commit_blocking_send_split(&snap);
+        crate::yarm_log!(
+            "U6_BLOCKING_SEND_COMMIT tid={} asid={} endpoint={} endpoint_generation={} cpu={} outcome={}",
+            snap.sender_tid,
+            snap.sender_asid.0,
+            snap.endpoint_idx,
+            snap.endpoint_generation,
+            cpu.0,
+            outcome.slug()
+        );
+        match outcome {
+            BlockingSendCommitOutcome::Committed { send_generation } => {
+                // The sender is blocked and this CPU has no current task. Arm the established
+                // U4 D2-send deferral so the very next drain in this same post-lock section
+                // performs the one authoritative queue-advancing dispatch. This is not a
+                // second dispatch channel — it is the same one the in-lock route arms.
+                let cpu_idx = cpu.0 as usize;
+                let armed = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                    && crate::kernel::boot::d2_send_dispatch_try_defer(cpu_idx, snap.sender_tid);
+                if armed {
+                    crate::yarm_log!(
+                        "D2_SEND_GENUINE_DISPATCH_DEFERRED tid={} cpu={}",
+                        snap.sender_tid,
+                        cpu_idx
+                    );
+                }
+                crate::yarm_log!(
+                    "U6_BLOCKING_SEND_COMMITTED tid={} send_generation={} deferral_armed={} result=ok",
+                    snap.sender_tid,
+                    send_generation,
+                    u8::from(armed)
+                );
+                DispatchPostWorkDisposition::SenderCommittedBlocked {
+                    tid: snap.sender_tid,
+                }
+            }
+            refusal => {
+                // Nothing was mutated. The caller is still running and still owns its message,
+                // so it owes exactly what the in-lock error path owes: take the stashed
+                // transfer envelope back, then return the canonical error.
+                if let Some(cleanup) = snap.transfer_envelope {
+                    let taken = self.take_transfer_envelope_split(
+                        cleanup.handle,
+                        cleanup.endpoint_idx,
+                        cleanup.cleanup_tid,
+                    );
+                    crate::yarm_log!(
+                        "U6_BLOCKING_SEND_ENVELOPE_RECLAIMED tid={} handle={} taken={}",
+                        snap.sender_tid,
+                        cleanup.handle,
+                        u8::from(taken)
+                    );
+                }
+                let error = refusal
+                    .immediate_error()
+                    .expect("only Committed has no immediate error");
+                if let Some(frame) = frame {
+                    frame.set_err(crate::kernel::syscall::SyscallError::from(error).code());
+                }
+                DispatchPostWorkDisposition::ImmediateReturn { error }
+            }
+        }
     }
 
     /// Stage 188A — execute one drained [`DispatchPostWork`] item through
@@ -3848,6 +4397,9 @@ impl SharedKernel {
         use crate::kernel::dispatch_post_work::DispatchPostWork;
         match work {
             DispatchPostWork::None => Ok(()),
+            // U6 §4: routed by `drain_dispatch_post_work` before it reaches here, because it
+            // needs the caller's frame and returns a caller disposition. Unreachable.
+            DispatchPostWork::BlockingSendCommit(_) => Ok(()),
             DispatchPostWork::BlockedWaiterPlainDelivery(snap) => {
                 crate::yarm_log!(
                     "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_plain waiter_tid={}",
@@ -8781,7 +9333,14 @@ impl SharedKernel {
         cpu: CpuId,
         sender_tid: crate::kernel::ipc::ThreadId,
     ) -> Result<(), KernelError> {
-        self.apply_split_sender_wake_plan_split(cpu, sender_tid)
+        self.apply_split_sender_wake_plan_split(
+            cpu,
+            crate::kernel::ipc::SenderWakeTarget {
+                tid: sender_tid,
+                asid: None,
+                send_generation: 0,
+            },
+        )
     }
 
     /// U3 (203C) — test-only entry to the PRIVATE fault-record transaction, so the focused

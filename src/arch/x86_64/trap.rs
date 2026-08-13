@@ -346,6 +346,31 @@ pub(crate) fn x86_post_lock_resume_marked_incoming(
         .direct_dispatch_restore_context_split(token)
         .ok_or(X86ResumeRefusal::Context)?;
     frame.apply_user_context(context);
+    // U6 §8 — the BLOCKED-SEND completion boundary on x86_64.
+    //
+    // Placed immediately after `apply_user_context`, which reloads the sender's pre-block
+    // register snapshot: writing the result before that call would restore over it. x86_64's
+    // blocked recv installs its result into the saved frame at completion time and never
+    // consumes a parked record; a blocked SEND cannot do that, because the U6 commit happens
+    // off-lock after the producer has already returned, so the saved frame still carries the
+    // pre-block state. The parked completion is what makes the resumed sender's result true.
+    //
+    // ABI: the same lanes an ordinary `ipc_send` return uses — success is `set_ok(0, 0, 0)`,
+    // an error is the canonical code in the error lane. RIP is untouched.
+    if let Some(done) = shared.direct_dispatch_take_send_completion_split(token) {
+        if done.result == 0 {
+            frame.set_ok(0, 0, 0);
+        } else {
+            frame.set_err(done.result as usize);
+        }
+        crate::yarm_log!(
+            "X86_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} result=ok",
+            incoming,
+            done.syscall_class.slug(),
+            done.result,
+            done.blocked_generation
+        );
+    }
     let tls = tls.unwrap_or(0);
     restore_fs_base_if_needed(tls);
     let idx = cpu.0 as usize;

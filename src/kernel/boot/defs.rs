@@ -241,10 +241,43 @@ impl TransferEnvelope {
     }
 }
 
+/// A sender parked on an endpoint because its message could not be delivered or queued.
+///
+/// U6 §7 — the waiter carries the EXACT BLOCKING CYCLE, not merely a numeric TID.
+///
+/// Before U6 a waiter was `{tid, msg}`, which was enough while nothing ever completed a
+/// blocked sender: the receiver simply woke the numeric TID. It is not enough now that
+/// consumption and timeout must PUBLISH a completion, because a numeric TID alone cannot
+/// distinguish:
+///
+/// * a replacement task that reused the numeric TID (a different incarnation — it always
+///   carries a different ASID), from the sender that actually parked here; and
+/// * this blocking cycle from a LATER one by the same incarnation (woken, re-blocked on the
+///   same endpoint), which advanced `blocked_send_generation`.
+///
+/// Publishing a completion against either of those would hand one cycle's result to another
+/// cycle's caller. Carrying `{asid, send_generation}` makes the completion's identity exactly
+/// the identity the resume boundary revalidates, so a stale waiter can only ever be discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SenderWaiter {
     pub(crate) tid: ThreadId,
     pub(crate) msg: Message,
+    /// The blocking sender's address-space id at block time. `None` only for a sender that
+    /// had no bound ASID, which cannot be completed (no exact incarnation exists to name).
+    pub(crate) asid: Option<Asid>,
+    /// The sender's `blocked_send_generation` for THIS blocking cycle.
+    pub(crate) send_generation: u64,
+}
+
+impl SenderWaiter {
+    /// The exact blocking cycle this waiter was parked with, as the wake sites consume it.
+    pub(crate) fn wake_target(&self) -> crate::kernel::ipc::SenderWakeTarget {
+        crate::kernel::ipc::SenderWakeTarget {
+            tid: self.tid,
+            asid: self.asid,
+            send_generation: self.send_generation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

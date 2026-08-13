@@ -3,6 +3,7 @@
 
 use crate::arch::trap::TrapEvent;
 use crate::kernel::boot::{FaultBookkeepingMode, KernelState, TrapHandleError};
+use crate::kernel::dispatch_post_work::DispatchPostWorkDisposition;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trapframe::TrapFrame;
 // Stage 199D-WA3A-R2-SEAL (item E): every dispatch-mark consumer in this file matches all five
@@ -366,7 +367,40 @@ pub fn handle_trap_entry_shared(
     // `DISPATCH_RETURN_CHANNEL_READY mode=helper_only`). Placed FIRST among the
     // post-`with_cpu` drains so a future blocked-waiter delivery completes before
     // any context-switch drain.
-    shared.drain_dispatch_post_work(cpu)?;
+    // U6 §4: the drain now reports what it requires of THIS wrapper, and is given the caller's
+    // frame so a refused blocking-send commit can encode its canonical error into it.
+    let post_work_disposition = shared.drain_dispatch_post_work(cpu, frame.as_deref_mut())?;
+    match post_work_disposition {
+        // Every pre-U6 variant, and an empty stash, land here: behaviour unchanged.
+        DispatchPostWorkDisposition::NoCallerAction => {}
+        DispatchPostWorkDisposition::ImmediateReturn { error } => {
+            // The commit was refused with nothing mutated, so the caller is still running and
+            // still owns this frame. Its canonical error is already encoded; return now, before
+            // the D2 drains, because there is no deferral to drain — the transaction armed none.
+            crate::yarm_log!(
+                "U6_BLOCKING_SEND_IMMEDIATE_RETURN cpu={} err={:?} result=ok",
+                cpu.0,
+                error
+            );
+            return Ok(());
+        }
+        DispatchPostWorkDisposition::SenderCommittedBlocked { tid } => {
+            // The sender is parked and this CPU has no current task. Fall through WITHOUT
+            // writing any syscall result: this frame belongs to a blocked task now, and its
+            // result arrives from the completion its waker publishes. The D2-send drain below
+            // performs the queue-advancing dispatch the transaction armed.
+            crate::yarm_log!(
+                "U6_BLOCKING_SEND_WRAPPER_BLOCKED arch={} cpu={} tid={} result=ok",
+                if cfg!(target_arch = "x86_64") {
+                    "x86_64"
+                } else {
+                    "aarch64"
+                },
+                cpu.0,
+                tid
+            );
+        }
+    }
 
     // Stage 167 (D6-GENUINE-A): first LIVE production use of the rank-1
     // scheduler split seam. With the global `SpinLock<KernelState>` guard from

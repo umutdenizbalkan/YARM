@@ -102,6 +102,42 @@ fn restore_arch_thread_state(
     // is written LAST and cannot be overwritten by the restored pre-block snapshot. `sepc`,
     // `sstatus`, `satp`/ASID, `sp` and `tp`/TLS are all left exactly as restored — the ecall
     // return address was advanced once, at block time.
+    // U6 §8 — the BLOCKED-SEND completion boundary (production-live, no feature gate).
+    //
+    // Same placement and same reasoning as the reply-timeout boundary below: it runs AFTER
+    // `resume_current_thread_with_frame`, whose `apply_user_context` reloads the pre-block
+    // `user_gprs` — the very write that would otherwise clobber the result lane — so the
+    // canonical result is written LAST. `sepc` is untouched: the bridge pre-advanced it past
+    // the `ecall` before `handle_trap_entry`, so a woken sender never re-executes its `ecall`
+    // and the parked completion is the only thing that can supply its result.
+    if let Some(current_tid) = kernel.current_tid()
+        && let Some(done) = kernel.take_blocked_syscall_completion_of_class(
+            current_tid,
+            crate::kernel::task::BlockedSyscallClass::IpcSend,
+        )
+    {
+        // RISC-V convention, matching the reply-timeout consumer below: write BOTH lanes so the
+        // result survives either resume route (post-switch resume reads a0 directly; a same-task
+        // return re-derives a0 from the frame's ERROR lane). A SUCCESS completion clears the
+        // error lane instead of setting it, so the export cannot turn a success into an error.
+        if done.result == 0 {
+            frame.set_ok(0, 0, 0);
+        } else {
+            frame.set_err(done.result as usize);
+        }
+        frame.set_user_gpr(10, done.result as usize);
+        frame.set_user_gpr(11, 0);
+        crate::yarm_log!(
+            "RISCV_BLOCKED_SEND_COMPLETION_DELIVERED tid={} class={} result={} blocked_generation={} sepc=0x{:016x} final_a0={} final_a1={} result=ok",
+            current_tid,
+            done.syscall_class.slug(),
+            done.result,
+            done.blocked_generation,
+            frame.saved_pc() as u64,
+            frame.user_gpr(10),
+            frame.user_gpr(11)
+        );
+    }
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     if let Some(current_tid) = kernel.current_tid() {
         if let Some(done) = kernel.take_blocked_syscall_completion(current_tid) {
@@ -752,7 +788,35 @@ pub fn handle_riscv_trap_entry_shared(
     // waiter delivery the broad-lock phase stashed. Inert on traps that stash
     // nothing (the common case). This is the mechanism that makes the RISC-V
     // deferred-snapshot wake path complete AFTER the broad borrow drops.
-    shared.drain_dispatch_post_work(cpu)?;
+    // U6 §4: the RISC-V wrapper applies the same typed disposition as the shared x86_64 +
+    // AArch64 wrapper — one channel, one drain, two drivers.
+    let post_work_disposition = shared.drain_dispatch_post_work(cpu, Some(&mut *frame))?;
+    match post_work_disposition {
+        crate::kernel::dispatch_post_work::DispatchPostWorkDisposition::NoCallerAction => {}
+        crate::kernel::dispatch_post_work::DispatchPostWorkDisposition::ImmediateReturn {
+            error,
+        } => {
+            // Refused with nothing mutated: the caller is still current and still owns this
+            // frame, whose error lane the drain already encoded. Return to it directly.
+            crate::yarm_log!(
+                "U6_BLOCKING_SEND_IMMEDIATE_RETURN cpu={} err={:?} result=ok",
+                cpu.0,
+                error
+            );
+            return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
+        }
+        crate::kernel::dispatch_post_work::DispatchPostWorkDisposition::SenderCommittedBlocked {
+            tid,
+        } => {
+            // Parked. Write no syscall result; the D2-send drain below performs the
+            // queue-advancing dispatch the transaction armed.
+            crate::yarm_log!(
+                "U6_BLOCKING_SEND_WRAPPER_BLOCKED arch=riscv64 cpu={} tid={} result=ok",
+                cpu.0,
+                tid
+            );
+        }
+    }
 
     // Stage 200C2C2 (IpcReplyTimeout OFF-LOCK RETIREMENT, RISC-V cell): with the broad
     // `SpinLock<KernelState>` from Phase 2's `with_cpu` genuinely released, collect DUE

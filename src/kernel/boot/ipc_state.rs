@@ -915,6 +915,52 @@ impl DetachOutcome {
     }
 }
 
+/// U6 §5 — which of the two blocking-send origins a commit came from. Telemetry only: both
+/// origins share one body and one contract, and this names which caller reached it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockingSendOrigin {
+    /// A `Synchronous` endpoint with no receiver waiting.
+    SynchronousNoWaiter,
+    /// A `Buffered` endpoint whose queue is full.
+    BufferedFull,
+}
+
+impl BlockingSendOrigin {
+    pub(crate) const fn slug(self) -> &'static str {
+        match self {
+            Self::SynchronousNoWaiter => "synchronous_no_waiter",
+            Self::BufferedFull => "buffered_full",
+        }
+    }
+}
+
+/// U6 §5 — which contract the caller of the send body is able to honour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockingSendRoute {
+    /// The caller needs the pre-U6 contract: on a blocking origin, commit in-lock and return
+    /// `Err(WouldBlock)`. Every in-kernel send entry uses this.
+    Legacy,
+    /// The caller is on the trap path and will run the post-lock drain, so a blocking origin
+    /// may publish a commit instead of performing one.
+    PublicationEligible,
+}
+
+/// U6 §5 — the private typed outcome of the publishing send entry.
+///
+/// It is a THIRD state, not a boolean and not an error overload, because "the caller is not
+/// blocked, has not completed, and must not have a syscall result written yet" is genuinely
+/// distinct from both success and failure. Encoding it as `Err(WouldBlock)` (the pre-U6 shape)
+/// is precisely what would make the producer's caller run the readback that U6 must bypass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockingSendProducerOutcome {
+    /// The send finished under the broad lock — delivered, queued, or handed off.
+    CompletedImmediately,
+    /// A blocking-send commit is STASHED and not yet performed. The caller must leave the
+    /// frame alone and let the post-lock drain decide; the drain's typed disposition is what
+    /// finally determines the syscall's result.
+    PublicationPending,
+}
+
 impl KernelState {
     fn wake_tid_to_runnable(&mut self, tid: ThreadId) -> Result<(), KernelError> {
         let old_status = self.task_status(tid.0).ok_or(KernelError::TaskMissing)?;
@@ -2210,18 +2256,49 @@ impl KernelState {
     /// Returns the canonical syscall result to encode, or `None` when nothing applies. The caller
     /// encodes the result FIRST and only then observes the cleared state — this function performs
     /// no register or ELR mutation of its own.
+    ///
+    /// U6 §2: the take is CLASS-SCOPED. A parked completion of a different class is left
+    /// exactly where it is — see [`Self::take_blocked_syscall_completion_of_class`], which
+    /// this delegates to for the `IpcRecv` class.
     pub(crate) fn take_blocked_syscall_completion(
         &mut self,
         tid: u64,
     ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        self.take_blocked_syscall_completion_of_class(
+            tid,
+            crate::kernel::task::BlockedSyscallClass::IpcRecv,
+        )
+    }
+
+    /// U6 §2 — CONSUME the pending completion for `tid` **of exactly one class**.
+    ///
+    /// Two consumers now exist at each resume boundary, and they must not eat each other's
+    /// work: the `IpcRecv` consumer is compiled only under the reply-timeout oracle feature,
+    /// while the `IpcSend` consumer is production-live on every build. A single unscoped take
+    /// would let whichever consumer ran first discard the other's completion, so the class is
+    /// checked FIRST and a non-matching entry is left parked, untouched.
+    ///
+    /// Within the requested class the pre-U6 discipline is unchanged and deliberately so: the
+    /// entry is TAKEN either way (a stale one must never linger to be seen by a later block),
+    /// it is RETURNED only on an exact `{tid, asid, generation}` match — with the generation
+    /// selected by class via [`crate::kernel::task::BlockedSyscallCompletion::matches_tcb`] —
+    /// and an exact take clears the residue belonging to that completion alone. Exactly-once
+    /// consumption follows from the take: there is one slot and it is emptied here.
+    pub(crate) fn take_blocked_syscall_completion_of_class(
+        &mut self,
+        tid: u64,
+        class: crate::kernel::task::BlockedSyscallClass,
+    ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
             let pending = tcb.pending_syscall_completion?;
-            // Exact identity: same incarnation AND the generation captured at block time.
-            let exact = pending.tid == tid
-                && tcb.asid == Some(pending.asid)
-                && tcb.blocked_recv_generation == pending.blocked_generation;
-            // Take it either way — a stale entry must not linger to be seen by a later receive.
+            // Not this consumer's class: leave it parked for the consumer that owns it.
+            if pending.syscall_class != class {
+                return None;
+            }
+            // Exact identity: same incarnation AND the class's own generation at block time.
+            let exact = pending.matches_tcb(tcb);
+            // Take it either way — a stale entry must not linger to be seen by a later block.
             tcb.pending_syscall_completion = None;
             if !exact {
                 return None;
@@ -2232,6 +2309,121 @@ impl KernelState {
             tcb.blocked_recv_state = None;
             Some(pending)
         })
+    }
+
+    /// U6 §2 — PUBLISH the completion of a blocked send, for the exact cycle a
+    /// [`SenderWaiter`] was parked with. The single producer for
+    /// [`crate::kernel::task::BlockedSyscallClass::IpcSend`].
+    ///
+    /// Every caller is a site that has just taken a sender waiter out of an endpoint's waiter
+    /// queue and is about to wake it, and each must call this BEFORE the wake. That ordering
+    /// is the contract, not a preference: once woken, the sender is a dispatch candidate on
+    /// this or another CPU, and its resume boundary consumes whatever is parked at that
+    /// moment. Publishing after the wake would race the consumer and could deliver
+    /// `WouldBlock` — the value its saved frame still carries — for a message the receiver has
+    /// already taken.
+    ///
+    /// The publication is refused, with no mutation at all, unless the waiter's recorded
+    /// `{tid, asid, send_generation}` still names a live incarnation blocked in
+    /// `EndpointSend`. A replacement task that reused the numeric TID, a sender that has
+    /// already been completed by another site, or one that has since been woken and re-blocked
+    /// under a newer generation are all different cycles, and none of them is this waiter's.
+    ///
+    /// Returns `true` iff a completion was published.
+    pub(crate) fn publish_blocking_send_completion(
+        &mut self,
+        target: crate::kernel::ipc::SenderWakeTarget,
+        result: u64,
+    ) -> bool {
+        let Some((tid, asid, send_generation)) = target.exact() else {
+            // An ASID-less sender has no incarnation to bind a completion to. It is woken
+            // exactly as it was before U6 — this is the pre-U6 behaviour, preserved.
+            return false;
+        };
+        let published = self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid && t.asid == Some(asid))
+            else {
+                return false;
+            };
+            if tcb.blocked_send_generation != send_generation {
+                return false;
+            }
+            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {
+                return false;
+            }
+            tcb.pending_syscall_completion = Some(crate::kernel::task::BlockedSyscallCompletion {
+                syscall_class: crate::kernel::task::BlockedSyscallClass::IpcSend,
+                result,
+                tid,
+                asid,
+                blocked_generation: send_generation,
+            });
+            true
+        });
+        if published {
+            crate::yarm_log!(
+                "U6_SEND_COMPLETION_PUBLISHED tid={} asid={} send_generation={} result={} result=ok",
+                tid,
+                asid.0,
+                send_generation,
+                result
+            );
+        } else {
+            crate::yarm_log!(
+                "U6_SEND_COMPLETION_REFUSED_STALE tid={} asid={} send_generation={}",
+                tid,
+                asid.0,
+                send_generation
+            );
+        }
+        published
+    }
+
+    /// U6 §2 — the canonical "a receiver consumed this sender's message" completion result:
+    /// success, encoded exactly as a non-blocking `ipc_send` success is.
+    pub(crate) const SEND_COMPLETION_OK: u64 = 0;
+
+    /// U6 §2 — the canonical "this sender's deadline expired first" completion result.
+    pub(crate) const SEND_COMPLETION_TIMED_OUT: u64 =
+        crate::kernel::syscall::SyscallError::TimedOut.code() as u64;
+
+    /// U6 §2 — apply the blocked-SENDER wake that [`Self::ipc_recv_endpoint_take`] returned.
+    ///
+    /// The single applier for the FULL receive path, and the sibling of
+    /// [`Self::apply_split_sender_wake_plan`] on the split path. It exists so the full path
+    /// cannot express "wake this sender" without also publishing its completion: there is no
+    /// bare-TID wake left on this route to reach for.
+    pub(crate) fn apply_blocked_sender_wake(
+        &mut self,
+        target: Option<crate::kernel::ipc::SenderWakeTarget>,
+    ) -> Result<(), KernelError> {
+        let Some(target) = target else {
+            return Ok(());
+        };
+        self.complete_and_wake_blocked_sender(target, Self::SEND_COMPLETION_OK)
+    }
+
+    /// U6 §2/§7 — complete and then wake one blocked sender, in that order.
+    ///
+    /// The SINGLE seam every receiver-side sender-waiter consumption path calls. It exists so
+    /// the publish-before-wake ordering is a property of one function rather than a convention
+    /// repeated at each call site: the completion is parked first, and only then is the sender
+    /// made a dispatch candidate. Reversing the two would let the sender's resume boundary run
+    /// on another CPU before anything was parked, and return the `WouldBlock` its saved frame
+    /// still carries for a message that has already been delivered.
+    ///
+    /// The wake itself is the ordinary `wake_tid_to_runnable` seam — this adds no second wake
+    /// implementation and no new status writer.
+    pub(crate) fn complete_and_wake_blocked_sender(
+        &mut self,
+        target: crate::kernel::ipc::SenderWakeTarget,
+        result: u64,
+    ) -> Result<(), KernelError> {
+        self.publish_blocking_send_completion(target, result);
+        self.wake_tid_to_runnable(target.tid)
     }
 
     /// `true` iff a pending blocked-syscall completion is parked for `tid` (assertions).
@@ -3502,6 +3694,175 @@ impl KernelState {
         Ok(plan.blocked_tid)
     }
 
+    /// U6 §5/§6 — the SINGLE shared body of both blocking-send origins.
+    ///
+    /// Before U6 the two origins (`Synchronous` with no waiter, and `Buffered` whose queue is
+    /// full) each open-coded the same three statements. They now share one body, which is what
+    /// makes "both origins produce the same waiter, the same completion contract and the same
+    /// deferral" a property of the code rather than of two copies staying in step.
+    ///
+    /// The route decides only where the commit happens:
+    ///
+    /// * `Legacy` — commit in-lock through `block_current_on_send_with_deadline` and return
+    ///   `Err(WouldBlock)`, byte-identical to the pre-U6 behaviour;
+    /// * `PublicationEligible` — if this send is eligible, mutate NOTHING and stash a
+    ///   [`crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot`] for the post-lock
+    ///   drain, returning `PublicationPending`. Otherwise fall through to the legacy commit,
+    ///   so ineligibility is always a routing decision and never a behaviour change.
+    fn block_or_publish_send(
+        &mut self,
+        endpoint_idx: usize,
+        send_cap: CapId,
+        msg: Message,
+        deadline: Option<u64>,
+        route: BlockingSendRoute,
+        origin: BlockingSendOrigin,
+    ) -> Result<BlockingSendProducerOutcome, KernelError> {
+        if route == BlockingSendRoute::PublicationEligible
+            && let Some(snapshot) = self.blocking_send_publication_snapshot(
+                endpoint_idx,
+                send_cap,
+                msg,
+                deadline,
+                origin,
+            )
+        {
+            let cpu_idx = snapshot.cpu.0 as usize;
+            // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+            // identical discipline to every other producer of this stash.
+            unsafe {
+                crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].store(
+                    crate::kernel::dispatch_post_work::DispatchPostWork::BlockingSendCommit(
+                        snapshot,
+                    ),
+                );
+            }
+            self.with_ipc_state_mut(|ipc| {
+                ipc.telemetry.blocked_sends = ipc.telemetry.blocked_sends.saturating_add(1);
+            });
+            crate::yarm_log!(
+                "U6_BLOCKING_SEND_PUBLISHED origin={} endpoint={} cpu={} result=ok",
+                origin.slug(),
+                endpoint_idx,
+                cpu_idx
+            );
+            return Ok(BlockingSendProducerOutcome::PublicationPending);
+        }
+        crate::yarm_log!(
+            "U6_BLOCKING_SEND_INLOCK origin={} endpoint={}",
+            origin.slug(),
+            endpoint_idx
+        );
+        let _ = self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.blocked_sends = ipc.telemetry.blocked_sends.saturating_add(1);
+        });
+        Err(KernelError::WouldBlock)
+    }
+
+    /// U6 §5 — resolve the publication snapshot for this blocking send, or `None` when the send
+    /// is not eligible and must take the in-lock route.
+    ///
+    /// Resolves coordinates only; it mutates nothing. Eligibility is deliberately narrow, and
+    /// every exclusion routes to the unchanged in-lock commit rather than to a new behaviour:
+    ///
+    /// * the queue-advancing dispatch must be enabled and this must be a trap-path CPU with a
+    ///   live post-lock drainer — otherwise nothing would ever run the transaction;
+    /// * this CPU must be the only dispatcher, matching the U4 D2 deferral's own predicate;
+    /// * the stash must be empty, so publication never displaces another handler's post-work;
+    /// * the sender must have a bound ASID — without one there is no incarnation to name, and
+    ///   the commit's `{tid, asid}` identity could not be formed;
+    /// * a SHARED-REGION transfer envelope is excluded, because a refused commit would owe a
+    ///   rank-6 MemoryObject pin drop that the binding D3 fence (`doc/AI_AGENT_RULES.md §14.4`)
+    ///   forbids taking off-lock. Plain and ordinary-cap transfers carry no such pin and are
+    ///   eligible.
+    fn blocking_send_publication_snapshot(
+        &mut self,
+        endpoint_idx: usize,
+        send_cap: CapId,
+        msg: Message,
+        deadline: Option<u64>,
+        origin: BlockingSendOrigin,
+    ) -> Option<crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot> {
+        if !crate::kernel::boot::queue_advancing_dispatch_enabled() {
+            return None;
+        }
+        let cpu = self.current_cpu();
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+            return None;
+        }
+        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        // Same single-DISPATCHER predicate the U4 D2 deferral uses.
+        if self.dispatching_cpu_count() > 1 {
+            return None;
+        }
+        // A deferral already pending on this CPU means an earlier commit has not been drained;
+        // never nest.
+        if crate::kernel::boot::d2_send_dispatch_is_deferred(cpu_idx) {
+            return None;
+        }
+        // SAFETY: local-CPU trap path, interrupts disabled — the same discipline as the store.
+        if unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].is_occupied() } {
+            return None;
+        }
+        let sender_tid = self.current_tid()?;
+        let sender_asid = self.task_asid(sender_tid)?;
+        let endpoint_generation =
+            self.with_ipc_state(|ipc| ipc.endpoint_generations.get(endpoint_idx).copied())?;
+        // Reply caps are DIRECT-ONLY: materializing one needs a rank-4 mint followed by a
+        // rank-3 waiter-cap record, the unsolved `reply_cap_ipc_rank_inversion`. U6 does not
+        // become the first path to attempt that off-lock — a blocking reply-cap send takes the
+        // unchanged in-lock route.
+        if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+            return None;
+        }
+        let transfer_envelope = match msg.transferred_cap() {
+            None => None,
+            Some(handle) => {
+                let shared = self.with_ipc_state(|ipc| {
+                    let Ok(idx) = usize::try_from(handle.0 & 0xFFFF) else {
+                        return None;
+                    };
+                    ipc.transfer_envelopes
+                        .get(idx)
+                        .and_then(|slot| slot.map(|e| (e.shared_region.is_some(), e.receiver_tid)))
+                });
+                match shared {
+                    // No live envelope for this handle: nothing to reclaim on a refusal.
+                    None => None,
+                    // D3 fence — see the doc comment.
+                    Some((true, _)) => return None,
+                    Some((false, bound_receiver)) => Some(
+                        crate::kernel::dispatch_post_work::BlockingSendEnvelopeCleanup {
+                            handle: handle.0,
+                            endpoint_idx,
+                            cleanup_tid: bound_receiver.unwrap_or(ThreadId(sender_tid)),
+                        },
+                    ),
+                }
+            }
+        };
+        let _ = origin;
+        Some(
+            crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot {
+                cpu,
+                sender_tid,
+                sender_asid,
+                endpoint_idx,
+                endpoint_generation,
+                send_cap,
+                msg,
+                deadline,
+                transfer_envelope,
+            },
+        )
+    }
+
     fn block_current_on_send_with_deadline(
         &mut self,
         endpoint_idx: usize,
@@ -3512,16 +3873,26 @@ impl KernelState {
         // Phase A (scheduler rank 1) → Phase B (task rank 2): block + Blocked TCB.
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         crate::yarm_log!("SCHED_BLOCK tid={}", blocked_tid);
-        self.with_tcbs_mut(|tcbs| {
+        // U6 §2/§7: Phase B also mints the blocking cycle's identity. The legacy in-lock route
+        // and the off-lock transaction must produce the SAME waiter shape and the same
+        // completion contract — a sender parked by either route is completed by the same
+        // receiver-side and timeout-side publication points — so the generation is minted here
+        // too, with the same `checked_add` refusal.
+        let (blocked_asid, send_generation) = self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == blocked_tid)
                 .ok_or(KernelError::TaskMissing)?;
+            let next_generation = tcb
+                .blocked_send_generation
+                .checked_add(1)
+                .ok_or(KernelError::WouldBlock)?;
             tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
             tcb.ipc_timeout_deadline = deadline;
             tcb.ipc_timeout_fired = false;
-            Ok::<_, KernelError>(())
+            tcb.blocked_send_generation = next_generation;
+            Ok::<_, KernelError>((tcb.asid, next_generation))
         })?;
         if crate::kernel::boot::d2_send_genuine_enabled() {
             crate::yarm_log!("D2_SEND_GENUINE_PHASE_TASK_BLOCK tid={}", blocked_tid);
@@ -3534,6 +3905,8 @@ impl KernelState {
             SenderWaiter {
                 tid: ThreadId(blocked_tid),
                 msg,
+                asid: blocked_asid,
+                send_generation,
             },
         )?;
         if crate::kernel::boot::d2_send_genuine_enabled() {
@@ -3699,6 +4072,42 @@ impl KernelState {
                         _ => continue,
                     };
                     if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {
+                        // U6 §2 — TIMED-OUT SEND: publish the `TimedOut` completion for this
+                        // exact blocking cycle BEFORE anything makes the sender runnable.
+                        //
+                        // This is the timeout-side sibling of the receiver-side publication in
+                        // `apply_split_sender_wake_plan`, and it must happen HERE rather than
+                        // beside the Phase-3 enqueue for two reasons: the status is about to
+                        // become `Runnable`, which is no longer a completable state; and the
+                        // generation that identifies the cycle is on this very TCB, under the
+                        // rank-2 lock we already hold. Phase 3's enqueue — the actual wake — is
+                        // strictly later, so publish-before-wake holds.
+                        //
+                        // A receiver that consumed this sender's message first will have
+                        // already published SUCCESS and woken it, so this task would no longer
+                        // be `Blocked(EndpointSend)` and would not be selected by the `is_send`
+                        // match above: receiver-before-timeout keeps the success result, and
+                        // timeout-before-receiver makes the later receiver-side publication
+                        // refuse against a sender that is no longer blocked. Exactly one of the
+                        // two publishes, whichever ran first.
+                        if is_send && let Some(asid) = tcb.asid {
+                            tcb.pending_syscall_completion =
+                                Some(crate::kernel::task::BlockedSyscallCompletion {
+                                    syscall_class:
+                                        crate::kernel::task::BlockedSyscallClass::IpcSend,
+                                    result: Self::SEND_COMPLETION_TIMED_OUT,
+                                    tid: tcb.tid.0,
+                                    asid,
+                                    blocked_generation: tcb.blocked_send_generation,
+                                });
+                            crate::yarm_log!(
+                                "U6_SEND_COMPLETION_PUBLISHED tid={} asid={} send_generation={} result={} result=ok",
+                                tcb.tid.0,
+                                asid.0,
+                                tcb.blocked_send_generation,
+                                Self::SEND_COMPLETION_TIMED_OUT
+                            );
+                        }
                         tcb.status = TaskStatus::Runnable;
                         tcb.ipc_timeout_deadline = None;
                         tcb.ipc_timeout_fired = true;
@@ -3878,8 +4287,10 @@ impl KernelState {
 
             // Stage 4D: peek at sender waiter queue head (position 0) before touching the
             // endpoint. Copies data so no reference is held across the endpoint borrow below.
-            let head_waiter: Option<(ThreadId, Message)> =
-                ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.tid, w.msg));
+            // U6 §7: the peek carries the waiter's EXACT blocking cycle, not just its TID —
+            // the wake site must publish a completion against that cycle.
+            let head_waiter: Option<(crate::kernel::ipc::SenderWakeTarget, Message)> =
+                ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.wake_target(), w.msg));
 
             // If the queue is sparse (position 0 is None but later positions are Some), the
             // gap was left by a timed-out sender; fall back to the full path which handles
@@ -3964,7 +4375,10 @@ impl KernelState {
                     ep.send(waiter_msg)
                         .expect("one slot must be free after recv dequeue");
                 }
-                crate::yarm_log!("IPC_RECV_SPLIT_REFILL_QUEUED waiter_tid={}", waiter_tid.0);
+                crate::yarm_log!(
+                    "IPC_RECV_SPLIT_REFILL_QUEUED waiter_tid={}",
+                    waiter_tid.tid.0
+                );
                 return IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid);
             }
 
@@ -4000,8 +4414,10 @@ impl KernelState {
                 );
             }
 
-            let head_waiter: Option<(ThreadId, Message)> =
-                ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.tid, w.msg));
+            // U6 §7: the peek carries the waiter's EXACT blocking cycle, not just its TID —
+            // the wake site must publish a completion against that cycle.
+            let head_waiter: Option<(crate::kernel::ipc::SenderWakeTarget, Message)> =
+                ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.wake_target(), w.msg));
 
             if head_waiter.is_none()
                 && ipc.endpoint_sender_waiters[endpoint_idx]
@@ -4069,7 +4485,7 @@ impl KernelState {
                 }
                 crate::yarm_log!(
                     "IPC_RECV_SPLIT_CAP_REFILL_QUEUED waiter_tid={}",
-                    waiter_tid.0
+                    waiter_tid.tid.0
                 );
                 return IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid);
             }
@@ -4082,12 +4498,24 @@ impl KernelState {
     ///
     /// Must be called outside `ipc_state_lock`. Wakes the sender whose message was
     /// already refilled into the endpoint queue under ipc_state_lock.
+    ///
+    /// U6 §2/§7: this is the receiver-side completion point for a blocked sender. The
+    /// sender's message HAS been consumed by the time we get here — the refill happened under
+    /// `ipc_state_lock` above — so the sender's send succeeded, and the success completion is
+    /// published against its exact blocking cycle BEFORE the wake. Without it the woken sender
+    /// would return the `WouldBlock` its saved frame still carries for a message that was
+    /// already delivered, and a caller that retried on `WouldBlock` would deliver it twice.
     pub(crate) fn apply_split_sender_wake_plan(
         &mut self,
-        sender_tid: ThreadId,
+        target: crate::kernel::ipc::SenderWakeTarget,
     ) -> Result<(), KernelError> {
-        crate::yarm_log!("IPC_RECV_SPLIT_REFILL_WAKE_APPLY tid={}", sender_tid.0);
-        self.apply_scheduler_wake_plan(super::SchedulerWakePlan::Wake(sender_tid))
+        crate::yarm_log!(
+            "IPC_RECV_SPLIT_REFILL_WAKE_APPLY tid={} send_generation={}",
+            target.tid.0,
+            target.send_generation
+        );
+        self.publish_blocking_send_completion(target, Self::SEND_COMPLETION_OK);
+        self.apply_scheduler_wake_plan(super::SchedulerWakePlan::Wake(target.tid))
     }
 
     pub(crate) fn ipc_try_send_queued_plain_endpoint_only(
@@ -5741,6 +6169,36 @@ impl KernelState {
         self.ipc_send_with_optional_deadline(send_cap, msg, None)
     }
 
+    /// U6 §5 — the send entry that can PUBLISH a blocking-send commit instead of performing it
+    /// in-lock, used by the syscall producer (`handle_ipc_send`) and by nothing else.
+    ///
+    /// It is a separate entry rather than a flag on the existing one because the two have
+    /// genuinely different contracts. `ipc_send_with_deadline` promises that when it returns,
+    /// the send has either completed or the caller is already blocked — every in-kernel caller
+    /// depends on that. This entry may instead return
+    /// [`BlockingSendProducerOutcome::PublicationPending`], meaning "nothing is committed yet;
+    /// the post-lock drain will decide", which is only meaningful to a caller that IS on the
+    /// trap path and will run that drain. Making the route an explicit argument keeps a caller
+    /// from accidentally acquiring a contract it cannot honour.
+    pub(crate) fn ipc_send_with_deadline_publishing(
+        &mut self,
+        send_cap: CapId,
+        msg: Message,
+        timeout_ticks: u64,
+    ) -> Result<BlockingSendProducerOutcome, KernelError> {
+        let deadline = if timeout_ticks == 0 {
+            None
+        } else {
+            Some(self.scheduler_tick_now().wrapping_add(timeout_ticks))
+        };
+        self.ipc_send_routed(
+            send_cap,
+            msg,
+            deadline,
+            BlockingSendRoute::PublicationEligible,
+        )
+    }
+
     pub fn ipc_send_with_deadline(
         &mut self,
         send_cap: CapId,
@@ -5761,12 +6219,34 @@ impl KernelState {
         msg: Message,
         deadline: Option<u64>,
     ) -> Result<(), KernelError> {
+        // The legacy route: a blocking origin commits the block in-lock and returns
+        // `Err(WouldBlock)`, exactly as before U6. `PublicationPending` is unreachable here.
+        match self.ipc_send_routed(send_cap, msg, deadline, BlockingSendRoute::Legacy)? {
+            BlockingSendProducerOutcome::CompletedImmediately => Ok(()),
+            BlockingSendProducerOutcome::PublicationPending => {
+                debug_assert!(false, "the legacy send route never publishes");
+                Err(KernelError::WouldBlock)
+            }
+        }
+    }
+
+    /// The shared body of both send entries. `route` decides ONLY what happens at the two
+    /// blocking origins; every other path through this function is identical on both routes.
+    fn ipc_send_routed(
+        &mut self,
+        send_cap: CapId,
+        msg: Message,
+        deadline: Option<u64>,
+        route: BlockingSendRoute,
+    ) -> Result<BlockingSendProducerOutcome, KernelError> {
         let capability = self.resolve_send_cap_task_local(send_cap)?;
         if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
         }
         if capability.object == CapObject::Kernel {
-            return self.handle_restart_control_kernel_ipc(msg);
+            return self
+                .handle_restart_control_kernel_ipc(msg)
+                .map(|()| BlockingSendProducerOutcome::CompletedImmediately);
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
@@ -5876,16 +6356,18 @@ impl KernelState {
                     });
                 }
                 crate::yarm_log!("IPC_SEND_SYNC_SWITCH_DONE waiter_tid={}", waiter_tid.0);
-                return Ok(());
+                return Ok(BlockingSendProducerOutcome::CompletedImmediately);
             }
 
             crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);
-            let _ =
-                self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
-            self.with_ipc_state_mut(|ipc| {
-                ipc.telemetry.blocked_sends = ipc.telemetry.blocked_sends.saturating_add(1);
-            });
-            return Err(KernelError::WouldBlock);
+            return self.block_or_publish_send(
+                endpoint_idx,
+                send_cap,
+                msg,
+                deadline,
+                route,
+                BlockingSendOrigin::SynchronousNoWaiter,
+            );
         }
 
         if let Some(waiter_tid) = self.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)) {
@@ -5916,7 +6398,7 @@ impl KernelState {
                             endpoint_idx
                         );
                         self.wake_waiter_for_endpoint(endpoint_idx)?;
-                        return Ok(());
+                        return Ok(BlockingSendProducerOutcome::CompletedImmediately);
                     }
                     Err(err) => {
                         crate::yarm_log!(
@@ -5940,12 +6422,14 @@ impl KernelState {
         })?;
         if !queued {
             crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);
-            let _ =
-                self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
-            self.with_ipc_state_mut(|ipc| {
-                ipc.telemetry.blocked_sends = ipc.telemetry.blocked_sends.saturating_add(1);
-            });
-            return Err(KernelError::WouldBlock);
+            return self.block_or_publish_send(
+                endpoint_idx,
+                send_cap,
+                msg,
+                deadline,
+                route,
+                BlockingSendOrigin::BufferedFull,
+            );
         }
 
         self.with_ipc_state_mut(|ipc| {
@@ -5957,7 +6441,7 @@ impl KernelState {
             crate::yarm_log!("D2_SEND_GENUINE_IMMEDIATE_OK tid={}", d2_send_tid);
             crate::yarm_log!("D2_SEND_GENUINE_DONE result=immediate tid={}", d2_send_tid);
         }
-        Ok(())
+        Ok(BlockingSendProducerOutcome::CompletedImmediately)
     }
 
     pub(crate) fn note_endpoint_only_queued_send_split(&mut self) {
@@ -6473,10 +6957,24 @@ impl KernelState {
     ///       If message, no waiter: return message → None wake.
     ///       If no message + waiter: direct delivery of waiter's message → WakeSender.
     ///       If neither: return None → None wake.
+    ///
+    /// U6 §2: the wake this returns is ALWAYS a blocked SENDER's — it can only come from
+    /// `endpoint_sender_waiters` — so it is returned as a `SenderWakeTarget` carrying the exact
+    /// blocking cycle, not as a bare `SchedulerWakePlan::Wake(tid)`. Waking such a sender
+    /// without first publishing its `IpcSend` success completion would return the `WouldBlock`
+    /// its saved frame still carries for a message this function has already handed to the
+    /// receiver; every caller therefore applies the result through
+    /// [`Self::apply_blocked_sender_wake`], which cannot skip the publication.
     pub(crate) fn ipc_recv_endpoint_take(
         &mut self,
         endpoint_idx: usize,
-    ) -> Result<(Option<Message>, super::SchedulerWakePlan), KernelError> {
+    ) -> Result<
+        (
+            Option<Message>,
+            Option<crate::kernel::ipc::SenderWakeTarget>,
+        ),
+        KernelError,
+    > {
         self.with_ipc_state_mut(|ipc| {
             // 1a: Dequeue from endpoint queue; scoped block releases the borrow.
             let opt_msg = {
@@ -6519,14 +7017,14 @@ impl KernelState {
                     kernel_mut(ep_storage)
                         .send(waiter.msg)
                         .map_err(|_| KernelError::EndpointQueueFull)?;
-                    Ok((Some(msg), super::SchedulerWakePlan::Wake(waiter.tid)))
+                    Ok((Some(msg), Some(waiter.wake_target())))
                 }
-                (Some(msg), None) => Ok((Some(msg), super::SchedulerWakePlan::None)),
+                (Some(msg), None) => Ok((Some(msg), None)),
                 (None, Some(waiter)) => {
                     // Direct delivery: bypass endpoint queue.
-                    Ok((Some(waiter.msg), super::SchedulerWakePlan::Wake(waiter.tid)))
+                    Ok((Some(waiter.msg), Some(waiter.wake_target())))
                 }
-                (None, None) => Ok((None, super::SchedulerWakePlan::None)),
+                (None, None) => Ok((None, None)),
             }
         })
     }
@@ -6546,7 +7044,7 @@ impl KernelState {
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
         let (msg, wake_plan) = self.ipc_recv_endpoint_take(endpoint_idx)?;
-        self.apply_scheduler_wake_plan(wake_plan)?;
+        self.apply_blocked_sender_wake(wake_plan)?;
         Ok(msg)
     }
 
@@ -6639,7 +7137,7 @@ impl KernelState {
         if d2_recv_genuine {
             crate::yarm_log!("D2_RECV_GENUINE_PHASE_IPC_LOCK tid={}", d2_recv_tid);
         }
-        self.apply_scheduler_wake_plan(wake_plan)?;
+        self.apply_blocked_sender_wake(wake_plan)?;
         if msg.is_some() {
             if d2_recv_genuine {
                 crate::yarm_log!("D2_RECV_GENUINE_IMMEDIATE_OK tid={}", d2_recv_tid);
@@ -6660,7 +7158,7 @@ impl KernelState {
         }
         // Phase 2: post-wake recv under ipc_state_lock (sender may have delivered directly).
         let (msg, wake_plan) = self.ipc_recv_endpoint_take(endpoint_idx)?;
-        self.apply_scheduler_wake_plan(wake_plan)?;
+        self.apply_blocked_sender_wake(wake_plan)?;
         if d2_recv_genuine {
             crate::yarm_log!("D2_RECV_GENUINE_BLOCKED_OK tid={}", blocked_tid.0);
             crate::yarm_log!(

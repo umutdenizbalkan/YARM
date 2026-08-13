@@ -163,6 +163,27 @@ pub(crate) enum ResumeRefusal {
 /// telemetry.
 ///
 /// Returns the activated ASID on success, or which step refused.
+/// U6 §8 — encode a consumed blocked-SEND completion into a resumed AArch64 frame.
+///
+/// Two lanes, because unlike the reply-timeout class a send completion can succeed:
+///
+/// * `result == 0` — the receiver consumed the message. The syscall succeeded, so the success
+///   lanes are what a non-blocking `ipc_send` return leaves: `x0 = 0` and no transferred-cap
+///   return.
+/// * `result != 0` — a canonical error (today only `TimedOut`). The code lands in the x0 lane
+///   and x1..x5 are zeroed, following the established AArch64 error convention
+///   (`export_syscall_result_to_user_gprs`'s error path), so stale send ARGUMENTS can never be
+///   mistaken for a result.
+///
+/// `ELR_EL1` is deliberately untouched in both cases — it was advanced exactly once at block
+/// time. The caller mirrors `arg0..arg5` into `x0..x5` immediately after.
+fn encode_blocked_send_completion(frame: &mut TrapFrame, result: u64) {
+    frame.set_arg(0, result as usize);
+    for lane in 1..=5 {
+        frame.set_arg(lane, 0);
+    }
+}
+
 pub(crate) fn direct_dispatch_resume_incoming_core(
     shared: &crate::runtime::SharedKernel,
     token: crate::runtime::DispatchMarkToken,
@@ -202,6 +223,24 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
             frame.saved_pc() as u64
         );
         crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
+    }
+    // U6 §8 — the BLOCKED-SEND completion boundary (production-live, no feature gate).
+    //
+    // A blocked sender resumes here, and its `ELR_EL1` was advanced exactly once at block time
+    // (see `crate::arch::trap::aarch64_syscall_elr_policy`), so the `SVC` is never re-executed
+    // and the handler is never re-entered. The parked completion is therefore the ONLY thing
+    // that can supply the result — without it the sender would return the `WouldBlock` its
+    // saved frame still carries for a message the receiver already took.
+    if let Some(done) = shared.direct_dispatch_take_send_completion_split(token) {
+        encode_blocked_send_completion(frame, done.result);
+        crate::yarm_log!(
+            "AARCH64_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} elr=0x{:016x} result=ok",
+            incoming,
+            done.syscall_class.slug(),
+            done.result,
+            done.blocked_generation,
+            frame.saved_pc() as u64
+        );
     }
     use crate::arch::aarch64::syscall_abi::{REG_X0, REG_X1, REG_X2, REG_X3, REG_X4, REG_X5};
     frame.set_user_gpr(REG_X0, frame.arg(0));
@@ -322,6 +361,24 @@ pub(crate) fn restore_arch_thread_state(
         // `export_syscall_result_to_user_gprs`'s error path): the error code lands in the x0 lane
         // and x1..x5 are zeroed, so the stale receive ARGUMENTS can never be mistaken for a result.
         // ELR is deliberately untouched — it was advanced exactly once at block time.
+        // U6 §8 — the BLOCKED-SEND completion boundary on the IN-LOCK resume path, the sibling
+        // of the post-lock one in `direct_dispatch_resume_incoming_core`. Ungated: the send
+        // class is production-live on every build, and it is class-scoped so it can never
+        // consume the reply-timeout consumer's `IpcRecv` entry below.
+        if let Some(done) = kernel.take_blocked_syscall_completion_of_class(
+            current_tid,
+            crate::kernel::task::BlockedSyscallClass::IpcSend,
+        ) {
+            encode_blocked_send_completion(frame, done.result);
+            crate::yarm_log!(
+                "AARCH64_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} elr=0x{:016x} result=ok",
+                current_tid,
+                done.syscall_class.slug(),
+                done.result,
+                done.blocked_generation,
+                frame.saved_pc() as u64
+            );
+        }
         #[cfg(feature = "ipc-reply-timeout-oracle-core")]
         if let Some(done) = kernel.take_blocked_syscall_completion(current_tid) {
             frame.set_arg(0, done.result as usize);
@@ -656,32 +713,9 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     let task_switched = matches!(event, TrapEvent::Syscall) && entering_tid != exiting_tid;
     let syscall_resume_pc = if matches!(event, TrapEvent::Syscall) {
         let tid = entering_tid.unwrap_or(0);
-        let (syscall_nr, needs_plus4) = if let Some(f) = frame.as_ref() {
-            let nr = f.syscall_num();
-            // AArch64 ELR_EL1 for SVC holds the SVC instruction address itself.
-            // We add +4 to advance to the next instruction for IpcRecv when it
-            // completes successfully (immediate receive). When IpcRecv blocks, the
-            // syscall handler sets frame.error = WouldBlock so is_error() is true,
-            // causing needs_plus4 = false and saved_pc = SVC. The task then retries
-            // the SVC on wakeup when the message is in the queue.
-            let ipc_recv_ok =
-                nr == crate::kernel::syscall::Syscall::IpcRecv as usize && !f.is_error();
-            (nr, ipc_recv_ok)
-        } else {
-            (0, false)
-        };
-        let final_pc = if needs_plus4 {
-            raw_vector_return_pc.wrapping_add(4)
-        } else {
-            raw_vector_return_pc
-        };
-        let reason = if needs_plus4 {
-            "ipc_recv_plus4"
-        } else if syscall_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR {
-            "debug_log_raw"
-        } else {
-            "raw"
-        };
+        let syscall_nr = frame.as_ref().map(|f| f.syscall_num()).unwrap_or(0);
+        let (final_pc, reason) =
+            crate::arch::trap::aarch64_syscall_elr_policy(raw_vector_return_pc, syscall_nr);
         trap_trace!(
             "AARCH64_ELR_POLICY tid={} nr={} raw=0x{:016x} final=0x{:016x} reason={}",
             tid,

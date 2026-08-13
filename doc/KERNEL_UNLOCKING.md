@@ -242,6 +242,161 @@ There is no longer any dead or test-only weight in the total, so **every further
 must retire real runtime work.** U1 and U2 served **204C** / **204D** / **204E** without
 completing any of them.
 
+**U6 — OFF-LOCK BLOCKING-SEND COMMIT: PARTIAL PRODUCTION COHORT. CANONICAL 199C REMAINS
+OPEN/PARTIAL. CENSUS-DELTA 0.**
+
+> **Read the heading literally: this is a PARTIAL cohort, and canonical 199C is NOT complete.**
+>
+> Retired to the off-lock publication transaction: **plain** and **ordinary-cap** blocking
+> sends, from **both** genuine origins (synchronous-with-no-receiver, and buffered-queue-full).
+>
+> Still using the **unchanged broad in-lock publication**: **shared-region** transfer blocking
+> sends. These are a legal, reachable blocking-send class — `handle_ipc_send` builds an ordinary
+> `OPCODE_SHARED_MEM | FLAG_CAP_TRANSFER` message and nothing refuses it before either blocking
+> origin — so their exclusion is a real gap in 199C, not a class that cannot occur. They are
+> **dependency-blocked** by the D3 pin-release/shootdown fence (`doc/AI_AGENT_RULES.md §14.4`):
+> a refused off-lock commit would owe a rank-6 MemoryObject pin release, and taking
+> `with_memory_split_mut` off-lock requires the lock-free `await_tlb_shootdown_ack` design and
+> its multi-CPU evidence, neither of which exists yet. Both origins share this exclusion,
+> because both reach it through one shared body.
+>
+> **Reply caps are not a gap.** They are direct-only by production construction and cannot block
+> or queue at all: `handle_ipc_send` refuses a reply-cap send with `WouldBlock` before any
+> envelope is stashed or any `Message` is built when no recv-v2-blocked receiver is ready, and
+> with one ready it takes the accepted Stage 198C direct hand-off. That behaviour is preserved
+> exactly.
+>
+> Therefore: **do not state that blocking-`IpcSend` broad waiter publication has been retired**,
+> and do not describe this increment as "U6/199C delivered". 199C stays open until the
+> shared-region class is either retired onto the transaction or the D3 fence is lifted.
+>
+> U5's exit condition was already satisfied before this increment and is untouched by it.
+
+*What U6 retires, and for which classes.* U4 relocated the blocking-send DISPATCH out of the
+broad lock. U6 relocates the blocking-send COMMIT itself **for the plain and ordinary-cap
+classes**: the producer running under the broad lock resolves coordinates and **mutates
+nothing**, and the transition from running to `Blocked(EndpointSend)` — scheduler, task and IPC
+together — happens after the broad guard drops, through one rank-ordered transaction on the
+existing split seams. Shared-region blocking sends keep the in-lock commit (see the heading).
+The census delta is 0 because U6 retires no broad acquisition site; it removes the broad lock
+from a *transition*, which the census does not count.
+
+*The completion contract, and why it is required rather than tidy.* A blocked sender's saved
+frame carries the producer's `WouldBlock`, and on every port the syscall handler is never
+re-entered for it — AArch64's `ELR_EL1` and RISC-V's pre-advanced `sepc` both already point
+past the trapping instruction, and x86_64 resumes from the saved frame. Meanwhile the receiver
+that consumes the parked message wakes the sender. Without a published completion a woken
+sender therefore returns `WouldBlock` for a message that has already been delivered, and a
+caller that retried on `WouldBlock` would deliver it twice. U6 adds
+`BlockedSyscallClass::IpcSend`: a completion carrying `{tid, asid, send_generation}` is
+published BEFORE the wake (success, at the receiver-side consumption seam) or BEFORE the
+timeout wake (`TimedOut`, inside the deadline scan's rank-2 phase, while the task is still
+blocked), and is consumed exactly once at the resume boundary.
+
+The send generation is a **separate, checked** coordinate — `blocked_send_generation`, advanced
+by `checked_add` and never `wrapping_add`. Reusing `blocked_recv_generation` would conflate two
+independent block cycles; wrapping would let an ancient parked completion match a modern cycle.
+`BlockedSyscallCompletion::matches_tcb` is the single place that selects which counter a
+completion is validated against, by class.
+
+*Feature policy is unchanged.* The `IpcSend` consumers are production-live and ungated on all
+three ports. The `IpcRecv` / reply-timeout consumers stay exactly where they were, behind
+`ipc-reply-timeout-oracle-core`. The two cannot interfere: every take is class-scoped, so a
+consumer that does not own an entry's class leaves it parked.
+
+*The transaction (§6).* One architecture-neutral body, `commit_blocking_send_split`, shared by
+both blocking-send origins, with rank 2 nested inside rank 1 and rank 3 inside rank 2 —
+strictly ascending, the direction `doc/CAPABILITY_MODEL.md §3` mandates, and the same shape the
+accepted RISC-V exit snapshot uses for its rank-1 → rank-2 pair. Every fallible condition is
+decided before any mutation: the CPU is authoritative and the sender is its current task (rank
+1); a live `{tid, asid}` incarnation exists, is not already blocked, and its generation can be
+advanced (rank 2); the endpoint is present at the generation the producer resolved, carries no
+duplicate waiter for this TID, and has a free slot (rank 3). Only then does it mutate, in an
+order where nothing can fail: publish the waiter, commit the blocked TCB, clear `current` —
+the clear happening inside the SAME rank-1 section that validated it, so no observer can ever
+see a sender that is blocked yet still current. There is no broad-lock fallback and nothing to
+roll back.
+
+*One channel, one drain (§4).* U6 adds no second post-work stash, no second drain, no new global
+side table and no marker- or boolean-driven heuristic. It extends the existing
+`DispatchPostWork` enum with one owned `BlockingSendCommit` variant, and widens the existing
+`drain_dispatch_post_work` to take the current frame and return a typed
+`DispatchPostWorkDisposition`. Every pre-U6 variant answers `NoCallerAction`, so no existing
+wrapper behaviour changes; only the new variant can answer `SenderCommittedBlocked` (write no
+result — the frame belongs to a parked task) or `ImmediateReturn { error }` (nothing was
+mutated; the caller is still running and gets the canonical error the in-lock route would have
+returned). Both the shared x86_64 + AArch64 wrapper and the RISC-V wrapper apply the same
+disposition. The U4 D2-send deferral is armed only after a `Committed` outcome, never before it
+and never on a refusal.
+
+*The producer outcome (§5).* `handle_ipc_send` now calls
+`ipc_send_with_deadline_publishing`, whose outcome is a private typed third state —
+`PublicationPending` — not a boolean, a marker, or an error overload. That distinction is
+load-bearing: encoding it as `Err(WouldBlock)` is precisely what would send the handler into
+the readback at the old `ipc.rs:584-608`, which reads back a block that has not happened. When
+publication is pending the handler returns immediately, having reclaimed no envelope, consumed
+no timeout flag, and written nothing to the frame.
+
+*Waiter identity (§7).* `SenderWaiter` carries `{asid, send_generation}` alongside its TID, and
+every path that removes a waiter and wakes it now carries a `SenderWakeTarget` rather than a
+bare `ThreadId`, so a completion is always published against the exact blocking cycle. A
+replacement incarnation that reused the numeric TID, and a later cycle by the same incarnation,
+are both refused.
+
+*Deliberate exclusions, each routing to the UNCHANGED in-lock path — never to new behaviour.*
+Publication is refused, and the legacy in-lock commit runs instead, when: the queue-advancing
+predicate is off; there is no trap-path drainer; the CPU is not the sole dispatcher; a deferral
+or a stashed post-work item is already pending; the sender has no bound ASID; the message
+carries a REPLY CAP (direct-only — materializing one is the unsolved
+`reply_cap_ipc_rank_inversion`); or the message's transfer envelope carries a SHARED REGION,
+whose refusal path would owe a rank-6 MemoryObject pin drop that the binding D3 fence
+(`doc/AI_AGENT_RULES.md §14.4`) forbids taking off-lock. Plain and ordinary-cap transfers are
+eligible, and their envelope reclaim on a refusal is a rank-3-only transaction.
+
+*The §3 prerequisite, labelled `BLOCKS: U6` and repaired in the same commit.* The AArch64 global
+trap handler carried a `needs_plus4` / `ipc_recv_plus4` special case whose comment asserted the
+exact opposite of Stage 195B's correction: that `ELR_EL1` for an `SVC` "holds the `SVC`
+instruction address itself" and that a blocked `IpcRecv` "retries the `SVC` on wakeup". Both
+halves are false. The vector reads `elr_el1` and stores it verbatim; the bridge seeds and
+restores `saved_pc` from that same raw value; nothing anywhere applies an adjustment — so the
+hardware `ELR_EL1`, which for a synchronous `SVC` is the instruction AFTER it, is the whole
+policy. Stage 195B proved this empirically when removing the identical `+4` from the split
+finalize turned PM's NR 27 self-probe from `Internal` into `bytes=16`. The special case is
+retired: `crate::arch::trap::aarch64_syscall_elr_policy` returns the raw vector ELR
+unconditionally, with regression tests proving immediate success, immediate refusal and
+blocked-resume each advance **exactly once**. U6 depends on the second half being false —
+a blocked sender never re-executes its instruction, which is why the completion is the only
+thing that can supply its result.
+
+*A defect this cohort's own verification found and repaired.* `ipc_recv_endpoint_take` — the
+FULL (non-split) receive path, and the one most consumed senders actually take, since the split
+refill returns `Ineligible(SenderWaiterPresent)` for anything outside its narrow plain-message
+class — used to hand back a bare `SchedulerWakePlan::Wake(tid)`. That dropped the waiter's
+`{asid, send_generation}` and woke a U6-committed sender with **nothing parked**, so the sender
+returned the `WouldBlock` its saved frame still carried for a message the receiver had already
+been given; a caller that retried on `WouldBlock` would have delivered it twice. It now returns
+the exact `SenderWakeTarget`, and its three callers apply it through
+`apply_blocked_sender_wake`, which cannot skip the publication. The full path can no longer
+express a bare-TID sender wake, and a guard pins that.
+
+*Completion-path exhaustiveness.* Every production site that removes a sender waiter is
+enumerated and classified: `ipc_recv_endpoint_take` (full path) and both split refills publish
+SUCCESS through a seam that publishes strictly before it wakes; `process_ipc_timeout_deadlines`
+publishes `TimedOut` in its rank-2 phase while the task is still blocked, strictly before the
+Phase-3 enqueue; `clear_ipc_waiters_for_tid` (task exit) and `destroy_endpoint` remove without
+waking, so no completion is owed or fabricated. No remaining path consumes a sender waiter and
+wakes it without publishing.
+
+*Focused evidence.* 30 tests extending `u4_cross_arch_queue_advancing_dispatch`, all driving
+the real production entries (`ipc_send_with_deadline_publishing` and
+`drain_dispatch_post_work`) — never the transaction directly: both origins; plain,
+ordinary-cap and the shared-region exclusion; the reply-cap exclusion; waiter-full; duplicate;
+destroyed endpoint; sender-no-longer-current; FIFO; sparse-with-compaction; receiver-before-
+timeout; timeout-before-receiver; repeated cycles with fresh generations; exactly-once and
+class-scoped consumption; stale-cycle refusal; endpoint destruction and task exit. The status
+writer census gains exactly one row (`commit_blocking_send_split`, `IntoBlocked`) and the
+`wake_tid_to_runnable` caller set exactly one (`complete_and_wake_blocked_sender`).
+
 **U4 — CROSS-ARCH QUEUE-ADVANCING DISPATCH: DELIVERED, CENSUS-DELTA 0.** U4 is not
 a census increment: it retires no acquisition. It moves a named production predicate and four
 architecture-readiness cells, so blocking `IpcRecv` and blocking `IpcSend` now perform their
@@ -8021,10 +8176,21 @@ conversion and full global-lock retirement remain deferred; APs remain online bu
 no functional benefit until 187 (multi-dispatcher).
 
 **Stage 186D4 (ORDINARY-CAP-TRANSFER-LIVE-WIRING) — audited, HARD-STOPPED, no runtime
-conversion.** Goal was to wire the ordinary cap-transfer path to the seam live-equivalent
-helper (`materialize_received_message_cap_routed_with_delegation_split`). On audit this
-**cannot be done safely** in the current architecture without the broad IPC/dispatch
-decomposition this stage is told to stop before. No runtime code changed.
+conversion *at the time*.** Goal was to wire the ordinary cap-transfer path to the seam
+live-equivalent helper (`materialize_received_message_cap_routed_with_delegation_split`). On
+audit this **could not be done safely** in the architecture as it stood, without the broad
+IPC/dispatch decomposition that stage was told to stop before. No runtime code changed in 186D4.
+
+> **U5 — SUPERSEDED PREMISE (corrected here, U6/199C).** The paragraph above is a record of
+> what was true at Stage 186D4, and must no longer be read as the current state. The
+> decomposition it was waiting for has since landed, and
+> `materialize_received_message_cap_routed_with_delegation_split` now has **two live production
+> callers** — `src/runtime.rs` `complete_recv_boundary_ordinary_cap` (the post-lock ordinary-cap
+> delivery) and the queued-recv boundary beside it. It is no longer a
+> `M2_SEAM_LIVE_EQUIVALENT` helper awaiting a caller, and any statement that the ordinary
+> cap-transfer path "cannot be wired" or that the seam "has no production caller" is stale.
+> Nothing else in the 186D4 audit is retracted: the inventory below still describes the
+> router's call sites correctly.
 
 *Materialization call-site inventory* (`materialize_received_message_cap_routed`, the D1/D5
 router in `ipc_recv_core.rs`):

@@ -573,13 +573,31 @@ pub(super) fn handle_ipc_send(
         }
         _ => (None, IpcSchedulerPlan::None),
     };
+    // U6 §5 — the PRODUCER OUTCOME.
+    //
+    // The publishing send entry has three answers, not two, and the third one — "a blocking
+    // commit is stashed and nothing is decided yet" — must not be expressible as an error.
+    // Overloading `Err(WouldBlock)` for it is exactly what would send this function into the
+    // readback below, which reads back a block that has not happened.
     let send_result = if let Some(send_result) = split_send_result {
-        send_result
-    } else if send_timeout_ticks == 0 {
-        kernel.ipc_send(cap, msg)
+        send_result.map(|()| crate::kernel::boot::BlockingSendProducerOutcome::CompletedImmediately)
     } else {
-        kernel.ipc_send_with_deadline(cap, msg, send_timeout_ticks)
+        kernel.ipc_send_with_deadline_publishing(cap, msg, send_timeout_ticks)
     };
+    if let Ok(crate::kernel::boot::BlockingSendProducerOutcome::PublicationPending) = send_result {
+        // BYPASS the entire error/readback block below. Nothing is committed: the sender is
+        // still current, the endpoint is untouched, and no transfer envelope has been reclaimed.
+        // Every one of those decisions now belongs to the post-lock transaction, which owns both
+        // the commit and — through the drain's typed disposition — the caller's frame. Writing a
+        // result here, of any kind, would be writing a result for a syscall whose outcome does
+        // not exist yet.
+        crate::yarm_log!(
+            "U6_SEND_PRODUCER_PUBLICATION_PENDING tid={} endpoint_cap={} result=ok",
+            sender_tid,
+            cap.0
+        );
+        return Ok(());
+    }
     if let Err(err) = send_result {
         if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
             // Use the receiver TID that was bound at stash time. Passing sender_tid
