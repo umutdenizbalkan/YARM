@@ -1700,7 +1700,11 @@ impl SharedKernel {
     ///
     /// Callers must not already hold a lock of rank ≥ 2. It is legal — and is the point — to
     /// hold rank 1 (scheduler) across this, because 1 → 2 is the canonical ascending direction.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Architecture-neutral. It was introduced `#[cfg(target_arch = "x86_64")]` because its only
+    /// caller was the x86_64 AP enqueue→dispatch transaction; U3's class-neutral blocked-waiter
+    /// completion transaction is reached on every architecture, so the gate is gone. Nothing
+    /// about the seam itself was x86-specific — the projector it wraps never carried a gate.
     fn with_task_enqueue_policy_split_mut<R>(
         &self,
         f: impl FnOnce(
@@ -2211,6 +2215,238 @@ impl SharedKernel {
                 terminal,
                 in_runqueue,
             })
+        })
+    }
+
+    /// U3 (canonical 203C) — the class-neutral blocked-waiter Phase-C completion transaction.
+    ///
+    /// Replaces the three byte-identical broad `with_cpu` completion closures the plain,
+    /// ordinary-cap and reply-cap blocked-waiter delivery executors each held. All three ran the
+    /// same body — clear the waiter's return registers, then (when a wake TID exists) clear the
+    /// endpoint waiter slot by identity and wake exactly once — so one transaction serves all
+    /// three. It takes no class name and emits no class-specific telemetry: every
+    /// `kind=blocked_waiter_*` marker stays at its call site, outside this seam.
+    ///
+    /// Lock ordering. The legacy body ran inside one broad guard, but its own helpers took the
+    /// task, IPC and scheduler locks sequentially underneath it. This reproduces that sequence
+    /// with the domain locks taken directly, in the SAME order the legacy body produced, each
+    /// fully released before the next is taken — so no lock is ever held while another is
+    /// acquired, and the canonical rank direction is never violated:
+    ///
+    /// 1. rank 1 (scheduler) — authenticate `cpu` with the same predicate `with_cpu` uses and
+    ///    bind `current_cpu`, exactly as `with_cpu` did on entry;
+    /// 2. rank 2 (task) — clear the waiter's return registers through the byte-identical locked
+    ///    helper, and read the wake TID's current ASID for the identity below;
+    /// 3. rank 3 (IPC) — clear the endpoint waiter through the central identity path;
+    /// 4. rank 2 (task) — the wake's state half: status validation, `Runnable`, timeout clear,
+    ///    and the placement facts;
+    /// 5. rank 1 (scheduler) — the enqueue decision.
+    ///
+    /// Identity is deliberately UNCHANGED: the endpoint clear keys on
+    /// `task_asid(wake_tid).unwrap_or(Asid(0))` — the wake TID's CURRENT ASID, read here — not on
+    /// the snapshot's `waiter_asid`, a wait generation, a `WaiterKey` or an ownership token.
+    /// Tightening that is a WA3C2 question and is not this increment's.
+    ///
+    /// The caller ignores the result, matching the retired `let _ = self.with_cpu(...)`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn complete_blocked_waiter_delivery_split(
+        &self,
+        cpu: CpuId,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        wake_tid: Option<crate::kernel::ipc::ThreadId>,
+    ) -> Result<(), KernelError> {
+        use crate::kernel::boot::{ReceiverWaiterIdentity, map_scheduler_error};
+        use crate::kernel::vm::Asid;
+
+        // (1) rank 1 — the CPU authentication and binding `with_cpu` performed on entry.
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .map_err(map_scheduler_error)?;
+            sched.current_cpu = cpu;
+            Ok::<(), KernelError>(())
+        })?;
+
+        // (2) rank 2 — return-register clear, then the wake TID's current ASID. An absent waiter
+        // TCB mutates nothing and is not an error, exactly as the locked helper behaves.
+        let wake_asid = self.with_task_tcbs_split_mut(|tcbs| {
+            KernelState::clear_blocked_recv_return_regs_locked(tcbs, waiter_tid);
+            wake_tid.map(|w| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == w.0)
+                    .and_then(|t| t.asid)
+                    .unwrap_or(Asid(0))
+            })
+        });
+
+        let (Some(wake_tid), Some(wake_asid)) = (wake_tid, wake_asid) else {
+            // `wake_tid == None`: registers cleared, no endpoint clear, no wake.
+            return Ok(());
+        };
+
+        // (3) rank 3 — the central identity-keyed clear. Slot clearing, the direct-ack lease
+        // release and the waiter-census unlink all remain owned by that one path; the slot is
+        // never written directly here. Same marker, same identity-only reblock semantics.
+        self.with_ipc_split_mut(|ipc| {
+            if ipc.clear_endpoint_waiter_if_identity(
+                endpoint_idx,
+                ReceiverWaiterIdentity::new(wake_tid, wake_asid),
+            ) {
+                crate::yarm_log!(
+                    "IPC_SEND_SPLIT_RECV_V2_CLEAR_WAITER receiver_tid={}",
+                    wake_tid.0
+                );
+            }
+        });
+
+        // (4)/(5) — the wake, reproducing `apply_scheduler_wake_plan(Wake(tid))`.
+        self.wake_blocked_waiter_split(cpu, wake_tid)
+    }
+
+    /// U3 (canonical 203C) — the split form of `KernelState::wake_tid_to_runnable`.
+    ///
+    /// Byte-for-byte the same decisions and the same five markers as the in-lock body: the
+    /// accepted old states are `Blocked | Runnable | Running` and everything else returns
+    /// `WouldBlock` after `SCHED_WAKE_FAIL`; a missing task is `TaskMissing`; the status becomes
+    /// `Runnable` only when it was not already; `ipc_timeout_deadline`/`ipc_timeout_fired` are
+    /// cleared; a `Running` task already current on this CPU is NOT redundantly enqueued; and
+    /// otherwise placement is the pinned CPU when the task has an affinity, else this CPU, with
+    /// the spawn-reservation refusal, class-derived priority, first-user pinning invariant and
+    /// `reason=` string all unchanged.
+    ///
+    /// The rank-2 half is one acquisition and the rank-1 enqueue is a separate later one, so no
+    /// lock is held across the other.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn wake_blocked_waiter_split(
+        &self,
+        cpu: CpuId,
+        tid: crate::kernel::ipc::ThreadId,
+    ) -> Result<(), KernelError> {
+        use crate::kernel::boot::map_scheduler_error;
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::{TaskClass, TaskStatus};
+
+        const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
+
+        // (4) rank 2 — status validation + transition + timeout clear + placement facts, in ONE
+        // acquisition. `WakeState` mirrors what the in-lock body read from the TCB.
+        struct WakeState {
+            old_status: TaskStatus,
+            affinity: Option<CpuId>,
+            priority: TaskPriority,
+            reserved: bool,
+        }
+        let state = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+            let idx = tcbs
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|t| t.tid.0 == tid.0))
+                .ok_or(KernelError::TaskMissing)?;
+            let old_status = tcbs[idx].as_ref().expect("slot present").status;
+            crate::yarm_log!("SCHED_WAKE_BEGIN tid={} old_status={:?}", tid.0, old_status);
+            if !matches!(
+                old_status,
+                TaskStatus::Blocked(_) | TaskStatus::Runnable | TaskStatus::Running
+            ) {
+                crate::yarm_log!(
+                    "SCHED_WAKE_FAIL tid={} reason=unexpected_status:{:?}",
+                    tid.0,
+                    old_status
+                );
+                return Err(KernelError::WouldBlock);
+            }
+            let tcb = tcbs[idx].as_mut().expect("slot present");
+            if !matches!(old_status, TaskStatus::Runnable) {
+                tcb.status = TaskStatus::Runnable;
+            }
+            // `clear_ipc_timeout_for_tid`, in the same acquisition.
+            tcb.ipc_timeout_deadline = None;
+            tcb.ipc_timeout_fired = false;
+            let affinity = tcb.cpu_affinity;
+            let reserved = tcb.is_spawn_reservation();
+            // `task_priority`: TID 0 is the idle/supervisor sentinel and is Normal WITHOUT a
+            // class lookup; every other TID needs a class, and a missing one is `TaskMissing`.
+            let priority = if tid.0 == 0 {
+                TaskPriority::Normal
+            } else {
+                match classes[idx] {
+                    Some(TaskClass::SystemServer) => TaskPriority::High,
+                    Some(TaskClass::Driver) | Some(TaskClass::App) => TaskPriority::Normal,
+                    None => return Err(KernelError::TaskMissing),
+                }
+            };
+            Ok(WakeState {
+                old_status,
+                affinity,
+                priority,
+                reserved,
+            })
+        })?;
+        crate::yarm_log!("SCHED_WAKE_SET_RUNNABLE tid={} new_status=Runnable", tid.0);
+
+        // (5) rank 1 — the placement decision. `current_tid_on(cpu)` is the same fact
+        // `current_tid()` read: the in-lock body resolved it through `current_cpu()`, which is
+        // this CPU (bound in step 1, and MPIDR-derived to the same value on freestanding
+        // AArch64, where `cpu` is the trapping CPU).
+        self.with_scheduler_split_mut(|sched| {
+            let already_current = kernel_ref(&sched.scheduler)
+                .current_tid_on(cpu)
+                .is_some_and(|c| c.0 == tid.0)
+                && matches!(state.old_status, TaskStatus::Running);
+            if already_current {
+                crate::yarm_log!("SCHED_WAKE_ALREADY_RUNNABLE tid={}", tid.0);
+                return Ok(());
+            }
+            // `enqueue_woken_task`: the pinned CPU when the task has an affinity, else this CPU.
+            let (target, reason) = match state.affinity {
+                Some(pinned) => (pinned, "pinned"),
+                None => (sched.current_cpu, "current_cpu"),
+            };
+            // `enqueue_on_cpu`'s refusals, in its order: spawn reservation first, then the queue
+            // primitive's own mapped error.
+            if state.reserved {
+                crate::yarm_log!(
+                    "ENQUEUE_REFUSED tid={} reason=spawn_reservation_not_live",
+                    tid.0
+                );
+                return Err(KernelError::WrongObject);
+            }
+            // First-user CPU pinning: TID 1 must only ever be placed on the bootstrap CPU.
+            if tid.0 == BOOTSTRAP_FIRST_USER_TID
+                && target.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+                && cfg!(not(feature = "hosted-dev"))
+            {
+                crate::yarm_log!(
+                    "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
+                    sched.current_cpu.0,
+                    tid.0,
+                    target.0
+                );
+                assert_eq!(target.0, crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+            }
+            kernel_mut(&mut sched.scheduler)
+                .enqueue_on_with_priority(target, tid, state.priority)
+                .map_err(map_scheduler_error)?;
+            if tid.0 == BOOTSTRAP_FIRST_USER_TID && cfg!(not(feature = "hosted-dev")) {
+                let q = |c: u8| kernel_ref(&sched.scheduler).runnable_count_on(CpuId(c));
+                crate::yarm_log!(
+                    "BOOTSTRAP_ENQUEUE_VERIFY tid=1 queue0_len={} queue1_len={} queue2_len={} queue3_len={}",
+                    q(0),
+                    q(1),
+                    q(2),
+                    q(3)
+                );
+            }
+            let queue_len = kernel_ref(&sched.scheduler).runnable_count_on(target);
+            crate::yarm_log!(
+                "SCHED_WAKE_ENQUEUE tid={} cpu={} queue_len={} reason={}",
+                tid.0,
+                target.0,
+                queue_len,
+                reason
+            );
+            Ok(())
         })
     }
 
@@ -3321,15 +3557,15 @@ impl SharedKernel {
                 //   2. clear the endpoint receiver-waiter slot (legacy Phase 4
                 //      ipc_clear_plain_receiver_waiter_only),
                 //   3. wake the waiter exactly once (legacy Phase 5).
-                let _ = self.with_cpu(cpu, |kernel| {
-                    kernel.clear_blocked_recv_return_regs(snap.waiter_tid);
-                    if let Some(wake_tid) = snap.wake_tid {
-                        kernel.ipc_clear_plain_receiver_waiter_only(snap.endpoint_idx, wake_tid);
-                        let _ = kernel.apply_scheduler_wake_plan(
-                            crate::kernel::boot::SchedulerWakePlan::Wake(wake_tid),
-                        );
-                    }
-                });
+                // U3 (canonical 203C): the class-neutral rank-ordered completion transaction
+                // replaces this broad re-entry. Same order, same identity, same wake; the
+                // result stays ignored exactly as `let _ = self.with_cpu(...)` ignored it.
+                let _ = self.complete_blocked_waiter_delivery_split(
+                    cpu,
+                    snap.waiter_tid,
+                    snap.endpoint_idx,
+                    snap.wake_tid,
+                );
                 crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_plain");
                 // Stage 193A: for an IpcSend-origin plain delivery, emit the IpcSend boundary
                 // wake/done markers + the one-shot retirement, and consume the origin flag.
@@ -3666,15 +3902,15 @@ impl SharedKernel {
 
         // Phase C.2 — completion (brief `with_cpu`, no seam): clear return regs +
         // waiter slot, wake once.
-        let _ = self.with_cpu(cpu, |kernel| {
-            kernel.clear_blocked_recv_return_regs(snap.waiter_tid);
-            if let Some(wake_tid) = snap.wake_tid {
-                kernel.ipc_clear_plain_receiver_waiter_only(snap.endpoint_idx, wake_tid);
-                let _ = kernel.apply_scheduler_wake_plan(
-                    crate::kernel::boot::SchedulerWakePlan::Wake(wake_tid),
-                );
-            }
-        });
+        // U3 (canonical 203C): the class-neutral rank-ordered completion transaction replaces
+        // this broad re-entry. Same order, same identity, same wake; the result stays ignored
+        // exactly as `let _ = self.with_cpu(...)` ignored it.
+        let _ = self.complete_blocked_waiter_delivery_split(
+            cpu,
+            snap.waiter_tid,
+            snap.endpoint_idx,
+            snap.wake_tid,
+        );
         crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_reply_cap");
         // Stage 193D: for an IpcSend-origin reply-cap delivery, emit the IpcSend-reply-cap
         // boundary wake/done markers + the one-shot retirement, and consume the origin flag.
@@ -3878,15 +4114,15 @@ impl SharedKernel {
         // Phase C — completion via a brief global re-entry (no seam inside),
         // preserving the legacy order copy → clear GPRs → clear waiter slot →
         // wake exactly once.
-        let _ = self.with_cpu(cpu, |kernel| {
-            kernel.clear_blocked_recv_return_regs(snap.waiter_tid);
-            if let Some(wake_tid) = snap.wake_tid {
-                kernel.ipc_clear_plain_receiver_waiter_only(snap.endpoint_idx, wake_tid);
-                let _ = kernel.apply_scheduler_wake_plan(
-                    crate::kernel::boot::SchedulerWakePlan::Wake(wake_tid),
-                );
-            }
-        });
+        // U3 (canonical 203C): the class-neutral rank-ordered completion transaction replaces
+        // this broad re-entry. Same order, same identity, same wake; the result stays ignored
+        // exactly as `let _ = self.with_cpu(...)` ignored it.
+        let _ = self.complete_blocked_waiter_delivery_split(
+            cpu,
+            snap.waiter_tid,
+            snap.endpoint_idx,
+            snap.wake_tid,
+        );
         crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_ordinary_cap");
         // Stage 193C: for an IpcSend-origin ordinary-cap delivery, emit the IpcSend-cap
         // boundary wake/done markers + the one-shot retirement, and consume the origin flag.

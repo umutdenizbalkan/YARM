@@ -127,16 +127,16 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **20** |
+| `SharedKernel::with_cpu` | **17** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **1** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **21** |
+| **Total broad-lock acquisition sites** | **18** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
 | File | Count | Lines |
 |------|-------|-------|
-| `src/runtime.rs` | 12 | U1 deleted the obsolete `handle_trap_with_cpu` acquisition (13 → 12) |
+| `src/runtime.rs` | 8 | U1 deleted the obsolete `handle_trap_with_cpu` acquisition (13 → 12). This row had not been re-derived when U3 retired `current_tid_authoritative` onto the rank-1 scheduler transaction (12 → 11); it is corrected here rather than carried forward. U3 (203C) then retired the three homologous blocked-waiter Phase-C completions — `execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`, `execute_blocked_waiter_ordinary_cap_delivery` — onto ONE shared, class-neutral, rank-ordered transaction, `complete_blocked_waiter_delivery_split` (11 → 8). The mechanical per-file count in `tests/broad_lock_census_guard.rs` is the authority for this figure. |
 | `src/arch/trap_entry.rs` | 5 | U3 retired the AArch64 FutexWait and Yield switch-success restores (11 → 9), then the two homologous x86_64 D2 switch-success restores — blocking send and blocking receive — onto one neutral exact-token transaction, `x86_post_lock_resume_marked_incoming` (9 → 7), then the x86_64 FutexWait and Yield switch-success restores, which reuse that same transaction unchanged (7 → 5). The five that remain are the canonical broad trap phase, the AArch64 FutexWait no-incoming idle current-TID read (restored: its live gate is unreachable behind the pre-existing SpawnV5 stall), the D6 controlled-proof restore, and the two AArch64 `ExitCurrentTask` acquisitions. |
 | `src/arch/riscv64/trap.rs` | 2 | U3 retired six: two read-only current-TID re-acquisitions (foundation-oracle drain 8 → 7, FutexWait no-incoming idle 7 → 6), the three homologous switch/restore drains — queue-switch foundation, FutexWait switch-success, Yield switch-success (6 → 3) — onto the exact-token rank-2 transaction, and the post-lock `CurrentTaskExited` validation snapshot onto `post_lock_exit_validation_split`, one coherent rank-1 scheduler transaction with the rank-2 task acquisition nested inside it (3 → 2). The two that remain are the canonical broad trap phase and the terminal-idle predicate, whose provenance arm has no live coverage at any accepted base and is deferred. |
 | `src/arch/x86_64/smp.rs` | 2 | 2466, 2688 — U3 retired the AP saved-resume enqueue→dispatch placement onto `enqueue_then_dispatch_on_cpu_split` (4 → 3), then the AP return-to-idle `block_current_on_cpu` onto `block_current_on_cpu_split` (3 → 2) |
@@ -233,7 +233,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **21** |
+| runtime-required | **18** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -3801,13 +3801,13 @@ were a direct caller of `wake_tid_to_runnable` when the real chain runs through
 `apply_scheduler_wake_plan`. The two layers are now separate, and the caller sets are pinned by
 `the_helper_writer_direct_caller_sets_are_pinned`.
 
-**Layer 1 — the 21 CAN status-assignment sites** (this is the census; the counts are the
+**Layer 1 — the 22 CAN status-assignment sites** (this is the census; the counts are the
 classification table's):
 
 | file | function | sites |
 |---|---|---|
 | `ipc_state.rs` | `rt_commit_receiver_runnable`, `wake_tid_to_runnable`, `process_ipc_timeout_deadlines`, `signal_notification`, `wake_destroyed_notification_waiter` | 5 |
-| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split` | 4 |
+| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`, `wake_blocked_waiter_split` | 5 |
 | `restart_state.rs` | `exit_task`, `restart_task`, `mark_task_dead`, `reap_faulted_task_noalloc_cleanup` | 4 |
 | `exec_state.rs` | `spawn_user_task_from_image`, `dispatch_next_task`, `yield_current` ×2, `yield_current_to` ×2 | 6 |
 | `scheduler_state.rs` | `apply_cross_cpu_wake_task` | 1 |
@@ -3818,11 +3818,24 @@ classification table's):
 | helper writer | direct production callers | count |
 |---|---|---|
 | `wake_tid_to_runnable` | `recv_block_unwind_race`, `wake_waiter_for_endpoint`, `apply_scheduler_wake_plan` | 3 |
-| `apply_scheduler_wake_plan` | `apply_split_receiver_wake_plan`, `apply_split_sender_wake_plan`, `ipc_recv_with_optional_deadline` ×2, `ipc_reply` ×2, `ipc_send_with_optional_deadline`, `try_ipc_recv`, `execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`, `execute_blocked_waiter_ordinary_cap_delivery` | 11 |
+| `apply_scheduler_wake_plan` | `apply_split_receiver_wake_plan`, `apply_split_sender_wake_plan`, `ipc_recv_with_optional_deadline` ×2, `ipc_reply` ×2, `ipc_send_with_optional_deadline`, `try_ipc_recv` | 8 |
+| `wake_blocked_waiter_split` | `complete_blocked_waiter_delivery_split` | 1 |
 | `apply_split_receiver_wake_plan` | `ctx_finalize_and_wake` ×2, `emit_fault_report_for_fault`, `handle_ipc_send`, `handle_ipc_call` | 5 |
 | `wake_waiter_for_endpoint` | `send_message_to_endpoint_and_wake`, `ipc_send_with_optional_deadline` ×2 | 3 |
 | `apply_cross_cpu_wake_task` | `apply_cross_cpu_work` (the `WorkItem::WakeTask` drain) | 1 |
 | `rt_commit_receiver_runnable` | `complete_reply_timeout_over`, `complete_server_death_over` | 2 |
+
+> **U3 (canonical 203C) — blocked-waiter Phase-C completions.** The three `runtime.rs` Phase-C
+> completions (`execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`,
+> `execute_blocked_waiter_ordinary_cap_delivery`) used to reach `apply_scheduler_wake_plan` by
+> re-entering the broad `SharedKernel::with_cpu`. Those three broad acquisitions are retired: the
+> three sites now call one shared, class-neutral, rank-ordered transaction,
+> `complete_blocked_waiter_delivery_split`, whose wake phase is `wake_blocked_waiter_split` — the
+> split form of the same `Blocked|Running → Runnable` transition. So `apply_scheduler_wake_plan`
+> loses three direct production callers and `wake_blocked_waiter_split` becomes a new writer with
+> exactly one. **No wake origin was added or removed; one moved off the broad lock.** Ownership is
+> untouched: this population still claims nothing, and the `LegacyDelivery` disposition below is
+> the design intent, not implemented state.
 
 So `ipc_reply` is an origin **two hops** from the writer (`ipc_reply` →
 `apply_scheduler_wake_plan` → `wake_tid_to_runnable`), and `ctx_finalize_and_wake` is **three**
@@ -3910,7 +3923,7 @@ reconstructed from the slot before the claim, not after.
 | `ipc_reply` ×2 | reply delivery |
 | `ipc_send_with_optional_deadline` | send-to-blocked-receiver |
 | `try_ipc_recv`, `ipc_recv_with_optional_deadline` ×2 | receive-side sender wake |
-| `execute_dispatch_post_work`, `execute_blocked_waiter_{reply,ordinary}_cap_delivery` | post-lock capability delivery |
+| `complete_blocked_waiter_delivery_split`, reached from `execute_dispatch_post_work` and `execute_blocked_waiter_{reply,ordinary}_cap_delivery` | post-lock capability delivery |
 
 **A bare `Wake(tid)` is insufficient.** `SchedulerWakePlan` must either carry a typed cause plus
 the exact identity the cause implies (an endpoint `WaiterKey` for delivery, a `{tid, asid}` +
@@ -3976,7 +3989,7 @@ point of the matrix.
 | set | sites | intended `WaiterOwner` | disposition |
 |---|---|---|---|
 | endpoint delivery, direct IPC | `sr_commit_blocked_receiver_split` | `DirectRequest` (NR6) / `DirectReply` (NR7) | claim → consume on delivery, restore on rollback |
-| endpoint delivery, legacy + shared region | `wake_tid_to_runnable` (via `wake_waiter_for_endpoint`), `sr_wake_receiver_split`, `apply_cross_cpu_wake_task` (endpoint-origin form only) | `LegacyDelivery` | claim → consume; key rebuilt from the slot **before** the claim, since these take by index today |
+| endpoint delivery, legacy + shared region | `wake_tid_to_runnable` (via `wake_waiter_for_endpoint`), `sr_wake_receiver_split`, `wake_blocked_waiter_split` (via `complete_blocked_waiter_delivery_split`), `apply_cross_cpu_wake_task` (endpoint-origin form only) | `LegacyDelivery` | claim → consume; key rebuilt from the slot **before** the claim, since these take by index today |
 | ordinary deadline scan | `process_ipc_timeout_deadlines` | `OrdinaryTimeout` | claim → consume on fire, restore on loss; requires the ipc-first reorder |
 | already-terminal, translation undecided | `rt_commit_receiver_runnable` (Timeout **and** PeerDeath) | **none yet** — see E.1; not `OrdinaryTimeout` | E.1 prerequisite |
 | teardown | `exit_task`, `restart_task`, `mark_task_dead`, `reap_faulted_task_noalloc_cleanup` | `Teardown` | claim → cancel; retire paired with `clear_ipc_waiters_for_tid` |

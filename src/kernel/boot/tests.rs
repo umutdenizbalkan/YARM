@@ -49577,9 +49577,15 @@ mod stage188b_blocked_waiter_plain_delivery_live {
             .nth(1)
             .and_then(|r| r.split("\n            }").next())
             .expect("executor arm");
+        // U3 (203C): Phase C's endpoint clear + wake moved into the shared class-neutral
+        // transaction `complete_blocked_waiter_delivery_split`. The CLAIM is unchanged — that
+        // transaction still performs the identity-keyed clear through
+        // `clear_endpoint_waiter_if_identity` and the wake, both pinned by
+        // `u3_blocked_waiter_completion_transaction`.
         assert!(
-            body.contains("ipc_clear_plain_receiver_waiter_only")
-                && body.contains("apply_scheduler_wake_plan"),
+            body.contains("complete_blocked_waiter_delivery_split")
+                && body.contains("snap.endpoint_idx")
+                && body.contains("snap.wake_tid"),
             "executor Phase C must clear the endpoint waiter slot and wake"
         );
         assert!(
@@ -50267,9 +50273,11 @@ mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
             body.contains("rollback_materialized_recv_cap"),
             "executor must roll back the mint on a user-copy fault"
         );
+        // U3 (203C): as for 188B, Phase C's clear + wake are the shared transaction's now.
         assert!(
-            body.contains("ipc_clear_plain_receiver_waiter_only")
-                && body.contains("apply_scheduler_wake_plan"),
+            body.contains("complete_blocked_waiter_delivery_split")
+                && body.contains("snap.endpoint_idx")
+                && body.contains("snap.wake_tid"),
             "executor Phase C must clear the waiter slot and wake"
         );
         assert!(
@@ -114733,7 +114741,11 @@ mod stage199d_wa2a_ownership_boundary {
             ("src/kernel/spawn_reservation.rs", 2),
             ("src/kernel/task.rs", 2),
             ("src/kernel/task_transition.rs", 1),
-            ("src/runtime.rs", 5),
+            // U3 (203C): 5 -> 6. `wake_blocked_waiter_split` is the split form of
+            // `wake_tid_to_runnable`'s `Blocked|Running -> Runnable` transition, added when the
+            // three blocked-waiter Phase-C completions retired their broad acquisitions. It is a
+            // WAKE owner of exactly the same class as the in-lock writer it mirrors.
+            ("src/runtime.rs", 6),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -114755,8 +114767,8 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            32,
-            "29 raw writes, the WA3A barrier's single write, and the WA3B barrier's two"
+            33,
+            "30 raw writes, the WA3A barrier's single write, and the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -115223,6 +115235,15 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Cannot,
         ),
+        // U3 (203C): the split form of `wake_tid_to_runnable`'s `Blocked|Running -> Runnable`
+        // transition, reached by the blocked-waiter Phase-C completion transaction. Same class
+        // as the in-lock writer it mirrors, so it carries the same verdict.
+        (
+            "src/runtime.rs",
+            "wake_blocked_waiter_split",
+            1,
+            Verdict::Can,
+        ),
         ("src/runtime.rs", "futex_wake_split_mut", 1, Verdict::Cannot),
         ("src/runtime.rs", "sr_wake_receiver_split", 1, Verdict::Can),
         (
@@ -115625,6 +115646,14 @@ mod stage199d_wa2b_wake_owner_census {
         ),
         (
             "src/runtime.rs",
+            "wake_blocked_waiter_split",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "if !matches!(old_status, TaskStatus::Runnable) {",
+            "}",
+        ),
+        (
+            "src/runtime.rs",
             "futex_wake_split_mut",
             "tcb.status",
             "TaskStatus::Runnable",
@@ -115738,8 +115767,10 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            29,
-            "still 29 raw writes: WA3B removed spawn's and added the reservation constructor's"
+            30,
+            "30 raw writes: U3 (203C) added `wake_blocked_waiter_split`, the split form of \
+             `wake_tid_to_runnable`'s transition, when the blocked-waiter Phase-C completions \
+             retired their broad acquisitions"
         );
         for (i, (file, function, lhs, rhs, before, after)) in sites.iter().enumerate() {
             let (pf, pfn, plhs, prhs, pbefore, pafter) = FINGERPRINTS[i];
@@ -115801,10 +115832,14 @@ mod stage199d_wa2b_wake_owner_census {
         // `ThreadControlBlock::reserved` — the non-live reservation constructor this stage
         // requires — is a genuinely NEW fresh-constructor writer. Reporting 38 is the honest
         // result; forcing 37 would mean hiding one of the two.
+        // U3 (203C) raises it to 39: `wake_blocked_waiter_split` is the split form of the
+        // `wake_tid_to_runnable` transition the blocked-waiter Phase-C completions used to
+        // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            38,
-            "37 pinned by WA2A-R1, plus `ThreadControlBlock::reserved`"
+            39,
+            "37 pinned by WA2A-R1, `ThreadControlBlock::reserved`, and U3 (203C)'s \
+             `wake_blocked_waiter_split`"
         );
         assert_eq!(
             FINGERPRINTS.len()
@@ -115816,8 +115851,8 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            38,
-            "29 raw writes + 8 transition-barriered sites + 1 reservation-barriered site"
+            39,
+            "30 raw writes + 8 transition-barriered sites + 1 reservation-barriered site"
         );
     }
 
@@ -115981,17 +116016,15 @@ mod stage199d_wa2b_wake_owner_census {
                         1,
                     ),
                     ("src/kernel/boot/ipc_state.rs", "try_ipc_recv", 1),
-                    (
-                        "src/runtime.rs",
-                        "execute_blocked_waiter_ordinary_cap_delivery",
-                        1,
-                    ),
-                    (
-                        "src/runtime.rs",
-                        "execute_blocked_waiter_reply_cap_delivery",
-                        1,
-                    ),
-                    ("src/runtime.rs", "execute_dispatch_post_work", 1),
+                    // U3 (203C): the three `src/runtime.rs` blocked-waiter Phase-C completion
+                    // callers — `execute_blocked_waiter_ordinary_cap_delivery`,
+                    // `execute_blocked_waiter_reply_cap_delivery` and
+                    // `execute_dispatch_post_work` — are GONE from this set. They reached
+                    // `apply_scheduler_wake_plan` only through the broad `with_cpu` re-entry
+                    // this stage retired; they now go through the rank-ordered completion
+                    // transaction, whose wake phase is `wake_blocked_waiter_split`. The
+                    // shrinkage IS the retirement: no wake origin was removed, it moved off the
+                    // broad lock.
                 ],
             ),
             (
@@ -116113,7 +116146,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            38,
+            39,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -116121,9 +116154,13 @@ mod stage199d_wa2b_wake_owner_census {
         // one-shot reservation protocol, and added ONE new fresh-constructor writer
         // (`ThreadControlBlock::reserved`). Hence 38, not 37: the two movements the stage
         // predicted hold exactly, and the extra site is disclosed rather than absorbed.
+        // U3 (203C) adds ONE row, `wake_blocked_waiter_split`, to CAN: the split form of the
+        // `wake_tid_to_runnable` transition the blocked-waiter Phase-C completions previously
+        // reached under the retired broad acquisition. Same class, new seam — so CAN moves
+        // 12 → 13 and nothing else moves.
         assert_eq!(
             (can, cannot, into_blocked, fresh, non_production),
-            (12, 16, 7, 2, 1)
+            (13, 16, 7, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -116374,7 +116411,7 @@ mod stage199d_wa2b_wake_owner_census {
         // A. writer sites and logical origins are two explicit layers, and every helper's
         // direct callers are named (not a transitive caller standing in for the real one).
         assert!(
-            matrix.contains("Layer 1 — the 21 CAN status-assignment sites")
+            matrix.contains("Layer 1 — the 22 CAN status-assignment sites")
                 && matrix.contains("Layer 2 — logical origins"),
             "the matrix must separate writer sites from logical origins"
         );
@@ -120301,5 +120338,609 @@ mod u3_d6_first_resume_bind_transaction {
             code.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE"),
             "its cleanup path is untouched"
         );
+    }
+}
+
+/// U3 (canonical 203C) — the class-neutral blocked-waiter Phase-C completion transaction.
+///
+/// `SharedKernel::complete_blocked_waiter_delivery_split` replaces the three byte-identical
+/// broad `with_cpu` completion closures held by the plain, ordinary-cap and reply-cap
+/// blocked-waiter delivery executors. Every test here compares it against the retired body on
+/// twin kernel states wherever the fact is observable, so the proof is equivalence rather than
+/// a restatement of the new code.
+#[cfg(test)]
+mod u3_blocked_waiter_completion_transaction {
+    use crate::kernel::boot::types::KernelError;
+    use crate::kernel::boot::{Bootstrap, EndpointWaiterRecord, ReceiverWaiterIdentity};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const WAITER: u64 = 500;
+    const WAKE: u64 = 501;
+    const ASID: u16 = 9;
+
+    fn ident(tid: u64, asid: u16) -> ReceiverWaiterIdentity {
+        ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+
+    fn waiters_linked() -> usize {
+        crate::kernel::direct_ack_census::waiters_current()
+    }
+
+    /// A kernel with an online AP, a blocked waiter carrying dirty return registers, and a
+    /// `wake_tid` published as the endpoint's receive-waiter.
+    fn fixture(wake_status: TaskStatus, wake_asid: Option<u16>) -> (SharedKernel, usize) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let eidx = k.with(|s| {
+            s.bring_up_cpu(CpuId(1)).expect("cpu1");
+            s.register_task_with_class(WAITER, TaskClass::App)
+                .expect("waiter");
+            s.register_task_with_class(WAKE, TaskClass::App)
+                .expect("wake");
+            let (eidx, _s, _r) = s.create_endpoint(4).expect("ep");
+            s.with_tcbs_mut(|tcbs| {
+                let w = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == WAITER)
+                    .unwrap();
+                w.user_context.arg0 = 0xdead;
+                w.user_context.user_gprs[0] = 0xdead;
+                w.user_context.user_gprs[2] = 0xdead;
+                w.user_context.user_gprs[3] = 0xdead;
+                w.user_context.user_gprs[7] = 0xdead;
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == WAKE).unwrap();
+                t.status = wake_status;
+                t.asid = wake_asid.map(Asid);
+                t.ipc_timeout_deadline = Some(1234);
+                t.ipc_timeout_fired = true;
+            });
+            s.with_ipc_state_mut(|ipc| {
+                ipc.set_endpoint_waiter(
+                    eidx,
+                    EndpointWaiterRecord::new(ident(WAKE, wake_asid.unwrap_or(0)), 4),
+                );
+            });
+            eidx
+        });
+        (k, eidx)
+    }
+
+    /// The exact retired body, for differential comparison.
+    fn legacy(k: &SharedKernel, cpu: CpuId, waiter_tid: u64, eidx: usize, wake: Option<ThreadId>) {
+        let _ = k.with_cpu(cpu, |kernel| {
+            kernel.clear_blocked_recv_return_regs(waiter_tid);
+            if let Some(wake_tid) = wake {
+                kernel.ipc_clear_plain_receiver_waiter_only(eidx, wake_tid);
+                let _ = kernel.apply_scheduler_wake_plan(
+                    crate::kernel::boot::SchedulerWakePlan::Wake(wake_tid),
+                );
+            }
+        });
+    }
+
+    /// Everything the completion may legitimately change, as one comparable value.
+    type Observed = (
+        [usize; 5],         // waiter return-register lanes
+        Option<ThreadId>,   // endpoint waiter slot
+        Option<TaskStatus>, // wake task status
+        Option<u64>,        // wake task ipc_timeout_deadline
+        bool,               // wake task ipc_timeout_fired
+        usize,              // runnable count on cpu 0
+        usize,              // runnable count on cpu 1
+        CpuId,              // bound current_cpu
+        usize,              // direct-ack waiter census
+    );
+
+    fn observe(k: &SharedKernel, eidx: usize) -> Observed {
+        k.with(|s| {
+            let regs = s.with_tcbs(|tcbs| {
+                let w = tcbs.iter().flatten().find(|t| t.tid.0 == WAITER).unwrap();
+                [
+                    w.user_context.arg0,
+                    w.user_context.user_gprs[0],
+                    w.user_context.user_gprs[2],
+                    w.user_context.user_gprs[3],
+                    w.user_context.user_gprs[7],
+                ]
+            });
+            let (deadline, fired) =
+                s.with_tcbs(
+                    |tcbs| match tcbs.iter().flatten().find(|t| t.tid.0 == WAKE) {
+                        Some(t) => (t.ipc_timeout_deadline, t.ipc_timeout_fired),
+                        None => (None, false),
+                    },
+                );
+            (
+                regs,
+                s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx)),
+                s.task_status(WAKE),
+                deadline,
+                fired,
+                s.runnable_count_on_cpu(CpuId(0)),
+                s.runnable_count_on_cpu(CpuId(1)),
+                s.current_cpu(),
+                waiters_linked(),
+            )
+        })
+    }
+
+    /// Run one scenario through both bodies on twin kernels and require identical observations.
+    fn differential(
+        wake_status: TaskStatus,
+        wake_asid: Option<u16>,
+        wake: Option<u64>,
+        name: &str,
+    ) {
+        let cpu = CpuId(0);
+        // The direct-ack waiter census is a PROCESS-WIDE counter, so only the delta each body
+        // causes is comparable between two sequentially-created twin kernels.
+        let (a, ea) = fixture(wake_status, wake_asid);
+        let a_census = waiters_linked();
+        legacy(&a, cpu, WAITER, ea, wake.map(ThreadId));
+        let obs_a = observe(&a, ea);
+        let a_delta = waiters_linked() as i64 - a_census as i64;
+
+        let (b, eb) = fixture(wake_status, wake_asid);
+        let b_census = waiters_linked();
+        let _ = b.complete_blocked_waiter_delivery_split(cpu, WAITER, eb, wake.map(ThreadId));
+        let obs_b = observe(&b, eb);
+        let b_delta = waiters_linked() as i64 - b_census as i64;
+
+        assert_eq!(
+            strip_census(obs_a),
+            strip_census(obs_b),
+            "{name}: the transaction must observe identically"
+        );
+        assert_eq!(a_delta, b_delta, "{name}: same waiter-census delta");
+    }
+
+    /// Drop the process-wide census field, which is only comparable as a delta.
+    fn strip_census(o: Observed) -> ObservedNoCensus {
+        (o.0, o.1, o.2, o.3, o.4, o.5, o.6, o.7)
+    }
+
+    type ObservedNoCensus = (
+        [usize; 5],
+        Option<ThreadId>,
+        Option<TaskStatus>,
+        Option<u64>,
+        bool,
+        usize,
+        usize,
+        CpuId,
+    );
+
+    // ── differential equivalence across the behavioural surface ───────────────────────────
+
+    #[test]
+    fn u3_bw_matches_the_retired_broad_body() {
+        differential(
+            TaskStatus::Blocked(WaitReason::Poll),
+            Some(ASID),
+            Some(WAKE),
+            "blocked wake",
+        );
+        differential(
+            TaskStatus::Runnable,
+            Some(ASID),
+            Some(WAKE),
+            "runnable wake",
+        );
+        differential(TaskStatus::Running, Some(ASID), Some(WAKE), "running wake");
+        differential(
+            TaskStatus::Faulted,
+            Some(ASID),
+            Some(WAKE),
+            "faulted refusal",
+        );
+        differential(TaskStatus::Dead, Some(ASID), Some(WAKE), "dead refusal");
+        differential(
+            TaskStatus::Exited(0),
+            Some(ASID),
+            Some(WAKE),
+            "exited refusal",
+        );
+        differential(
+            TaskStatus::Reserved,
+            Some(ASID),
+            Some(WAKE),
+            "reserved refusal",
+        );
+        differential(
+            TaskStatus::Blocked(WaitReason::Poll),
+            None,
+            Some(WAKE),
+            "wake task with no ASID",
+        );
+        differential(
+            TaskStatus::Blocked(WaitReason::Poll),
+            Some(ASID),
+            None,
+            "wake_tid = None",
+        );
+        differential(
+            TaskStatus::Blocked(WaitReason::Poll),
+            Some(ASID),
+            Some(4242),
+            "missing wake task",
+        );
+    }
+
+    // ── CPU authentication and binding ────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_bw_valid_cpu_is_bound() {
+        let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+        k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+        assert_eq!(
+            k.complete_blocked_waiter_delivery_split(CpuId(1), WAITER, eidx, None),
+            Ok(())
+        );
+        assert_eq!(
+            k.with(|s| s.current_cpu()),
+            CpuId(1),
+            "current_cpu is bound"
+        );
+    }
+
+    #[test]
+    fn u3_bw_invalid_cpu_returns_the_legacy_error_and_mutates_nothing() {
+        for bad in [CpuId(7), CpuId(200)] {
+            let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+            k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
+            let before = observe(&k, eidx);
+            let err = k
+                .complete_blocked_waiter_delivery_split(bad, WAITER, eidx, Some(ThreadId(WAKE)))
+                .expect_err("refused");
+            assert_eq!(
+                err,
+                k.with(|s| s.set_current_cpu(bad).unwrap_err()),
+                "the same failure class `with_cpu` produced"
+            );
+            assert_eq!(observe(&k, eidx), before, "a refused CPU mutates nothing");
+        }
+    }
+
+    // ── register clearing ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_bw_wake_none_clears_registers_only() {
+        let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+        assert_eq!(
+            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, None),
+            Ok(())
+        );
+        let (regs, slot, status, deadline, fired, ..) = observe(&k, eidx);
+        assert_eq!(regs, [0; 5], "all return lanes cleared");
+        assert_eq!(slot, Some(ThreadId(WAKE)), "no endpoint clear");
+        assert_eq!(
+            status,
+            Some(TaskStatus::Blocked(WaitReason::Poll)),
+            "no wake"
+        );
+        assert_eq!(deadline, Some(1234), "no timeout clear");
+        assert!(fired, "no timeout clear");
+    }
+
+    #[test]
+    fn u3_bw_absent_waiter_tcb_is_not_an_error() {
+        let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+        assert_eq!(
+            k.complete_blocked_waiter_delivery_split(CpuId(0), 9_999, eidx, None),
+            Ok(()),
+            "an absent waiter TCB mutates nothing and raises no new error"
+        );
+    }
+
+    // ── identity semantics at the endpoint ────────────────────────────────────────────────
+
+    #[test]
+    fn u3_bw_identity_mismatch_leaves_the_endpoint_waiter_untouched() {
+        // The slot is published under a DIFFERENT ASID than the wake task now carries, so the
+        // identity-keyed clear must decline and the census must not unlink.
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let eidx = k.with(|s| {
+            s.register_task_with_class(WAITER, TaskClass::App)
+                .expect("waiter");
+            s.register_task_with_class(WAKE, TaskClass::App)
+                .expect("wake");
+            let (eidx, _s, _r) = s.create_endpoint(4).expect("ep");
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == WAKE).unwrap();
+                t.status = TaskStatus::Blocked(WaitReason::Poll);
+                t.asid = Some(Asid(ASID));
+            });
+            s.with_ipc_state_mut(|ipc| {
+                ipc.set_endpoint_waiter(eidx, EndpointWaiterRecord::new(ident(WAKE, ASID + 1), 4));
+            });
+            eidx
+        });
+        let linked = waiters_linked();
+        let _ =
+            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        assert_eq!(
+            k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx))),
+            Some(ThreadId(WAKE)),
+            "a slot bearing a different ASID is a different receiver and stays published"
+        );
+        assert_eq!(waiters_linked(), linked, "no census unlink on a mismatch");
+    }
+
+    #[test]
+    fn u3_bw_identity_match_removes_through_the_central_path_exactly_once() {
+        let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+        let linked = waiters_linked();
+        let _ =
+            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        assert_eq!(
+            k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx))),
+            None,
+            "the matching identity is removed"
+        );
+        assert_eq!(waiters_linked(), linked - 1, "unlinked exactly once");
+        // A second completion is a no-op and must not double-unlink.
+        let _ =
+            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        assert_eq!(waiters_linked(), linked - 1, "no double unlink");
+    }
+
+    #[test]
+    fn u3_bw_same_identity_new_wait_generation_is_still_this_receiver() {
+        // The accepted semantics: a REBLOCKED waiter (same {tid, asid}, new generation) is still
+        // this receiver and IS cleared. This increment does not tighten that (WA3C2).
+        let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+        k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                ipc.set_endpoint_waiter(eidx, EndpointWaiterRecord::new(ident(WAKE, ASID), 77));
+            })
+        });
+        let _ =
+            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        assert_eq!(
+            k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx))),
+            None,
+            "identity-only clear ignores the wait generation, as before"
+        );
+    }
+
+    // ── wake placement ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_bw_pinned_and_current_cpu_placement_match_the_legacy_body() {
+        for affinity in [None, Some(CpuId(1))] {
+            let setup = |k: &SharedKernel| {
+                k.with(|s| {
+                    s.with_tcbs_mut(|tcbs| {
+                        let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == WAKE).unwrap();
+                        t.cpu_affinity = affinity;
+                    })
+                });
+            };
+            let (a, ea) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+            setup(&a);
+            legacy(&a, CpuId(0), WAITER, ea, Some(ThreadId(WAKE)));
+            let (b, eb) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+            setup(&b);
+            let _ = b.complete_blocked_waiter_delivery_split(
+                CpuId(0),
+                WAITER,
+                eb,
+                Some(ThreadId(WAKE)),
+            );
+            assert_eq!(
+                observe(&a, ea),
+                observe(&b, eb),
+                "affinity {affinity:?}: same placement"
+            );
+        }
+    }
+
+    #[test]
+    fn u3_bw_wake_clears_timeout_fields_and_does_not_double_enqueue() {
+        let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+        let before = k.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        assert_eq!(
+            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE))),
+            Ok(())
+        );
+        let (_, _, status, deadline, fired, q0, ..) = observe(&k, eidx);
+        assert_eq!(status, Some(TaskStatus::Runnable));
+        assert_eq!(deadline, None, "ipc_timeout_deadline cleared");
+        assert!(!fired, "ipc_timeout_fired cleared");
+        assert_eq!(q0, before + 1, "enqueued exactly once");
+    }
+
+    #[test]
+    fn u3_bw_terminal_states_keep_the_same_refusal() {
+        for bad in [
+            TaskStatus::Faulted,
+            TaskStatus::Dead,
+            TaskStatus::Exited(0),
+            TaskStatus::Reserved,
+        ] {
+            let (k, eidx) = fixture(bad, Some(ASID));
+            let err = k
+                .complete_blocked_waiter_delivery_split(
+                    CpuId(0),
+                    WAITER,
+                    eidx,
+                    Some(ThreadId(WAKE)),
+                )
+                .expect_err("refused");
+            assert_eq!(err, KernelError::WouldBlock, "{bad:?}: same refusal");
+        }
+    }
+
+    #[test]
+    fn u3_bw_missing_wake_task_is_task_missing() {
+        let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
+        assert_eq!(
+            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(4_242))),
+            Err(KernelError::TaskMissing)
+        );
+    }
+
+    // ── lock shape and call-site conversion ───────────────────────────────────────────────
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of(name: &str) -> alloc::string::String {
+        let tail = RUNTIME
+            .split(name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{name}` must exist"));
+        // Bound at the method's own closing brace (4-space indent), not at the next doc
+        // comment — the latter swallows whatever follows the method.
+        code_of(tail.split_once("\n    }\n").expect("the method closes").0)
+    }
+
+    #[test]
+    fn u3_bw_transaction_lock_trace_is_canonical_and_has_no_broad_acquisition() {
+        let outer = body_of("pub(crate) fn complete_blocked_waiter_delivery_split");
+        let wake = body_of("fn wake_blocked_waiter_split");
+        for (name, body) in [("completion", &outer), ("wake", &wake)] {
+            assert!(
+                !body.contains(".with_cpu(") && !body.contains("self.with(|"),
+                "{name}: no broad acquisition and no broad fallback"
+            );
+        }
+        // Ascending, one acquisition each, in the legacy order.
+        let sched = outer.find("with_scheduler_split_mut").expect("rank 1");
+        let task = outer
+            .find("with_task_tcbs_split_mut")
+            .expect("rank 2 register clear");
+        let ipc = outer.find("with_ipc_split_mut").expect("rank 3");
+        let wake_call = outer.find("wake_blocked_waiter_split").expect("the wake");
+        assert!(
+            sched < task && task < ipc && ipc < wake_call,
+            "rank 1 -> rank 2 -> rank 3 -> wake, matching the legacy order"
+        );
+        assert_eq!(outer.matches("with_scheduler_split_mut").count(), 1);
+        assert_eq!(outer.matches("with_ipc_split_mut").count(), 1);
+        // The wake half: rank 2 then rank 1, never the reverse.
+        let w_task = wake
+            .find("with_task_enqueue_policy_split_mut")
+            .expect("rank 2");
+        let w_sched = wake.find("with_scheduler_split_mut").expect("rank 1");
+        assert!(
+            w_task < w_sched,
+            "rank 2 fully released before the rank-1 enqueue"
+        );
+        // The slot is never written directly, and the central path is not bypassed.
+        assert!(
+            outer.contains("clear_endpoint_waiter_if_identity"),
+            "removal goes through the central identity path"
+        );
+        assert!(
+            !outer.contains("endpoint_waiters["),
+            "the slot is never written directly"
+        );
+        // The identity is the wake TID's CURRENT asid, defaulting to 0 — unchanged.
+        assert!(
+            outer.contains("unwrap_or(Asid(0))") && !outer.contains("waiter_asid"),
+            "identity stays `task_asid(wake_tid).unwrap_or(Asid(0))`, not the snapshot ASID"
+        );
+        // No re-entrant KernelState accessors inside the held domains.
+        for reentrant in [
+            "clear_blocked_recv_return_regs(",
+            "ipc_clear_plain_receiver_waiter_only(",
+            "apply_scheduler_wake_plan(",
+            "task_asid(",
+            "current_tid()",
+        ] {
+            assert!(
+                !outer.contains(reentrant) && !wake.contains(reentrant),
+                "`{reentrant}` would re-enter a domain lock already held"
+            );
+        }
+        // The five wake markers survive verbatim.
+        for marker in [
+            "SCHED_WAKE_BEGIN tid={} old_status={:?}",
+            "SCHED_WAKE_FAIL tid={} reason=unexpected_status:{:?}",
+            "SCHED_WAKE_SET_RUNNABLE tid={} new_status=Runnable",
+            "SCHED_WAKE_ALREADY_RUNNABLE tid={}",
+            "SCHED_WAKE_ENQUEUE tid={} cpu={} queue_len={} reason={}",
+        ] {
+            assert!(wake.contains(marker), "marker `{marker}` must be preserved");
+        }
+        assert!(
+            wake.contains("enqueue_on_with_priority"),
+            "the existing queue primitive is used"
+        );
+    }
+
+    #[test]
+    fn u3_bw_all_three_call_sites_are_converted() {
+        let code = code_of(RUNTIME);
+        assert_eq!(
+            code.matches("self.complete_blocked_waiter_delivery_split(")
+                .count(),
+            3,
+            "plain, ordinary-cap and reply-cap completions all use the shared transaction"
+        );
+        // The retired body's signature literal is gone from every completion arm.
+        assert_eq!(
+            code.matches("kernel.ipc_clear_plain_receiver_waiter_only(snap.endpoint_idx")
+                .count(),
+            0,
+            "no completion arm retains the broad body"
+        );
+        // The class-specific markers stay at the call sites, not in the transaction.
+        for kind in [
+            "blocked_waiter_plain",
+            "blocked_waiter_ordinary_cap",
+            "blocked_waiter_reply_cap",
+        ] {
+            assert!(
+                code.contains(&alloc::format!("DISPATCH_POST_WORK_WAKE_OK kind={kind}")),
+                "{kind}: its wake marker stays at the call site"
+            );
+        }
+        let outer = body_of("pub(crate) fn complete_blocked_waiter_delivery_split");
+        // No class-specific telemetry and no class name inside the seam. (The helper it calls
+        // is `wake_blocked_waiter_split`, which is class-neutral despite the shared substring.)
+        assert!(
+            !outer.contains("kind=blocked_waiter_")
+                && !outer.contains("DISPATCH_POST_WORK_")
+                && !outer.contains("IPC_SEND_CAP_")
+                && !outer.contains("IPC_SEND_REPLY_CAP_"),
+            "the transaction emits no class-specific telemetry"
+        );
+        // The production broad-acquisition COUNT is owned authoritatively by
+        // `tests/broad_lock_census_guard.rs`, which applies the census method (test-module
+        // cutoff, comment filtering). It is deliberately not restated here with a weaker scan.
+    }
+
+    #[test]
+    fn u3_bw_ownership_operations_still_have_zero_production_callers() {
+        // This cohort arms, claims, consumes, cancels, restores and retires nothing.
+        let code = code_of(RUNTIME);
+        let outer = body_of("pub(crate) fn complete_blocked_waiter_delivery_split");
+        let wake = body_of("fn wake_blocked_waiter_split");
+        for op in [
+            "arm_waiter_ownership",
+            "claim_waiter_ownership",
+            "consume_waiter_ownership",
+            "cancel_waiter_ownership",
+            "restore_waiter_ownership",
+            "retire_waiter_ownership",
+        ] {
+            assert!(
+                !outer.contains(op) && !wake.contains(op),
+                "`{op}` must have no caller in this cohort"
+            );
+            let _ = &code;
+        }
     }
 }
