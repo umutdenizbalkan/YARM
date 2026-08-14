@@ -57,7 +57,7 @@ complete the canonical stage.**
 
 | Phase | Complete | Partial foundation | Open |
 |-------|----------|--------------------|------|
-| 2 — IPC (199C–199G) | 0 of 5 | 199D, 199E | 199C, 199F, 199G |
+| 2 — IPC (199C–199G) | 1 of 5 (199C) | 199D, 199E | 199F, 199G |
 | 3 — Capability (200A–200D) | 0 of 4 | 200A, 200C | 200B, 200D |
 | 4 — VM (201A–201G) | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
 | 5 — Lifecycle (202A–202F) | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |

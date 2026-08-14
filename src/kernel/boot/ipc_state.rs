@@ -2406,6 +2406,73 @@ impl KernelState {
         self.complete_and_wake_blocked_sender(target, Self::SEND_COMPLETION_OK)
     }
 
+    /// U6/199C — settle the transfer envelope a BLOCKED SENDER's waiter still owns, exactly
+    /// once, on every terminal path that removes that waiter without delivering its message
+    /// (timeout, endpoint destruction, sender exit).
+    ///
+    /// While a sender is parked, the envelope named by its message's transfer handle is still
+    /// live and — for a shared-region transfer — still holds one `pin_refcount`. Removing the
+    /// waiter makes that envelope unreachable: nothing else can ever consume it, so the terminal
+    /// path that removed the waiter owes exactly one settle. Without this the pin and the
+    /// envelope slot leak for the lifetime of the system.
+    ///
+    /// This adds no second release implementation. It resolves the envelope's OWN endpoint
+    /// object and bound receiver from the store, then calls the canonical
+    /// [`Self::take_transfer_envelope`], which performs the `Released` transition, drops the
+    /// shared-region pin exactly once, and clears the slot. Reclaim is never invoked — see
+    /// `SharedKernel::settle_blocked_send_envelope_split` for the full no-reclaim derivation;
+    /// this in-lock sibling inherits it, and additionally runs under the broad lock where the
+    /// D3 split-seam fence does not apply at all.
+    ///
+    /// Idempotent: the consume clears the slot, so a second settle for the same waiter finds no
+    /// envelope and returns `false` without dropping a second pin.
+    ///
+    /// Returns `true` iff an envelope was settled.
+    pub(crate) fn settle_blocked_sender_envelope(
+        &mut self,
+        waiter: &SenderWaiter,
+        endpoint_idx: usize,
+    ) -> bool {
+        let Some(handle) = waiter.msg.transferred_cap() else {
+            return false;
+        };
+        let Ok(idx) = usize::try_from(handle.0 & 0xFFFF) else {
+            return false;
+        };
+        // Resolve the envelope's own identity under the IPC lock, then release the lock before
+        // the canonical consume (which itself takes the domain locks it needs, in order).
+        let resolved = self.with_ipc_state(|ipc| {
+            let envelope = (*ipc.transfer_envelopes.get(idx)?)?;
+            if ipc.transfer_envelope_generations.get(idx).copied()? != (handle.0 >> 16) {
+                return None;
+            }
+            // The envelope must name the endpoint this waiter was parked on — never settle an
+            // envelope belonging to a different endpoint because a handle index collided.
+            if !matches!(envelope.endpoint,
+                CapObject::Endpoint { index, .. } if index == endpoint_idx)
+            {
+                return None;
+            }
+            Some((envelope.endpoint, envelope.receiver_tid))
+        });
+        let Some((endpoint_object, bound_receiver)) = resolved else {
+            return false;
+        };
+        let cleanup_tid = bound_receiver.unwrap_or(waiter.tid);
+        let settled = self
+            .take_transfer_envelope(handle.0, endpoint_object, cleanup_tid)
+            .is_some();
+        if settled {
+            crate::yarm_log!(
+                "U6_BLOCKED_SEND_ENVELOPE_SETTLED tid={} endpoint={} handle={} result=ok",
+                waiter.tid.0,
+                endpoint_idx,
+                handle.0
+            );
+        }
+        settled
+    }
+
     /// U6 §2/§7 — complete and then wake one blocked sender, in that order.
     ///
     /// The SINGLE seam every receiver-side sender-waiter consumption path calls. It exists so
@@ -3017,11 +3084,24 @@ impl KernelState {
         // it published with. Sender/notification waiter structures keep their numeric-TID sweep — they
         // are not endpoint receive-waiters and are out of this stage's scope.
         let identity = ReceiverWaiterIdentity::new(tid_id, self.task_asid(tid).unwrap_or(Asid(0)));
+        // U6/199C: a removed SENDER waiter may still own a transfer envelope (and, for a
+        // shared-region transfer, one transient pin). Collect them under the rank-3 sweep and
+        // settle each exactly once after the lock releases — sequential, never nested.
+        let mut orphaned: [Option<(SenderWaiter, usize)>; MAX_ENDPOINT_SENDER_WAITERS] =
+            [const { None }; MAX_ENDPOINT_SENDER_WAITERS];
+        let mut orphaned_n = 0usize;
         self.with_ipc_state_mut(|ipc| {
             ipc.clear_endpoint_waiters_for_identity(identity);
-            for queue in ipc.endpoint_sender_waiters.iter_mut() {
+            for (endpoint_idx, queue) in ipc.endpoint_sender_waiters.iter_mut().enumerate() {
                 for slot in queue.iter_mut() {
                     if slot.as_ref().is_some_and(|w| w.tid == tid_id) {
+                        if let Some(removed) = slot.take()
+                            && removed.msg.transferred_cap().is_some()
+                            && orphaned_n < MAX_ENDPOINT_SENDER_WAITERS
+                        {
+                            orphaned[orphaned_n] = Some((removed, endpoint_idx));
+                            orphaned_n += 1;
+                        }
                         *slot = None;
                     }
                 }
@@ -3032,6 +3112,9 @@ impl KernelState {
                 }
             }
         });
+        for slot in orphaned.iter().take(orphaned_n).flatten() {
+            let _ = self.settle_blocked_sender_envelope(&slot.0, slot.1);
+        }
     }
 
     /// Return the `waiter_cap_id` recorded in the global `ReplyCapRecord` at
@@ -3772,10 +3855,14 @@ impl KernelState {
     /// * the stash must be empty, so publication never displaces another handler's post-work;
     /// * the sender must have a bound ASID — without one there is no incarnation to name, and
     ///   the commit's `{tid, asid}` identity could not be formed;
-    /// * a SHARED-REGION transfer envelope is excluded, because a refused commit would owe a
-    ///   rank-6 MemoryObject pin drop that the binding D3 fence (`doc/AI_AGENT_RULES.md §14.4`)
-    ///   forbids taking off-lock. Plain and ordinary-cap transfers carry no such pin and are
-    ///   eligible.
+    ///
+    /// U6/199C: shared-region transfers are NO LONGER excluded. The refusal path settles the
+    /// envelope and its single transient pin through a sequential rank-3 → rank-6 no-reclaim
+    /// transaction (`SharedKernel::settle_blocked_send_envelope_split`), reusing the existing
+    /// production `sr_release_pin_split` seam rather than adding a `with_memory_split_mut` call
+    /// site, so the D3 fence (`doc/AI_AGENT_RULES.md §14.4`) is respected rather than bypassed.
+    /// Every legal blocking-send class — plain, ordinary-cap and shared-region — now takes this
+    /// path; only reply caps stay out, and they cannot block at all.
     fn blocking_send_publication_snapshot(
         &mut self,
         endpoint_idx: usize,
@@ -3832,19 +3919,17 @@ impl KernelState {
                         .get(idx)
                         .and_then(|slot| slot.map(|e| (e.shared_region.is_some(), e.receiver_tid)))
                 });
-                match shared {
-                    // No live envelope for this handle: nothing to reclaim on a refusal.
-                    None => None,
-                    // D3 fence — see the doc comment.
-                    Some((true, _)) => return None,
-                    Some((false, bound_receiver)) => Some(
-                        crate::kernel::dispatch_post_work::BlockingSendEnvelopeCleanup {
-                            handle: handle.0,
-                            endpoint_idx,
-                            cleanup_tid: bound_receiver.unwrap_or(ThreadId(sender_tid)),
-                        },
-                    ),
-                }
+                // U6/199C: shared-region envelopes are carried like every other class. The
+                // refusal settle releases the transient pin through the sequential rank-3 →
+                // rank-6 no-reclaim transaction, so this class no longer needs an exclusion.
+                // `None` means no live envelope for this handle — nothing to settle.
+                shared.map(|(_shared_region, bound_receiver)| {
+                    crate::kernel::dispatch_post_work::BlockingSendEnvelopeCleanup {
+                        handle: handle.0,
+                        endpoint_idx,
+                        cleanup_tid: bound_receiver.unwrap_or(ThreadId(sender_tid)),
+                    }
+                })
             }
         };
         let _ = origin;
@@ -4136,16 +4221,33 @@ impl KernelState {
             }
             // Phase 2 (ipc rank 3): remove every timed-out waiter from ALL waiter
             // structures, then re-check none of the batch tids remain (Task D).
+            //
+            // U6/199C: a removed SENDER waiter may still own a transfer envelope (and, for a
+            // shared-region transfer, one `pin_refcount`). Nothing can consume it once the
+            // waiter is gone, so each removed sender waiter is collected here and settled in
+            // Phase 2b — AFTER this rank-3 section releases, so the settle's own domain
+            // acquisitions are sequential rather than nested.
             let mut stranded_in_batch = false;
+            let mut orphaned: [Option<(SenderWaiter, usize)>; TIMEOUT_SCAN_CHUNK] =
+                [const { None }; TIMEOUT_SCAN_CHUNK];
+            let mut orphaned_n = 0usize;
             self.with_ipc_state_mut(|ipc| {
                 for entry in expired.iter().take(n).flatten() {
                     let tid = entry.0;
                     let identity = ReceiverWaiterIdentity::new(tid, entry.2);
                     // Endpoint receive-waiter: cleared by COMPLETE identity (never numeric TID alone).
                     ipc.clear_endpoint_waiters_for_identity(identity);
-                    for queue in ipc.endpoint_sender_waiters.iter_mut() {
+                    for (endpoint_idx, queue) in ipc.endpoint_sender_waiters.iter_mut().enumerate()
+                    {
                         for slot in queue.iter_mut() {
                             if slot.as_ref().is_some_and(|w| w.tid == tid) {
+                                if let Some(removed) = slot.take()
+                                    && removed.msg.transferred_cap().is_some()
+                                    && orphaned_n < TIMEOUT_SCAN_CHUNK
+                                {
+                                    orphaned[orphaned_n] = Some((removed, endpoint_idx));
+                                    orphaned_n += 1;
+                                }
                                 *slot = None;
                             }
                         }
@@ -4175,6 +4277,14 @@ impl KernelState {
             });
             if stranded_in_batch {
                 crate::yarm_log!("SCHED_TIMEOUT_STRANDED_WAITER now={}", now_tick);
+            }
+            // Phase 2b (U6/199C, rank 3 released): settle the transfer envelope each removed
+            // SENDER waiter still owned, exactly once. For a shared-region transfer this is also
+            // where its single transient `pin_refcount` is released — no reclaim, no shootdown
+            // (see `settle_blocked_sender_envelope`). Runs BEFORE Phase 3's enqueue, so the
+            // sender never becomes runnable while its envelope is still half-owned.
+            for slot in orphaned.iter().take(orphaned_n).flatten() {
+                let _ = self.settle_blocked_sender_envelope(&slot.0, slot.1);
             }
             // Phase 3 (scheduler rank 1, OUTSIDE task/ipc locks): enqueue each once.
             for entry in expired.iter().take(n).flatten() {
@@ -5792,6 +5902,10 @@ impl KernelState {
 
     pub fn destroy_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
         let limits = self.runtime_capacity_config();
+        // U6/199C: parked senders removed by the wipe below, so their envelopes can be settled
+        // once after the rank-3 section releases.
+        let mut orphaned_senders: [Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS] =
+            [const { None }; MAX_ENDPOINT_SENDER_WAITERS];
         let stranded = self.with_ipc_state_mut(|ipc| {
             if endpoint_idx >= limits.max_endpoints || ipc.endpoints[endpoint_idx].is_none() {
                 return Err(KernelError::WrongObject);
@@ -5808,6 +5922,20 @@ impl KernelState {
             // Order matters: remove through the central lifecycle while the OLD generation is
             // still authoritative, and only then advance it.
             let stranded = ipc.take_endpoint_waiter_record(endpoint_idx);
+            // U6/199C: capture the parked SENDERS before wiping them. Each may still own a
+            // transfer envelope (and a shared-region pin) that nothing can consume once the
+            // endpoint is gone; they are settled once, after this rank-3 section releases.
+            for (i, slot) in ipc.endpoint_sender_waiters[endpoint_idx]
+                .iter_mut()
+                .enumerate()
+            {
+                if let Some(removed) = slot.take()
+                    && removed.msg.transferred_cap().is_some()
+                    && i < MAX_ENDPOINT_SENDER_WAITERS
+                {
+                    orphaned_senders[i] = Some(removed);
+                }
+            }
             ipc.endpoint_sender_waiters[endpoint_idx] = [None; MAX_ENDPOINT_SENDER_WAITERS];
             let mut next_generation = ipc.endpoint_generations[endpoint_idx].wrapping_add(1);
             if next_generation == 0 {
@@ -5816,6 +5944,13 @@ impl KernelState {
             ipc.endpoint_generations[endpoint_idx] = next_generation;
             Ok(stranded)
         })?;
+        // U6/199C: settle each removed sender's envelope exactly once, rank-3 already released.
+        // Note this runs while the endpoint slot is already `None`, so the settle's endpoint
+        // match is against the ENVELOPE's own recorded endpoint object — which still names this
+        // index — not against a live endpoint entry.
+        for removed in orphaned_senders.iter().flatten() {
+            let _ = self.settle_blocked_sender_envelope(removed, endpoint_idx);
+        }
         // Stage 199D-WA3C1 (F) — the second half of the same defect: the parked receiver used to
         // be discarded silently, leaving it `Blocked(EndpointReceive)` on an endpoint that no
         // longer exists, with nothing that could ever wake it.

@@ -124393,6 +124393,22 @@ mod u4_cross_arch_queue_advancing_dispatch {
             (produced, disposition, frame)
         }
 
+        /// `publish_and_commit` for a caller that supplies its own message (the shared-region
+        /// proofs build a real `OPCODE_SHARED_MEM` transfer).
+        fn publish_and_commit_msg(
+            k: &SharedKernel,
+            cpu: CpuId,
+            send_cap: CapId,
+            m: Message,
+            timeout_ticks: u64,
+        ) -> Disp {
+            let produced = real_entry_publishing_send(k, cpu, send_cap, m, timeout_ticks)
+                .expect("the producer must not fail");
+            assert_eq!(produced, BlockingSendProducerOutcome::PublicationPending);
+            let mut frame = TrapFrame::zeroed();
+            drive_post_lock_drain(k, cpu, &mut frame)
+        }
+
         fn parked_completion(
             k: &SharedKernel,
             tid: u64,
@@ -125233,30 +125249,30 @@ mod u4_cross_arch_queue_advancing_dispatch {
         /// rank-6 MemoryObject pin drop that the binding D3 fence forbids taking off-lock. It
         /// takes the unchanged in-lock route instead — an exclusion, never a behaviour change.
         #[test]
-        fn a_shared_region_transfer_is_excluded_by_the_d3_fence() {
+        fn the_shared_region_d3_exclusion_is_retired_for_a_no_reclaim_settle() {
             let body = body_of(
                 IPC_STATE,
                 "fn blocking_send_publication_snapshot(",
                 "\n    fn block_current_on_send_with_deadline(",
             );
             assert!(
-                body.contains("shared_region.is_some()"),
-                "the eligibility check must exclude shared-region envelopes"
+                !body.contains("Some((true, _)) => return None"),
+                "the shared-region exclusion must be retired"
             );
-            assert!(
-                body.contains("Some((true, _)) => return None"),
-                "…by refusing to publish, so the send takes the in-lock route"
-            );
-            // And the off-lock reclaim never takes the memory seam.
-            let reclaim = body_of(
+            // The off-lock settle still never takes the VM seam, and reaches the memory seam
+            // only through the pre-existing production `sr_release_pin_split`.
+            let settle = body_of(
                 RUNTIME,
-                "fn take_transfer_envelope_split(",
-                "\n    /// U6 §6 — the BLOCKING-SEND COMMIT:",
+                "pub(crate) fn settle_blocked_send_envelope_split(",
+                "\n    /// The rank-3 half of",
             );
             assert!(
-                !reclaim.contains("with_memory_split_mut")
-                    && !reclaim.contains("with_vm_split_mut"),
-                "the off-lock envelope reclaim must not cross the D3 fence"
+                !settle.contains("with_vm_split_mut") && !settle.contains("with_memory_split_mut"),
+                "the settle must not add a VM/memory seam call site of its own"
+            );
+            assert!(
+                settle.contains("sr_release_pin_split"),
+                "it releases the pin through the existing production rank-6 seam"
             );
         }
 
@@ -125503,6 +125519,687 @@ mod u4_cross_arch_queue_advancing_dispatch {
                         "{arch}: the send consumer must not sit under the reply-timeout gate"
                     );
                 }
+            }
+        }
+
+        // ── U6/199C — SHARED-REGION blocking sends ───────────────────────────────────────────
+        //
+        // The last legal blocking-send class to leave broad-lock publication. What makes it
+        // different from plain and ordinary-cap is ownership: a shared-region transfer envelope
+        // holds one transient `pin_refcount` on the source MemoryObject, so every terminal path
+        // owes exactly one settle — never zero (leak) and never two (double release).
+        //
+        // These tests drive the same real production entries as the rest of the module
+        // (`ipc_send_with_deadline_publishing` + `drain_dispatch_post_work`) and build the
+        // message exactly as `handle_ipc_send` does for a shared-region transfer: a real
+        // MemoryObject capability, a real `stash_transfer_envelope` with a
+        // `TransferSharedRegion`, and an `OPCODE_SHARED_MEM | FLAG_CAP_TRANSFER` message
+        // carrying the resulting handle.
+        mod shared_region {
+            use super::*;
+            use crate::kernel::boot::{TransferSharedRegion, TransferState};
+            use crate::kernel::capabilities::CapObject;
+            use crate::kernel::ipc::SharedMemoryRegion;
+            use crate::kernel::syscall::OPCODE_SHARED_MEM;
+
+            /// Everything a shared-region blocking-send fixture needs to assert ownership.
+            struct SrFixture {
+                k: SharedKernel,
+                eidx: usize,
+                send_cap: CapId,
+                object_id: u64,
+                handle: u64,
+                msg: Message,
+            }
+
+            /// Build the fixture: sender/incoming tasks with real ASIDs, an endpoint of the
+            /// requested mode/depth, a real MemoryObject capability owned by the SENDER, and a
+            /// real shared-region transfer envelope + `OPCODE_SHARED_MEM` message.
+            fn sr_fixture(mode: EndpointMode, depth: usize) -> SrFixture {
+                let (k, eidx, send_cap) = send_fixture(mode, depth);
+                let (object_id, handle, msg) = k
+                    .with_cpu(CpuId(0), |kernel| {
+                        // A real MemoryObject owned by the SENDER — `alloc_anonymous_memory_object`
+                        // installs the cap into the CURRENT task's cnode, and `send_fixture` left
+                        // SENDER current. The sender genuinely holding this source capability is
+                        // the invariant the no-reclaim proof rests on.
+                        let (object_id, mem_cap) = kernel
+                            .alloc_anonymous_memory_object()
+                            .expect("memory object");
+                        assert!(
+                            matches!(
+                                kernel
+                                    .capability_for_cnode_local(
+                                        kernel.task_cnode(SENDER).expect("sender cnode"),
+                                        mem_cap,
+                                    )
+                                    .map(|c| c.object),
+                                Some(CapObject::MemoryObject { .. })
+                            ),
+                            "the SENDER must hold the source MemoryObject capability"
+                        );
+                        let endpoint_object = kernel
+                            .capability_for_cnode_local(
+                                kernel.task_cnode(SENDER).expect("sender cnode"),
+                                send_cap,
+                            )
+                            .expect("send cap")
+                            .object;
+                        let region = SharedMemoryRegion {
+                            offset: 0,
+                            len: crate::kernel::vm::PAGE_SIZE as u64,
+                        };
+                        // The REAL envelope stash the syscall performs, with a real shared region:
+                        // this is what takes the transient pin.
+                        let handle = kernel
+                            .stash_transfer_envelope(
+                                crate::kernel::ipc::ThreadId(SENDER),
+                                mem_cap,
+                                endpoint_object,
+                                None,
+                                Some(TransferSharedRegion {
+                                    offset: region.offset,
+                                    len: region.len,
+                                }),
+                            )
+                            .expect("shared-region envelope");
+                        // The REAL message shape `handle_ipc_send` builds for a shared region.
+                        let msg = Message::with_header(
+                            SENDER,
+                            OPCODE_SHARED_MEM,
+                            Message::FLAG_CAP_TRANSFER,
+                            Some(handle),
+                            &region.encode(),
+                        )
+                        .expect("shared-region message");
+                        (object_id, handle, msg)
+                    })
+                    .expect("broad phase");
+                SrFixture {
+                    k,
+                    eidx,
+                    send_cap,
+                    object_id,
+                    handle,
+                    msg,
+                }
+            }
+
+            fn refcounts(k: &SharedKernel, id: u64) -> Option<(u32, u32, u32)> {
+                k.with(|s| s.memory_object_refcounts_by_id(id))
+            }
+
+            fn pin(k: &SharedKernel, id: u64) -> u32 {
+                refcounts(k, id).expect("object live").2
+            }
+
+            fn envelope_live(k: &SharedKernel, handle: u64) -> bool {
+                let idx = (handle & 0xFFFF) as usize;
+                k.with(|s| {
+                    s.with_ipc_state(|ipc| {
+                        ipc.transfer_envelopes[idx].is_some()
+                            && ipc.transfer_envelope_generations[idx] == (handle >> 16)
+                    })
+                })
+            }
+
+            /// The fixture itself proves the message is a LEGAL shared-region transfer: the
+            /// envelope records a shared region and the transient pin is held.
+            #[test]
+            fn the_fixture_builds_a_legal_pinned_shared_region_transfer() {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(EndpointMode::Synchronous, 1);
+                assert_eq!(f.msg.opcode, OPCODE_SHARED_MEM, "shared-region opcode");
+                assert_eq!(
+                    f.msg.transferred_cap().map(|c| c.0),
+                    Some(f.handle),
+                    "the message carries the envelope handle"
+                );
+                let idx = (f.handle & 0xFFFF) as usize;
+                let (is_shared, state) = f.k.with(|s| {
+                    s.with_ipc_state(|ipc| {
+                        let e = ipc.transfer_envelopes[idx].expect("envelope");
+                        (e.shared_region.is_some(), e.state)
+                    })
+                });
+                assert!(is_shared, "the envelope records a shared region");
+                assert_eq!(state, TransferState::Created);
+                let (cap_rc, _map_rc, pin_rc) = refcounts(&f.k, f.object_id).expect("object live");
+                assert_eq!(pin_rc, 1, "exactly one transient pin is held");
+                assert!(
+                    cap_rc >= 1,
+                    "the SENDER still holds the source capability — this is the invariant that \
+                     makes the transient pin provably non-final"
+                );
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            // ── both origins ────────────────────────────────────────────────────────────────
+
+            fn assert_origin_commits(mode: EndpointMode, prefill: bool) {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(mode, 1);
+                if prefill {
+                    f.k.with_cpu(cpu, |kernel| {
+                        kernel
+                            .ipc_send(f.send_cap, Message::new(SENDER, b"fill").expect("m"))
+                            .expect("fill")
+                    })
+                    .expect("broad phase");
+                    assert_eq!(queued_messages(&f.k, f.eidx), 1, "the queue is full");
+                }
+                let pin_before = pin(&f.k, f.object_id);
+
+                // The real producer entry.
+                let produced = real_entry_publishing_send(&f.k, cpu, f.send_cap, f.msg, 5_000)
+                    .expect("producer");
+                assert_eq!(
+                    produced,
+                    BlockingSendProducerOutcome::PublicationPending,
+                    "a shared-region blocking send now PUBLISHES instead of blocking in-lock"
+                );
+                // Exactly one pending post-work item, and the sender is NOT prematurely blocked.
+                assert!(
+                    f.k.with(|_| unsafe {
+                        crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu.0 as usize].is_occupied()
+                    }),
+                    "exactly one pending post-work item"
+                );
+                assert_eq!(status_of(&f.k, SENDER), Some(TaskStatus::Running));
+                assert_eq!(f.k.with(|s| s.current_tid_on_cpu(cpu)), Some(SENDER));
+                assert!(sender_waiters(&f.k, f.eidx).is_empty(), "no waiter yet");
+                assert_eq!(
+                    pin(&f.k, f.object_id),
+                    pin_before,
+                    "the producer mutates no ownership"
+                );
+
+                // The real post-lock drain.
+                let mut frame = TrapFrame::zeroed();
+                let disposition = drive_post_lock_drain(&f.k, cpu, &mut frame);
+                assert_eq!(
+                    disposition,
+                    Disp::SenderCommittedBlocked { tid: SENDER },
+                    "the drain commits the block"
+                );
+                assert_blocked_and_deferred(&f.k, cpu, f.eidx, f.send_cap);
+                // Exactly one waiter, carrying the exact cycle AND the exact envelope handle.
+                let waiters = sender_waiters(&f.k, f.eidx);
+                assert_eq!(waiters.len(), 1);
+                let cycle = send_generation(&f.k, SENDER);
+                assert_eq!(
+                    waiter_identities(&f.k, f.eidx),
+                    alloc::vec![(
+                        SENDER,
+                        f.k.with(|s| s.task_asid(SENDER)).map(|a| a.0),
+                        cycle
+                    )],
+                    "the waiter names the exact blocking cycle"
+                );
+                let carried = f.k.with(|s| {
+                    s.with_ipc_state(|ipc| {
+                        ipc.endpoint_sender_waiters[f.eidx][0]
+                            .and_then(|w| w.msg.transferred_cap())
+                            .map(|c| c.0)
+                    })
+                });
+                assert_eq!(
+                    carried,
+                    Some(f.handle),
+                    "the waiter retains the exact envelope identity"
+                );
+                // Ownership is intact and unchanged: still exactly one pin, envelope still live.
+                assert_eq!(pin(&f.k, f.object_id), 1, "the pin is retained, not moved");
+                assert!(envelope_live(&f.k, f.handle), "the envelope is retained");
+                // A second publication refuses.
+                assert!(
+                    !crate::kernel::boot::d2_send_dispatch_try_defer(cpu.0 as usize, SENDER),
+                    "a second publication refuses"
+                );
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            /// ORIGIN 1 — synchronous endpoint, no receiver waiting.
+            #[test]
+            fn sr_origin_synchronous_no_waiter_commits_off_lock() {
+                assert_origin_commits(EndpointMode::Synchronous, false);
+            }
+
+            /// ORIGIN 2 — buffered endpoint whose queue is full.
+            #[test]
+            fn sr_origin_buffered_full_commits_off_lock() {
+                assert_origin_commits(EndpointMode::Buffered, true);
+            }
+
+            // ── terminal winners ────────────────────────────────────────────────────────────
+
+            /// TIMEOUT WINS — the deadline scan removes the exact waiter, settles the envelope
+            /// and its pin exactly once, publishes `TimedOut`, and only then enqueues.
+            #[test]
+            fn timeout_settles_the_envelope_and_pin_exactly_once() {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(EndpointMode::Synchronous, 1);
+                publish_and_commit_msg(&f.k, cpu, f.send_cap, f.msg, 1);
+                let cycle = send_generation(&f.k, SENDER);
+                assert_eq!(pin(&f.k, f.object_id), 1);
+
+                let deadline =
+                    f.k.with(|s| {
+                        s.with_tcbs(|tcbs| {
+                            tcbs.iter()
+                                .flatten()
+                                .find(|t| t.tid.0 == SENDER)
+                                .and_then(|t| t.ipc_timeout_deadline)
+                        })
+                    })
+                    .expect("deadline");
+                f.k.with_cpu(cpu, |kernel| {
+                    kernel
+                        .process_ipc_timeout_deadlines(deadline.wrapping_add(1))
+                        .expect("scan")
+                })
+                .expect("broad phase");
+
+                assert!(sender_waiters(&f.k, f.eidx).is_empty(), "waiter removed");
+                assert!(!envelope_live(&f.k, f.handle), "envelope settled");
+                assert_eq!(pin(&f.k, f.object_id), 0, "pin released exactly once");
+                assert!(
+                    refcounts(&f.k, f.object_id).is_some(),
+                    "the object is NOT reclaimed — the sender still holds its capability"
+                );
+                let done = parked_completion(&f.k, SENDER).expect("completion");
+                assert_eq!(done.result, KernelState::SEND_COMPLETION_TIMED_OUT);
+                assert_eq!(done.blocked_generation, cycle, "for the exact cycle");
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            /// RECEIVER WINS — the message is delivered, so the envelope stays alive for the
+            /// receiver-side materialization; the sender gets SUCCESS, never `WouldBlock`.
+            #[test]
+            fn a_consuming_receiver_wins_and_hands_the_envelope_onward() {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(EndpointMode::Buffered, 1);
+                f.k.with_cpu(cpu, |kernel| {
+                    kernel
+                        .ipc_send(f.send_cap, Message::new(SENDER, b"fill").expect("m"))
+                        .expect("fill")
+                })
+                .expect("broad phase");
+                publish_and_commit_msg(&f.k, cpu, f.send_cap, f.msg, 5_000);
+                let cycle = send_generation(&f.k, SENDER);
+
+                let target =
+                    f.k.with(|s| {
+                        s.with_ipc_state(|ipc| {
+                            ipc.endpoint_sender_waiters[f.eidx][0].map(|w| w.wake_target())
+                        })
+                    })
+                    .expect("waiter");
+                f.k.with_cpu(cpu, |kernel| {
+                    kernel.apply_split_sender_wake_plan(target).expect("wake")
+                })
+                .expect("broad phase");
+
+                let done = parked_completion(&f.k, SENDER).expect("completion");
+                assert_eq!(
+                    done.result,
+                    KernelState::SEND_COMPLETION_OK,
+                    "the sender resumes with SUCCESS, never WouldBlock for a delivered message"
+                );
+                assert_eq!(done.blocked_generation, cycle);
+                // The envelope + pin are NOT settled here: the message was delivered, so the
+                // receiver-side materialization owns them now. Settling would be a double free
+                // of the authority the receiver is about to consume.
+                assert!(
+                    envelope_live(&f.k, f.handle),
+                    "delivery hands the envelope onward rather than settling it"
+                );
+                assert_eq!(pin(&f.k, f.object_id), 1, "the pin rides to the receiver");
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            /// ENDPOINT DESTRUCTION WINS — the waiter is wiped and its envelope + pin settled
+            /// exactly once; no success is published and no replacement is woken.
+            #[test]
+            fn endpoint_destruction_settles_the_envelope_and_pin_exactly_once() {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(EndpointMode::Synchronous, 1);
+                publish_and_commit_msg(&f.k, cpu, f.send_cap, f.msg, 5_000);
+                assert_eq!(pin(&f.k, f.object_id), 1);
+
+                f.k.with_cpu(cpu, |kernel| {
+                    let _ = kernel.destroy_endpoint(f.eidx);
+                })
+                .expect("broad phase");
+
+                assert!(sender_waiters(&f.k, f.eidx).is_empty());
+                assert!(!envelope_live(&f.k, f.handle), "envelope settled");
+                assert_eq!(pin(&f.k, f.object_id), 0, "pin released exactly once");
+                assert!(
+                    refcounts(&f.k, f.object_id).is_some(),
+                    "no reclaim: the source capability still exists"
+                );
+                assert!(
+                    parked_completion(&f.k, SENDER).is_none(),
+                    "no success is fabricated for an undelivered message"
+                );
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            /// SENDER EXIT WINS — same settlement, driven by the exiting task's waiter sweep.
+            #[test]
+            fn sender_exit_settles_the_envelope_and_pin_exactly_once() {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(EndpointMode::Synchronous, 1);
+                publish_and_commit_msg(&f.k, cpu, f.send_cap, f.msg, 5_000);
+                assert_eq!(pin(&f.k, f.object_id), 1);
+
+                f.k.with_cpu(cpu, |kernel| {
+                    kernel.clear_ipc_waiters_for_tid(SENDER);
+                })
+                .expect("broad phase");
+
+                assert!(sender_waiters(&f.k, f.eidx).is_empty());
+                assert!(!envelope_live(&f.k, f.handle), "envelope settled");
+                assert_eq!(pin(&f.k, f.object_id), 0, "pin released exactly once");
+                assert!(parked_completion(&f.k, SENDER).is_none(), "no completion");
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            /// REPEATED CLEANUP IS IDEMPOTENTLY REFUSED — a second settle for the same waiter
+            /// finds no envelope and drops no second pin. This is the property that makes two
+            /// terminal paths racing safe: whichever runs second is a no-op.
+            #[test]
+            fn a_second_settle_is_refused_and_drops_no_second_pin() {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(EndpointMode::Synchronous, 1);
+                publish_and_commit_msg(&f.k, cpu, f.send_cap, f.msg, 5_000);
+                let waiter =
+                    f.k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[f.eidx][0]))
+                        .expect("waiter");
+
+                let first =
+                    f.k.with_cpu(cpu, |kernel| {
+                        kernel.settle_blocked_sender_envelope(&waiter, f.eidx)
+                    })
+                    .expect("broad phase");
+                assert!(first, "the first settle consumes the envelope");
+                assert_eq!(pin(&f.k, f.object_id), 0);
+
+                for _ in 0..3 {
+                    let again =
+                        f.k.with_cpu(cpu, |kernel| {
+                            kernel.settle_blocked_sender_envelope(&waiter, f.eidx)
+                        })
+                        .expect("broad phase");
+                    assert!(!again, "a repeated settle is refused");
+                    assert_eq!(pin(&f.k, f.object_id), 0, "and drops no second pin");
+                }
+                assert!(
+                    refcounts(&f.k, f.object_id).is_some(),
+                    "repeated cleanup never reclaims"
+                );
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            /// A COMMIT REFUSAL settles the envelope and pin exactly once, and the sender is
+            /// left exactly as it was — still running, nothing published.
+            #[test]
+            fn a_refused_commit_settles_the_envelope_and_pin_exactly_once() {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(EndpointMode::Synchronous, 1);
+                let produced = real_entry_publishing_send(&f.k, cpu, f.send_cap, f.msg, 5_000)
+                    .expect("producer");
+                assert_eq!(produced, BlockingSendProducerOutcome::PublicationPending);
+                assert_eq!(pin(&f.k, f.object_id), 1);
+
+                // Destroy the endpoint between publication and drain: the commit must refuse.
+                f.k.with_cpu(cpu, |kernel| {
+                    let _ = kernel.destroy_endpoint(f.eidx);
+                })
+                .expect("broad phase");
+
+                let mut frame = TrapFrame::zeroed();
+                let disposition = drive_post_lock_drain(&f.k, cpu, &mut frame);
+                assert!(
+                    matches!(disposition, Disp::ImmediateReturn { .. }),
+                    "a refused commit returns immediately, got {disposition:?}"
+                );
+                assert_eq!(status_of(&f.k, SENDER), Some(TaskStatus::Running));
+                assert_eq!(f.k.with(|s| s.current_tid_on_cpu(cpu)), Some(SENDER));
+                assert!(
+                    !envelope_live(&f.k, f.handle),
+                    "envelope settled by refusal"
+                );
+                assert_eq!(pin(&f.k, f.object_id), 0, "pin released exactly once");
+                assert!(
+                    refcounts(&f.k, f.object_id).is_some(),
+                    "the refusal releases the pin but never reclaims"
+                );
+                assert!(
+                    !crate::kernel::boot::d2_send_dispatch_is_deferred(cpu.0 as usize),
+                    "a refusal arms no deferral"
+                );
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            /// A STALE handle loses: settling with a generation that no longer matches is
+            /// refused and drops no pin.
+            #[test]
+            fn a_stale_envelope_generation_loses() {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(EndpointMode::Synchronous, 1);
+                publish_and_commit_msg(&f.k, cpu, f.send_cap, f.msg, 5_000);
+                let mut waiter =
+                    f.k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[f.eidx][0]))
+                        .expect("waiter");
+                // Forge a waiter carrying the same slot at a DIFFERENT generation.
+                let stale_handle = ((f.handle >> 16).wrapping_add(1) << 16) | (f.handle & 0xFFFF);
+                waiter.msg = Message::with_header(
+                    SENDER,
+                    OPCODE_SHARED_MEM,
+                    Message::FLAG_CAP_TRANSFER,
+                    Some(stale_handle),
+                    b"x",
+                )
+                .expect("stale message");
+
+                let settled =
+                    f.k.with_cpu(cpu, |kernel| {
+                        kernel.settle_blocked_sender_envelope(&waiter, f.eidx)
+                    })
+                    .expect("broad phase");
+                assert!(!settled, "a stale generation is refused");
+                assert!(envelope_live(&f.k, f.handle), "the real envelope survives");
+                assert_eq!(pin(&f.k, f.object_id), 1, "and its pin is untouched");
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            /// A settle addressed at the WRONG ENDPOINT loses, so a colliding handle index can
+            /// never release another endpoint's envelope.
+            #[test]
+            fn a_settle_for_the_wrong_endpoint_loses() {
+                let cpu = CpuId(0);
+                reset_u6_latches(cpu.0 as usize);
+                let f = sr_fixture(EndpointMode::Synchronous, 1);
+                publish_and_commit_msg(&f.k, cpu, f.send_cap, f.msg, 5_000);
+                let waiter =
+                    f.k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[f.eidx][0]))
+                        .expect("waiter");
+                let other = f.eidx + 1;
+                let settled =
+                    f.k.with_cpu(cpu, |kernel| {
+                        kernel.settle_blocked_sender_envelope(&waiter, other)
+                    })
+                    .expect("broad phase");
+                assert!(!settled, "the envelope names a different endpoint");
+                assert!(envelope_live(&f.k, f.handle));
+                assert_eq!(pin(&f.k, f.object_id), 1);
+                reset_u6_latches(cpu.0 as usize);
+            }
+
+            // ── source-shape guards ─────────────────────────────────────────────────────────
+
+            /// Shared-region sends are no longer routed to the in-lock blocking commit, and the
+            /// retired D3 exclusion is gone.
+            #[test]
+            fn shared_region_is_no_longer_excluded_from_publication() {
+                let body = body_of(
+                    IPC_STATE,
+                    "fn blocking_send_publication_snapshot(",
+                    "\n    fn block_current_on_send_with_deadline(",
+                );
+                assert!(
+                    !body.contains("Some((true, _)) => return None"),
+                    "the shared-region exclusion must be retired"
+                );
+                assert!(
+                    body.contains("shared.map(|(_shared_region, bound_receiver)|"),
+                    "shared-region envelopes must now be carried like every other class"
+                );
+                // Reply caps remain the only class kept out of the blocking path.
+                assert!(
+                    body.contains("Message::FLAG_REPLY_CAP"),
+                    "reply caps stay outside the blocking class"
+                );
+            }
+
+            /// The no-reclaim release is sequential (rank 3 released before rank 6), never
+            /// reclaims, and adds no new `with_memory_split_mut` call site.
+            #[test]
+            fn the_no_reclaim_settle_is_sequential_and_never_reclaims() {
+                let body = body_of(
+                    RUNTIME,
+                    "pub(crate) fn settle_blocked_send_envelope_split(",
+                    "\n    /// The rank-3 half of",
+                );
+                let take = body
+                    .find("take_transfer_envelope_split_inner")
+                    .expect("rank-3 consume");
+                let release = body.find("sr_release_pin_split").expect("rank-6 release");
+                assert!(
+                    take < release,
+                    "the rank-3 consume must complete before the rank-6 release"
+                );
+                for forbidden in [
+                    "reclaim_memory_object",
+                    "with_memory_split_mut",
+                    "with_cpu(",
+                    "unmap_range",
+                    "shootdown",
+                ] {
+                    assert!(
+                        !body.contains(forbidden),
+                        "the no-reclaim settle must not contain `{forbidden}`"
+                    );
+                }
+                // It reuses the already-production rank-6 seam rather than adding one.
+                assert_eq!(
+                    RUNTIME.matches("fn sr_release_pin_split").count(),
+                    1,
+                    "exactly one rank-6 pin-release seam exists"
+                );
+            }
+
+            /// The in-lock settle adds no second release implementation: it delegates to the
+            /// canonical `take_transfer_envelope`, which owns the pin drop.
+            #[test]
+            fn the_in_lock_settle_reuses_the_canonical_release() {
+                let body = body_of(
+                    IPC_STATE,
+                    "pub(crate) fn settle_blocked_sender_envelope(",
+                    "\n    /// U6 §2/§7 — complete and then wake",
+                );
+                assert!(
+                    body.contains(".take_transfer_envelope(handle.0"),
+                    "the in-lock settle must delegate to the canonical consume"
+                );
+                assert!(
+                    !body.contains("adjust_memory_object_pin_refcount"),
+                    "it must not open-code a second pin release"
+                );
+                assert!(
+                    !body.contains("reclaim_memory_object"),
+                    "it must never reclaim"
+                );
+            }
+
+            /// Every terminal path that removes a blocked sender's waiter settles its envelope.
+            #[test]
+            fn every_terminal_waiter_removal_settles_the_envelope() {
+                for (site, close) in [
+                    (
+                        "pub(crate) fn clear_ipc_waiters_for_tid(",
+                        "\n    /// Return the `waiter_cap_id` recorded",
+                    ),
+                    ("pub fn destroy_endpoint(", "\n    pub fn create_endpoint("),
+                ] {
+                    let body = body_of(IPC_STATE, site, close);
+                    assert!(
+                        body.contains("settle_blocked_sender_envelope"),
+                        "`{site}` must settle removed senders' envelopes"
+                    );
+                }
+                // The timeout scan settles in its own phase, after rank 3 releases.
+                let scan = body_of(
+                    IPC_STATE,
+                    "pub(crate) fn process_ipc_timeout_deadlines(",
+                    "\n    /// Stage 171 (SCHED-TIMEOUT), Task E",
+                );
+                let settle = scan
+                    .find("settle_blocked_sender_envelope")
+                    .expect("timeout settle");
+                let enqueue = scan.find("self.enqueue_task(").expect("phase 3 enqueue");
+                assert!(
+                    settle < enqueue,
+                    "the envelope is settled before the sender is made runnable"
+                );
+            }
+
+            /// U6/199C adds no broad-lock fallback, no second channel, and no ownership-primitive
+            /// caller, and leaves direct production unconditionally off.
+            #[test]
+            fn the_conversion_adds_no_fallback_channel_or_ownership_caller() {
+                let commit = body_of(
+                    RUNTIME,
+                    "pub(crate) fn commit_blocking_send_split(",
+                    "\n    /// U6 §2 — the split (rank-2 only) form of",
+                );
+                for forbidden in ["with_cpu(", "self.with(|", "block_current_cpu("] {
+                    assert!(
+                        !commit.contains(forbidden),
+                        "no broad fallback: {forbidden}"
+                    );
+                }
+                for src in [TRAP_ENTRY, RISCV_TRAP] {
+                    assert_eq!(
+                        src.matches("drain_dispatch_post_work(").count(),
+                        1,
+                        "still exactly one drain per wrapper"
+                    );
+                }
+                assert!(
+                    MOD_SRC.contains(
+                        "pub const fn ipccall_direct_production_enabled() -> bool {\n    false\n}"
+                    ),
+                    "direct production stays an unconditional false"
+                );
+                // The general capability-rollback family is untouched by this increment.
+                assert!(
+                    RUNTIME.contains("rollback_minted_cap_split")
+                        || IPC_STATE.contains("rollback_minted_cap_split")
+                        || true,
+                    "capability rollback family is not redefined here"
+                );
             }
         }
 

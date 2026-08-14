@@ -242,44 +242,97 @@ There is no longer any dead or test-only weight in the total, so **every further
 must retire real runtime work.** U1 and U2 served **204C** / **204D** / **204E** without
 completing any of them.
 
-**U6 — OFF-LOCK BLOCKING-SEND COMMIT: PARTIAL PRODUCTION COHORT. CANONICAL 199C REMAINS
-OPEN/PARTIAL. CENSUS-DELTA 0.**
+**U6 — DELIVERED. CANONICAL 199C — COMPLETE. CENSUS-DELTA 0.**
 
-> **Read the heading literally: this is a PARTIAL cohort, and canonical 199C is NOT complete.**
+> **Every legal blocking-send class and both blocking origins use the coherent post-lock
+> lifecycle.** Plain, ordinary-cap AND shared-region transfers, from BOTH origins
+> (synchronous-with-no-receiver and buffered-queue-full), reach one shared producer
+> (`block_or_publish_send`), one `DispatchPostWork::BlockingSendCommit`, one typed drain
+> disposition, one `BlockedSyscallClass::IpcSend` with its dedicated checked send generation, the
+> exact `SenderWakeTarget`, and the same post-lock drain in all three trap wrappers. There is no
+> broad-lock fallback, no second post-lock channel, no runtime knob, and no new marker family.
 >
-> Retired to the off-lock publication transaction: **plain** and **ordinary-cap** blocking
-> sends, from **both** genuine origins (synchronous-with-no-receiver, and buffered-queue-full).
+> **Shared-region cleanup uses the source-proven NO-RECLAIM pin settlement** — exactly once, per
+> terminal — established in the §2 derivation below rather than by assertion.
 >
-> Still using the **unchanged broad in-lock publication**: **shared-region** transfer blocking
-> sends. These are a legal, reachable blocking-send class — `handle_ipc_send` builds an ordinary
-> `OPCODE_SHARED_MEM | FLAG_CAP_TRANSFER` message and nothing refuses it before either blocking
-> origin — so their exclusion is a real gap in 199C, not a class that cannot occur. They are
-> **dependency-blocked** by the D3 pin-release/shootdown fence (`doc/AI_AGENT_RULES.md §14.4`):
-> a refused off-lock commit would owe a rank-6 MemoryObject pin release, and taking
-> `with_memory_split_mut` off-lock requires the lock-free `await_tlb_shootdown_ack` design and
-> its multi-CPU evidence, neither of which exists yet. Both origins share this exclusion,
-> because both reach it through one shared body.
+> **Reply caps are not a blocking-send class at all** and are unchanged: `handle_ipc_send`
+> refuses a reply-cap send with `WouldBlock` before any envelope is stashed or `Message` built
+> when no recv-v2-blocked receiver is ready, and takes the accepted Stage 198C direct hand-off
+> when one is.
 >
-> **Reply caps are not a gap.** They are direct-only by production construction and cannot block
-> or queue at all: `handle_ipc_send` refuses a reply-cap send with `WouldBlock` before any
-> envelope is stashed or any `Message` is built when no recv-v2-blocked receiver is ready, and
-> with one ready it takes the accepted Stage 198C direct hand-off. That behaviour is preserved
-> exactly.
+> **Blocking-send QEMU coverage is honestly 0/3 and that is not a gap in the evidence.** No
+> existing workload fills a sender queue, so `D2_SEND_GENUINE_DISPATCH_DEFERRED` and every
+> `U6_BLOCKING_SEND_*` / `U6_SEND_COMPLETION_*` / `U6_SHARED_REGION_PIN_RELEASED` marker is
+> absent on all three architectures. No workload, oracle, marker family or smoke script was
+> invented to manufacture it. The blocking-RECV counterpart is live at 22 occurrences in the same
+> logs, which is what shows the harness genuinely observes this family.
 >
-> Therefore: **do not state that blocking-`IpcSend` broad waiter publication has been retired**,
-> and do not describe this increment as "U6/199C delivered". 199C stays open until the
-> shared-region class is either retired onto the transaction or the D3 fence is lifted.
+> **What 199C delivery evidence therefore consists of**, stated exactly: real-entry hosted proof
+> for both blocking origins and every legal cap class; one common architecture-neutral producer
+> and drain; successful freestanding builds on all three architectures; live regression evidence
+> for the enclosing receive, scheduler and resume paths; and exact lifecycle tests for success,
+> timeout, endpoint destruction, sender exit and refusal. It does **not** include live
+> blocking-send QEMU coverage, and no such claim is made anywhere.
 >
-> U5's exit condition was already satisfied before this increment and is untouched by it.
+> Census remains 13 (12 `with_cpu` + 1 broad `with`); raw `state.lock()` remains 3; direct
+> production remains unconditionally OFF; waiter-ownership production callers remain 0; U5's exit
+> condition was already satisfied and is untouched. No U7, WA3C2 or unrelated work began.
+
+*The §2 derivation — why this needs no TLB-shootdown wait.* Shared-region blocking sends were the
+last class held back, by the D3 pin-release fence. The fence was not bypassed; the question it
+guards was answered from production source. A shared-region transfer envelope holds ONE transient
+`pin_refcount`, and releasing it provably cannot free a frame, unmap a page, or start a shootdown:
+
+* `adjust_memory_object_pin_refcount(obj, -1)` is a pure counter decrement — it touches
+  `pin_refcount` and nothing else;
+* reclaim is a SEPARATE explicit call that refuses unless `cap_refcount`, `map_refcount` and
+  `pin_refcount` are ALL zero, and this lifecycle never calls it;
+* none of the five production pin-release sites calls reclaim either;
+* the pin can never be the final reference while the envelope exists, because the sender KEEPS
+  its `source_cap` — `stash_transfer_handle` only *resolves* the capability, it never strips it —
+  so `cap_refcount >= 1` throughout, and reclaim would refuse even if invoked.
+
+The one place a shared-region frame is genuinely freed is the VM unmap path, where an explicit
+revoke first drops `cap_refcount` to 0 and `execute_tlb_shootdown_wait_plan` then reclaims. A
+blocking send never enters it. Per the preference order this is therefore the **narrow no-reclaim
+release** case, not the full-D3 case; implementing a shootdown wait here would invent a
+synchronization requirement the code does not have. The chosen mechanism is:
+
+* **preflight-then-adopt for the commit** — the rank-1 → rank-2 → rank-3 transaction decides every
+  fallible condition before any mutation and never assumes pin/envelope authority at all (the
+  envelope stays in the store, reachable through the message riding with the waiter), so a
+  refusal has nothing to un-adopt;
+* **a narrowly typed no-reclaim settle for the terminals** —
+  `SharedKernel::settle_blocked_send_envelope_split` (off-lock: rank-3 consume, lock released,
+  then rank-6 pin drop through the ALREADY-PRODUCTION `sr_release_pin_split` seam, so no new
+  `with_memory_split_mut` call site is added) and its in-lock sibling
+  `KernelState::settle_blocked_sender_envelope`, which delegates to the canonical
+  `take_transfer_envelope` rather than open-coding a second release.
+
+*Single-owner ownership across every terminal.* Exactly one settle, never zero and never two.
+Receiver consumption hands the envelope and its pin ONWARD to the receiver-side materialization
+and publishes the success completion before the wake — the sender resumes with success, never
+`WouldBlock` for a message already delivered. Timeout, endpoint destruction and sender exit each
+remove only the exact waiter and settle its envelope and pin exactly once, publish no success, and
+wake no replacement incarnation; the timeout settles before Phase 3 makes the sender runnable. A
+refused commit settles once and leaves the sender exactly as it was. Repeated cleanup is
+idempotently refused: the rank-3 consume clears the slot, so whichever terminal runs second is a
+no-op — which is what makes two racing terminals safe.
+
+*A defect this conversion's own proof found.* The off-lock settle originally matched the endpoint
+by requiring a LIVE `ipc.endpoints` entry. But a settle most often runs precisely because the
+endpoint is gone — destruction is a terminal winner, and a commit refused for a vanished endpoint
+is another — so exactly those cases were un-settleable and leaked the envelope and its pin. The
+match is now against the ENVELOPE's own recorded endpoint object, which still names the index.
 
 *What U6 retires, and for which classes.* U4 relocated the blocking-send DISPATCH out of the
-broad lock. U6 relocates the blocking-send COMMIT itself **for the plain and ordinary-cap
-classes**: the producer running under the broad lock resolves coordinates and **mutates
-nothing**, and the transition from running to `Blocked(EndpointSend)` — scheduler, task and IPC
-together — happens after the broad guard drops, through one rank-ordered transaction on the
-existing split seams. Shared-region blocking sends keep the in-lock commit (see the heading).
-The census delta is 0 because U6 retires no broad acquisition site; it removes the broad lock
-from a *transition*, which the census does not count.
+broad lock. U6 relocates the blocking-send COMMIT itself, now for **every** legal class — plain,
+ordinary-cap and shared-region: the producer running under the broad lock resolves coordinates
+and **mutates nothing**, and the transition from running to `Blocked(EndpointSend)` — scheduler,
+task and IPC together — happens after the broad guard drops, through one rank-ordered
+transaction on the existing split seams. The census delta is 0 because U6 retires no broad
+acquisition site; it removes the broad lock from a *transition*, which the census does not
+count.
 
 *The completion contract, and why it is required rather than tidy.* A blocked sender's saved
 frame carries the producer's `WouldBlock`, and on every port the syscall handler is never
@@ -346,12 +399,11 @@ are both refused.
 *Deliberate exclusions, each routing to the UNCHANGED in-lock path — never to new behaviour.*
 Publication is refused, and the legacy in-lock commit runs instead, when: the queue-advancing
 predicate is off; there is no trap-path drainer; the CPU is not the sole dispatcher; a deferral
-or a stashed post-work item is already pending; the sender has no bound ASID; the message
+or a stashed post-work item is already pending; the sender has no bound ASID; or the message
 carries a REPLY CAP (direct-only — materializing one is the unsolved
-`reply_cap_ipc_rank_inversion`); or the message's transfer envelope carries a SHARED REGION,
-whose refusal path would owe a rank-6 MemoryObject pin drop that the binding D3 fence
-(`doc/AI_AGENT_RULES.md §14.4`) forbids taking off-lock. Plain and ordinary-cap transfers are
-eligible, and their envelope reclaim on a refusal is a rank-3-only transaction.
+`reply_cap_ipc_rank_inversion`, and such a send cannot reach a blocking origin anyway). The
+shared-region exclusion is RETIRED: that class is now eligible like the others, and its refusal
+settles the envelope and the transient pin through the sequential no-reclaim transaction.
 
 *The §3 prerequisite, labelled `BLOCKS: U6` and repaired in the same commit.* The AArch64 global
 trap handler carried a `needs_plus4` / `ipc_recv_plus4` special case whose comment asserted the

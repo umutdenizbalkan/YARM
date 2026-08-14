@@ -229,6 +229,18 @@ impl KernelState {
         memory.memory_objects[slot_index] = None;
     }
 
+    /// U6/199C test accessor: `(cap_refcount, map_refcount, pin_refcount)` for the MemoryObject
+    /// with `id`, or `None` if it has been reclaimed. Keyed by id because the shared-region
+    /// blocking-send proofs hold a `CapObject::MemoryObject { id }`, not a physical address.
+    #[cfg(test)]
+    pub(crate) fn memory_object_refcounts_by_id(&self, id: u64) -> Option<(u32, u32, u32)> {
+        let slot = self.memory_object_slot_by_id(id)?;
+        self.with_memory_state(|memory| {
+            memory.memory_objects[slot]
+                .map(|obj| (obj.cap_refcount, obj.map_refcount, obj.pin_refcount))
+        })
+    }
+
     /// Return `(cap_refcount, map_refcount, pin_refcount)` for the MemoryObject
     /// backing `phys`, or `None` if the object has been reclaimed.
     #[cfg(test)]

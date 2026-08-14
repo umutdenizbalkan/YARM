@@ -2680,82 +2680,138 @@ impl SharedKernel {
         self.wake_tid_to_runnable_split(cpu, target.tid)
     }
 
-    /// U6 §4 — take back a stashed transfer envelope after a REFUSED blocking-send commit,
-    /// through the rank-3 IPC seam alone.
+    /// U6/199C §2 — the NO-RECLAIM transient-pin release, and the single off-lock envelope
+    /// settle used by every terminal path that must dispose of a blocked shared-region send.
     ///
-    /// This is the off-lock form of the cleanup the in-lock error path performs
-    /// (`take_transfer_envelope(handle, endpoint, cleanup_tid)`), and it performs the same
-    /// validation: the handle's generation must still match the slot's, the envelope must name
-    /// the same endpoint, a bound receiver must match, and the state transition to `Released`
-    /// must be legal. A failure at any of those leaves the store untouched.
+    /// # Why this needs no TLB-shootdown wait (the §2 derivation, from production source)
     ///
-    /// **It handles NON-SHARED envelopes only, by construction.** A shared-region envelope
-    /// additionally owes a `-1` MemoryObject pin, which lives in the rank-6 memory subsystem;
-    /// reaching it off-lock would require `with_memory_split_mut`, which the binding D3 fence
-    /// (`doc/AI_AGENT_RULES.md §14.4`) forbids without the lock-free TLB-shootdown-ack design
-    /// and its multi-CPU evidence. Rather than half-perform the cleanup, U6 refuses to publish
-    /// a blocking send whose envelope carries a shared region at all
-    /// (`blocking_send_publication_eligible`), so such a send takes the unchanged in-lock route
-    /// and this function never sees one. The `shared_region` check below is therefore a
-    /// belt-and-braces refusal, not a live path.
+    /// A shared-region transfer envelope holds ONE transient `pin_refcount` on the source
+    /// MemoryObject, taken at `stash_transfer_envelope`. Releasing it here provably cannot free
+    /// a frame, unmap a page, or initiate a shootdown, so the full D3 `await_tlb_shootdown_ack`
+    /// design is **not** required. Four independent facts, each checked against the tree:
     ///
-    /// Returns `true` iff an envelope was consumed.
-    fn take_transfer_envelope_split(
+    /// 1. `adjust_memory_object_pin_refcount(obj, -1)` is a PURE COUNTER DECREMENT. It touches
+    ///    `pin_refcount` and nothing else — no `free_frame`, no unmap, no shootdown.
+    /// 2. Reclaim is a SEPARATE, EXPLICITLY-CALLED operation
+    ///    (`reclaim_memory_object_if_unreferenced` / `reclaim_memory_object_for_phys_locked`),
+    ///    and it refuses unless `cap_refcount == 0 && map_refcount == 0 && pin_refcount == 0`.
+    ///    This transaction never calls it.
+    /// 3. NONE of the five production pin-release sites calls reclaim either
+    ///    (`take_transfer_envelope`, the two `shared_region_txn` releases,
+    ///    `revoke_transfer_envelopes_for_cnode`, and `sr_release_pin_split`) — dropping this
+    ///    pin is simply not a reclaim trigger anywhere in the tree.
+    /// 4. The pin can never be the FINAL reference while the envelope exists. The sender KEEPS
+    ///    its `source_cap`: `stash_transfer_handle` only *resolves* the capability, it never
+    ///    strips it from the sender's cnode, and a cnode-held MemoryObject/DmaRegion cap holds
+    ///    `cap_refcount >= 1` (`mint_capability_in_cnode` bumps it; only revocation drops it).
+    ///    So even if reclaim WERE called it would refuse on `cap_refcount != 0`.
+    ///
+    /// The one place a shared-region frame is genuinely freed is the VM unmap path, where an
+    /// explicit `revoke_capability_in_cnode` first drops `cap_refcount` to 0 and
+    /// `execute_tlb_shootdown_wait_plan` then reclaims (see `syscall/vm.rs`). That path is not
+    /// reachable from a blocking send, and this transaction does not enter it.
+    ///
+    /// Per §2's preference order this is therefore case (2) — a narrowly typed no-reclaim
+    /// release — not case (3). Implementing a shootdown wait here would be inventing a
+    /// synchronization requirement the code does not have.
+    ///
+    /// # Lock discipline
+    ///
+    /// Strictly ascending and never nested: the rank-3 IPC section consumes the envelope and
+    /// RELEASES its lock, and only then does the rank-6 memory section drop the pin, through the
+    /// already-production `sr_release_pin_split` seam. No new `with_memory_split_mut` call site
+    /// is introduced, and no lock is held across the other.
+    ///
+    /// Idempotent by construction: the rank-3 consume clears the slot, so a second settle for
+    /// the same handle finds no envelope, returns `false`, and drops no second pin.
+    pub(crate) fn settle_blocked_send_envelope_split(
         &self,
         handle: u64,
         endpoint_idx: usize,
         receiver_tid: crate::kernel::ipc::ThreadId,
     ) -> bool {
+        // Rank 3: consume the envelope exactly once, reporting whether it owed a pin.
+        let (taken, pinned_object) =
+            self.take_transfer_envelope_split_inner(handle, endpoint_idx, receiver_tid);
+        if !taken {
+            return false;
+        }
+        // Rank 3 is released. Rank 6: drop the transient pin — no reclaim, see above.
+        if let Some(object) = pinned_object {
+            self.sr_release_pin_split(object);
+            crate::yarm_log!(
+                "U6_SHARED_REGION_PIN_RELEASED handle={} endpoint={} reclaim=0 result=ok",
+                handle,
+                endpoint_idx
+            );
+        }
+        true
+    }
+
+    /// The rank-3 half of [`Self::settle_blocked_send_envelope_split`]. Returns
+    /// `(consumed, pinned_object)`, where
+    /// `pinned_object` is `Some` exactly when the consumed envelope was a shared-region one and
+    /// therefore owes the caller a single rank-6 pin release.
+    fn take_transfer_envelope_split_inner(
+        &self,
+        handle: u64,
+        endpoint_idx: usize,
+        receiver_tid: crate::kernel::ipc::ThreadId,
+    ) -> (bool, Option<CapObject>) {
         use crate::kernel::boot::{MAX_TRANSFER_ENVELOPES, TransferState};
         let Ok(idx) = usize::try_from(handle & 0xFFFF) else {
-            return false;
+            return (false, None);
         };
         if idx >= MAX_TRANSFER_ENVELOPES {
-            return false;
+            return (false, None);
         }
         let generation = handle >> 16;
         if generation == 0 {
-            return false;
+            return (false, None);
         }
         self.with_ipc_split_mut(|ipc| {
             if ipc.transfer_envelope_generations[idx] != generation {
-                return false;
+                return (false, None);
             }
             let Some(envelope) = ipc.transfer_envelopes[idx] else {
-                return false;
+                return (false, None);
             };
-            // The endpoint the envelope was stashed against, matched by the slot the producer
-            // resolved — the same object identity the in-lock cleanup matches on.
-            let endpoint_matches = ipc
-                .endpoints
-                .get(endpoint_idx)
-                .and_then(Option::as_ref)
-                .is_some_and(|_| {
-                    matches!(envelope.endpoint,
-                        crate::kernel::capabilities::CapObject::Endpoint { index, .. }
-                            if index == endpoint_idx)
-                });
+            // The endpoint the envelope was stashed against, matched against the ENVELOPE's OWN
+            // recorded endpoint object — deliberately NOT against a live `ipc.endpoints` entry.
+            //
+            // A settle frequently runs precisely because the endpoint is gone (destruction is one
+            // of the terminal winners, and a commit refused for a vanished endpoint is another).
+            // Requiring a live entry here would make exactly those cases un-settleable and leak
+            // the envelope and its pin — which is what this check originally did.
+            let endpoint_matches = matches!(envelope.endpoint,
+                crate::kernel::capabilities::CapObject::Endpoint { index, .. }
+                    if index == endpoint_idx);
             if !endpoint_matches {
-                return false;
+                return (false, None);
             }
             if let Some(bound_receiver) = envelope.receiver_tid
                 && bound_receiver != receiver_tid
             {
-                return false;
-            }
-            // A pinned shared-region envelope owes a rank-6 pin drop this seam may not take.
-            if envelope.shared_region.is_some() {
-                return false;
+                return (false, None);
             }
             if envelope.transition(TransferState::Released).is_none() {
-                return false;
+                return (false, None);
             }
             ipc.telemetry.transfer_records_materialized = ipc
                 .telemetry
                 .transfer_records_materialized
                 .saturating_add(1);
             ipc.transfer_envelopes[idx] = None;
-            true
+            // A shared-region envelope owes exactly ONE rank-6 pin release, which the caller
+            // performs after this lock is dropped. Reporting it here — rather than releasing it
+            // here — is what keeps the two domains strictly sequential instead of nested.
+            (
+                true,
+                envelope
+                    .shared_region
+                    .is_some()
+                    .then_some(envelope.source_object),
+            )
         })
     }
 
@@ -4363,7 +4419,10 @@ impl SharedKernel {
                 // so it owes exactly what the in-lock error path owes: take the stashed
                 // transfer envelope back, then return the canonical error.
                 if let Some(cleanup) = snap.transfer_envelope {
-                    let taken = self.take_transfer_envelope_split(
+                    // U6/199C: one settle for every cap class. For a shared-region envelope it
+                    // additionally releases the transient pin exactly once (rank 3 then rank 6,
+                    // sequential, no reclaim — see `settle_blocked_send_envelope_split`).
+                    let taken = self.settle_blocked_send_envelope_split(
                         cleanup.handle,
                         cleanup.endpoint_idx,
                         cleanup.cleanup_tid,
