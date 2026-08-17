@@ -139,7 +139,27 @@ leaving only the client's `caller_result=1 caller_continuations=2 late_reply=1 r
 character-identical to base. Neither is caused by this checkpoint and neither is a timeout-pipeline
 defect.
 
-**Default AArch64/RISC-V scheduler-tick reachability is unresolved**, so end-to-end production
+**AArch64 GIC base-derivation prerequisite — DELIVERED. CENSUS-DELTA 0.** Arming the AArch64 BSP timer needs PPI 30
+enabled at the GIC distributor, and reconnaissance found the runtime had no usable distributor
+base: `aarch64/dtb.rs` decided which `reg` tuple was the CPU interface at the moment it saw `reg`,
+while the `compatible` string was still unknown. QEMU `virt` emits `reg` BEFORE `compatible`
+(verified against a real `dumpdtb`), so the parser stored the FIRST tuple — the DISTRIBUTOR at
+`0x0800_0000` — as `gic_cpu_if_base`. Every GIC CPU-interface access was therefore aimed at
+distributor registers: the priority-mask write landed in `GICD_TYPER` (read-only, ignored) and the
+CPU-interface enable in `GICD_CTLR`, silently enabling the distributor. It was invisible only
+because AArch64 had never taken an interrupt. The decision is now deferred to the node's
+`FDT_END_NODE`, scoped by node depth so a nested `arm,gic-v2m-frame` child cannot contaminate it,
+and both bases are committed together or not at all — GICv3 and unknown compatibles get no mapping.
+**GICC no longer aliases GICD**: the CPU-interface setter is reachable only with a genuine
+CPU-interface base, so priority-mask and enable writes no longer land in `GICD_TYPER`/`GICD_CTLR`.
+Live-verified on fresh artifacts attesting this commit: `gic_cpu_if_base=0x8010000
+gic_dist_base=0x8000000`, normal boot, with `YARM_SCHED_TICK`/`YARM_TIMER_IRQ_DELIVERED`/
+`YARM_TIMER_EOI_DONE` all 0 — no distributor MMIO, PPI enable, timer arm or DAIF unmask is
+performed here and no interrupt behaviour is activated. Repository-policy clippy is byte-identical
+to exact base `90a52dc` in both errors and warnings; census delta 0.
+
+**AArch64 ProductionTick bring-up remains PENDING** on that now-unblocked prerequisite, and
+**default AArch64/RISC-V scheduler-tick reachability is unresolved**, so end-to-end production
 expiry on those ports is still not demonstrable and **canonical 199E remains OPEN**. Census delta 0;
 direct production remains OFF (`IPCCALL_DIRECT_PROOF_ENABLED: AtomicBool::new(false)`); ownership
 production callers 0; no U8 or WA3C2 work is begun.

@@ -128574,3 +128574,209 @@ mod u8_live_production_path_arrangement {
         );
     }
 }
+
+/// Canonical 199E PREREQUISITE — AArch64 GICv2 base derivation must be property-order-independent.
+///
+/// The device tree does not order properties, and QEMU `virt` emits the interrupt controller's
+/// `reg` BEFORE its `compatible`. The parser used to decide which `reg` tuple was the CPU
+/// interface at the moment it saw `reg`, i.e. while the compatible string was still unknown, so
+/// it stored the FIRST tuple — the DISTRIBUTOR at `0x0800_0000` — as `gic_cpu_if_base`. Every GIC
+/// CPU-interface access was therefore aimed at distributor registers: `init_gic_cpu_if_base`
+/// wrote the priority mask into `GICD_TYPER` (read-only, ignored) and the CPU-interface enable
+/// into `GICD_CTLR`, silently enabling the distributor instead.
+///
+/// It was invisible because AArch64 had never taken an interrupt. It is a hard blocker for
+/// arming the BSP timer, so it is fixed and pinned here, in a module the canonical hosted suite
+/// actually runs — `src/arch/aarch64/**` is `#[cfg(target_arch = "aarch64")]` and its own unit
+/// fixtures compile only in an AArch64 test build.
+mod aarch64_gicv2_base_derivation {
+    const DTB_SRC: &str = include_str!("../../arch/aarch64/dtb.rs");
+    const AARCH64_IRQ_SRC: &str = include_str!("../../arch/aarch64/irq.rs");
+
+    fn parse_body() -> &'static str {
+        DTB_SRC
+            .split("pub fn parse_boot_dtb(")
+            .nth(1)
+            .expect("the parser")
+            .split("\nfn parse_cpu_id_from_node_name")
+            .next()
+            .expect("its body")
+    }
+
+    /// The decision is taken at END-OF-NODE, not when `reg` is seen.
+    #[test]
+    fn the_gic_mapping_is_decided_at_end_of_node() {
+        let body = parse_body();
+        let end_node = body.find("FDT_END_NODE =>").expect("the end-node arm");
+        let commit = body
+            .find("out.gic_cpu_if_base = Some(cpu_if.0 as usize);")
+            .expect("the CPU-interface commit");
+        assert!(
+            commit > end_node,
+            "the GIC bases must be committed from the FDT_END_NODE arm, after both `compatible` \
+             and `reg` have had their chance to appear in either order"
+        );
+        // And the property arm must only RECORD, never commit.
+        let prop_arm = body
+            .split("FDT_PROP =>")
+            .nth(1)
+            .expect("the property arm")
+            .split("FDT_NOP")
+            .next()
+            .expect("its body");
+        assert!(
+            !prop_arm.contains("out.gic_cpu_if_base = ")
+                && !prop_arm.contains("out.gic_dist_base = "),
+            "no GIC base may be committed while walking properties — that is the ordering bug"
+        );
+    }
+
+    /// Both tuples are committed TOGETHER, so they can never disagree about which is which.
+    #[test]
+    fn both_bases_are_committed_together_or_not_at_all() {
+        let body = parse_body();
+        let dist = body
+            .find("out.gic_dist_base = Some(dist.0 as usize);")
+            .expect("distributor commit");
+        let cpu_if = body
+            .find("out.gic_cpu_if_base = Some(cpu_if.0 as usize);")
+            .expect("CPU-interface commit");
+        assert_eq!(
+            body.matches("out.gic_cpu_if_base = Some").count(),
+            1,
+            "exactly one CPU-interface commit site"
+        );
+        assert_eq!(
+            body.matches("out.gic_dist_base = Some").count(),
+            1,
+            "exactly one distributor commit site"
+        );
+        assert!(
+            dist < cpu_if && cpu_if - dist < 200,
+            "the two commits are one transaction"
+        );
+        assert!(
+            body.contains("(scratch.supported_gicv2, scratch.first, scratch.second)"),
+            "and are gated on a supported GICv2 compatible plus BOTH tuples"
+        );
+    }
+
+    /// The scratch is scoped by node depth, so a nested controller-shaped child (QEMU nests an
+    /// `arm,gic-v2m-frame` inside `intc`) cannot contaminate the parent's decision.
+    #[test]
+    fn the_node_scratch_is_depth_scoped() {
+        let body = parse_body();
+        assert!(
+            body.contains("gic_scratch.is_some_and(|s| s.depth == depth)"),
+            "properties are attributed to the node whose depth opened the scratch"
+        );
+        assert!(
+            body.contains("scratch.depth == closing_depth"),
+            "and the decision fires only when THAT node closes"
+        );
+        assert!(
+            body.contains("gic_scratch.is_none()")
+                && body.contains("out.gic_cpu_if_base.is_none()"),
+            "a nested controller must not displace an open scratch, and a committed result must \
+             not be reopened — first-valid-controller selection is preserved"
+        );
+    }
+
+    /// GICv3 and unknown controllers must not receive the GICv2 tuple mapping: their second
+    /// `reg` entry is a redistributor, not a CPU interface.
+    #[test]
+    fn only_supported_gicv2_compatibles_get_the_mapping() {
+        assert!(
+            DTB_SRC.contains("fn compatible_is_supported_gicv2"),
+            "the supported set is named once"
+        );
+        let f = DTB_SRC
+            .split("fn compatible_is_supported_gicv2")
+            .nth(1)
+            .expect("the predicate")
+            .split("\npub fn ")
+            .next()
+            .expect("its body");
+        assert!(
+            f.contains("arm,cortex-a15-gic") && f.contains("arm,gic-400"),
+            "the GICv2 compatibles this layout is known for"
+        );
+        assert!(
+            !f.contains("gic-v3") && !f.contains("gic-600"),
+            "GICv3 must never be admitted to the GICv2 two-tuple mapping"
+        );
+    }
+
+    /// STRUCTURAL PROTECTION: GICC setup must be reachable only with a CPU-interface base.
+    ///
+    /// `init_gic_cpu_if_base` writes `GICC_PMR`/`GICC_CTLR` offsets, which alias
+    /// `GICD_TYPER`/`GICD_CTLR` if handed a distributor base. Nothing may pass the distributor
+    /// tuple to it, and the distributor constant must be kept out of its callers.
+    #[test]
+    fn gicc_setup_cannot_be_given_the_distributor_tuple() {
+        let setup = AARCH64_IRQ_SRC
+            .split("pub fn init_gic_cpu_if_base(base: usize)")
+            .nth(1)
+            .expect("the GICC setup")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert!(
+            setup.contains("GICC_PMR_OFFSET") && setup.contains("GICC_CTLR_OFFSET"),
+            "it writes CPU-interface offsets"
+        );
+        assert!(
+            !setup.contains("GIC_DIST") && !setup.contains("gic_dist"),
+            "and must never be reached with a distributor base"
+        );
+        // The platform-layout fallback the CPU-interface setter uses must be the CPU interface.
+        let configure = AARCH64_IRQ_SRC
+            .split("pub fn configure_gic_from_platform_layout()")
+            .nth(1)
+            .expect("the platform-layout configuration")
+            .split("\npub fn ")
+            .next()
+            .expect("its body");
+        assert!(
+            configure.contains("init_gic_cpu_if_base(super::platform_layout::GIC_CPU_IF_BASE)"),
+            "the fallback must name the CPU-interface constant, never a distributor address"
+        );
+        // And the description path must feed it the CPU-interface token only.
+        let described = AARCH64_IRQ_SRC
+            .split("pub fn try_configure_gic_from_description(")
+            .nth(1)
+            .expect("the described configuration")
+            .split("\npub fn ")
+            .next()
+            .expect("its body");
+        assert!(
+            described.contains("\"gic_cpu_if_base\"")
+                && described.contains("init_gic_cpu_if_base(base)"),
+            "the described CPU-interface base is the only thing GICC setup may consume"
+        );
+    }
+
+    /// This checkpoint derives and carries the distributor base but performs NO distributor MMIO:
+    /// no PPI enable, no timer arm, no DAIF unmask.
+    #[test]
+    fn the_prerequisite_activates_no_interrupt_behaviour() {
+        for forbidden in [
+            "GICD_ISENABLER",
+            "GICD_CTLR",
+            "enable_timer_ppi",
+            "bring_up_bsp_timer",
+        ] {
+            assert!(
+                !AARCH64_IRQ_SRC.contains(forbidden),
+                "{forbidden} belongs to the ProductionTick bring-up, not to this prerequisite"
+            );
+        }
+        assert_eq!(
+            AARCH64_IRQ_SRC
+                .matches("pub fn enable_interrupts_for_boot()")
+                .count(),
+            3,
+            "the interrupt-enable seam keeps its existing per-cfg definitions and gains no caller"
+        );
+    }
+}

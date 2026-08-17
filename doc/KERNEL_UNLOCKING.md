@@ -373,6 +373,37 @@ completing any of them.
 > Neither is caused by this checkpoint, neither is a timeout-pipeline defect, and neither was
 > repaired here.
 >
+> **AArch64 GIC base-derivation prerequisite — DELIVERED. CENSUS-DELTA 0.** Arming the AArch64 BSP
+> timer requires PPI 30 enabled at the GIC distributor, and the runtime had no usable distributor
+> base to enable it through. `aarch64/dtb.rs` chose which `reg` tuple was the CPU interface at the
+> moment it encountered `reg`, i.e. while `compatible` was still unread; QEMU `virt` emits `reg`
+> BEFORE `compatible` (confirmed against a real `dumpdtb`), so the FIRST tuple — the DISTRIBUTOR at
+> `0x0800_0000` — was stored as `gic_cpu_if_base`. Consequently every CPU-interface access targeted
+> distributor registers: `init_gic_cpu_if_base` wrote the priority mask into `GICD_TYPER`
+> (read-only, ignored) and the CPU-interface enable into `GICD_CTLR`, enabling the distributor by
+> accident. The defect was dormant only because no AArch64 interrupt had ever been delivered.
+>
+> The mapping is now resolved at the node's `FDT_END_NODE`, after both properties have had their
+> chance to appear in either order, using bounded node-local scratch scoped by node DEPTH so a
+> nested controller-shaped child (QEMU nests `arm,gic-v2m-frame` inside `intc`) cannot contaminate
+> the parent. Both bases commit as one transaction or not at all; GICv3 and unknown compatibles get
+> no GICv2 mapping, since their second tuple is a redistributor rather than a CPU interface.
+> First-valid-controller selection, the address/size-cell handling and the tuple offsets are
+> unchanged, and there is no allocation. **GICC no longer aliases GICD**: the CPU-interface setter
+> can be reached only with a genuine CPU-interface base — pinned structurally — so its priority-mask
+> and enable writes can no longer land in `GICD_TYPER`/`GICD_CTLR`.
+>
+> Delivered against fresh artifacts attesting this commit
+> (`ARTIFACT_BUILD_INTEGRITY arch=aarch64 … result=ok`): the AArch64 SMP=1 standard core PASSES with
+> `gic_cpu_if_base=0x8010000 gic_dist_base=0x8000000`, zero fatal, zero panic, and
+> `YARM_SCHED_TICK` / `YARM_TIMER_IRQ_DELIVERED` / `YARM_TIMER_EOI_DONE` all 0 — no interrupt or
+> timer behaviour is activated here. `cargo metadata --locked` and `cargo check --workspace` are
+> clean, and repository-policy clippy is BYTE-IDENTICAL to exact base `90a52dc` in both its error
+> and warning multisets: this prerequisite adds no finding of any kind. The only deferred item is
+> the established exact-base page fault `PAGE_FAULT_UNHANDLED tid=1 addr=0x0 access=Read
+> rip=0x40307c`. **AArch64 ProductionTick bring-up remains PENDING** on this now-unblocked
+> prerequisite.
+>
 > **What stays open.** Default AArch64/RISC-V scheduler-tick reachability under a user workload is
 > unresolved, so end-to-end production expiry on those ports is still not demonstrable and
 > **canonical 199E remains OPEN**. Census delta 0; direct production remains OFF

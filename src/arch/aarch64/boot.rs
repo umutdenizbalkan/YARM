@@ -8434,12 +8434,16 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
             }
             if let Some(parsed) = crate::arch::aarch64::dtb::parse_boot_dtb(dtb) {
                 crate::yarm_log!(
-                    "YARM_AARCH64_DTB memory_start=0x{:x} memory_len=0x{:x} initrd_start=0x{:x} initrd_end=0x{:x} gic_cpu_if_base=0x{:x}",
+                    "YARM_AARCH64_DTB memory_start=0x{:x} memory_len=0x{:x} initrd_start=0x{:x} initrd_end=0x{:x} gic_cpu_if_base=0x{:x} gic_dist_base=0x{:x}",
                     parsed.memory_start.unwrap_or(0),
                     parsed.memory_len.unwrap_or(0),
                     parsed.initrd_start.unwrap_or(0),
                     parsed.initrd_end.unwrap_or(0),
                     parsed.gic_cpu_if_base.unwrap_or(0),
+                    // Canonical 199E prerequisite: the distributor tuple is now derived and
+                    // carried alongside the CPU interface so a later checkpoint can enable PPI 30.
+                    // Reported only — this checkpoint performs no distributor MMIO.
+                    parsed.gic_dist_base.unwrap_or(0),
                 );
                 if let Some(bitmap) = parsed.present_cpu_bitmap {
                     let max_cpus = options
