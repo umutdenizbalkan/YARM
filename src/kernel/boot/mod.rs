@@ -3894,6 +3894,24 @@ pub fn ipc_reply_timeout_selector() -> Option<u64> {
     })
 }
 
+/// Canonical 199E — the slot-5 selector the proof workload runs under.
+///
+/// With a runtime selector armed this is that selector, unchanged. With NO runtime selector it is
+/// the TIMEOUT-WINS scenario, because that is the one scenario whose client blocks on a reply
+/// endpoint with a finite timeout and lets the deadline win — i.e. the workload that drives
+/// `IpcRecvTimeout → arm_production_reply_deadline → expiry → collector/drain → TimedOut`.
+///
+/// The encoder is the architecture-local one from the shared ABI, the exact inverse of the
+/// decoder userspace applies, so the kernel still never hand-writes a slot-5 number.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub fn ipc_reply_timeout_workload_selector() -> u64 {
+    ipc_reply_timeout_selector().unwrap_or_else(|| {
+        yarm_ipc_abi::ipc_reply_liveness_abi::ipc_reply_liveness_selector_for_current_arch(
+            yarm_ipc_abi::ipc_reply_liveness_abi::IpcReplyLivenessScenario::TimeoutWins,
+        ) as u64
+    })
+}
+
 /// Stage 200C2C1 — the monotonic "now" that drives reply-timeout deadlines, per arch.
 ///
 /// U7 (canonical 199E) ungated these: the timeout pipeline they clock is production on every
@@ -5232,6 +5250,11 @@ pub(crate) fn server_death_work_drained_count() -> u64 {
 pub(crate) struct ReplyTimeoutPostWork {
     pub handle: crate::kernel::deadline_token::DeadlineTokenHandle,
     pub deadline: u64,
+    /// Canonical 199E — the clock domain `deadline` is expressed in, carried from the
+    /// registration so the drain's own re-check compares against the SAME clock the collector
+    /// used. Without it the re-check would have to pick a domain, and on a selector-on boot
+    /// (where both domains coexist) it would pick wrongly for one of them.
+    pub clock: crate::kernel::deadline_token::ReplyDeadlineClock,
 }
 
 /// Per-CPU deferred-work slots — bounded by the whole deadline-token store, so a
@@ -5500,6 +5523,124 @@ pub(crate) fn send_timeout_work_clear(cpu_idx: usize) {
     }
 }
 
+// Canonical 199E: per-CPU bounded DEFERRED ordinary RECEIVE timeout work.
+//
+// The third and last class to leave the broad-lock scan. It rides the identical shape as the
+// other two, and carries the identity the in-lock scan carried — the exact `{tid, asid}`
+// incarnation plus the blocked-RECEIVE generation minted for this block — so a replacement task
+// that reused the numeric TID, or the same task blocking a second time, can never be timed out
+// by a stale item. `endpoint_idx` is the endpoint whose waiter must be removed.
+
+/// One owned unit of deferred receive-timeout work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecvTimeoutPostWork {
+    pub tid: u64,
+    pub asid: Option<crate::kernel::vm::Asid>,
+    pub wait_generation: u64,
+    pub deadline: u64,
+}
+
+/// Per-CPU deferred receive-timeout slots.
+pub(crate) const CT_POST_WORK_SLOTS: usize = 8;
+
+static RECV_TIMEOUT_POST_WORK: [crate::kernel::lock::SpinLockIrq<
+    [Option<RecvTimeoutPostWork>; CT_POST_WORK_SLOTS],
+>; crate::kernel::scheduler::MAX_CPUS] =
+    [const { crate::kernel::lock::SpinLockIrq::new([None; CT_POST_WORK_SLOTS]) };
+        crate::kernel::scheduler::MAX_CPUS];
+
+static RECV_TIMEOUT_WORK_PUBLISHED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static RECV_TIMEOUT_WORK_DRAINED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Publish one owned receive-timeout item. A duplicate `{tid, asid, wait_generation}` yields one
+/// owner; a full queue returns `false` and the collector leaves the deadline armed for a later
+/// pass, so no due registration is dropped.
+pub(crate) fn recv_timeout_work_publish(cpu_idx: usize, work: RecvTimeoutPostWork) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    let mut q = RECV_TIMEOUT_POST_WORK[cpu_idx].lock();
+    for slot in q.iter().flatten() {
+        if slot.tid == work.tid
+            && slot.asid == work.asid
+            && slot.wait_generation == work.wait_generation
+        {
+            return true;
+        }
+    }
+    if let Some(free) = q.iter_mut().find(|s| s.is_none()) {
+        *free = Some(work);
+        RECV_TIMEOUT_WORK_PUBLISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn recv_timeout_work_drain_next(cpu_idx: usize) -> Option<RecvTimeoutPostWork> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let mut q = RECV_TIMEOUT_POST_WORK[cpu_idx].lock();
+    let taken = q.iter_mut().find(|s| s.is_some()).and_then(|s| s.take());
+    if taken.is_some() {
+        RECV_TIMEOUT_WORK_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    taken
+}
+
+pub(crate) fn recv_timeout_work_published_count() -> u64 {
+    RECV_TIMEOUT_WORK_PUBLISHED.load(core::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn recv_timeout_work_drained_count() -> u64 {
+    RECV_TIMEOUT_WORK_DRAINED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// One-shot latch for the receive-timeout deferred-work evidence marker.
+static RECV_TIMEOUT_DEFERRED_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub(crate) fn recv_timeout_deferred_once() -> bool {
+    !RECV_TIMEOUT_DEFERRED_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// The IpcRecvTimeout class-retirement seal, on the same discipline as the other two: the settle
+/// only ARMS it, and it is emitted once a resumed receiver has actually consumed its result.
+static RECV_TIMEOUT_RETIRE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static RECV_TIMEOUT_RETIRE_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn arm_recv_timeout_class_retired() {
+    RECV_TIMEOUT_RETIRE_ARMED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn maybe_emit_recv_timeout_class_retired() {
+    if !RECV_TIMEOUT_RETIRE_ARMED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if RECV_TIMEOUT_RETIRE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcRecvTimeout result=ok",
+        REPLY_TIMEOUT_ARCH
+    );
+}
+
+/// Test-only: empty a CPU's deferred receive-timeout queue. Gated exactly like its
+/// `reply_timeout_work_clear` sibling: every caller is a retirement-cell test, and those modules
+/// compile only under the oracle feature, so a plain hosted build has no use for it.
+#[cfg(all(test, feature = "ipc-reply-timeout-oracle-core"))]
+pub(crate) fn recv_timeout_work_clear(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        for slot in RECV_TIMEOUT_POST_WORK[cpu_idx].lock().iter_mut() {
+            *slot = None;
+        }
+    }
+}
+
 /// U7 (canonical 199E) — the per-CPU cursor of the arch-neutral IPC-timeout scanner.
 ///
 /// The scanner examines a bounded WINDOW of TCB slots per trap instead of the whole
@@ -5600,9 +5741,19 @@ pub fn provision_init_ipc_reply_timeout_oracle(
     kernel: &mut KernelState,
     init_tid: u64,
 ) -> Option<IpcReplyTimeoutOracleCaps> {
-    if !x86_ipc_reply_timeout_oracle_enabled() {
-        return None;
-    }
+    // Canonical 199E: provisioning is gated by the COMPILE-TIME proof feature alone — the `cfg`
+    // on this function — and no longer by the runtime selector.
+    //
+    // That separation is what makes the production path observable live. The runtime selector
+    // decides whether the ORACLE pre-arms a confined, synthetic deadline
+    // (`maybe_arm_reply_timeout_oracle` returns immediately when the mode is 0). While it was
+    // also the gate on provisioning, the two were welded together: the only way to get a
+    // userspace client that blocks on a reply endpoint with a finite timeout was to enable the
+    // selector, and the selector's own pre-arm then won the one-registration race, so
+    // `arm_production_reply_deadline` never fired on any live boot. With the selector off the
+    // same client now runs against the PRODUCTION registration, which is the path that ships.
+    //
+    // This adds no knob: a build without the feature provisions nothing, exactly as before.
     use crate::kernel::capabilities::{CapObject, CapRights, Capability};
     let init_cnode = kernel.task_cnode(init_tid)?;
     let mint = |kernel: &mut KernelState, recv_root: crate::kernel::capabilities::CapId| {

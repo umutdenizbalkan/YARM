@@ -246,6 +246,139 @@ completing any of them.
 
 **U7 — DELIVERED. CANONICAL 199E — OPEN (two classes retired). CENSUS-DELTA 0.**
 
+**199E TIMEOUT-UNLOCKING CHECKPOINT — DELIVERED. CANONICAL 199E — OPEN. CENSUS-DELTA 0.**
+
+> Two things U7 left open are now implemented, and one is now genuinely production-wired.
+>
+> **Reply/call timeout has production registration and exact retirement.**
+> `arm_production_reply_deadline` runs at the committed reply-receive block point on every build
+> and boot, driven only by the caller's own `timeout_ticks` — no new syscall, no new ABI field,
+> no invented deadline. It registers only when a live reply record is already bound to this exact
+> `{caller_tid, caller_asid}` at this exact reply endpoint, so an ordinary receive is untouched,
+> and it reuses the existing exact token end to end with the blocked-receive generation serving
+> as the deadline-token generation. It fails closed on every degenerate case, including a full
+> bounded store — a caller whose registration fails keeps its deadline and is served by the
+> receive class, so a registry-full arm never leaves an unbounded blocked wait. Both properties
+> are proven through production entries: five sequential real call/reply cycles reuse the
+> four-slot registry (cycle five could not register if retirement did not free the slot), and a
+> fifth concurrent wait against a saturated registry falls back to the receive class and times
+> out exactly once while the four registered waits stay intact.
+>
+> **Retirement is exactly once, on every terminal outcome.**
+> `retire_reply_deadline_for_tid` is wired into the single in-lock wake seam, its split twin and
+> `mark_task_dead`, and re-validates the handle against its own terminal identity, so a
+> replacement incarnation reusing the numeric TID cannot retire another's registration. Before
+> this, `disarm_reply_deadline_on_reply_win` had **zero** production callers: enabling
+> registration without it would have leaked one Armed slot per completed call and permanently
+> exhausted the four-slot registry after four calls.
+>
+> **Endpoint AND notification receive timeout are off the broad lock.** Both wait kinds block as
+> `Blocked(EndpointReceive)`, so both ride the third off-lock class
+> (`drain_recv_timeout_post_work`: rank-2 exact `{tid, asid, blocked_recv_generation}` claim
+> publishing the timeout fact in the same acquisition as `Runnable`, rank-3 identity waiter
+> removal across every structure plus the stranded re-check, rank-1 single enqueue). The
+> broad-lock scan now owns **no** timeout class.
+>
+> **The deadline clock follows the arming site, not the architecture.** Production deadlines are
+> scheduler ticks on all three ports; the hardware counter is read only while the oracle selector
+> is armed, and that selector is written only by boot-cmdline parse, so the domain is immutable
+> for the lifetime of every record and the two domains never coexist.
+>
+> **x86_64 production expiry is LIVE-PROVEN.** Provisioning the proof workload was welded to the
+> runtime oracle selector, and that selector also makes `maybe_arm_reply_timeout_oracle` pre-arm a
+> confined synthetic deadline which wins the one-registration race — so no live boot had ever
+> exercised the production arm. Provisioning is now gated by the COMPILE-TIME feature alone (no new
+> knob), which lets the SAME existing client run with the selector OFF. On that boot
+> (`--profile x86-none`, `mode=0`): `IPC_REPLY_TIMEOUT_ORACLE_PROVISION_OK … mode=0` →
+> `IPC_REPLY_TIMEOUT_ARMED … record_generation=17 token_generation=17` (the production arm keys the
+> token generation to the blocked-receive generation; the oracle's is the constant `1`) →
+> `IPC_REPLY_TIMEOUT_OK … terminal=Timeout timeout_result=TimedOut` →
+> `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcReplyTimeout` →
+> `X86_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected
+> result=ok`, alongside `IPC_REPLY_TIMEOUT_LOCK_STATUS … scan_broad_lock=0 … production=1`. Zero
+> `ARM_SKIP`/`ARM_FAIL`, zero stranded waiters, zero real fatal/panic/page-fault, and the 15
+> graduated-path markers present. The selector-ON retirement cell still passes on the SAME
+> artifacts, with `token_generation=1` — the pre-arm proof is preserved and isolated.
+>
+> **Mixed production/oracle clock domains are repaired.** Making production registration live
+> created a hazard the pipeline did not previously have: a selector-on boot now holds BOTH a
+> confined oracle record armed from the architectural hardware counter AND ordinary production
+> records armed as `scheduler_tick_now() + timeout_ticks`, and the live AArch64/RISC-V logs proved
+> it empirically (an unrelated production caller at `deadline=1` beside the oracle's own record).
+> The two values are orders of magnitude apart, so a selector-global "reply now" is wrong in both
+> directions — a hardware counter makes every production tick deadline instantly due, and a stuck
+> tick makes the oracle's counter deadline never due. Each registration therefore carries its own
+> `ReplyDeadlineClock` (`ProductionTick` | `OracleHardware`), written by the single registration
+> seam `register_reply_receive_deadline` together with the deadline and the token, and never
+> rewritten while that registration is live — so selector state cannot reinterpret an already-armed
+> production deadline. `run_due_ipc_timeout_work` reads both domains plus the unchanged `send_now`,
+> and the collector and the reply drain each select per record from the record's own stored domain.
+> No allocation, no ABI change, no broad-lock fallback, no second drain, no per-architecture policy.
+> Six focused tests cover coexistence, a huge counter failing to expire a non-due production
+> record, a due oracle record expiring while a non-due production record survives, a due production
+> record expiring on scheduler ticks alone, repeated scans settling each exact record once, and a
+> stale record refusing to be settled across domains.
+>
+> **Oracle accounting is scoped to the exact oracle identity.** The `IPC_REPLY_TIMEOUT_ARMED` and
+> `_OK` marker FAMILIES stopped being oracle-specific the moment production registration went live.
+> The retirement profiles now take the oracle's caller identity from
+> `IPC_REPLY_TIMEOUT_ORACLE_PROVISION_OK init_tid=` and require exactly one registration for it —
+> stricter than the family count it replaces — while bounding settlements by registrations and
+> requiring every settlement line to carry its full field contract. Unrelated production settlement
+> proceeds normally and consumes no oracle one-shot state; production registration is skipped on no
+> endpoint. `IPC_REPLY_TIMEOUT_ARMED arch=` moved from the feature-OFF forbidden set to the
+> production-present set on all three ports, because `arm_production_reply_deadline` is
+> unconditional production code and its format string is therefore in every image.
+>
+> **Delivery, stated exactly.** All static gates pass at this commit: integration targets (18
+> targets, 0 failures), `cargo metadata --locked`, `cargo check --workspace` (0 errors), the
+> canonical hosted suite (4545 pass / 0 fail), `cargo fmt --all --check`, and the census and
+> documentation guards. Repository-policy clippy carries the SAME three errors as exact base
+> `8275c927` — the pre-existing `yarm-freestanding-alloc` lib-test `uninit_vec` pair, deferred as
+> exact-base — and +7 warnings across six families the base already carries at 14–97 instances
+> each. One candidate finding was a real signal and was FIXED (`recv_timeout_work_clear` was dead
+> under a plain hosted build; it is now gated exactly like its `reply_timeout_work_clear` sibling).
+> The remaining six are ACCEPTED under repository policy, the production one with an in-source
+> rationale: the retired-but-preserved `process_ipc_timeout_deadlines` body still names `deadline`
+> at a use the unconditional skips make unreachable, so clippy reports the binding unused while
+> rustc still resolves it — deleting the binding would mean editing the preserved body, and an `_`
+> prefix does not compile against that same use.
+>
+> Fresh matched standard artifacts for all three architectures attest this commit with
+> `ARTIFACT_BUILD_INTEGRITY … stale_artifact_acceptance=0 failed_build_rejected=1 result=ok`, and
+> the established standard core profile passes on x86_64, AArch64 and RISC-V with zero fatal, zero
+> panic, zero duplicate wake and zero stale completion. AArch64 core carries the pre-existing
+> `PAGE_FAULT_UNHANDLED tid=1 addr=0x0 access=Read rip=0x40307c` reproduced character-identically at
+> exact base, and its own gate passes.
+>
+> **x86_64 is fully green.** The retirement profile passes both cells, and selector-off production
+> expiry is live-proven on fresh feature-on artifacts. The clock domain is proven by the ARM
+> SIGNATURE rather than asserted: for the same caller and the same record generation 17, the
+> selector-off boot registers `token_generation=17` — the production arm keys the token generation
+> to the blocked-receive generation, so this is `ProductionTick` — while the selector-on boot
+> registers `token_generation=1`, the oracle's constant, so that is `OracleHardware`. The
+> selector-off cell settles `ARMED=2 OK=2 COMMITTED=2`: one settlement per registration, exactly one
+> completion, wake and enqueue per identity, with `ARM_SKIP=0`, `ARM_FAIL=0`, zero stranded waiters,
+> zero leaked deadline/record/waiter/lease, zero fatal/panic/page-fault, and all 15 graduated-path
+> markers present. Oracle accounting is scoped to the exact oracle identity throughout.
+>
+> **AArch64 and RISC-V are DEFERRED, and only because each is mechanically exact-base-identical.**
+> The AArch64 oracle client workload never starts, here and at base alike — `ordered marker sequence
+> incomplete (ci= cn= rt= ud=)` character-identical, client-start markers 0. On RISC-V the clock
+> repair restored the client's full sequence (`ci=29552 cn=29654 rt=29657`, where before the fix it
+> stalled at `ci` with a duplicate timeout encoding) and the candidate's own settlement is
+> exact-once — `ARMED=2 OK=1 COMMITTED=1 CLASS_DONE=1`, the oracle record settling while the
+> unrelated production record correctly does not — leaving only the client's
+> `caller_result=1 caller_continuations=2 late_reply=1 result=fail`, character-identical to base.
+> Neither is caused by this checkpoint, neither is a timeout-pipeline defect, and neither was
+> repaired here.
+>
+> **What stays open.** Default AArch64/RISC-V scheduler-tick reachability under a user workload is
+> unresolved, so end-to-end production expiry on those ports is still not demonstrable and
+> **canonical 199E remains OPEN**. Census delta 0; direct production remains OFF
+> (`IPCCALL_DIRECT_PROOF_ENABLED: AtomicBool::new(false)`); ownership production callers 0; no U8 or
+> WA3C2 work is begun.
+
 > **The off-lock IPC-timeout pipeline is production on all three architectures, and two
 > classes are gone from the broad-lock scan.**
 >

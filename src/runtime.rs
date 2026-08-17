@@ -3107,6 +3107,10 @@ impl SharedKernel {
             // `clear_ipc_timeout_for_tid`, in the same acquisition.
             tcb.ipc_timeout_deadline = None;
             tcb.ipc_timeout_fired = false;
+            // Canonical 199E: the in-lock twin retires the caller's reply-deadline registration
+            // here too. The handle is captured under this same rank-2 claim; the rank-3 store
+            // release runs after this section drops, never nested inside it.
+            let retire = tcb.reply_timeout_token.take();
             let affinity = tcb.cpu_affinity;
             let reserved = tcb.is_spawn_reservation();
             // `task_priority`: TID 0 is the idle/supervisor sentinel and is Normal WITHOUT a
@@ -3120,13 +3124,26 @@ impl SharedKernel {
                     None => return Err(KernelError::TaskMissing),
                 }
             };
-            Ok(WakeState {
-                old_status,
-                affinity,
-                priority,
-                reserved,
-            })
+            Ok((
+                WakeState {
+                    old_status,
+                    affinity,
+                    priority,
+                    reserved,
+                },
+                retire,
+            ))
         })?;
+        let (state, retire) = state;
+        // Rank 2 is released. Rank 3: return the caller's reply-deadline slot to the bounded
+        // store, exactly once and only for the handle this wake took off the TCB.
+        if let Some(handle) = retire {
+            self.with_ipc_split_mut(|ipc| {
+                if let Some(t) = ipc.reply_deadline_tokens.get_mut(handle.token_index()) {
+                    let _ = t.disarm_after_terminal_completion(handle.identity(), handle.epoch());
+                }
+            });
+        }
         crate::yarm_log!("SCHED_WAKE_SET_RUNNABLE tid={} new_status=Runnable", tid.0);
 
         // (5) rank 1 — the placement decision. `current_tid_on(cpu)` is the same fact
@@ -6700,19 +6717,34 @@ impl SharedKernel {
 
     // ── Stage 200C2B: OFF-LOCK reply-timeout collection + completion ────────────────
 
-    /// Stage 200C2C1 — the monotonic "now" that the off-lock collector scans in. x86_64: the
-    /// LAPIC-advanced scheduler tick (read off-lock). AArch64: the generic-timer physical counter,
-    /// since the cooperative port has no periodic scheduler tick. Matches the units the deadline is
-    /// armed in (`maybe_arm_reply_timeout_oracle`).
-    pub(crate) fn reply_timeout_now_split_read(&self) -> u64 {
+    /// The monotonic "now" of the **`OracleHardware` clock domain** — the domain the confined
+    /// reply-timeout oracle arms its own deadlines in (Stage 200C2C1/200C2C2).
+    ///
+    /// On AArch64 and RISC-V, while the oracle selector is armed, this is the architectural
+    /// hardware counter: those cooperative ports have no periodic scheduler tick, so the oracle's
+    /// scenario needs a clock that advances under a user workload, and it arms
+    /// `reply_timeout_hw_now() + delta` to match. Everywhere else — x86_64 always, and
+    /// AArch64/RISC-V on a production boot — this IS the scheduler tick, because there is no
+    /// hardware branch to read.
+    ///
+    /// # This is NOT a global reply clock
+    ///
+    /// Canonical 199E made production reply/call registration live, so a selector-on boot
+    /// contains BOTH domains at once: the oracle's counter deadline AND ordinary production
+    /// deadlines armed as `scheduler_tick_now() + timeout_ticks` by unrelated callers. The two
+    /// values are orders of magnitude apart, so judging every record against one of them is
+    /// wrong in both directions — a hardware counter makes every production tick deadline
+    /// instantly due, and a stuck tick makes the oracle's counter deadline never due. Each
+    /// record therefore carries its own [`ReplyDeadlineClock`] and the collector receives both
+    /// values; this seam supplies exactly one of them.
+    ///
+    /// [`ReplyDeadlineClock`]: crate::kernel::deadline_token::ReplyDeadlineClock
+    pub(crate) fn reply_timeout_oracle_now_split_read(&self) -> u64 {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        {
-            crate::kernel::boot::reply_timeout_hw_now()
+        if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
+            return crate::kernel::boot::reply_timeout_hw_now();
         }
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
-        {
-            self.scheduler_tick_now_split_read()
-        }
+        self.scheduler_tick_now_split_read()
     }
 
     /// U7 (canonical 199E) — the PRODUCTION, arch-neutral IPC-timeout scanner.
@@ -6744,7 +6776,25 @@ impl SharedKernel {
     /// that published nothing advances, and a window whose publications were refused by a full
     /// queue advances too. That is what stops a high slot starving behind a persistently full
     /// queue, and it makes coverage a property of the cursor rather than of the workload.
-    pub(crate) fn collect_due_ipc_timeout_work(&self, reply_now: u64, send_now: u64, cpu: CpuId) {
+    ///
+    /// # Two reply clock domains, compared per record
+    ///
+    /// `production_now` and `oracle_now` are the current values of the two [`ReplyDeadlineClock`]
+    /// domains. A token-bearing record is judged ONLY against the domain it was armed in, read
+    /// from the registration itself — never against a selector-global "reply now", which a
+    /// selector-on boot makes meaningless now that production registration is live and both
+    /// domains coexist. `send_now` is unchanged: the blocking-send and ordinary-receive classes
+    /// have one clock, the scheduler tick.
+    ///
+    /// [`ReplyDeadlineClock`]: crate::kernel::deadline_token::ReplyDeadlineClock
+    pub(crate) fn collect_due_ipc_timeout_work(
+        &self,
+        production_now: u64,
+        oracle_now: u64,
+        send_now: u64,
+        cpu: CpuId,
+    ) {
+        use crate::kernel::deadline_token::ReplyDeadlineClock;
         use crate::kernel::task::{TaskStatus, WaitReason};
         // Stage 200C2C2C-R2B — the CAUSAL reply-wins gate. While held, publish NO REPLY work, so
         // no timeout claimant can reach the terminal cell while a reply is in flight. It is
@@ -6767,6 +6817,10 @@ impl SharedKernel {
             crate::kernel::boot::ST_POST_WORK_SLOTS] =
             [None; crate::kernel::boot::ST_POST_WORK_SLOTS];
         let mut send_n = 0usize;
+        let mut recv_due: [Option<crate::kernel::boot::RecvTimeoutPostWork>;
+            crate::kernel::boot::CT_POST_WORK_SLOTS] =
+            [None; crate::kernel::boot::CT_POST_WORK_SLOTS];
+        let mut recv_n = 0usize;
         let mut scanned = 0usize;
         self.with_task_tcbs_split_mut(|tcbs| {
             let len = tcbs.len();
@@ -6788,6 +6842,15 @@ impl SharedKernel {
                 };
                 // ── class 1: the token-bearing reply-receive deadline ─────────────────────
                 if let Some(handle) = tcb.reply_timeout_token {
+                    // Canonical 199E: each record against ITS OWN clock. The domain was written
+                    // by the single registration seam together with the deadline, so this cannot
+                    // read a domain that belongs to some other registration, and the selector
+                    // cannot reinterpret a production deadline that is already armed.
+                    let clock = tcb.reply_timeout_clock;
+                    let reply_now = match clock {
+                        ReplyDeadlineClock::ProductionTick => production_now,
+                        ReplyDeadlineClock::OracleHardware => oracle_now,
+                    };
                     if reply_now < deadline
                         || reply_held
                         || reply_n >= crate::kernel::boot::RT_POST_WORK_SLOTS
@@ -6841,8 +6904,11 @@ impl SharedKernel {
                             );
                         }
                     }
-                    reply_due[reply_n] =
-                        Some(crate::kernel::boot::ReplyTimeoutPostWork { handle, deadline });
+                    reply_due[reply_n] = Some(crate::kernel::boot::ReplyTimeoutPostWork {
+                        handle,
+                        deadline,
+                        clock,
+                    });
                     reply_n += 1;
                     continue;
                 }
@@ -6853,19 +6919,40 @@ impl SharedKernel {
                 // or the same incarnation blocking a second time, can never be settled by a
                 // stale item. An ASID-less sender carries `asid: None` and is woken without a
                 // completion, exactly as the retired in-lock scan handled it.
-                if send_now < deadline
-                    || !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_)))
-                    || send_n >= crate::kernel::boot::ST_POST_WORK_SLOTS
+                if send_now < deadline {
+                    continue;
+                }
+                if matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {
+                    if send_n >= crate::kernel::boot::ST_POST_WORK_SLOTS {
+                        continue;
+                    }
+                    send_due[send_n] = Some(crate::kernel::boot::SendTimeoutPostWork {
+                        tid: tcb.tid.0,
+                        asid: tcb.asid,
+                        send_generation: tcb.blocked_send_generation,
+                        deadline,
+                    });
+                    send_n += 1;
+                    continue;
+                }
+                // ── class 3 (canonical 199E): the ordinary RECEIVE timeout ────────────────
+                //
+                // Same clock as the send class: a receive deadline is `scheduler_tick_now() +
+                // timeout_ticks`, which is what the broad-lock scan compared against. The
+                // identity published is `{tid, asid, blocked_recv_generation}` — the generation
+                // `recv_block_phase_b_task` minted for THIS block — never a bare TID.
+                if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointReceive(_)))
+                    || recv_n >= crate::kernel::boot::CT_POST_WORK_SLOTS
                 {
                     continue;
                 }
-                send_due[send_n] = Some(crate::kernel::boot::SendTimeoutPostWork {
+                recv_due[recv_n] = Some(crate::kernel::boot::RecvTimeoutPostWork {
                     tid: tcb.tid.0,
                     asid: tcb.asid,
-                    send_generation: tcb.blocked_send_generation,
+                    wait_generation: tcb.blocked_recv_generation,
                     deadline,
                 });
-                send_n += 1;
+                recv_n += 1;
             }
         });
         // Advance by entries SCANNED (see the doc comment): coverage is the cursor's property.
@@ -6878,6 +6965,9 @@ impl SharedKernel {
         for work in send_due.iter().flatten() {
             let _ = crate::kernel::boot::send_timeout_work_publish(cpu_idx, *work);
         }
+        for work in recv_due.iter().flatten() {
+            let _ = crate::kernel::boot::recv_timeout_work_publish(cpu_idx, *work);
+        }
     }
 
     /// Stage 200C2B — the OFF-LOCK drain. Runs the SINGLE Stage 200C1 completion
@@ -6888,7 +6978,13 @@ impl SharedKernel {
     /// (`scan_broad_lock=0`) and emits the reply-timeout class retirement seal exactly
     /// once. On a non-`Woken` outcome it clears the caller's stale TCB registration so it
     /// is not re-collected.
-    pub(crate) fn drain_reply_timeout_post_work(&self, cpu: CpuId, now: u64) {
+    pub(crate) fn drain_reply_timeout_post_work(
+        &self,
+        cpu: CpuId,
+        production_now: u64,
+        oracle_now: u64,
+    ) {
+        use crate::kernel::deadline_token::ReplyDeadlineClock;
         // U7 (canonical 199E): the deadline scan for BOTH retired classes runs HERE — off the
         // broad `SpinLock<KernelState>` — on every trap, whether or not a completion drains and
         // whether or not any deadline is currently armed. That is the whole content of the
@@ -6908,9 +7004,19 @@ impl SharedKernel {
         let cpu_idx = cpu.0 as usize;
         while let Some(work) = crate::kernel::boot::reply_timeout_work_drain_next(cpu_idx) {
             // U7: the DUE value the scanner selected on is the authority, not the scanner's
-            // say-so. The production entry hands both halves the same `now`, so this cannot
-            // normally fail; if a future driver ever passed an older clock, the item goes back
-            // on the queue rather than being completed early, and the pass stops.
+            // say-so. The production entry hands both halves the same pair of clocks, so this
+            // cannot normally fail; if a future driver ever passed an older clock, the item goes
+            // back on the queue rather than being completed early, and the pass stops.
+            //
+            // Canonical 199E: re-check and complete against the item's OWN domain — the same one
+            // the collector judged it in. Selecting a domain here rather than at the call site is
+            // what lets a single drain pass settle a production-tick record and an
+            // oracle-counter record in either order without either being measured by the
+            // other's clock.
+            let now = match work.clock {
+                ReplyDeadlineClock::ProductionTick => production_now,
+                ReplyDeadlineClock::OracleHardware => oracle_now,
+            };
             if now < work.deadline {
                 let _ = crate::kernel::boot::reply_timeout_work_publish(cpu_idx, work);
                 break;
@@ -7011,8 +7117,12 @@ impl SharedKernel {
             // attestation can only be made by a drain whose collector was genuinely free to
             // publish timeout work — and still claimed none. While held the collector is
             // suppressed, and a "late scan claimed nothing" claim would be vacuous.
+            // `rw` is the ORACLE's own reply-wins deadline, so it is measured in the
+            // `OracleHardware` domain — canonical 199E makes that explicit here rather than
+            // inheriting whichever item happened to drain last (production items now drain
+            // through this same loop, in the scheduler-tick domain).
             if rw != 0
-                && now >= rw
+                && oracle_now >= rw
                 && !crate::kernel::boot::reply_timeout_collector_held()
                 && crate::kernel::boot::ipc_reply_timeout_rw_late_scan_once()
             {
@@ -7196,6 +7306,118 @@ impl SharedKernel {
         }
     }
 
+    /// Canonical 199E — the OFF-LOCK ordinary RECEIVE timeout settle.
+    ///
+    /// The third and last class off the broad lock, in the same three sequential, never-nested
+    /// claims the in-lock scan used and in the same order — task rank 2, then ipc rank 3, then
+    /// scheduler rank 1 — with nothing held across anything else:
+    ///
+    /// 1. **rank 2 — the exact claim.** Settled only if `{tid, asid, blocked_recv_generation}`
+    ///    still names a live incarnation `Blocked(EndpointReceive)` whose armed deadline is
+    ///    still the collected one and still due. Everything else is refused with ZERO mutation,
+    ///    which is what gives delivery / destruction / death / exit and the timeout exactly one
+    ///    winner: whichever moves the receiver out of `Blocked(EndpointReceive)` or advances its
+    ///    receive generation first, the other refuses. `ipc_timeout_fired` is published in the
+    ///    SAME acquisition that makes the receiver `Runnable`, so the `TimedOut` fact is always
+    ///    visible before the wake — nothing enqueues until phase 3.
+    /// 2. **rank 3 — waiter removal**, by COMPLETE identity (`{tid, asid}`), never a numeric TID,
+    ///    across every waiter structure the in-lock Phase 2 cleared, followed by the same
+    ///    stranded-waiter re-check.
+    /// 3. **rank 1 — the enqueue**, once, through the same split seam the other two classes use.
+    ///    It is the last visible action.
+    pub(crate) fn drain_recv_timeout_post_work(&self, cpu: CpuId, now: u64) {
+        use crate::kernel::boot::ReceiverWaiterIdentity;
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let cpu_idx = cpu.0 as usize;
+        while let Some(work) = crate::kernel::boot::recv_timeout_work_drain_next(cpu_idx) {
+            // ── (1) rank 2: the exact claim + the TimedOut publication ──────────────────────
+            let claimed = self.with_task_tcbs_split_mut(|tcbs| {
+                let Some(tcb) = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == work.tid && t.asid == work.asid)
+                else {
+                    return false;
+                };
+                if tcb.blocked_recv_generation != work.wait_generation {
+                    return false;
+                }
+                if !matches!(
+                    tcb.status,
+                    TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                ) {
+                    return false;
+                }
+                // A token-bearing receive belongs to the reply class and is never selected here;
+                // refusing defensively keeps that a property of this function too.
+                if tcb.reply_timeout_token.is_some() {
+                    return false;
+                }
+                let Some(deadline) = tcb.ipc_timeout_deadline else {
+                    return false;
+                };
+                if deadline != work.deadline || now < deadline {
+                    return false;
+                }
+                tcb.status = TaskStatus::Runnable;
+                tcb.ipc_timeout_deadline = None;
+                tcb.ipc_timeout_fired = true;
+                true
+            });
+            if !claimed {
+                crate::yarm_log!(
+                    "U8_RECV_TIMEOUT_REFUSED_STALE tid={} asid={} wait_generation={} deadline={}",
+                    work.tid,
+                    work.asid.map(|a| a.0).unwrap_or(0),
+                    work.wait_generation,
+                    work.deadline
+                );
+                continue;
+            }
+            // ── (2) rank 3: remove the exact waiter from every structure, then re-check ─────
+            let identity = ReceiverWaiterIdentity::new(
+                crate::kernel::ipc::ThreadId(work.tid),
+                work.asid.unwrap_or(crate::kernel::vm::Asid(0)),
+            );
+            let stranded = self.with_ipc_split_mut(|ipc| {
+                ipc.clear_endpoint_waiters_for_identity(identity);
+                for waiter in ipc.notification_waiters.iter_mut() {
+                    if *waiter == Some(crate::kernel::ipc::ThreadId(work.tid)) {
+                        *waiter = None;
+                    }
+                }
+                ipc.any_endpoint_waiter_is(identity)
+                    || ipc
+                        .notification_waiters
+                        .iter()
+                        .any(|w| *w == Some(crate::kernel::ipc::ThreadId(work.tid)))
+            });
+            if stranded {
+                crate::yarm_log!("SCHED_TIMEOUT_STRANDED_WAITER tid={}", work.tid);
+            }
+            // ── (3) rank 1: the wake, last ─────────────────────────────────────────────────
+            self.enqueue_reply_timeout_wake_split(work.tid);
+            crate::yarm_log!(
+                "U8_RECV_TIMEOUT_SETTLED arch={} tid={} asid={} wait_generation={} deadline={} now={} broad_lock=0 result=ok",
+                crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                work.tid,
+                work.asid.map(|a| a.0).unwrap_or(0),
+                work.wait_generation,
+                work.deadline,
+                now
+            );
+            if crate::kernel::boot::recv_timeout_deferred_once() {
+                crate::yarm_log!(
+                    "U8_RECV_TIMEOUT_DEFERRED arch={} published={} drained={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                    crate::kernel::boot::recv_timeout_work_published_count(),
+                    crate::kernel::boot::recv_timeout_work_drained_count()
+                );
+            }
+            crate::kernel::boot::arm_recv_timeout_class_retired();
+        }
+    }
+
     /// U7 (canonical 199E) — THE production timeout entry.
     ///
     /// One arch-neutral seam that every port's post-lock area calls unconditionally: read the
@@ -7209,23 +7431,45 @@ impl SharedKernel {
     /// Stage 200C1 transaction and the send class through the single U6 blocking-send lifecycle,
     /// exactly as their in-lock predecessors did.
     pub(crate) fn run_due_ipc_timeout_work(&self, cpu: CpuId) {
-        // TWO CLOCKS, because the two retired classes are armed in two different domains and
-        // comparing one against the other is a correctness bug, not a rounding error.
+        // THREE CLOCK VALUES over two domains, because a deadline is only meaningful against the
+        // clock that produced it and comparing one against another is a correctness bug, not a
+        // rounding error.
         //
-        // * The reply class is armed in `reply_timeout_now_split_read()`'s domain — the LAPIC
-        //   scheduler tick on x86_64, the generic-timer/`time` CSR hardware counter on AArch64
-        //   and RISC-V, where the cooperative ports have no reliable periodic tick.
-        // * The blocking-SEND class is armed from the caller's `timeout_ticks` in the SCHEDULER
-        //   TICK domain on every architecture — that is what `process_ipc_timeout_deadlines`
-        //   compared against before U7 moved the class off the broad lock, and preserving it is
-        //   what makes the move a relocation rather than a semantic change. Scanning send
-        //   deadlines against the hardware counter would make every one of them instantly due
-        //   on AArch64 and RISC-V, since the counter is orders of magnitude larger than a tick.
-        let reply_now = self.reply_timeout_now_split_read();
+        // * `production_now` — the SCHEDULER TICK. Every production reply/call deadline
+        //   (`arm_production_reply_deadline`) lives here, on all three architectures: there is one
+        //   deadline ABI and it is `scheduler_tick_now() + timeout_ticks`.
+        // * `oracle_now` — the confined oracle's domain, the architectural hardware counter on
+        //   AArch64/RISC-V while the selector is armed (those cooperative ports have no reliable
+        //   periodic tick under a user workload) and the scheduler tick everywhere else.
+        // * `send_now` — the SCHEDULER TICK for the blocking-send and ordinary-receive classes,
+        //   which have only ever had one clock. That is what `process_ipc_timeout_deadlines`
+        //   compared against before U7 moved the classes off the broad lock, and preserving it is
+        //   what makes the move a relocation rather than a semantic change.
+        //
+        // Canonical 199E: since production registration went live, a selector-on boot holds
+        // records of BOTH reply domains simultaneously, so there is no single "reply now" to
+        // scan with. Both values are handed down and each record selects its own.
+        let production_now = self.scheduler_tick_now_split_read();
+        let oracle_now = self.reply_timeout_oracle_now_split_read();
         let send_now = self.scheduler_tick_now_split_read();
-        self.collect_due_ipc_timeout_work(reply_now, send_now, cpu);
-        self.drain_reply_timeout_post_work(cpu, reply_now);
+        self.run_due_ipc_timeout_work_at(cpu, production_now, oracle_now, send_now);
+    }
+
+    /// The clock-INJECTED body of [`Self::run_due_ipc_timeout_work`]. Splitting the two is what
+    /// lets a hosted test drive the real production composition — one scan, then the three
+    /// class drains, in this order — at a controlled `now`, instead of re-implementing the
+    /// order in the test and proving nothing about the production entry.
+    pub(crate) fn run_due_ipc_timeout_work_at(
+        &self,
+        cpu: CpuId,
+        production_now: u64,
+        oracle_now: u64,
+        send_now: u64,
+    ) {
+        self.collect_due_ipc_timeout_work(production_now, oracle_now, send_now, cpu);
+        self.drain_reply_timeout_post_work(cpu, production_now, oracle_now);
         self.drain_send_timeout_post_work(cpu, send_now);
+        self.drain_recv_timeout_post_work(cpu, send_now);
     }
 
     /// Stage 200C2B — the OFF-LOCK scheduler enqueue for a timeout-woken caller. Reads

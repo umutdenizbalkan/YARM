@@ -2787,7 +2787,7 @@ mod tests {
         crate::kernel::boot::reset_ipc_timeout_scan_cursor(cpu.0 as usize);
         crate::kernel::boot::send_timeout_work_clear(cpu.0 as usize);
         let now = deadline.wrapping_add(1);
-        k.collect_due_ipc_timeout_work(now, now, cpu);
+        k.collect_due_ipc_timeout_work(now, now, now, cpu);
         k.drain_send_timeout_post_work(cpu, now);
         k.with(|state| {
             assert!(

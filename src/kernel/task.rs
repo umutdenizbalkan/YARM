@@ -222,6 +222,14 @@ pub struct ThreadControlBlock {
     /// which keep their existing plain-deadline behavior unchanged. Dormant in
     /// production this stage (no live path registers it yet).
     pub reply_timeout_token: Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
+    /// Canonical 199E — the CLOCK DOMAIN the `reply_timeout_token` registration above was armed
+    /// in. Written once by the single registration seam
+    /// (`KernelState::register_reply_receive_deadline`) together with the token and the deadline,
+    /// and never rewritten while that registration is live, so the timeout collector judges each
+    /// record against its OWN clock instead of a selector-global one. Meaningless (and ignored)
+    /// when `reply_timeout_token` is `None`: the ordinary-receive and blocking-send classes are
+    /// scheduler-tick-only and never consult it.
+    pub reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock,
     /// Stage 200D — the BOUNDED, generation-bearing REVERSE link from this task (as the
     /// authorized replier) to the reply record it must answer.
     ///
@@ -455,6 +463,7 @@ impl ThreadControlBlock {
             ipc_timeout_fired: false,
             blocked_recv_state: None,
             reply_timeout_token: None,
+            reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick,
             server_reply_link: None,
             blocked_recv_generation: 0,
             blocked_send_generation: 0,

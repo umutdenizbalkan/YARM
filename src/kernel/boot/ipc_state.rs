@@ -2060,6 +2060,7 @@ impl KernelState {
         blocked_recv_generation: u64,
         token_generation: u64,
         deadline_tick: u64,
+        clock: crate::kernel::deadline_token::ReplyDeadlineClock,
     ) -> Result<
         crate::kernel::deadline_token::DeadlineTokenHandle,
         crate::kernel::deadline_token::ReplyDeadlineRegError,
@@ -2132,6 +2133,8 @@ impl KernelState {
             {
                 tcb.ipc_timeout_deadline = Some(deadline_tick);
                 tcb.reply_timeout_token = Some(handle);
+                // Canonical 199E: deadline and clock domain are published together, here only.
+                tcb.reply_timeout_clock = clock;
                 tcb.blocked_recv_generation = blocked_recv_generation;
             }
         });
@@ -2576,6 +2579,149 @@ impl KernelState {
         })
     }
 
+    /// Canonical 199E — the PRODUCTION reply/call deadline registration.
+    ///
+    /// Runs at the committed reply-receive block point, on every build and every boot, for the
+    /// ONE input that already exists: the caller's own `timeout_ticks`. There is no new syscall,
+    /// no new ABI field and no invented deadline — if the caller asked for no timeout, this is a
+    /// strict no-op.
+    ///
+    /// It registers only for a genuine CALL/REPLY receive: a live reply record must already be
+    /// bound to this exact `{caller_tid, caller_asid}` at this exact reply endpoint. An ordinary
+    /// receive has no such record, so it is left to the ordinary receive-timeout class. The
+    /// registration reuses the existing exact token end to end — `reply_terminal_identity` +
+    /// `arm_reply_terminal` + `register_reply_receive_deadline` — so TID, ASID/incarnation, the
+    /// reply record index+generation, the blocked-receive generation and the deadline-token
+    /// generation are all carried unchanged.
+    ///
+    /// The deadline-token generation IS the blocked-receive generation. That generation is minted
+    /// fresh under task rank 2 by the recv-block task phase for every block, so it is unique per
+    /// registration by construction and needs no counter of its own.
+    ///
+    /// Fails CLOSED and silently in every degenerate case — no record, no ASID, a token already
+    /// registered for this caller, a terminal that is not Open, or a full bounded store. A caller
+    /// whose registration fails keeps its `ipc_timeout_deadline` and is therefore still served by
+    /// the ordinary receive-timeout class; it never loses its timeout, it only loses the exact
+    /// reply terminal claim.
+    pub(crate) fn arm_production_reply_deadline(
+        &mut self,
+        caller_tid: u64,
+        reply_eidx: usize,
+        deadline: Option<u64>,
+    ) {
+        let Some(deadline_tick) = deadline else {
+            return;
+        };
+        if deadline_tick == 0 {
+            return;
+        }
+        let Some(caller_asid) = self.task_asid(caller_tid) else {
+            return;
+        };
+        // One registration per blocked receive. On an oracle boot the confined arm above has
+        // already installed its own token for its own endpoint; this must not double-register.
+        if self
+            .reply_timeout_token_for_caller(caller_tid, caller_asid)
+            .is_some()
+        {
+            return;
+        }
+        let caller = ReceiverWaiterIdentity::new(ThreadId(caller_tid), caller_asid);
+        let Some((record_index, record_generation)) =
+            self.find_reply_record_for_caller_endpoint(caller, reply_eidx)
+        else {
+            // Not a reply receive — an ordinary one. Its deadline stays on the ordinary class.
+            return;
+        };
+        let Some(brg) = self.blocked_recv_generation_for(caller_tid, caller_asid) else {
+            return;
+        };
+        let Some(identity) =
+            self.reply_terminal_identity(record_index, record_generation, brg, Some(brg))
+        else {
+            return;
+        };
+        self.arm_reply_terminal(record_index, identity);
+        match self.register_reply_receive_deadline(
+            record_index,
+            record_generation,
+            brg,
+            brg,
+            deadline_tick,
+            // The caller's own `timeout_ticks` was added to `scheduler_tick_now()`, so this
+            // registration is a scheduler-tick deadline on every architecture and every boot,
+            // including a boot where the oracle selector is armed for its own confined workload.
+            crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick,
+        ) {
+            Ok(handle) => {
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_ARMED arch={} caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                    caller_tid,
+                    caller_asid.0,
+                    record_index,
+                    record_generation,
+                    self.reply_terminal_epoch(record_index).unwrap_or(0),
+                    handle.token_index(),
+                    handle.token_generation(),
+                    deadline_tick
+                );
+            }
+            Err(e) => {
+                // Bounded store exhausted or the terminal moved under us. The caller keeps its
+                // deadline and is served by the ordinary class; nothing is left half-armed.
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_ARM_FAIL caller_tid={} err={:?}",
+                    caller_tid,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Canonical 199E — RETIRE the exact reply deadline a caller still holds, exactly once.
+    ///
+    /// The single in-lock release seam. It is keyed on the handle stored in the caller's own TCB,
+    /// so it can only ever cancel THAT registration: a newer one installed by a later block
+    /// carries a different handle, and a caller with no registration is a no-op. Both the
+    /// bounded-store slot and the TCB reference are cleared, which is what stops the 4-slot
+    /// registry leaking a slot per completed call.
+    ///
+    /// Returns `true` iff a live registration was retired here.
+    pub(crate) fn retire_reply_deadline_for_tid(&mut self, tid: u64) -> bool {
+        // The handle is read off the LIVE TCB at this TID and then re-validated against its own
+        // terminal identity: the registration must name this exact `{tid, asid}` incarnation.
+        // A bare-TID match would let a replacement incarnation that reused the number retire a
+        // registration that is not its own, so the ASID is part of the key, not context.
+        let Some(handle) = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| {
+                    let h = t.reply_timeout_token?;
+                    let owner = h.identity().terminal_identity;
+                    (owner.caller_tid.0 == tid && Some(owner.caller_asid) == t.asid).then_some(h)
+                })
+        }) else {
+            return false;
+        };
+        let disarmed = self.with_ipc_state_mut(|ipc| {
+            ipc.reply_deadline_tokens
+                .get_mut(handle.token_index())
+                .is_some_and(|t| {
+                    t.disarm_after_terminal_completion(handle.identity(), handle.epoch())
+                })
+        });
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)
+                && tcb.reply_timeout_token == Some(handle)
+            {
+                tcb.reply_timeout_token = None;
+            }
+        });
+        disarmed
+    }
+
     /// Stage 200C2A — oracle-gated: at the committed reply-receive block point, arm
     /// the terminal cell for the caller's reply record and register a reply-timeout
     /// deadline referencing the exact token. Fires ONLY for the oracle's confined
@@ -2698,6 +2844,12 @@ impl KernelState {
             brg,
             token_gen,
             deadline_tick,
+            // The confined oracle scenario is the ONLY registration in the hardware-counter
+            // domain: on AArch64/RISC-V `deadline_tick` was computed as `reply_timeout_hw_now() +
+            // delta` just above, because those ports have no advancing scheduler tick under a
+            // user workload. On x86_64 that domain IS the scheduler tick (there is no hardware
+            // branch to read), so the tag is uniform while the value it selects stays per-port.
+            crate::kernel::deadline_token::ReplyDeadlineClock::OracleHardware,
         ) {
             Ok(handle) => {
                 crate::yarm_log!(
@@ -3310,6 +3462,12 @@ impl KernelState {
     }
 
     fn clear_ipc_timeout_for_tid(&mut self, tid: u64) -> Result<(), KernelError> {
+        // Canonical 199E: a wake is a terminal outcome for this receive — a delivered reply, a
+        // destroyed endpoint, a dead peer or an exit. Whatever caused it, the caller's reply
+        // deadline is over, so its bounded-store slot is returned HERE, at the single in-lock
+        // wake seam, rather than at each of the several delivery paths that reach it. Keyed on
+        // the TCB's own handle, so it retires that registration and no other, exactly once.
+        self.retire_reply_deadline_for_tid(tid);
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
@@ -3346,6 +3504,15 @@ impl KernelState {
             let fired = tcb.ipc_timeout_fired;
             tcb.ipc_timeout_fired = false;
             Ok::<_, KernelError>(fired)
+        })
+        .inspect(|fired| {
+            // Canonical 199E: THE delivery point for a receive timeout. If an off-lock settle
+            // armed the class-retirement seal, this is where it becomes true — a resumed
+            // receiver has now consumed the exact `TimedOut` fact it published. Arming alone
+            // never emits, so a committed-but-undelivered timeout cannot claim the class retired.
+            if *fired {
+                crate::kernel::boot::maybe_emit_recv_timeout_class_retired();
+            }
         })
     }
 
@@ -3621,6 +3788,11 @@ impl KernelState {
         // reply endpoint / with no finite deadline, so ordinary receives are unchanged.
         #[cfg(feature = "ipc-reply-timeout-oracle-core")]
         self.maybe_arm_reply_timeout_oracle(plan.blocked_tid.0, plan.endpoint_idx, deadline);
+        // Canonical 199E: the PRODUCTION registration, ungated. A strict no-op unless the caller
+        // supplied a finite timeout AND a live reply record is bound to this exact caller at
+        // this exact reply endpoint, so an ordinary receive is untouched. On an oracle boot the
+        // confined arm above has already registered and this refuses.
+        self.arm_production_reply_deadline(plan.blocked_tid.0, plan.endpoint_idx, deadline);
         if crate::kernel::boot::d2_recv_genuine_enabled() {
             // Stage 168 (D2-GENUINE-RECV): ipc publish done; enter dispatch.
             crate::yarm_log!("D2_RECV_GENUINE_PHASE_IPC_LOCK tid={}", plan.blocked_tid.0);
@@ -4147,6 +4319,13 @@ impl KernelState {
                     if n >= TIMEOUT_SCAN_CHUNK {
                         break;
                     }
+                    // Canonical 199E: this binding is retained deliberately. Every class the loop
+                    // once compared now belongs to the off-lock pipeline and is skipped
+                    // unconditionally below, which makes the comparison further down unreachable —
+                    // so clippy reports the binding unused while rustc still resolves the use. The
+                    // retired body is preserved verbatim rather than deleted, so the warning is
+                    // ACCEPTED rather than silenced: removing the binding would require editing the
+                    // preserved body, and an `_` prefix would not compile against that same use.
                     let Some(deadline) = tcb.ipc_timeout_deadline else {
                         continue;
                     };
@@ -4166,6 +4345,16 @@ impl KernelState {
                     if matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {
                         continue;
                     }
+                    // Canonical 199E — the LAST class leaves. The ordinary RECEIVE deadline is
+                    // now collected by `SharedKernel::collect_due_ipc_timeout_work` and settled
+                    // by `drain_recv_timeout_post_work`, off the broad lock, exactly as the
+                    // reply and blocking-send classes already were. With it gone this scan owns
+                    // NO timeout class at all: every remaining arm below is unreachable by
+                    // construction and is kept only so the phase sequence, its markers and its
+                    // rank order stay a single reviewable body rather than being deleted and
+                    // re-derived elsewhere.
+                    continue;
+                    #[allow(unreachable_code)]
                     if !matches!(
                         tcb.status,
                         TaskStatus::Blocked(WaitReason::EndpointReceive(_))

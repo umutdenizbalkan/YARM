@@ -3808,7 +3808,7 @@ classification table's):
 | file | function | sites |
 |---|---|---|
 | `ipc_state.rs` | `rt_commit_receiver_runnable`, `wake_tid_to_runnable`, `process_ipc_timeout_deadlines`, `signal_notification`, `wake_destroyed_notification_waiter` | 5 |
-| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`, `wake_tid_to_runnable_split` | 5 |
+| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`, `wake_tid_to_runnable_split`, `drain_recv_timeout_post_work` | 6 |
 | `restart_state.rs` | `exit_task`, `restart_task`, `mark_task_dead`, `reap_faulted_task_noalloc_cleanup` | 4 |
 | `exec_state.rs` | `spawn_user_task_from_image`, `dispatch_next_task`, `yield_current` ×2, `yield_current_to` ×2 | 6 |
 | `scheduler_state.rs` | `apply_cross_cpu_wake_task` | 1 |
@@ -3825,6 +3825,7 @@ classification table's):
 | `wake_waiter_for_endpoint` | `send_message_to_endpoint_and_wake`, `ipc_send_with_optional_deadline` ×2 | 3 |
 | `apply_cross_cpu_wake_task` | `apply_cross_cpu_work` (the `WorkItem::WakeTask` drain) | 1 |
 | `rt_commit_receiver_runnable` | `complete_reply_timeout_over`, `complete_server_death_over` | 2 |
+| `drain_recv_timeout_post_work` | `run_due_ipc_timeout_work` (the single production timeout entry) | 1 |
 
 > **U3 (canonical 203C) — blocked-waiter Phase-C completions.** The three `runtime.rs` Phase-C
 > completions (`execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`,

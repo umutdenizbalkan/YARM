@@ -351,6 +351,11 @@ impl KernelState {
         );
         let _ = self.revoke_reply_caps_for_caller_identity(dead_identity);
         let _ = self.revoke_reply_caps_for_replier_identity(dead_identity);
+        // Canonical 199E: a dead task can never consume a reply, so its reply deadline is over.
+        // Return the bounded-store slot here — the exit path does not go through the wake seam
+        // that retires it on every other terminal outcome, and a leaked Armed slot would both
+        // exhaust the registry and leave a registration naming a task that no longer exists.
+        self.retire_reply_deadline_for_tid(tid);
         self.clear_ipc_waiters_for_tid(tid);
         let _ = self.release_kernel_context(tid);
         let _ = self.revoke_driver_runtime_caps(tid);

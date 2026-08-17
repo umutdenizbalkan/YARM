@@ -680,16 +680,32 @@ mod tests {
 
         // Deadline tick: the blocked receiver fires; waiter slot cleared;
         // task runnable with ipc_timeout_fired staged for the recv return.
-        let fired = state
-            .process_ipc_timeout_deadlines(deadline_tick)
-            .expect("deadline tick");
-        assert_eq!(fired, 1, "deadline must fire at the staged tick");
+        // Canonical 199E: the staged deadline is fired by the PRODUCTION off-lock pipeline.
+        // The staging property under test is unchanged — the deadline rode with the live
+        // publish and fires at exactly the staged tick, clearing the waiter slot.
         assert_eq!(
-            state.endpoint_waiter_tid(endpoint_obj),
-            None,
-            "expired waiter must be cleared from the endpoint slot"
+            state
+                .process_ipc_timeout_deadlines(deadline_tick)
+                .expect("deadline tick"),
+            0,
+            "the broad-lock scan no longer owns the receive class"
         );
-        assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
+        let cpu = crate::kernel::scheduler::CpuId(0);
+        let k = crate::runtime::SharedKernel::new(state);
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(cpu.0 as usize);
+        k.run_due_ipc_timeout_work_at(cpu, deadline_tick, deadline_tick, deadline_tick);
+        k.with(|state| {
+            assert_eq!(
+                state.endpoint_waiter_tid(endpoint_obj),
+                None,
+                "expired waiter must be cleared from the endpoint slot"
+            );
+            assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
+            assert!(
+                state.consume_ipc_timeout_fired_for_tid(0).expect("consume"),
+                "and the staged timeout fact is delivered to the recv return"
+            );
+        });
     }
 
     fn fresh_endpoint(state: &mut KernelState) -> (usize, CapId, CapId) {

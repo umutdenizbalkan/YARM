@@ -1046,12 +1046,12 @@ pub fn bootstrap_first_user_task(
     // plus slot 15 for the mode (1=timeout-wins, 2=reply-wins). Mutually exclusive with EVERY slot-5/
     // 13/14 oracle above (it only fires when they are all zero), so a conflicting oracle already armed
     // leaves this one stood down. Transactional + fail-closed.
+    // Canonical 199E: provisioned by the COMPILE-TIME feature, not by the runtime selector, so
+    // the same client can be run with the selector OFF — where the oracle pre-arm stands down and
+    // the PRODUCTION reply-deadline registration owns the token. Still mutually exclusive with
+    // every other slot-5/13/14 oracle, and still absent entirely without the feature.
     #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
-    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled()
-        && init_args[5] == 0
-        && init_args[13] == 0
-        && init_args[14] == 0
-    {
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
         if let Some(caps) = crate::kernel::boot::provision_init_ipc_reply_timeout_oracle(
             kernel,
             RING3_INIT_SERVER_TID,
@@ -1062,7 +1062,7 @@ pub fn bootstrap_first_user_task(
             // in `yarm_ipc_abi::ipc_reply_liveness_abi` — the exact inverse of the decoder
             // userspace applies — so the kernel never hand-writes a slot-5 number and the
             // two sides cannot drift apart.
-            init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);
+            init_args[5] = crate::kernel::boot::ipc_reply_timeout_workload_selector();
             init_args[13] = caps.request_ep_cap as u64;
             init_args[14] = caps.reply_ep_cap as u64;
             crate::yarm_log!(

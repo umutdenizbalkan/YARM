@@ -103,7 +103,14 @@ if (( ! fail )); then
   # timeouts are processed — only which oracle SCENARIOS are built.
   #
   # (a) The oracle's own scenario literals must still be absent from a feature-OFF kernel.
-  for lit in "IPC_REPLY_BEATS_TIMEOUT_OK arch=" "IPC_REPLY_TIMEOUT_ARMED arch="; do
+  #
+  # Canonical 199E moved "IPC_REPLY_TIMEOUT_ARMED arch=" out of this half and into (b). It is
+  # no longer an oracle-only literal: `KernelState::arm_production_reply_deadline` is
+  # unconditional production code — no `#[cfg]`, no runtime selector — and emits the same
+  # arch-neutral `IPC_REPLY_TIMEOUT_ARMED arch={}` format string at the committed
+  # reply-receive block point, so the literal is compiled into EVERY image, feature-OFF
+  # included. Asserting its absence would now assert that production registration is absent.
+  for lit in "IPC_REPLY_BEATS_TIMEOUT_OK arch="; do
     rg -a -q "$lit" "$OFF_BIN" && die "feature-OFF kernel contains oracle literal $lit (not marker-clean)"
   done
   # (b) The PRODUCTION pipeline's literals must now be PRESENT in a feature-OFF kernel. Their
@@ -119,7 +126,8 @@ if (( ! fail )); then
   # x86_64 the drain itself is the delivery point, so the seal is present there.
   for lit in "IPC_REPLY_TIMEOUT_OK arch=" "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=" \
              "IPC_REPLY_TIMEOUT_LATE_SCAN arch=" \
-             "IPC_REPLY_TIMEOUT_DEFERRED arch="; do
+             "IPC_REPLY_TIMEOUT_DEFERRED arch=" \
+             "IPC_REPLY_TIMEOUT_ARMED arch="; do
     rg -a -q "$lit" "$OFF_BIN" || die "feature-OFF kernel is missing PRODUCTION literal $lit (the U7 pipeline must not be feature-gated)"
   done
 fi
@@ -152,6 +160,56 @@ verify_log() {
     [[ "$c" == "1" ]] || die "marker count != 1 (got $c): $m"
   done
 }
+# ── Canonical 199E: ORACLE-SCOPED settlement accounting ──────────────────────────────────────
+#
+# Production reply/call registration is live on every boot now, so the ARMED and OK marker
+# FAMILIES are no longer oracle-specific: an unrelated production caller legitimately arms its own
+# reply deadline in the same cell, and where its scheduler-tick deadline elapses it legitimately
+# settles too. Counting the family and calling the result "the oracle's" was therefore wrong, and
+# it is wrong in the dangerous direction — it fails on correct behaviour.
+#
+# These helpers scope the oracle's assertions to the oracle's EXACT caller identity, taken from
+# the provisioning marker rather than hardcoded, and keep a family-level bound that a duplicate
+# settlement cannot satisfy. Nothing is loosened: the identity check is STRICTER than the family
+# count it replaces, every settlement line must still carry the full field contract, and the
+# oracle's one-shot terminal seals stay at exactly one.
+oracle_init_tid() {
+  rg -a -o -m1 'IPC_REPLY_TIMEOUT_ORACLE_PROVISION_OK init_tid=[0-9]+' "$1" 2>/dev/null \
+    | rg -a -o '[0-9]+$' || true
+}
+
+# Exactly ONE registration for the oracle's own caller identity.
+verify_oracle_armed_once() {
+  local norm="$1" arch="$2" tid c
+  tid="$(oracle_init_tid "$norm")"
+  [[ -n "$tid" ]] || die "no oracle provisioning marker: the oracle identity cannot be scoped"
+  c=$(rg -a -c -F "IPC_REPLY_TIMEOUT_ARMED arch=${arch} caller_tid=${tid} " "$norm" 2>/dev/null || echo 0)
+  [[ "$c" == "1" ]] || die "oracle-identity ARMED count != 1 (got $c) for caller_tid=${tid}"
+}
+
+# No DUPLICATE settlement anywhere, and every settlement carries the exact field contract.
+verify_no_duplicate_settlement() {
+  local norm="$1" arch="$2" full="$3" armed ok okfull
+  armed=$(rg -a -c -F "IPC_REPLY_TIMEOUT_ARMED arch=${arch} " "$norm" 2>/dev/null || echo 0)
+  ok=$(rg -a -c -F "IPC_REPLY_TIMEOUT_OK arch=${arch} terminal=Timeout" "$norm" 2>/dev/null || echo 0)
+  okfull=$(rg -a -c -F "$full" "$norm" 2>/dev/null || echo 0)
+  (( ok >= 1 )) || die "no timeout settlement at all"
+  (( ok <= armed )) || die "settlements ($ok) exceed registrations ($armed) — duplicate settlement"
+  [[ "$okfull" == "$ok" ]] \
+    || die "a settlement line does not carry the exact contract ($okfull of $ok match): $full"
+}
+
+# The reply-wins variant: the ORACLE's record must not be settled by timeout, but an unrelated
+# production caller's own deadline may legitimately elapse in the same boot, so zero settlements
+# is permitted while a settlement WITHOUT a matching registration (a duplicate) is not. The
+# oracle's own outcome stays sealed by the identity-bearing reply-win markers the cell asserts.
+verify_settlements_within_registrations() {
+  local norm="$1" arch="$2" armed ok
+  armed=$(rg -a -c -F "IPC_REPLY_TIMEOUT_ARMED arch=${arch} " "$norm" 2>/dev/null || echo 0)
+  ok=$(rg -a -c -F "IPC_REPLY_TIMEOUT_OK arch=${arch} terminal=Timeout" "$norm" 2>/dev/null || echo 0)
+  (( ok <= armed )) || die "settlements ($ok) exceed registrations ($armed) — duplicate settlement"
+}
+
 forbid_log() {
   local norm="$1"; shift
   local m
@@ -167,9 +225,10 @@ if (( ! fail )); then
   boot_mode timeout-wins "$LOGDIR/boot-timeout-wins.log"
   TW="$LOGDIR/tw.norm.log"; tr '\r' '\n' <"$LOGDIR/boot-timeout-wins.log" >"$TW"
   [[ -s "$TW" ]] || die "no timeout-wins boot log"
+  verify_oracle_armed_once "$TW" aarch64
+  verify_no_duplicate_settlement "$TW" aarch64 \
+    "IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok"
   verify_log "$TW" \
-    "IPC_REPLY_TIMEOUT_ARMED arch=aarch64" \
-    "IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok" \
     "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok" \
     "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=aarch64 scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok" \
     "IPC_REPLY_TIMEOUT_DEFERRED arch=aarch64 published=1 drained=1 result=ok" \
@@ -211,14 +270,14 @@ if (( ! fail )); then
   RW="$LOGDIR/rw.norm.log"; tr '\r' '\n' <"$LOGDIR/boot-reply-wins.log" >"$RW"
   [[ -s "$RW" ]] || die "no reply-wins boot log"
   verify_log "$RW" \
-    "IPC_REPLY_TIMEOUT_ARMED arch=aarch64" \
     "IPC_REPLY_BEATS_TIMEOUT_OK arch=aarch64 terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok" \
     "IPC_REPLY_TIMEOUT_LATE_SCAN arch=aarch64 outcome=reply_won late_timeout_claims=0 result=ok" \
     "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=aarch64 scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok" \
     "AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok" \
     "IPC_REPLY_TIMEOUT_ORACLE_SERVER_DUP_REPLY rejected=1"
+  verify_oracle_armed_once "$RW" aarch64
+  verify_settlements_within_registrations "$RW" aarch64
   forbid_log "$RW" \
-    "IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout" \
     "scan_broad_lock=1" \
     "KERNEL PANIC" "RUST PANIC" "panicked at" "SYNCHRONOUS EXCEPTION" "Unhandled"
   recheck_sha_clean

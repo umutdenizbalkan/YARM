@@ -86,6 +86,37 @@ impl DeadlineTokenIdentity {
     };
 }
 
+/// Canonical 199E — the CLOCK DOMAIN one reply-deadline registration is expressed in.
+///
+/// A reply deadline is only meaningful against the clock that produced it, and this kernel
+/// has two live sources that cannot be compared:
+///
+/// * [`Self::ProductionTick`] — `scheduler_tick_now() + timeout_ticks`, the one deadline ABI a
+///   user can ask for. Every `arm_production_reply_deadline` registration is in this domain, on
+///   all three architectures.
+/// * [`Self::OracleHardware`] — the AArch64/RISC-V reply-timeout oracle's hardware-counter
+///   deadline (`CNTPCT_EL0` / the RISC-V `time` CSR). Those cooperative ports have no periodic
+///   scheduler tick, so the confined proof scenario needs a clock that advances under a user
+///   workload. ONLY `maybe_arm_reply_timeout_oracle` registers in this domain.
+///
+/// The two are orders of magnitude apart, so a selector-global "reply now" is invalid: judging a
+/// production tick deadline against a hardware counter makes every one of them instantly due, and
+/// judging an oracle counter deadline against ticks makes it never due. The domain is therefore
+/// stored PER REGISTRATION at its arm site and is immutable for that registration's life — the
+/// selector can provision a proof workload's clock but can never reinterpret a production
+/// deadline that is already armed.
+///
+/// This is a plain `Copy` discriminant living in the existing per-TCB registration state: it
+/// allocates nothing, adds no queue, and carries no per-architecture policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplyDeadlineClock {
+    /// Scheduler ticks — every production reply/call registration.
+    #[default]
+    ProductionTick,
+    /// The architecture's monotonic hardware counter — the oracle's confined scenario only.
+    OracleHardware,
+}
+
 /// Stage 200C1 — a deterministic failure to REGISTER a reply-receive deadline
 /// (the composed production registration transaction). Every variant leaves the
 /// caller un-mutated so the block path can roll back cleanly.
