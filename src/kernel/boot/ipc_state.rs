@@ -2700,8 +2700,6 @@ impl KernelState {
             deadline_tick,
         ) {
             Ok(handle) => {
-                // Gate the retired off-lock scan attestation: a deadline is now live.
-                crate::kernel::boot::set_reply_timeout_armed_any();
                 crate::yarm_log!(
                     "IPC_REPLY_TIMEOUT_ARMED arch={} caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
                     crate::kernel::boot::REPLY_TIMEOUT_ARCH,
@@ -4117,21 +4115,30 @@ impl KernelState {
         // nested, so no lower-rank lock is ever taken while a higher-rank lock is
         // held.
         const TIMEOUT_SCAN_CHUNK: usize = 32;
-        // Stage 200C2B: token-bearing REPLY-receive deadlines are NO LONGER completed
-        // here under the broad lock. The narrow collector + OFF-LOCK drain
-        // (`SharedKernel::collect_due_reply_timeout_work` /
-        // `drain_reply_timeout_post_work`) run at the trap-entry post-lock area with the
-        // broad `SpinLock<KernelState>` already dropped. This ordinary scan STILL SKIPS
-        // token-bearing TCBs (below), so ordinary and reply-receive deadlines stay
-        // cleanly distinguished and ordinary behavior is byte-for-byte unchanged.
+        // U7 (canonical 199E) — BOTH retired classes are gone from this broad-lock scan.
+        //
+        // Neither a token-bearing REPLY-receive deadline nor a blocking-SEND deadline is
+        // completed here any more. They are collected and settled by the production
+        // arch-neutral pipeline at the post-lock area of every port's trap wrapper
+        // (`SharedKernel::run_due_ipc_timeout_work` → `collect_due_ipc_timeout_work` →
+        // `drain_reply_timeout_post_work` / `drain_send_timeout_post_work`), with the broad
+        // `SpinLock<KernelState>` already dropped. Both are SKIPPED below, so what remains
+        // here is exactly one class — the ORDINARY receive-timeout deadline — and its behavior
+        // is byte-for-byte what it was.
+        //
+        // The skips are unconditional. Under Stage 200C2B the reply skip was gated on the
+        // oracle feature, because without the feature nothing off-lock would have completed a
+        // token-bearing deadline; the pipeline is production now, so gating the skip would
+        // hand one class to two owners.
         let proof = crate::kernel::boot::sched_timeout_enabled();
         let mut total = 0usize;
         let mut scan_announced = false;
         loop {
-            // `(tid, is_send, asid)` — `is_send` classifies the SCHED_TIMEOUT_EXPIRED kind; `asid` is
-            // the timed-out task's captured ASID (Stage 198E3B2B2), so the endpoint receive-waiter is
-            // cleared by COMPLETE identity, never numeric TID alone.
-            let mut expired: [Option<(ThreadId, bool, Asid)>; TIMEOUT_SCAN_CHUNK] =
+            // `(tid, asid)` — `asid` is the timed-out task's captured ASID (Stage 198E3B2B2), so
+            // the endpoint receive-waiter is cleared by COMPLETE identity, never numeric TID
+            // alone. U7 (199E) dropped the `is_send` discriminant with the class: every entry
+            // this scan can now select is an ORDINARY receive timeout.
+            let mut expired: [Option<(ThreadId, Asid)>; TIMEOUT_SCAN_CHUNK] =
                 [None; TIMEOUT_SCAN_CHUNK];
             let mut n = 0usize;
             // Phase 1 (task rank 2): mark up to CHUNK expired tasks Runnable.
@@ -4143,60 +4150,33 @@ impl KernelState {
                     let Some(deadline) = tcb.ipc_timeout_deadline else {
                         continue;
                     };
-                    // Stage 200C2A: a token-bearing REPLY-receive deadline is completed
-                    // by the reply-timeout pre-pass above (the shared terminal
-                    // transaction), never by this ordinary loop — so an ordinary and a
-                    // reply-receive deadline are cleanly distinguished.
-                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                    // A token-bearing REPLY-receive deadline belongs to the off-lock reply
+                    // pipeline (the shared terminal transaction), never to this loop.
                     if tcb.reply_timeout_token.is_some() {
                         continue;
                     }
-                    let is_send = match tcb.status {
-                        TaskStatus::Blocked(WaitReason::EndpointReceive(_)) => false,
-                        TaskStatus::Blocked(WaitReason::EndpointSend(_)) => true,
-                        _ => continue,
-                    };
+                    // U7 §3B/§4: a blocking-SEND deadline belongs to the off-lock send
+                    // pipeline. It is skipped here for the same reason and by the same rule —
+                    // one class, one owner. The U6 `TimedOut` completion publication that used
+                    // to live in this loop moved WITH the class to
+                    // `SharedKernel::drain_send_timeout_post_work`, where it is published in
+                    // the same rank-2 acquisition that makes the sender `Runnable`, so
+                    // publish-before-wake still holds and the receiver/timeout race is still
+                    // decided by whichever of the two claims the blocked sender first.
+                    if matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {
+                        continue;
+                    }
+                    if !matches!(
+                        tcb.status,
+                        TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                    ) {
+                        continue;
+                    }
                     if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {
-                        // U6 §2 — TIMED-OUT SEND: publish the `TimedOut` completion for this
-                        // exact blocking cycle BEFORE anything makes the sender runnable.
-                        //
-                        // This is the timeout-side sibling of the receiver-side publication in
-                        // `apply_split_sender_wake_plan`, and it must happen HERE rather than
-                        // beside the Phase-3 enqueue for two reasons: the status is about to
-                        // become `Runnable`, which is no longer a completable state; and the
-                        // generation that identifies the cycle is on this very TCB, under the
-                        // rank-2 lock we already hold. Phase 3's enqueue — the actual wake — is
-                        // strictly later, so publish-before-wake holds.
-                        //
-                        // A receiver that consumed this sender's message first will have
-                        // already published SUCCESS and woken it, so this task would no longer
-                        // be `Blocked(EndpointSend)` and would not be selected by the `is_send`
-                        // match above: receiver-before-timeout keeps the success result, and
-                        // timeout-before-receiver makes the later receiver-side publication
-                        // refuse against a sender that is no longer blocked. Exactly one of the
-                        // two publishes, whichever ran first.
-                        if is_send && let Some(asid) = tcb.asid {
-                            tcb.pending_syscall_completion =
-                                Some(crate::kernel::task::BlockedSyscallCompletion {
-                                    syscall_class:
-                                        crate::kernel::task::BlockedSyscallClass::IpcSend,
-                                    result: Self::SEND_COMPLETION_TIMED_OUT,
-                                    tid: tcb.tid.0,
-                                    asid,
-                                    blocked_generation: tcb.blocked_send_generation,
-                                });
-                            crate::yarm_log!(
-                                "U6_SEND_COMPLETION_PUBLISHED tid={} asid={} send_generation={} result={} result=ok",
-                                tcb.tid.0,
-                                asid.0,
-                                tcb.blocked_send_generation,
-                                Self::SEND_COMPLETION_TIMED_OUT
-                            );
-                        }
                         tcb.status = TaskStatus::Runnable;
                         tcb.ipc_timeout_deadline = None;
                         tcb.ipc_timeout_fired = true;
-                        expired[n] = Some((tcb.tid, is_send, tcb.asid.unwrap_or(Asid(0))));
+                        expired[n] = Some((tcb.tid, tcb.asid.unwrap_or(Asid(0))));
                         n += 1;
                     }
                 }
@@ -4211,11 +4191,11 @@ impl KernelState {
                     scan_announced = true;
                 }
                 for entry in expired.iter().take(n).flatten() {
-                    crate::yarm_log!(
-                        "SCHED_TIMEOUT_EXPIRED tid={} kind={}",
-                        entry.0.0,
-                        if entry.1 { "send" } else { "recv" }
-                    );
+                    // U7 (199E): `kind` is now invariably `recv` — the blocking-SEND class is
+                    // retired from this scan and reports through its own off-lock markers
+                    // (`U7_SEND_TIMEOUT_SETTLED`). The field is kept so the phase sequence and
+                    // its exactly-once EXPIRED == RUNQUEUE_ENQUEUE accounting are unchanged.
+                    crate::yarm_log!("SCHED_TIMEOUT_EXPIRED tid={} kind=recv", entry.0.0);
                 }
                 crate::yarm_log!("SCHED_TIMEOUT_TASK_WAKE_BEGIN count={}", n);
             }
@@ -4234,7 +4214,7 @@ impl KernelState {
             self.with_ipc_state_mut(|ipc| {
                 for entry in expired.iter().take(n).flatten() {
                     let tid = entry.0;
-                    let identity = ReceiverWaiterIdentity::new(tid, entry.2);
+                    let identity = ReceiverWaiterIdentity::new(tid, entry.1);
                     // Endpoint receive-waiter: cleared by COMPLETE identity (never numeric TID alone).
                     ipc.clear_endpoint_waiters_for_identity(identity);
                     for (endpoint_idx, queue) in ipc.endpoint_sender_waiters.iter_mut().enumerate()
@@ -4263,7 +4243,7 @@ impl KernelState {
                 // unless the clear loop has a bug.
                 for entry in expired.iter().take(n).flatten() {
                     let tid = entry.0;
-                    let identity = ReceiverWaiterIdentity::new(tid, entry.2);
+                    let identity = ReceiverWaiterIdentity::new(tid, entry.1);
                     let remains = ipc.any_endpoint_waiter_is(identity)
                         || ipc
                             .endpoint_sender_waiters

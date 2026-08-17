@@ -1187,38 +1187,70 @@ fn ipc_recv_deadline_timeout_wakes_blocked_waiter_on_timer_tick() {
 
 #[test]
 fn ipc_send_deadline_timeout_wakes_blocked_sender_on_timer_tick() {
-    let mut state = Bootstrap::init().expect("init");
-    state.set_timer_for_test(Timer::new(1));
-    state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch to task1");
-    let blocked_tid = state.current_tid().expect("running tid");
+    // U7 (canonical 199E): the timer trap still runs the broad-lock scan, but the blocking-send
+    // class is no longer processed there — the production off-lock pipeline that every port's
+    // trap wrapper drives immediately after the broad guard drops owns it. This test therefore
+    // asserts BOTH halves of the retirement: the in-lock trap leaves the sender blocked, and
+    // the post-lock pipeline wakes it with the timeout marker set.
+    let cpu = CpuId(0);
+    let k = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+    crate::kernel::boot::reset_ipc_timeout_scan_cursor(cpu.0 as usize);
+    crate::kernel::boot::send_timeout_work_clear(cpu.0 as usize);
+    let (blocked_tid, send_cap, deadline) = k.with(|state| {
+        state.set_timer_for_test(Timer::new(1));
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch to task1");
+        let blocked_tid = state.current_tid().expect("running tid");
 
-    let (_eid, send_cap, _recv_cap) = state
-        .create_endpoint_with_mode(1, EndpointMode::Synchronous)
-        .expect("endpoint");
-    let msg = Message::new(1, b"x").expect("msg");
-    let send_result = state.ipc_send_with_deadline(send_cap, msg, 1);
-    assert_eq!(send_result, Err(KernelError::WouldBlock));
-    assert_eq!(
-        state.task_status(blocked_tid),
-        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
-    );
+        let (_eid, send_cap, _recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+        let msg = Message::new(1, b"x").expect("msg");
+        let send_result = state.ipc_send_with_deadline(send_cap, msg, 1);
+        assert_eq!(send_result, Err(KernelError::WouldBlock));
+        assert_eq!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+        );
+        let deadline = state
+            .with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == blocked_tid)
+                    .and_then(|t| t.ipc_timeout_deadline)
+            })
+            .expect("a deadline rode with the block");
 
-    state
-        .handle_trap(Trap::TimerInterrupt, None)
-        .expect("timer trap");
-
-    assert!(matches!(
-        state.task_status(blocked_tid),
-        Some(TaskStatus::Runnable | TaskStatus::Running)
-    ));
-    assert!(
         state
-            .consume_ipc_timeout_fired_for_tid(blocked_tid)
-            .expect("consume timeout marker"),
-        "timeout marker should be set when send wait times out"
-    );
+            .handle_trap(Trap::TimerInterrupt, None)
+            .expect("timer trap");
+        assert_eq!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap))),
+            "the broad-lock scan must not touch the retired blocking-send class"
+        );
+        (blocked_tid, send_cap, deadline)
+    });
+    let _ = send_cap;
+
+    // The post-lock area of the trap, which is where the production pipeline runs.
+    let now = deadline.wrapping_add(1);
+    k.collect_due_ipc_timeout_work(now, now, cpu);
+    k.drain_send_timeout_post_work(cpu, now);
+
+    k.with(|state| {
+        assert!(matches!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Runnable | TaskStatus::Running)
+        ));
+        assert!(
+            state
+                .consume_ipc_timeout_fired_for_tid(blocked_tid)
+                .expect("consume timeout marker"),
+            "timeout marker should be set when send wait times out"
+        );
+    });
 }
 
 #[test]
@@ -18161,54 +18193,65 @@ fn recv_timeout_process_clears_endpoint_waiter_and_deadline() {
 
 #[test]
 fn send_deadline_process_clears_sender_waiter_and_deadline() {
-    // process_ipc_timeout_deadlines must clear the sender waiter slot when a
-    // send-blocked task's deadline expires.
-    let mut state = Bootstrap::init().expect("init");
-    state.register_task(281).expect("task");
-    let (ep_idx, send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
-
-    state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
-            asid: None,
-            send_generation: 0,
-            tid: crate::kernel::ipc::ThreadId(281),
-            msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
+    // U7 (canonical 199E): the blocking-send timeout class is settled by the PRODUCTION
+    // off-lock pipeline, not by `process_ipc_timeout_deadlines`. The invariant under test is
+    // unchanged — an expired send deadline clears the sender-waiter slot and the TCB deadline
+    // and makes the sender Runnable — only the owner moved, so the test drives the owner.
+    let cpu = CpuId(0);
+    let k = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+    crate::kernel::boot::reset_ipc_timeout_scan_cursor(cpu.0 as usize);
+    crate::kernel::boot::send_timeout_work_clear(cpu.0 as usize);
+    let (ep_idx, send_cap) = k.with(|state| {
+        state.register_task(281).expect("task");
+        let (ep_idx, send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+                asid: None,
+                send_generation: 0,
+                tid: crate::kernel::ipc::ThreadId(281),
+                msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
+            });
         });
+        state
+            .with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 281).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
+                tcb.ipc_timeout_deadline = Some(10);
+                tcb.ipc_timeout_fired = false;
+                Ok::<_, KernelError>(())
+            })
+            .expect("inject blocked state");
+        assert_eq!(state.sender_waiter_count(ep_idx), 1, "sender waiter injected");
+        assert_eq!(state.ipc_deadline_count_for_tid(281), 1, "deadline set");
+        // The retired owner must find nothing: one class, one owner.
+        assert_eq!(
+            state.process_ipc_timeout_deadlines(10).expect("timeout"),
+            0,
+            "the broad-lock scan must no longer expire the blocking-send class"
+        );
+        (ep_idx, send_cap)
     });
-    state
-        .with_tcbs_mut(|tcbs| {
-            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 281).unwrap();
-            tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
-            tcb.ipc_timeout_deadline = Some(10);
-            tcb.ipc_timeout_fired = false;
-            Ok::<_, KernelError>(())
-        })
-        .expect("inject blocked state");
+    let _ = send_cap;
 
-    assert_eq!(
-        state.sender_waiter_count(ep_idx),
-        1,
-        "sender waiter injected"
-    );
-    assert_eq!(state.ipc_deadline_count_for_tid(281), 1, "deadline set");
+    k.collect_due_ipc_timeout_work(10, 10, cpu);
+    k.drain_send_timeout_post_work(cpu, 10);
 
-    let expired = state.process_ipc_timeout_deadlines(10).expect("timeout");
-    assert_eq!(expired, 1, "one task expired");
-
-    assert_eq!(
-        state.sender_waiter_count(ep_idx),
-        0,
-        "sender waiter slot must be cleared after send-deadline timeout"
-    );
-    assert_eq!(
-        state.ipc_deadline_count_for_tid(281),
-        0,
-        "TCB deadline must be cleared after send deadline fires"
-    );
-    assert!(
-        state.task_is_runnable(281),
-        "sender must become Runnable after timeout"
-    );
+    k.with(|state| {
+        assert_eq!(
+            state.sender_waiter_count(ep_idx),
+            0,
+            "sender waiter slot must be cleared after send-deadline timeout"
+        );
+        assert_eq!(
+            state.ipc_deadline_count_for_tid(281),
+            0,
+            "TCB deadline must be cleared after send deadline fires"
+        );
+        assert!(
+            state.task_is_runnable(281),
+            "sender must become Runnable after timeout"
+        );
+    });
 }
 
 #[test]
@@ -18714,47 +18757,55 @@ fn wake_task_cross_cpu_work_skips_runnable_task() {
 #[test]
 fn repeated_send_deadline_cycles_no_stale_sender_waiter() {
     // Stress: 4 iterations of inject sender waiter + deadline → timeout → verify cleared.
-    let mut state = Bootstrap::init().expect("init");
-    let (ep_idx, send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+    // U7 (199E): driven through the PRODUCTION off-lock pipeline that now owns the class.
+    let cpu = CpuId(0);
+    let k = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+    crate::kernel::boot::reset_ipc_timeout_scan_cursor(cpu.0 as usize);
+    crate::kernel::boot::send_timeout_work_clear(cpu.0 as usize);
+    let (ep_idx, send_cap) = k.with(|state| {
+        let (ep_idx, send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+        (ep_idx, send_cap)
+    });
 
     for i in 0..4u64 {
         let tid = 311 + i;
-        state.register_task(tid).expect("register");
         let deadline = 20 + i;
-
-        state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
-                asid: None,
-                send_generation: 0,
-                tid: crate::kernel::ipc::ThreadId(tid),
-                msg: Message::with_header(0, i as u16, 0, None, &[]).expect("msg"),
+        k.with(|state| {
+            state.register_task(tid).expect("register");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+                    asid: None,
+                    send_generation: 0,
+                    tid: crate::kernel::ipc::ThreadId(tid),
+                    msg: Message::with_header(0, i as u16, 0, None, &[]).expect("msg"),
+                });
             });
+            state
+                .with_tcbs_mut(|tcbs| {
+                    let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                    tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
+                    tcb.ipc_timeout_deadline = Some(deadline);
+                    Ok::<_, KernelError>(())
+                })
+                .expect("inject");
         });
-        state
-            .with_tcbs_mut(|tcbs| {
-                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
-                tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
-                tcb.ipc_timeout_deadline = Some(deadline);
-                Ok::<_, KernelError>(())
-            })
-            .expect("inject");
 
-        let expired = state
-            .process_ipc_timeout_deadlines(deadline)
-            .expect("process");
-        assert_eq!(expired, 1, "one expired i={i}");
-        assert_eq!(
-            state.sender_waiter_count(ep_idx),
-            0,
-            "no stale sender waiter after timeout i={i}"
-        );
-        assert_eq!(
-            state.ipc_deadline_count_for_tid(tid),
-            0,
-            "no stale deadline after sender timeout i={i}"
-        );
+        k.collect_due_ipc_timeout_work(deadline, deadline, cpu);
+        k.drain_send_timeout_post_work(cpu, deadline);
 
-        state.mark_task_dead(tid).expect("dead");
+        k.with(|state| {
+            assert_eq!(
+                state.sender_waiter_count(ep_idx),
+                0,
+                "no stale sender waiter after timeout i={i}"
+            );
+            assert_eq!(
+                state.ipc_deadline_count_for_tid(tid),
+                0,
+                "no stale deadline after sender timeout i={i}"
+            );
+            state.mark_task_dead(tid).expect("dead");
+        });
     }
 }
 
@@ -53935,7 +53986,10 @@ mod stage169_d2_send_genuine {
         let block_idx = IPC_STATE_SRC
             .find("fn block_current_on_send_with_deadline")
             .expect("send-block orchestrator");
-        let region = &IPC_STATE_SRC[block_idx..block_idx + 4200];
+        // U7 (199E) widened the window from 4200: the orchestrator gained the
+        // `set_ipc_timeout_armed_any()` registration record for the retired send-timeout class,
+        // which sits between the block commit and the deferral arming.
+        let region = &IPC_STATE_SRC[block_idx..block_idx + 4600];
         let blocked = region
             .find("Blocked(WaitReason::EndpointSend(send_cap))")
             .expect("sender must be Blocked(EndpointSend)");
@@ -54882,12 +54936,12 @@ fn stage171_chunked_timeout_wakes_all_expired_exactly_once() {
                     .flatten()
                     .find(|t| t.tid.0 == tid)
                     .expect("tcb");
-                // Alternate recv/send blocked reasons; both carry deadlines.
-                tcb.status = if i % 2 == 0 {
-                    TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)))
-                } else {
-                    TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1)))
-                };
+                // U7 (canonical 199E): every task here is receive-blocked. The scan under test
+                // owns exactly ONE class now — the ordinary receive timeout — so alternating in
+                // send-blocked tasks would no longer test chunking, it would test the skip. The
+                // skip is asserted separately below, with a send-blocked task this scan must
+                // leave completely alone.
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
                 tcb.ipc_timeout_deadline = Some(5);
                 tcb.ipc_timeout_fired = false;
                 Ok::<_, KernelError>(())
@@ -54917,6 +54971,37 @@ fn stage171_chunked_timeout_wakes_all_expired_exactly_once() {
         state.process_ipc_timeout_deadlines(5).expect("second pass"),
         0,
         "already-woken tasks must not be re-expired (no duplicate wake)"
+    );
+    // U7 (199E): a send-blocked task with an EXPIRED deadline is invisible to this scan. It
+    // belongs to the off-lock pipeline, and being selected here would mean two owners.
+    let send_tid = base + N;
+    state.register_task(send_tid).expect("register send-blocked");
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == send_tid)
+                .expect("tcb");
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1)));
+            tcb.ipc_timeout_deadline = Some(5);
+            tcb.ipc_timeout_fired = false;
+            Ok::<_, KernelError>(())
+        })
+        .expect("inject send-blocked");
+    assert_eq!(
+        state.process_ipc_timeout_deadlines(9).expect("retired class"),
+        0,
+        "the retired blocking-send class must not be expired by the broad-lock scan"
+    );
+    assert!(
+        !state.task_is_runnable(send_tid),
+        "the send-blocked task must still be blocked"
+    );
+    assert_eq!(
+        state.ipc_deadline_count_for_tid(send_tid),
+        1,
+        "its deadline must still be armed for the off-lock pipeline to find"
     );
 }
 
@@ -55010,10 +55095,31 @@ mod stage171_sched_timeout {
         ] {
             assert!(IPC_STATE_SRC.contains(m), "ipc_state must emit {m}");
         }
-        // kind classification is recv|send (the only wait reasons with a deadline).
+        // U7 (canonical 199E): `kind` is now invariably `recv`. The blocking-SEND class was
+        // retired from this scan and reports through the off-lock pipeline's own markers, so
+        // the discriminant that used to select the literal is gone — and the scan must no
+        // longer be able to select a send-blocked task at all.
         assert!(
-            IPC_STATE_SRC.contains("if entry.1 { \"send\" } else { \"recv\" }"),
-            "SCHED_TIMEOUT_EXPIRED kind must be recv|send"
+            IPC_STATE_SRC.contains("\"SCHED_TIMEOUT_EXPIRED tid={} kind=recv\""),
+            "SCHED_TIMEOUT_EXPIRED kind must be the retired-class-free `recv`"
+        );
+        assert!(
+            !IPC_STATE_SRC.contains("if entry.1 { \"send\" } else { \"recv\" }"),
+            "the send/recv discriminant must be gone with the class"
+        );
+        let scan_body = timeout_fn_body();
+        assert!(
+            scan_body
+                .contains("if matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {"),
+            "the broad-lock scan must SKIP the retired blocking-send class"
+        );
+        assert!(
+            scan_body.contains("if tcb.reply_timeout_token.is_some() {"),
+            "the broad-lock scan must SKIP the retired reply-timeout class"
+        );
+        assert!(
+            !scan_body.contains("SEND_COMPLETION_TIMED_OUT"),
+            "the send-side TimedOut publication moved off the broad lock with its class"
         );
         // Markers are knob-gated (only fire when a timeout actually occurs).
         let body = timeout_fn_body();
@@ -91570,7 +91676,7 @@ mod stage200c2b_guards {
         // The hosted broad wrapper delegates to the SAME single body.
         assert!(IPC_STATE_SRC.contains("complete_reply_timeout_over(self, handle, now_tick)"));
         // Collection + drain are invoked at the trap-entry post-lock area (broad lock dropped).
-        assert!(TRAP_SRC.contains("shared.collect_due_reply_timeout_work(now, cpu)"));
+        assert!(TRAP_SRC.contains("shared.collect_due_ipc_timeout_work(now, now, cpu)"));
         assert!(TRAP_SRC.contains("shared.drain_reply_timeout_post_work(cpu, now)"));
     }
 
@@ -91693,7 +91799,7 @@ mod stage200c2b_guards {
         assert!(RUNTIME_SRC.contains("REPLY_TIMEOUT_ARCH"));
         // The emitting fns are all `#[cfg(feature = "ipc-reply-timeout-oracle-core")]`.
         assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn maybe_arm_reply_timeout_oracle"));
-        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn collect_due_reply_timeout_work"));
+        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn collect_due_ipc_timeout_work"));
         assert!(RUNTIME_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn drain_reply_timeout_post_work"));
     }
 
@@ -91753,7 +91859,7 @@ mod stage200c2b_guards {
     #[test]
     fn h1_offlock_path_takes_no_broad_lock() {
         for name in [
-            "fn collect_due_reply_timeout_work",
+            "fn collect_due_ipc_timeout_work",
             "fn drain_reply_timeout_post_work",
         ] {
             let body = RUNTIME_SRC.split(name).nth(1).expect(name);
@@ -91895,7 +92001,7 @@ mod stage200c2b_guards {
         );
         // The call sits in the shared entry AFTER `with_cpu` returns (broad lock dropped).
         let idx_call = TRAP_SRC
-            .find("shared.collect_due_reply_timeout_work")
+            .find("shared.collect_due_ipc_timeout_work")
             .expect("collect call");
         let idx_ret = TRAP_SRC
             .find("// `with_cpu` has returned")
@@ -91912,7 +92018,7 @@ mod stage200c2b_guards {
     fn a3_single_source_no_arch_duplication() {
         assert_eq!(
             RUNTIME_SRC
-                .matches("fn collect_due_reply_timeout_work")
+                .matches("fn collect_due_ipc_timeout_work")
                 .count(),
             1
         );
@@ -91992,7 +92098,7 @@ mod stage200c2b_guards {
 }
 
 /// Stage 200C2B — deterministic OFF-LOCK reply-timeout collection + completion proofs.
-/// Each exercises the narrow collector (`collect_due_reply_timeout_work`) and/or the
+/// Each exercises the narrow collector (`collect_due_ipc_timeout_work`) and/or the
 /// off-lock drain (`drain_reply_timeout_post_work`) — the production timer-path entry
 /// with the broad lock retired — plus the reversible reply lease that governs the
 /// reply-copy-fault race. Run single-threaded (the per-CPU deferred queue is a
@@ -92042,7 +92148,7 @@ mod stage200c2b_offlock {
         clear_queue();
         let fx = caller_fixture();
         let (idx, _rgen, _id, _h) = setup(&fx);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         assert_eq!(queue_len(), 1, "one due entry collected off-lock");
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         assert_eq!(queue_len(), 0, "drained");
@@ -92069,7 +92175,7 @@ mod stage200c2b_offlock {
                 assert!(tcb.reply_timeout_token.is_none());
             });
         });
-        k.collect_due_reply_timeout_work(NOW, CPU);
+        k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         assert_eq!(queue_len(), 0, "ordinary deadline is not token-bearing");
         clear_queue();
     }
@@ -92080,9 +92186,9 @@ mod stage200c2b_offlock {
         clear_queue();
         let fx = caller_fixture();
         let _ = setup(&fx);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         assert_eq!(queue_len(), 1, "duplicate collection → one work owner");
         clear_queue();
         teardown();
@@ -92105,7 +92211,7 @@ mod stage200c2b_offlock {
         let fx = caller_fixture();
         let (_idx, _rgen, _id, handle) = setup(&fx);
         let before = queue_len();
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         assert_eq!(queue_len(), before, "full queue → not added");
         // The real registration is untouched: TCB deadline + token still present, armed.
         assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 1);
@@ -92120,8 +92226,8 @@ mod stage200c2b_offlock {
         clear_queue();
         let fx = caller_fixture();
         let (idx, _rgen, _id, _h) = setup(&fx);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         assert_eq!(queue_len(), 1);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         // A single terminal commit — a second would require a second work owner.
@@ -92167,7 +92273,7 @@ mod stage200c2b_offlock {
         clear_queue();
         let fx = caller_fixture();
         let (idx, _rgen, id, _h) = setup(&fx);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         // Advance the reply endpoint generation → the drain's endpoint revalidation fails.
         fx.k.with(|s| {
             s.with_ipc_state_mut(|ipc| {
@@ -92193,7 +92299,7 @@ mod stage200c2b_offlock {
         clear_queue();
         let fx = caller_fixture();
         let (_idx, _rgen, _id, _h) = setup(&fx);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         // Replace the caller incarnation (advance its blocked-recv generation).
         fx.k.with(|s| s.bump_blocked_recv_generation(1));
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
@@ -92208,7 +92314,7 @@ mod stage200c2b_offlock {
         clear_queue();
         let fx = caller_fixture();
         let _ = setup(&fx);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         assert!(
             fx.k.with(|s| s.ipc_timeout_fired_read(1)),
@@ -92225,7 +92331,7 @@ mod stage200c2b_offlock {
         clear_queue();
         let fx = caller_fixture();
         let (idx, _rgen, _id, handle) = setup(&fx);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         assert_eq!(
             fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
@@ -92242,7 +92348,7 @@ mod stage200c2b_offlock {
         clear_queue();
         let fx = caller_fixture();
         let (idx, rgen, _id, _h) = setup(&fx);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         assert_eq!(
             fx.k.with(|s| s.reply_cap_record_reservation(idx)),
@@ -92267,7 +92373,7 @@ mod stage200c2b_offlock {
             fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
                 .expect("reply terminal");
         // A concurrent due timeout cannot fire the leased token.
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         assert!(
             !fx.k.with(|s| s.ipc_timeout_fired_read(1)),
@@ -92319,7 +92425,7 @@ mod stage200c2b_offlock {
             fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
                 .expect("reply lease");
         // While leased, a due timeout cannot claim the terminal.
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         assert!(
             fx.k.with(|s| s.reply_terminal_is_open(idx)),
@@ -92327,7 +92433,7 @@ mod stage200c2b_offlock {
         );
         // Copy fault → restore the lease; now a due timeout wins the SINGLE terminal.
         assert!(fx.k.with(|s| s.restore_deadline_reply_lease(handle.token_index(), &lease)));
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         assert_eq!(
             fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
@@ -92350,7 +92456,7 @@ mod stage200c2b_offlock {
                 let _ = s.register_task(t);
             }
         });
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         assert_eq!(queue_len(), 1, "the due entry is not stranded");
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         assert_eq!(
@@ -92411,7 +92517,7 @@ mod stage200c2b_offlock {
         let fx = caller_fixture();
         let _ = setup(&fx);
         // now < DEADLINE → nothing due.
-        fx.k.collect_due_reply_timeout_work(DEADLINE - 1, CPU);
+        fx.k.collect_due_ipc_timeout_work(DEADLINE - 1, DEADLINE - 1, CPU);
         assert_eq!(queue_len(), 0, "not-yet-due is not collected");
         clear_queue();
         teardown();
@@ -92446,7 +92552,7 @@ mod stage200c2b_offlock {
         // Success path: collect + drain leaves the queue empty.
         let fx = caller_fixture();
         let (_idx, _rgen, _id, _h) = setup(&fx);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         assert_eq!(queue_len(), 0, "empty after a successful drain");
         teardown();
@@ -92518,7 +92624,7 @@ mod stage200c2c1b_aarch64_reentry {
     /// Drive a full off-lock timeout completion for the fixture's caller.
     fn complete_timeout(fx: &CallerFx) {
         clear_queue();
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         clear_queue();
     }
@@ -93028,7 +93134,7 @@ mod stage200c2c2_riscv_port {
 
     fn complete_timeout(fx: &CallerFx) {
         clear_queue();
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         clear_queue();
     }
@@ -93103,14 +93209,14 @@ mod stage200c2c2_riscv_port {
     // (4) a token-bearing deadline reaches the RISC-V post-lock collector + drain.
     #[test]
     fn r04_reaches_postlock_collector() {
-        assert!(RISCV_TRAP_SRC.contains("shared.collect_due_reply_timeout_work(now, cpu)"));
+        assert!(RISCV_TRAP_SRC.contains("shared.collect_due_ipc_timeout_work(now, now, cpu)"));
         assert!(RISCV_TRAP_SRC.contains("shared.drain_reply_timeout_post_work(cpu, now)"));
         // It sits in Phase 3, AFTER the broad guard is released.
         let p3 = RISCV_TRAP_SRC
             .find("Phase 3: post-lock drain (broad guard released)")
             .expect("phase 3 marker");
         let call = RISCV_TRAP_SRC
-            .find("shared.collect_due_reply_timeout_work")
+            .find("shared.collect_due_ipc_timeout_work")
             .expect("collector call");
         assert!(p3 < call, "the collector runs in the post-lock phase");
         // Reachability: gated only on the umbrella feature + the runtime selector (never dead).
@@ -93404,7 +93510,7 @@ mod stage200c2c2_riscv_port {
         // Exactly ONE implementation of each shared piece.
         assert_eq!(
             RUNTIME_SRC
-                .matches("fn collect_due_reply_timeout_work")
+                .matches("fn collect_due_ipc_timeout_work")
                 .count(),
             1
         );
@@ -93901,7 +94007,7 @@ mod stage200c2c2c_r2b_reply_authority {
         assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
         // The collector now runs on the still-registered token.
         crate::kernel::boot::reply_timeout_work_clear(0);
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         fx.k.drain_reply_timeout_post_work(CPU, NOW);
         crate::kernel::boot::reply_timeout_work_clear(0);
         assert_eq!(
@@ -94101,7 +94207,7 @@ mod stage200c2c2c_r2b_reply_authority {
 
         crate::kernel::boot::hold_reply_timeout_collector();
         assert!(crate::kernel::boot::reply_timeout_collector_held());
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         assert_eq!(
             crate::kernel::boot::reply_timeout_work_len(0),
             0,
@@ -94113,7 +94219,7 @@ mod stage200c2c2c_r2b_reply_authority {
             "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=8 reply_ok=1",
         );
         assert!(!crate::kernel::boot::reply_timeout_collector_held());
-        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_ipc_timeout_work(NOW, NOW, CPU);
         assert_eq!(
             crate::kernel::boot::reply_timeout_work_len(0),
             1,
@@ -94198,7 +94304,7 @@ mod stage200c2c2c_r2b_reply_authority {
         );
         // The collector honours the gate as its FIRST action.
         let collect = RUNTIME_SRC
-            .split("pub(crate) fn collect_due_reply_timeout_work")
+            .split("pub(crate) fn collect_due_ipc_timeout_work")
             .nth(1)
             .expect("collector body");
         assert!(collect.contains("if crate::kernel::boot::reply_timeout_collector_held() {\n            return;\n        }"));
@@ -96585,21 +96691,6 @@ mod stage200df0_feature_gating {
                 "static IPC_REPLY_TIMEOUT_COLLECTOR_HOLD:",
             ),
             (
-                "reply-timeout work queue",
-                MOD_SRC,
-                "static REPLY_TIMEOUT_POST_WORK:",
-            ),
-            (
-                "narrow collector",
-                RUNTIME_SRC,
-                "pub(crate) fn collect_due_reply_timeout_work(",
-            ),
-            (
-                "reply-timeout drain",
-                RUNTIME_SRC,
-                "pub(crate) fn drain_reply_timeout_post_work(",
-            ),
-            (
                 "reply-win reserve",
                 IPC_STATE_SRC,
                 "pub(crate) fn reserve_reply_win_before_copy(",
@@ -96609,6 +96700,50 @@ mod stage200df0_feature_gating {
             assert!(
                 cfgs.contains(ORACLE_FEATURE),
                 "{what} is oracle scaffolding and must stay gated on {ORACLE_FEATURE}: {cfgs}"
+            );
+        }
+        // U7 (canonical 199E): the deferred-work QUEUE, the scanner and the two drains are no
+        // longer scaffolding — they ARE the production timeout pipeline, so the same guard runs
+        // in reverse for them. What stays gated above is the oracle's causal machinery and its
+        // scenario selection; what is ungated here is where timeouts are processed. Both
+        // directions are asserted in one place so a future stage cannot quietly re-gate the
+        // production path or ungate the scenario machinery.
+        for (what, src, needle) in [
+            (
+                "deferred reply work queue",
+                MOD_SRC,
+                "static REPLY_TIMEOUT_POST_WORK:",
+            ),
+            (
+                "deferred send work queue",
+                MOD_SRC,
+                "static SEND_TIMEOUT_POST_WORK:",
+            ),
+            (
+                "arch-neutral scanner",
+                RUNTIME_SRC,
+                "pub(crate) fn collect_due_ipc_timeout_work(",
+            ),
+            (
+                "reply-timeout drain",
+                RUNTIME_SRC,
+                "pub(crate) fn drain_reply_timeout_post_work(",
+            ),
+            (
+                "send-timeout drain",
+                RUNTIME_SRC,
+                "pub(crate) fn drain_send_timeout_post_work(",
+            ),
+            (
+                "production timeout entry",
+                RUNTIME_SRC,
+                "pub(crate) fn run_due_ipc_timeout_work(",
+            ),
+        ] {
+            let cfgs = preceding_cfgs(src, needle);
+            assert!(
+                !cfgs.contains(ORACLE_FEATURE),
+                "{what} is the PRODUCTION timeout pipeline and must NOT be oracle-gated: {cfgs}"
             );
         }
     }
@@ -97404,7 +97539,7 @@ mod stage200d0b3_x86_exit_corrected {
         // EVERY shared post-lock drain precedes the drain marker.
         for drain in [
             "shared.drain_dispatch_post_work(cpu, ",
-            "shared.drain_reply_timeout_post_work(cpu, now);",
+            "shared.run_due_ipc_timeout_work(cpu);",
             "shared.drain_server_death_post_work(cpu)",
             "DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()",
         ] {
@@ -98253,7 +98388,7 @@ mod stage200d0c1_aarch64_exit_prep {
         for drain in [
             "shared.drain_dispatch_post_work(cpu, ",
             "shared.drain_server_death_post_work(cpu)",
-            "shared.drain_reply_timeout_post_work(cpu, now);",
+            "shared.run_due_ipc_timeout_work(cpu);",
             "super::aarch64::trap::enter_post_lock_idle(cpu);",
             "DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()",
         ] {
@@ -99038,7 +99173,7 @@ mod stage200d0d1_riscv_exit_prep {
             .expect("consumer");
         for drain in [
             "shared.drain_dispatch_post_work(cpu, ",
-            "shared.drain_reply_timeout_post_work(cpu, now);",
+            "shared.run_due_ipc_timeout_work(cpu);",
             "shared.drain_server_death_post_work(cpu)",
             "RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN",
             "RISCV_FUTEX_WAIT_DISPATCH_DRAIN_BEGIN",
@@ -101935,7 +102070,7 @@ mod stage200d2b1bii_races {
         assert!(INIT_SRC.contains("SyscallError::ServerDied as u32"));
         // And the collector really consults the gate before publishing any timeout work.
         let collect = RUNTIME_SRC
-            .split("fn collect_due_reply_timeout_work")
+            .split("fn collect_due_ipc_timeout_work")
             .nth(1)
             .expect("collector");
         let collect = collect.split("\n    }\n").next().unwrap();
@@ -101996,7 +102131,7 @@ mod stage200d2b1bii_races {
             (
                 "IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION",
                 RUNTIME_SRC,
-                "fn collect_due_reply_timeout_work",
+                "fn collect_due_ipc_timeout_work",
                 "server_dies_stale_token()",
             ),
             (
@@ -114987,7 +115122,15 @@ mod stage199d_wa2a_ownership_boundary {
             // `block_current_on_send_with_deadline` performs in-lock. It is a BLOCK owner, not a
             // wake owner: it can only ever move a task OUT of runnability, and it does so inside
             // the same rank-1 section that proved the task was this CPU's current.
-            ("src/runtime.rs", 7),
+            //
+            // U7 (199E): 7 -> 8. `drain_send_timeout_post_work` writes
+            // `Blocked(EndpointSend) -> Runnable` for a timed-out blocking sender. It is the
+            // SAME wake owner the retired in-lock scan was — `process_ipc_timeout_deadlines`'s
+            // Phase 1 performed exactly this transition for the class before U7 moved it off
+            // the broad lock — and it writes only after the exact `{tid, asid,
+            // send_generation}` claim, in the same acquisition that parks the `TimedOut`
+            // completion, so the completion is always visible before the wake.
+            ("src/runtime.rs", 8),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -115009,9 +115152,10 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            34,
-            "31 raw writes (U6 added `commit_blocking_send_split`), the WA3A barrier's single \
-             write, and the WA3B barrier's two"
+            35,
+            "32 raw writes (U6 added `commit_blocking_send_split`; U7 added \
+             `drain_send_timeout_post_work`), the WA3A barrier's single write, and the WA3B \
+             barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -115511,6 +115655,16 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::IntoBlocked,
         ),
+        // U7 (199E): the blocking-SEND timeout wake. It is proven unable to act on a
+        // `Blocked(EndpointReceive)` task by a precondition no caller can bypass — the rank-2
+        // claim refuses anything whose status is not `Blocked(EndpointSend(_))`, and refuses
+        // before any mutation.
+        (
+            "src/runtime.rs",
+            "drain_send_timeout_post_work",
+            1,
+            Verdict::Cannot,
+        ),
         (
             "src/runtime.rs",
             "futex_wait_publish_block_split_mut",
@@ -115785,10 +115939,11 @@ mod stage199d_wa2b_wake_owner_census {
             "process_ipc_timeout_deadlines",
             "tcb.status",
             "TaskStatus::Runnable",
-            // U6 (199C): the line above the write is now the close of the send-side
-            // `TimedOut` completion publication, which must precede the `Runnable` transition
-            // (a Runnable task is no longer completable). Same site, same transition.
-            "}",
+            // U7 (199E): the send-side `TimedOut` completion publication that U6 put above this
+            // write moved OFF the broad lock with its class, so the preceding line is once
+            // again the due test itself. Same site, same transition — but now it can only ever
+            // select an ORDINARY receive timeout.
+            "if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {",
             "tcb.ipc_timeout_deadline = None;",
         ),
         (
@@ -115951,6 +116106,18 @@ mod stage199d_wa2b_wake_owner_census {
             "}",
             "true",
         ),
+        // U7 (199E): the blocking-SEND timeout wake, moved off the broad lock. The previous
+        // line is the close of the `if let Some(asid)` arm that parks the `TimedOut`
+        // completion, which is the whole point of the fingerprint: the completion is published
+        // in the SAME rank-2 acquisition, immediately before the status write.
+        (
+            "src/runtime.rs",
+            "drain_send_timeout_post_work",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "tcb.ipc_timeout_deadline = None;",
+        ),
         (
             "src/runtime.rs",
             "futex_wait_publish_block_split_mut",
@@ -116034,12 +116201,14 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            31,
-            "31 raw writes: U6 (199C) added `commit_blocking_send_split`, the split form of the \
+            32,
+            "32 raw writes: U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
              split form of \
              `wake_tid_to_runnable`'s transition, when the blocked-waiter Phase-C completions \
-             retired their broad acquisitions"
+             retired their broad acquisitions; U7 (199E) added \
+             `drain_send_timeout_post_work`, which is the SAME blocking-send timeout wake \
+             `process_ipc_timeout_deadlines` used to perform under the broad lock"
         );
         for (i, (file, function, lhs, rhs, before, after)) in sites.iter().enumerate() {
             let (pf, pfn, plhs, prhs, pbefore, pafter) = FINGERPRINTS[i];
@@ -116106,10 +116275,10 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            40,
+            41,
             "37 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
-             `commit_blocking_send_split`, and U3 (203C)'s \
-             `wake_tid_to_runnable_split`"
+             `commit_blocking_send_split`, U3 (203C)'s `wake_tid_to_runnable_split`, and U7 \
+             (199E)'s `drain_send_timeout_post_work`"
         );
         assert_eq!(
             FINGERPRINTS.len()
@@ -116121,8 +116290,8 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            40,
-            "31 raw writes + 8 transition-barriered sites + 1 reservation-barriered site"
+            41,
+            "32 raw writes + 8 transition-barriered sites + 1 reservation-barriered site"
         );
     }
 
@@ -116421,7 +116590,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            40,
+            41,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -116433,9 +116602,14 @@ mod stage199d_wa2b_wake_owner_census {
         // `wake_tid_to_runnable` transition the blocked-waiter Phase-C completions previously
         // reached under the retired broad acquisition. Same class, new seam — so CAN moves
         // 12 → 13 and nothing else moves.
+        // U7 (199E) adds ONE row, `drain_send_timeout_post_work`, to CANNOT: the blocking-send
+        // timeout wake, moved off the broad lock from `process_ipc_timeout_deadlines`. Its
+        // rank-2 claim refuses every status but `Blocked(EndpointSend(_))` before mutating
+        // anything, so it can never act on a `Blocked(EndpointReceive)` task — CANNOT moves
+        // 16 → 17 and nothing else moves.
         assert_eq!(
             (can, cannot, into_blocked, fresh, non_production),
-            (13, 16, 8, 2, 1)
+            (13, 17, 8, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -116519,6 +116693,16 @@ mod stage199d_wa2b_wake_owner_census {
                 "futex_wake_split_mut",
                 "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {",
                 "for tcb in tcbs.iter_mut().flatten() {",
+            ),
+            // U7 (199E): the blocking-send timeout wake. Its local precondition refuses any
+            // status that is not `Blocked(EndpointSend(_))`, BEFORE any mutation; the caller
+            // closure is the deferred-work drain loop, whose items can only have been published
+            // by the collector for a task that was `Blocked(EndpointSend)` at scan time.
+            (
+                "runtime.rs",
+                "drain_send_timeout_post_work",
+                "if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {",
+                "while let Some(work) = crate::kernel::boot::send_timeout_work_drain_next(cpu_idx)",
             ),
         ];
         // Exactly one proof per CANNOT assignment.
@@ -124344,6 +124528,10 @@ mod u4_cross_arch_queue_advancing_dispatch {
             unsafe {
                 let _ = crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].take();
             }
+            // U7 (199E): the scan cursor and the send-timeout queue are process-global statics,
+            // so one test's leftovers would otherwise steer the next test's scan window.
+            crate::kernel::boot::reset_ipc_timeout_scan_cursor(cpu_idx);
+            crate::kernel::boot::send_timeout_work_clear(cpu_idx);
         }
 
         fn msg(body: &[u8]) -> Message {
@@ -124775,12 +124963,13 @@ mod u4_cross_arch_queue_advancing_dispatch {
                     })
                 })
                 .expect("a deadline rode with the block");
-            k.with_cpu(cpu, |kernel| {
-                kernel
-                    .process_ipc_timeout_deadlines(deadline.wrapping_add(1))
-                    .expect("scan")
-            })
-            .expect("broad phase");
+            // U7 (199E): the class is settled by the PRODUCTION off-lock pipeline, not by the
+            // broad-lock scan — `collect_due_ipc_timeout_work` publishes the due cycle and
+            // `drain_send_timeout_post_work` runs the U6 lifecycle for it. `now` is passed
+            // explicitly so the hosted test controls the clock the trap wrapper would read.
+            let now = deadline.wrapping_add(1);
+            k.collect_due_ipc_timeout_work(now, now, cpu);
+            k.drain_send_timeout_post_work(cpu, now);
 
             let done = parked_completion(&k, SENDER).expect("a completion is parked");
             assert_eq!(done.syscall_class, BlockedSyscallClass::IpcSend);
@@ -125796,12 +125985,10 @@ mod u4_cross_arch_queue_advancing_dispatch {
                         })
                     })
                     .expect("deadline");
-                f.k.with_cpu(cpu, |kernel| {
-                    kernel
-                        .process_ipc_timeout_deadlines(deadline.wrapping_add(1))
-                        .expect("scan")
-                })
-                .expect("broad phase");
+                // U7 (199E): the production off-lock pipeline owns this class now.
+                let now = deadline.wrapping_add(1);
+                f.k.collect_due_ipc_timeout_work(now, now, cpu);
+                f.k.drain_send_timeout_post_work(cpu, now);
 
                 assert!(sender_waiters(&f.k, f.eidx).is_empty(), "waiter removed");
                 assert!(!envelope_live(&f.k, f.handle), "envelope settled");
@@ -126218,5 +126405,695 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 );
             }
         }
+    }
+}
+
+/// U7 (canonical 199E) — PRODUCTION TIMEOUT PROMOTION.
+///
+/// Two things are proven here, and the second is what makes the first non-vacuous:
+///
+/// 1. the off-lock timeout pipeline is **production** — no oracle feature, no runtime selector,
+///    one driver per port, and one arch-neutral body behind all of them; and
+/// 2. the two U7 classes are **gone from the broad-lock scan**, so promoting the pipeline did
+///    not leave a class with two owners.
+///
+/// The behavioural half drives the real production bodies (`collect_due_ipc_timeout_work` +
+/// `drain_send_timeout_post_work`) rather than re-implementing their decisions.
+mod u7_production_timeout_promotion {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const ORACLE: &str = "ipc-reply-timeout-oracle-core";
+
+    const SENDER: u64 = 7;
+    const EP_DEPTH: usize = 1;
+
+    fn fresh(cpu: CpuId) -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(cpu.0 as usize);
+        crate::kernel::boot::send_timeout_work_clear(cpu.0 as usize);
+        k
+    }
+
+    /// A blocked sender injected directly: `{tid, asid, send_generation}` and a live waiter, so
+    /// the pipeline sees exactly the shape a real blocking send leaves behind.
+    fn blocked_sender(
+        k: &SharedKernel,
+        tid: u64,
+        asid: Option<crate::kernel::vm::Asid>,
+        generation: u64,
+        deadline: u64,
+    ) -> usize {
+        k.with(|state| {
+            state.register_task(tid).expect("register");
+            let (ep_idx, send_cap, _recv) = state.create_endpoint(EP_DEPTH).expect("endpoint");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+                    tid: crate::kernel::ipc::ThreadId(tid),
+                    msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
+                    asid,
+                    send_generation: generation,
+                });
+            });
+            state
+                .with_tcbs_mut(|tcbs| {
+                    let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                    tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
+                    tcb.asid = asid;
+                    tcb.blocked_send_generation = generation;
+                    tcb.ipc_timeout_deadline = Some(deadline);
+                    tcb.ipc_timeout_fired = false;
+                    Ok::<_, KernelError>(())
+                })
+                .expect("inject");
+            ep_idx
+        })
+    }
+
+    fn status(k: &SharedKernel, tid: u64) -> Option<TaskStatus> {
+        k.with(|s| s.task_status(tid))
+    }
+
+    fn completion(
+        k: &SharedKernel,
+        tid: u64,
+    ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .and_then(|t| t.pending_syscall_completion)
+            })
+        })
+    }
+
+    fn waiters(k: &SharedKernel, ep: usize) -> usize {
+        k.with(|s| s.sender_waiter_count(ep))
+    }
+
+    // ── (1) the pipeline is production ──────────────────────────────────────────────────────
+
+    /// The single production entry exists, is ungated, and composes the pass in the ONE order
+    /// its attestation depends on: collect, then drain.
+    #[test]
+    fn the_production_entry_scans_before_it_drains() {
+        let body = RUNTIME_SRC
+            .split("pub(crate) fn run_due_ipc_timeout_work(")
+            .nth(1)
+            .expect("the production entry")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        let collect = body
+            .find("self.collect_due_ipc_timeout_work(reply_now, send_now, cpu);")
+            .expect("the scanner runs");
+        let reply = body
+            .find("self.drain_reply_timeout_post_work(cpu, reply_now);")
+            .expect("the reply drain runs");
+        let send = body
+            .find("self.drain_send_timeout_post_work(cpu, send_now);")
+            .expect("the send drain runs");
+        // The two classes are armed in two clock domains, and each must be scanned and settled
+        // in ITS OWN. Comparing a scheduler-tick send deadline against the AArch64/RISC-V
+        // hardware counter would make every send deadline instantly due.
+        assert!(
+            body.contains("let reply_now = self.reply_timeout_now_split_read();")
+                && body.contains("let send_now = self.scheduler_tick_now_split_read();"),
+            "each retired class must read the clock its deadlines are armed in"
+        );
+        assert!(
+            collect < reply && collect < send,
+            "the scan must precede both drains — the retired-lock attestation is emitted from \
+             the reply drain and claims the scan already ran off the broad lock"
+        );
+    }
+
+    /// One driver per port, both ungated, both calling the SAME body — and the shared cell keeps
+    /// its single-driver `not(riscv64)` guard so a future routing change cannot double-drive the
+    /// one-shot attestations.
+    #[test]
+    fn every_port_drives_the_same_ungated_entry_exactly_once() {
+        for (port, src) in [("shared", TRAP_ENTRY_SRC), ("riscv64", RISCV_TRAP_SRC)] {
+            assert_eq!(
+                src.matches("shared.run_due_ipc_timeout_work(cpu);").count(),
+                1,
+                "{port}: exactly one driver"
+            );
+            let at = src
+                .find("shared.run_due_ipc_timeout_work(cpu);")
+                .expect("driver");
+            let before = &src[at.saturating_sub(400)..at];
+            assert!(
+                !before.contains(ORACLE),
+                "{port}: the production timeout entry must not be oracle-feature-gated"
+            );
+            assert!(
+                !before.contains("x86_ipc_reply_timeout_oracle_enabled()"),
+                "{port}: the production timeout entry must not be selector-gated"
+            );
+        }
+        let at = TRAP_ENTRY_SRC
+            .find("shared.run_due_ipc_timeout_work(cpu);")
+            .expect("driver");
+        assert!(
+            TRAP_ENTRY_SRC[at.saturating_sub(120)..at]
+                .contains("#[cfg(not(target_arch = \"riscv64\"))]"),
+            "the shared cell keeps its single-driver guard"
+        );
+    }
+
+    /// The oracle knobs still select SCENARIOS — promotion must not have deleted the confined
+    /// machinery, only its authority over where timeouts are processed.
+    #[test]
+    fn the_oracle_scenario_machinery_is_untouched() {
+        assert!(MOD_SRC.contains("pub(crate) fn hold_reply_timeout_collector()"));
+        assert!(IPC_SRC.contains("pub(crate) fn maybe_arm_reply_timeout_oracle("));
+        let arm = IPC_SRC
+            .find("pub(crate) fn maybe_arm_reply_timeout_oracle(")
+            .expect("arm");
+        assert!(
+            IPC_SRC[arm.saturating_sub(200)..arm].contains(ORACLE),
+            "the oracle's own deadline arm stays feature-gated"
+        );
+    }
+
+    /// The retired-lock attestation is no longer gated on an oracle having armed something: it
+    /// reports where the PRODUCTION scan runs, and carries `armed_any` as evidence instead.
+    #[test]
+    fn the_retired_lock_attestation_is_not_gated_on_an_arm() {
+        let body = RUNTIME_SRC
+            .split("pub(crate) fn drain_reply_timeout_post_work(")
+            .nth(1)
+            .expect("drain");
+        let emit = body.find("IPC_REPLY_TIMEOUT_LOCK_STATUS").expect("marker");
+        let guard = &body[..emit];
+        assert!(
+            guard.contains("if crate::kernel::boot::reply_timeout_lock_status_once() {"),
+            "the one-shot latch is the whole gate"
+        );
+        assert!(
+            !guard.contains("crate::kernel::boot::reply_timeout_armed_any()"),
+            "the arm-only latch must not gate the attestation"
+        );
+        assert!(
+            body[emit..emit + 400].contains("scan_broad_lock=0"),
+            "the attestation names the retired lock"
+        );
+        assert!(
+            body[emit..emit + 400].contains("production=1"),
+            "and names itself production"
+        );
+    }
+
+    /// The arm-only latch that used to gate the attestation is gone from the tree entirely, not
+    /// merely unread — a dormant latch is exactly what a later stage would re-wire by accident.
+    #[test]
+    fn the_arm_only_gate_is_gone_not_dormant() {
+        for needle in [
+            "static REPLY_TIMEOUT_ARMED_ANY",
+            "pub(crate) fn set_reply_timeout_armed_any(",
+            "pub(crate) fn reply_timeout_armed_any(",
+        ] {
+            assert!(
+                !MOD_SRC.contains(needle),
+                "the arm-only latch must be deleted, not left dormant: {needle}"
+            );
+        }
+    }
+
+    // ── (2) the classes are gone from the broad lock ────────────────────────────────────────
+
+    /// The broad-lock scan skips both retired classes, unconditionally, and no longer carries
+    /// the send-side completion publication at all.
+    #[test]
+    fn the_broad_lock_scan_owns_neither_retired_class() {
+        let body = IPC_SRC
+            .split("pub(crate) fn process_ipc_timeout_deadlines(")
+            .nth(1)
+            .expect("the scan")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        for skip in [
+            "if tcb.reply_timeout_token.is_some() {",
+            "if matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {",
+        ] {
+            let at = body.find(skip).unwrap_or_else(|| panic!("missing: {skip}"));
+            // The skip is unconditional: no cfg attribute immediately above it.
+            assert!(
+                !body[at.saturating_sub(120)..at].contains("#[cfg("),
+                "the skip for `{skip}` must not be conditionally compiled — a class with two \
+                 owners on some builds is the exact failure U7 removes"
+            );
+        }
+        assert!(
+            !body.contains("SEND_COMPLETION_TIMED_OUT"),
+            "the send-side TimedOut publication moved off the broad lock with its class"
+        );
+        assert!(
+            body.contains("TaskStatus::Blocked(WaitReason::EndpointReceive(_))"),
+            "the ordinary receive timeout stays here"
+        );
+    }
+
+    /// End to end at the state level: an expired send deadline is invisible to the broad-lock
+    /// scan and settled by the production pipeline.
+    #[test]
+    fn the_broad_lock_scan_leaves_an_expired_send_deadline_for_the_pipeline() {
+        let cpu = CpuId(0);
+        let k = fresh(cpu);
+        let ep = blocked_sender(&k, SENDER, Some(crate::kernel::vm::Asid(3)), 1, 10);
+        assert_eq!(
+            k.with(|s| s.process_ipc_timeout_deadlines(11).expect("scan")),
+            0,
+            "the broad-lock scan must expire nothing"
+        );
+        assert!(matches!(
+            status(&k, SENDER),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(_)))
+        ));
+        k.collect_due_ipc_timeout_work(11, 11, cpu);
+        k.drain_send_timeout_post_work(cpu, 11);
+        assert_eq!(status(&k, SENDER), Some(TaskStatus::Runnable));
+        assert_eq!(waiters(&k, ep), 0, "the waiter is removed");
+        let done = completion(&k, SENDER).expect("a completion is parked");
+        assert_eq!(
+            done.syscall_class,
+            crate::kernel::task::BlockedSyscallClass::IpcSend
+        );
+        assert_eq!(done.result, KernelState::SEND_COMPLETION_TIMED_OUT);
+        assert_eq!(done.blocked_generation, 1, "for the exact cycle");
+    }
+
+    // ── (3) the exact claim ─────────────────────────────────────────────────────────────────
+
+    /// A published item whose cycle has moved on is refused with ZERO mutation. This is the
+    /// receiver-wins case and the re-blocked-sender case in one: both present the drain with a
+    /// generation the TCB no longer carries.
+    #[test]
+    fn a_stale_cycle_is_refused_without_mutating_anything() {
+        let cpu = CpuId(0);
+        let k = fresh(cpu);
+        let ep = blocked_sender(&k, SENDER, Some(crate::kernel::vm::Asid(3)), 1, 10);
+        k.collect_due_ipc_timeout_work(11, 11, cpu);
+        // The sender re-blocks under a NEW cycle before the drain runs.
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == SENDER).unwrap();
+                tcb.blocked_send_generation = 2;
+                Ok::<_, KernelError>(())
+            })
+            .expect("re-block")
+        });
+        k.drain_send_timeout_post_work(cpu, 11);
+        assert!(
+            matches!(
+                status(&k, SENDER),
+                Some(TaskStatus::Blocked(WaitReason::EndpointSend(_)))
+            ),
+            "a stale item must not wake the new cycle"
+        );
+        assert!(completion(&k, SENDER).is_none(), "and must publish nothing");
+        assert_eq!(waiters(&k, ep), 1, "and must remove no waiter");
+    }
+
+    /// A receiver that consumed the message first leaves the sender non-blocked, so the drain's
+    /// claim fails and the SUCCESS result the receiver published survives.
+    #[test]
+    fn a_receiver_that_won_keeps_its_success_result() {
+        let cpu = CpuId(0);
+        let k = fresh(cpu);
+        let asid = crate::kernel::vm::Asid(3);
+        let _ep = blocked_sender(&k, SENDER, Some(asid), 1, 10);
+        k.collect_due_ipc_timeout_work(11, 11, cpu);
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == SENDER).unwrap();
+                tcb.pending_syscall_completion =
+                    Some(crate::kernel::task::BlockedSyscallCompletion {
+                        syscall_class: crate::kernel::task::BlockedSyscallClass::IpcSend,
+                        result: KernelState::SEND_COMPLETION_OK,
+                        tid: SENDER,
+                        asid,
+                        blocked_generation: 1,
+                    });
+                tcb.status = TaskStatus::Runnable;
+                Ok::<_, KernelError>(())
+            })
+            .expect("receiver wins")
+        });
+        k.drain_send_timeout_post_work(cpu, 11);
+        assert_eq!(
+            completion(&k, SENDER).expect("still parked").result,
+            KernelState::SEND_COMPLETION_OK,
+            "the timeout must not overwrite a delivered send"
+        );
+    }
+
+    /// An ASID-less sender has no incarnation to name, so it is woken with NOTHING published —
+    /// exactly what the retired in-lock scan did for it. Losing the wake would strand it.
+    #[test]
+    fn an_asid_less_sender_is_woken_without_a_completion() {
+        let cpu = CpuId(0);
+        let k = fresh(cpu);
+        let ep = blocked_sender(&k, SENDER, None, 0, 10);
+        k.collect_due_ipc_timeout_work(11, 11, cpu);
+        k.drain_send_timeout_post_work(cpu, 11);
+        assert_eq!(status(&k, SENDER), Some(TaskStatus::Runnable), "woken");
+        assert!(completion(&k, SENDER).is_none(), "nothing published");
+        assert_eq!(waiters(&k, ep), 0, "waiter still removed");
+    }
+
+    /// THE TWO-CLOCK SEPARATION, behaviourally. A blocking-send deadline lives in the
+    /// scheduler-tick domain; the reply class lives in the per-arch monotonic domain, which on
+    /// AArch64 and RISC-V is a hardware counter orders of magnitude larger than a tick. If the
+    /// scanner compared send deadlines against the reply clock, EVERY send deadline would be
+    /// instantly due on those ports — a spurious timeout for every blocked sender. Here the
+    /// reply clock is far past the deadline and the send clock is not: nothing may settle.
+    #[test]
+    fn a_send_deadline_is_judged_only_by_the_scheduler_tick_clock() {
+        let cpu = CpuId(0);
+        let k = fresh(cpu);
+        let ep = blocked_sender(&k, SENDER, Some(crate::kernel::vm::Asid(3)), 1, 100);
+        k.collect_due_ipc_timeout_work(9_000_000, 99, cpu);
+        k.drain_send_timeout_post_work(cpu, 9_000_000);
+        assert!(
+            matches!(
+                status(&k, SENDER),
+                Some(TaskStatus::Blocked(WaitReason::EndpointSend(_)))
+            ),
+            "a hardware-counter `now` must not make a scheduler-tick deadline due"
+        );
+        assert!(completion(&k, SENDER).is_none());
+        assert_eq!(waiters(&k, ep), 1);
+        // The same deadline against its OWN clock does settle.
+        k.collect_due_ipc_timeout_work(9_000_000, 101, cpu);
+        k.drain_send_timeout_post_work(cpu, 101);
+        assert_eq!(status(&k, SENDER), Some(TaskStatus::Runnable));
+        assert_eq!(waiters(&k, ep), 0);
+    }
+
+    /// A not-yet-due deadline is neither collected nor settled.
+    #[test]
+    fn a_future_deadline_is_left_alone() {
+        let cpu = CpuId(0);
+        let k = fresh(cpu);
+        blocked_sender(&k, SENDER, Some(crate::kernel::vm::Asid(3)), 1, 100);
+        k.collect_due_ipc_timeout_work(99, 99, cpu);
+        k.drain_send_timeout_post_work(cpu, 99);
+        assert!(matches!(
+            status(&k, SENDER),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(_)))
+        ));
+    }
+
+    /// Collecting the same cycle repeatedly yields ONE owner, so a settle can happen at most
+    /// once no matter how many scans ran before the drain.
+    #[test]
+    fn repeated_collection_of_one_cycle_yields_one_settle() {
+        let cpu = CpuId(0);
+        let k = fresh(cpu);
+        blocked_sender(&k, SENDER, Some(crate::kernel::vm::Asid(3)), 1, 10);
+        let before = crate::kernel::boot::send_timeout_work_published_count();
+        for _ in 0..4 {
+            k.collect_due_ipc_timeout_work(11, 11, cpu);
+        }
+        assert_eq!(
+            crate::kernel::boot::send_timeout_work_published_count() - before,
+            1,
+            "a duplicate cycle is not published twice"
+        );
+        k.drain_send_timeout_post_work(cpu, 11);
+        assert_eq!(status(&k, SENDER), Some(TaskStatus::Runnable));
+    }
+
+    // ── (4) publish before wake ─────────────────────────────────────────────────────────────
+
+    /// The `TimedOut` completion is parked in the SAME rank-2 acquisition that makes the sender
+    /// Runnable, and the scheduler enqueue is the LAST action in the settle. A woken sender can
+    /// therefore never reach its resume boundary before its result exists.
+    #[test]
+    fn the_completion_is_published_before_the_enqueue() {
+        let body = RUNTIME_SRC
+            .split("pub(crate) fn drain_send_timeout_post_work(")
+            .nth(1)
+            .expect("the settle")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        let publish = body
+            .find("tcb.pending_syscall_completion =")
+            .expect("the publication");
+        let runnable = body
+            .find("tcb.status = TaskStatus::Runnable;")
+            .expect("the wake");
+        let settle = body
+            .find("self.settle_blocked_send_envelope_split(")
+            .expect("the envelope settle");
+        let enqueue = body
+            .find("self.enqueue_reply_timeout_wake_split(work.tid);")
+            .expect("the enqueue");
+        assert!(publish < runnable, "publish precedes the status transition");
+        assert!(
+            runnable < settle && settle < enqueue,
+            "the envelope is settled before the sender can be dispatched"
+        );
+        assert!(
+            body[enqueue..].find("with_task_tcbs_split_mut").is_none(),
+            "nothing mutates the task after the enqueue"
+        );
+    }
+
+    /// The settle takes its four domain claims SEQUENTIALLY. No `with_*_split_mut` closure
+    /// contains another — a nested claim here would be a rank violation, since rank 3 (ipc) is
+    /// entered after rank 2 (task) and rank 1 (scheduler) after both.
+    #[test]
+    fn the_settle_never_nests_a_domain_claim() {
+        let body = RUNTIME_SRC
+            .split("pub(crate) fn drain_send_timeout_post_work(")
+            .nth(1)
+            .expect("the settle")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        let mut depth = 0usize;
+        let mut open: Vec<usize> = Vec::new();
+        for (i, ch) in body.char_indices() {
+            match ch {
+                '{' => {
+                    // Is this the opening brace of a split-mut closure argument?
+                    let head = &body[i.saturating_sub(48)..i];
+                    if head.contains("_split_mut(|") {
+                        assert_eq!(
+                            depth, 0,
+                            "a domain claim opened while another was still held (at byte {i})"
+                        );
+                        depth += 1;
+                        open.push(i);
+                    } else if depth > 0 {
+                        depth += 1;
+                    }
+                }
+                '}' if depth > 0 => depth -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "unbalanced scan");
+        assert_eq!(open.len(), 2, "exactly the rank-2 claim and the rank-3 claim");
+    }
+
+    // ── (5) the cursor ──────────────────────────────────────────────────────────────────────
+
+    /// The cursor advances by entries SCANNED, so a pass that publishes nothing still moves it,
+    /// and a pass whose publications are refused by a full queue moves it too. Wrapping the
+    /// whole array leaves it where it started, which is what makes coverage total.
+    #[test]
+    fn the_cursor_advances_by_entries_scanned_and_wraps() {
+        let cpu = CpuId(3);
+        let idx = cpu.0 as usize;
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(idx);
+        assert_eq!(crate::kernel::boot::ipc_timeout_scan_cursor(idx), 0);
+        crate::kernel::boot::advance_ipc_timeout_scan_cursor(idx, 64);
+        assert_eq!(crate::kernel::boot::ipc_timeout_scan_cursor(idx), 64);
+        crate::kernel::boot::advance_ipc_timeout_scan_cursor(idx, 64);
+        assert_eq!(crate::kernel::boot::ipc_timeout_scan_cursor(idx), 128);
+        // A full wrap returns to the same slot — every slot was visited on the way.
+        crate::kernel::boot::advance_ipc_timeout_scan_cursor(idx, 512);
+        assert_eq!(crate::kernel::boot::ipc_timeout_scan_cursor(idx), 128);
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(idx);
+    }
+
+    /// Below the window, ONE pass covers the whole array: the scan runs out of slots before it
+    /// runs out of window, wraps, and leaves the cursor exactly where it started. That is the
+    /// ordinary case — a system with a handful of tasks never defers a due deadline to a later
+    /// trap — and it is also what makes the focused tests above deterministic.
+    #[test]
+    fn a_pass_below_the_window_covers_the_whole_array() {
+        let cpu = CpuId(2);
+        let idx = cpu.0 as usize;
+        let k = fresh(cpu);
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(idx);
+        k.collect_due_ipc_timeout_work(1, 1, cpu);
+        assert_eq!(
+            crate::kernel::boot::ipc_timeout_scan_cursor(idx),
+            0,
+            "a full wrap advances by exactly MAX_TASKS and returns to the same slot"
+        );
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(idx);
+    }
+
+    /// Above the window, the pass STOPS — bounded work — and the cursor is left mid-array so the
+    /// next trap resumes where this one gave up. This is the property that makes the scan O(64)
+    /// rather than O(MAX_TASKS), and it is also what stops a high slot starving.
+    #[test]
+    fn a_pass_above_the_window_stops_and_resumes_where_it_stopped() {
+        let cpu = CpuId(2);
+        let idx = cpu.0 as usize;
+        let k = fresh(cpu);
+        let window = crate::kernel::boot::IPC_TIMEOUT_SCAN_WINDOW;
+        k.with(|state| {
+            for tid in 1..=(window as u64 + 8) {
+                state.register_task(tid).expect("register");
+            }
+        });
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(idx);
+        k.collect_due_ipc_timeout_work(1, 1, cpu);
+        let first = crate::kernel::boot::ipc_timeout_scan_cursor(idx);
+        assert_ne!(first, 0, "the pass stopped before wrapping");
+        assert!(
+            first <= window + 8,
+            "it stopped as soon as it had examined `window` occupied slots, not later"
+        );
+        k.collect_due_ipc_timeout_work(1, 1, cpu);
+        assert_ne!(
+            crate::kernel::boot::ipc_timeout_scan_cursor(idx),
+            first,
+            "the next pass resumes from the cursor and advances again"
+        );
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(idx);
+    }
+
+    /// The advance is unconditional in source: it sits after the scan closure and before the
+    /// publish loops, so no `continue`, no full queue and no refused publish can skip it.
+    #[test]
+    fn the_advance_cannot_be_skipped() {
+        let body = RUNTIME_SRC
+            .split("pub(crate) fn collect_due_ipc_timeout_work(")
+            .nth(1)
+            .expect("the scanner")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        let close = body.find("        });\n").expect("the scan closure closes");
+        let advance = body
+            .find("crate::kernel::boot::advance_ipc_timeout_scan_cursor(cpu_idx, scanned);")
+            .expect("the advance");
+        let publish = body
+            .find("reply_timeout_work_publish(cpu_idx, *work)")
+            .expect("the reply publish");
+        assert!(
+            close < advance && advance < publish,
+            "the cursor advances after the scan and BEFORE any publish, so a refused publish \
+             cannot stall it"
+        );
+        assert!(
+            body[..advance].matches("scanned += 1;").count() == 1,
+            "`scanned` is incremented at exactly one place — the top of the loop"
+        );
+    }
+
+    /// The scanner classifies, it does not decide: no status write, no deadline clear, no wake
+    /// and no waiter mutation anywhere in its body.
+    #[test]
+    fn the_scanner_mutates_nothing() {
+        let body = RUNTIME_SRC
+            .split("pub(crate) fn collect_due_ipc_timeout_work(")
+            .nth(1)
+            .expect("the scanner")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        for forbidden in [
+            "tcb.status =",
+            "tcb.ipc_timeout_deadline =",
+            "tcb.pending_syscall_completion =",
+            "with_ipc_split_mut",
+            "with_scheduler_split_mut",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the scanner must not `{forbidden}` — every decision belongs to a drain"
+            );
+        }
+    }
+
+    // ── (6) no second channel ───────────────────────────────────────────────────────────────
+
+    /// U7 adds no second drain channel: the scanner and both drains have exactly one production
+    /// caller each, and it is the single entry.
+    #[test]
+    fn u7_adds_no_second_channel() {
+        for callee in [
+            "self.collect_due_ipc_timeout_work(",
+            "self.drain_reply_timeout_post_work(",
+            "self.drain_send_timeout_post_work(",
+        ] {
+            assert_eq!(
+                RUNTIME_SRC.matches(callee).count(),
+                1,
+                "{callee} must have exactly one production caller"
+            );
+        }
+        for src in [TRAP_ENTRY_SRC, RISCV_TRAP_SRC] {
+            for callee in [
+                "collect_due_ipc_timeout_work",
+                "drain_reply_timeout_post_work",
+                "drain_send_timeout_post_work",
+            ] {
+                assert!(
+                    !src.contains(callee),
+                    "the ports call the single entry, never its parts"
+                );
+            }
+        }
+    }
+
+    /// The send class retires through the SAME seal discipline as the reply class: the settle
+    /// only ARMS it, and the U6 delivery point emits it.
+    #[test]
+    fn the_send_class_seal_requires_delivery() {
+        assert!(MOD_SRC.contains("pub(crate) fn arm_send_timeout_class_retired()"));
+        assert!(MOD_SRC.contains("pub(crate) fn maybe_emit_send_timeout_class_retired()"));
+        assert!(
+            MOD_SRC.contains("class=IpcSendTimeout"),
+            "the seal reuses GLOBAL_LOCK_RETIRE_CLASS_DONE with the class named"
+        );
+        let settle = RUNTIME_SRC
+            .split("pub(crate) fn drain_send_timeout_post_work(")
+            .nth(1)
+            .expect("the settle");
+        assert!(
+            settle.contains("crate::kernel::boot::arm_send_timeout_class_retired();"),
+            "the settle only ARMS"
+        );
+        let delivery = RUNTIME_SRC
+            .split("pub(crate) fn direct_dispatch_take_send_completion_split(")
+            .nth(1)
+            .expect("the U6 delivery point")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        assert!(
+            delivery.contains("maybe_emit_send_timeout_class_retired();"),
+            "and only the delivery point emits"
+        );
     }
 }

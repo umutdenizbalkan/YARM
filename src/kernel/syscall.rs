@@ -2760,22 +2760,50 @@ mod tests {
             "timeout marker must not fire before timer progression"
         );
 
+        // U7 (canonical 199E): the blocking-send timeout class is no longer processed inside
+        // the broad-lock timer scan. The timer trap runs it and leaves the sender blocked; the
+        // production off-lock pipeline that every port's trap wrapper drives immediately after
+        // the broad guard drops is what settles it.
+        let deadline = state
+            .with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .and_then(|t| t.ipc_timeout_deadline)
+            })
+            .expect("a deadline rode with the block");
         state
             .handle_trap(crate::kernel::trap::Trap::TimerInterrupt, None)
             .expect("timer trap");
         assert!(
-            state
+            !state
                 .consume_ipc_timeout_fired_for_tid(1)
-                .expect("consume timeout marker"),
-            "send timeout marker should fire after deadline"
+                .expect("post-tick timeout marker"),
+            "the broad-lock scan must not fire the retired blocking-send class"
         );
-        assert!(matches!(
-            state.task_status(1),
-            Some(
-                crate::kernel::task::TaskStatus::Runnable
-                    | crate::kernel::task::TaskStatus::Running
-            )
-        ));
+
+        let cpu = crate::kernel::scheduler::CpuId(0);
+        let k = crate::runtime::SharedKernel::new(state);
+        crate::kernel::boot::reset_ipc_timeout_scan_cursor(cpu.0 as usize);
+        crate::kernel::boot::send_timeout_work_clear(cpu.0 as usize);
+        let now = deadline.wrapping_add(1);
+        k.collect_due_ipc_timeout_work(now, now, cpu);
+        k.drain_send_timeout_post_work(cpu, now);
+        k.with(|state| {
+            assert!(
+                state
+                    .consume_ipc_timeout_fired_for_tid(1)
+                    .expect("consume timeout marker"),
+                "send timeout marker should fire after deadline"
+            );
+            assert!(matches!(
+                state.task_status(1),
+                Some(
+                    crate::kernel::task::TaskStatus::Runnable
+                        | crate::kernel::task::TaskStatus::Running
+                )
+            ));
+        });
     }
 
     #[test]

@@ -92,6 +92,18 @@ reply-timeout transaction) are IPC timeout work belonging to canonical **199E**.
 contribute nothing to canonical 200A–200C, which are the **capability** stages and have
 essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ONLY`.
 
+**U7 (canonical 199E, partial).** The off-lock timeout pipeline is now PRODUCTION on all
+three architectures: `SharedKernel::run_due_ipc_timeout_work` is driven unconditionally from
+every port's post-lock area, and `IPC_REPLY_TIMEOUT_LOCK_STATUS arch=… scan_broad_lock=0 …
+production=1` appears on an ordinary core-smoke boot of x86_64, AArch64 and RISC-V.
+`process_ipc_timeout_deadlines` unconditionally skips both retired classes, so the only class
+it still owns is the ordinary receive timeout. **Blocking-send timeout is fully retired and
+production-reachable.** **Reply/call timeout is retired as a pipeline but not yet reachable**:
+no production site registers a token-bearing reply deadline (the only one is the oracle-gated
+`maybe_arm_reply_timeout_oracle`), so that quarter still needs a real deadline queue and a
+unified deadline timebase. `IpcRecvTimeout` and `IpcCall` timeout remain open, so **199E stays
+OPEN**.
+
 ### Live cells earned
 
 | Programme | Cells | Seal / canonical stage served |

@@ -84,7 +84,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 |-------|------------------------------|--------|----------------------------|
 | **199C** | **Blocking IpcSend.** Retire sender-waiter publication where endpoint policy blocks a sender: sender → `Blocked(IpcSend)`, waiter enqueued once, receiver later consumes sender, sender wakes once. Full sparse-queue and timeout parity. | **OPEN** | `handle_ipc_send` and its waiter publication run entirely inside the broad `with_cpu`. The only off-lock element is the x86_64 D2-send drain (`src/arch/trap_entry.rs:388`), which relocates the *queue-advancing dispatch* — **not** the waiter publication — and is compile-time absent on AArch64/RISC-V. Sparse-queue and send-timeout parity untouched. The 15 `IpcSend` live cells (plain / ordinary-cap / shared-region) prove **delivery**, not blocking-sender retirement. |
 | **199D** | **IpcCall and reply-object lifecycle** as one transaction: delivery → caller reply-blocked → reply object created → reply cap transferred → server replies → caller wakes → reply object destroyed. Required: no orphan reply object, no duplicate reply, no lost caller, no reply-cap rematerialization, timeout/cancellation cleanup, **server crash cleanup**. | **OPEN** (hosted foundation + knob-gated live proof) | Transaction exists off-lock: `src/kernel/ipccall_direct_txn.rs`, `syscall_split.rs:295/307`, reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 in both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) — but **default-OFF** (`ipccall_direct_proof_enabled()`, `src/kernel/boot/mod.rs:3095`), so **no production boot takes it**. Server-crash cleanup: the reverse-link accounting is **repaired**, and the **first live cell is EARNED on x86_64** — `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`, tree `e2fd0b5c`: scoped vector `[1;9]`, quiescent system balance `created=54 closed=54 live_links=0`, owner revalidation executed with a correct replacement return, zero `result=fail` in the log (`doc/IPC.md` §8.5). **1 of 3 architectures**; AArch64 and RISC-V cells unearned. Timeout/cancellation cleanup depends on 199E. |
-| **199E** | **IPC timeout and cancellation** off the broad lock: `IpcRecvTimeout`, **IpcSend timeout**, **IpcCall timeout**, reply timeout/cancellation. Bounded timer/deadline structures, subsystem-local cleanup. Known sparse sender-waiter behavior must remain fixed. | **OPEN** (partial) | Reply timeout is the only retired quarter: narrow completion transaction on all three arches, scan off-lock **x86_64 only** (`IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0`), 6 live cells (timeout-wins + reply-wins × 3 arches, `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`). `IpcRecvTimeout` pre-reads its deadline off-lock but the receive itself is broad. **IpcSend timeout and IpcCall timeout are not retired at all.** U1 deleted the callerless `SharedKernel::run_reply_timeout_completion` wrapper, but that retired a census entry, not the behavior: the single completion body `KernelState::run_reply_timeout_completion_locked` is unchanged and the in-lock scan still calls it on every architecture. |
+| **199E** | **IPC timeout and cancellation** off the broad lock: `IpcRecvTimeout`, **IpcSend timeout**, **IpcCall timeout**, reply timeout/cancellation. Bounded timer/deadline structures, subsystem-local cleanup. Known sparse sender-waiter behavior must remain fixed. | **OPEN** (partial) | **U7 promoted the off-lock timeout pipeline to production on all three architectures and retired two classes from the broad-lock scan.** `SharedKernel::run_due_ipc_timeout_work` is driven unconditionally from every port's post-lock area — no oracle feature, no runtime selector — and `IPC_REPLY_TIMEOUT_LOCK_STATUS arch=… scan_broad_lock=0 … production=1` is now emitted on an ORDINARY boot of x86_64, AArch64 and RISC-V. `process_ipc_timeout_deadlines` unconditionally SKIPS both retired classes, so the only class it still owns is the ordinary receive timeout. **Blocking-send timeout is fully retired**: production arms it, the arch-neutral cursor-bounded scanner collects it, and `drain_send_timeout_post_work` settles it through the U6 lifecycle (exact `{tid, asid, send_generation}` claim → waiter removal → envelope+pin settle → rank-1 enqueue), with the class seal `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendTimeout` emitted only from the U6 delivery point. **Reply/call timeout is retired as a PIPELINE but is not yet reachable in production**: the only site that registers a token-bearing reply deadline is `maybe_arm_reply_timeout_oracle`, which stays oracle-gated, so the promoted scanner is production-live and idle for that class until a real deadline queue replaces the 4-slot single-pair store (`MAX_DEADLINE_TOKENS = 4`) and the per-arch deadline timebases are unified. **`IpcRecvTimeout` and `IpcCall` timeout registration remain open.** 6 live cells (timeout-wins + reply-wins × 3 arches, `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`). |
 | **199F** | **Notification wait/signal parity**: signal, wait, wait-with-timeout, multi-signal accumulation, wake exactly once. No global lock in IRQ-originated notification delivery. | **OPEN** | Only `notification_waiter_count_split_read` (`src/runtime.rs:4341`) exists, and it is a read helper. `signal_notification` (`src/kernel/boot/ipc_state.rs:5196`) takes `&mut self` under the broad lock. IRQ-originated delivery runs inside `handle_trap_entry_shared`'s `with_cpu`. No seams for wait, wait-with-timeout, or multi-signal accumulation. |
 | **199G** | **Full IPC subsystem seal** — send, recv, call, reply, notifications, timeouts, capability transfer, shared-region transfer all operate with **zero** runtime broad-lock acquisitions. Major exit gate. | **OPEN** | Blocked on 199C–199F. The authoritative trap dispatch (`src/arch/trap_entry.rs:299`, `src/arch/riscv64/trap.rs:563`) still serves every non-split IPC syscall. |
 
@@ -243,6 +243,69 @@ must retire real runtime work.** U1 and U2 served **204C** / **204D** / **204E**
 completing any of them.
 
 **U6 — DELIVERED. CANONICAL 199C — COMPLETE. CENSUS-DELTA 0.**
+
+**U7 — DELIVERED. CANONICAL 199E — OPEN (two classes retired). CENSUS-DELTA 0.**
+
+> **The off-lock IPC-timeout pipeline is production on all three architectures, and two
+> classes are gone from the broad-lock scan.**
+>
+> Before U7 the pipeline existed but was proof-gated: `collect_due_reply_timeout_work` and
+> `drain_reply_timeout_post_work` were compiled only under `ipc-reply-timeout-oracle-core`
+> and driven only when the runtime oracle selector was active, so **production processed
+> every timeout inside `process_ipc_timeout_deadlines` under the broad lock.** U7 removed
+> both gates. There is now one arch-neutral production entry,
+> `SharedKernel::run_due_ipc_timeout_work(cpu)`, driven unconditionally from each port's
+> post-lock area — the shared `trap_entry` cell for x86_64/AArch64 (still behind the
+> `not(target_arch = "riscv64")` single-driver guard) and the RISC-V wrapper's Phase 3. It
+> reads the port's monotonic clock, runs ONE cursor-bounded scan, then drains each class.
+>
+> **What the scan is.** `collect_due_ipc_timeout_work` walks the TCB array through the rank-2
+> task split seam, classifies every DUE deadline into one of the two retired classes, and
+> publishes one owned work item per entry. It decides nothing, mutates nothing and wakes
+> nobody. It examines at most `IPC_TIMEOUT_SCAN_WINDOW` (64) OCCUPIED slots per pass and
+> advances its per-CPU cursor by the number of entries **SCANNED**, never by the number
+> published — so a pass that published nothing advances, a pass whose publications a full
+> queue refused advances, and no slot can starve. Ordinary receive timeouts are not a U7
+> class and are skipped.
+>
+> **What was retired.** `process_ipc_timeout_deadlines` now SKIPS token-bearing reply
+> deadlines and `Blocked(EndpointSend)` tasks **unconditionally** — the reply skip used to be
+> feature-gated, which would have left one class with two owners once the pipeline went
+> production. The U6 `TimedOut` publication moved out of that scan with its class. The one
+> class the broad-lock scan still owns is the ordinary receive timeout, and its behaviour is
+> byte-for-byte unchanged (`SCHED_TIMEOUT_EXPIRED … kind=recv`, same phase sequence, same
+> exactly-once EXPIRED == RUNQUEUE_ENQUEUE accounting).
+>
+> **Blocking-send timeout is fully retired and production-reachable.**
+> `drain_send_timeout_post_work` runs the U6 lifecycle off the broad lock in four
+> SEQUENTIAL, never-nested claims: rank 2 (the exact `{tid, asid, send_generation}` claim,
+> which publishes `SEND_COMPLETION_TIMED_OUT` in the SAME acquisition that makes the sender
+> `Runnable`), rank 3 (waiter removal + envelope identity resolution), rank 3→6 (the
+> canonical `settle_blocked_send_envelope_split`, one consume and one no-reclaim pin
+> release), then rank 1 (the enqueue, last). The receiver/timeout race is decided exactly as
+> before — whichever claims the blocked sender first wins, and the loser's publication
+> refuses with zero mutation. An ASID-less sender has no incarnation to name, so it is woken
+> with nothing published, exactly as the in-lock scan handled it. The class seal
+> `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendTimeout` is ARMED by the settle and EMITTED
+> only from the U6 delivery point, so a committed-but-undelivered completion cannot claim it.
+>
+> **What is NOT retired, stated plainly.** Production still has **no site that registers a
+> token-bearing reply/call deadline**: the only one is `maybe_arm_reply_timeout_oracle`,
+> which is and remains oracle-gated. The promoted reply scanner is therefore production-live
+> and *idle* for that class on an ordinary boot. Closing that quarter needs a real deadline
+> queue in place of the deliberately tiny 4-slot single-pair store
+> (`MAX_DEADLINE_TOKENS = 4`, documented "dormant in production this stage"), per-call token
+> minting on every endpoint, and unification of the deadline timebases (x86_64 scheduler tick
+> vs the AArch64 `CNTPCT_EL0` / RISC-V `time` CSR readers). That is the work the source itself
+> defers, and U7 did not do it. `IpcRecvTimeout` and `IpcCall` timeout remain OPEN, so
+> **canonical 199E stays OPEN.**
+>
+> **Live evidence.** `IPC_REPLY_TIMEOUT_LOCK_STATUS arch=<arch> scan_broad_lock=0
+> completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1
+> result=ok` is emitted on an ORDINARY core-smoke boot of x86_64, AArch64 and RISC-V — the
+> first time this attestation has appeared without an oracle build. Stage 200C2B gated it on
+> an arm-only latch; that latch is deleted rather than left dormant, because the attestation
+> now fires at the first production drain, which necessarily precedes any arm.
 
 > **Every legal blocking-send class and both blocking origins use the coherent post-lock
 > lifecycle.** Plain, ordinary-cap AND shared-region transfers, from BOTH origins

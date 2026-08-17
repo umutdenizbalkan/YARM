@@ -818,22 +818,17 @@ pub fn handle_riscv_trap_entry_shared(
         }
     }
 
-    // Stage 200C2C2 (IpcReplyTimeout OFF-LOCK RETIREMENT, RISC-V cell): with the broad
-    // `SpinLock<KernelState>` from Phase 2's `with_cpu` genuinely released, collect DUE
-    // token-bearing reply-receive deadlines through the NARROW collector (rank-2 task split seam)
-    // and drain the per-CPU deferred work through the OFF-LOCK completion transaction (per-domain
-    // split-mut seams). This is the arch-neutral machinery accepted for x86_64 and AArch64 — only
-    // the call site and the monotonic clock differ. `now` comes from the RISC-V `time` CSR (the
-    // scheduler tick does not advance reliably under a user workload on this port), the SAME clock
-    // domain the deadline is armed in. Ordinary receive-timeout deadlines stay on the in-lock scan
-    // (the collector's token-bearing filter skips them). Default-off: a strict no-op unless the
-    // RISC-V oracle feature is built AND its selector is active.
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
-        let now = shared.reply_timeout_now_split_read();
-        shared.collect_due_reply_timeout_work(now, cpu);
-        shared.drain_reply_timeout_post_work(cpu, now);
-    }
+    // U7 (canonical 199E) — THE PRODUCTION IPC-TIMEOUT ENTRY, RISC-V cell.
+    //
+    // With the broad `SpinLock<KernelState>` from Phase 2's `with_cpu` genuinely released, scan
+    // both OFF-LOCK-retired timeout classes and settle each through its own off-lock
+    // transaction. This is the SAME arch-neutral seam the x86_64/AArch64 cell drives — only the
+    // call site and the monotonic clock differ. `now` comes from the RISC-V `time` CSR (the
+    // scheduler tick does not advance reliably under a user workload on this port), the SAME
+    // clock domain the deadline is armed in. Ordinary receive-timeout deadlines stay on the
+    // in-lock scan. Ungated: U7 removed the oracle feature cfg and the runtime selector that
+    // used to decide whether production processed these classes off the broad lock.
+    shared.run_due_ipc_timeout_work(cpu);
 
     // Stage 200D-2A: the SERVER-DEATH post-lock drain, ungated (production behaviour on
     // every build). RISC-V drives its own post-lock area, so the drain is wired here for

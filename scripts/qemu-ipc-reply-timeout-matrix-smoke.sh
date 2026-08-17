@@ -307,7 +307,7 @@ cell_timeout_wins() {
   need_once "$norm" "$label" \
     "IPC_REPLY_TIMEOUT_ARMED arch=${arch}" \
     "IPC_REPLY_TIMEOUT_OK arch=${arch} terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok" \
-    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=${arch} scan_broad_lock=0 completion_transaction_narrow=1 result=ok" \
+    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=${arch} scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok" \
     "IPC_REPLY_TIMEOUT_DEFERRED arch=${arch} published=1 drained=1 result=ok" \
     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcReplyTimeout result=ok" \
     "${up}_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok"
@@ -380,7 +380,7 @@ cell_reply_wins() {
     "IPC_REPLY_TIMEOUT_ORACLE_SERVER_DUP_REPLY rejected=1" \
     "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=${arch} outcome=released trigger=userspace_reply_validated result=ok" \
     "IPC_REPLY_TIMEOUT_LATE_SCAN arch=${arch} outcome=reply_won late_timeout_claims=0 result=ok" \
-    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=${arch} scan_broad_lock=0 completion_transaction_narrow=1 result=ok" \
+    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=${arch} scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok" \
     "USER_LOG tid=1 msg=IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=8 reply_ok=1" \
     "${up}_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok"
   # No timeout may claim, no reservation may be declined, and the reservation must never be

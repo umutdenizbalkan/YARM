@@ -99,15 +99,30 @@ if (( ! fail )); then
     || die "feature-off kernel_boot build failed (see $LOGDIR/kbuild-off.log)"
   OFF_BIN="$LOGDIR/kernel_boot_off.bin"
   "$OBJCOPY" -O binary "$KELF" "$OFF_BIN" >/dev/null 2>&1 || die "objcopy of feature-off kernel failed"
-  # Reply-timeout-SPECIFIC live literals must be absent (other classes may legitimately carry a
-  # GLOBAL_LOCK_RETIRE_CLASS_DONE for their own class — hence class-specific).
-  for lit in "IPC_REPLY_TIMEOUT_OK arch=riscv64" "IPC_REPLY_BEATS_TIMEOUT_OK arch=riscv64" \
-             "IPC_REPLY_TIMEOUT_ARMED arch=riscv64" "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=riscv64" \
-             "IPC_REPLY_TIMEOUT_LATE_SCAN arch=riscv64" "class=IpcReplyTimeout" \
-             "IPC_REPLY_TIMEOUT_DEFERRED arch=riscv64" \
-             "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=riscv64" \
-             "IPC_REPLY_WIN_RESERVE arch=riscv64"; do
-    rg -a -q "$lit" "$OFF_BIN" && die "feature-OFF kernel contains live literal $lit (not marker-clean)"
+  # U7 (canonical 199E) split this gate in two, because the feature no longer decides where
+  # timeouts are processed — only which oracle SCENARIOS are built.
+  #
+  # (a) The oracle's own scenario literals must still be absent from a feature-OFF kernel.
+  for lit in "IPC_REPLY_BEATS_TIMEOUT_OK arch=" "IPC_REPLY_TIMEOUT_ARMED arch=" \
+             "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=" \
+             "IPC_REPLY_WIN_RESERVE arch="; do
+    rg -a -q "$lit" "$OFF_BIN" && die "feature-OFF kernel contains oracle literal $lit (not marker-clean)"
+  done
+  # (b) The PRODUCTION pipeline's literals must now be PRESENT in a feature-OFF kernel. Their
+  # absence would mean the promotion regressed back behind the feature — the exact thing U7
+  # removed — so this half of the gate is asserted positively.
+  # NB: the arch tag is a RUNTIME argument (`arch={}` + `REPLY_TIMEOUT_ARCH`), so the composite
+  # "MARKER arch=riscv64" string never exists in the image — only the format-string fragment
+  # does. Matching the fragment is what makes this gate real rather than vacuously true.
+  # `class=IpcReplyTimeout` is deliberately NOT in this list on riscv64. Its only emit site on
+  # this port is the resume-boundary recv/reply completion consumer, which U6 policy keeps
+  # feature-gated (`the_reply_timeout_feature_policy_is_unchanged`) and U7 does not widen: U7
+  # promoted where timeouts are SCANNED and SETTLED, not the IpcRecv delivery consumer. On
+  # x86_64 the drain itself is the delivery point, so the seal is present there.
+  for lit in "IPC_REPLY_TIMEOUT_OK arch=" "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=" \
+             "IPC_REPLY_TIMEOUT_LATE_SCAN arch=" \
+             "IPC_REPLY_TIMEOUT_DEFERRED arch="; do
+    rg -a -q "$lit" "$OFF_BIN" || die "feature-OFF kernel is missing PRODUCTION literal $lit (the U7 pipeline must not be feature-gated)"
   done
 fi
 
@@ -201,7 +216,7 @@ if (( ! fail )); then
     "IPC_REPLY_TIMEOUT_ARMED arch=riscv64" \
     "IPC_REPLY_TIMEOUT_OK arch=riscv64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok" \
     "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64 terminal=Timeout result=ok" \
-    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=riscv64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok" \
+    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=riscv64 scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok" \
     "IPC_REPLY_TIMEOUT_DEFERRED arch=riscv64 published=1 drained=1 result=ok" \
     "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED" \
     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReplyTimeout result=ok" \
@@ -265,7 +280,7 @@ run_reply_wins() {
     "IPC_REPLY_BEATS_TIMEOUT_OK arch=riscv64 terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok" \
     "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=riscv64 outcome=released trigger=userspace_reply_validated result=ok" \
     "IPC_REPLY_TIMEOUT_LATE_SCAN arch=riscv64 outcome=reply_won late_timeout_claims=0 result=ok" \
-    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=riscv64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok" \
+    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=riscv64 scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok" \
     "RISCV_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok" \
     "IPC_REPLY_TIMEOUT_ORACLE_SERVER_DUP_REPLY rejected=1"
   # The reply must never be declined here, and NO decline reason may ever be raised by deadline

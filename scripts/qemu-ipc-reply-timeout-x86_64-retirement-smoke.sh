@@ -87,12 +87,19 @@ if (( ! fail )); then
   # boot image was already copied to build-x86_64/kernel_boot.elf in step 2, so it is
   # untouched here. Do NOT re-copy $KELF (it is now the feature-OFF binary).
   OFF_ELF="target/x86_64-yarm-none/${KPROFILE}/kernel_boot"
-  # Reply-timeout-SPECIFIC live literals must be absent (other classes may legitimately
-  # carry a `GLOBAL_LOCK_RETIRE_CLASS_DONE` for their own class — hence class-specific).
-  for lit in IPC_REPLY_TIMEOUT_OK IPC_REPLY_BEATS_TIMEOUT_OK IPC_REPLY_TIMEOUT_ARMED \
-             IPC_REPLY_TIMEOUT_LOCK_STATUS IPC_REPLY_TIMEOUT_LATE_SCAN \
+  # U7 (canonical 199E) split this gate in two, because the feature no longer decides where
+  # timeouts are processed — only which oracle SCENARIOS are built.
+  #
+  # (a) The oracle's own scenario literals must still be absent from a feature-OFF kernel.
+  for lit in IPC_REPLY_BEATS_TIMEOUT_OK IPC_REPLY_TIMEOUT_ARMED; do
+    rg -a -q "$lit" "$OFF_ELF" && die "feature-OFF kernel contains oracle literal $lit (not marker-clean)"
+  done
+  # (b) The PRODUCTION pipeline's literals must now be PRESENT in a feature-OFF kernel. Their
+  # absence would mean the promotion regressed back behind the feature — the exact thing U7
+  # removed — so this half of the gate is asserted positively.
+  for lit in IPC_REPLY_TIMEOUT_OK IPC_REPLY_TIMEOUT_LOCK_STATUS IPC_REPLY_TIMEOUT_LATE_SCAN \
              "class=IpcReplyTimeout" IPC_REPLY_TIMEOUT_DEFERRED; do
-    rg -a -q "$lit" "$OFF_ELF" && die "feature-OFF kernel contains live literal $lit (not marker-clean)"
+    rg -a -q "$lit" "$OFF_ELF" || die "feature-OFF kernel is missing PRODUCTION literal $lit (the U7 pipeline must not be feature-gated)"
   done
 fi
 
@@ -143,7 +150,7 @@ if (( ! fail )); then
   verify_log "$TW" \
     "IPC_REPLY_TIMEOUT_ARMED arch=x86_64" \
     "IPC_REPLY_TIMEOUT_OK arch=x86_64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok" \
-    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok" \
+    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok" \
     "IPC_REPLY_TIMEOUT_DEFERRED arch=x86_64 published=1 drained=1 result=ok" \
     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout result=ok" \
     "X86_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok"
@@ -168,7 +175,7 @@ if (( ! fail )); then
     "IPC_REPLY_TIMEOUT_ARMED arch=x86_64" \
     "IPC_REPLY_BEATS_TIMEOUT_OK arch=x86_64 terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok" \
     "IPC_REPLY_TIMEOUT_LATE_SCAN arch=x86_64 outcome=reply_won late_timeout_claims=0 result=ok" \
-    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok" \
+    "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok" \
     "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok" \
     "IPC_REPLY_TIMEOUT_ORACLE_SERVER_DUP_REPLY rejected=1"
   # Reply won ⇒ NO timeout wake, no broad-lock status, no panic/fatal trap.

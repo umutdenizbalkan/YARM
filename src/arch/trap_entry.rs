@@ -1713,30 +1713,29 @@ pub fn handle_trap_entry_shared(
         }
     }
 
-    // Stage 200C2B/200C2C1 (IpcReplyTimeout OFF-LOCK RETIREMENT): with the broad
-    // `SpinLock<KernelState>` from `with_cpu` already dropped above, collect DUE
-    // token-bearing reply-receive deadlines through the NARROW collector (rank-2 task
-    // split seam) and drain the per-CPU deferred work through the OFF-LOCK completion
-    // transaction (per-domain split-mut seams). Neither holds the broad lock — this is
-    // the production timer/deadline entry for the retired reply-timeout class, SHARED by
-    // the x86_64 and AArch64 cells (this seam runs for every arch that flows through
-    // `handle_trap_entry_shared`, so the AArch64 timer IRQ reaches it after `with_cpu`
-    // returns). Ordinary receive-timeout deadlines stay on the in-lock scan (they are
-    // skipped by the collector's token-bearing filter). Default-off: a strict no-op
-    // unless a per-arch oracle feature is built AND its selector is active.
-    // NB: RISC-V does NOT flow through this shared entry — it wires the identical collector/drain
-    // into its own trap wrapper's Phase 3. The explicit `not(riscv64)` gate keeps that a
-    // single-driver invariant even if a future path routes RISC-V here, so the one-shot
-    // attestation can never be driven from two wrappers.
-    #[cfg(all(
-        feature = "ipc-reply-timeout-oracle-core",
-        not(target_arch = "riscv64")
-    ))]
-    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
-        let now = shared.reply_timeout_now_split_read();
-        shared.collect_due_reply_timeout_work(now, cpu);
-        shared.drain_reply_timeout_post_work(cpu, now);
-    }
+    // U7 (canonical 199E) — THE PRODUCTION IPC-TIMEOUT ENTRY, x86_64 + AArch64 cell.
+    //
+    // With the broad `SpinLock<KernelState>` from `with_cpu` already dropped above, scan both
+    // OFF-LOCK-retired timeout classes through the cursor-bounded arch-neutral collector (rank-2
+    // task split seam) and settle each class's due work through its own off-lock transaction
+    // (per-domain split-mut seams). Nothing here holds the broad lock.
+    //
+    // Stage 200C2B wired this same machinery behind the reply-timeout oracle FEATURE and its
+    // runtime selector, so production still processed both classes inside
+    // `process_ipc_timeout_deadlines` under the broad lock. U7 removes both gates: this is now
+    // the ordinary production timer/deadline path on every build and every boot, and the two
+    // classes are gone from the broad-lock scan. The oracle knobs still select oracle SCENARIOS;
+    // they no longer decide where timeouts are processed.
+    //
+    // Ordinary receive-timeout deadlines are NOT a U7 class and stay on the in-lock scan (the
+    // collector's classifier skips them).
+    //
+    // NB: RISC-V does NOT flow through this shared entry — it wires the identical seam into its
+    // own trap wrapper's Phase 3. The explicit `not(riscv64)` gate keeps that a single-driver
+    // invariant even if a future path routes RISC-V here, so the one-shot attestations can never
+    // be driven from two wrappers.
+    #[cfg(not(target_arch = "riscv64"))]
+    shared.run_due_ipc_timeout_work(cpu);
 
     // Stage 200D-2A: the SERVER-DEATH post-lock drain. Unlike the reply-timeout collector
     // above this is NOT feature-gated — server death is production behaviour on every

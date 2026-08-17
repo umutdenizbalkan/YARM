@@ -3896,6 +3896,11 @@ pub fn ipc_reply_timeout_selector() -> Option<u64> {
 
 /// Stage 200C2C1 — the monotonic "now" that drives reply-timeout deadlines, per arch.
 ///
+/// U7 (canonical 199E) ungated these: the timeout pipeline they clock is production on every
+/// build now, so a deadline timebase that existed only under the oracle feature would leave the
+/// promoted scanner with no clock to scan in. The PER-ARCH `cfg`s are untouched — only the
+/// current architecture's reader is ever linked.
+///
 /// x86_64: the periodic LAPIC timer advances the scheduler tick, so the scheduler tick IS the
 /// monotonic source (the caller passes it — see `reply_timeout_now_split_read`). AArch64: the port
 /// is COOPERATIVE — there is no periodic timer preemption, so the scheduler tick never advances
@@ -3904,7 +3909,7 @@ pub fn ipc_reply_timeout_selector() -> Option<u64> {
 /// hardware regardless of IRQ delivery, so the off-lock collector (which runs on EVERY trap, e.g. the
 /// oracle's yield loop) observes it advance and finds a DUE deadline. The deadline is armed in the
 /// SAME units (`reply_timeout_hw_now() + delta`), so arm and scan share one clock.
-#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 pub(crate) const REPLY_TIMEOUT_AARCH64_TICK_SHIFT: u64 = 16;
 
 /// Stage 200C2C2 — the RISC-V monotonic reply-timeout tick. Like AArch64, the RISC-V port has no
@@ -3914,10 +3919,10 @@ pub(crate) const REPLY_TIMEOUT_AARCH64_TICK_SHIFT: u64 = 16;
 /// It is scaled down by the same shift so the arm and the scan share ONE clock domain. `time` is
 /// 64-bit on RV64, so wrap is not reachable in any realistic uptime; the comparison is a plain
 /// `now >= deadline` in the scaled domain.
-#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 pub(crate) const REPLY_TIMEOUT_RISCV_TICK_SHIFT: u64 = 13;
 
-#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 pub(crate) fn reply_timeout_hw_now() -> u64 {
     let t: u64;
     // SAFETY: `time` is a read-only architectural CSR; the read has no side effects.
@@ -3928,7 +3933,7 @@ pub(crate) fn reply_timeout_hw_now() -> u64 {
 }
 
 /// Read the AArch64 generic-timer physical counter scaled to a coarse reply-timeout tick.
-#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn reply_timeout_hw_now() -> u64 {
     let cnt: u64;
     // SAFETY: `CNTPCT_EL0` is a read-only architectural counter register; the read has no side
@@ -5223,7 +5228,6 @@ pub(crate) fn server_death_work_drained_count() -> u64 {
 /// full generation-bearing identity (token slot+generation, terminal epoch, caller
 /// `{tid,asid}`, reply record index+generation, reply endpoint index+generation, and
 /// blocked-recv generation); `deadline` is the DUE tick that selected it.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReplyTimeoutPostWork {
     pub handle: crate::kernel::deadline_token::DeadlineTokenHandle,
@@ -5232,10 +5236,8 @@ pub(crate) struct ReplyTimeoutPostWork {
 
 /// Per-CPU deferred-work slots — bounded by the whole deadline-token store, so a
 /// full store cannot overflow it.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) const RT_POST_WORK_SLOTS: usize = MAX_DEADLINE_TOKENS;
 
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_POST_WORK: [crate::kernel::lock::SpinLockIrq<
     [Option<ReplyTimeoutPostWork>; RT_POST_WORK_SLOTS],
 >; crate::kernel::scheduler::MAX_CPUS] =
@@ -5244,10 +5246,8 @@ static REPLY_TIMEOUT_POST_WORK: [crate::kernel::lock::SpinLockIrq<
 
 /// Live counters (retirement-seal evidence): total deferred-work items published by the
 /// collector and total drained by the off-lock drain.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_WORK_PUBLISHED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_WORK_DRAINED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -5257,7 +5257,6 @@ static REPLY_TIMEOUT_WORK_DRAINED: core::sync::atomic::AtomicU64 =
 /// FULL queue returns `false`; the collector then leaves the DUE deadline armed to be
 /// retried on a later scan. Returns `true` iff the item is now published (or already
 /// present).
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_work_publish(cpu_idx: usize, work: ReplyTimeoutPostWork) -> bool {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return false;
@@ -5282,7 +5281,6 @@ pub(crate) fn reply_timeout_work_publish(cpu_idx: usize, work: ReplyTimeoutPostW
 
 /// Drain (remove + return) the next published work item for `cpu_idx`, or `None` when
 /// the queue is empty.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_work_drain_next(cpu_idx: usize) -> Option<ReplyTimeoutPostWork> {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return None;
@@ -5308,12 +5306,10 @@ pub(crate) fn reply_timeout_work_is_empty(cpu_idx: usize) -> bool {
 }
 
 /// Total deferred-work items published by the collector (retirement-seal evidence).
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_work_published_count() -> u64 {
     REPLY_TIMEOUT_WORK_PUBLISHED.load(core::sync::atomic::Ordering::Relaxed)
 }
 /// Total deferred-work items drained by the off-lock drain (retirement-seal evidence).
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_work_drained_count() -> u64 {
     REPLY_TIMEOUT_WORK_DRAINED.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -5321,10 +5317,8 @@ pub(crate) fn reply_timeout_work_drained_count() -> u64 {
 /// One-shot latch guarding the retired lock-status + class retirement seal: `true` on
 /// the FIRST off-lock completion (proving the class scan runs with the broad lock
 /// retired), `false` afterwards.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_LOCK_STATUS_EMITTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_lock_status_once() -> bool {
     // Stage 200C2C2B: an explicit compare-exchange is the single authority for this attestation.
     // Exactly one caller can observe the false -> true transition, so the marker is emitted once
@@ -5345,16 +5339,13 @@ pub(crate) fn reply_timeout_lock_status_once() -> bool {
 /// completion transaction itself IS the delivery point (saved-frame return), so the drain arms
 /// this immediately; on AArch64 the drain only ARMS it and the resume boundary fires it, so a
 /// committed-but-never-delivered completion can never claim the class retired.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_RETIRE_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_RETIRE_EMITTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Arm the class-retirement marker (called by the off-lock completion transaction once it has
 /// COMMITTED a timeout terminal). Arming alone never emits.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn arm_reply_timeout_class_retired() {
     REPLY_TIMEOUT_RETIRE_ARMED.store(true, core::sync::atomic::Ordering::Release);
 }
@@ -5362,7 +5353,6 @@ pub(crate) fn arm_reply_timeout_class_retired() {
 /// Emit `GLOBAL_LOCK_RETIRE_CLASS_DONE` exactly once, and ONLY if a committed completion armed
 /// it. Called from the delivery point (the resume boundary), so the marker attests an
 /// end-to-end retirement: collected off-lock, completed off-lock, and actually delivered.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn maybe_emit_reply_timeout_class_retired() {
     if !REPLY_TIMEOUT_RETIRE_ARMED.load(core::sync::atomic::Ordering::Acquire) {
         return;
@@ -5376,25 +5366,186 @@ pub(crate) fn maybe_emit_reply_timeout_class_retired() {
     );
 }
 
-/// `true` once at least one reply-timeout deadline has been armed this boot — the gate
-/// for attesting the retired off-lock scan (the scan is meaningful only after an arm).
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
-static REPLY_TIMEOUT_ARMED_ANY: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
-pub(crate) fn set_reply_timeout_armed_any() {
-    REPLY_TIMEOUT_ARMED_ANY.store(true, core::sync::atomic::Ordering::Release);
+// U7 (canonical 199E) deleted the `REPLY_TIMEOUT_ARMED_ANY` latch that used to live here. Its
+// only reader was the gate on the retired-scan attestation, and the promotion moved that
+// attestation to the FIRST production drain — which necessarily runs before anything has armed a
+// deadline. A latch that can never be true at its only read site is not evidence, so it went with
+// the gate rather than being kept as a field that would always report zero.
+
+// ── U7 (canonical 199E): per-CPU bounded DEFERRED blocking-SEND timeout work ────────
+//
+// The IpcSend timeout class rides the SAME shape as the reply class: the arch-neutral
+// scanner publishes one owned work item per DUE blocking-send deadline off the broad
+// lock, and the off-lock drain settles it through the U6 blocking-send lifecycle
+// (completion publication → waiter removal → envelope settle → scheduler enqueue). The
+// identity carried is the U6 one — `{tid, asid, send_generation}` — never a bare TID, so
+// a replacement incarnation or a re-blocked sender can never be timed out by a stale
+// item. `deadline` is the DUE value that selected it and is re-checked at settle.
+
+/// One owned unit of deferred blocking-send timeout work.
+///
+/// `asid` is `Option` for exactly the reason U6's `SenderWakeTarget::asid` is: a task with no
+/// bound address space has no incarnation to name. Such a sender is still timed out and woken —
+/// the retired in-lock scan woke it too — but nothing is published for it, because the U6
+/// completion contract is keyed on `{tid, asid, generation}` and cannot name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SendTimeoutPostWork {
+    pub tid: u64,
+    pub asid: Option<crate::kernel::vm::Asid>,
+    pub send_generation: u64,
+    pub deadline: u64,
 }
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
-pub(crate) fn reply_timeout_armed_any() -> bool {
-    REPLY_TIMEOUT_ARMED_ANY.load(core::sync::atomic::Ordering::Acquire)
+
+/// Per-CPU deferred blocking-send work slots. Bounded by the endpoint sender-waiter
+/// capacity so one scan pass cannot publish more than the system can hold blocked.
+pub(crate) const ST_POST_WORK_SLOTS: usize = 8;
+
+static SEND_TIMEOUT_POST_WORK: [crate::kernel::lock::SpinLockIrq<
+    [Option<SendTimeoutPostWork>; ST_POST_WORK_SLOTS],
+>; crate::kernel::scheduler::MAX_CPUS] =
+    [const { crate::kernel::lock::SpinLockIrq::new([None; ST_POST_WORK_SLOTS]) };
+        crate::kernel::scheduler::MAX_CPUS];
+
+static SEND_TIMEOUT_WORK_PUBLISHED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static SEND_TIMEOUT_WORK_DRAINED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Publish one owned send-timeout work item for `cpu_idx`. A DUPLICATE (the exact
+/// `{tid, asid, send_generation}` cycle already queued and not yet drained) yields only
+/// ONE owner. A FULL queue returns `false` and the collector leaves the DUE deadline
+/// armed on the TCB, to be retried on a later scan — no due deadline is ever dropped.
+pub(crate) fn send_timeout_work_publish(cpu_idx: usize, work: SendTimeoutPostWork) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    let mut q = SEND_TIMEOUT_POST_WORK[cpu_idx].lock();
+    for slot in q.iter().flatten() {
+        if slot.tid == work.tid
+            && slot.asid == work.asid
+            && slot.send_generation == work.send_generation
+        {
+            return true;
+        }
+    }
+    if let Some(free) = q.iter_mut().find(|s| s.is_none()) {
+        *free = Some(work);
+        SEND_TIMEOUT_WORK_PUBLISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// Drain (remove + return) the next published send-timeout work item for `cpu_idx`.
+pub(crate) fn send_timeout_work_drain_next(cpu_idx: usize) -> Option<SendTimeoutPostWork> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let mut q = SEND_TIMEOUT_POST_WORK[cpu_idx].lock();
+    let taken = q.iter_mut().find(|s| s.is_some()).and_then(|s| s.take());
+    if taken.is_some() {
+        SEND_TIMEOUT_WORK_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    taken
+}
+
+/// One-shot latch for the send-timeout deferred-work publish/drain evidence marker.
+static SEND_TIMEOUT_DEFERRED_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub(crate) fn send_timeout_deferred_once() -> bool {
+    !SEND_TIMEOUT_DEFERRED_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// The IpcSendTimeout class-retirement seal, on the SAME discipline as the reply class: the
+/// off-lock settle only ARMS it, and it is emitted from the U6 delivery point once a resumed
+/// sender has actually consumed its parked completion. A committed-but-never-delivered
+/// completion can therefore never claim the class retired.
+static SEND_TIMEOUT_RETIRE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static SEND_TIMEOUT_RETIRE_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn arm_send_timeout_class_retired() {
+    SEND_TIMEOUT_RETIRE_ARMED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn maybe_emit_send_timeout_class_retired() {
+    if !SEND_TIMEOUT_RETIRE_ARMED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if SEND_TIMEOUT_RETIRE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcSendTimeout result=ok",
+        REPLY_TIMEOUT_ARCH
+    );
+}
+
+pub(crate) fn send_timeout_work_published_count() -> u64 {
+    SEND_TIMEOUT_WORK_PUBLISHED.load(core::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn send_timeout_work_drained_count() -> u64 {
+    SEND_TIMEOUT_WORK_DRAINED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only: empty a CPU's deferred send-timeout queue WITHOUT settling anything.
+#[cfg(test)]
+pub(crate) fn send_timeout_work_clear(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        for slot in SEND_TIMEOUT_POST_WORK[cpu_idx].lock().iter_mut() {
+            *slot = None;
+        }
+    }
+}
+
+/// U7 (canonical 199E) — the per-CPU cursor of the arch-neutral IPC-timeout scanner.
+///
+/// The scanner examines a bounded WINDOW of TCB slots per trap instead of the whole
+/// array, so its cost is O(window) regardless of `MAX_TASKS`. The cursor advances by the
+/// number of entries **scanned**, never by the number published: a window that publishes
+/// nothing still advances, and a window whose publications were refused by a full queue
+/// still advances, so no slot can starve behind a permanently-full queue. It wraps at
+/// `MAX_TASKS`, so every slot is visited within `ceil(MAX_TASKS / window)` traps.
+static IPC_TIMEOUT_SCAN_CURSOR: [core::sync::atomic::AtomicUsize;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// The number of TCB slots one scan pass examines. Bounded and arch-neutral.
+pub(crate) const IPC_TIMEOUT_SCAN_WINDOW: usize = 64;
+
+/// Read this CPU's scan cursor (already reduced modulo `MAX_TASKS`).
+pub(crate) fn ipc_timeout_scan_cursor(cpu_idx: usize) -> usize {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return 0;
+    }
+    IPC_TIMEOUT_SCAN_CURSOR[cpu_idx].load(core::sync::atomic::Ordering::Relaxed) % MAX_TASKS
+}
+
+/// Advance this CPU's scan cursor by the number of entries the pass SCANNED.
+pub(crate) fn advance_ipc_timeout_scan_cursor(cpu_idx: usize, scanned: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    let cur = IPC_TIMEOUT_SCAN_CURSOR[cpu_idx].load(core::sync::atomic::Ordering::Relaxed);
+    IPC_TIMEOUT_SCAN_CURSOR[cpu_idx].store(
+        (cur.wrapping_add(scanned)) % MAX_TASKS,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Test-only: rewind a CPU's scan cursor so a focused test starts from slot 0.
+#[cfg(test)]
+pub(crate) fn reset_ipc_timeout_scan_cursor(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        IPC_TIMEOUT_SCAN_CURSOR[cpu_idx].store(0, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// One-shot latch for the deferred-work publish/drain evidence marker.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_DEFERRED_EMITTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_deferred_once() -> bool {
     !REPLY_TIMEOUT_DEFERRED_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
 }
