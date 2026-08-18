@@ -759,6 +759,39 @@ impl KernelState {
         Ok(())
     }
 
+    /// Canonical 199E-R1F — an UNSUPPORTED user instruction faults the offending task, and only
+    /// that task.
+    ///
+    /// This is the fail-closed terminal for the FP/vector policy. Userspace is built soft-float
+    /// and every U-mode return forces `sstatus.FS`/`VS` Off, so a floating-point or vector
+    /// instruction reaching the CPU raises an illegal-instruction trap. It must not be resumed
+    /// (the instruction would trap again forever), it must not be emulated, and it must not take
+    /// the whole kernel down for one task's bad instruction.
+    ///
+    /// It therefore routes into the EXISTING per-task user-fault policy verbatim — the same
+    /// `fault_current_task_with_fault` a user-unhandled page fault uses: emit the fault report,
+    /// honour `FaultPolicy` (`NotifyAndContinue` reports and returns; `KillTask` validates the
+    /// victim, blocks it, marks it `Faulted`), and dispatch a replacement. No new mechanism, no
+    /// new policy knob, and no second way for a task to die.
+    ///
+    /// `pc` is the faulting instruction's address, reported as an `Execute` fault because that is
+    /// what happened: the instruction at that address could not be executed. It is deliberately
+    /// NOT reported as a page fault — the mapping is fine; the instruction is not supported.
+    pub(crate) fn fault_current_task_unsupported_instruction(
+        &mut self,
+        pc: crate::kernel::vm::VirtAddr,
+    ) -> Result<(), KernelError> {
+        crate::yarm_log!(
+            "USER_UNSUPPORTED_INSTRUCTION tid={} pc=0x{:x} policy=fail_closed reason=fp_or_vector_off result=ok",
+            self.current_tid().unwrap_or(u64::MAX),
+            pc.0
+        );
+        self.fault_current_task_for_fault(crate::kernel::trap::FaultInfo {
+            addr: pc,
+            access: crate::kernel::trap::FaultAccess::Execute,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn emit_fault_report_for_fault_for_test(
         &mut self,

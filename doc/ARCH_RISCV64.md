@@ -1218,28 +1218,96 @@ reload them, silently repairing the exact corruption under test) reports `mismat
 result=ok`; `caller_continuations=1`, not 75; no restart at the old recv return lane, no provenance
 failure, no storm, no drift, no duplicate wake or completion.
 
-**FP/vector is a stated latent dependency, not a closed one.** The RISC-V user targets declare the
-`lp64d` hard-float ABI and `sstatus.FS` reads Dirty on the first user trap, so the hardware permits
-user floating-point — and neither `RiscvTrapFrame` (304 bytes of `x1..x31` plus `sepc`/`sstatus`/
-`scause`/`stval`) nor `UserRegisterContext` (`user_gprs: [usize; 32]`) has anywhere to put
-`f0..f31` or `fcsr`. It is not live: **no RISC-V user binary in this tree contains a single FP
-instruction or f-register reference**, so there is no FP state to lose and the integer-only contract
-is complete for every build that exists. This is not a silent assumption — the guard
-`riscv64_async_preemption::no_user_floating_point_state_can_be_live` fails the moment
-`UserRegisterContext` grows an FP area or the port starts writing an explicit `sstatus.FS` policy.
+#### 13.6.2 199E-R1F — the userspace FP/vector policy (fail-closed)
 
-**No general FP-safe asynchronous preemption is claimed.** What 199E-R1D proves is exact
-preservation of the INTEGER context, which is complete for every binary that exists today precisely
-because none of them can create live FP state — not because FP state would be preserved if it did.
-Turning asynchronous preemption on BY DEFAULT therefore needs a separate `lp64d`/`sstatus.FS`
-policy decision first. The two coherent options are an FP/vector save area sized for `f0..f31` plus
-`fcsr` (carried in `UserRegisterContext` and snapshotted with the integer file), or an explicit
-`FS` policy for user tasks so that a user floating-point instruction traps loudly instead of having
-its state silently discarded at the next preemption. Neither is taken here, and a third option —
-leaving `FS` Dirty and enabling default preemption — is the one this section exists to rule out.
+199E-R1D preserved the interrupted INTEGER context exactly and could claim nothing about
+floating-point or vector state, because there is nowhere to save it: `RiscvTrapFrame` is 304 bytes
+of `x1..x31` plus `sepc`/`sstatus`/`scause`/`stval`, and `UserRegisterContext` is
+`user_gprs: [usize; 32]`. Neither holds `f0..f31`, `fcsr` or any vector register.
 
-**The `riscv64-timer-irq` feature stays default-OFF, and canonical 199E remains OPEN on two things:
-that `lp64d`/`FS` policy decision, and retiring the feature/default gate itself.**
+That was safe **by accident**. The user target advertised the `lp64d` hard-float ABI and
+`sstatus.FS` arrived from OpenSBI reading Dirty, so the hardware permitted user floating-point the
+whole time — nothing broke purely because no binary happened to contain an FP instruction. One
+`f64` in a server would have turned it into silent cross-task corruption: task A's live `f` state
+discarded at a preemption, task B's stale values observed as A's.
+
+**The policy, in two halves.** Neither is sufficient alone — building soft-float only removes what
+the compiler emits, and forcing the status bits Off only closes the hardware door — so both are
+applied:
+
+| half | contract |
+|------|----------|
+| userspace ISA/ABI | **RV64IMAC / LP64 soft-float** — `llvm-abiname: lp64`, `features: +m,+a,+c`. No `F`, `D` or `V`. |
+| every U-mode return | `sstatus.FS = Off`, `VS = Off`, `SPP` cleared, `SUM` set. |
+
+The **kernel** target remains **RV64GC / LP64D** (`+m,+a,+f,+d,+c`, `lp64d`), pinned unchanged by
+the Stage 199D target-spec guards. The difference between the two targets is therefore
+**intentional and exclusively FP capability and FP ABI**: strip `+f`/`+d`/`+v` from the kernel's
+feature list and the two integer feature sets are identical, which is exactly what
+`the_kernel_and_user_targets_agree_on_isa_and_abi` now asserts — so an unrelated divergence still
+fails the build.
+
+`arch/riscv64/user_status.rs` is the single definition. `sanitize_user_sstatus` clears
+`SPP|FS|VS` and sets `SUM`, preserving every other bit — `SPIE`, `UXL`, `SD` are per-path policy
+and are not this sanitizer's business — and it is total and idempotent, so a path that sanitizes
+defensively cannot disagree with one that sanitizes once.
+
+Applied at every user return:
+
+* **first user entry** — no frame, so `yarm_riscv64_enter_user` clears the same bits in asm
+  (`li t5, 0x6720` = `SPP|SPIE|FS|VS`), pinned against the Rust constants by a unit test;
+* **syscall return, blocked/D2 continuation, asynchronous-preemption restore** — all funnel
+  through the generic trap tail, which restores `sstatus` straight out of the frame, so the frame
+  is sanitized immediately before `sret` and no resume class can opt out;
+* **S-mode idle dispatch into U-mode** — sanitized, then its own approved `SPIE` added.
+
+The **S-mode timer return is deliberately NOT sanitized**: it resumes the kernel's own `wfi`
+loop, and clearing `SPP` there would `sret` into U-mode at a kernel address.
+
+**Unsupported FP/vector execution fails closed.** With `FS`/`VS` Off, a floating-point or vector
+instruction raises an illegal-instruction trap. RISC-V now decodes `scause = 2` explicitly and
+routes it into the **existing** per-task user-fault policy — the same
+`fault_current_task_with_fault` a user-unhandled page fault uses: emit the fault report, honour
+`FaultPolicy`, block the victim, mark it `Faulted`, dispatch a replacement. Before this it decoded
+to `TrapEvent::Unknown`, whose freestanding policy panics the whole kernel for one task's bad
+instruction and whose hosted policy returns `Ok` — resuming the same instruction forever. There is
+**no emulation, no lazy-FPU and no partial save area**; `USER_UNSUPPORTED_INSTRUCTION` names the
+fault, and the task dies rather than the machine.
+
+**Artifact proof**, all twelve RISC-V user images (`init_server`, `supervisor`,
+`process_manager`, `vfs_server`, `ramfs_srv`, `devfs_srv`, `fat_srv`, `ext4_srv`, `blkcache_srv`,
+`virtio_blk_srv`, `driver_manager`, `initramfs_srv`): ELF flags `0x1, RVC` — the `double-float
+ABI` bit is gone; no `.riscv.attributes` section declares an F/D/V requirement; zero FP/vector
+load, store, arithmetic or fused opcodes; zero f-register references. The link succeeded with a
+uniform soft-float ABI, so no hard-float object was silently included. The **kernel** target
+retains RV64GC/`lp64d` as permitted, and kernel code uses no FP/vector state (0 f-registers, 0 FP
+instructions, 0 `fcsr` accesses).
+
+The kernel/user ABI split is sound precisely because **no syscall, startup or IPC interface
+carries an FP value**. Every syscall argument and return lane, every startup-argument slot handed
+to a fresh task, and every IPC payload is an integer register or integer memory; there is no
+`f32`/`f64` in any user crate or in the shared IPC ABI, and a guard fails if one appears. The two
+targets are separate ELF images that are never linked together, so nothing requires them to
+match.
+
+**Asynchronous integer-context preemption remains live-proven** on the rebuilt soft-float
+userspace: six switch-away/switch-back cycles, register canary `mismatches=0x0000 result=ok`,
+`caller_continuations=1`, full `TimedOut` chain once, IRQ = tick = re-arm (7980 S-origin + 74
+U-origin = 8054 re-arms), late reply rejected, and **zero `USER_UNSUPPORTED_INSTRUCTION`** — the
+existing service chain executes no FP or vector instruction with the units Off.
+
+**Full FP/vector support is future work, and requires per-task FP ownership plus save/restore.**
+Two things are needed, and neither is present: a per-task OWNER for the FP/vector unit — which
+task's state currently occupies `f0..f31`, and the `FS`/`VS` transitions that track it — and a
+SAVE/RESTORE path, a save area sized for `f0..f31` plus `fcsr` carried in `UserRegisterContext`
+and snapshotted with the integer file on every asynchronous preemption. A lazy/dirty-tracking
+scheme is the usual optimisation of the same pair, not a substitute for it. That is a deliberate
+stage, not a side effect. Until it lands this policy is what makes the absence honest, and **no
+general FP-safe asynchronous preemption is claimed**.
+
+**The `riscv64-timer-irq` feature stays default-OFF. With the FP-state policy decided, default
+timer admission is the sole remaining 199E blocker, pending the final gate-retirement
+checkpoint.**
 
 ### 13.2 Current smoke contract
 

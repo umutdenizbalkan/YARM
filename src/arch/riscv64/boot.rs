@@ -394,7 +394,15 @@ yarm_riscv64_enter_user:
     // (bit 5) so interrupts stay disabled in U-mode (we have no timer/IRQ
     // path yet); set SUM (bit 18) so the kernel can still touch U-pages from
     // S-mode for trap bookkeeping if/when we resume there.
-    li t5, 0x120              // SPP | SPIE
+    //
+    // 199E-R1F: FS (bits 14:13) and VS (bits 10:9) are cleared here too, so the FIRST
+    // instruction any user task ever executes already runs with the floating-point and vector
+    // units Off. OpenSBI hands us FS=Dirty, and inheriting it is exactly the accident this
+    // policy removes — there is no FP/vector save area, so permitting that state at all would
+    // make asynchronous preemption silently lose it. 0x6720 = SPP|SPIE|FS|VS; the arithmetic
+    // is pinned against `user_status::USER_RETURN_CLEAR_MASK | SSTATUS_SPIE` by
+    // `the_first_entry_masks_match_the_constants`, and the literal by a structural guard.
+    li t5, 0x6720             // SPP | SPIE | FS | VS
     csrc sstatus, t5
     li t5, 0x40000            // SUM
     csrs sstatus, t5
@@ -1346,6 +1354,18 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // single provenance chain (`frame_ptr → &mut frame → *const derived here`), so
     // the extern read is modeled as observing the write-back and the stores
     // survive optimization on their own — independent of any logging.
+    // 199E-R1F — the LAST thing that happens before `sret`, and the only shape this kernel
+    // returns to userspace with. This tail is reached exclusively for U-origin traps: an S-mode
+    // trap either takes the audited timer fast path or halts, long before here. Sanitizing the
+    // frame rather than the CSR is what makes it total — the return tail restores `sstatus`
+    // straight out of the frame, so every user-return route that ends here (fresh spawn,
+    // syscall continuation, D2/blocked continuation, and the 199E-R1D asynchronous-preemption
+    // restore alike) is covered by this one call and none of them can opt out.
+    //
+    // In particular the saved value is whatever hardware stashed at trap entry, which on this
+    // platform carries FS=Dirty inherited from OpenSBI. Restoring it verbatim — as this path
+    // did until now — is precisely how a Dirty FS would escape back to U-mode.
+    frame.sstatus = crate::arch::riscv64::user_status::sanitize_user_sstatus(frame.sstatus);
     let frame_resume: *const RiscvTrapFrame = frame;
     unsafe { yarm_riscv64_trap_return(frame_resume, canonical_top) }
 }
@@ -1423,9 +1443,14 @@ fn riscv_s_mode_timer_trap(
                 tick,
                 resume_tid
             );
-            const SPP_BIT: u64 = 1 << 8;
+            // 199E-R1F: leaving the idle lifecycle for U-mode goes through the SAME sanitizer
+            // as every other user return — SPP cleared, FS and VS forced Off — and only then
+            // adds this path's own approved bit, SPIE, so the resumed task runs with interrupts
+            // enabled. Hand-clearing SPP alone (what this line did) would have let the idle
+            // frame's inherited FS=Dirty reach userspace by a second, divergent route.
             const SPIE_BIT: u64 = 1 << 5;
-            frame.sstatus = (frame.sstatus & !SPP_BIT) | SPIE_BIT;
+            frame.sstatus =
+                crate::arch::riscv64::user_status::sanitize_user_sstatus(frame.sstatus) | SPIE_BIT;
             // Same write-back the main bridge performs for a task switch: PC/SP from the
             // resumed thread's saved context, non-ABI GPRs mirrored, and the startup ABI lanes
             // taken from `args` (a freshly-resumed task's `user_gprs` would clobber them).

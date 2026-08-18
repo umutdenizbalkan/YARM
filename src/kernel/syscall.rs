@@ -7030,10 +7030,21 @@ mod tests {
         // The S-mode -> U-mode transition asm must atomically clear sstatus.SPP
         // (bit 8) so sret returns to U-mode, and SPIE (bit 5) so interrupts
         // remain disabled across the transition.
+        //
+        // 199E-R1F widened the mask from 0x120 to 0x6720, adding FS (bits 14:13) and VS
+        // (bits 10:9). The FIRST instruction any user task executes must already run with the
+        // floating-point and vector units Off: OpenSBI hands the kernel FS=Dirty, and inheriting
+        // it is exactly the accident that let user FP state exist with nowhere to save it across
+        // an asynchronous preemption. The old mask is banned explicitly so a revert cannot pass
+        // by merely still containing a `csrc`.
         let src = include_str!("../arch/riscv64/boot.rs");
         assert!(
-            src.contains("li t5, 0x120") && src.contains("csrc sstatus, t5"),
-            "enter-user asm must csrc sstatus with mask 0x120 (SPP|SPIE)"
+            src.contains("li t5, 0x6720") && src.contains("csrc sstatus, t5"),
+            "enter-user asm must csrc sstatus with mask 0x6720 (SPP|SPIE|FS|VS)"
+        );
+        assert!(
+            !src.contains("li t5, 0x120"),
+            "the SPP|SPIE-only mask must not return: it inherited OpenSBI's Dirty FS into U-mode"
         );
         assert!(
             src.contains("csrw sepc"),

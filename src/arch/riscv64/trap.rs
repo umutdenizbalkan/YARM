@@ -14,6 +14,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 const INTERRUPT_BIT: usize = 1usize << (usize::BITS as usize - 1);
 const SCAUSE_EXCEPTION_MASK: usize = !INTERRUPT_BIT;
 
+const EXC_ILLEGAL_INSTRUCTION: usize = 2;
 const EXC_USER_ECALL: usize = 8;
 const EXC_LOAD_PAGE_FAULT: usize = 13;
 const EXC_STORE_PAGE_FAULT: usize = 15;
@@ -384,11 +385,42 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     {
         let _ = kernel.snapshot_async_preempted_current(f);
     }
-    kernel.handle_trap_event_with_fault_bookkeeping_mode(
-        decode_trap_context(context),
-        frame.as_deref_mut(),
-        fault_bookkeeping_mode,
-    )?;
+    // ── Canonical 199E-R1F: the fail-closed terminal for an UNSUPPORTED user instruction ──
+    //
+    // Userspace is built soft-float and every U-mode return forces `sstatus.FS`/`VS` Off, so a
+    // floating-point or vector instruction raises an illegal-instruction trap instead of
+    // executing against register state nothing saves. This is where that trap lands.
+    //
+    // Without this arm it decoded to `TrapEvent::Unknown`, whose freestanding policy
+    // (`STRICT_UNKNOWN_TRAPS`) panics the whole kernel for one task's bad instruction — and
+    // whose hosted policy returns `Ok`, which would resume the same instruction forever. Neither
+    // is the right answer for a user fault, and "resume the task" is the outcome the policy
+    // exists to make impossible.
+    //
+    // The existing per-task user-fault policy is: emit the fault report, honour `FaultPolicy`,
+    // block the victim, mark it `Faulted`, dispatch a replacement. That is reused verbatim, so
+    // no second way for a task to die is introduced, and the downstream restore below resumes
+    // the REPLACEMENT exactly as it does after a user-unhandled page fault.
+    //
+    // Only U-mode reaches here: an S-mode trap either takes the audited timer fast path or halts
+    // in the bridge, well before this point.
+    let user_illegal_instruction = (context.scause & SCAUSE_EXCEPTION_MASK)
+        == EXC_ILLEGAL_INSTRUCTION
+        && (context.scause & INTERRUPT_BIT) == 0;
+    if user_illegal_instruction {
+        let pc =
+            crate::kernel::vm::VirtAddr(frame.as_deref().map(|f| f.saved_pc() as u64).unwrap_or(0));
+        kernel
+            .fault_current_task_unsupported_instruction(pc)
+            .map_err(crate::kernel::syscall::SyscallError::from)
+            .map_err(TrapHandleError::Syscall)?;
+    } else {
+        kernel.handle_trap_event_with_fault_bookkeeping_mode(
+            decode_trap_context(context),
+            frame.as_deref_mut(),
+            fault_bookkeeping_mode,
+        )?;
+    }
     // Stage 196D (QUEUE-SWITCH FOUNDATION BYPASS): if the in-lock Yield handler recorded a
     // one-shot foundation switch deferral (it published + re-enqueued the outgoing task and
     // cleared `current`), the canonical in-lock restore below has NO current task to restore

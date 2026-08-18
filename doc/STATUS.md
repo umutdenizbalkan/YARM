@@ -323,20 +323,47 @@ incidental scheduler state. Fresh, syscall-return and D2 paths are unchanged, an
 canonical `sscratch` stack-top invariant is retained. Live: five real switch-away/switch-back cycles
 inside one dwell, each restoring `sepc=0x406d16`, the same user `sp`, `a0=0xa0a00001dead0000` and
 `a7=0xa7a70008dead0007` with `startup_rewrite=0`; an assembly register canary reports
-`mismatches=0x0000 result=ok`; `caller_continuations=1`, not 75. **User FP/vector is a stated latent
-dependency, not a closed one:** the RISC-V user targets declare the `lp64d` hard-float ABI and
-`sstatus.FS` reads Dirty, so hardware permits user floating-point, and neither the trap frame nor
-`UserRegisterContext` has anywhere to put `f0..f31`/`fcsr` — but no RISC-V user binary in the tree
-contains a single FP instruction or f-register reference, so no FP state can be live to lose. A
-guard fails the moment that stops being true. **This is not a claim of general FP-safe asynchronous
-preemption.** What is proven is exact preservation of the INTEGER context, which is complete for
-every binary that exists today because none of them can create live FP state. Making asynchronous
-preemption safe by default requires a separate `lp64d`/`sstatus.FS` policy decision first — either
-an FP/vector save area, or an explicit `FS` policy that makes user FP fail closed — and that
-decision is **not** taken in this checkpoint.
+`mismatches=0x0000 result=ok`; `caller_continuations=1`, not 75.
 
-`riscv64-timer-irq` still stays **default-OFF**, and 199E remains open on two things: that
-`lp64d`/`FS` policy decision, and retiring the feature/default gate itself. AArch64 and x86_64 ProductionTick status is unchanged. Census delta 0;
+**199E-R1F — the RISC-V userspace FP/vector policy is now an explicit fail-closed decision.**
+The previous checkpoint could only say the integer-context proof was complete *because no binary
+happened to contain an FP instruction*, while the user target advertised `lp64d` and `sstatus.FS`
+arrived from OpenSBI reading Dirty — so the hardware permitted user floating-point the whole time
+and a single `f64` in a server would have become silent cross-task corruption. That accident is
+replaced by a decision with two halves, each insufficient alone. **RISC-V userspace is
+intentionally RV64IMAC/LP64 soft-float and integer-only**: the user target is `lp64` with
+`+m,+a,+c` — RV64IMAC — and no `F`/`D`/`V` features, so the compiler cannot emit floating-point or
+vector instructions. And
+**every U-mode return forces `sstatus.FS = Off` and `VS = Off`** through one sanitizer
+(`arch/riscv64/user_status.rs`), applied at the first user entry, syscall return, blocked/D2
+continuation and the asynchronous-preemption restore alike — the generic trap tail restores
+`sstatus` straight from the frame, so sanitizing the frame covers every resume class and none can
+opt out. **An unsupported FP/vector instruction therefore fails closed**: it raises an
+illegal-instruction trap, which is routed into the *existing* per-task user-fault policy — fault
+report, `FaultPolicy`, block, `Faulted`, dispatch a replacement — rather than being resumed
+forever (the old hosted behaviour) or panicking the whole kernel for one task's bad instruction
+(the old freestanding behaviour). No emulation, no lazy-FPU, no partial save area.
+
+Static proof across all twelve RISC-V user images: ELF flags `0x1, RVC` with the `double-float
+ABI` bit gone, no `.riscv.attributes` section declaring an F/D/V requirement, and zero FP/vector
+instructions and zero f-register references. The kernel target keeps RV64GC/`lp64d` as permitted,
+and kernel code uses no FP/vector state (0 f-registers, 0 FP instructions, 0 `fcsr` accesses).
+**The difference between the two targets is intentionally and exclusively FP capability and FP
+ABI** — the integer feature sets are identical, and a guard fails on any other divergence. The
+split is sound because **no syscall, startup or IPC interface carries an FP value**: there is no
+`f32`/`f64` anywhere in the user crates or the shared IPC ABI, every startup-argument slot and
+every syscall lane is an integer register, and a guard fails if one appears. **Asynchronous integer-context preemption remains live-proven** under the new
+soft-float userspace: six switch-away/switch-back cycles, register canary `mismatches=0x0000
+result=ok`, `caller_continuations=1`, and zero `USER_UNSUPPORTED_INSTRUCTION` from existing
+userspace. **Full FP/vector support remains future work, and requires per-task FP ownership plus
+save/restore** — a per-task owner for the FP/vector unit and a save area sized for `f0..f31` and
+`fcsr` snapshotted with the integer file (or an equivalent lazy/dirty-tracking scheme). This
+checkpoint is the fail-closed policy that makes its absence honest, not a claim of FP-safe
+asynchronous preemption.
+
+`riscv64-timer-irq` still stays **default-OFF**. With the FP-state policy now decided, **default
+timer admission is the sole remaining 199E blocker**, pending the final gate-retirement
+checkpoint. AArch64 and x86_64 ProductionTick status is unchanged. Census delta 0;
 direct production remains OFF (`IPCCALL_DIRECT_PROOF_ENABLED: AtomicBool::new(false)`); ownership
 production callers 0; no U8 or WA3C2 work is begun.
 

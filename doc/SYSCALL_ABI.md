@@ -233,6 +233,38 @@ reserved holes from implemented privileged paths.
 - Spawn-thread staging rule: spawned threads do not receive independent copied brk bounds.
 - Future work: move from tid-keyed staging toward process-wide brk ownership/model.
 
+## Floating-point and vector registers are not part of this ABI
+
+**No syscall argument, no return value, no startup argument and no IPC payload is ever passed in a
+floating-point or vector register, on any architecture.** Every lane in this document is an integer
+register, and so is every startup-argument slot handed to a freshly spawned task. There is no
+`f32` or `f64` anywhere in the shared IPC ABI crate or in any userspace crate, and a repository
+guard fails if one appears.
+
+On **RISC-V this is load-bearing, not incidental** (canonical 199E-R1F). Userspace is built
+**RV64IMAC / LP64 soft-float**: the user target is `lp64` with features `+m,+a,+c` and no `F`, `D`
+or `V`. The kernel target remains **RV64GC / LP64D**, so the two sides deliberately differ — and
+the difference is intentionally and **exclusively** FP capability and FP ABI, with identical
+integer feature sets and a guard on any other divergence. It is sound only because no syscall,
+startup or IPC interface carries an FP value. They are separate ELF images and are never linked
+together.
+
+The reason is the asynchronous-preemption contract. A timer interrupt can preempt a user task at
+any instruction, and the saved context (`RiscvTrapFrame`, `UserRegisterContext`) holds the integer
+register file only — there is nowhere to put `f0..f31` or `fcsr`. Permitting user floating-point
+would therefore mean silently losing it across a preemption. Instead:
+
+- every return to U-mode forces `sstatus.FS = Off` and `VS = Off`;
+- an unsupported floating-point or vector instruction raises an illegal-instruction trap and
+  **fails closed** through the ordinary per-task user-fault policy — the task is faulted, the
+  kernel is not;
+- there is no emulation, no lazy-FPU and no partial save area.
+
+Full FP/vector support is future work and requires **per-task FP ownership plus save/restore**.
+Until it lands, **a userspace ABI that needs to pass a floating-point value must marshal it as
+integer bits**; adding an FP lane to a syscall would be an ABI change requiring that
+context-management stage first.
+
 ## Argument register layout (`args[0..]`)
 
 - `args[0]`: endpoint capability id

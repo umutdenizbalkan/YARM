@@ -109907,6 +109907,20 @@ mod stage199d_live_evidence_ledger {
 // `+c`, `+f`, `+d` or switching `lp64d` for `lp64`. The kernel would still build; it would
 // silently be a different machine. These guards therefore pin the triple, the ISA feature set
 // and the ABI as three INDEPENDENT propositions, so no future edit can trade one for another.
+//
+// Canonical 199E-R1F introduced the ONE intentional exception, and it is the opposite of the
+// defect above: a deliberate, argued policy decision rather than an accidental weakening to make
+// an error go away. The USER target is now soft-float — `lp64`, no `+f`/`+d`/`+v` — because
+// asynchronous preemption has no FP/vector save area, so permitting user floating-point at all
+// would mean silently losing it across a preemption. The KERNEL target keeps RV64GC/`lp64d`
+// unchanged.
+//
+// The two targets therefore no longer agree, and that is now the pinned contract rather than a
+// drift: they are separate ELF images that are never linked together, and the syscall ABI
+// between them is integer-only (no `f32`/`f64` crosses it), so nothing required them to match.
+// The guards below pin the kernel's ISA/ABI as strictly as before, pin the user's new
+// soft-float contract just as strictly, and pin that the difference is EXACTLY the float ABI
+// and float features — so an unrelated divergence still fails.
 mod stage199d_riscv_target_spec_guards {
     use super::*;
 
@@ -109920,7 +109934,7 @@ mod stage199d_riscv_target_spec_guards {
     const REJECTED_LLVM_ARCH: &str = "riscv64gc";
     const SUPPORTED_TRIPLE: &str = "riscv64-unknown-none-elf";
 
-    /// The RV64GC ISA capability, carried by `features` and nowhere else.
+    /// The RV64GC ISA capability of the KERNEL target, carried by `features` and nowhere else.
     const REQUIRED_FEATURES: &[(&str, &str)] = &[
         ("+m", "integer multiply/divide"),
         (
@@ -109936,6 +109950,16 @@ mod stage199d_riscv_target_spec_guards {
     ];
 
     const REQUIRED_ABI: &str = "lp64d";
+
+    /// 199E-R1F — the USER target's integer-only ISA. These are required; `+f`, `+d` and `+v`
+    /// are banned outright.
+    const USER_REQUIRED_FEATURES: &[(&str, &str)] = &[
+        ("+m", "integer multiply/divide"),
+        ("+a", "atomics — the IPC and futex seams require them"),
+        ("+c", "compressed instructions"),
+    ];
+    /// 199E-R1F — the USER target's soft-float ABI.
+    const USER_REQUIRED_ABI: &str = "lp64";
 
     /// Value of a JSON string field, without pulling in a parser.
     fn string_field<'a>(json: &'a str, key: &str) -> &'a str {
@@ -110008,15 +110032,33 @@ mod stage199d_riscv_target_spec_guards {
     /// `+c`, `+f` or `+d` fails by name rather than as an opaque string mismatch.
     #[test]
     fn the_isa_feature_set_is_rv64gc() {
-        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
-            let features = string_field(json, "features");
-            for (ext, why) in REQUIRED_FEATURES {
-                assert!(
-                    features.split(',').any(|f| f.trim() == *ext),
-                    "the {what} target dropped `{ext}` ({why}) from its ISA feature set `{features}` \
-                     — the triple must never be repaired by weakening the ISA"
-                );
-            }
+        // The KERNEL target keeps the full RV64GC capability, exactly as link 1 sealed it.
+        let features = string_field(KERNEL_JSON, "features");
+        for (ext, why) in REQUIRED_FEATURES {
+            assert!(
+                features.split(',').any(|f| f.trim() == *ext),
+                "the kernel target dropped `{ext}` ({why}) from its ISA feature set `{features}` \
+                 — the triple must never be repaired by weakening the ISA"
+            );
+        }
+        // 199E-R1F: the USER target is deliberately integer-only. Its required extensions are
+        // pinned just as strictly, and the float/vector ones are banned rather than merely
+        // absent — so re-adding `+d` to silence a build error fails here instead of quietly
+        // reopening the FP hazard asynchronous preemption cannot cover.
+        let user = string_field(USER_JSON, "features");
+        for (ext, why) in USER_REQUIRED_FEATURES {
+            assert!(
+                user.split(',').any(|f| f.trim() == *ext),
+                "the user target dropped `{ext}` ({why}) from its ISA feature set `{user}`"
+            );
+        }
+        for banned in ["+f", "+d", "+v"] {
+            assert!(
+                !user.split(',').any(|f| f.trim() == banned),
+                "the user target must not advertise `{banned}`: RISC-V userspace is soft-float \
+                 because asynchronous preemption has no FP/vector save area (199E-R1F). Adding \
+                 it back needs a full FP context-management stage, not a target edit."
+            );
         }
     }
 
@@ -110047,29 +110089,66 @@ mod stage199d_riscv_target_spec_guards {
     /// change every FP call boundary while still compiling.
     #[test]
     fn the_abi_is_lp64d() {
-        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
-            assert_eq!(
-                string_field(json, "llvm-abiname"),
-                REQUIRED_ABI,
-                "the {what} target must keep the `{REQUIRED_ABI}` ABI"
-            );
-        }
+        assert_eq!(
+            string_field(KERNEL_JSON, "llvm-abiname"),
+            REQUIRED_ABI,
+            "the kernel target must keep the `{REQUIRED_ABI}` ABI"
+        );
+        // 199E-R1F: the user ABI is soft-float LP64. Asserted positively AND negatively, so a
+        // silent revert to a hard-float ABI cannot pass by matching some other string.
+        assert_eq!(
+            string_field(USER_JSON, "llvm-abiname"),
+            USER_REQUIRED_ABI,
+            "RISC-V userspace must use the soft-float `{USER_REQUIRED_ABI}` ABI"
+        );
+        assert!(
+            !USER_JSON.contains("lp64d"),
+            "no hard-float ABI may remain anywhere in the user target spec"
+        );
     }
 
     /// Kernel and user targets must not drift apart: they share one ISA and one ABI, or the
     /// kernel and the servers it loads disagree about how to pass arguments.
     #[test]
     fn the_kernel_and_user_targets_agree_on_isa_and_abi() {
+        // 199E-R1F: they deliberately DIFFER now, and the difference is pinned rather than
+        // merely tolerated. What this case protects is unchanged in spirit — the two specs may
+        // not drift apart for unstated reasons — but the one stated reason is float, so the
+        // assertion is now "identical except for float".
+        let kernel_int: alloc::vec::Vec<&str> = string_field(KERNEL_JSON, "features")
+            .split(',')
+            .map(|f| f.trim())
+            .filter(|f| !matches!(*f, "+f" | "+d" | "+v"))
+            .collect();
+        let user_int: alloc::vec::Vec<&str> = string_field(USER_JSON, "features")
+            .split(',')
+            .map(|f| f.trim())
+            .filter(|f| !matches!(*f, "+f" | "+d" | "+v"))
+            .collect();
         assert_eq!(
-            string_field(KERNEL_JSON, "features"),
-            string_field(USER_JSON, "features"),
-            "kernel and user RISC-V targets must share one ISA feature set"
+            kernel_int, user_int,
+            "kernel and user RISC-V targets must share one INTEGER ISA feature set — only the \
+             float/vector extensions may differ (199E-R1F)"
         );
-        assert_eq!(
+        // The float halves differ, and in exactly the specified direction.
+        assert_eq!(string_field(KERNEL_JSON, "llvm-abiname"), REQUIRED_ABI);
+        assert_eq!(string_field(USER_JSON, "llvm-abiname"), USER_REQUIRED_ABI);
+        assert_ne!(
             string_field(KERNEL_JSON, "llvm-abiname"),
             string_field(USER_JSON, "llvm-abiname"),
-            "kernel and user RISC-V targets must share one ABI"
+            "the ABI split is the point of 199E-R1F; if these matched again the user side \
+             would have silently regained hard float"
         );
+        // The split is only sound because nothing crosses the syscall boundary in an FP
+        // register. If a float ever appears in the shared ABI crate, this must be revisited.
+        const IPC_ABI_SRC: &str = include_str!("../../../crates/yarm-ipc-abi/src/lib.rs");
+        for float in ["f32", "f64"] {
+            assert!(
+                !IPC_ABI_SRC.contains(float),
+                "the shared IPC ABI gained `{float}` — a differing float ABI between kernel and \
+                 userspace is only sound while no value travels in an FP register"
+            );
+        }
     }
 
     // ── 4. Everything the repair had to preserve ────────────────────────────────────────────
@@ -130372,6 +130451,328 @@ mod riscv64_async_preemption {
                 !code.contains("sstatus.FS") && !code.contains("SSTATUS_FS"),
                 "an explicit sstatus.FS policy would change the FP dependency this stage rests on"
             );
+        }
+    }
+}
+
+/// Canonical 199E-R1F — the RISC-V userspace FP/vector policy: soft-float, `FS`/`VS` forced Off
+/// on every U-mode return, unsupported instructions fail closed.
+///
+/// 199E-R1D proved exact preservation of the interrupted INTEGER context and could claim nothing
+/// about floating-point or vector state, because there is nowhere to save it. That was safe only
+/// by accident: the user target advertised `lp64d` and `sstatus.FS` arrived from OpenSBI reading
+/// Dirty, so the hardware permitted user FP the whole time — nothing broke purely because no
+/// binary happened to contain an FP instruction. One `f64` in a server would have turned that
+/// into silent cross-task corruption.
+///
+/// These cases pin the replacement policy. `src/arch/riscv64/**` is
+/// `#[cfg(target_arch = "riscv64")]`, so its own unit tests cannot run in the canonical hosted
+/// suite; the sanitizer is therefore reproduced here as a runnable model and the source is pinned
+/// structurally, the same arrangement the S-mode-timer and async-preemption modules use.
+mod riscv64_user_fp_policy {
+    use super::*;
+
+    const USER_STATUS_SRC: &str = include_str!("../../arch/riscv64/user_status.rs");
+    const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const USER_TARGET_JSON: &str = include_str!("../../../targets/riscv64-yarm-user-none.json");
+
+    const SSTATUS_SPP: u64 = 1 << 8;
+    const SSTATUS_SPIE: u64 = 1 << 5;
+    const SSTATUS_SUM: u64 = 1 << 18;
+    const SSTATUS_FS_MASK: u64 = 0b11 << 13;
+    const SSTATUS_VS_MASK: u64 = 0b11 << 9;
+
+    /// The sanitizer, reproduced EXACTLY from `arch/riscv64/user_status.rs`. Keeping a runnable
+    /// model here is what makes the policy provable on a host that has no RISC-V.
+    fn sanitize_user_sstatus(raw: u64) -> u64 {
+        (raw & !(SSTATUS_SPP | SSTATUS_FS_MASK | SSTATUS_VS_MASK)) | SSTATUS_SUM
+    }
+
+    fn is_sanitized(v: u64) -> bool {
+        (v & SSTATUS_SPP) == 0
+            && (v & SSTATUS_FS_MASK) == 0
+            && (v & SSTATUS_VS_MASK) == 0
+            && (v & SSTATUS_SUM) != 0
+    }
+
+    /// The value observed live on the accepted QEMU profile at the first user trap: SD set,
+    /// UXL=2, SUM set, and **FS = Dirty**. The exact value that must never reach U-mode.
+    const OBSERVED_DIRTY: u64 = 0x8000_0002_0004_6000;
+
+    /// (1) Every resume class — fresh, syscall, D2/blocked continuation, asynchronous preemption
+    /// — returns to U-mode with `FS` and `VS` Off. They share one sanitizer, so this is one
+    /// property checked four ways rather than four separate promises.
+    #[test]
+    fn every_resume_class_returns_with_fs_and_vs_off() {
+        // Whatever each class assembles, it passes through the same transformation. The inputs
+        // below are the shapes those classes actually produce.
+        let fresh = SSTATUS_SUM; // first entry: built from scratch
+        let syscall = OBSERVED_DIRTY; // restored verbatim from the trap-saved value
+        let d2 = OBSERVED_DIRTY | SSTATUS_SPIE; // continuation with interrupts pending
+        let async_preempt = OBSERVED_DIRTY | SSTATUS_SPP; // idle frame, SPP still Supervisor
+        for (name, raw) in [
+            ("fresh", fresh),
+            ("syscall", syscall),
+            ("d2", d2),
+            ("async", async_preempt),
+        ] {
+            let out = sanitize_user_sstatus(raw);
+            assert_eq!(out & SSTATUS_FS_MASK, 0, "{name}: FS must be Off");
+            assert_eq!(out & SSTATUS_VS_MASK, 0, "{name}: VS must be Off");
+            assert_eq!(out & SSTATUS_SPP, 0, "{name}: must return to U-mode");
+            assert!(is_sanitized(out), "{name}");
+        }
+    }
+
+    /// (2) A saved Dirty `FS` cannot escape sanitization, under any encoding of `FS`/`VS`.
+    #[test]
+    fn a_saved_dirty_value_can_never_escape() {
+        assert_ne!(
+            OBSERVED_DIRTY & SSTATUS_FS_MASK,
+            0,
+            "the input really is Dirty"
+        );
+        assert!(is_sanitized(sanitize_user_sstatus(OBSERVED_DIRTY)));
+        for fs in 0..4u64 {
+            for vs in 0..4u64 {
+                let raw = (fs << 13) | (vs << 9) | SSTATUS_SPP | (1 << 63);
+                assert!(
+                    is_sanitized(sanitize_user_sstatus(raw)),
+                    "FS={fs} VS={vs} escaped"
+                );
+            }
+        }
+    }
+
+    /// (3) The APPROVED user-return status bits survive exactly. This is a sanitizer, not a
+    /// rewrite: clearing more than `SPP`/`FS`/`VS` would silently change interrupt or width
+    /// policy on paths this stage is not allowed to touch.
+    #[test]
+    fn approved_status_bits_are_preserved_exactly() {
+        let raw = SSTATUS_SPIE | (2u64 << 32) | (1u64 << 63) | SSTATUS_FS_MASK | SSTATUS_SPP;
+        let out = sanitize_user_sstatus(raw);
+        assert_ne!(
+            out & SSTATUS_SPIE,
+            0,
+            "SPIE is per-path policy, not cleared here"
+        );
+        assert_eq!(out & (3u64 << 32), 2u64 << 32, "UXL preserved");
+        assert_ne!(out & (1u64 << 63), 0, "SD preserved");
+        assert_ne!(out & SSTATUS_SUM, 0, "SUM set");
+        // Idempotent, so a defensive second application cannot disagree with the first.
+        assert_eq!(sanitize_user_sstatus(out), out);
+    }
+
+    /// (4) SOURCE: the user target is a consistent soft-float configuration — `lp64`, and no
+    /// `F`, `D` or `V` feature. Both halves matter: the ABI decides what the compiler emits,
+    /// the features decide what it may emit at all.
+    #[test]
+    fn the_user_target_is_soft_float_lp64() {
+        assert!(
+            USER_TARGET_JSON.contains("\"llvm-abiname\": \"lp64\""),
+            "the RISC-V user ABI must be LP64, not LP64D"
+        );
+        assert!(
+            !USER_TARGET_JSON.contains("lp64d"),
+            "no hard-float ABI may remain anywhere in the user target"
+        );
+        let features = USER_TARGET_JSON
+            .split("\"features\": \"")
+            .nth(1)
+            .expect("features")
+            .split('"')
+            .next()
+            .expect("value");
+        for banned in ["+f", "+d", "+v"] {
+            assert!(
+                !features.contains(banned),
+                "user target must not advertise `{banned}`: {features}"
+            );
+        }
+        // The integer extensions the port actually needs stay exactly as they were.
+        for required in ["+m", "+a", "+c"] {
+            assert!(
+                features.contains(required),
+                "required integer extension `{required}` was dropped: {features}"
+            );
+        }
+    }
+
+    /// (5) SOURCE: the sanitization is CENTRALIZED — one definition, and every user-return path
+    /// goes through it. A second, divergent way to build a user `sstatus` is the defect this
+    /// guard exists to prevent.
+    #[test]
+    fn user_status_sanitization_is_centralized_and_universal() {
+        assert!(
+            USER_STATUS_SRC.contains("pub const fn sanitize_user_sstatus(raw: u64) -> u64 {"),
+            "one sanitizer"
+        );
+        assert!(
+            USER_STATUS_SRC.contains("pub const USER_RETURN_CLEAR_MASK: u64 =\n    SSTATUS_SPP | SSTATUS_FS_MASK | SSTATUS_VS_MASK;")
+                || USER_STATUS_SRC.contains(
+                    "pub const USER_RETURN_CLEAR_MASK: u64 = SSTATUS_SPP | SSTATUS_FS_MASK | SSTATUS_VS_MASK;"
+                ),
+            "the clear mask must be SPP|FS|VS, spelled from the named bits"
+        );
+        // Both frame-based user returns call it: the generic bridge tail (which every
+        // trap-return resume class funnels through) and the S-mode idle dispatch into U-mode.
+        assert_eq!(
+            RV_BOOT_SRC
+                .matches("crate::arch::riscv64::user_status::sanitize_user_sstatus(")
+                .count(),
+            2,
+            "both frame-based user-return sites must sanitize"
+        );
+        // The first user entry has no frame, so it clears the same bits in asm. 0x6720 =
+        // SPP|SPIE|FS|VS; the arithmetic is pinned by a unit test in `user_status.rs`.
+        assert!(
+            RV_BOOT_SRC.contains("li t5, 0x6720             // SPP | SPIE | FS | VS"),
+            "the first user entry must clear FS and VS too"
+        );
+        assert!(
+            !RV_BOOT_SRC.contains("li t5, 0x120              // SPP | SPIE"),
+            "the old SPP|SPIE-only mask must be gone: it inherited OpenSBI's Dirty FS"
+        );
+    }
+
+    /// (6) SOURCE: no direct return path restores an unsanitized `FS`/`VS`.
+    ///
+    /// The generic tail restores `sstatus` straight out of the frame, so the frame must be
+    /// sanitized before `sret`; and the hand-rolled `SPP`-only clear that the S-mode dispatch
+    /// used must not come back.
+    #[test]
+    fn no_user_return_path_restores_unsanitized_status() {
+        let tail = RV_BOOT_SRC
+            .split("let frame_resume: *const RiscvTrapFrame = frame;")
+            .nth(1)
+            .expect("the generic resume tail");
+        assert!(
+            tail.starts_with(
+                "\n    unsafe { yarm_riscv64_trap_return(frame_resume, canonical_top) }"
+            ),
+            "nothing may run between the sanitized frame and the sret"
+        );
+        let before = RV_BOOT_SRC
+            .split("let frame_resume: *const RiscvTrapFrame = frame;")
+            .next()
+            .expect("everything before the resume");
+        assert!(
+            before.contains(
+                "frame.sstatus = crate::arch::riscv64::user_status::sanitize_user_sstatus(frame.sstatus);"
+            ),
+            "the generic tail's frame must be sanitized immediately before sret"
+        );
+        assert!(
+            !RV_BOOT_SRC.contains("frame.sstatus = (frame.sstatus & !SPP_BIT) | SPIE_BIT;"),
+            "the hand-rolled SPP-only clear must not return: it let a Dirty FS through"
+        );
+    }
+
+    /// (7) The S-mode timer RETURN is unaffected. It resumes the kernel's own `wfi`, not a user
+    /// task, so sanitizing it would clear `SPP` and `sret` into U-mode at a kernel address.
+    #[test]
+    fn the_s_mode_timer_return_is_not_sanitized() {
+        let s_return = RV_BOOT_SRC
+            .split("yarm_riscv64_s_mode_timer_return:")
+            .nth(1)
+            .expect("the S-mode return tail")
+            .split("\n\"#")
+            .next()
+            .expect("its body");
+        assert!(
+            s_return.contains("csrw sstatus, t0"),
+            "it restores the interrupted supervisor status verbatim"
+        );
+        assert!(
+            !s_return.contains("0x6720"),
+            "the S-mode return must NOT clear SPP — it returns to the kernel's own wfi"
+        );
+    }
+
+    /// (8) SOURCE: an unsupported instruction fails closed through the EXISTING per-task
+    /// user-fault policy — it is neither resumed nor emulated, and it does not take the kernel
+    /// down for one task's bad instruction.
+    #[test]
+    fn unsupported_instructions_fail_closed_through_the_user_fault_policy() {
+        assert!(
+            RV_TRAP_SRC.contains("const EXC_ILLEGAL_INSTRUCTION: usize = 2;"),
+            "illegal instruction is decoded explicitly"
+        );
+        assert!(
+            RV_TRAP_SRC
+                .contains("kernel\n            .fault_current_task_unsupported_instruction(pc)")
+                || RV_TRAP_SRC.contains(".fault_current_task_unsupported_instruction(pc)"),
+            "and routed into the per-task fault policy"
+        );
+        let helper = FAULT_SRC
+            .split("pub(crate) fn fault_current_task_unsupported_instruction(")
+            .nth(1)
+            .expect("the helper")
+            .split("\n    #[cfg(test)]")
+            .next()
+            .expect("its body");
+        assert!(
+            helper.contains("self.fault_current_task_for_fault("),
+            "it must delegate to the EXISTING policy, not implement a second way to die"
+        );
+        assert!(
+            helper.contains("FaultAccess::Execute"),
+            "reported as an execute fault: the instruction could not be executed"
+        );
+        // No emulation, no lazy-FPU, no partial save area anywhere in the policy.
+        for banned in ["emulate", "lazy_fp", "fp_save", "save_fp", "restore_fp"] {
+            assert!(
+                !USER_STATUS_SRC.contains(banned) && !RV_TRAP_SRC.contains(banned),
+                "no FP emulation or lazy-FPU mechanism may be introduced ({banned})"
+            );
+        }
+    }
+
+    /// (9) Full FP/vector support stays EXPLICITLY unsupported rather than partially
+    /// implemented. A half-built save area is worse than none: it looks like ownership while
+    /// still losing state.
+    #[test]
+    fn full_fp_support_remains_explicitly_unsupported() {
+        const TASK_SRC: &str = include_str!("../task.rs");
+        let ctx = TASK_SRC
+            .split("pub struct UserRegisterContext {")
+            .nth(1)
+            .expect("the context")
+            .split('}')
+            .next()
+            .expect("its fields");
+        for absent in ["f0", "fcsr", "fp_regs", "vregs", "vector"] {
+            assert!(
+                !ctx.contains(absent),
+                "UserRegisterContext gained `{absent}` — that is FP context management, which \
+                 must be a deliberate stage, not a side effect"
+            );
+        }
+        assert!(
+            USER_STATUS_SRC.contains("future work"),
+            "the module must say plainly that full FP/vector management is future work"
+        );
+    }
+
+    /// (10) The kernel target may keep its ISA configuration, but kernel CODE must not use
+    /// FP/vector state — otherwise forcing `FS` Off on user returns would break the kernel
+    /// itself the first time it touched an `f` register.
+    #[test]
+    fn the_kernel_does_not_use_fp_or_vector_state() {
+        for (name, src) in [("boot", RV_BOOT_SRC), ("trap", RV_TRAP_SRC)] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            for banned in ["fadd.", "fmul.", "fld ", "fsd ", "vsetvli", "vle64"] {
+                assert!(
+                    !code.contains(banned),
+                    "{name} must not use FP/vector state ({banned})"
+                );
+            }
         }
     }
 }

@@ -12,6 +12,7 @@ pub mod sbi;
 pub mod syscall_abi;
 pub mod timer;
 pub mod trap;
+pub mod user_status;
 pub mod vm_layout;
 
 pub mod topology;
