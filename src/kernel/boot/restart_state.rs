@@ -101,6 +101,21 @@ impl KernelState {
             }
             tcb.status = TaskStatus::Exited(code);
             tcb.restart.token = Some(RestartToken(token));
+            // Canonical 199E-R1D: a dead task's asynchronously preempted register file is dead
+            // with it. Dropping the tag here makes the snapshot UNREACHABLE at the moment the
+            // task stops being resumable, so nothing can later restore a corpse's registers.
+            //
+            // This is defence in depth rather than the primary guarantee: the tag is validated
+            // against the exact `{tid, asid, generation}` incarnation at every consumer, so a
+            // replacement task reusing the numeric TID would be refused even without this. It is
+            // cleared anyway, because "cannot match" and "is not there" are different strengths
+            // of the same claim and the cheaper one belongs at the point of death.
+            //
+            // Placed AFTER the status/restart writes on purpose: the Stage 199D-WA2B wake-owner
+            // census fingerprints each status assignment by its immediate neighbourhood, and
+            // this clear has no ordering requirement of its own — it runs in the same closure,
+            // under the same lock, before anything can observe the exit.
+            tcb.async_preempted = None;
             Ok::<_, KernelError>(())
         })?;
         // Stage 173 (CAP-CNODE): default-off on-exit cap-revoke markers. Diagnostic

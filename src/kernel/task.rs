@@ -281,6 +281,24 @@ pub struct ThreadControlBlock {
     /// incarnation is refused, so a NEW receive can never observe an OLD result and no
     /// completion is observed twice.
     pub pending_syscall_completion: Option<BlockedSyscallCompletion>,
+    /// Canonical 199E-R1D — set exactly when this task's saved [`Self::user_context`] holds an
+    /// ASYNCHRONOUSLY PREEMPTED register file rather than a syscall/startup lane convention.
+    ///
+    /// This is the explicit resume-state tag: the resume path reads it to decide whether to
+    /// restore `a0..a7` verbatim or to install the startup/result lanes, and consumes it in the
+    /// same step so one snapshot can never be applied twice. `None` means the ordinary lane
+    /// conventions apply, exactly as before this stage. See [`AsyncPreemptedContext`].
+    pub async_preempted: Option<AsyncPreemptedContext>,
+    /// Canonical 199E-R1D — a monotonic per-task PREEMPTION generation, the async sibling of
+    /// [`Self::blocked_recv_generation`] and [`Self::blocked_send_generation`] and deliberately
+    /// a separate coordinate from both: a preemption is not a block, and conflating them would
+    /// let a stale block completion match a preemption cycle or vice versa.
+    ///
+    /// Advanced by `checked_add` at each snapshot — never `wrapping_add`. An exhausted counter
+    /// REFUSES the snapshot rather than wrapping into a value an ancient tag could match; at
+    /// u64 width that is unreachable in practice, and refusing is what makes the identity a
+    /// proof rather than a probability.
+    pub async_preempt_generation: u64,
     /// Stage 199D-WA3B: the one-shot spawn reservation this TCB carries, if it is one.
     ///
     /// `Some` exactly when `status == TaskStatus::Reserved`. Cleared by the typed live commit,
@@ -370,6 +388,70 @@ pub struct BlockedSyscallCompletion {
     /// compared against is decided by [`Self::syscall_class`] — see
     /// [`BlockedSyscallCompletion::matches_tcb`].
     pub blocked_generation: u64,
+}
+
+/// Canonical 199E-R1D — the TYPED resume state for a user context that was interrupted
+/// ASYNCHRONOUSLY, i.e. by a timer interrupt at an arbitrary instruction boundary rather than
+/// at a syscall.
+///
+/// # Why a third resume state exists
+///
+/// RISC-V previously had exactly two ways to resume a task, and both are *lane* conventions
+/// rather than register-file restores:
+///
+///   * **Fresh/startup** — `a0..a5` carry the startup ABI, `a7` is zeroed. The task has never
+///     run, so its `user_gprs` are all zero and mirroring them would clobber the arguments.
+///   * **Syscall / blocked-syscall continuation** — `a0`/`a1` carry the syscall result lane,
+///     published into both `user_gprs` and the `arg` mirror by `publish_riscv_user_return`.
+///
+/// Both install `a0..a5` from the argument mirror and force `a7 = 0`, which is correct for a
+/// task resuming *from a syscall boundary*, where those registers are either the ABI arguments
+/// or dead. It is corruption for a task preempted mid-computation: `a0..a7` are ordinary live
+/// registers there, and `a7` in particular is an argument register the RISC-V ABI does not
+/// preserve across anything.
+///
+/// Asynchronous preemption is therefore its OWN state, tagged explicitly. Nothing infers it
+/// from zero registers, a PC value, a bare TID or incidental scheduler state — the tag is
+/// published by the snapshot and consumed by the resume, exactly once each.
+///
+/// # Identity
+///
+/// Modelled on [`BlockedSyscallCompletion`]: a snapshot is only ever restored into the exact
+/// `{tid, asid, generation}` incarnation it was taken from. A replacement task that reused the
+/// numeric TID always carries a different ASID, and a task preempted twice advances its own
+/// generation, so a stale tag can neither resurrect an older register file nor be consumed
+/// twice. On any mismatch the resume FAILS CLOSED — it must never fall back to the startup
+/// argument rewrite, because that would install a startup ABI over a running computation.
+///
+/// # Scope: integer registers only
+///
+/// This state carries the integer register file (`user_gprs`), `sepc` and `sp`, which is the
+/// complete architecturally live user state **for every binary this port builds**. RISC-V user
+/// targets declare the `lp64d` hard-float ABI and `sstatus.FS` is observed Dirty, so the
+/// hardware permits user floating-point; no build in the tree contains a single FP instruction
+/// or f-register reference, so no FP state can be live to lose. That is a real latent
+/// dependency rather than a closed one — see `riscv64_async_preemption` guard
+/// `no_user_floating_point_state_can_be_live`, which fails the moment it stops being true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsyncPreemptedContext {
+    /// The exact preempted thread id.
+    pub tid: u64,
+    /// The exact preempted address-space id (a replacement incarnation differs).
+    pub asid: Asid,
+    /// The preemption generation captured when the snapshot was published. A task preempted
+    /// again advances this, so a stale tag cannot restore an older register file.
+    pub preempt_generation: u64,
+}
+
+impl AsyncPreemptedContext {
+    /// The SINGLE source of truth for "is this snapshot still exactly this task's, for the
+    /// preemption it was published for?". All three coordinates must agree.
+    #[must_use]
+    pub fn matches_tcb(&self, tcb: &ThreadControlBlock) -> bool {
+        self.tid == tcb.tid.0
+            && tcb.asid == Some(self.asid)
+            && self.preempt_generation == tcb.async_preempt_generation
+    }
 }
 
 impl BlockedSyscallCompletion {
@@ -468,6 +550,8 @@ impl ThreadControlBlock {
             blocked_recv_generation: 0,
             blocked_send_generation: 0,
             pending_syscall_completion: None,
+            async_preempted: None,
+            async_preempt_generation: 0,
             spawn_reservation: None,
         }
     }

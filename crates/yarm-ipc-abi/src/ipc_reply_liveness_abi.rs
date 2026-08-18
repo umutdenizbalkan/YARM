@@ -12,13 +12,18 @@
 //! # Why interpretation must be architecture-local
 //!
 //! Each architecture owns a distinct free RUN of slot-5 selector values,
-//! `(base, base + 1, base + 2)` = `(TimeoutWins, ReplyWins, ServerDies)`:
+//! `(base, base + 1, base + 2, base + 3)` =
+//! `(TimeoutWins, ReplyWins, ServerDies, ProductionTimeoutWins)`:
 //!
-//! | arch    | TimeoutWins | ReplyWins | ServerDies |
-//! |---------|-------------|-----------|------------|
-//! | AArch64 | 8           | 9         | 10         |
-//! | RISC-V  | 9           | 10        | 11         |
-//! | x86_64  | 10          | 11        | 12         |
+//! | arch    | TimeoutWins | ReplyWins | ServerDies | ProductionTimeoutWins |
+//! |---------|-------------|-----------|------------|-----------------------|
+//! | AArch64 | 8           | 9         | 10         | 11                    |
+//! | RISC-V  | 9           | 10        | 11         | 12                    |
+//! | x86_64  | 10          | 11        | 12         | 13                    |
+//!
+//! 199E-R1 widened each run from three values to four. The fourth is proof-protocol
+//! metadata for the PRODUCTION timeout lane (see `ProductionTimeoutWins`), not a fourth
+//! liveness outcome, and it reuses the SAME slot — no ABI slot and no capability was added.
 //!
 //! **The runs overlap.** `10` is AArch64's `ServerDies`, RISC-V's `ReplyWins` AND x86_64's
 //! `TimeoutWins`; `11` is RISC-V's `ServerDies` and x86_64's `ReplyWins`. A shared numeric
@@ -51,6 +56,28 @@ pub enum IpcReplyLivenessScenario {
     /// completion, the post-lock drain claims `PeerDeath`, and the caller resumes with the
     /// canonical `ServerDied` (code 10); the stale deadline then loses.
     ServerDies,
+    /// 199E-R1 — the same liveness QUESTION as `TimeoutWins`, asked of the PRODUCTION
+    /// pipeline instead of the oracle's pre-armed confined deadline.
+    ///
+    /// This is proof-protocol metadata, not a fourth liveness outcome: the caller's terminal
+    /// is the same canonical `TimedOut`. What differs is the mechanism under test and,
+    /// consequently, the WAIT STRATEGY the workload may use.
+    ///
+    /// `TimeoutWins` runs with an `OracleHardware` deadline the kernel armed up front, so the
+    /// server may yield-spin until `CLIENT_TIMED_OUT` — the deadline expires against a clock
+    /// that advances on traps, and the spin's own traps advance it.
+    ///
+    /// `ProductionTimeoutWins` runs with NO pre-armed deadline: the only deadline is the one
+    /// `arm_production_reply_deadline` registers on the ordinary block path, and on a port
+    /// whose scheduler tick is driven by a periodic timer that tick only advances while the
+    /// CPU is IDLE. A yield-spinning server keeps a runnable task on the CPU forever, so
+    /// terminal idle is never reached, the timer is never armed and the deadline can never
+    /// expire. The production lane therefore has BOTH parties block, which is exactly the
+    /// state the production timeout is specified to resolve.
+    ///
+    /// Kept in the same slot-5 run rather than in a separate slot so it stays subject to the
+    /// architecture-local decoding rule above; it adds no ABI slot and no capability.
+    ProductionTimeoutWins,
 }
 
 /// AArch64's slot-5 run base (`8`/`9`/`10`).
@@ -96,6 +123,8 @@ pub const fn ipc_reply_liveness_scenario_for_base(
         Some(IpcReplyLivenessScenario::ReplyWins)
     } else if selector == base + 2 {
         Some(IpcReplyLivenessScenario::ServerDies)
+    } else if selector == base + 3 {
+        Some(IpcReplyLivenessScenario::ProductionTimeoutWins)
     } else {
         None
     }
@@ -124,5 +153,6 @@ pub const fn ipc_reply_liveness_selector_for_current_arch(
         IpcReplyLivenessScenario::TimeoutWins => CURRENT_ARCH_SELECTOR_BASE,
         IpcReplyLivenessScenario::ReplyWins => CURRENT_ARCH_SELECTOR_BASE + 1,
         IpcReplyLivenessScenario::ServerDies => CURRENT_ARCH_SELECTOR_BASE + 2,
+        IpcReplyLivenessScenario::ProductionTimeoutWins => CURRENT_ARCH_SELECTOR_BASE + 3,
     }
 }

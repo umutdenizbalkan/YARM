@@ -1883,6 +1883,11 @@ mod ipc_reply_timeout_oracle {
     const REQUEST_DATA: [u8; 8] = *b"RTOreq!!";
     const REPLY_OPCODE: u16 = 0x0C0B;
     pub(super) const REPLY_DATA: [u8; 8] = *b"RTOrep!!";
+    /// 199E-R1 — the production lane's SECOND message on the EXISTING request endpoint: the
+    /// client's "now attempt your late reply" trigger. A distinct opcode/payload so the server
+    /// can prove the message it woke on is the trigger and not a replayed request.
+    const LATE_REPLY_TRIGGER_OPCODE: u16 = 0x0C0C;
+    const LATE_REPLY_TRIGGER_DATA: [u8; 8] = *b"RTOtrg!!";
     const MAX_ATTEMPTS: u32 = 64;
     /// timeout-wins: short deadline so the production scan fires BEFORE the (delayed) reply.
     const TIMEOUT_WINS_TICKS: u64 = 3;
@@ -1890,6 +1895,20 @@ mod ipc_reply_timeout_oracle {
     const REPLY_WINS_TICKS: u64 = 30;
     /// Bounded cross-thread spin cap (deterministic termination, never wall-clock correctness).
     const SPIN_CAP: u64 = 2_000_000;
+    /// 199E-R1(A): bounded U-mode dwell length. Sized only to give the periodic timer a generous
+    /// observation window under the accepted QEMU profile — it is NOT a duration claim and NOT
+    /// evidence. Termination is unconditional, so the workload cannot hang if no interrupt arrives.
+    ///
+    /// 199E-R1D raised it tenfold, because the loop body got about ten times cheaper. The dwell
+    /// used to be a `read_volatile`/`write_volatile` pair plus loop overhead; it is now two
+    /// instructions, so the same iteration count bought roughly a tenth of the wall time and the
+    /// window stopped spanning a full supervisor receive cycle. That mattered: with no other task
+    /// becoming runnable, the client was never descheduled, the switch-away/switch-back path this
+    /// stage repairs was never taken, and the proof would have passed VACUOUSLY — `continuations`
+    /// stays 1 when nothing ever preempts you. The count restores the previous observation
+    /// window, so a real cross-task switch happens inside the dwell and the repair is what the
+    /// canary is actually testing.
+    const U_MODE_DWELL_ITERATIONS: u64 = 400_000_000;
 
     pub(super) fn oracle_caps() -> (u32, u32) {
         let req = yarm_user_rt::runtime::startup_arg_slot(
@@ -1927,8 +1946,35 @@ mod ipc_reply_timeout_oracle {
         ipc_reply_liveness_scenario_for_current_arch(mode() as usize)
     }
 
+    /// Both TIMEOUT-WINS lanes: the oracle's pre-armed `OracleHardware` deadline and 199E-R1's
+    /// production deadline. They share the whole shape of the exchange — finite-deadline block,
+    /// canonical `TimedOut` terminal, late reply rejected — and differ ONLY in the wait strategy
+    /// (`is_production_timeout_wins`).
     pub(super) fn is_timeout_wins() -> bool {
-        matches!(scenario(), Some(IpcReplyLivenessScenario::TimeoutWins))
+        matches!(
+            scenario(),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
+                | Some(IpcReplyLivenessScenario::ProductionTimeoutWins)
+        )
+    }
+
+    /// 199E-R1 — the PRODUCTION timeout lane, and the only lane that may use the blocking
+    /// proof handshake.
+    ///
+    /// The oracle lane keeps its yield-spin verbatim: its deadline is armed up front against a
+    /// clock the spin's own traps advance, so spinning is both harmless and sufficient. The
+    /// production lane cannot spin. Its deadline is armed by the ordinary block path, and the
+    /// tick it expires against is driven by the periodic supervisor timer, which is only armed
+    /// at the terminal kernel-idle boundary. A spinning server keeps a runnable task on the CPU,
+    /// so idle is never reached, the timer is never armed, and the deadline can never come due —
+    /// measured deterministically before this lane existed. Blocking BOTH parties is what makes
+    /// idle reachable, and a blocked caller waiting on a deadline is precisely the state the
+    /// production timeout exists to resolve.
+    pub(super) fn is_production_timeout_wins() -> bool {
+        matches!(
+            scenario(),
+            Some(IpcReplyLivenessScenario::ProductionTimeoutWins)
+        )
     }
 
     /// Stage 200D-2B1: the third liveness scenario — the authorized replier exits without
@@ -2044,7 +2090,95 @@ mod ipc_reply_timeout_oracle {
                 Ok(m) => m,
                 Err(_) => return,
             };
-        if is_timeout_wins() {
+        if is_production_timeout_wins() {
+            // ── 199E-R1: the PRODUCTION lane's blocking proof handshake ──────────────────
+            //
+            // The request is already consumed and the reply capability is RETAINED across the
+            // wait below. That is sound and adds no resource: `ipc_send` mints no reply
+            // capability (it passes no reply endpoint), so the trigger message cannot deliver
+            // a second reply cap and therefore cannot overwrite or alias the retained one.
+            // The server ends up holding exactly one reply capability, the one it received
+            // with the request — which is the whole point, since the late reply must be
+            // attempted through THAT capability.
+            //
+            // Blocking rather than spinning is what makes the proof reachable at all. With
+            // the client blocked on its production reply deadline and this server blocked
+            // here, no task is runnable, the CPU reaches its terminal kernel-idle boundary,
+            // the periodic supervisor timer is armed there, and its S-mode ticks advance the
+            // scheduler tick the deadline is measured against. A yield-spin here keeps a
+            // runnable task on the CPU forever and idle is never reached.
+            yarm_user_rt::user_log!(
+                "IPC_REPLY_TIMEOUT_ORACLE_SERVER_REQUEST_CONSUMED opcode=0x{:04x} expected=0x{:04x} len={} reply_cap={} result=ok",
+                rm.message.opcode,
+                REQUEST_OPCODE,
+                rm.message.len,
+                reply_cap
+            );
+            yarm_user_rt::user_log!(
+                "IPC_REPLY_TIMEOUT_ORACLE_SERVER_BLOCKED_FOR_LATE_REPLY_TRIGGER reply_cap_retained={}",
+                u32::from(rm.reply_cap.is_some())
+            );
+            // SAFETY: the SAME shared-CSpace request endpoint cap; a blocking recv-v2. No new
+            // endpoint, no new capability slot.
+            let trigger = unsafe { yarm_user_rt::syscall::ipc_recv_v2(request_ep) };
+            let trigger_ok = match trigger {
+                Ok(Some(tm)) => {
+                    // A PLAIN NR5 send carries its opcode INLINE: `ipc_call_prepare` writes the
+                    // little-endian opcode into the first two payload bytes and the kernel's
+                    // `Message::opcode` field stays 0. The prefix is only stripped for messages
+                    // flagged as cap/reply transfers, which a plain send is not — so the trigger
+                    // arrives as `[opcode_lo, opcode_hi, ..payload]` with `len = 2 + payload`.
+                    // The request did not, because it came through NR6 with a reply cap. Decode
+                    // the format that is actually on the wire rather than assuming the request's.
+                    let tlen = tm.message.len as usize;
+                    let expect = 2 + LATE_REPLY_TRIGGER_DATA.len();
+                    let inline_opcode = if tlen >= 2 {
+                        u16::from_le_bytes([tm.message.payload[0], tm.message.payload[1]])
+                    } else {
+                        0
+                    };
+                    let payload_ok = tlen == expect
+                        && inline_opcode == LATE_REPLY_TRIGGER_OPCODE
+                        && tm.message.payload[2..tlen] == LATE_REPLY_TRIGGER_DATA;
+                    // The trigger is a plain NR5 send, so the kernel must NOT have handed this
+                    // receive a reply capability. If it had, the retained one would be at risk
+                    // and the "one reply capability" claim above would be false.
+                    let no_second_reply_cap = tm.reply_cap.is_none();
+                    yarm_user_rt::user_log!(
+                        "IPC_REPLY_TIMEOUT_ORACLE_SERVER_LATE_REPLY_TRIGGER_RECV opcode=0x{:04x} len={} payload_ok={} second_reply_cap={} result={}",
+                        inline_opcode,
+                        tlen,
+                        u32::from(payload_ok),
+                        u32::from(!no_second_reply_cap),
+                        if payload_ok && no_second_reply_cap {
+                            "ok"
+                        } else {
+                            "fail"
+                        }
+                    );
+                    payload_ok && no_second_reply_cap
+                }
+                other => {
+                    yarm_user_rt::user_log!(
+                        "IPC_REPLY_TIMEOUT_ORACLE_SERVER_LATE_REPLY_TRIGGER_RECV_FAIL err={} result=fail",
+                        u32::from(other.is_err())
+                    );
+                    false
+                }
+            };
+            // The record is now Cancelled (the production deadline won) → this late NR7 through
+            // the RETAINED reply capability is rejected. Attempted unconditionally after the
+            // wake so a malformed trigger still produces a verdict rather than a silent hang.
+            let r = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply_msg) };
+            let rejected = u32::from(r.is_err() && trigger_ok);
+            SERVER_LATE_REPLY_REJECTED.store(rejected, Relaxed);
+            yarm_user_rt::user_log!(
+                "IPC_REPLY_TIMEOUT_ORACLE_SERVER_LATE_REPLY_REJECTED rejected={} trigger_ok={} err={:?}",
+                rejected,
+                u32::from(trigger_ok),
+                r.is_err()
+            );
+        } else if is_timeout_wins() {
             // Delay NR7 until the client has TIMED OUT (delivered by the production scan).
             let mut spun = 0u64;
             while CLIENT_TIMED_OUT.load(Relaxed) == 0 && spun < SPIN_CAP {
@@ -2099,6 +2233,109 @@ mod ipc_reply_timeout_oracle {
             }
             SERVER_REPLIED_OK.store(u32::from(ok), Relaxed);
             yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_SERVER_REPLIED ok={}", ok as u32);
+        }
+    }
+
+    /// 199E-R1D — the bounded, syscall-free U-mode dwell, carrying a REGISTER CANARY.
+    ///
+    /// Two jobs in one loop. It keeps this task in U-mode long enough for the periodic
+    /// supervisor timer to interrupt it several times — the observation window the U-origin
+    /// evidence needs — and it holds recognizable values in the exact registers asynchronous
+    /// preemption used to destroy, so their survival is CHECKED rather than assumed.
+    ///
+    /// On RISC-V the loop is one inline-assembly block, and it has to be. The registers under
+    /// test are `a0..a7`, which is precisely the block a compiler treats as freely reusable
+    /// scratch; any Rust-level loop would spill them across a call and reload them afterwards,
+    /// so a corrupted register would be silently repaired by the reload and the canary would
+    /// pass for the wrong reason. Pinning them as `inout` operands of a single asm block keeps
+    /// the values in those architectural registers, untouched by anything but the loop itself,
+    /// from entry to exit.
+    ///
+    /// The old startup-argument rewrite installed `a0..a5` from the argument mirror and forced
+    /// `a7 = 0`, so before the repair this canary reports a non-zero mask. Zero is the only
+    /// passing value.
+    ///
+    /// `t0` is the loop counter and is deliberately NOT a canary: it is the one register the
+    /// loop itself mutates. `sp`, `gp`, `tp` and `ra` are never named — they are reserved, and
+    /// a canary that clobbered them would prove nothing except that the proof crashed.
+    ///
+    /// Returns a bit mask: bit N set means canary N did not survive. Termination is
+    /// unconditional, so the workload cannot hang if no interrupt ever arrives, and the
+    /// iteration count is an observation window rather than a duration claim.
+    fn u_mode_dwell_with_register_canary() -> u64 {
+        #[cfg(target_arch = "riscv64")]
+        {
+            // Distinctive, non-zero, mutually distinct values. None is a plausible pointer,
+            // capability, length or syscall number, so an accidental pass is not credible.
+            const C0: u64 = 0xA0A0_0001_DEAD_0000;
+            const C1: u64 = 0xA1A1_0002_DEAD_0001;
+            const C2: u64 = 0xA2A2_0003_DEAD_0002;
+            const C3: u64 = 0xA3A3_0004_DEAD_0003;
+            const C4: u64 = 0xA4A4_0005_DEAD_0004;
+            const C5: u64 = 0xA5A5_0006_DEAD_0005;
+            const C6: u64 = 0xA6A6_0007_DEAD_0006;
+            const C7: u64 = 0xA7A7_0008_DEAD_0007;
+            let (o0, o1, o2, o3, o4, o5, o6, o7): (u64, u64, u64, u64, u64, u64, u64, u64);
+            // SAFETY: the block touches no memory (`nomem`), uses no stack (`nostack`), and
+            // names only caller-saved argument registers plus its own counter. Every register
+            // it writes is declared as an operand, so the compiler accounts for all of them.
+            unsafe {
+                core::arch::asm!(
+                    "2:",
+                    "addi t0, t0, -1",
+                    "bnez t0, 2b",
+                    inout("t0") U_MODE_DWELL_ITERATIONS => _,
+                    inout("a0") C0 => o0,
+                    inout("a1") C1 => o1,
+                    inout("a2") C2 => o2,
+                    inout("a3") C3 => o3,
+                    inout("a4") C4 => o4,
+                    inout("a5") C5 => o5,
+                    inout("a6") C6 => o6,
+                    inout("a7") C7 => o7,
+                    options(nomem, nostack),
+                );
+            }
+            let mut mask = 0u64;
+            for (bit, (got, want)) in [
+                (o0, C0),
+                (o1, C1),
+                (o2, C2),
+                (o3, C3),
+                (o4, C4),
+                (o5, C5),
+                (o6, C6),
+                (o7, C7),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if got != want {
+                    mask |= 1u64 << bit;
+                }
+            }
+            mask
+        }
+        // The other ports reach this workload only with the ORACLE selector, which never runs
+        // the dwell, so this arm exists purely so the shared core keeps compiling. It performs
+        // the same bounded, syscall-free spin and asserts nothing about registers.
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let mut sink: u64 = 0;
+            let p = &raw mut sink;
+            let mut i: u64 = 0;
+            while i < U_MODE_DWELL_ITERATIONS {
+                // SAFETY: `p` points at a live local; the volatile pair is a compiler barrier
+                // that keeps the loop observable and touches nothing else.
+                unsafe {
+                    let v = core::ptr::read_volatile(p);
+                    core::ptr::write_volatile(p, v.wrapping_add(i | 1));
+                }
+                i += 1;
+            }
+            // SAFETY: same live local.
+            let _ = unsafe { core::ptr::read_volatile(p) };
+            0
         }
     }
 
@@ -2192,6 +2429,91 @@ mod ipc_reply_timeout_oracle {
                 out.timed_out = true;
                 CLIENT_TIMED_OUT.store(1, Relaxed);
                 yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_TIMED_OUT");
+                if is_production_timeout_wins() {
+                    // ── 199E-R1: bounded U-mode dwell ──────────────────────────────────────
+                    //
+                    // Placed HERE, after the canonical `TimedOut`, and nowhere else. By this
+                    // point the terminal kernel-idle boundary has already armed the periodic
+                    // supervisor timer, so there is a live periodic source to be interrupted
+                    // BY. Running the dwell before the block (where it first sat) proved
+                    // nothing: no task had blocked yet, idle was never reached, and the timer
+                    // was not running.
+                    //
+                    // Stay in U-mode long enough for that periodic timer to interrupt THIS
+                    // client while it is running, so the U-mode origin can be witnessed.
+                    // Deliberately syscall-free: a syscall would leave U-mode and the interrupt
+                    // would be taken from the kernel instead. `read_volatile`/`write_volatile`
+                    // on a local keep the loop from being optimised away without inline asm or
+                    // any new ABI — userspace counter access (`scounteren`) stays closed, and no
+                    // time syscall is added.
+                    //
+                    // The loop's assumed duration proves NOTHING. It only widens the observation
+                    // window; the evidence is what the KERNEL records — accepted timer interrupts
+                    // tagged `origin=user`, each with its own re-arm, each returning to this same
+                    // client, and this client then reaching the post-dwell marker. Termination is
+                    // unconditional, so the workload cannot hang if no interrupt ever arrives.
+                    yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_DWELL_BEGIN");
+                    let canary_mismatches = u_mode_dwell_with_register_canary();
+                    yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_DWELL_DONE");
+                    // 199E-R1D: the register canary's verdict. This is the DIRECT user-visible
+                    // evidence for asynchronous-preemption correctness — the kernel's own
+                    // RISCV_ASYNC_PREEMPT_RESUME marker says what it restored, this says what
+                    // userspace actually observed afterwards.
+                    yarm_user_rt::user_log!(
+                        "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REGISTER_CANARY mismatches=0x{:04x} result={}",
+                        canary_mismatches,
+                        if canary_mismatches == 0 { "ok" } else { "fail" }
+                    );
+                    // Wake the blocked server so it attempts its late reply through the RETAINED
+                    // reply capability. A plain NR5 send on the EXISTING request endpoint: it
+                    // passes no reply endpoint, so it mints no second reply capability and can
+                    // create no second completion — it is a wake, not a new call.
+                    match yarm_user_rt::ipc::Message::with_header(
+                        0,
+                        LATE_REPLY_TRIGGER_OPCODE,
+                        0,
+                        None,
+                        &LATE_REPLY_TRIGGER_DATA,
+                    ) {
+                        Ok(trigger_msg) => {
+                            let mut tattempts = 0u32;
+                            let mut sent = false;
+                            while tattempts < MAX_ATTEMPTS {
+                                tattempts += 1;
+                                // SAFETY: `request_ep` is the provisioned request SEND cap.
+                                match unsafe {
+                                    yarm_user_rt::syscall::ipc_send(request_ep, &trigger_msg)
+                                } {
+                                    Ok(()) => {
+                                        sent = true;
+                                        break;
+                                    }
+                                    Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+                                        let _ = yarm_user_rt::syscall::yield_now();
+                                    }
+                                    Err(e) => {
+                                        yarm_user_rt::user_log!(
+                                            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_LATE_REPLY_TRIGGER_FAIL err={:?}",
+                                            e
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            yarm_user_rt::user_log!(
+                                "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_LATE_REPLY_TRIGGER opcode=0x{:04x} attempts={} result={}",
+                                LATE_REPLY_TRIGGER_OPCODE,
+                                tattempts,
+                                if sent { "ok" } else { "fail" }
+                            );
+                        }
+                        Err(_) => {
+                            yarm_user_rt::user_log!(
+                                "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_LATE_REPLY_TRIGGER result=fail reason=message_build"
+                            );
+                        }
+                    }
+                }
                 // Let the server attempt (and fail) its late NR7.
                 let mut spun = 0u64;
                 while SERVER_LATE_REPLY_REJECTED.load(Relaxed) == 0 && spun < SPIN_CAP {

@@ -1999,6 +1999,107 @@ impl KernelState {
         })
     }
 
+    /// Canonical 199E-R1D — snapshot the CURRENT task's asynchronously interrupted user context
+    /// and publish the typed resume tag for it.
+    ///
+    /// This is the async sibling of [`Self::sync_current_thread_from_frame`], and it is a strict
+    /// superset of it: the register file, PC and SP are captured by the same
+    /// `capture_user_context`, and the tag is what tells the resume path that those registers are
+    /// a live computation rather than a syscall/startup lane convention.
+    ///
+    /// Ordering is the whole safety argument, and it is enforced by construction rather than by
+    /// the caller: the context is written FIRST and the tag is published LAST, so a tag can never
+    /// be observed pointing at a half-written register file. The caller's obligation is the other
+    /// half — call this before anything that can schedule another task.
+    ///
+    /// Returns `false` and publishes NOTHING when there is no current task, when the current task
+    /// is the idle/kernel identity (tid 0), when the task has no ASID (it cannot be a user task),
+    /// or when the preemption counter is exhausted. A refusal is always fail-closed: the previous
+    /// tag, if any, is left untouched and no partial state is written.
+    ///
+    /// Repeated preemption of the same task is coherent: the context is overwritten wholesale and
+    /// the generation advances, so the tag always names the newest snapshot and the older one
+    /// becomes unmatchable rather than lingering as a second claim.
+    pub(crate) fn snapshot_async_preempted_current(&mut self, frame: &TrapFrame) -> bool {
+        let Some(tid) = self.current_tid() else {
+            return false;
+        };
+        // tid 0 is the idle/kernel identity: it never returns to U-mode through a saved user
+        // context, so there is nothing to preserve and a tag would be meaningless.
+        if tid == 0 {
+            return false;
+        }
+        let captured = frame.capture_user_context();
+        self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) else {
+                return false;
+            };
+            // A user task always has an ASID; without one the exact-incarnation check the tag
+            // depends on cannot be formed, so refuse rather than publish an unverifiable tag.
+            let Some(asid) = tcb.asid else {
+                return false;
+            };
+            // `checked_add`: an exhausted counter refuses rather than wrapping into a value an
+            // ancient tag could match.
+            let Some(next_generation) = tcb.async_preempt_generation.checked_add(1) else {
+                return false;
+            };
+            // Context FIRST …
+            tcb.user_context = captured;
+            tcb.async_preempt_generation = next_generation;
+            // … tag LAST, so it can never name a half-written register file.
+            tcb.async_preempted = Some(crate::kernel::task::AsyncPreemptedContext {
+                tid,
+                asid,
+                preempt_generation: next_generation,
+            });
+            true
+        })
+    }
+
+    /// Canonical 199E-R1D — consume `tid`'s async-preemption tag if, and only if, it still names
+    /// this exact incarnation and preemption cycle.
+    ///
+    /// Consumption is unconditional on a match, so one snapshot authorizes exactly one verbatim
+    /// register-file restore; a second resume of the same task falls back to the ordinary lane
+    /// conventions, which is correct because by then the task has been resumed and any further
+    /// state change is its own.
+    ///
+    /// A tag that does NOT match — a replacement `{tid, asid}` incarnation that reused the
+    /// numeric TID, or a stale generation — is REFUSED and left in place for its rightful owner
+    /// rather than silently re-pointed. Refusal returns `false`; callers must fail closed on it
+    /// and must never substitute the startup-argument rewrite.
+    pub(crate) fn take_async_preempted_resume(&mut self, tid: u64) -> bool {
+        self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) else {
+                return false;
+            };
+            let Some(tag) = tcb.async_preempted else {
+                return false;
+            };
+            if !tag.matches_tcb(tcb) {
+                return false;
+            }
+            tcb.async_preempted = None;
+            true
+        })
+    }
+
+    /// Canonical 199E-R1D — does `tid` currently carry a VALID async-preemption tag?
+    ///
+    /// Read-only; consumes nothing. Exists so a resume path can classify before it commits, and
+    /// so tests can observe the tag's lifetime without ending it.
+    #[must_use]
+    pub(crate) fn async_preempted_resume_pending(&mut self, tid: u64) -> bool {
+        self.with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.async_preempted.map(|tag| tag.matches_tcb(tcb)))
+                .unwrap_or(false)
+        })
+    }
+
     fn apply_current_thread_to_frame(&mut self, frame: &mut TrapFrame) -> Result<(), KernelError> {
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let context = self

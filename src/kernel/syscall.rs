@@ -7100,13 +7100,22 @@ mod tests {
             src.contains("csrw sepc, t0") && src.contains("csrw sstatus, t0"),
             "trap-return must restore sepc and sstatus from the frame"
         );
+        // 199E-R1(B): the return no longer reseats the SAVED SP into `sscratch` — that swap
+        // leaked the bridge's own stack pointer and walked the trap stack down one frame per
+        // trap. It now writes the CANONICAL per-hart top (a1) and loads the interrupted sp
+        // directly from the frame, so the interrupted sp still round-trips exactly while the
+        // next entry always starts from a fixed address.
         assert!(
-            src.contains("csrw sscratch, t0"),
-            "trap-return must reseat user sp into sscratch"
+            src.contains("csrw sscratch, a1"),
+            "trap-return must reseat the canonical per-hart trap-stack top into sscratch"
+        );
+        assert!(
+            src.contains("ld sp,   8(a0)"),
+            "and must restore the interrupted sp directly from the frame's saved x2"
         );
         // a0 (x10) restored last from offset 72.
         assert!(
-            src.contains("ld a0, 72(a0)"),
+            src.contains("ld a0,  72(a0)"),
             "trap-return must restore a0 from frame[A0] LAST so the frame ptr stays live"
         );
         assert!(src.contains("sret"), "trap-return tail must end with sret");

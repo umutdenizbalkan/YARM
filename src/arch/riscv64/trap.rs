@@ -88,6 +88,29 @@ fn restore_arch_thread_state(
         .resume_current_thread_with_frame(frame)
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
+    // Canonical 199E-R1D — classify the resume BEFORE any result lane is published below.
+    //
+    // `resume_current_thread_with_frame` has just reloaded the saved `user_gprs`, `sepc` and
+    // `sp`; what it cannot say is whether those registers are a syscall/startup lane convention
+    // or a live computation interrupted mid-flight. The tag says, and consuming it here — at the
+    // point where the exact `{tid, asid, generation}` incarnation is reachable — is what makes
+    // one snapshot authorize exactly one verbatim restore.
+    //
+    // The decision travels to the bridge's write-back through the per-CPU flag, because that is
+    // where the choice between "install startup/result ABI lanes" and "restore a0..a7 verbatim"
+    // is actually made and the bridge holds no `&mut KernelState`. Publishing only on a
+    // CONSUMED tag means the bridge can never observe an unauthorized decision.
+    //
+    // Deliberately ordered before the blocked-syscall completion consumers below: a task cannot
+    // be both asynchronously preempted and holding a parked syscall completion for the same
+    // resume — a preemption tag is published only for a RUNNING task, a completion only for a
+    // BLOCKED one — and a completion, if one is somehow present, is the later and more specific
+    // authority. It therefore overwrites the result lanes last, exactly as it did before.
+    if let Some(current_tid) = kernel.current_tid()
+        && kernel.take_async_preempted_resume(current_tid)
+    {
+        crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize);
+    }
     // Stage 200C2C2 — BLOCKED-SYSCALL COMPLETION boundary (RISC-V).
     //
     // Like AArch64, a blocked recv on this port is NEVER re-entered: the boot bridge
@@ -212,6 +235,13 @@ fn direct_dispatch_resume_incoming(
     let asid = shared.direct_dispatch_activate_asid_split(token)?;
     let (context, tls) = shared.direct_dispatch_restore_context_split(token)?;
     frame.apply_user_context(context);
+    // Canonical 199E-R1D — the post-lock twin of the in-lock classification in
+    // `restore_arch_thread_state`. Same exact-token identity discipline as every other step of
+    // this transaction: the tag is consumed only for the incarnation this token marked, and only
+    // a consumed tag publishes the decision the bridge's write-back will act on.
+    if shared.direct_dispatch_take_async_preempt_split(token) {
+        crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize);
+    }
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     if let Some(done) = shared.direct_dispatch_take_completion_split(token) {
         frame.set_err(done.result as usize);
@@ -325,6 +355,35 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     // NOTE: the standalone `handle_trap_entry` entry (tests) leaves the flag at its default
     // (false), so unit tests still take the inline wake path — no drainer runs there.
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
+    // ── Canonical 199E-R1D: the ASYNCHRONOUS-PREEMPTION snapshot ─────────────────────────
+    //
+    // A timer interrupt is the only trap on this port that can arrive at an arbitrary user
+    // instruction boundary, and the only one whose handler can deschedule the interrupted task
+    // (`Trap::TimerInterrupt` calls `yield_current` on quantum expiry). Every other RISC-V trap
+    // is a synchronous `ecall` or a fault, where the register file is either the syscall ABI or
+    // about to be replaced by a fault outcome.
+    //
+    // Until this stage nothing captured that register file. `Trap::Syscall` snapshots via
+    // `sync_current_thread_from_frame`; the timer arm never did, so a preempted task's TCB still
+    // held whatever its LAST ECALL stored, and a switch away and back resumed it at that ecall's
+    // saved PC with that ecall's return lane — measured live as a caller re-running its receive
+    // continuation 75 times. x86_64 avoids this with an unconditional entering-task snapshot in
+    // its own trap entry; this is the same SEMANTICS, expressed in this port's own terms rather
+    // than by copying its frame layout.
+    //
+    // Placement is load-bearing and is the earliest correct point: strictly BEFORE
+    // `handle_trap_event_*`, which is what ticks the scheduler and can yield. Snapshotting after
+    // it would race the very switch the snapshot exists to survive.
+    //
+    // Scoped to a U-ORIGIN timer interrupt. An S-mode timer taken at the audited kernel-idle
+    // boundary interrupted no user context — `current` is the idle identity there — and
+    // `snapshot_async_preempted_current` additionally refuses tid 0, so that path publishes
+    // nothing by both construction and check.
+    if matches!(decode_trap_context(context), TrapEvent::TimerInterrupt)
+        && let Some(f) = frame.as_deref()
+    {
+        let _ = kernel.snapshot_async_preempted_current(f);
+    }
     kernel.handle_trap_event_with_fault_bookkeeping_mode(
         decode_trap_context(context),
         frame.as_deref_mut(),
@@ -1137,6 +1196,10 @@ pub fn handle_riscv_trap_entry_shared(
             crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
             let dispatch = shared.d2_recv_dispatch_step_mut(cpu);
             // All five WA3A outcomes matched explicitly, each with its own evidence.
+            // 199E-R1(A): only a CLEAN idle outcome may publish return provenance. The two
+            // refusal outcomes below also produce `None`, and they are errors — they must
+            // publish nothing.
+            let mut clean_idle = false;
             let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
                 Mark::Marked(token) => Some(token),
                 Mark::Idle => {
@@ -1144,6 +1207,7 @@ pub fn handle_riscv_trap_entry_shared(
                         "D2_RECV_GENUINE_DISPATCH_DECLINED cpu={} reason=idle",
                         cpu.0
                     );
+                    clean_idle = true;
                     None
                 }
                 Mark::RefusedRolledBack => {
@@ -1199,6 +1263,48 @@ pub fn handle_riscv_trap_entry_shared(
                 // Typed SUCCESSFUL idle: the outgoing caller stays blocked in its class,
                 // `current` stays clear, no frame is restored and no `sret` is attempted. The
                 // wrapper's existing terminal-idle handling produces the typed idle outcome.
+                //
+                // ── 199E-R1(A): publish the blocked-syscall return provenance HERE ────────────
+                //
+                // This is the authoritative D2 completion point, and it is the point the U4
+                // handler bypass diverted control away from. A genuine blocking receive normally
+                // publishes provenance from the arch-neutral syscall-return classification in
+                // `syscall.rs`; the D2 in-lock bypass returns before that classification runs, so
+                // for a deferred receive the token was never published and the wrapper's
+                // terminal-idle handling — which the comment above says produces the typed idle
+                // outcome — found none and took the defensive error path instead. That was
+                // unreachable until RISC-V could leave terminal idle at all.
+                //
+                // Every precondition the token asserts is already established right here, which
+                // is why this is the correct seam rather than the timer handler or the return
+                // path:
+                //   * EXACT identity and generation — `d2_recv_reverify_blocked(out)` gated this
+                //     whole branch, so `out` is still the same blocked incarnation and not a
+                //     replacement that reused the tid;
+                //   * the receive's block is COMMITTED — the in-lock phase published the waiter,
+                //     marked the caller `Blocked(EndpointReceive)` and cleared `current`;
+                //   * the outcome is a CLEAN idle (`Mark::Idle`), never a refusal or a torn
+                //     dispatch — those arms leave `clean_idle` false and publish nothing;
+                //   * it can only run for an ACTUAL pending D2 receive deferral, so a
+                //     nonblocking or immediately-satisfied receive reaches nothing here;
+                //   * exactly once — the deferral is cleared on every path and this branch runs
+                //     once per deferral;
+                //   * outside incompatible locks — the broad guard was dropped before this drain
+                //     (`D2_RECV_GENUINE_GLOBAL_DROPPED` above).
+                if clean_idle {
+                    if let Some(out) = outgoing {
+                        crate::kernel::boot::blocked_syscall_idle_provenance_set(
+                            cpu_idx,
+                            out,
+                            crate::kernel::boot::BlockingSyscallClass::IpcRecv,
+                        );
+                        crate::yarm_log!(
+                            "D2_RECV_GENUINE_IDLE_PROVENANCE_PUBLISHED cpu={} tid={} class=IpcRecv",
+                            cpu.0,
+                            out
+                        );
+                    }
+                }
                 crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
                 crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_DONE result=idle cpu={}", cpu.0);
             }
@@ -1711,10 +1817,21 @@ pub fn handle_riscv_trap_entry_shared(
                     reason: RiscvIdleReason::BlockedIpcNoRunnable,
                 });
             }
-            (None, true) => {
+            (None, true) if is_syscall => {
                 // DEFENSIVE: terminal-idle scheduler state with NO authoritative blocking-syscall
                 // provenance must NEVER be read as intentional idle — it is a bug (a non-blocking
                 // syscall left `current == None`). Take the canonical error path.
+                //
+                // 199E-R1: this guard is about SYSCALLS, as its own contract above says
+                // ("a canonical blocking syscall (IpcRecv / IpcCall / IpcSend) that blocks the
+                // last runnable task"). A supervisor TIMER INTERRUPT taken while the system is
+                // already at terminal idle legitimately observes exactly this state — no
+                // provenance, no current, nothing runnable — because it interrupted the idle loop
+                // rather than completing a syscall. Applying the syscall guard to it would turn
+                // every idle tick into `Err(Internal)`, so the trap class is now part of the
+                // predicate. A non-syscall trap falls through to the ordinary tail return below,
+                // which reports `ReturnToCurrent` with `current == None`; the S-mode timer path
+                // reads that as "still idle" and resumes the `wfi`.
                 crate::yarm_log!(
                     "RISCV_BLOCKED_IDLE_NO_PROVENANCE cpu={} current_none=1 runnable=0 result=defensive_err",
                     cpu.0

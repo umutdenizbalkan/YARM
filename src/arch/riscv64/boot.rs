@@ -483,9 +483,21 @@ yarm_riscv64_trap_return:
     csrw sepc, t0
     ld t0, 256(a0)
     csrw sstatus, t0
-    // Save user sp into sscratch so the next trap can swap it in.
-    ld t0, 8(a0)
-    csrw sscratch, t0
+    // 199E-R1(B) — restore `sscratch` to the CANONICAL per-hart trap-stack top (a1), never to a
+    // value derived from this trap's own stack position.
+    //
+    // The old sequence wrote the saved sp into `sscratch` and then obtained sp with
+    // `csrrw sp, sscratch, sp`. That swap is what leaked: at that instruction sp is the BRIDGE's
+    // stack pointer (this tail is reached by a `call`, not by falling through), so the swap left
+    // `sscratch` holding the bridge's sp — one frame BELOW the frame base. Entry is
+    // sscratch-idempotent (`addi t0, sp, 304` restores exactly what was swapped in), so the next
+    // trap started 304 + |bridge frame| bytes lower, and the trap stack descended monotonically,
+    // one frame per trap, until it would run off the bottom.
+    //
+    // Writing a1 fixes it at the source: every successful return leaves the next entry starting
+    // from the same fixed address. sp is loaded directly from the frame's saved x2 below, so the
+    // interrupted sp still round-trips exactly and no register semantics change.
+    csrw sscratch, a1
     // Restore GPRs from the frame.
     ld x1,   0(a0)
     ld x3,  16(a0)
@@ -517,11 +529,65 @@ yarm_riscv64_trap_return:
     ld x29, 224(a0)
     ld x30, 232(a0)
     ld x31, 240(a0)
-    // Swap sp <-> sscratch: sp gets the user sp, sscratch gets the kernel trap
-    // stack top (saved during the entry tail).
-    csrrw sp, sscratch, sp
-    // Finally restore a0.
-    ld a0, 72(a0)
+    // Restore the interrupted sp directly from the frame's saved x2, then a0 last (the frame
+    // pointer is still needed for that load).
+    ld sp,   8(a0)
+    ld a0,  72(a0)
+    sret
+
+    // 199E-R1 — dedicated S-mode supervisor-timer return tail.
+    //
+    // Differs from the generic tail in exactly one way, and it is the whole point: `sscratch` is
+    // reset to the TRUE trap-stack top (passed in a1) rather than to the saved sp. The generic
+    // tail leaves `sscratch` holding the bridge's sp at call time, which drifts one bridge frame
+    // lower on every trap; inheriting that would walk each successive S-mode timer frame further
+    // down the stack. Re-pointing it at the fixed top makes every accepted timer interrupt land
+    // its frame at the same address, indefinitely.
+    //
+    // sp is restored from the frame's saved x2, i.e. the interrupted kernel sp, so the `wfi`
+    // loop resumes on its own stack. `sstatus` is restored unchanged, so SPP stays Supervisor
+    // and `sret` restores SIE from SPIE.
+    .global yarm_riscv64_s_mode_timer_return
+    .type yarm_riscv64_s_mode_timer_return, @function
+yarm_riscv64_s_mode_timer_return:
+    // a0 = *const RiscvTrapFrame, a1 = trap stack top for the next S-mode entry.
+    ld t0, 248(a0)
+    csrw sepc, t0
+    ld t0, 256(a0)
+    csrw sstatus, t0
+    csrw sscratch, a1
+    ld x1,   0(a0)
+    ld x3,  16(a0)
+    ld x4,  24(a0)
+    ld x5,  32(a0)
+    ld x6,  40(a0)
+    ld x7,  48(a0)
+    ld x8,  56(a0)
+    ld x9,  64(a0)
+    ld x11, 80(a0)
+    ld x12, 88(a0)
+    ld x13, 96(a0)
+    ld x14, 104(a0)
+    ld x15, 112(a0)
+    ld x16, 120(a0)
+    ld x17, 128(a0)
+    ld x18, 136(a0)
+    ld x19, 144(a0)
+    ld x20, 152(a0)
+    ld x21, 160(a0)
+    ld x22, 168(a0)
+    ld x23, 176(a0)
+    ld x24, 184(a0)
+    ld x25, 192(a0)
+    ld x26, 200(a0)
+    ld x27, 208(a0)
+    ld x28, 216(a0)
+    ld x29, 224(a0)
+    ld x30, 232(a0)
+    ld x31, 240(a0)
+    // Restore the interrupted kernel sp from the frame's saved x2, then a0 last.
+    ld sp,   8(a0)
+    ld a0,  72(a0)
     sret
 "#
 );
@@ -573,7 +639,13 @@ struct RiscvEnterUserCtx {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 unsafe extern "C" {
     fn yarm_riscv64_enter_user(ctx: *const RiscvEnterUserCtx) -> !;
-    fn yarm_riscv64_trap_return(frame: *const RiscvTrapFrame) -> !;
+    /// 199E-R1(B): `stack_top` is the CANONICAL per-hart trap-stack top this return must leave in
+    /// `sscratch`, so the next trap on this hart starts from a fixed address instead of one frame
+    /// lower each time.
+    fn yarm_riscv64_trap_return(frame: *const RiscvTrapFrame, stack_top: u64) -> !;
+    /// 199E-R1 dedicated S-mode supervisor-timer return: restores the interrupted kernel
+    /// context and re-points `sscratch` at `stack_top` for the next accepted interrupt.
+    fn yarm_riscv64_s_mode_timer_return(frame: *const RiscvTrapFrame, stack_top: u64) -> !;
     static yarm_riscv64_trap_vector: u8;
 }
 
@@ -655,6 +727,37 @@ fn riscv_trap_stack_top() -> u64 {
     (base + (RISCV_TRAP_STACK_SIZE as u64)) & !0xf
 }
 
+/// The trap-stack top the 199E-R1 S-mode timer boundary installs into
+/// `sscratch`. Exposed so `timer.rs` can establish the S-mode entry contract
+/// without duplicating the address computation.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub(crate) fn riscv_trap_stack_top_for_s_mode_timer() -> u64 {
+    riscv_trap_stack_top()
+}
+
+/// 199E-R1(B) — the CANONICAL trap-stack top for whichever hart owns `frame_ptr`.
+///
+/// Every trap frame is allocated on the trapping hart's own trap stack, so the frame's address
+/// names the hart. This resolves it with the SAME region matching `riscv_logical_cpu_for_trap_frame`
+/// uses, which is what keeps per-hart stack ownership from aliasing: a secondary's return restores
+/// ITS top, never the boot hart's. A frame outside every published secondary region belongs to the
+/// boot hart, exactly as that function concludes.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_canonical_trap_stack_top_for_frame(frame_ptr: usize) -> u64 {
+    use core::sync::atomic::Ordering;
+    for slot in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
+        let top = RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].load(Ordering::Acquire);
+        if top == 0 {
+            continue;
+        }
+        let base = top.saturating_sub(RISCV64_SECONDARY_STACK_BYTES);
+        if frame_ptr >= base && frame_ptr < top {
+            return (top as u64) & !0xf;
+        }
+    }
+    riscv_trap_stack_top()
+}
+
 /// S-mode trap bridge. Builds a generic `TrapFrame` from the saved RISC-V
 /// register frame, dispatches through the existing
 /// `crate::arch::riscv64::trap::handle_trap_entry` Rust path (which decodes
@@ -674,7 +777,6 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     let sstatus = frame.sstatus as usize;
     let user_sp = frame.regs[RiscvTrapFrame::SP] as usize;
     let from_u = (sstatus >> 8) & 1 == 0;
-
     let first_trap = !RISCV_FIRST_ROUNDTRIP_LOGGED.load(core::sync::atomic::Ordering::Acquire);
     if first_trap {
         early_marker!(
@@ -716,6 +818,9 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // this bridge while the secondaries park with every interrupt admission disabled and never
     // enter userspace. See `stage199d_riscv_secondary_trap_ready`.
     let cpu = riscv_logical_cpu_for_trap_frame(frame_ptr as usize);
+    // 199E-R1(B): the same frame pointer names the hart whose trap-stack top this return
+    // must restore, so the next trap on THIS hart starts from its own fixed address.
+    let canonical_top = riscv_canonical_trap_stack_top_for_frame(frame_ptr as usize);
     // Stage 199D (RISC-V readiness blocker 2): the ENTERING identity comes from the rank-1
     // scheduler seam, not the broad lock. `with_cpu(cpu, |k| k.current_tid())` resolves to
     // `current_tid_on(current_cpu)` AFTER `set_current_cpu(cpu)` rebinds it, so on this bridge —
@@ -724,6 +829,22 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // here for the same reason (see `riscv_current_cpu_binding_is_invariant`), so dropping the
     // broad acquisition drops no state change. Taken at the SAME program boundary as before.
     let entering_tid = shared.current_tid_split_read(cpu).unwrap_or(0);
+    // 199E-R1(A): record the SECOND accepted origin, naming the task that was interrupted.
+    //
+    // A supervisor timer interrupt taken while U-mode was running enters the ordinary bridge and
+    // reaches the same arch-neutral `Trap::TimerInterrupt` arm — and therefore the same single
+    // re-arm point — as one taken from the audited S-mode idle boundary. Recording it here, where
+    // the trapping identity is already resolved, is what lets a live log show BOTH that the timer
+    // is periodic across both origins and that each U-origin interrupt returned to the SAME user
+    // client rather than landing somewhere else. Bounded emission; no new marker family.
+    if from_u && crate::arch::riscv64::timer::is_user_origin_timer_trap(scause) {
+        crate::arch::riscv64::timer::record_user_origin_timer_irq(entering_tid);
+    }
+    // Canonical 199E-R1D: no decision may be inherited across traps. A resume decision published
+    // on a trap that then diverged (fatal halt, kernel idle) must not authorize a verbatim
+    // restore on the NEXT one, so every trap starts from a cleared flag. This is a clear, not a
+    // take: it consumes no authorization and can never be mistaken for one.
+    crate::kernel::boot::riscv_async_resume_clear(cpu.0 as usize);
 
     // ── Phase: SAVE_DONE ────────────────────────────────────────────────
     if first_trap {
@@ -744,6 +865,24 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     }
 
     if !from_u {
+        // ── 199E-R1: the ONE accepted S-mode trap ────────────────────────────────────────────
+        //
+        // A supervisor timer interrupt taken from the audited kernel-idle boundary is the only
+        // S-mode entry this bridge admits. The predicate is mechanical — interrupt bit set,
+        // supervisor-timer cause, `sstatus.SPP` = Supervisor, and the boundary latch armed by
+        // `arm_one_shot_timer_and_enable` immediately before it enabled `sstatus.SIE`. Anything
+        // else falls through to the fail-closed halt below, exactly as before.
+        //
+        // The interrupted context is `riscv_trap_halt`'s `wfi` loop, which is `-> !` and keeps
+        // nothing live across the `wfi`. That is what makes it sound to run this handler on the
+        // same trap stack: the outer frame it overlays is already dead.
+        if crate::arch::riscv64::timer::is_accepted_s_mode_timer_trap(
+            scause,
+            sstatus,
+            crate::arch::riscv64::timer::s_mode_timer_boundary_armed(),
+        ) {
+            return riscv_s_mode_timer_trap(shared, cpu, frame, sepc, sstatus);
+        }
         // The trap was taken from S-mode — kernel fault. We have no fallback
         // path; report and halt with the named step so the user sees the
         // exact failure point rather than a silent loop.
@@ -774,6 +913,28 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     tframe.set_user_gpr(0, 0); // x0
     for n in 1..32usize {
         tframe.set_user_gpr(n, frame.regs[n - 1] as usize);
+    }
+    // Canonical 199E-R1D: keep the TWO mirrors of `UserRegisterContext` coherent for an
+    // asynchronously interrupted user context as well.
+    //
+    // `capture_user_context` stores `user_gprs` AND `arg0..arg5`, and `apply_user_context`
+    // restores both; the argument mirror is what the RISC-V resume treats as authoritative for
+    // `a0..a5`. Only the `ecall` arm below used to populate it, so a timer trap would have
+    // captured a register file with an ALL-ZERO argument mirror beside it. The verbatim restore
+    // added by this stage reads `user_gprs` and never the mirror, so this is not what makes the
+    // repair work — it is what makes the repair's failure mode safe. Should a verbatim restore
+    // ever be declined, the mirror now carries the true `a0..a5` instead of zeros, so the worst
+    // case degrades to "a7 not preserved" rather than "the argument registers are wiped".
+    //
+    // The syscall-number lane is deliberately NOT set here: this trap is not a syscall, and
+    // writing it would make a preempted task look like one to any later reader.
+    if scause != EXC_USER_ECALL && from_u {
+        tframe.set_arg(0, frame.regs[RiscvTrapFrame::A0] as usize);
+        tframe.set_arg(1, frame.regs[RiscvTrapFrame::A1] as usize);
+        tframe.set_arg(2, frame.regs[RiscvTrapFrame::A2] as usize);
+        tframe.set_arg(3, frame.regs[RiscvTrapFrame::A3] as usize);
+        tframe.set_arg(4, frame.regs[RiscvTrapFrame::A4] as usize);
+        tframe.set_arg(5, frame.regs[RiscvTrapFrame::A5] as usize);
     }
     // RISC-V Linux-style syscall ABI: a7 = syscall number, a0..a5 = args.
     if scause == EXC_USER_ECALL {
@@ -858,6 +1019,13 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // explicitly audited. No frame is restored and no `sret` is armed for idle.
             let _ = crate::arch::riscv64::timer::init_timer_after_idle_safe_point();
             let _ = crate::arch::riscv64::plic::init_plic_after_idle_safe_point();
+            // 199E-R1: the first arrival ARMS the timer; every later arrival must RE-ESTABLISH the
+            // entry contract, because it comes from a trap handler where hardware cleared
+            // `sstatus.SIE`. Without this the idle `wfi` loops masked and the pending timer is
+            // never taken — which is why ticks previously stopped the moment anything was
+            // dispatched out of idle. Same single audited boundary, and a no-op unless the opt-in
+            // feature already armed the timer.
+            crate::arch::riscv64::timer::reestablish_idle_boundary();
             riscv_trap_halt("kernel_idle_awaiting_io");
         }
         // Genuine internal trap-handling failure — NEVER idle, regardless of `current`.
@@ -931,7 +1099,56 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             frame.regs[i] = tframe.user_gpr(n) as usize as u64;
         }
 
-        if task_switched {
+        // ── Canonical 199E-R1D: the THIRD resume state ───────────────────────────────────
+        //
+        // A task resumed here is in exactly one of three states, and until this stage only two
+        // of them existed:
+        //
+        //   1. FRESH/STARTUP — never run; `a0..a5` carry the startup ABI from the argument
+        //      mirror and `a7` is zeroed. Its `user_gprs` are all zero, which is why they must
+        //      not be mirrored over the arguments.
+        //   2. SYSCALL / BLOCKED-SYSCALL CONTINUATION — resuming past its own `ecall`; `a0`/`a1`
+        //      carry the result lane, published into both mirrors by the completion consumers.
+        //   3. ASYNCHRONOUSLY PREEMPTED — interrupted by a timer at an arbitrary instruction.
+        //      `a0..a7` are ORDINARY LIVE REGISTERS, not an ABI lane. Installing the startup
+        //      arguments over them, or forcing `a7 = 0`, corrupts a running computation; that is
+        //      precisely the defect measured live as a caller re-running its receive
+        //      continuation 75 times.
+        //
+        // The state is read from an EXPLICIT tag, never inferred. `riscv_async_resume_take`
+        // returns true only when a resume boundary consumed an async-preemption tag whose exact
+        // `{tid, asid, generation}` incarnation matched, and taking it here means one snapshot
+        // authorizes exactly one verbatim restore. No zero register, PC value, bare TID or
+        // incidental scheduler state participates in the decision.
+        let async_resume = crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize);
+        if task_switched && async_resume {
+            // State 3. Restore the COMPLETE integer register file: the mirror loop above already
+            // wrote every non-ABI register, so all that remains is the ABI block it deliberately
+            // skips. `a0..a5` and `a7` come from the saved register file itself — never from the
+            // argument mirror, and never from a hard-coded zero.
+            //
+            // `sepc` and `sp` were written from the saved context above and are the exact
+            // interrupted instruction and stack; `sstatus` is untouched, so SPP/SPIE keep the
+            // values the trap saved and `sret` returns to U-mode with interrupts restored.
+            // `sscratch` is re-pointed at the canonical per-hart trap-stack top by the return
+            // tail, so the repaired non-drift invariant is retained unchanged.
+            frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;
+            frame.regs[RiscvTrapFrame::A1] = tframe.user_gpr(11) as u64;
+            frame.regs[RiscvTrapFrame::A2] = tframe.user_gpr(12) as u64;
+            frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
+            frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
+            frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
+            frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+            crate::yarm_log!(
+                "RISCV_ASYNC_PREEMPT_RESUME tid={} entering={} sepc=0x{:016x} sp=0x{:016x} a0={} a7={} startup_rewrite=0 result=ok",
+                resume_tid,
+                entering_tid,
+                frame.sepc,
+                frame.regs[RiscvTrapFrame::SP],
+                frame.regs[RiscvTrapFrame::A0],
+                frame.regs[RiscvTrapFrame::A7]
+            );
+        } else if task_switched {
             // First instruction the resumed task will execute consumes the YARM
             // startup ABI in a0..a5. UserRegisterContext stores those in
             // `args[0..5]` (apply_user_context copied them into `tframe.args`).
@@ -1130,7 +1347,166 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // the extern read is modeled as observing the write-back and the stores
     // survive optimization on their own — independent of any logging.
     let frame_resume: *const RiscvTrapFrame = frame;
-    unsafe { yarm_riscv64_trap_return(frame_resume) }
+    unsafe { yarm_riscv64_trap_return(frame_resume, canonical_top) }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+/// 199E-R1 — the dedicated S-mode supervisor-timer fast path.
+///
+/// Entered only from the audited kernel-idle boundary, with the acceptance predicate already
+/// checked by [`crate::arch::riscv64::timer::is_accepted_s_mode_timer_trap`]. Ordering mirrors
+/// the delivered AArch64 path: drive the tick ONCE through the arch-neutral pipeline, then
+/// acknowledge-and-re-arm ONCE, then return.
+///
+/// The tick reuses `handle_riscv_trap_entry_shared` — the SAME wrapper the user path uses — so
+/// this adds no broad-lock acquisition site and no second timeout drain: `decode_trap_context`
+/// already maps the supervisor-timer cause to `TrapEvent::TimerInterrupt`, which is the
+/// arch-neutral `Trap::TimerInterrupt` arm that advances the shared scheduler counter once and
+/// runs the existing timeout collector/drain.
+///
+/// Two outcomes, and only two:
+/// * still idle — return to the interrupted `wfi`, leaving `SPP` as it was so `sret` re-enters
+///   S-mode and `SIE` is restored from `SPIE`;
+/// * a task became runnable (typically because a reply deadline expired and woke its caller) —
+///   clear `SPP` so the same `sret` enters U-mode, and hand the frame to the normal write-back
+///   path. Without this the woken task would be stranded: the idle loop dispatches nothing.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_s_mode_timer_trap(
+    shared: &'static crate::runtime::SharedKernel,
+    cpu: crate::kernel::scheduler::CpuId,
+    frame: &mut RiscvTrapFrame,
+    sepc: usize,
+    sstatus: usize,
+) -> ! {
+    use crate::arch::riscv64::trap::{RiscvTrapEntryOutcome, handle_riscv_trap_entry_shared};
+
+    let tick = crate::arch::riscv64::timer::record_timer_tick();
+    early_marker!(
+        "RISCV_S_MODE_TIMER_ACCEPTED tick={} origin=supervisor sepc=0x{:x} spp=1 boundary=armed",
+        tick,
+        sepc
+    );
+
+    // ONE tick through the arch-neutral pipeline. `frame`/`tframe` carries no user syscall: the
+    // timer arm reads none of the syscall lanes.
+    let mut tframe = crate::kernel::trapframe::TrapFrame::zeroed();
+    tframe.set_saved_pc(sepc);
+    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {
+        scause: frame.scause as usize,
+        stval: frame.stval as usize,
+    };
+    let outcome = handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe);
+
+    // NO S-mode-local re-arm. The re-arm is owned by the ONE common point — the arch-neutral
+    // `Trap::TimerInterrupt` arm's tail, which calls `program_timer_deadline` and which the
+    // dispatch above has already passed through. Re-arming again here would be a second SBI
+    // `set_timer` for a single accepted interrupt and would break the strict 1:1 relationship
+    // that holds for the U-mode origin. SBI `set_timer` both clears the pending timer condition
+    // and programs the next deadline, so that one call is also the whole completion — there is no
+    // separate end-of-interrupt on RISC-V.
+    early_marker!(
+        "RISCV_S_MODE_TIMER_REARMED tick={} rearms={}",
+        tick,
+        crate::arch::riscv64::timer::rearm_count()
+    );
+
+    let resume_tid = shared.current_tid_split_read(cpu).unwrap_or(0);
+    match outcome {
+        Ok(RiscvTrapEntryOutcome::ReturnToCurrent)
+        | Ok(RiscvTrapEntryOutcome::ReturnToIncoming)
+            if resume_tid != 0 =>
+        {
+            // A task is runnable again. Leave the idle lifecycle: clear SPP so `sret` targets
+            // U-mode, and populate the frame from the resumed task's saved context.
+            early_marker!(
+                "RISCV_S_MODE_TIMER_DISPATCH tick={} resume_tid={}",
+                tick,
+                resume_tid
+            );
+            const SPP_BIT: u64 = 1 << 8;
+            const SPIE_BIT: u64 = 1 << 5;
+            frame.sstatus = (frame.sstatus & !SPP_BIT) | SPIE_BIT;
+            // Same write-back the main bridge performs for a task switch: PC/SP from the
+            // resumed thread's saved context, non-ABI GPRs mirrored, and the startup ABI lanes
+            // taken from `args` (a freshly-resumed task's `user_gprs` would clobber them).
+            frame.sepc = tframe.saved_pc() as u64;
+            frame.regs[RiscvTrapFrame::SP] = tframe.saved_sp() as u64;
+            for n in 1..32usize {
+                let i = n - 1;
+                if i == RiscvTrapFrame::SP
+                    || i == RiscvTrapFrame::A0
+                    || i == RiscvTrapFrame::A1
+                    || i == RiscvTrapFrame::A2
+                    || i == RiscvTrapFrame::A3
+                    || i == RiscvTrapFrame::A4
+                    || i == RiscvTrapFrame::A5
+                    || i == RiscvTrapFrame::A7
+                {
+                    continue;
+                }
+                frame.regs[i] = tframe.user_gpr(n) as u64;
+            }
+            // Canonical 199E-R1D: this dispatch leaves terminal idle, so the task it resumes may
+            // equally be one that was asynchronously preempted before the system went idle. It
+            // therefore honours the SAME explicit resume tag as the main bridge — the two
+            // write-backs must not disagree about what `a0..a7` mean, or a task's registers
+            // would depend on which of the two paths happened to wake it.
+            if crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize) {
+                frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;
+                frame.regs[RiscvTrapFrame::A1] = tframe.user_gpr(11) as u64;
+                frame.regs[RiscvTrapFrame::A2] = tframe.user_gpr(12) as u64;
+                frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
+                frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
+                frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
+                frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+                crate::yarm_log!(
+                    "RISCV_ASYNC_PREEMPT_RESUME tid={} entering=0 sepc=0x{:016x} sp=0x{:016x} a0={} a7={} startup_rewrite=0 origin=s_mode_idle result=ok",
+                    resume_tid,
+                    frame.sepc,
+                    frame.regs[RiscvTrapFrame::SP],
+                    frame.regs[RiscvTrapFrame::A0],
+                    frame.regs[RiscvTrapFrame::A7]
+                );
+            } else {
+                frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;
+                frame.regs[RiscvTrapFrame::A1] = tframe.arg(1) as u64;
+                frame.regs[RiscvTrapFrame::A2] = tframe.arg(2) as u64;
+                frame.regs[RiscvTrapFrame::A3] = tframe.arg(3) as u64;
+                frame.regs[RiscvTrapFrame::A4] = tframe.arg(4) as u64;
+                frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;
+                frame.regs[RiscvTrapFrame::A7] = 0;
+            }
+            let frame_resume: *const RiscvTrapFrame = frame;
+            unsafe {
+                yarm_riscv64_trap_return(
+                    frame_resume,
+                    riscv_canonical_trap_stack_top_for_frame(frame as *const _ as usize),
+                )
+            }
+        }
+        Err(err) => {
+            // A genuine trap-handling failure is NEVER swallowed into idle, exactly as on the
+            // user path: report and halt with the named step.
+            early_marker!(
+                "RISCV_TRAP_HANDLE_FAILED reason=s_mode_timer_handle_err err={:?}",
+                err
+            );
+            riscv_trap_halt("s_mode_timer_handle_err");
+        }
+        Ok(_) => {
+            // Still idle: return to the interrupted `wfi`. `sstatus` is restored unchanged, so
+            // SPP stays Supervisor and SIE is restored from SPIE — the idle loop resumes
+            // interruptible, ready for the next tick.
+            let _ = sstatus;
+            early_marker!("RISCV_S_MODE_TIMER_RESUME_IDLE tick={}", tick);
+            unsafe {
+                yarm_riscv64_s_mode_timer_return(
+                    frame as *const RiscvTrapFrame,
+                    riscv_trap_stack_top(),
+                )
+            }
+        }
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -1736,12 +2112,17 @@ pub fn bootstrap_first_user_task(
     // every other RISC-V slot-5 oracle: it fires only when slots 5/13/14 are ALL still zero, so a
     // selector collision fails closed (this oracle simply stands down). Transactional +
     // fail-closed inside the provisioning helper.
+    //
+    // 199E-R1(B): provisioning is gated on the COMPILE-TIME proof feature, not on the runtime
+    // oracle selector. The two are deliberately different things — the feature decides whether the
+    // client/server workload exists in the image, the selector decides whether the ORACLE pre-arms
+    // a confined `OracleHardware` deadline. Gating provisioning on the selector meant a
+    // selector-off boot provisioned nothing, so the ordinary `arm_production_reply_deadline`
+    // registration had no workload to register for and production expiry was unobservable. x86_64
+    // already publishes the canonical workload selector here; this brings RISC-V into line.
+    // AArch64 is intentionally left as it was.
     #[cfg(feature = "riscv64-ipc-reply-timeout-oracle")]
-    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled()
-        && init_args[5] == 0
-        && init_args[13] == 0
-        && init_args[14] == 0
-    {
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
         if let Some(caps) = crate::kernel::boot::provision_init_ipc_reply_timeout_oracle(
             kernel,
             RING3_INIT_SERVER_TID,
@@ -1750,7 +2131,21 @@ pub fn bootstrap_first_user_task(
             // in `yarm_ipc_abi::ipc_reply_liveness_abi` — the exact inverse of the decoder
             // userspace applies — so the kernel never hand-writes a slot-5 number and the
             // two sides cannot drift apart.
-            init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);
+            // With a runtime selector armed this is that selector, unchanged; with NO selector it
+            // is the TIMEOUT-WINS scenario — the one whose client blocks on a reply endpoint with a
+            // finite timeout and lets the deadline win, i.e. the workload that drives
+            // `IpcRecvTimeout -> arm_production_reply_deadline -> expiry -> collector/drain ->
+            // TimedOut`. The encoder is the architecture-local one from the shared ABI, so the
+            // kernel still never hand-writes a slot-5 number.
+            //
+            // 199E-R1: RISC-V publishes through its OWN entry point. With a runtime selector
+            // armed the two are identical, so the accepted `OracleHardware` cell is unchanged;
+            // with none armed this publishes `ProductionTimeoutWins` rather than `TimeoutWins`,
+            // which is what tells userspace the deadline under test is the production one and
+            // that the workload must therefore let BOTH parties block so the CPU can reach the
+            // terminal idle boundary that arms the periodic timer. x86_64 keeps calling the
+            // shared helper, so its selector-off cell is untouched.
+            init_args[5] = crate::kernel::boot::riscv_ipc_reply_timeout_workload_selector();
             init_args[13] = caps.request_ep_cap as u64;
             init_args[14] = caps.reply_ep_cap as u64;
             crate::yarm_log!(

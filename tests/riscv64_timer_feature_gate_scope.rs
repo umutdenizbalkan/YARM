@@ -38,9 +38,20 @@ fn timer_module_records_feature_and_audit_constants() {
         ),
         "TIMER_IRQ_FEATURE_ENABLED must mirror the cargo feature"
     );
+    // 199E-R1: the trap-bridge re-entrancy audit HAS landed and its invariant is live-proven
+    // (`sstatus.SIE` is set at exactly one program point, and the only S-mode code interruptible
+    // with it set is the idle `wfi` loop), so this flag is now true. The default-OFF protection
+    // does not weaken — it moves entirely onto the cargo feature, which
+    // `timer_feature_is_declared_default_off` above and
+    // `riscv64_s_mode_timer_bridge::the_timer_feature_remains_default_off` both pin.
     assert!(
-        timer.contains("pub const STIE_AUDIT_COMPLETE: bool = false;"),
-        "STIE_AUDIT_COMPLETE must default to false until the audit lands"
+        timer.contains("pub const STIE_AUDIT_COMPLETE: bool = true;"),
+        "STIE_AUDIT_COMPLETE is true once the audit lands; default builds stay off via the feature"
+    );
+    assert!(
+        timer.contains("pub fn s_mode_timer_boundary_armed()")
+            && timer.contains("pub fn is_accepted_s_mode_timer_trap("),
+        "the audit's mechanical acceptance predicate must exist alongside the flag"
     );
 }
 
@@ -79,10 +90,18 @@ fn live_enable_sequence_orders_stie_before_sie() {
         stie_pos < sie_pos,
         "sie.STIE must be enabled before sstatus.SIE in the live-enable path"
     );
-    let set_stie_pos = timer
+    // 199E-R1: scope the ordering to the live-enable function itself. `reestablish_idle_boundary`
+    // also calls `set_sstatus_sie()` — it re-enables SIE on every later arrival at the SAME audited
+    // idle boundary — and it is gated on `stie_enabled()`, so it can only run after this ordered
+    // sequence already armed STIE. Searching the whole file would find that call first.
+    let arm = timer
+        .split("fn arm_one_shot_timer_and_enable()")
+        .nth(1)
+        .expect("the live-enable path");
+    let set_stie_pos = arm
         .find("set_sie_stie();")
         .expect("set_sie_stie call must exist");
-    let set_sie_pos = timer
+    let set_sie_pos = arm
         .find("set_sstatus_sie();")
         .expect("set_sstatus_sie call must exist");
     assert!(
@@ -160,20 +179,45 @@ fn default_build_does_not_enable_csrs() {
         !csr_calls.is_empty(),
         "csr-set helpers must be referenced by the live-enable path"
     );
-    // Both calls must live inside arm_one_shot_timer_and_enable.
-    let arm_body_start = timer
-        .find("fn arm_one_shot_timer_and_enable()")
-        .expect("arm helper must exist");
-    let arm_body_end = timer[arm_body_start..]
-        .find("\nfn ")
-        .map(|rel| arm_body_start + rel)
-        .unwrap_or(timer.len());
+    // 199E-R1: the CSR-set helpers may be reached from EXACTLY TWO places, and both are gated.
+    //
+    //  * `arm_one_shot_timer_and_enable` — the live-enable path, itself behind the cargo feature
+    //    and `STIE_AUDIT_COMPLETE`; and
+    //  * `reestablish_idle_boundary` — which re-enables `sstatus.SIE` on every LATER arrival at the
+    //    same audited idle boundary (hardware cleared it on the intervening trap entry, so without
+    //    this the idle `wfi` would loop masked and the timer would stop after the first dispatch).
+    //    It is gated on `stie_enabled()`, so it can only ever run after the live-enable path
+    //    already armed STIE — it cannot be a bypass.
+    //
+    // Anything else calling them would be an unguarded enable, which is what this guard forbids.
+    let span = |name: &str| {
+        let start = timer
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} must exist"));
+        let end = timer[start..]
+            .find("\nfn ")
+            .or_else(|| timer[start..].find("\npub fn "))
+            .map(|rel| start + rel)
+            .unwrap_or(timer.len());
+        (start, end)
+    };
+    let arm = span("fn arm_one_shot_timer_and_enable()");
+    let idle = span("pub fn reestablish_idle_boundary()");
     for (pos, _) in &csr_calls {
+        let in_arm = *pos > arm.0 && *pos < arm.1;
+        let in_idle = *pos > idle.0 && *pos < idle.1;
         assert!(
-            *pos > arm_body_start && *pos < arm_body_end,
-            "csr-set helper call must live inside arm_one_shot_timer_and_enable"
+            in_arm || in_idle,
+            "csr-set helper call must live inside arm_one_shot_timer_and_enable or the gated \
+             reestablish_idle_boundary"
         );
     }
+    // And the idle re-establishment must actually carry its gate.
+    let idle_body = &timer[idle.0..idle.1];
+    assert!(
+        idle_body.contains("if !stie_enabled() {"),
+        "reestablish_idle_boundary must be inert unless the live-enable path already armed STIE"
+    );
 }
 
 #[test]

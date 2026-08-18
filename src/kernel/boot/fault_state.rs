@@ -1085,7 +1085,11 @@ impl KernelState {
                 // its own. x86_64 keeps the exact code and bound it already had.
                 #[cfg(all(
                     not(feature = "hosted-dev"),
-                    any(target_arch = "x86_64", target_arch = "aarch64")
+                    any(
+                        target_arch = "x86_64",
+                        target_arch = "aarch64",
+                        target_arch = "riscv64"
+                    )
                 ))]
                 {
                     use core::sync::atomic::{AtomicU64, Ordering};
@@ -1108,7 +1112,11 @@ impl KernelState {
                 }
                 #[cfg(all(
                     not(feature = "hosted-dev"),
-                    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+                    not(any(
+                        target_arch = "x86_64",
+                        target_arch = "aarch64",
+                        target_arch = "riscv64"
+                    ))
                 ))]
                 if DEBUG_TIMER_LOG {
                     crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);

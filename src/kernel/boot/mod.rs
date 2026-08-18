@@ -1217,6 +1217,63 @@ pub(crate) fn yield_dispatch_clear(cpu_idx: usize) {
     YIELD_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }
 
+// ─── Canonical 199E-R1D: the RISC-V ASYNC-PREEMPTED resume decision ───────────────────
+//
+// The sixth member of the `YIELD_DISPATCH_*` / `FUTEX_WAIT_*` / `D2_RECV_*` per-CPU flag family,
+// and exactly as narrow. It carries ONE bit from the phase that knows the answer to the phase
+// that needs it.
+//
+// The classification happens where the TCB is reachable — the in-lock restore
+// (`restore_arch_thread_state`) and the post-lock switch drains
+// (`direct_dispatch_resume_incoming`) — because only there can the tag's exact `{tid, asid,
+// generation}` incarnation be validated and consumed. The DECISION is needed later and
+// elsewhere: in the RISC-V trap bridge's register write-back, which owns the choice between
+// "install the startup/result ABI lanes" and "restore a0..a7 verbatim", and which holds only a
+// `SharedKernel` rather than a `&mut KernelState`.
+//
+// Routing it through this flag rather than a new broad-lock acquisition is what keeps the
+// Stage 204A census delta at zero, and it reuses a pattern this port already relies on for five
+// other cross-phase decisions.
+//
+// The flag is set only when a tag was actually CONSUMED, so it cannot be observed without a
+// matching one-shot authorization, and the bridge takes it (clearing it) so a single snapshot
+// authorizes exactly one verbatim restore.
+pub(crate) static RISCV_ASYNC_RESUME_PENDING: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Canonical 199E-R1D: record that the task about to be resumed on `cpu_idx` had a VALID
+/// async-preemption tag, which the caller has already consumed.
+pub(crate) fn riscv_async_resume_publish(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    RISCV_ASYNC_RESUME_PENDING[cpu_idx].store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Canonical 199E-R1D: TAKE the async-resume decision for `cpu_idx`, clearing it.
+///
+/// Take-once by construction: the bridge's write-back is the sole consumer, so a decision can
+/// never survive into a later, unrelated trap and silently suppress a startup-argument install.
+pub(crate) fn riscv_async_resume_take(cpu_idx: usize) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    RISCV_ASYNC_RESUME_PENDING[cpu_idx].swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// Canonical 199E-R1D: clear any stale async-resume decision for `cpu_idx` without consuming
+/// it as an authorization.
+///
+/// Called at the START of every RISC-V trap, so a decision published on a trap that then
+/// diverged (fatal halt, idle) cannot be inherited by the next one.
+pub(crate) fn riscv_async_resume_clear(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    RISCV_ASYNC_RESUME_PENDING[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
+}
+
 // ─── Stage 196D: RISC-V queue-advancing context-switch FOUNDATION deferral ───
 // A SEPARATE, default-off, one-shot deferral used ONLY by the RISC-V queue-switch
 // foundation oracle. It is deliberately distinct from `YIELD_DISPATCH_*` so it can
@@ -3908,6 +3965,34 @@ pub fn ipc_reply_timeout_workload_selector() -> u64 {
     ipc_reply_timeout_selector().unwrap_or_else(|| {
         yarm_ipc_abi::ipc_reply_liveness_abi::ipc_reply_liveness_selector_for_current_arch(
             yarm_ipc_abi::ipc_reply_liveness_abi::IpcReplyLivenessScenario::TimeoutWins,
+        ) as u64
+    })
+}
+
+/// 199E-R1 — the RISC-V proof workload's slot-5 selector.
+///
+/// Identical to `ipc_reply_timeout_workload_selector` whenever a runtime selector IS armed:
+/// the oracle lane is that selector, unchanged, so the accepted `OracleHardware` cell keeps
+/// its exact prior encoding and its exact prior userspace behaviour.
+///
+/// The ONLY difference is the selector-off fallback. There it publishes
+/// `ProductionTimeoutWins` instead of `TimeoutWins`, which tells userspace that the deadline
+/// under test is the PRODUCTION one — armed by `arm_production_reply_deadline` on the
+/// ordinary block path, with no pre-armed confined deadline behind it. That distinction
+/// decides the workload's wait strategy: on this port the scheduler tick is driven by the
+/// periodic supervisor timer, which is armed at the terminal KERNEL-IDLE boundary, so a
+/// yield-spinning server would keep a runnable task on the CPU, never reach idle, never arm
+/// the timer and never let the deadline expire. See `IpcReplyLivenessScenario`.
+///
+/// Deliberately a SEPARATE, RISC-V-only entry point rather than a change to the shared
+/// helper: x86_64's provisioning site keeps calling `ipc_reply_timeout_workload_selector`, so
+/// its selector-off production cell publishes the same selector it always did and its
+/// behaviour is untouched. AArch64 does not call either — its site is unchanged.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub fn riscv_ipc_reply_timeout_workload_selector() -> u64 {
+    ipc_reply_timeout_selector().unwrap_or_else(|| {
+        yarm_ipc_abi::ipc_reply_liveness_abi::ipc_reply_liveness_selector_for_current_arch(
+            yarm_ipc_abi::ipc_reply_liveness_abi::IpcReplyLivenessScenario::ProductionTimeoutWins,
         ) as u64
     })
 }

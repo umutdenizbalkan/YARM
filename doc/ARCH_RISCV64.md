@@ -1047,10 +1047,199 @@ docs update `doc/BOOT.md`.
 | Real U-mode `sret` | ✅ `RISCV_ENTER_USER_SRET tid=2`; first trap `from_u=1 spp=0` |
 | Syscall round-trip | ✅ full `RiscvTrapFrame` save/restore; `+4` ecall PC advance; fail-closed S-mode-fault halt |
 | Core service chain | ✅ reaches `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked`; required markers include `RAMFS_MOUNT_READY`, `VFS_MOUNT_REGISTER_RAMFS_OK`, `EXT4_SRV_READY`, `VFS_MOUNT_REGISTER_EXT4_OK` |
-| Timer | ⏸ deferred — audit-stage scaffold landed (`RISCV_TIMER_AUDIT_BEGIN`/`AUDIT_DONE`), defers with canonical `reason=timer_irq_feature_disabled` in default builds; feature-on path defers with `reason=trap_bridge_reentrancy_not_ready` because the trap vector has no kernel-S-mode timer fast path yet |
+| Timer | ⏸ default OFF — defers with canonical `reason=timer_irq_feature_disabled`; **the S-mode trap-bridge prerequisite is live-proven under the opt-in `riscv64-timer-irq` feature** (see §13.6) |
 | PLIC | ⏸ discovery + threshold-address compute live; threshold write skipped under active satp (`RISCV_PLIC_DEFERRED reason=plic_mmio_unmapped_under_active_satp`); base / context / per-source breadcrumbs emit |
 | External IRQ | ⏸ `RISCV_EXTIRQ_DEFERRED reason=no_safe_source`; UART0 (sid=10) marked as the candidate via `RISCV_EXTIRQ_SELECT`; no source enabled |
 | RISC-V SMP scheduling | ⏸ not implemented; `online_cpus` stays at 1 by design |
+
+### 13.6 199E-R1 — the S-mode supervisor-timer bridge prerequisite (opt-in feature)
+
+**What was blocking.** RISC-V was canonical 199E's sole remaining default-reachability blocker.
+SBI TIME is present, but a timer interrupt arriving from the kernel's idle `wfi` re-entered the
+bridge as S-mode and hit `RISCV_TRAP_UNHANDLED reason=trap_from_s_mode`, so `sstatus.SIE` was
+never armed and `SchedulerState.timer` never advanced. Every reply/call deadline armed in the
+`ProductionTick` clock domain was therefore unreachable on this port.
+
+**The audit invariant, and why it holds.** `sstatus.SIE` is set at exactly ONE program point, and
+the only S-mode code that can be interrupted with it set is `riscv_trap_halt`'s `wfi` loop:
+
+* hardware clears `sstatus.SIE` on every trap entry, so every syscall and fault handler runs
+  masked — a timer can never interrupt arbitrary kernel code;
+* in U-mode, S-interrupts are gated by privilege rather than by SIE, so user-mode routing is
+  unchanged;
+* SIE is enabled **last**, immediately before the kernel commits to the never-returning idle loop,
+  and **no lock is held** there — `handle_riscv_trap_entry_shared` has already returned by value,
+  its bounded `with_cpu` guard dropped and its post-lock work drained.
+
+The bridge does not merely argue this: it *checks* it. An S-mode trap is admitted only when the
+interrupt bit is set, the cause is the supervisor timer, `sstatus.SPP` says Supervisor, **and** the
+boundary latch armed at that one program point is set. Everything else stays fail-closed on the
+pre-existing `trap_from_s_mode` halt, and a genuine handling error inside the accepted path halts
+rather than resuming as if idle.
+
+**Mechanism.** At the boundary, `sscratch` is re-pointed at the true trap-stack top so an accepted
+interrupt lands its frame at a fixed address — sound *there and nowhere else*, because that
+boundary has committed to a `-> !` loop that never returns through the overlaid frame. (The
+generic return tail leaves `sscratch` drifting one bridge frame lower per trap, so inheriting it
+would walk each successive S-mode frame down the stack; a dedicated S-mode return tail re-points
+it to the top on every return.) Ordering per accepted interrupt is: **one tick** through the
+arch-neutral `Trap::TimerInterrupt` pipeline — reusing the SAME shared wrapper the user path uses,
+so no broad-lock callsite is added and no second timeout drain exists — then **one**
+acknowledge-and-re-arm. On RISC-V there is no separate end-of-interrupt: SBI `set_timer` clears the
+pending timer interrupt as a side effect of programming the next deadline, so that single call is
+the whole completion. Boot hart only.
+
+**Two corrections were required.** The arch-neutral timer arm calls `acknowledge_interrupt(0)`,
+which reached the PLIC's claim/complete register and faulted (`scause=0xf`, `stval=0x0c201004`)
+because the PLIC page is not mapped under the active satp — and because a supervisor timer is not
+a PLIC source at all. PLIC source 0 is reserved, so it is now refused. Separately, the
+blocked-syscall no-provenance defensive guard is now scoped to syscalls: a timer interrupt taken
+at terminal idle legitimately observes no provenance and no current task, and applying a syscall
+guard to it turned every idle tick into `Err(Internal)`.
+
+**Live, feature-on (`--features riscv64-timer-irq`):** 10 accepted interrupts, 10 re-arms (1:1),
+`YARM_SCHED_TICK cpu=0 tick=1..` strictly monotonic, boot hart the sole owner, **zero unhandled
+S-mode traps**, no storm, no duplicate accounting — and a task woken from terminal idle was
+successfully dispatched back into U-mode. **Default builds are unchanged**: `feature=0`,
+`RISCV_TIMER_DEFERRED reason=timer_irq_feature_disabled`, scheduler tick 0, no timer IRQ behaviour
+activated.
+
+**Two defects the live bridge exposed, both now repaired.**
+
+*(A) The D2 blocked-receive return provenance hole.* A genuine blocking receive normally publishes
+idle provenance from the arch-neutral syscall-return classification. The U4 D2 in-lock bypass
+returns *before* that classification runs, so for a deferred receive the token was never published,
+and the wrapper's terminal-idle handling found none and took the defensive error path
+(`RISCV_BLOCKED_IDLE_NO_PROVENANCE`). It was unreachable until RISC-V could leave terminal idle at
+all. The repair publishes at the **authoritative D2 completion point** — the post-lock drain's clean
+idle outcome, which is exactly the point the bypass diverted control away from, and which its own
+comment says should produce the typed idle outcome. Every precondition the token asserts is already
+established there: exact identity and generation (`d2_recv_reverify_blocked` gates the branch, so a
+replacement incarnation that reused the tid cannot publish), a committed block (the in-lock phase
+published the waiter, marked the caller `Blocked(EndpointReceive)` and cleared `current`), a clean
+`Mark::Idle` outcome (the two refusal arms and the torn arm publish nothing), an actual pending
+deferral (so nonblocking and immediately-satisfied receives reach nothing), exactly once (the
+deferral is cleared on every path), and outside incompatible locks (the broad guard was dropped
+before the drain). The defensive guard itself is **not** weakened, nothing is synthesized in the
+timer handler, and nothing is inferred from a bare tid or `current`. The repair is RISC-V-local
+because RISC-V is the sole reader of the token — the shared drain that serves x86_64/AArch64 gains
+neither a publication nor a read.
+
+*(B) Trap-stack drift.* Entry is `sscratch`-idempotent — `addi t0, sp, 304` restores exactly the
+value swapped in — so the drift came entirely from the return. It wrote the saved sp into
+`sscratch` and then obtained sp via `csrrw sp, sscratch, sp`; at that instruction sp is the
+**bridge's** stack pointer, because the tail is reached by a `call`, not by falling through. The
+swap therefore left `sscratch` one frame *below* the frame base, and the next trap started
+`304 + |bridge frame|` bytes lower — every trap, monotonically, until the 2 MiB stack would run
+out. The return now writes the **canonical per-hart trap-stack top** and loads the interrupted sp
+directly from the frame's saved `x2`, so the interrupted sp still round-trips exactly while the
+next entry always starts from a fixed address. The top is resolved from the frame pointer using the
+same region matching that names the hart, so a secondary restores *its* top and per-hart ownership
+cannot alias. Frame layout and register semantics are unchanged, so the task-switch ABI does not
+change. Live-verified with a temporary diagnostic over **800+ traps**: the trap-frame address was
+identical (`0x81633950`) on every sample. The diagnostic was removed.
+
+**Live, feature-on, repeated:** 10 interrupts = 10 ticks = 10 re-arms (strictly 1:1), `YARM_SCHED_TICK
+cpu=0` monotonic, boot hart the sole owner, **zero** unhandled S-mode traps, **zero**
+`TRAP_HANDLE_FAILED`, **zero** `BLOCKED_IDLE_NO_PROVENANCE`, `scan_broad_lock=0 production=1`,
+provenance published once at the D2 idle outcome and consumed normally, and a task woken from
+terminal idle returned to U-mode.
+
+**What is still NOT complete, and why 199E stays OPEN.** The production reply deadline is armed in
+the `ProductionTick` domain and the collector/drain runs on every tick, but on this workload the
+supervisor's reply legitimately wins (`IPC_REPLY_DELIVER_TO_WAITER tid=2`) and the record is
+correctly disarmed, so `TimedOut` does not fire — the same intended outcome the delivered AArch64
+checkpoint records. Separately, the timer is now **periodic rather than idle-only**:
+`program_timer_deadline` is implemented as the ONE common re-arm point, at the tail of the
+arch-neutral `Trap::TimerInterrupt` arm that BOTH accepted origins pass through, so a U-origin and an
+audited S-idle-origin interrupt re-arm through the same seam exactly once each. The duplicate
+S-mode-local re-arm was removed; SBI `set_timer` both clears the pending condition and programs the
+next deadline, so it is the whole completion; boot hart only; no PLIC; a complete no-op with the
+feature off. Fixed with it: `sstatus.SIE` was set only on the FIRST idle entry, and every later
+arrival comes from a trap handler where hardware cleared it, so the idle `wfi` looped masked and
+ticks stopped as soon as anything was dispatched — `reestablish_idle_boundary` re-enables it at the
+SAME audited boundary, gated on `stie_enabled()`, leaving the audit invariant intact. Live: 480
+accepted interrupts = 480 re-arms, strict 1:1, no storm, no drift, no unhandled trap.
+
+Both gaps are now closed by a **profile-confined selector-off proof cell**. Its client blocks on a
+real finite reply deadline while its server blocks on a second receive on the EXISTING request
+endpoint, retaining the reply capability. A yield-spinning server cannot work here — the production
+deadline expires against the scheduler tick, which is driven by the periodic timer armed at the
+terminal kernel-idle boundary, so a runnable task means idle is never reached and the deadline never
+comes due (measured deterministically). With both parties blocked the CPU reaches idle, the timer
+arms, and its S-mode ticks drive `IPC_REPLY_TIMEOUT_ARMED … deadline=3` →
+`DEFERRED published=1 drained=1` → `OK terminal=Timeout timeout_result=TimedOut caller_wakes=1` →
+`COMPLETION_COMMITTED` → `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcReplyTimeout` → the caller's
+canonical `TimedOut`. The caller then runs a bounded syscall-free U-mode dwell against the
+already-armed timer, which is the first live witness of `RISCV_U_MODE_TIMER_ACCEPTED … origin=user`,
+and finally triggers the retained late reply, which is rejected exactly once. Retaining the reply
+capability across the second receive adds no resource: `ipc_send` passes no reply endpoint, so the
+trigger mints no second reply capability and cannot alias the retained one. The lane is selected by
+`ProductionTimeoutWins` — a fourth value appended to each architecture's existing slot-5 liveness run
+(base+3), published only by RISC-V, so x86_64 and AArch64 provisioning is untouched.
+
+#### 13.6.1 199E-R1D — asynchronous user-context save/restore
+
+The dwell exposed a latent whole-port defect the timer had never been able to reach: **nothing
+captured a user register file interrupted asynchronously.** `Trap::Syscall` snapshots via
+`sync_current_thread_from_frame`; the `Trap::TimerInterrupt` arm never did, so a preempted task's TCB
+still held whatever its last `ecall` stored, and a switch away and back resumed it at that `ecall`'s
+saved PC and return lane — measured as a caller re-running its receive continuation 75 times.
+
+Both pre-existing resume conventions are *lane* conventions keyed to a syscall boundary:
+
+| state | `a0..a5` | `a7` |
+|-------|----------|------|
+| fresh / startup | startup ABI, from the argument mirror | forced `0` |
+| syscall / blocked-syscall continuation | result lane, published into both mirrors | forced `0` |
+| **asynchronously preempted** (new) | **the saved register file, verbatim** | **the saved register file, verbatim** |
+
+The third state is tagged EXPLICITLY, never inferred. `snapshot_async_preempted_current` runs on a
+U-origin timer trap strictly before anything that can schedule, writes the context first and the tag
+last, and stamps the exact `{tid, asid, preempt_generation}` incarnation with `checked_add` (an
+exhausted counter refuses rather than wrapping into a matchable value). Exactly one consumer runs per
+resume — the in-lock `restore_arch_thread_state` or the post-lock `direct_dispatch_resume_incoming`,
+each validating the same three coordinates — and only a CONSUMED tag publishes the per-CPU decision
+that the bridge's write-back acts on. That flag is the sixth member of the existing
+`YIELD_DISPATCH_*` / `FUTEX_WAIT_*` / `D2_RECV_*` family, so the repair adds no broad-lock callsite
+and the Stage 204A census delta stays 0.
+
+Failure is closed at every step: a replacement incarnation reusing the numeric TID fails the ASID
+match, a superseded snapshot fails the generation match, a missing tag simply is not an
+authorization — and none of them falls back to the startup argument rewrite. Exit clears the tag.
+Both write-backs (the main bridge and the S-mode idle dispatch) honour the same tag, so a task's
+registers cannot depend on which path woke it. `sepc` and `sp` come from the saved context, `sstatus`
+is untouched, and the canonical per-hart `sscratch` stack-top invariant is retained.
+
+**Live:** five real switch-away/switch-back cycles inside one dwell, each restoring the identical
+`sepc`, user `sp`, `a0=0xa0a00001dead0000` and `a7=0xa7a70008dead0007` with `startup_rewrite=0`; an
+assembly register canary that pins `a0..a7` as `inout` operands (a Rust-level loop would spill and
+reload them, silently repairing the exact corruption under test) reports `mismatches=0x0000
+result=ok`; `caller_continuations=1`, not 75; no restart at the old recv return lane, no provenance
+failure, no storm, no drift, no duplicate wake or completion.
+
+**FP/vector is a stated latent dependency, not a closed one.** The RISC-V user targets declare the
+`lp64d` hard-float ABI and `sstatus.FS` reads Dirty on the first user trap, so the hardware permits
+user floating-point — and neither `RiscvTrapFrame` (304 bytes of `x1..x31` plus `sepc`/`sstatus`/
+`scause`/`stval`) nor `UserRegisterContext` (`user_gprs: [usize; 32]`) has anywhere to put
+`f0..f31` or `fcsr`. It is not live: **no RISC-V user binary in this tree contains a single FP
+instruction or f-register reference**, so there is no FP state to lose and the integer-only contract
+is complete for every build that exists. This is not a silent assumption — the guard
+`riscv64_async_preemption::no_user_floating_point_state_can_be_live` fails the moment
+`UserRegisterContext` grows an FP area or the port starts writing an explicit `sstatus.FS` policy.
+
+**No general FP-safe asynchronous preemption is claimed.** What 199E-R1D proves is exact
+preservation of the INTEGER context, which is complete for every binary that exists today precisely
+because none of them can create live FP state — not because FP state would be preserved if it did.
+Turning asynchronous preemption on BY DEFAULT therefore needs a separate `lp64d`/`sstatus.FS`
+policy decision first. The two coherent options are an FP/vector save area sized for `f0..f31` plus
+`fcsr` (carried in `UserRegisterContext` and snapshotted with the integer file), or an explicit
+`FS` policy for user tasks so that a user floating-point instruction traps loudly instead of having
+its state silently discarded at the next preemption. Neither is taken here, and a third option —
+leaving `FS` Dirty and enabling default preemption — is the one this section exists to rule out.
+
+**The `riscv64-timer-irq` feature stays default-OFF, and canonical 199E remains OPEN on two things:
+that `lp64d`/`FS` policy decision, and retiring the feature/default gate itself.**
 
 ### 13.2 Current smoke contract
 

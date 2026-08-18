@@ -217,15 +217,38 @@ fn timer_boot_hart_only_guard_is_present() {
 }
 
 #[test]
-fn timer_stie_audit_flag_remains_false_in_default_build() {
+fn timer_stie_audit_flag_requires_the_s_mode_fast_path() {
     let timer = include_str!("../src/arch/riscv64/timer.rs");
-    // Flipping `STIE_AUDIT_COMPLETE` without landing the trap vector's
-    // kernel-S-mode timer fast path would let every `wfi` re-enter the
-    // bridge as `trap_from_s_mode`, which the smoke gate rejects.
-    assert!(
-        timer.contains("pub const STIE_AUDIT_COMPLETE: bool = false;"),
-        "STIE_AUDIT_COMPLETE must remain false until the trap-vector fast path lands"
-    );
+    let boot = include_str!("../src/arch/riscv64/boot.rs");
+    // Flipping `STIE_AUDIT_COMPLETE` without landing the trap vector's kernel-S-mode timer fast
+    // path would let every `wfi` re-enter the bridge as `trap_from_s_mode`, which the smoke gate
+    // rejects. 199E-R1 landed that fast path, so what this guard pins is the DEPENDENCY rather
+    // than the flag's value: the flag may only be true while the fast path and its mechanical
+    // acceptance predicate exist. Default builds stay off via the `riscv64-timer-irq` feature,
+    // which is pinned separately in `riscv64_timer_feature_gate_scope`.
+    if timer.contains("pub const STIE_AUDIT_COMPLETE: bool = true;") {
+        assert!(
+            boot.contains("fn riscv_s_mode_timer_trap("),
+            "the audit flag may not be true without the S-mode supervisor-timer fast path"
+        );
+        assert!(
+            timer.contains("pub fn is_accepted_s_mode_timer_trap("),
+            "nor without the mechanical acceptance predicate the bridge checks"
+        );
+        assert!(
+            boot.contains("yarm_riscv64_s_mode_timer_return"),
+            "nor without the dedicated S-mode return that re-points sscratch"
+        );
+        assert!(
+            boot.contains("riscv_trap_halt(\"trap_from_s_mode\")"),
+            "and every other S-mode trap must still be fail-closed"
+        );
+    } else {
+        assert!(
+            timer.contains("pub const STIE_AUDIT_COMPLETE: bool = false;"),
+            "the audit flag is a bool constant, true or false"
+        );
+    }
 }
 
 #[test]

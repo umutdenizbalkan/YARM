@@ -46357,8 +46357,10 @@ mod stage184_riscv_trap_return_provenance {
             "trap bridge must derive the trap-return pointer from the &mut frame \
              (single provenance) so the ABI-register write-back is observed"
         );
+        // 199E-R1(B) added the canonical per-hart stack top as a second argument; the
+        // single-provenance requirement this guard exists for is unchanged.
         assert!(
-            bridge.contains("yarm_riscv64_trap_return(frame_resume)"),
+            bridge.contains("yarm_riscv64_trap_return(frame_resume, canonical_top)"),
             "trap bridge must resume via the frame-derived `frame_resume` pointer"
         );
         assert!(
@@ -76193,8 +76195,13 @@ mod stage198a_second_cohort_plain_parity {
         );
         // Terminal state WITHOUT provenance takes the defensive canonical error path, NEVER idle.
         // Scope to the no-provenance match arm so the defensive marker + Err are co-located.
+        // 199E-R1: the arm is now scoped to SYSCALLS. A supervisor timer interrupt taken at
+        // terminal idle legitimately observes no provenance and no current task — it interrupted
+        // the idle loop rather than completing a syscall — so applying this guard to it would
+        // turn every idle tick into `Err(Internal)`. The defensive behaviour for the syscall case
+        // it was written for is unchanged.
         let no_prov = RISCV_TRAP_SRC
-            .split("(None, true) =>")
+            .split("(None, true) if is_syscall =>")
             .nth(1)
             .expect("no-provenance arm")
             .split("_ => {}")
@@ -93434,7 +93441,22 @@ mod stage200c2c2_riscv_port {
     #[test]
     fn r01_feature_and_selector_required() {
         assert!(RISCV_BOOT_SRC.contains("#[cfg(feature = \"riscv64-ipc-reply-timeout-oracle\")]"));
-        assert!(RISCV_BOOT_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
+        // 199E-R1(B): provisioning is gated on the COMPILE-TIME feature alone, not additionally
+        // on the runtime oracle knob. The two decide different things — the feature decides
+        // whether the client/server workload exists in the image, the knob decides whether the
+        // ORACLE pre-arms a confined `OracleHardware` deadline — and conflating them meant a
+        // selector-OFF boot provisioned no endpoints, so the ordinary production registration
+        // had no workload to register for and production expiry was unobservable. The knob
+        // itself is unchanged and still parsed; what it no longer does is veto provisioning.
+        assert!(
+            !RISCV_BOOT_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"),
+            "the runtime knob must not gate RISC-V provisioning — that hid the production lane"
+        );
+        assert!(
+            RISCV_BOOT_SRC
+                .contains("crate::kernel::boot::riscv_ipc_reply_timeout_workload_selector()"),
+            "the selector is still published, through the architecture-local encoder"
+        );
         assert!(CMDLINE_SRC.contains("yarm.riscv_ipc_reply_timeout_oracle"));
         // Unrecognized selector values leave the oracle inert.
         assert_eq!(
@@ -93462,18 +93484,29 @@ mod stage200c2c2_riscv_port {
         // Stage 200C2C2C-R2C: the provisioning site now calls the architecture-local encoder,
         // so anchor the guard on that call rather than on the constant's name.
         let blk = RISCV_BOOT_SRC
-            .split("init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector()")
+            .split(
+                "init_args[5] = crate::kernel::boot::riscv_ipc_reply_timeout_workload_selector()",
+            )
             .next()
             .expect("provisioning guard");
         assert!(
             blk.len() < RISCV_BOOT_SRC.len(),
             "riscv64 boot must publish slot 5 through the shared encoder"
         );
-        // The guard immediately preceding the selector assignment requires all three slots empty.
-        let tail = &blk[blk.len().saturating_sub(1200)..];
-        assert!(tail.contains("init_args[5] == 0"));
+        // The `if` that ENCLOSES the selector assignment requires all three slots empty. Taken
+        // from the last such guard before the assignment rather than from a fixed-size window,
+        // so growing the explanatory comment between them cannot silently defeat the check.
+        let tail = blk
+            .rsplit("if init_args[5] == 0")
+            .next()
+            .expect("the enclosing fail-closed guard");
+        assert!(blk.contains("if init_args[5] == 0"));
         assert!(tail.contains("init_args[13] == 0"));
         assert!(tail.contains("init_args[14] == 0"));
+        assert!(
+            !tail.contains("init_args[5] ="),
+            "no other slot-5 write may sit between the fail-closed guard and this one"
+        );
     }
 
     // (3) the deadline is armed and evaluated in the SAME monotonic clock domain.
@@ -94520,10 +94553,11 @@ mod stage200c2c2c_r2b_reply_authority {
         assert!(
             SERVICE_SRC.contains("ipc_reply_liveness_scenario_for_current_arch(mode() as usize)")
         );
-        assert!(
-            SERVICE_SRC
-                .contains("matches!(scenario(), Some(IpcReplyLivenessScenario::TimeoutWins))")
-        );
+        // 199E-R1 widened `is_timeout_wins` to cover the PRODUCTION lane as well, so the
+        // single-variant form no longer exists. What this case guards is unchanged: the
+        // scenarios are matched BY NAME through the shared decoder, never by a numeric set.
+        assert!(SERVICE_SRC.contains("Some(IpcReplyLivenessScenario::TimeoutWins)"));
+        assert!(SERVICE_SRC.contains("Some(IpcReplyLivenessScenario::ProductionTimeoutWins)"));
         assert!(!SERVICE_SRC.contains("pub(super) const SELECTOR_BASE: u64"));
     }
 
@@ -94756,19 +94790,21 @@ mod stage200c2c2c_r2c_selector_matrix {
     /// in a given build.
     #[test]
     fn s03_foreign_only_selectors_activate_nothing() {
-        // Stage 200D-2B1 widened each architecture's PAIR into a RUN of three
-        // (base, base+1, base+2) = (TimeoutWins, ReplyWins, ServerDies), so the runs overlap
-        // more than the pairs did. "Foreign" now means "outside THIS build's run of three",
-        // and the guard asserts exactly that — a selector inside the run must decode, and a
-        // selector outside it must not, even when it is valid for another architecture.
+        // Stage 200D-2B1 widened each architecture's PAIR into a RUN of three; 199E-R1 widened
+        // that run again to FOUR — (base, base+1, base+2, base+3) =
+        // (TimeoutWins, ReplyWins, ServerDies, ProductionTimeoutWins) — so the runs overlap more
+        // than ever. "Foreign" means "outside THIS build's run of four", and the guard asserts
+        // exactly that: a selector inside the run must decode, and a selector outside it must
+        // not, even when it is valid for another architecture.
         //
-        // AArch64 run is 8/9/10, so x86_64's ReplyWins (11) and ServerDies (12) are foreign.
+        // AArch64 run is 8/9/10/11, so x86_64's ServerDies (12) and
+        // ProductionTimeoutWins (13) are foreign.
         assert_eq!(
-            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 11),
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 12),
             None
         );
         assert_eq!(
-            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 12),
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 13),
             None
         );
         // 10 IS in AArch64's run — it is AArch64 ServerDies — even though it is also
@@ -94777,21 +94813,31 @@ mod stage200c2c2c_r2c_selector_matrix {
             ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 10),
             Some(IpcReplyLivenessScenario::ServerDies)
         );
-        // RISC-V run is 9/10/11: AArch64's TimeoutWins (8) and x86_64's ServerDies (12)
-        // are foreign; 11 is RISC-V's own ServerDies.
+        // 11 is AArch64's own ProductionTimeoutWins AND RISC-V's ServerDies. Same rule.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 11),
+            Some(IpcReplyLivenessScenario::ProductionTimeoutWins)
+        );
+        // RISC-V run is 9/10/11/12: AArch64's TimeoutWins (8) and x86_64's
+        // ProductionTimeoutWins (13) are foreign; 11 is RISC-V's own ServerDies and 12 its
+        // own ProductionTimeoutWins — the selector the 199E-R1 production cell publishes.
         assert_eq!(
             ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 8),
             None
         );
         assert_eq!(
-            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 12),
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 13),
             None
         );
         assert_eq!(
             ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 11),
             Some(IpcReplyLivenessScenario::ServerDies)
         );
-        // x86_64 run is 10/11/12: AArch64's whole TimeoutWins/ReplyWins pair (8/9) is foreign.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 12),
+            Some(IpcReplyLivenessScenario::ProductionTimeoutWins)
+        );
+        // x86_64 run is 10/11/12/13: AArch64's whole TimeoutWins/ReplyWins pair (8/9) is foreign.
         assert_eq!(
             ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 8),
             None
@@ -94804,16 +94850,20 @@ mod stage200c2c2c_r2c_selector_matrix {
             ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 12),
             Some(IpcReplyLivenessScenario::ServerDies)
         );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 13),
+            Some(IpcReplyLivenessScenario::ProductionTimeoutWins)
+        );
         // Nothing outside a base's own RUN activates anything, including the off value 0.
-        // 12 is deliberately NOT in this list any more: it is x86_64's ServerDies, so it is
-        // only inert for the other two bases. The loop derives the off-run values from each
-        // base rather than hard-coding a set that silently became run-relative.
+        // The loop derives the off-run values from each base rather than hard-coding a set
+        // that silently became run-relative — that is why widening the run to four did not
+        // require re-deriving the list by hand.
         for base in [
             AARCH64_SELECTOR_BASE,
             RISCV64_SELECTOR_BASE,
             X86_64_SELECTOR_BASE,
         ] {
-            for sel in [0usize, 1, base - 1, base + 3, base + 4, 100, usize::MAX] {
+            for sel in [0usize, 1, base - 1, base + 4, base + 5, 100, usize::MAX] {
                 assert_eq!(
                     ipc_reply_liveness_scenario_for_base(base, sel),
                     None,
@@ -94825,6 +94875,7 @@ mod stage200c2c2c_r2c_selector_matrix {
                 ipc_reply_liveness_scenario_for_base(base, base),
                 ipc_reply_liveness_scenario_for_base(base, base + 1),
                 ipc_reply_liveness_scenario_for_base(base, base + 2),
+                ipc_reply_liveness_scenario_for_base(base, base + 3),
             ];
             assert_eq!(
                 run,
@@ -94832,8 +94883,9 @@ mod stage200c2c2c_r2c_selector_matrix {
                     Some(IpcReplyLivenessScenario::TimeoutWins),
                     Some(IpcReplyLivenessScenario::ReplyWins),
                     Some(IpcReplyLivenessScenario::ServerDies),
+                    Some(IpcReplyLivenessScenario::ProductionTimeoutWins),
                 ],
-                "the run based at {base} must map to the three scenarios in order"
+                "the run based at {base} must map to the four scenarios in order"
             );
         }
     }
@@ -94846,6 +94898,7 @@ mod stage200c2c2c_r2c_selector_matrix {
             IpcReplyLivenessScenario::TimeoutWins,
             IpcReplyLivenessScenario::ReplyWins,
             IpcReplyLivenessScenario::ServerDies,
+            IpcReplyLivenessScenario::ProductionTimeoutWins,
         ] {
             let sel = ipc_reply_liveness_selector_for_current_arch(scenario);
             assert_eq!(
@@ -94854,20 +94907,40 @@ mod stage200c2c2c_r2c_selector_matrix {
                 "encode/decode must round-trip for {scenario:?}"
             );
         }
-        // Values just outside this build's own pair are inert.
+        // Values just outside this build's own run are inert.
         assert_eq!(
             ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE - 1),
             None
         );
-        // base+2 is now this build's own ServerDies; base+3 is the first value past the run.
+        // base+2 is this build's own ServerDies; 199E-R1 made base+3 its own
+        // ProductionTimeoutWins, so base+4 is now the first value past the run.
         assert_eq!(
             ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE + 2),
             Some(IpcReplyLivenessScenario::ServerDies)
         );
         assert_eq!(
             ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE + 3),
+            Some(IpcReplyLivenessScenario::ProductionTimeoutWins)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE + 4),
             None
         );
+        // The four selectors are DISTINCT — a widened run must not alias two scenarios onto
+        // one number, which is the failure mode the arch-local decoding rule exists to stop.
+        let sels = [
+            ipc_reply_liveness_selector_for_current_arch(IpcReplyLivenessScenario::TimeoutWins),
+            ipc_reply_liveness_selector_for_current_arch(IpcReplyLivenessScenario::ReplyWins),
+            ipc_reply_liveness_selector_for_current_arch(IpcReplyLivenessScenario::ServerDies),
+            ipc_reply_liveness_selector_for_current_arch(
+                IpcReplyLivenessScenario::ProductionTimeoutWins,
+            ),
+        ];
+        for i in 0..sels.len() {
+            for j in (i + 1)..sels.len() {
+                assert_ne!(sels[i], sels[j], "selectors {i} and {j} alias");
+            }
+        }
     }
 
     /// (5) the kernel's selector registry constants ARE the ABI bases — one numeric source
@@ -94993,9 +95066,15 @@ mod stage200c2c2c_r2c_selector_matrix {
                 "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);",
             ),
             (
+                // 199E-R1: RISC-V publishes through its OWN wrapper, which still delegates to
+                // `ipc_reply_timeout_selector()` when a runtime selector is armed and otherwise
+                // falls back through the SAME architecture-local encoder — to
+                // `ProductionTimeoutWins` rather than `TimeoutWins`, so userspace can tell the
+                // production deadline lane from the oracle one. The invariant is unchanged: the
+                // selector is encoder-produced, never hand-computed.
                 "riscv64",
                 RISCV_BOOT_SRC,
-                "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);",
+                "init_args[5] = crate::kernel::boot::riscv_ipc_reply_timeout_workload_selector();",
             ),
         ] {
             assert!(
@@ -95007,6 +95086,53 @@ mod stage200c2c2c_r2c_selector_matrix {
                 "{name} must not hand-compute the selector from the mode"
             );
         }
+        // The RISC-V wrapper must be a SEPARATE entry point, so widening it cannot reach the
+        // other ports. x86_64 keeps the shared helper and AArch64 keeps the bare selector.
+        assert!(
+            MOD_SRC.contains("pub fn riscv_ipc_reply_timeout_workload_selector() -> u64 {"),
+            "the RISC-V production-lane selector must be its own function"
+        );
+        assert!(
+            !X86_BOOT_SRC.contains("riscv_ipc_reply_timeout_workload_selector"),
+            "x86_64 must not publish through the RISC-V production-lane wrapper"
+        );
+        assert!(
+            !AARCH64_BOOT_SRC.contains("riscv_ipc_reply_timeout_workload_selector"),
+            "aarch64 must not publish through the RISC-V production-lane wrapper"
+        );
+        // …and the shared helper still falls back to TimeoutWins, which is what keeps x86_64's
+        // selector-off production cell publishing exactly the selector it always did.
+        let shared = MOD_SRC
+            .split("pub fn ipc_reply_timeout_workload_selector() -> u64 {")
+            .nth(1)
+            .expect("the shared workload selector")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        assert!(
+            shared.contains("IpcReplyLivenessScenario::TimeoutWins"),
+            "the shared helper's selector-off fallback must stay TimeoutWins"
+        );
+        assert!(
+            !shared.contains("ProductionTimeoutWins"),
+            "the shared helper must not be widened to the production scenario — that would \
+             change x86_64's selector-off behaviour"
+        );
+        let rv = MOD_SRC
+            .split("pub fn riscv_ipc_reply_timeout_workload_selector() -> u64 {")
+            .nth(1)
+            .expect("the RISC-V workload selector")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        assert!(
+            rv.contains("IpcReplyLivenessScenario::ProductionTimeoutWins"),
+            "the RISC-V wrapper's selector-off fallback must be the production scenario"
+        );
+        assert!(
+            rv.contains("ipc_reply_timeout_selector()"),
+            "an ARMED runtime selector must still win, so the oracle cell is unchanged"
+        );
     }
 
     /// (9) SOURCE: userspace decodes through the SAME shared module the kernel encodes
@@ -95017,9 +95143,18 @@ mod stage200c2c2c_r2c_selector_matrix {
         assert!(
             SERVICE_SRC.contains("ipc_reply_liveness_scenario_for_current_arch(mode() as usize)")
         );
+        // 199E-R1: `is_timeout_wins` now covers BOTH timeout-wins lanes, because they share the
+        // whole shape of the exchange. The decode still goes through the shared decoder and the
+        // scenarios are still named, not numbered.
         assert!(
-            SERVICE_SRC
-                .contains("matches!(scenario(), Some(IpcReplyLivenessScenario::TimeoutWins))")
+            SERVICE_SRC.contains(
+                "            Some(IpcReplyLivenessScenario::TimeoutWins)\n                | Some(IpcReplyLivenessScenario::ProductionTimeoutWins)"
+            ),
+            "both timeout-wins lanes must be recognised by name through the shared decoder"
+        );
+        assert!(
+            SERVICE_SRC.contains("pub(super) fn is_production_timeout_wins() -> bool {"),
+            "the production lane must have its OWN predicate — the wait strategy depends on it"
         );
         // The userspace copy of the per-arch base table is gone.
         assert!(!SERVICE_SRC.contains("pub(super) const SELECTOR_BASE: u64"));
@@ -100387,9 +100522,9 @@ mod stage200d2b1_liveness_abi {
     fn b01_selector_table_is_exactly_the_specified_runs() {
         use IpcReplyLivenessScenario as S;
         for (base, expect) in [
-            (AARCH64_SELECTOR_BASE, [8usize, 9, 10]),
-            (RISCV64_SELECTOR_BASE, [9, 10, 11]),
-            (X86_64_SELECTOR_BASE, [10, 11, 12]),
+            (AARCH64_SELECTOR_BASE, [8usize, 9, 10, 11]),
+            (RISCV64_SELECTOR_BASE, [9, 10, 11, 12]),
+            (X86_64_SELECTOR_BASE, [10, 11, 12, 13]),
         ] {
             assert_eq!(base, expect[0], "base");
             assert_eq!(
@@ -100403,6 +100538,13 @@ mod stage200d2b1_liveness_abi {
             assert_eq!(
                 ipc_reply_liveness_scenario_for_base(base, expect[2]),
                 Some(S::ServerDies)
+            );
+            // 199E-R1 appended the fourth value. It is proof-protocol metadata for the
+            // production timeout lane, not a fourth liveness outcome, and it reuses the SAME
+            // slot — no ABI slot and no capability was added for it.
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, expect[3]),
+                Some(S::ProductionTimeoutWins)
             );
         }
     }
@@ -100480,6 +100622,9 @@ mod stage200d2b1_liveness_abi {
                 "matches!(mode(), 8",
                 "SELECTOR_BASE + 1",
                 "SELECTOR_BASE + 2",
+                // 199E-R1: the fourth value must be named through the encoder too. Its
+                // arithmetic belongs to the ABI module alone, like the other three.
+                "SELECTOR_BASE + 3",
             ] {
                 assert!(
                     !code.contains(forbidden),
@@ -100520,7 +100665,7 @@ mod stage200d2b1_liveness_abi {
         assert!(
             armed.contains("ipc_reply_liveness_scenario_for_current_arch(v as usize).is_some()")
         );
-        for n in ["8", "9", "10", "11", "12"] {
+        for n in ["8", "9", "10", "11", "12", "13"] {
             assert!(
                 !armed.contains(n),
                 "armed must contain no selector literal ({n})"
@@ -100529,6 +100674,7 @@ mod stage200d2b1_liveness_abi {
         // The only base+offset arithmetic lives in the ABI module itself.
         assert!(ABI_SRC.contains("selector == base + 1"));
         assert!(ABI_SRC.contains("selector == base + 2"));
+        assert!(ABI_SRC.contains("selector == base + 3"));
     }
 
     /// The ExitCurrentTask ABI is a DIFFERENT namespace and must never select an IPC scenario.
@@ -116410,7 +116556,7 @@ mod stage199d_wa2b_wake_owner_census {
             "src/kernel/task.rs",
             "new",
             "status:",
-            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, blocked_send_generation: 0, pending_syscall_completion: None, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
+            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, blocked_send_generation: 0, pending_syscall_completion: None, async_preempted: None, async_preempt_generation: 0, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
             "thread_group_id: ThreadGroupId(tid.0),",
             "asid,",
         ),
@@ -123233,7 +123379,13 @@ mod u3_riscv_terminal_idle_snapshot {
         assert!(code.contains("(Some((blocked_tid, class)), true) => {"));
         assert!(code.contains("RISCV_BLOCKED_IPC_IDLE_PROVENANCE_OK"));
         assert!(code.contains("RiscvIdleReason::BlockedIpcNoRunnable"));
-        assert!(code.contains("(None, true) => {"));
+        // 199E-R1: scoped to syscalls — see the note on the defensive arm in
+        // `riscv_blocked_recv_idle_requires_typed_provenance`.
+        assert!(code.contains("(None, true) if is_syscall => {"));
+        assert!(
+            !code.contains("(None, true) => {"),
+            "the unscoped arm must not come back: it would fail every idle timer tick"
+        );
         assert!(code.contains("RISCV_BLOCKED_IDLE_NO_PROVENANCE"));
         assert!(code.contains("SyscallError::Internal"));
         // The earlier typed-idle paths are untouched.
@@ -129039,6 +129191,1570 @@ mod aarch64_gic_device_mapping {
 /// The behavioural fixtures live in `arch/aarch64/irq.rs` and compile only in an AArch64 test
 /// build (`src/arch/aarch64/**` is `#[cfg(target_arch = "aarch64")]`); these guards run in the
 /// canonical hosted suite, and the live QEMU sequence proves the running arrangement.
+
+/// Canonical 199E-R1 — the RISC-V S-mode supervisor-timer bridge prerequisite.
+///
+/// RISC-V was canonical 199E's sole remaining default-reachability blocker: SBI TIME exists, but
+/// a timer interrupt arriving from the kernel's idle `wfi` re-entered the bridge as S-mode and
+/// hit `RISCV_TRAP_UNHANDLED reason=trap_from_s_mode`, so `sstatus.SIE` was never armed and the
+/// scheduler tick never advanced.
+///
+/// The audit that unblocks it rests on one invariant: **`sstatus.SIE` is set at exactly ONE
+/// program point, and the only S-mode code that can be interrupted with it set is
+/// `riscv_trap_halt`'s `wfi` loop.** Hardware clears `sstatus.SIE` on every trap entry, so every
+/// syscall and fault handler runs masked; in U-mode S-interrupts are gated by privilege rather
+/// than by SIE; and SIE is enabled last, immediately before the kernel commits to the
+/// never-returning idle loop, with no lock held.
+///
+/// `src/arch/riscv64/**` is `#[cfg(target_arch = "riscv64")]`, so its own fixtures compile only
+/// in a RISC-V test build; these guards run in the canonical hosted suite.
+mod riscv64_s_mode_timer_bridge {
+    const RV_TIMER_SRC: &str = include_str!("../../arch/riscv64/timer.rs");
+    const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RV_IRQ_SRC: &str = include_str!("../../arch/riscv64/irq.rs");
+    const A64_IRQ_SRC: &str = include_str!("../../arch/aarch64/irq.rs");
+    const X86_IRQ_SRC: &str = include_str!("../../arch/x86_64/irq.rs");
+
+    /// The acceptance predicate, reproduced exactly from `timer.rs`. Keeping a runnable model
+    /// here is what makes the discrimination provable on a host that has no RISC-V.
+    fn is_accepted_s_mode_timer_trap(scause: u64, sstatus: u64, boundary_armed: bool) -> bool {
+        const INTERRUPT_BIT: u64 = 1u64 << 63;
+        const SPP_BIT: u64 = 1u64 << 8;
+        let is_interrupt = (scause & INTERRUPT_BIT) != 0;
+        let code = scause & !INTERRUPT_BIT;
+        let from_supervisor = (sstatus & SPP_BIT) != 0;
+        is_interrupt && code == 5 && from_supervisor && boundary_armed
+    }
+
+    const INT: u64 = 1u64 << 63;
+    const SPP: u64 = 1u64 << 8;
+
+    /// All four conjuncts are load-bearing: interrupt bit, supervisor-timer cause, SPP, boundary.
+    #[test]
+    fn only_a_supervisor_timer_from_the_armed_boundary_is_accepted() {
+        assert!(
+            is_accepted_s_mode_timer_trap(INT | 5, SPP, true),
+            "interrupt + supervisor-timer cause + SPP=Supervisor + boundary armed"
+        );
+        assert!(
+            !is_accepted_s_mode_timer_trap(5, SPP, true),
+            "an EXCEPTION whose code happens to be 5 is not a timer interrupt"
+        );
+        assert!(
+            !is_accepted_s_mode_timer_trap(INT | 9, SPP, true),
+            "a supervisor EXTERNAL interrupt is not the timer"
+        );
+        assert!(
+            !is_accepted_s_mode_timer_trap(INT | 1, SPP, true),
+            "a supervisor SOFTWARE interrupt is not the timer"
+        );
+        assert!(
+            !is_accepted_s_mode_timer_trap(INT | 5, 0, true),
+            "SPP=User means the timer came from userspace — the ordinary path owns it"
+        );
+        assert!(
+            !is_accepted_s_mode_timer_trap(INT | 5, SPP, false),
+            "before the boundary is armed nothing may be accepted from S-mode"
+        );
+    }
+
+    /// A timer taken from USER mode keeps its existing routing: it never reaches the S-mode
+    /// fast path, because the bridge only consults the predicate when `!from_u`.
+    #[test]
+    fn a_timer_from_user_mode_keeps_its_existing_routing() {
+        for scause in [INT | 5, INT | 9, 8] {
+            assert!(
+                !is_accepted_s_mode_timer_trap(scause, 0, true),
+                "SPP=User is never an S-mode acceptance, whatever the cause"
+            );
+        }
+        let bridge = RV_BOOT_SRC
+            .split("extern \"C\" fn yarm_riscv64_trap_bridge(")
+            .nth(1)
+            .expect("the trap bridge")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        let s_mode_arm = bridge
+            .split("if !from_u {")
+            .nth(1)
+            .expect("the S-mode guard arm");
+        assert!(
+            s_mode_arm.contains("timer::is_accepted_s_mode_timer_trap("),
+            "the acceptance check lives INSIDE the `!from_u` arm, so a user trap cannot reach it"
+        );
+        assert!(
+            bridge.contains("timer::record_user_origin_timer_irq(entering_tid)"),
+            "a U-origin timer is COUNTED as the second accepted origin, not diverted into the \
+             S-mode fast path"
+        );
+        assert!(
+            !bridge.contains("timer::record_user_origin_timer_irq()"),
+            "the U-origin record must carry the RESUMED tid — a bare no-argument call cannot \
+             attest that the interrupt returned to the client that was dwelling"
+        );
+    }
+
+    /// Every other S-mode trap stays fail-closed on the pre-existing halt.
+    #[test]
+    fn every_other_s_mode_trap_remains_fail_closed() {
+        let bridge = RV_BOOT_SRC
+            .split("extern \"C\" fn yarm_riscv64_trap_bridge(")
+            .nth(1)
+            .expect("the trap bridge")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert!(
+            bridge.contains("reason=trap_from_s_mode")
+                && bridge.contains("riscv_trap_halt(\"trap_from_s_mode\")"),
+            "the fail-closed halt is preserved verbatim"
+        );
+        let accept = bridge
+            .find("timer::is_accepted_s_mode_timer_trap(")
+            .expect("the acceptance check");
+        let halt = bridge
+            .find("riscv_trap_halt(\"trap_from_s_mode\")")
+            .expect("the halt");
+        assert!(
+            accept < halt,
+            "acceptance is checked first; anything it refuses falls through to the halt"
+        );
+        // And a genuine handling failure inside the accepted path is never swallowed into idle.
+        assert!(
+            RV_BOOT_SRC.contains("riscv_trap_halt(\"s_mode_timer_handle_err\")"),
+            "an Err from the accepted timer path halts rather than resuming as if idle"
+        );
+    }
+
+    /// One accepted IRQ produces exactly one tick and exactly one SBI re-arm, in that order.
+    #[test]
+    fn one_accepted_irq_gives_one_tick_and_one_rearm() {
+        let path = RV_BOOT_SRC
+            .split("fn riscv_s_mode_timer_trap(")
+            .nth(1)
+            .expect("the S-mode timer path")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert_eq!(
+            path.matches("timer::record_timer_tick()").count(),
+            1,
+            "exactly one tick per accepted interrupt"
+        );
+        assert_eq!(
+            path.matches("handle_riscv_trap_entry_shared(").count(),
+            1,
+            "exactly one pass through the arch-neutral pipeline — no second timeout drain"
+        );
+        // 199E-R1: the re-arm is NOT S-mode-local. It is owned by the ONE common point — the
+        // arch-neutral `Trap::TimerInterrupt` arm's tail — which BOTH origins pass through, so a
+        // second re-arm here would break the strict 1:1 that holds for the U-mode origin.
+        assert!(
+            !path.contains("timer::rearm_periodic_deadline()"),
+            "the S-mode path must not re-arm: that is the common point's job"
+        );
+        let tick = path.find("record_timer_tick()").expect("the tick");
+        let dispatch = path
+            .find("handle_riscv_trap_entry_shared(")
+            .expect("the pipeline");
+        assert!(
+            tick < dispatch,
+            "tick, then the arch-neutral pipeline that owns the single re-arm"
+        );
+        // That common point is the RISC-V `program_timer_deadline`: one re-arm, boot hart only,
+        // and a complete no-op unless the opt-in feature actually armed the timer.
+        let seam = RV_IRQ_SRC
+            .split("pub fn program_timer_deadline(")
+            .nth(1)
+            .expect("the single re-arm point")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert_eq!(
+            seam.matches("timer::rearm_periodic_deadline()").count(),
+            1,
+            "exactly one re-arm per accepted interrupt, at one place"
+        );
+        assert!(
+            seam.contains("cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID"),
+            "boot hart only"
+        );
+        assert!(
+            seam.contains("!crate::arch::riscv64::timer::stie_enabled()"),
+            "and inert unless the opt-in feature armed the timer"
+        );
+    }
+
+    /// On RISC-V the re-arm IS the acknowledgement: SBI `set_timer` clears the pending timer
+    /// interrupt as a side effect, so a second completion call would be a duplicate.
+    #[test]
+    fn acknowledgement_and_rearm_are_one_sbi_call() {
+        let ack = RV_TIMER_SRC
+            .split("pub fn rearm_periodic_deadline() -> u64 {")
+            .nth(1)
+            .expect("the ack/re-arm seam")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert_eq!(
+            ack.matches("sbi_set_timer(").count(),
+            1,
+            "one SBI call is the whole completion"
+        );
+        // PLIC source 0 is reserved, so the arch-neutral `acknowledge_interrupt(0)` must not
+        // reach the PLIC — a supervisor timer is not a PLIC source.
+        let eoi = RV_IRQ_SRC
+            .split("pub fn external_irq_eoi(irq_line: u16) {")
+            .nth(1)
+            .expect("the PLIC completion seam")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert!(
+            eoi.contains("if irq_line == 0 {"),
+            "PLIC source 0 is reserved and must never be written as a completion"
+        );
+    }
+
+    /// The boundary is armed before SIE, and SIE is the last thing enabled.
+    #[test]
+    fn the_boundary_is_established_before_interrupts_are_enabled() {
+        let enable = RV_TIMER_SRC
+            .split("fn arm_one_shot_timer_and_enable() -> Option<&'static str> {")
+            .nth(1)
+            .expect("the enable sequence")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        let sscratch = enable
+            .find("set_sscratch_to_trap_stack_top()")
+            .expect("the sscratch re-point");
+        let armed = enable
+            .find("arm_s_mode_timer_boundary()")
+            .expect("the boundary arm");
+        let stie = enable.find("set_sie_stie()").expect("STIE");
+        let sie = enable.find("set_sstatus_sie()").expect("SIE");
+        assert!(
+            sscratch < armed && armed < stie && stie < sie,
+            "sscratch, then the boundary latch, then STIE, then SIE last"
+        );
+        assert_eq!(
+            enable.matches("set_sstatus_sie()").count(),
+            1,
+            "there is exactly one place that enables interrupts"
+        );
+        assert_eq!(
+            RV_TIMER_SRC.matches("fn set_sstatus_sie()").count(),
+            1,
+            "and exactly one definition of it"
+        );
+    }
+
+    /// The syscall-only defensive guard must not fire for a timer interrupt.
+    #[test]
+    fn the_blocked_syscall_idle_guard_is_scoped_to_syscalls() {
+        assert!(
+            RV_TRAP_SRC.contains("(None, true) if is_syscall =>"),
+            "the no-provenance defensive error is a SYSCALL guard: a timer interrupt taken at \
+             terminal idle legitimately observes no provenance and no current task"
+        );
+        assert!(
+            RV_TRAP_SRC.contains("RISCV_BLOCKED_IDLE_NO_PROVENANCE"),
+            "the guard itself is preserved for the syscall case it was written for"
+        );
+    }
+
+    /// Boot hart only: the shared scheduler counter has exactly one owner.
+    #[test]
+    fn only_the_boot_hart_may_drive_the_timer() {
+        assert!(
+            RV_TIMER_SRC.contains("DEFER_REASON_NOT_BOOT_HART"),
+            "a non-boot hart defers instead of arming"
+        );
+        let init = RV_TIMER_SRC
+            .split("pub fn init_timer_after_idle_safe_point() -> Option<&'static str> {")
+            .nth(1)
+            .expect("the init seam")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        let boot_hart = init.find("if !on_boot_hart {").expect("the boot-hart gate");
+        let feature = init
+            .find("if !TIMER_IRQ_FEATURE_ENABLED {")
+            .expect("the feature gate");
+        assert!(
+            boot_hart < feature,
+            "the boot-hart gate is checked before the feature path is entered"
+        );
+    }
+
+    /// The opt-in feature stays default-OFF: default builds arm nothing.
+    #[test]
+    fn the_timer_feature_remains_default_off() {
+        assert!(
+            RV_TIMER_SRC.contains(
+                "pub const TIMER_IRQ_FEATURE_ENABLED: bool = cfg!(feature = \"riscv64-timer-irq\");"
+            ),
+            "the live path is gated on an opt-in cargo feature, never on a default"
+        );
+        let manifest = include_str!("../../../Cargo.toml");
+        assert!(
+            manifest.contains("riscv64-timer-irq = []"),
+            "the feature exists and pulls in nothing else"
+        );
+        let default_line = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("default ="))
+            .unwrap_or("");
+        assert!(
+            !default_line.contains("riscv64-timer-irq"),
+            "and it is NOT in the default feature set: {default_line}"
+        );
+    }
+
+    /// x86_64 and AArch64 timer routing is untouched by this RISC-V-local change.
+    #[test]
+    fn other_architectures_are_unchanged() {
+        for (name, src) in [("x86_64", X86_IRQ_SRC), ("aarch64", A64_IRQ_SRC)] {
+            for rv_only in [
+                "is_accepted_s_mode_timer_trap",
+                "acknowledge_and_rearm",
+                "s_mode_timer_boundary_armed",
+                "STIE_AUDIT_COMPLETE",
+            ] {
+                assert!(
+                    !src.contains(rv_only),
+                    "{rv_only} is RISC-V-local; {name} must not acquire it"
+                );
+            }
+        }
+        // AArch64 keeps its own split claim/complete; RISC-V has no such split (SBI set_timer is
+        // the whole completion), so neither borrows the other's mechanism.
+        assert!(
+            A64_IRQ_SRC.contains("pub fn claim_interrupt()")
+                && A64_IRQ_SRC.contains("pub fn complete_interrupt("),
+            "the delivered AArch64 claim/complete split is intact"
+        );
+        assert!(
+            !RV_IRQ_SRC.contains("claim_interrupt") && !RV_TIMER_SRC.contains("claim_interrupt"),
+            "RISC-V does not gain a GIC-shaped claim seam"
+        );
+    }
+
+    /// 199E-R1(A) — the D2 blocked-receive RETURN provenance hole.
+    ///
+    /// A genuine blocking receive normally publishes idle provenance from the arch-neutral
+    /// syscall-return classification. The U4 D2 in-lock bypass returns BEFORE that
+    /// classification runs, so for a deferred receive the token was never published, and the
+    /// wrapper's terminal-idle handling found none and took the defensive error path. It was
+    /// unreachable until RISC-V could leave terminal idle at all.
+    #[test]
+    fn the_d2_recv_idle_outcome_publishes_return_provenance() {
+        // The publication sits at the post-lock drain's idle outcome — the authoritative D2
+        // completion point — not in the timer handler and not in a return path.
+        let drain = RV_TRAP_SRC
+            .split("if cpu_idx < MAX_CPUS && crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx) {")
+            .nth(1)
+            .expect("the post-lock D2 recv drain")
+            .split("\n    // ── Stage 200D-0D1")
+            .next()
+            .expect("its body");
+        assert!(
+            drain.contains("blocked_syscall_idle_provenance_set("),
+            "the drain's idle outcome publishes the token"
+        );
+        assert!(
+            drain.contains("BlockingSyscallClass::IpcRecv"),
+            "with the receive class it actually completed"
+        );
+        // Exact identity: gated behind the reverify that proved the SAME blocked incarnation.
+        assert!(
+            drain.contains("shared.d2_recv_reverify_blocked(t)"),
+            "publication is downstream of the exact-identity re-verification"
+        );
+        let reverify = drain
+            .find("d2_recv_reverify_blocked")
+            .expect("the reverify");
+        let publish = drain
+            .find("blocked_syscall_idle_provenance_set(")
+            .expect("the publication");
+        assert!(
+            reverify < publish,
+            "a stale identity or replacement incarnation cannot reach the publication"
+        );
+        // The published tid is the re-verified outgoing tid, never a bare current task.
+        assert!(
+            drain.contains("if let Some(out) = outgoing {")
+                && drain.contains("blocked_syscall_idle_provenance_set(\n                            cpu_idx,\n                            out,"),
+            "the token carries the re-verified outgoing identity, not `current`"
+        );
+    }
+
+    /// Only a CLEAN idle outcome may publish: the refusal outcomes are errors.
+    #[test]
+    fn refusals_and_torn_dispatches_publish_nothing() {
+        let drain = RV_TRAP_SRC
+            .split("if cpu_idx < MAX_CPUS && crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx) {")
+            .nth(1)
+            .expect("the drain")
+            .split("\n    // ── Stage 200D-0D1")
+            .next()
+            .expect("its body");
+        assert!(
+            drain.contains("let mut clean_idle = false;")
+                && drain.contains("clean_idle = true;")
+                && drain.contains("if clean_idle {"),
+            "publication is gated on the clean-idle outcome alone"
+        );
+        // The two refusal arms and the torn arm must not set the flag.
+        for arm in [
+            "reason=refused_dequeue_undone",
+            "reason=refused_scheduler_untouched",
+        ] {
+            let after = drain.split(arm).nth(1).expect("the refusal arm");
+            let next_arm_end = after.find("None\n                }").unwrap_or(after.len());
+            assert!(
+                !after[..next_arm_end].contains("clean_idle = true"),
+                "{arm} is an error outcome and must publish nothing"
+            );
+        }
+        assert_eq!(
+            drain.matches("clean_idle = true;").count(),
+            1,
+            "exactly one outcome sets it, so publication happens at most once per deferral"
+        );
+        assert_eq!(
+            drain
+                .matches("blocked_syscall_idle_provenance_set(")
+                .count(),
+            1,
+            "and there is exactly one publication site in the drain"
+        );
+    }
+
+    /// Publication only becomes reachable through an ACTUAL pending deferral, which only a
+    /// blocking receive creates — a nonblocking or immediately-satisfied receive reaches nothing.
+    #[test]
+    fn nonblocking_and_immediate_receives_publish_nothing() {
+        assert!(
+            RV_TRAP_SRC.contains(
+                "if cpu_idx < MAX_CPUS && crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx) {"
+            ),
+            "the whole drain is gated on a real pending D2 receive deferral"
+        );
+        // And the deferral is cleared on every path, so a duplicate drain cannot republish.
+        let drain = RV_TRAP_SRC
+            .split("if cpu_idx < MAX_CPUS && crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx) {")
+            .nth(1)
+            .expect("the drain")
+            .split("\n    // ── Stage 200D-0D1")
+            .next()
+            .expect("its body");
+        assert!(
+            drain.matches("d2_recv_dispatch_clear(cpu_idx);").count() >= 3,
+            "the deferral is cleared on the switch, idle and fallback paths alike"
+        );
+    }
+
+    /// The defensive guard is NOT weakened: terminal idle with no provenance still fails closed
+    /// for a syscall.
+    #[test]
+    fn terminal_idle_without_provenance_still_fails_closed() {
+        assert!(
+            RV_TRAP_SRC.contains("(None, true) if is_syscall =>")
+                && RV_TRAP_SRC.contains("RISCV_BLOCKED_IDLE_NO_PROVENANCE")
+                && RV_TRAP_SRC.contains("SyscallError::Internal"),
+            "the syscall guard and its defensive error path are intact"
+        );
+        // Provenance is consumed exactly once per trap, as before.
+        assert_eq!(
+            RV_TRAP_SRC
+                .matches("blocked_syscall_idle_provenance_take(cpu_idx)")
+                .count(),
+            1,
+            "exactly one consumer"
+        );
+    }
+
+    /// x86_64 / AArch64 D2 behaviour is untouched: they never read this token, so the repair is
+    /// deliberately RISC-V-local rather than placed in the shared drain.
+    #[test]
+    fn other_architectures_d2_behaviour_is_unchanged() {
+        const SHARED_TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        assert!(
+            !SHARED_TRAP_ENTRY.contains("blocked_syscall_idle_provenance_set("),
+            "the shared drain that serves x86_64/AArch64 gains no publication"
+        );
+        assert!(
+            !SHARED_TRAP_ENTRY.contains("blocked_syscall_idle_provenance_take("),
+            "and still reads none — RISC-V is the sole reader, which is why the repair is local"
+        );
+    }
+
+    /// 199E-R1(B) — the trap stack no longer drifts.
+    ///
+    /// Entry is sscratch-idempotent (`addi t0, sp, 304` restores exactly the value swapped in),
+    /// so the drift came entirely from the return: it wrote the saved sp into `sscratch` and then
+    /// obtained sp via `csrrw sp, sscratch, sp`, at which point sp was the BRIDGE's stack pointer
+    /// (the tail is reached by a `call`). The swap therefore left `sscratch` one frame BELOW the
+    /// frame base, and the next trap started that much lower — every trap, monotonically.
+    #[test]
+    fn the_generic_return_restores_the_canonical_stack_top() {
+        let tail = RV_BOOT_SRC
+            .split("yarm_riscv64_trap_return:")
+            .nth(1)
+            .expect("the generic return tail")
+            .split("\n    // 199E-R1 — dedicated S-mode")
+            .next()
+            .expect("its body");
+        assert!(
+            tail.contains("csrw sscratch, a1"),
+            "the canonical per-hart top is written, not a value derived from this trap's stack"
+        );
+        // Match the INSTRUCTION (line-leading), not the prose: the comment above deliberately
+        // names the leaking swap in order to explain it.
+        assert!(
+            !tail.contains("\n    csrrw sp, sscratch, sp"),
+            "the leaking swap is gone: sp is loaded directly from the frame instead"
+        );
+        assert!(
+            tail.contains("ld sp,   8(a0)"),
+            "the interrupted sp round-trips exactly, from the frame's saved x2"
+        );
+        // a0 must be restored last, after sp, because the frame pointer is still needed.
+        let sp_load = tail.find("ld sp,   8(a0)").expect("sp restore");
+        let a0_load = tail.find("ld a0,  72(a0)").expect("a0 restore");
+        assert!(sp_load < a0_load, "a0 is restored last");
+    }
+
+    /// The dedicated S-mode return has the same non-drifting shape.
+    #[test]
+    fn the_s_mode_return_also_restores_the_canonical_top() {
+        let tail = RV_BOOT_SRC
+            .split("yarm_riscv64_s_mode_timer_return:")
+            .nth(1)
+            .expect("the S-mode return tail")
+            .split("\"#")
+            .next()
+            .expect("its body");
+        assert!(
+            tail.contains("csrw sscratch, a1") && tail.contains("ld sp,   8(a0)"),
+            "canonical top into sscratch, interrupted kernel sp out of the frame"
+        );
+        assert!(
+            !tail.contains("\n    csrrw sp, sscratch, sp"),
+            "no swap, so nothing can leak a stack-relative value into sscratch"
+        );
+    }
+
+    /// Per-hart ownership: the canonical top is resolved from the frame pointer with the SAME
+    /// region matching that names the hart, so a secondary restores ITS top, never the boot
+    /// hart's.
+    #[test]
+    fn the_canonical_top_is_resolved_per_hart_and_cannot_alias() {
+        let resolver = RV_BOOT_SRC
+            .split("fn riscv_canonical_trap_stack_top_for_frame(frame_ptr: usize) -> u64 {")
+            .nth(1)
+            .expect("the resolver")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            resolver.contains("RISCV64_SECONDARY_TRAP_STACK_TOPS[slot]")
+                && resolver.contains("frame_ptr >= base && frame_ptr < top"),
+            "it matches the frame against the published per-hart regions"
+        );
+        assert!(
+            resolver.contains("riscv_trap_stack_top()"),
+            "and falls back to the boot hart's own top, exactly as the CPU resolver concludes"
+        );
+        // The same matching the hart resolver uses, so the two can never disagree.
+        let cpu_resolver = RV_BOOT_SRC
+            .split("fn riscv_logical_cpu_for_trap_frame(frame_ptr: usize)")
+            .nth(1)
+            .expect("the cpu resolver")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert!(
+            cpu_resolver.contains("frame_ptr >= base && frame_ptr < top"),
+            "both resolvers key off the identical region predicate"
+        );
+    }
+
+    /// A fail-closed exit must not publish a corrupted `sscratch`: the halts never run a return
+    /// tail at all.
+    #[test]
+    fn fail_closed_exits_publish_no_sscratch_value() {
+        let halt = RV_BOOT_SRC
+            .split("fn riscv_trap_halt(reason: &'static str) -> ! {")
+            .nth(1)
+            .expect("the halt")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            !halt.contains("sscratch") && !halt.contains("yarm_riscv64_trap_return"),
+            "the fail-closed halt touches no stack state and reaches no return tail"
+        );
+        assert!(
+            halt.contains("wfi"),
+            "it parks, so no later entry can inherit a half-written value"
+        );
+    }
+
+    /// This checkpoint adds no broad-lock acquisition, so the Stage 204A census is unchanged.
+    #[test]
+    fn no_broad_lock_acquisition_is_added() {
+        let path = RV_BOOT_SRC
+            .split("fn riscv_s_mode_timer_trap(")
+            .nth(1)
+            .expect("the S-mode timer path")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert!(
+            !path.contains(".with_cpu(")
+                && !path.contains(".with(|")
+                && !path.contains(".state.lock()"),
+            "the timer path reuses the EXISTING shared wrapper rather than acquiring the broad lock"
+        );
+        assert!(
+            !RV_TIMER_SRC.contains(".with_cpu(") && !RV_TIMER_SRC.contains(".state.lock()"),
+            "and the timer module touches no kernel lock at all"
+        );
+    }
+}
+
+/// Canonical 199E-R1 — the PRODUCTION timeout lane's blocking proof handshake.
+///
+/// The oracle timeout-wins lane spins: its `OracleHardware` deadline is armed up front against a
+/// clock that advances on traps, so the server can yield-spin until the client has timed out.
+///
+/// The production lane cannot. Its deadline is armed by `arm_production_reply_deadline` on the
+/// ordinary block path and expires against the SCHEDULER TICK, which on this port is driven by
+/// the periodic supervisor timer — and that timer is armed at the terminal kernel-idle boundary.
+/// A yield-spinning server keeps a runnable task on the CPU, idle is never reached, the timer is
+/// never armed, and the deadline can never come due. That was measured, deterministically, before
+/// this lane existed.
+///
+/// The protocol these guards pin therefore blocks BOTH parties — which is exactly the state the
+/// production timeout is specified to resolve — and then reuses the ALREADY-ARMED periodic timer
+/// for the bounded U-mode dwell that witnesses a user-origin interrupt.
+///
+/// `crates/yarm-control-plane-servers/**` userspace and `src/arch/riscv64/**` compile only in
+/// their own targets; these guards read the source and run in the canonical hosted suite.
+/// Canonical 199E-R1D — asynchronous U-mode preemption preserves the exact interrupted context.
+///
+/// Before this stage RISC-V had two resume conventions, both keyed to a syscall boundary:
+/// fresh/startup installed `a0..a5` from the argument mirror and zeroed `a7`, and a
+/// syscall/blocked-syscall continuation installed its result lane. Neither is correct for a task
+/// interrupted by a timer mid-computation, where `a0..a7` are ordinary live registers — and
+/// nothing captured that register file at all, so a preempted task resumed at its LAST ECALL's
+/// saved PC and lane. Measured live as a caller re-running its receive continuation 75 times.
+///
+/// These cases pin the third, explicitly tagged resume state and the identity discipline that
+/// keeps it from ever being applied to the wrong incarnation. The behavioural half runs against a
+/// real `KernelState`; the structural half reads `src/arch/riscv64/**`, which is
+/// `#[cfg(target_arch = "riscv64")]` and so cannot execute in the canonical hosted suite.
+mod riscv64_async_preemption {
+    use super::*;
+    use crate::kernel::task::{AsyncPreemptedContext, ThreadControlBlock};
+    use crate::kernel::vm::Asid;
+
+    const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    /// A frame carrying a RECOGNIZABLE value in every integer lane, so a lost or rewritten
+    /// register is identifiable rather than merely "different".
+    fn canary_frame(pc: usize, sp: usize) -> TrapFrame {
+        let mut f = TrapFrame::zeroed();
+        f.set_saved_pc(pc);
+        f.set_saved_sp(sp);
+        for n in 1..32usize {
+            f.set_user_gpr(n, 0xC0DE_0000 + n);
+        }
+        f.set_user_gpr(0, 0);
+        f
+    }
+
+    /// Bring up a real kernel with one dispatched user thread.
+    fn fixture() -> (KernelState, u64) {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state
+            .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
+                tid: 19,
+                entry: 0x7000,
+                asid: Some(asid),
+                class: TaskClass::App,
+                startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+                ..Default::default()
+            })
+            .expect("leader");
+        let tid = state
+            .spawn_user_thread(19, 0xABCD_0000, 0x8800_0000, 0x7010)
+            .expect("thread");
+        state.dispatch_next_task().expect("dispatch");
+        while state.current_tid() != Some(tid) {
+            state.yield_current().expect("switch");
+        }
+        (state, tid)
+    }
+
+    /// (1) A recognizable value in EVERY integer register survives the snapshot and comes back
+    /// through the restore. This is the property the whole stage exists for.
+    #[test]
+    fn every_integer_register_survives_snapshot_and_restore() {
+        let (mut state, tid) = fixture();
+        let frame = canary_frame(0x4321_0000, 0x7FFF_0000);
+        assert!(state.snapshot_async_preempted_current(&frame));
+        // Something else ran in between and left the frame holding foreign values.
+        let mut resumed = TrapFrame::new(7, [1, 2, 3, 4, 5, 6]);
+        for n in 1..32usize {
+            resumed.set_user_gpr(n, 0xBAD0_0000 + n);
+        }
+        state
+            .resume_current_thread_with_frame(&mut resumed)
+            .expect("resume");
+        for n in 1..32usize {
+            assert_eq!(
+                resumed.user_gpr(n),
+                0xC0DE_0000 + n,
+                "x{n} did not survive preemption"
+            );
+        }
+        assert_eq!(resumed.saved_pc(), 0x4321_0000, "PC must be the interrupt");
+        assert_eq!(resumed.saved_sp(), 0x7FFF_0000, "SP must be the user stack");
+        assert!(state.take_async_preempted_resume(tid));
+    }
+
+    /// (2) The ARGUMENT registers specifically — `a0..a5` nonzero and `a7` nonzero — survive
+    /// exactly. These are the lanes the startup rewrite used to overwrite and zero.
+    #[test]
+    fn nonzero_argument_registers_and_a7_survive_exactly() {
+        let (mut state, tid) = fixture();
+        let mut frame = canary_frame(0x1234, 0x5678);
+        // a0..a5 = user_gprs[10..16], a7 = user_gprs[17].
+        for (i, n) in (10..16usize).enumerate() {
+            frame.set_user_gpr(n, 0xAAAA_0000 + i);
+        }
+        frame.set_user_gpr(17, 0xA777_7777);
+        assert!(state.snapshot_async_preempted_current(&frame));
+        let mut resumed = TrapFrame::zeroed();
+        state
+            .resume_current_thread_with_frame(&mut resumed)
+            .expect("resume");
+        for (i, n) in (10..16usize).enumerate() {
+            assert_eq!(resumed.user_gpr(n), 0xAAAA_0000 + i, "a{i} lost");
+        }
+        assert_eq!(
+            resumed.user_gpr(17),
+            0xA777_7777,
+            "a7 must NOT be forced to zero for an async-preempted task"
+        );
+        assert!(state.take_async_preempted_resume(tid));
+    }
+
+    /// (3) The tag is consumed EXACTLY once. A second resume falls back to the ordinary lane
+    /// conventions, which is correct: by then the task has already run.
+    #[test]
+    fn the_resume_tag_is_consumed_exactly_once() {
+        let (mut state, tid) = fixture();
+        let frame = canary_frame(0x11, 0x22);
+        assert!(state.snapshot_async_preempted_current(&frame));
+        assert!(state.async_preempted_resume_pending(tid));
+        assert!(
+            state.take_async_preempted_resume(tid),
+            "first take succeeds"
+        );
+        assert!(
+            !state.take_async_preempted_resume(tid),
+            "a snapshot must not authorize two verbatim restores"
+        );
+        assert!(!state.async_preempted_resume_pending(tid));
+    }
+
+    /// (4) Consecutive preemptions update the SAME task coherently — newest snapshot wins, one
+    /// tag, no duplicate continuation.
+    #[test]
+    fn consecutive_preemptions_update_without_duplicating() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0xAA, 0xBB)));
+        let first = state.thread_user_context(tid).expect("ctx");
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0xCC, 0xDD)));
+        let second = state.thread_user_context(tid).expect("ctx");
+        assert_ne!(first.instruction_ptr, second.instruction_ptr);
+        assert_eq!(second.instruction_ptr, VirtAddr(0xCC));
+        // Still exactly one authorization, naming the NEWEST snapshot.
+        assert!(state.take_async_preempted_resume(tid));
+        assert!(!state.take_async_preempted_resume(tid));
+    }
+
+    /// (5) A stale generation cannot restore an older register file. This is the coordinate that
+    /// separates one preemption cycle from the next.
+    #[test]
+    fn a_stale_generation_is_refused() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(1, 2)));
+        // Forge a tag from an EARLIER cycle against the live TCB.
+        let matched = state.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .expect("tcb");
+            let stale = AsyncPreemptedContext {
+                tid,
+                asid: tcb.asid.expect("asid"),
+                preempt_generation: 0,
+            };
+            stale.matches_tcb(tcb)
+        });
+        assert!(
+            !matched,
+            "a superseded preemption generation must not match"
+        );
+    }
+
+    /// (6) A replacement incarnation that reused the numeric TID is refused: the ASID differs, so
+    /// a corpse's register file can never be restored into its successor.
+    #[test]
+    fn a_replacement_incarnation_reusing_the_tid_is_refused() {
+        let mut tcb = ThreadControlBlock::new(ThreadId(42), Some(Asid(7)));
+        tcb.async_preempt_generation = 3;
+        let tag = AsyncPreemptedContext {
+            tid: 42,
+            asid: Asid(7),
+            preempt_generation: 3,
+        };
+        assert!(tag.matches_tcb(&tcb), "the rightful owner matches");
+        // Same numeric TID, different address space = a different incarnation.
+        let mut replacement = ThreadControlBlock::new(ThreadId(42), Some(Asid(8)));
+        replacement.async_preempt_generation = 3;
+        assert!(!tag.matches_tcb(&replacement));
+        // And a task with no ASID at all can never match.
+        let mut unplaced = ThreadControlBlock::new(ThreadId(42), None);
+        unplaced.async_preempt_generation = 3;
+        assert!(!tag.matches_tcb(&unplaced));
+    }
+
+    /// (7) Death makes the snapshot unreachable, so nothing can restore a corpse's registers.
+    #[test]
+    fn exit_clears_the_snapshot() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(9, 9)));
+        assert!(state.async_preempted_resume_pending(tid));
+        state.exit_task(tid, 0).expect("exit");
+        assert!(
+            !state.async_preempted_resume_pending(tid),
+            "a dead task must carry no resume authorization"
+        );
+        assert!(!state.take_async_preempted_resume(tid));
+    }
+
+    /// (8) The idle/kernel identity publishes NOTHING: an S-mode timer at the audited idle
+    /// boundary interrupted no user context, so there is nothing to preserve.
+    #[test]
+    fn the_idle_identity_creates_no_snapshot() {
+        let mut state = Bootstrap::init().expect("init");
+        // No user task dispatched: `current` is the idle identity.
+        assert!(
+            !state.snapshot_async_preempted_current(&canary_frame(1, 1)),
+            "tid 0 must never publish an async-preemption tag"
+        );
+    }
+
+    /// (9) Fresh startup and syscall-return remain the OTHER two states: an untagged task is
+    /// never mistaken for a preempted one, whatever its registers happen to hold.
+    #[test]
+    fn an_untagged_task_is_never_treated_as_preempted() {
+        let (mut state, tid) = fixture();
+        assert!(!state.async_preempted_resume_pending(tid));
+        assert!(!state.take_async_preempted_resume(tid));
+        // Even a plain syscall capture leaves it untagged — `sync_current_thread_from_frame` is
+        // the syscall path and must not publish a preemption authorization.
+        state
+            .sync_current_thread_from_frame(&canary_frame(0x50, 0x60))
+            .expect("capture");
+        assert!(
+            !state.async_preempted_resume_pending(tid),
+            "the syscall snapshot must not tag an async preemption"
+        );
+    }
+
+    /// (10) SOURCE: the snapshot happens on a U-origin timer trap, strictly BEFORE anything that
+    /// can schedule another task.
+    #[test]
+    fn the_snapshot_precedes_anything_that_can_schedule() {
+        let body = RV_TRAP_SRC
+            .split("pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(")
+            .nth(1)
+            .expect("the shared trap entry")
+            .split("\n/// U3 (canonical 203C)")
+            .next()
+            .expect("its body");
+        let snap = body
+            .find("kernel.snapshot_async_preempted_current(f)")
+            .expect("the snapshot call");
+        let dispatch = body
+            .find("kernel.handle_trap_event_with_fault_bookkeeping_mode(")
+            .expect("the dispatch that can yield");
+        assert!(
+            snap < dispatch,
+            "snapshotting after the tick/yield would race the switch it exists to survive"
+        );
+        assert!(
+            body.contains("matches!(decode_trap_context(context), TrapEvent::TimerInterrupt)"),
+            "scoped to a timer trap by the TYPED decode, not by a raw scause literal"
+        );
+    }
+
+    /// (11) SOURCE: the resume mode is read from an EXPLICIT tag. Nothing infers it from zero
+    /// registers, a PC value, a bare TID or incidental scheduler state.
+    #[test]
+    fn the_resume_mode_is_explicit_and_never_inferred() {
+        let take = "crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize)";
+        assert_eq!(
+            RV_BOOT_SRC.matches(take).count(),
+            2,
+            "exactly two write-backs decide the ABI lanes: the main bridge and the S-mode \
+             timer dispatch — and both must consult the SAME tag"
+        );
+        // Publication happens only where a tag was actually consumed.
+        assert_eq!(
+            RV_TRAP_SRC
+                .matches("crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize)")
+                .count(),
+            2,
+            "one in-lock resume boundary and one post-lock drain boundary"
+        );
+        assert!(
+            RV_TRAP_SRC.contains("kernel.take_async_preempted_resume(current_tid)"),
+            "the in-lock boundary consumes through the identity-checked seam"
+        );
+        assert!(
+            RV_TRAP_SRC.contains("shared.direct_dispatch_take_async_preempt_split(token)"),
+            "the post-lock boundary consumes through the EXACT-TOKEN seam"
+        );
+        // The decision cannot be inherited across traps.
+        assert!(
+            RV_BOOT_SRC.contains("crate::kernel::boot::riscv_async_resume_clear(cpu.0 as usize)"),
+            "every trap starts from a cleared decision"
+        );
+    }
+
+    /// (12) SOURCE: the verbatim restore reads the saved REGISTER FILE, and the startup rewrite
+    /// is genuinely skipped rather than merely reordered.
+    #[test]
+    fn the_verbatim_restore_uses_the_register_file_and_skips_the_startup_rewrite() {
+        for (label, marker, end) in [
+            (
+                "main bridge",
+                "if task_switched && async_resume {",
+                "\n        } else if task_switched {",
+            ),
+            (
+                "s-mode timer dispatch",
+                "if crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize) {",
+                "\n            } else {",
+            ),
+        ] {
+            let arm = RV_BOOT_SRC
+                .split(marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{label}: the async arm"))
+                .split(end)
+                .next()
+                .unwrap_or_else(|| panic!("{label}: its body"));
+            for (reg, lane) in [
+                ("A0", 10usize),
+                ("A1", 11),
+                ("A2", 12),
+                ("A3", 13),
+                ("A4", 14),
+                ("A5", 15),
+                ("A7", 17),
+            ] {
+                let expect =
+                    format!("frame.regs[RiscvTrapFrame::{reg}] = tframe.user_gpr({lane}) as u64;");
+                assert!(
+                    arm.contains(&expect),
+                    "{label}: {reg} must come from the saved register file"
+                );
+            }
+            assert!(
+                !arm.contains("tframe.arg("),
+                "{label}: the async arm must not read the startup argument mirror"
+            );
+            assert!(
+                !arm.contains("RiscvTrapFrame::A7] = 0"),
+                "{label}: a7 must not be forced to zero for a preempted task"
+            );
+        }
+        // …and the ordinary arms still DO install the startup ABI, unchanged.
+        assert!(
+            RV_BOOT_SRC.contains("frame.regs[RiscvTrapFrame::A7] = 0;"),
+            "fresh/startup resume keeps its a7 convention"
+        );
+        assert_eq!(
+            RV_BOOT_SRC
+                .matches("frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;")
+                .count(),
+            2,
+            "both ordinary write-backs still install a0 from the argument mirror"
+        );
+    }
+
+    /// (13) SOURCE: the identity discipline is the established one, and it is CHECKED rather
+    /// than assumed — three coordinates, `checked_add`, context-before-tag.
+    #[test]
+    fn the_identity_and_ordering_discipline_is_enforced() {
+        assert!(TASK_SRC.contains("pub struct AsyncPreemptedContext {"));
+        let m = TASK_SRC
+            .split("impl AsyncPreemptedContext {")
+            .nth(1)
+            .expect("the async impl block")
+            .split("\nimpl ")
+            .next()
+            .expect("its body");
+        assert!(m.contains("self.tid == tcb.tid.0"));
+        assert!(m.contains("tcb.asid == Some(self.asid)"));
+        assert!(m.contains("self.preempt_generation == tcb.async_preempt_generation"));
+        let snap = THREAD_STATE_SRC
+            .split("pub(crate) fn snapshot_async_preempted_current(")
+            .nth(1)
+            .expect("the snapshot")
+            .split("\n    /// Canonical 199E-R1D — consume")
+            .next()
+            .expect("its body");
+        assert!(
+            snap.contains("checked_add(1)"),
+            "an exhausted counter must refuse rather than wrap into a matchable value"
+        );
+        let ctx_at = snap
+            .find("tcb.user_context = captured;")
+            .expect("context store");
+        let tag_at = snap
+            .find("tcb.async_preempted = Some(")
+            .expect("tag publish");
+        assert!(
+            ctx_at < tag_at,
+            "the tag must be published LAST so it cannot name a half-written register file"
+        );
+        assert!(
+            snap.contains("if tid == 0 {"),
+            "the idle identity publishes nothing"
+        );
+        // Death clears it.
+        assert!(
+            include_str!("restart_state.rs").contains("tcb.async_preempted = None;"),
+            "exit must make the snapshot unreachable"
+        );
+        // The post-lock seam refuses rather than consuming on a mismatch.
+        let split = RUNTIME_SRC
+            .split("pub(crate) fn direct_dispatch_take_async_preempt_split(")
+            .nth(1)
+            .expect("the split seam")
+            .split("\n    /// U6 §8")
+            .next()
+            .expect("its body");
+        assert!(split.contains("t.asid == Some(expected)"));
+        assert!(split.contains("if !tag.matches_tcb(tcb) {"));
+    }
+
+    /// (14) The Stage 204A census is unchanged: this stage routes its one cross-phase decision
+    /// through the existing per-CPU flag family rather than acquiring the broad lock.
+    #[test]
+    fn no_broad_lock_acquisition_is_added() {
+        for (name, src) in [("mod", MOD_SRC), ("thread_state", THREAD_STATE_SRC)] {
+            let region = src
+                .split("199E-R1D")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}: a 199E-R1D region"));
+            assert!(
+                !region.contains(".with_cpu(") && !region.contains(".state.lock()"),
+                "{name}: the async-preemption seam must not acquire the broad lock"
+            );
+        }
+        assert!(
+            MOD_SRC.contains("pub(crate) static RISCV_ASYNC_RESUME_PENDING:"),
+            "the decision travels through the same per-CPU flag family as the other five"
+        );
+    }
+
+    /// (15) The live REGISTER CANARY is real, proof-confined, and pins the exact registers this
+    /// stage repairs.
+    #[test]
+    fn the_live_register_canary_is_proof_confined_and_checks_a0_through_a7() {
+        let f = SERVICE_SRC
+            .split("fn u_mode_dwell_with_register_canary() -> u64 {")
+            .nth(1)
+            .expect("the canary dwell")
+            .split("\n    pub(super) fn server_park()")
+            .next()
+            .expect("its body");
+        for reg in ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"] {
+            assert!(
+                f.contains(&format!("inout(\"{reg}\")")),
+                "{reg} must be pinned as an operand — a Rust-level loop would spill and reload \
+                 it, silently repairing exactly the corruption under test"
+            );
+        }
+        assert!(
+            f.contains("options(nomem, nostack)"),
+            "the canary loop must touch no memory and no stack"
+        );
+        for reserved in ["\"sp\"", "\"gp\"", "\"tp\"", "\"ra\""] {
+            assert!(
+                !f.contains(reserved),
+                "the canary must never name the reserved register {reserved}"
+            );
+        }
+        // One success marker, emitted by the client, and only in the production lane.
+        assert!(SERVICE_SRC.contains("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REGISTER_CANARY"));
+        let guarded = SERVICE_SRC
+            .split("if is_production_timeout_wins() {")
+            .nth(1)
+            .expect("the production-only guard");
+        assert!(guarded.contains("u_mode_dwell_with_register_canary()"));
+    }
+
+    /// (16) The FP/VECTOR dependency, stated rather than assumed.
+    ///
+    /// RISC-V user targets declare the `lp64d` hard-float ABI and `sstatus.FS` is observed Dirty
+    /// on the first user trap, so the hardware PERMITS user floating-point. Neither the trap
+    /// frame nor `UserRegisterContext` has anywhere to put `f0..f31` or `fcsr`, so if FP state
+    /// were ever live, asynchronous preemption would lose it.
+    ///
+    /// It is not live: no RISC-V user binary in this tree contains a single FP instruction or
+    /// f-register reference, so there is no FP state to lose and the integer-only contract is
+    /// complete for every build that exists. That is a latent dependency, not a closed one —
+    /// and this case is what stops it from becoming a silent one. `UserRegisterContext` gaining
+    /// an FP area, or the integer register file growing past 32 lanes, should both be deliberate
+    /// acts that come here first.
+    #[test]
+    fn no_user_floating_point_state_can_be_live() {
+        // The save area is integer-only, and its width is the whole integer file.
+        assert!(TASK_SRC.contains("pub user_gprs: [usize; 32],"));
+        let ctx = TASK_SRC
+            .split("pub struct UserRegisterContext {")
+            .nth(1)
+            .expect("the context")
+            .split('}')
+            .next()
+            .expect("its fields");
+        for absent in ["f0", "fcsr", "fp_regs", "vector", "vregs"] {
+            assert!(
+                !ctx.contains(absent),
+                "UserRegisterContext gained `{absent}`: the async-preemption contract is no \
+                 longer integer-only and 199E-R1D's FP dependency must be re-derived"
+            );
+        }
+        // The RISC-V port must not be enabling FP for user tasks behind our back: `sstatus.FS`
+        // is never written anywhere in the port.
+        for src in [RV_BOOT_SRC, RV_TRAP_SRC] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("sstatus.FS") && !code.contains("SSTATUS_FS"),
+                "an explicit sstatus.FS policy would change the FP dependency this stage rests on"
+            );
+        }
+    }
+}
+
+mod riscv64_production_timeout_handshake {
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const ABI_SRC: &str =
+        include_str!("../../../crates/yarm-ipc-abi/src/ipc_reply_liveness_abi.rs");
+
+    /// The server body, from the shared arch-neutral core.
+    fn server_body() -> &'static str {
+        SERVICE_SRC
+            .split("pub(super) unsafe fn server_run() {")
+            .nth(1)
+            .expect("the server core")
+            .split("\n    pub(super) fn server_park()")
+            .next()
+            .expect("its body")
+    }
+
+    /// The client body, from the same shared core.
+    fn client_body() -> &'static str {
+        SERVICE_SRC
+            .split("pub(super) unsafe fn client_run(request_ep: u32, reply_ep: u32) -> ClientOutcome {")
+            .nth(1)
+            .expect("the client core")
+            .split("\n    /// Yields the surviving caller")
+            .next()
+            .expect("its body")
+    }
+
+    /// The production selector picks the BLOCKING handshake; the branch is keyed on the
+    /// production predicate and is the FIRST arm, so it cannot be shadowed by the oracle one.
+    #[test]
+    fn the_production_selector_chooses_the_blocking_handshake() {
+        let body = server_body();
+        let prod = body
+            .find("if is_production_timeout_wins() {")
+            .expect("the production arm exists and is keyed on the production predicate");
+        let oracle = body
+            .find("} else if is_timeout_wins() {")
+            .expect("the oracle arm follows it as an `else if`");
+        assert!(
+            prod < oracle,
+            "the production arm must be tested FIRST — `is_timeout_wins` is true for both lanes, \
+             so an earlier oracle arm would swallow the production selector and reinstate the spin"
+        );
+        let prod_arm = &body[prod..oracle];
+        assert!(
+            prod_arm.contains("ipc_recv_v2(request_ep)"),
+            "the production server BLOCKS on a receive rather than polling"
+        );
+        assert!(
+            !prod_arm.contains("CLIENT_TIMED_OUT.load("),
+            "and it must not poll the client's flag — that is the spin this lane exists to remove"
+        );
+        assert!(
+            !prod_arm.contains("yield_now()"),
+            "no yield loop may survive in the production arm: a runnable task blocks terminal idle"
+        );
+    }
+
+    /// The oracle lane keeps its EXACT prior wait strategy. Widening the shared predicate must
+    /// not have changed how the accepted `OracleHardware` cell waits.
+    #[test]
+    fn the_oracle_selector_retains_its_yield_spin() {
+        let body = server_body();
+        let oracle = body
+            .split("} else if is_timeout_wins() {")
+            .nth(1)
+            .expect("the oracle arm")
+            .split("\n        } else {")
+            .next()
+            .expect("its body");
+        assert!(
+            oracle.contains("while CLIENT_TIMED_OUT.load(Relaxed) == 0 && spun < SPIN_CAP {"),
+            "the oracle lane's bounded yield-spin is preserved verbatim"
+        );
+        assert!(
+            oracle.contains("yarm_user_rt::syscall::yield_now()"),
+            "including the yield itself"
+        );
+        assert!(
+            oracle.contains("IPC_REPLY_TIMEOUT_ORACLE_SERVER_LATE_REPLY rejected={}"),
+            "and its own marker, unchanged"
+        );
+    }
+
+    /// The server may not attempt its late reply BEFORE the trigger arrives. Attempting early
+    /// would race the deadline and could produce a reply that legitimately won, which proves
+    /// nothing about a rejected late reply.
+    #[test]
+    fn the_server_cannot_attempt_the_late_reply_before_the_trigger() {
+        let body = server_body();
+        let prod = body
+            .split("if is_production_timeout_wins() {")
+            .nth(1)
+            .expect("the production arm")
+            .split("\n        } else if is_timeout_wins() {")
+            .next()
+            .expect("its body");
+        let blocked = prod
+            .find("SERVER_BLOCKED_FOR_LATE_REPLY_TRIGGER")
+            .expect("the blocked marker");
+        let recv = prod
+            .find("ipc_recv_v2(request_ep)")
+            .expect("the blocking recv");
+        let reply = prod
+            .find("yarm_user_rt::syscall::ipc_reply(reply_cap, &reply_msg)")
+            .expect("the late reply");
+        let consumed = prod
+            .find("SERVER_REQUEST_CONSUMED")
+            .expect("the request-consumed marker");
+        assert!(
+            consumed < blocked && blocked < recv && recv < reply,
+            "order must be: request consumed -> announce blocking -> block -> only then reply"
+        );
+        assert_eq!(
+            prod.matches("yarm_user_rt::syscall::ipc_reply(").count(),
+            1,
+            "exactly ONE reply attempt in the production arm — a retry loop could land one \
+             attempt before the deadline and turn the proof into a race"
+        );
+    }
+
+    /// The trigger reuses the EXISTING request endpoint and mints no second reply capability,
+    /// so it cannot create a second completion or clobber the retained reply cap.
+    #[test]
+    fn the_trigger_reuses_the_existing_endpoint_and_creates_no_second_completion() {
+        let client = client_body();
+        assert!(
+            client.contains("yarm_user_rt::syscall::ipc_send(request_ep, &trigger_msg)"),
+            "the trigger is a plain NR5 send on the endpoint the request already used"
+        );
+        assert!(
+            !client.contains("ipc_call(request_ep, reply_ep, &trigger_msg)"),
+            "it is NOT a second call: a call would mint a second reply capability and a second \
+             completion, which is precisely the resource this proof must not add"
+        );
+        // The server verifies both halves of that claim on the receiving side.
+        let body = server_body();
+        assert!(
+            body.contains("let no_second_reply_cap = tm.reply_cap.is_none();"),
+            "the server proves the trigger delivered NO second reply capability"
+        );
+        assert!(
+            body.contains("payload_ok && no_second_reply_cap"),
+            "and refuses to call the handshake satisfied unless both hold"
+        );
+        // A plain NR5 send carries its opcode INLINE in the first two payload bytes
+        // (`ipc_call_prepare`), and the prefix is only stripped for cap/reply-flagged
+        // messages — which a plain send is not. The server must decode the format that is
+        // actually on the wire, not the NR6 request's stripped one.
+        assert!(
+            body.contains("let expect = 2 + LATE_REPLY_TRIGGER_DATA.len();")
+                && body
+                    .contains("u16::from_le_bytes([tm.message.payload[0], tm.message.payload[1]])")
+                && body.contains("inline_opcode == LATE_REPLY_TRIGGER_OPCODE"),
+            "the trigger check must decode the inline opcode prefix of a plain send"
+        );
+        // No new endpoint or capability slot is provisioned for the handshake. Scoped to the
+        // reply-timeout provisioning site: the IpcCall-direct oracle fills the same two slots
+        // for its own, mutually exclusive cell, and that site is not this proof's.
+        let site = RV_BOOT_SRC
+            .split("#[cfg(feature = \"riscv64-ipc-reply-timeout-oracle\")]")
+            .nth(1)
+            .expect("the reply-timeout provisioning site");
+        assert_eq!(
+            site.matches("init_args[13] = caps.request_ep_cap as u64;")
+                .count(),
+            1,
+            "still exactly one request-endpoint slot"
+        );
+        assert!(
+            !RV_BOOT_SRC.contains("init_args[15]"),
+            "the handshake adds no ABI slot"
+        );
+    }
+
+    /// The dwell runs AFTER the canonical `TimedOut`, and only in the production lane. Before
+    /// the timeout no task has blocked, so the terminal idle boundary has not been reached and
+    /// the periodic timer is not running — a dwell there would witness nothing.
+    #[test]
+    fn the_dwell_runs_after_the_timeout_and_only_in_the_production_lane() {
+        let client = client_body();
+        let timed_out = client
+            .find("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_TIMED_OUT")
+            .expect("the timeout marker");
+        let begin = client
+            .find("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_DWELL_BEGIN")
+            .expect("the dwell begin marker");
+        let done = client
+            .find("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_DWELL_DONE")
+            .expect("the dwell done marker");
+        let trigger = client
+            .find("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_LATE_REPLY_TRIGGER")
+            .expect("the trigger marker");
+        assert!(
+            timed_out < begin && begin < done && done < trigger,
+            "order must be: TimedOut -> dwell -> trigger"
+        );
+        // The block that arms the deadline must come BEFORE the dwell, not after it.
+        let block = client
+            .find("ipc_recv_with_deadline(reply_ep, TIMEOUT_WINS_TICKS)")
+            .expect("the finite-deadline block");
+        assert!(
+            block < begin,
+            "the dwell must not precede the block — that arrangement never reached idle"
+        );
+        // Both the dwell and the trigger sit inside the production-only guard.
+        let guarded = client
+            .split("if is_production_timeout_wins() {")
+            .nth(1)
+            .expect("the production-only guard in the timeout arm");
+        assert!(
+            guarded.contains("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_DWELL_BEGIN")
+                && guarded.contains("ipc_send(request_ep, &trigger_msg)"),
+            "the oracle lane must carry neither the dwell nor the trigger"
+        );
+        // The dwell stays syscall-free: a syscall leaves U-mode, and the interrupt would then
+        // be taken from the kernel instead of from the client.
+        //
+        // 199E-R1D moved the loop body into `u_mode_dwell_with_register_canary`, so the slice
+        // between the two markers is now the CALL. The syscall-free property is asserted on the
+        // callee, which is where the loop actually lives; asserting it on the call site alone
+        // would have become vacuous.
+        let dwell_site = client
+            .split("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_DWELL_BEGIN\");")
+            .nth(1)
+            .expect("the dwell body")
+            // Stop BEFORE the closing marker's own `user_log!`, not at its string literal —
+            // otherwise the slice swallows that macro call and the syscall-free check below
+            // fails on the very statement that terminates the dwell.
+            .split("yarm_user_rt::user_log!(\"IPC_REPLY_TIMEOUT_ORACLE_CLIENT_DWELL_DONE")
+            .next()
+            .expect("up to the done marker");
+        assert!(
+            dwell_site.contains("u_mode_dwell_with_register_canary()"),
+            "the dwell body is the canary function"
+        );
+        let dwell = SERVICE_SRC
+            .split("fn u_mode_dwell_with_register_canary() -> u64 {")
+            .nth(1)
+            .expect("the canary dwell")
+            .split("\n    pub(super) fn server_park()")
+            .next()
+            .expect("its body");
+        for forbidden in ["yield_now(", "ipc_", "futex_", "user_log!"] {
+            assert!(
+                !dwell.contains(forbidden),
+                "the dwell must contain no syscall ({forbidden})"
+            );
+        }
+        assert!(
+            dwell.contains("core::ptr::read_volatile(p)")
+                && dwell.contains("core::ptr::write_volatile(p,"),
+            "the non-RISC-V arm keeps the volatile pair, which is what makes its loop observable"
+        );
+        // 199E-R1D: inline assembly is now PRESENT, and confined to the canary loop. It is the
+        // only way to hold values in `a0..a7` across the dwell — a Rust-level loop spills and
+        // reloads them, which would silently repair the exact corruption under test.
+        assert!(
+            dwell.contains("core::arch::asm!"),
+            "the RISC-V arm pins its canaries with inline assembly"
+        );
+        assert!(
+            !client.contains("core::arch::asm!"),
+            "…and that assembly stays in the canary helper, never inlined into the client body"
+        );
+        // Userspace counter access stays closed and the dwell adds no time source. Checked
+        // against CODE only — the surrounding rationale names `scounteren` and `rdtime` in
+        // prose precisely to record that they were rejected.
+        let code: alloc::string::String = SERVICE_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in ["scounteren", "rdtime"] {
+            assert!(
+                !code.contains(forbidden),
+                "the proof workload must not reach for a userspace time source ({forbidden})"
+            );
+        }
+        // No inline assembly anywhere in the client — the pre-existing x86_64 naked child
+        // trampolines are elsewhere in the file and are not part of this lane.
+        assert!(
+            !client.contains("asm!"),
+            "the dwell is written in safe volatile accesses, not inline assembly"
+        );
+    }
+
+    /// A default or non-proof build provisions nothing: the whole handshake is behind the
+    /// RISC-V oracle feature, and the timer that makes it work is behind its own default-OFF
+    /// feature.
+    #[test]
+    fn a_default_build_provisions_nothing() {
+        let site = RV_BOOT_SRC
+            .split("#[cfg(feature = \"riscv64-ipc-reply-timeout-oracle\")]")
+            .nth(1)
+            .expect("the feature-gated provisioning site");
+        assert!(
+            site.contains("if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {"),
+            "provisioning still fails closed against every other slot-5 oracle"
+        );
+        assert!(
+            site.contains("crate::kernel::boot::riscv_ipc_reply_timeout_workload_selector()"),
+            "and publishes through the RISC-V production-lane encoder"
+        );
+        assert!(
+            MOD_SRC.contains(
+                "#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\npub fn riscv_ipc_reply_timeout_workload_selector() -> u64 {"
+            ),
+            "the encoder itself is feature-gated, so a default kernel does not carry it"
+        );
+        // The timer remains default-OFF and is a separate opt-in from the workload.
+        let features = include_str!("../../../Cargo.toml");
+        assert!(
+            features.contains("riscv64-timer-irq = []"),
+            "the timer feature exists as its own empty opt-in"
+        );
+        let default_line = features
+            .split("\ndefault = [")
+            .nth(1)
+            .expect("the default feature list")
+            .split(']')
+            .next()
+            .expect("its contents");
+        assert!(
+            !default_line.contains("riscv64-timer-irq"),
+            "the timer must not be in the default feature set"
+        );
+        assert!(
+            !default_line.contains("riscv64-ipc-reply-timeout-oracle"),
+            "nor the proof workload"
+        );
+    }
+
+    /// The production scenario is proof-protocol METADATA in the existing slot, not a new
+    /// capability, a new slot or a fourth liveness outcome.
+    #[test]
+    fn the_production_scenario_adds_no_abi_surface() {
+        assert!(
+            ABI_SRC.contains("ProductionTimeoutWins,"),
+            "the scenario lives in the existing liveness enum"
+        );
+        assert!(
+            ABI_SRC.contains("selector == base + 3"),
+            "decoded from the SAME slot-5 run, arch-locally"
+        );
+        // x86_64 and AArch64 provisioning is untouched: neither reaches the new encoder.
+        assert!(!X86_BOOT_SRC.contains("ProductionTimeoutWins"));
+        assert!(!A64_BOOT_SRC.contains("ProductionTimeoutWins"));
+        assert!(!X86_BOOT_SRC.contains("riscv_ipc_reply_timeout_workload_selector"));
+        assert!(!A64_BOOT_SRC.contains("riscv_ipc_reply_timeout_workload_selector"));
+        // …and x86_64 still publishes through the shared helper, whose fallback is unchanged.
+        assert!(
+            X86_BOOT_SRC.contains(
+                "init_args[5] = crate::kernel::boot::ipc_reply_timeout_workload_selector();"
+            ),
+            "x86_64's selector-off production cell publishes exactly what it always did"
+        );
+    }
+
+    /// The handshake adds no broad-lock acquisition — the Stage 204A census is unchanged.
+    #[test]
+    fn no_broad_lock_acquisition_is_added() {
+        for src in [server_body(), client_body()] {
+            assert!(
+                !src.contains(".with_cpu(")
+                    && !src.contains(".with(|")
+                    && !src.contains(".state.lock()"),
+                "the proof workload is USERSPACE — it cannot and must not name a kernel lock"
+            );
+        }
+    }
+}
+
 mod aarch64_production_tick {
     use std::vec::Vec;
 

@@ -129,6 +129,15 @@ pub fn external_irq_eoi(_irq_line: u16) {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn external_irq_eoi(irq_line: u16) {
+    // PLIC source 0 is RESERVED: the spec uses it to mean "no interrupt", so it can never name a
+    // real source and writing it as a completion is meaningless. The arch-neutral timer arm calls
+    // `acknowledge_interrupt(0)`, and a supervisor timer interrupt is not a PLIC source at all —
+    // it is acknowledged by SBI `set_timer`. Refusing source 0 keeps that call from storing into
+    // the PLIC's claim/complete register, which faults when the PLIC page is not mapped into the
+    // active address space.
+    if irq_line == 0 {
+        return;
+    }
     if !PLIC_CONFIGURED.load(Ordering::Relaxed) {
         return;
     }
@@ -151,7 +160,34 @@ pub fn acknowledge_interrupt(irq_line: u16) {
     external_irq_eoi(irq_line);
 }
 
-pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, _ticks_from_now: u64) {}
+/// 199E-R1 — the SINGLE RISC-V timer re-arm point.
+///
+/// The arch-neutral `Trap::TimerInterrupt` arm calls this at its tail, and BOTH accepted origins
+/// pass through that arm: a timer taken from U-mode enters the ordinary bridge, and one taken from
+/// the audited S-mode idle boundary is dispatched through the same shared wrapper. Owning the
+/// re-arm here therefore makes it periodic across both origins while keeping it exactly once per
+/// accepted interrupt — there is no second, S-mode-local re-arm.
+///
+/// `ticks_from_now` is deliberately unused. It carries the SCHEDULER's tick quantum
+/// (`BOOTSTRAP_TIMER_DEADLINE_TICKS`, 10 on this port), which is a count of scheduler ticks and not
+/// a `rdtime` counter delta; using it raw would program a ~1 microsecond deadline on QEMU virt's
+/// 10 MHz timebase and storm. The wall period is owned by the timer module's own
+/// `DEFAULT_TICK_INTERVAL`, which the initial arm also uses, so the initial arm and every re-arm
+/// are identical by construction and cannot drift apart.
+///
+/// Boot hart only, and a complete no-op unless the opt-in feature actually armed the timer: SBI
+/// `set_timer` both clears the pending timer condition and programs the next deadline, so calling
+/// it on a hart that never enabled `sie.STIE` would arm a source nothing is prepared to service.
+pub fn program_timer_deadline(cpu: crate::kernel::scheduler::CpuId, ticks_from_now: u64) {
+    let _ = ticks_from_now;
+    if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+        return;
+    }
+    if !crate::arch::riscv64::timer::stie_enabled() {
+        return;
+    }
+    crate::arch::riscv64::timer::rearm_periodic_deadline();
+}
 
 #[cfg(test)]
 mod tests {

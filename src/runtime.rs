@@ -2423,6 +2423,47 @@ impl SharedKernel {
         })
     }
 
+    /// Canonical 199E-R1D — the split consumer of an ASYNC-PREEMPTION tag, for the post-lock
+    /// resume boundaries.
+    ///
+    /// The exact-token sibling of `direct_dispatch_take_completion_split`, and identical in its
+    /// identity discipline: the tag is only consumed for the `{tid, asid}` incarnation this
+    /// dispatch transaction actually marked, and only when the tag's own generation still names
+    /// the live preemption cycle. A replacement task that reused the numeric TID fails the ASID
+    /// match and a superseded snapshot fails the generation match, so neither can authorize a
+    /// verbatim register-file restore into somebody else's frame.
+    ///
+    /// Returns `true` when a tag was consumed, which is the caller's authorization to restore
+    /// `a0..a7` verbatim instead of installing the startup ABI lanes. A refusal leaves the tag in
+    /// place for its rightful owner — unlike a parked completion, a snapshot is not "spent" by
+    /// being looked at from the wrong incarnation.
+    pub(crate) fn direct_dispatch_take_async_preempt_split(
+        &self,
+        token: DispatchMarkToken,
+    ) -> bool {
+        let incoming = token.tid();
+        let Some(expected) = token.expect_asid() else {
+            return false;
+        };
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == incoming && t.asid == Some(expected))
+            else {
+                return false;
+            };
+            let Some(tag) = tcb.async_preempted else {
+                return false;
+            };
+            if !tag.matches_tcb(tcb) {
+                return false;
+            }
+            tcb.async_preempted = None;
+            true
+        })
+    }
+
     /// U6 §8 — the PRODUCTION-LIVE, class-scoped split consumer of a blocked SENDER's parked
     /// completion, for the post-lock resume boundaries.
     ///
