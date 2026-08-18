@@ -5036,6 +5036,16 @@ yarm_aarch64_vector_dispatch:
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
+    // Canonical 199E: preserve the vector stub's `kind` across the marker calls below.
+    // The stub leaves it in x0, but `bl yarm_aarch64_vector_elr_marker` deliberately loads x0
+    // with ELR_EL1, so by the time `yarm_aarch64_vector_entry` is called x0 held that address
+    // instead and EVERY exception decoded as kind "unknown". That was invisible while AArch64
+    // took no interrupts — `kind` fed only a log line and an `is_irq_kind` test that stayed
+    // false — but it makes an IRQ indistinguishable from a syscall, so nothing would claim,
+    // tick, re-arm or complete, and a level-triggered timer PPI would re-present forever.
+    // x19 is callee-saved (AAPCS64), and the frame slot above already holds its incoming value,
+    // so the exit path still restores the interrupted context exactly.
+    mov x19, x0
     ldr x9, [sp, #800]
     str x9, [sp, #0]
     mrs x9, sp_el0
@@ -5070,6 +5080,7 @@ yarm_aarch64_vector_dispatch:
     stp q30, q31, [sp, #768]
     bl yarm_aarch64_vector_first_marker
     msr daifset, #0xf
+    mov x0, x19
     mov x1, sp
     bl yarm_aarch64_vector_entry
     ldp q0, q1, [sp, #288]
@@ -6897,6 +6908,39 @@ fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
     }
 }
 
+/// `true` once the shared-kernel pointer the trap path dispatches through is installed.
+///
+/// Canonical 199E readiness gate: an IRQ that arrived before this would fall through to the
+/// raw-`KernelState` fallback (or to `no_kernel_state`), so the BSP timer is not armed until the
+/// shared path the tick depends on actually exists.
+pub fn trap_shared_kernel_is_installed() -> bool {
+    !TRAP_SHARED_KERNEL_PTR
+        .load(core::sync::atomic::Ordering::SeqCst)
+        .is_null()
+}
+
+/// `true` when `VBAR_EL1` holds this kernel's EL1 vector table.
+///
+/// Canonical 199E readiness gate: unmasking IRQs with the wrong vector base would send the
+/// first timer interrupt somewhere that is not `yarm_aarch64_vector_entry`.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub fn vector_table_is_installed() -> bool {
+    unsafe extern "C" {
+        static yarm_aarch64_vector_table_el1: u8;
+    }
+    let expected = (&raw const yarm_aarch64_vector_table_el1) as u64;
+    let vbar: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, VBAR_EL1", out(reg) vbar, options(nomem, nostack, preserves_flags));
+    }
+    vbar == expected
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
+pub fn vector_table_is_installed() -> bool {
+    false
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[repr(C, align(16))]
 struct Aarch64VectorFrame {
@@ -6985,6 +7029,37 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         }
     }
     let is_irq_kind = matches!(kind, 2 | 6 | 10 | 14);
+    // ── Canonical 199E: claim, then dispatch, then complete ──────────────────────────────────
+    //
+    // The claim happens HERE, before any handler runs, and the completion happens after the
+    // handler has returned — because the arch timer's PPI is level-sensitive. Its level stays
+    // asserted until the handler reprograms `CNTP_TVAL_EL0`, so completing earlier would hand
+    // the distributor an interrupt that is still asserting and it would re-present it forever.
+    //
+    // The claim is also what tells us WHICH interrupt this is. Treating every IRQ exception as
+    // the timer would tick on an unrelated INTID; only INTID 30 ticks and re-arms.
+    let claimed_intid = if is_irq_kind {
+        crate::arch::aarch64::irq::claim_interrupt()
+    } else {
+        None
+    };
+    // GICv2 special INTIDs (1020..=1023) mean "nothing to service": no tick, no re-arm, and no
+    // completion — writing EOIR for them is not permitted.
+    if claimed_intid.is_some_and(crate::arch::aarch64::irq::intid_is_special) {
+        return;
+    }
+    let is_timer_irq = match claimed_intid {
+        Some(intid) => intid == crate::arch::aarch64::irq::ARCH_TIMER_PPI_INTID,
+        // No controller configured (e.g. a platform whose GIC bases were never derived): keep
+        // the pre-199E behaviour of treating an IRQ exception as the timer.
+        None => is_irq_kind,
+    };
+    // A non-timer INTID is reported as an external interrupt, which the shared handler treats as
+    // a no-op — it neither ticks nor re-arms — and is completed on the way out.
+    let external_irq_line = match claimed_intid {
+        Some(intid) if !is_timer_irq => Some(intid),
+        _ => None,
+    };
     let trap_cpu =
         crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
     if let Some(shared) = trap_shared_kernel() {
@@ -7006,8 +7081,8 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         let context = crate::arch::aarch64::trap::Aarch64TrapContext {
             esr_el1: frame.esr_el1 as u32,
             far_el1: frame.far_el1,
-            irq_line: None,
-            is_timer_irq: is_irq_kind,
+            irq_line: external_irq_line,
+            is_timer_irq,
         };
         if crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
             shared,
@@ -7063,8 +7138,8 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         let context = crate::arch::aarch64::trap::Aarch64TrapContext {
             esr_el1: frame.esr_el1 as u32,
             far_el1: frame.far_el1,
-            irq_line: None,
-            is_timer_irq: is_irq_kind,
+            irq_line: external_irq_line,
+            is_timer_irq,
         };
         if crate::arch::aarch64::trap::handle_trap_entry(
             kernel,
@@ -7093,6 +7168,12 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         }
     } else {
         crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE no_kernel_state");
+    }
+    // Exactly one completion per claim, and only now: for the timer the handler has already
+    // reprogrammed `CNTP_TVAL_EL0`, so the level source is deasserted and the distributor will
+    // not immediately re-present it.
+    if let Some(intid) = claimed_intid {
+        crate::arch::aarch64::irq::complete_interrupt(intid);
     }
     match kind {
         1 => crate::arch::aarch64::console::write_line(
@@ -8312,9 +8393,10 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
     }
     assert_eq!(observed_cpu.0, cpu.0);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
-    kernel.program_timer_deadline_current_cpu(
-        crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
-    );
+    // Canonical 199E: APs do NOT arm a timer. `SchedulerState.timer` is one shared counter, so a
+    // per-AP timer would make the scheduler's tick rate scale with the CPU count and would let
+    // several CPUs race to advance the same counter. Exactly one CPU — the BSP, in
+    // `start_bsp_periodic_timer` — drives it. APs still service cross-CPU work below.
     if cpu_bit != 0
         && (SECONDARY_READY_LOGGED_MASK.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit) == 0
     {

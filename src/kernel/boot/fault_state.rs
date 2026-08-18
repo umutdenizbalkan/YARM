@@ -1080,7 +1080,13 @@ impl KernelState {
                 // fires and the scheduler advances without flooding the UART.
                 // (BOOTSTRAP_TIMER_DEADLINE_TICKS / 16 ≈ 3 ms/tick on QEMU;
                 //  at 90 s we would get ~30 000 ticks — far too many to log.)
-                #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+                // Canonical 199E: AArch64 now delivers this same production tick, so it
+                // shares the identical bounded emission rather than gaining a marker family of
+                // its own. x86_64 keeps the exact code and bound it already had.
+                #[cfg(all(
+                    not(feature = "hosted-dev"),
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
                 {
                     use core::sync::atomic::{AtomicU64, Ordering};
                     static TIMER_LOG_EMITTED: AtomicU64 = AtomicU64::new(0);
@@ -1100,7 +1106,10 @@ impl KernelState {
                         );
                     }
                 }
-                #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
+                #[cfg(all(
+                    not(feature = "hosted-dev"),
+                    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+                ))]
                 if DEBUG_TIMER_LOG {
                     crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
                     crate::yarm_log!(

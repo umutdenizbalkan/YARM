@@ -128590,6 +128590,7 @@ mod u8_live_production_path_arrangement {
 /// actually runs — `src/arch/aarch64/**` is `#[cfg(target_arch = "aarch64")]` and its own unit
 /// fixtures compile only in an AArch64 test build.
 mod aarch64_gicv2_base_derivation {
+    use std::{format, vec::Vec};
     const DTB_SRC: &str = include_str!("../../arch/aarch64/dtb.rs");
     const AARCH64_IRQ_SRC: &str = include_str!("../../arch/aarch64/irq.rs");
 
@@ -128756,27 +128757,46 @@ mod aarch64_gicv2_base_derivation {
         );
     }
 
-    /// This checkpoint derives and carries the distributor base but performs NO distributor MMIO:
-    /// no PPI enable, no timer arm, no DAIF unmask.
+    /// The derived bases stay separated at their point of use. This guard originally asserted
+    /// that NO distributor MMIO existed at all; canonical 199E ProductionTick is the checkpoint
+    /// that adds it, so what is pinned now is that the distributor registers are addressed from
+    /// the distributor base and the CPU-interface registers from the CPU-interface base — the
+    /// exact confusion the order-independent derivation was written to prevent.
     #[test]
-    fn the_prerequisite_activates_no_interrupt_behaviour() {
-        for forbidden in [
-            "GICD_ISENABLER",
-            "GICD_CTLR",
-            "enable_timer_ppi",
-            "bring_up_bsp_timer",
-        ] {
+    fn distributor_and_cpu_interface_registers_use_their_own_bases() {
+        let bring_up = AARCH64_IRQ_SRC
+            .split("fn program_arch_timer_ppi(dist_base: usize, cpu_if_base: usize)")
+            .nth(1)
+            .expect("the PPI bring-up")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        // Collapse the rustfmt line breaks so each access reads as one `base, REGISTER` pair.
+        let flat = bring_up.split_whitespace().collect::<Vec<_>>().join(" ");
+        for register in ["GICD_CTLR_OFFSET", "GICD_ISENABLER0_OFFSET"] {
             assert!(
-                !AARCH64_IRQ_SRC.contains(forbidden),
-                "{forbidden} belongs to the ProductionTick bring-up, not to this prerequisite"
+                flat.contains(&format!("dist_base, {register}")),
+                "{register} is a distributor register and must be addressed from dist_base"
+            );
+            assert!(
+                !flat.contains(&format!("cpu_if_base, {register}")),
+                "{register} must never be reached through the CPU-interface base"
             );
         }
-        assert_eq!(
-            AARCH64_IRQ_SRC
-                .matches("pub fn enable_interrupts_for_boot()")
-                .count(),
-            3,
-            "the interrupt-enable seam keeps its existing per-cfg definitions and gains no caller"
+        for register in ["GICC_PMR_OFFSET", "GICC_CTLR_OFFSET"] {
+            assert!(
+                flat.contains(&format!("cpu_if_base, {register}")),
+                "{register} is a CPU-interface register and must be addressed from cpu_if_base"
+            );
+            assert!(
+                !flat.contains(&format!("dist_base, {register}")),
+                "{register} must never be reached through the distributor base — that is the \
+                 exact aliasing this derivation was fixed to prevent"
+            );
+        }
+        assert!(
+            !bring_up.contains("GIC_CPU_IF_BASE.load"),
+            "the bring-up takes both bases as parameters; it must not reach for the stored one"
         );
     }
 }
@@ -128981,24 +129001,15 @@ mod aarch64_gic_device_mapping {
                 "{name} must perform no device access — it only establishes a mapping"
             );
         }
-        // And the IRQ layer is untouched: no PPI enable, no timer arm, no extra unmask caller.
-        for forbidden in [
-            "GICD_ISENABLER",
-            "enable_timer_ppi",
-            "bring_up_bsp_timer",
-            "claim_interrupt",
-        ] {
-            assert!(
-                !A64_IRQ_SRC.contains(forbidden),
-                "{forbidden} belongs to the ProductionTick bring-up, not to this prerequisite"
-            );
-        }
-        assert_eq!(
-            A64_IRQ_SRC
-                .matches("pub fn enable_interrupts_for_boot()")
-                .count(),
-            3,
-            "the interrupt-enable seam keeps its per-cfg definitions and gains no caller"
+        // The page-table layer stays a mapping layer: the controller is programmed exclusively
+        // from the IRQ layer, which consumes the published bases and never re-derives them.
+        assert!(
+            A64_IRQ_SRC.contains("page_table::gic_mmio_bases()"),
+            "the IRQ layer reads the published DTB-derived bases"
+        );
+        assert!(
+            !A64_IRQ_SRC.contains("publish_gic_mmio_bases"),
+            "and never republishes them — publication stays a boot-time, pre-root act"
         );
     }
 
@@ -129010,6 +129021,459 @@ mod aarch64_gic_device_mapping {
                 && !X86_PT_SRC.contains("publish_gic_mmio_bases")
                 && !X86_PT_SRC.contains("is_reserved_device_va"),
             "the device-leaf mechanism is AArch64-local"
+        );
+    }
+}
+
+/// Canonical 199E — the AArch64 default production scheduler tick.
+///
+/// AArch64 had never taken an interrupt: `SchedulerState.timer` only advances from
+/// `Trap::TimerInterrupt`, and nothing on this port ever delivered one. Every reply/call deadline
+/// armed in the `ProductionTick` clock domain was therefore unreachable by default, which is what
+/// left canonical 199E open on this architecture.
+///
+/// This checkpoint arms it. The whole safety argument is ORDER, so that is what these guards pin:
+/// who may start the timer, what must be confirmed before IRQs are unmasked, and where the GIC
+/// claim sits relative to the tick, the re-arm and the completion.
+///
+/// The behavioural fixtures live in `arch/aarch64/irq.rs` and compile only in an AArch64 test
+/// build (`src/arch/aarch64/**` is `#[cfg(target_arch = "aarch64")]`); these guards run in the
+/// canonical hosted suite, and the live QEMU sequence proves the running arrangement.
+mod aarch64_production_tick {
+    use std::vec::Vec;
+
+    const BOOT_ENTRY_SRC: &str = include_str!("../../arch/boot_entry.rs");
+    const A64_IRQ_SRC: &str = include_str!("../../arch/aarch64/irq.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const X86_IRQ_SRC: &str = include_str!("../../arch/x86_64/irq.rs");
+    const RISCV_IRQ_SRC: &str = include_str!("../../arch/riscv64/irq.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    fn bsp_timer_arm() -> &'static str {
+        BOOT_ENTRY_SRC
+            .split("pub fn start_bsp_periodic_timer(")
+            .nth(1)
+            .expect("the single BSP timer start")
+            .split("\nstruct ")
+            .next()
+            .expect("its body")
+    }
+
+    /// Only CPU0 may start or drive the timer.
+    ///
+    /// `SchedulerState.timer` is ONE shared `Timer`, not a per-CPU counter (`defs.rs`), so a
+    /// second CPU arming its own timer would make the scheduler's tick rate scale with the CPU
+    /// count and let two CPUs race to advance the same value.
+    #[test]
+    fn only_the_bsp_can_start_the_timer() {
+        let arm = bsp_timer_arm();
+        let aarch64 = arm
+            .split("target_arch = \"aarch64\"")
+            .nth(1)
+            .expect("the AArch64 arm");
+        assert!(
+            aarch64.contains("cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID"),
+            "the first gate is a BSP identity check against the platform's bootstrap CPU"
+        );
+        assert!(
+            aarch64.contains("reason=not_bsp"),
+            "and a non-BSP caller is refused, not silently allowed through"
+        );
+        // The AP bring-up must not arm a timer of its own.
+        let ap = A64_BOOT_SRC
+            .split("YARM_AARCH64_SMP_WAIT cpu={} state=released")
+            .nth(1)
+            .expect("the AP release path")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert!(
+            !ap.contains("program_timer_deadline"),
+            "an AP must never arm a timer — it would advance the single shared scheduler counter"
+        );
+        assert!(
+            ap.contains("process_cross_cpu_work_for_cpu"),
+            "APs still service cross-CPU work; only the timer arm was withdrawn"
+        );
+    }
+
+    /// Everything the first interrupt will need is confirmed BEFORE `DAIF` is unmasked, and the
+    /// unmask is unconditionally the last thing that happens.
+    #[test]
+    fn readiness_is_confirmed_before_the_daif_unmask() {
+        let arm = bsp_timer_arm();
+        let aarch64 = arm
+            .split("target_arch = \"aarch64\"")
+            .nth(1)
+            .expect("the AArch64 arm");
+        let unmask = aarch64
+            .find("enable_interrupts_for_boot()")
+            .expect("the DAIF unmask");
+        for (what, needle) in [
+            (
+                "the scheduler is past bootstrap",
+                "bootstrap_scheduler_is_ready()",
+            ),
+            ("EL1 vectors are installed", "vector_table_is_installed()"),
+            (
+                "the shared trap state exists",
+                "trap_shared_kernel_is_installed()",
+            ),
+            ("the GIC accepted the PPI", "enable_bsp_arch_timer_ppi()"),
+            ("CNTP is actually armed", "arch_timer_is_armed()"),
+            (
+                "the timer deadline is programmed",
+                "program_timer_deadline_current_cpu(",
+            ),
+        ] {
+            let at = aarch64
+                .find(needle)
+                .unwrap_or_else(|| panic!("{what}: {needle} must be part of the arm"));
+            assert!(
+                at < unmask,
+                "{what} must be established BEFORE interrupts are unmasked"
+            );
+        }
+        assert_eq!(
+            aarch64.matches("enable_interrupts_for_boot()").count(),
+            1,
+            "there is exactly one unmask, on the one path where every gate passed"
+        );
+    }
+
+    /// Each gate is a readback, and a failing readback leaves the CPU masked with nothing armed.
+    #[test]
+    fn the_gic_and_cntp_gates_fail_closed() {
+        let arm = bsp_timer_arm();
+        let aarch64 = arm
+            .split("target_arch = \"aarch64\"")
+            .nth(1)
+            .expect("the AArch64 arm");
+        for reason in [
+            "reason=not_bsp",
+            "reason=scheduler_not_ready",
+            "reason=vbar_not_installed",
+            "reason=no_shared_trap_state",
+            "reason=gic_readback_failed",
+            "reason=cntp_readback_failed",
+        ] {
+            assert!(
+                aarch64.contains(reason),
+                "{reason} must be a reported skip, so a failed gate is visible and inert"
+            );
+        }
+        // The GIC bring-up judges every write by reading it back.
+        assert!(
+            A64_IRQ_SRC.contains("fn gic_bring_up_readbacks_agree("),
+            "one predicate decides the whole bring-up"
+        );
+        let agree = A64_IRQ_SRC
+            .split("pub fn gic_bring_up_readbacks_agree(")
+            .nth(1)
+            .expect("the readback predicate")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            agree.contains("pmr != 0")
+                && agree.contains("gicc_ctlr & 0x1")
+                && agree.contains("gicd_ctlr & 0x1")
+                && agree.contains("gicd_isenabler0 & (1u32 << (ARCH_TIMER_PPI_INTID as u32))"),
+            "all four readbacks must agree: priority mask, CPU interface, distributor, PPI"
+        );
+        // And CNTP is required to be enabled AND unmasked, not merely written.
+        let cntp = A64_IRQ_SRC
+            .split("pub fn cntp_ctl_is_armed(")
+            .nth(1)
+            .expect("the CNTP predicate")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            cntp.contains("(cntp_ctl_el0 & 0x3) == 1"),
+            "ENABLE set and IMASK clear — ISTATUS is transient and must not be part of the test"
+        );
+    }
+
+    /// The PPI enable targets CPU0's banked INTID 30 and nothing else, from the derived base.
+    #[test]
+    fn the_ppi_enable_is_the_banked_timer_intid_only() {
+        assert!(
+            A64_IRQ_SRC.contains("pub const ARCH_TIMER_PPI_INTID: u16 = 30;"),
+            "the EL1 physical timer PPI is fixed by the ARM binding"
+        );
+        let enable = A64_IRQ_SRC
+            .split("pub fn enable_bsp_arch_timer_ppi() -> bool {")
+            .nth(1)
+            .expect("the bring-up entry point")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert!(
+            enable.contains("crate::arch::aarch64::page_table::gic_mmio_bases()"),
+            "the bases come from the delivered DTB-derived publication"
+        );
+        assert!(
+            enable.contains("dist_pa == 0 || cpu_if_pa == 0"),
+            "an absent base programs nothing — fail closed, never a guessed address"
+        );
+        for guessed in ["0x0800_0000", "0x0801_0000", "0x08000000", "0x08010000"] {
+            assert!(
+                !A64_IRQ_SRC.contains(guessed),
+                "{guessed} would be a hard-coded GIC address"
+            );
+        }
+        let program = A64_IRQ_SRC
+            .split("fn program_arch_timer_ppi(dist_base: usize, cpu_if_base: usize)")
+            .nth(1)
+            .expect("the register sequence")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        let flat = program.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("GICD_ISENABLER0_OFFSET, 1u32 << (ARCH_TIMER_PPI_INTID as u32)"),
+            "exactly one bit is set, and it is the timer's"
+        );
+        assert!(
+            !program.contains("GICD_ISENABLER0_OFFSET + "),
+            "no shared-peripheral enable register is touched"
+        );
+        assert!(
+            !program.contains("0xffff_ffff") && !program.contains("!0u32"),
+            "nothing enables INTIDs wholesale"
+        );
+    }
+
+    /// Claim, tick, re-arm, complete — in that order, once each.
+    ///
+    /// The arch timer's PPI is LEVEL-sensitive: it stays asserted until `CNTP_TVAL_EL0` is
+    /// reprogrammed. Completing before that re-arm hands the distributor an interrupt that is
+    /// still asserting, and it re-presents it immediately — an IRQ storm.
+    #[test]
+    fn the_claim_precedes_the_tick_and_the_completion_follows_the_rearm() {
+        let entry = A64_BOOT_SRC
+            .split("extern \"C\" fn yarm_aarch64_vector_entry(")
+            .nth(1)
+            .expect("the vector entry")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        let claim = entry.find("irq::claim_interrupt()").expect("the claim");
+        let dispatch = entry
+            .find("dispatch_trap_entry_with_shared_kernel(")
+            .expect("the dispatch");
+        let complete = entry
+            .find("irq::complete_interrupt(")
+            .expect("the completion");
+        assert!(
+            claim < dispatch && dispatch < complete,
+            "claim happens before the handler runs and completion after it returns"
+        );
+        assert_eq!(
+            entry.matches("irq::claim_interrupt()").count(),
+            1,
+            "exactly one claim per IRQ exception"
+        );
+        assert_eq!(
+            entry.matches("irq::complete_interrupt(").count(),
+            1,
+            "exactly one completion per claim"
+        );
+        // The re-arm lives at the END of the shared timer arm, so it runs before the completion.
+        let timer_arm = FAULT_SRC
+            .split("Trap::TimerInterrupt => {")
+            .nth(1)
+            .expect("the shared timer arm")
+            .split("\n            Trap::PageFault")
+            .next()
+            .expect("its body");
+        let tick = timer_arm
+            .find("self.tick_scheduler_timer()")
+            .expect("the tick");
+        let rearm = timer_arm
+            .rfind("self.hal.program_timer_deadline(")
+            .expect("the re-arm");
+        assert!(
+            tick < rearm,
+            "the shared counter advances once, then the timer is re-armed"
+        );
+        assert_eq!(
+            timer_arm.matches("self.tick_scheduler_timer()").count(),
+            1,
+            "one accepted timer IRQ advances the shared counter exactly once"
+        );
+        // And the single-step acknowledgement the shared arm calls first is inert on AArch64, so
+        // it can neither consume the claim nor complete a still-asserted level source.
+        let ack = A64_IRQ_SRC
+            .split("pub fn acknowledge_interrupt(irq_line: u16) {")
+            .nth(1)
+            .expect("the AArch64 acknowledge seam")
+            .split('}')
+            .next()
+            .expect("its body");
+        assert!(
+            !ack.contains("gic_read_iar") && !ack.contains("gic_write_eoir"),
+            "AArch64 acknowledgement is split into claim and complete; this seam does neither"
+        );
+    }
+
+    /// A spurious or non-timer INTID neither ticks nor re-arms.
+    #[test]
+    fn spurious_and_non_timer_intids_do_nothing() {
+        let entry = A64_BOOT_SRC
+            .split("extern \"C\" fn yarm_aarch64_vector_entry(")
+            .nth(1)
+            .expect("the vector entry")
+            .split("\n#[cfg")
+            .next()
+            .expect("its body");
+        assert!(
+            entry.contains("irq::intid_is_special)") && entry.contains("return;"),
+            "a GICv2 special INTID (1020..=1023) returns immediately: no tick, no re-arm, no EOI"
+        );
+        assert!(
+            entry.contains("intid == crate::arch::aarch64::irq::ARCH_TIMER_PPI_INTID"),
+            "only INTID 30 is treated as the timer"
+        );
+        assert!(
+            entry.contains("Some(intid) if !is_timer_irq => Some(intid)"),
+            "any other claimed INTID is reported as an external interrupt instead"
+        );
+        // `Trap::ExternalInterrupt` is a no-op in the shared handler: no tick, no re-arm.
+        assert!(
+            FAULT_SRC
+                .contains("Trap::PageFault | Trap::ExternalInterrupt | Trap::Unknown => Ok(())"),
+            "an external interrupt neither advances the counter nor re-arms the timer"
+        );
+        let special = A64_IRQ_SRC
+            .split("pub fn intid_is_special(intid: u16) -> bool {")
+            .nth(1)
+            .expect("the special-INTID predicate")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            special.contains("intid >= GIC_FIRST_SPECIAL_INTID"),
+            "the GICv2 reserved range decides, not a magic literal at the call site"
+        );
+        assert!(
+            A64_IRQ_SRC.contains("const GIC_FIRST_SPECIAL_INTID: u16 = 1020;"),
+            "and that range is 1020..=1023"
+        );
+    }
+
+    /// The mappings delivered by the previous checkpoint are what make this reachable.
+    #[test]
+    fn the_persistent_device_mappings_are_what_is_used() {
+        assert!(
+            A64_IRQ_SRC.contains("crate::arch::aarch64::page_table::gic_mmio_bases()"),
+            "the controller is addressed through the published, mapped bases"
+        );
+        // Identity VA == PA is what lets the IRQ layer treat the base as a raw pointer at all.
+        const PT_SRC: &str = include_str!("../../arch/aarch64/page_table.rs");
+        assert!(
+            PT_SRC.contains("let va = pa;"),
+            "the device leaves are identity-mapped, so the derived PA is a usable address"
+        );
+        assert!(
+            PT_SRC.contains("ensure_reserved_device_mappings(self, root_idx)?;"),
+            "and every address space carries them, so an IRQ taken under a user root still reaches \
+             the GIC — no TTBR switch happens on AArch64 exception entry"
+        );
+    }
+
+    /// x86_64 and RISC-V keep their own, unchanged timer arrangements.
+    #[test]
+    fn x86_and_riscv_timer_behaviour_is_unchanged() {
+        // x86_64 still acknowledges in one step, from its own LAPIC seam.
+        assert!(
+            X86_IRQ_SRC.contains("pub fn acknowledge_interrupt(_irq_line: u16)"),
+            "the x86_64 acknowledgement seam is untouched"
+        );
+        for split_only in [
+            "claim_interrupt",
+            "complete_interrupt",
+            "ARCH_TIMER_PPI_INTID",
+        ] {
+            assert!(
+                !X86_IRQ_SRC.contains(split_only),
+                "{split_only} is the AArch64 split; x86_64 must not acquire it"
+            );
+            assert!(
+                !RISCV_IRQ_SRC.contains(split_only),
+                "{split_only} is the AArch64 split; RISC-V must not acquire it"
+            );
+        }
+        // The x86_64 BSP arm keeps its own body and its own marker.
+        let arm = bsp_timer_arm();
+        let x86 = arm
+            .split("target_arch = \"x86_64\"")
+            .nth(1)
+            .expect("the x86_64 arm")
+            .split("target_arch = \"aarch64\"")
+            .next()
+            .expect("bounded before the AArch64 arm begins");
+        assert!(
+            x86.contains("X86_BOOTSTRAP_TIMER_STARTED"),
+            "the x86_64 arm still emits its established marker"
+        );
+        assert!(
+            !x86.contains("enable_interrupts_for_boot()"),
+            "x86_64 unmasks elsewhere (STI at LAPIC init); this checkpoint adds no caller there"
+        );
+        // RISC-V remains gated: this checkpoint does not touch its blocker.
+        const RISCV_TIMER_SRC: &str = include_str!("../../arch/riscv64/mod.rs");
+        let _ = RISCV_TIMER_SRC;
+        assert!(
+            !RISCV_IRQ_SRC.contains("enable_bsp_arch_timer_ppi"),
+            "the RISC-V S-mode timer bridge stays where it was — it is the remaining blocker"
+        );
+    }
+
+    /// The readiness latch is set exactly where bootstrap declares itself finished.
+    #[test]
+    fn the_scheduler_readiness_latch_is_arch_neutral_and_set_once() {
+        let signal = BOOT_ENTRY_SRC
+            .split("pub fn signal_bootstrap_scheduler_ready() {")
+            .nth(1)
+            .expect("the readiness signal")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            signal.contains("BOOTSTRAP_SCHEDULER_READY.store(true, Ordering::Release)"),
+            "the latch is set by the established bootstrap-complete seam, not by a new one"
+        );
+        assert!(
+            signal.contains("target_arch = \"x86_64\""),
+            "and the x86_64 half of that seam is preserved unchanged"
+        );
+        assert_eq!(
+            BOOT_ENTRY_SRC
+                .matches("BOOTSTRAP_SCHEDULER_READY.store(")
+                .count(),
+            1,
+            "exactly one writer"
+        );
+    }
+
+    /// This checkpoint adds no broad-lock acquisition, so the Stage 204A census is unchanged.
+    #[test]
+    fn no_broad_lock_acquisition_is_added() {
+        for (name, src) in [
+            ("arch/boot_entry.rs", BOOT_ENTRY_SRC),
+            ("arch/aarch64/irq.rs", A64_IRQ_SRC),
+        ] {
+            assert!(
+                !src.contains(".with_cpu(") && !src.contains(".state.lock()"),
+                "{name} must not acquire the broad lock"
+            );
+        }
+        let arm = bsp_timer_arm();
+        assert!(
+            !arm.contains(".with_cpu(") && !arm.contains(".with(|"),
+            "the BSP timer arm drives the kernel through existing accessors only"
         );
     }
 }

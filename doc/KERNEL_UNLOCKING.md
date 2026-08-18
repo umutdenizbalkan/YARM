@@ -433,13 +433,101 @@ completing any of them.
 > ARM's JEP106 implementer ID, i.e. genuine distributor content rather than a stray read. The
 > diagnostic was removed before committing; the committed build performs no GIC MMIO at all.
 >
-> **AArch64 ProductionTick bring-up remains PENDING** on these now-unblocked prerequisites.
+> **AArch64 ProductionTick is DELIVERED** on these prerequisites — see below.
+
+> **AArch64 ProductionTick — DELIVERED. AArch64 drives the default production scheduler tick, and
+> only the BSP may.**
 >
-> **What stays open.** Default AArch64/RISC-V scheduler-tick reachability under a user workload is
-> unresolved, so end-to-end production expiry on those ports is still not demonstrable and
-> **canonical 199E remains OPEN**. Census delta 0; direct production remains OFF
-> (`IPCCALL_DIRECT_PROOF_ENABLED: AtomicBool::new(false)`); ownership production callers 0; no U8 or
-> WA3C2 work is begun.
+> `SchedulerState.timer` is ONE shared `Timer` (`defs.rs`), not a per-CPU counter. Exactly one CPU
+> may therefore advance it, or the scheduler's tick rate would scale with the CPU count and several
+> CPUs would race the same value. CPU0 owns it; the AArch64 AP timer arm was withdrawn (APs still
+> service cross-CPU work). SMP=4 is byte-identical to SMP=1: one `AARCH64_BSP_TIMER_STARTED`, every
+> tick `cpu=0`.
+>
+> **The bring-up order is the safety argument.** Each step is a gate that reports and stops rather
+> than proceeding, and a failure leaves the CPU masked with nothing armed: BSP identity → scheduler
+> past bootstrap → `VBAR_EL1` installed → shared trap state installed → GIC programmed and **read
+> back** (priority mask, CPU interface, distributor, and CPU0's banked PPI 30 must all agree, judged
+> by one predicate) → `CNTP` programmed and **read back** (`CNTP_CTL_EL0 & 0x3 == 1`: enabled and
+> unmasked; `ISTATUS` is transient and deliberately excluded) → only then `DAIF` is unmasked. The
+> bases come from the DTB-derived publication above and are never guessed; an absent base (RPi5's
+> GICv3) programs nothing.
+>
+> **Claim and completion are split**, because the arch timer's PPI is level-sensitive: its level
+> stays asserted until `CNTP_TVAL_EL0` is reprogrammed. So the vector entry claims from `GICC_IAR`,
+> the shared handler ticks once and re-arms (deasserting the level), and only then is `GICC_EOIR`
+> written. Completing before the re-arm would hand the distributor an interrupt that is still
+> asserting and it would re-present it forever. Spurious INTIDs (1020..=1023) complete nothing and
+> neither tick nor re-arm; any other INTID is reported as an external interrupt, which the shared
+> handler treats as a no-op.
+>
+> **Two latent defects had to be fixed.** The vector stub's `kind` never reached
+> `yarm_aarch64_vector_entry`: a marker call deliberately loads `x0` with `ELR_EL1`, so every
+> exception decoded as kind `unknown`. That was harmless for exactly as long as AArch64 took no
+> interrupts — `kind` fed only a log line and an `is_irq_kind` test that stayed false — but it makes
+> an IRQ indistinguishable from a syscall, so nothing claims, ticks, re-arms or completes, and the
+> level-triggered PPI re-presents forever (77 355 storm entries observed before the fix). The kind is
+> now preserved in `x19`. Separately, `DEBUG_TIMER_LOG` suppressed `YARM_SCHED_TICK` on non-x86;
+> AArch64 now shares x86_64's existing bounded four-tick emission rather than gaining a marker
+> family of its own, and x86_64 keeps its exact code and bound.
+
+> **The one-tick supervisor policy assumed a dormant clock; only that userspace policy was
+> recalibrated.**
+>
+> The kernel expires a deadline on the first tick where `now >= deadline` (`runtime.rs`:
+> `if reply_now < deadline { continue; }`), and the deadline is `scheduler_tick_now() + N` sampled
+> at whatever moment the receive is armed — an arbitrary phase inside the current tick period, whose
+> remainder is not guaranteed. So the budget is worth **`N - 1` complete periods**, and
+> `SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS = 1` guaranteed *nothing*. While the scheduler clock was
+> dormant this was invisible: the deadline was armed and never expired. The moment the tick
+> advanced, the supervisor's process-manager round-trip lost the race, the reply alias was correctly
+> invalidated, and the peer's later reply was correctly refused with `WrongObject`.
+>
+> The binding constraint is the two `query_*_via_process_manager` callers: each sends an `ipc_call`
+> to PM and waits for PM's reply **with no retry**, and a timeout there degrades to `Ok(None)` — a
+> wrong answer rather than a retried one. For that reply to be possible the peer must be dispatched
+> and run a full quantum, and it may not be the first task picked. The requirement is therefore two
+> guaranteed complete periods, i.e. `N - 1 >= 2`, and the smallest defensible value is **3**. It is
+> architecture-neutral by construction: denominated in scheduler ticks, naming no target.
+>
+> **Kernel timeout semantics were not touched** — no deadline arithmetic or comparison, no
+> reply-token or alias lifetime, no timeout settlement or retirement, no `WrongObject` handling, no
+> timer period or tick source, no per-architecture timeout policy, no smoke-script BAD-pattern
+> check, no oracle behaviour. The proof that the kernel evidence transfers is mechanical: the
+> AArch64 kernel image built after the supervisor-only amendment is **bit-for-bit identical** to the
+> image that produced the ProductionTick and `TimedOut` evidence (`sha256=013c8286…`, both `.bin`
+> and `.elf`), while only the initramfs differs. The kernel timeout proof was obtained from that
+> identical image; the final live profiles validate the amended supervisor image.
+>
+> With the policy calibrated, the supervisor's reply now wins before expiry —
+> `IPC_REPLY_DELIVER_TO_WAITER tid=2 endpoint=5` where the reply previously failed — and the
+> production timeout record is armed with `deadline=3` and correctly disarmed on the reply win. The
+> default timeout marker no longer fires on this boot, which is the intended outcome and not a
+> reason to weaken the policy.
+>
+> **Delivery gates.** Three consecutive AArch64 SMP=1 runs plus SMP=4, all PASS and identical:
+> `IPC_REPLY_FAIL` 0, supervisor `WrongObject` 0, `fatal=0 panic=0`, `AARCH64_BSP_TIMER_STARTED`
+> exactly once, ticks strictly monotonic (`cpu=0 tick=1/2/3`), CPU0 the only timer owner, IRQ count =
+> tick count = EOI count, no storm, no duplicate tick, no AP tick, `scan_broad_lock=0`,
+> `production=1`. x86_64 core PASS (`TICK=4`), RISC-V core PASS. Hosted suite 4568 passed / 0 failed;
+> 18 integration targets, 0 failures; census and doc guards green; `cargo fmt --all --check` and
+> `git diff --check` clean; `cargo metadata --locked` exit 0; `cargo check --workspace` 0 errors; all
+> three freestanding checks exit 0; `ARTIFACT_BUILD_INTEGRITY arch=aarch64 … result=ok`.
+> Repository-policy clippy adds **no new error class and no new warning class** against exact base
+> `7fe7d06`; the only deltas are count increases inside pre-existing classes from the added tests.
+>
+> **Exact-base deferral.** The AArch64 reply-timeout retirement profile
+> (`qemu-ipc-reply-timeout-aarch64-retirement-smoke.sh`) fails at this checkpoint AND at exact base
+> `7fe7d06`, and the two failure sets are **character-identical** — same nine `[fail]` lines, same
+> `STAGE_200C_REPLY_TIMEOUT_AARCH64_RETIREMENT_SEAL … result=fail`. It is therefore pre-existing and
+> deferred, not caused by this work.
+>
+> **What stays open.** RISC-V's gated S-mode timer bridge is now the **only** default ProductionTick
+> reachability blocker (`TIMER_IRQ_FEATURE_ENABLED = cfg!(feature = "riscv64-timer-irq")`, default
+> OFF, and `STIE_AUDIT_COMPLETE: bool = false`; the `wfi` re-entrancy blocker is recorded in
+> `doc/ARCH_RISCV64.md` §13). **Canonical 199E remains OPEN pending RISC-V.** Census delta 0; direct
+> production remains OFF (`IPCCALL_DIRECT_PROOF_ENABLED: AtomicBool::new(false)`); ownership
+> production callers 0; no U8 or WA3C2 work is begun.
 
 > **The off-lock IPC-timeout pipeline is production on all three architectures, and two
 > classes are gone from the broad-lock scan.**

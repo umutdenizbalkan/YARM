@@ -1194,6 +1194,164 @@ mod tests {
         );
     }
 
+    /// Canonical 199E — the supervisor's short receive budget must survive a LIVE scheduler clock.
+    ///
+    /// The kernel expires a deadline on the first tick where `now >= deadline`, and the deadline
+    /// is `scheduler_tick_now() + N` sampled at an arbitrary phase inside a tick period. The
+    /// remainder of that period is not guaranteed, so the budget is worth `N - 1` COMPLETE
+    /// periods and no more. `N = 1` guarantees nothing, which is why the process-manager
+    /// round-trip lost its race the moment the clock started advancing.
+    ///
+    /// This models the kernel's rule; it does not change it.
+    mod supervisor_short_recv_budget {
+        /// The literal the production supervisor compiles with. Parsed from source because the
+        /// constant itself is `#[cfg(not(test))]` — the production and test views must not drift.
+        fn configured_ticks() -> u64 {
+            let src = include_str!("supervisor/service.rs");
+            let decl = src
+                .split("const SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS: u64 = ")
+                .nth(1)
+                .expect("the supervisor short-receive budget must be declared");
+            decl.split(';')
+                .next()
+                .expect("its literal")
+                .trim()
+                .parse()
+                .expect("a plain integer literal")
+        }
+
+        /// The kernel's expiry rule, reproduced exactly: due on the first tick at or past the
+        /// deadline (`runtime.rs`: `if reply_now < deadline { continue; }`).
+        fn is_due(now: u64, deadline: u64) -> bool {
+            now >= deadline
+        }
+
+        /// Complete tick periods a budget of `n` guarantees, for ANY arm phase.
+        fn guaranteed_complete_periods(n: u64) -> u64 {
+            n.saturating_sub(1)
+        }
+
+        #[test]
+        fn the_budget_is_finite_and_nonzero() {
+            let n = configured_ticks();
+            assert_ne!(
+                n, 0,
+                "zero is not a try-receive in this runtime, it is ambiguous"
+            );
+            assert!(
+                n < u64::MAX,
+                "an unbounded wait would defeat the bounded-poll design"
+            );
+        }
+
+        #[test]
+        fn the_budget_carries_the_intended_phase_margin() {
+            let n = configured_ticks();
+            assert_eq!(
+                guaranteed_complete_periods(n),
+                n - 1,
+                "the arm phase is arbitrary, so only whole periods after the first tick count"
+            );
+            assert!(
+                guaranteed_complete_periods(n) >= 2,
+                "the process-manager round-trip has no retry: it needs one complete period for \
+                 the peer to run and one of slack if another runnable task is picked first, so \
+                 the budget must guarantee at least two — got {}",
+                guaranteed_complete_periods(n)
+            );
+        }
+
+        /// The worst case is the one that broke: armed a hair before a tick boundary.
+        #[test]
+        fn an_ordinary_reply_completes_before_expiry_even_at_the_worst_arm_phase() {
+            let n = configured_ticks();
+            // Armed at tick `t` with essentially no remainder left in that period, so the very
+            // next tick arrives immediately.
+            let armed_at_tick = 41u64;
+            let deadline = armed_at_tick + n;
+            // The peer is dispatched and replies within the guaranteed complete periods.
+            let peer_replies_at = armed_at_tick + 1 + guaranteed_complete_periods(n) - 1;
+            assert!(
+                !is_due(peer_replies_at, deadline),
+                "a reply landing inside the guaranteed margin must NOT have expired"
+            );
+            // And the immediately-following tick — the one N=1 would have expired on — is safe.
+            assert!(
+                !is_due(armed_at_tick + 1, deadline),
+                "the tick right after the arm must not expire the wait; that is the N=1 defect"
+            );
+        }
+
+        #[test]
+        fn a_genuinely_absent_reply_still_times_out() {
+            let n = configured_ticks();
+            let armed_at_tick = 41u64;
+            let deadline = armed_at_tick + n;
+            assert!(
+                is_due(armed_at_tick + n, deadline),
+                "the budget is bounded: silence must still expire, exactly at the deadline tick"
+            );
+            assert!(
+                is_due(armed_at_tick + n + 1, deadline),
+                "and stays expired afterwards"
+            );
+        }
+
+        /// Expiry is a single edge: exactly one tick is the first due tick, so a scan that runs
+        /// on every tick settles the record once and cannot wake or complete it twice.
+        #[test]
+        fn expiry_is_a_single_edge_so_no_duplicate_completion_or_wake_occurs() {
+            let n = configured_ticks();
+            let armed_at_tick = 41u64;
+            let deadline = armed_at_tick + n;
+            let mut transitions = 0usize;
+            let mut first_due_tick = None;
+            for t in armed_at_tick..=armed_at_tick + n + 4 {
+                if is_due(t, deadline) && !is_due(t.saturating_sub(1), deadline) {
+                    transitions += 1;
+                    first_due_tick.get_or_insert(t);
+                }
+            }
+            assert_eq!(
+                transitions, 1,
+                "there is exactly one transition into due across the whole scan window"
+            );
+            assert_eq!(
+                first_due_tick,
+                Some(deadline),
+                "and it lands on the deadline tick"
+            );
+        }
+
+        /// The budget is denominated in scheduler ticks and names no target: one policy for
+        /// every architecture.
+        #[test]
+        fn the_policy_is_architecture_neutral() {
+            let src = include_str!("supervisor/service.rs");
+            let decl_start = src
+                .find("/// Bounded wait, in scheduler ticks")
+                .expect("the budget must carry its derivation");
+            let decl_end = src
+                .find("const SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS: u64 = ")
+                .expect("the declaration");
+            let doc = &src[decl_start..decl_end];
+            assert!(
+                doc.contains("guaranteed complete periods = N - 1"),
+                "the phase rule must be stated where the value is chosen"
+            );
+            for target in ["aarch64", "x86_64", "riscv64", "target_arch"] {
+                assert!(
+                    !doc.contains(target),
+                    "{target} must not appear: the budget is one architecture-neutral policy"
+                );
+            }
+            assert!(
+                !src.contains("SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS_AARCH64"),
+                "no per-architecture variant of the budget may exist"
+            );
+        }
+    }
+
     #[test]
     fn sup5_restart_models_remain_inert_and_deferred() {
         let pm_src = include_str!("process_manager/service.rs");

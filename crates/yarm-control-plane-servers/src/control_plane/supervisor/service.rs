@@ -53,8 +53,34 @@ mod restart_model;
 pub(crate) use restart_model::*;
 
 const SUPERVISOR_FAULT_REPORT_WIRE_LEN: usize = 17;
+/// Bounded wait, in scheduler ticks, for the supervisor's short receives.
+///
+/// This is a *phase-aware* budget, not a duration. The kernel expires a deadline on the first
+/// tick where `now >= deadline`, and the deadline is `scheduler_tick_now() + N` sampled at
+/// whatever moment the receive is armed. That moment falls at an arbitrary phase inside the
+/// current tick period, and the remainder of that period is not guaranteed — it can be
+/// arbitrarily close to zero. So the margin this value actually buys is:
+///
+///     guaranteed complete periods = N - 1
+///
+/// `N = 1` therefore guarantees *nothing*: the very next tick may land immediately after the
+/// arm. That was invisible for as long as the scheduler clock was dormant on some targets — the
+/// deadline was armed and simply never expired. Once the clock genuinely advances, the
+/// process-manager round-trip below loses the race, the reply alias is correctly invalidated,
+/// and the peer's later reply is correctly refused with `WrongObject`.
+///
+/// The two `query_*_via_process_manager` callers are the binding constraint: each sends an
+/// `ipc_call` to PM and then waits for PM's reply, with no retry — a timeout there degrades to
+/// `Ok(None)`, i.e. "no token"/"no lifecycle", which is a wrong answer rather than a retried
+/// one. For that reply to be possible the peer must be dispatched and must run a full quantum,
+/// and it may not be the first task picked. So the requirement is two guaranteed complete
+/// periods — one for the peer to run, one of slack if another runnable task is scheduled first
+/// — which is `N - 1 >= 2`, i.e. the smallest defensible value is 3.
+///
+/// This is architecture-neutral by construction: it is denominated in scheduler ticks, so it
+/// scales with whatever period the platform's timer provides and names no target.
 #[cfg(not(test))]
-const SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS: u64 = 1;
+const SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS: u64 = 3;
 const SUPERVISOR_FAULT_REPORT_TID_START: usize = 0;
 const SUPERVISOR_FAULT_REPORT_TID_END: usize = 8;
 const SUPERVISOR_FAULT_REPORT_ADDR_START: usize = 8;

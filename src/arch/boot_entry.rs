@@ -63,10 +63,21 @@ pub fn emit_panic(info: &core::panic::PanicInfo<'_>) {
     crate::arch::selected_isa::boot::emit_panic(info)
 }
 
+/// Latched once by [`signal_bootstrap_scheduler_ready`], read by
+/// [`start_bsp_periodic_timer`]. Arch-neutral: it records the single ordering fact that both
+/// need — bootstrap has finished and the scheduler owns its state again.
+static BOOTSTRAP_SCHEDULER_READY: AtomicBool = AtomicBool::new(false);
+
+/// `true` once bootstrap has completed and the scheduler is ready to be driven by a timer.
+pub fn bootstrap_scheduler_is_ready() -> bool {
+    BOOTSTRAP_SCHEDULER_READY.load(Ordering::Acquire)
+}
+
 /// Called once after bootstrap_first_user_task completes and all user tasks are
 /// enqueued. On x86_64 bare metal, this unblocks the timer ISR from EOI-only
 /// mode so it can process scheduler ticks and preemption normally.
 pub fn signal_bootstrap_scheduler_ready() {
+    BOOTSTRAP_SCHEDULER_READY.store(true, Ordering::Release);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     {
         crate::arch::x86_64::descriptor_tables::signal_bootstrap_scheduler_ready();
@@ -89,7 +100,65 @@ pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
         );
         crate::yarm_log!("X86_BOOTSTRAP_TIMER_STARTED");
     }
-    #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+    // Canonical 199E — the AArch64 default production scheduler tick.
+    //
+    // The order below is the whole safety argument, and every step is a gate, not a hope:
+    // nothing is programmed until the CPU, the scheduler, the vectors and the shared trap state
+    // are all confirmed, the GIC is confirmed by readback before `CNTP` is touched, `CNTP` is
+    // confirmed by readback before IRQs are unmasked, and the unmask is unconditionally last.
+    // Any gate that fails leaves the CPU exactly as it was: masked, with nothing armed.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    {
+        let cpu = kernel.current_cpu();
+        // BSP only. `SchedulerState.timer` is a SINGLE shared counter, not per-CPU, so exactly
+        // one CPU may ever advance it — otherwise the tick rate would scale with the CPU count.
+        if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+            crate::yarm_log!("AARCH64_BSP_TIMER_SKIPPED cpu={} reason=not_bsp", cpu.0);
+        } else if !bootstrap_scheduler_is_ready() {
+            crate::yarm_log!(
+                "AARCH64_BSP_TIMER_SKIPPED cpu={} reason=scheduler_not_ready",
+                cpu.0
+            );
+        } else if !crate::arch::aarch64::boot::vector_table_is_installed() {
+            crate::yarm_log!(
+                "AARCH64_BSP_TIMER_SKIPPED cpu={} reason=vbar_not_installed",
+                cpu.0
+            );
+        } else if !crate::arch::aarch64::boot::trap_shared_kernel_is_installed() {
+            crate::yarm_log!(
+                "AARCH64_BSP_TIMER_SKIPPED cpu={} reason=no_shared_trap_state",
+                cpu.0
+            );
+        } else if !crate::arch::aarch64::irq::enable_bsp_arch_timer_ppi() {
+            crate::yarm_log!(
+                "AARCH64_BSP_TIMER_SKIPPED cpu={} reason=gic_readback_failed",
+                cpu.0
+            );
+        } else {
+            kernel.program_timer_deadline_current_cpu(
+                crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+            );
+            if !crate::arch::aarch64::irq::arch_timer_is_armed() {
+                crate::yarm_log!(
+                    "AARCH64_BSP_TIMER_SKIPPED cpu={} reason=cntp_readback_failed",
+                    cpu.0
+                );
+            } else {
+                // Everything the first IRQ will need is confirmed present. Only now.
+                crate::arch::aarch64::irq::enable_interrupts_for_boot();
+                crate::yarm_log!(
+                    "AARCH64_BSP_TIMER_STARTED cpu={} intid={} interval_ticks={}",
+                    cpu.0,
+                    crate::arch::aarch64::irq::ARCH_TIMER_PPI_INTID,
+                    crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS
+                );
+            }
+        }
+    }
+    #[cfg(any(
+        feature = "hosted-dev",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
     let _ = kernel;
 }
 

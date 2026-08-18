@@ -174,9 +174,66 @@ nothing and fail closed. User mappings targeting a reserved device leaf are refu
 under an active user root by reading only harmless identification registers: `GICD_IIDR=0x43b`
 (ARM's JEP106 implementer ID) and `GICC_CTLR=0x1`, at addresses that previously hung the boot.
 
-**AArch64 ProductionTick bring-up remains PENDING** on these now-unblocked prerequisites, and
-**default AArch64/RISC-V scheduler-tick reachability is unresolved**, so end-to-end production
-expiry on those ports is still not demonstrable and **canonical 199E remains OPEN**. Census delta 0;
+**AArch64 ProductionTick — DELIVERED. CENSUS-DELTA 0.** Built on the two prerequisites above, the BSP
+now drives the default production scheduler tick from the architected timer. `CPU0` alone owns it:
+`SchedulerState.timer` is ONE shared `Timer`, not a per-CPU counter, so exactly one CPU may advance
+it and the AArch64 AP timer arm was withdrawn — SMP=4 is byte-identical to SMP=1, with every tick
+`cpu=0`. The bring-up order is the whole safety argument, and each step is a gate that reports and
+stops rather than proceeding: BSP identity → scheduler past bootstrap → `VBAR_EL1` installed →
+shared trap state installed → GIC programmed and **read back** (priority mask, CPU interface,
+distributor, and CPU0's banked PPI 30 must all agree) → `CNTP` programmed and **read back**
+(`CNTP_CTL_EL0 & 0x3 == 1`) → only then `DAIF` is unmasked. A failing gate leaves the CPU masked
+with nothing armed. Claim and completion are **split**, because the timer PPI is level-sensitive:
+the vector entry claims from `GICC_IAR`, the shared handler ticks once and re-arms `CNTP`
+(deasserting the level), and only then is `GICC_EOIR` written — completing earlier would hand the
+distributor a still-asserting interrupt. Spurious INTIDs (1020..=1023) complete nothing and neither
+tick nor re-arm; a non-timer INTID is reported as an external interrupt, which the shared handler
+treats as a no-op. Two latent defects were fixed to get here: the vector stub's `kind` never reached
+`yarm_aarch64_vector_entry` (a marker call loads `x0` with `ELR_EL1`, so every exception decoded as
+kind `unknown` — harmless while no interrupts were taken, but it makes an IRQ indistinguishable from
+a syscall, so nothing claims, ticks, re-arms or completes and the PPI re-presents forever), and
+`DEBUG_TIMER_LOG` suppressed `YARM_SCHED_TICK` on non-x86 — AArch64 now shares x86_64's existing
+bounded four-tick emission rather than gaining a marker family of its own. Live, default
+selector-off: `AARCH64_BSP_TIMER_STARTED cpu=0 intid=30`, ticks strictly monotonic, IRQ count = tick
+count = EOI count, no storm, no duplicate tick, no AP tick, `fatal=0 panic=0`.
+
+**The one-tick supervisor policy assumed a dormant clock.** `SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS`
+was `1`. The kernel expires on the first tick where `now >= deadline`, and the deadline is
+`scheduler_tick_now() + N` sampled at an arbitrary phase inside a tick period, so the budget is
+worth `N - 1` COMPLETE periods — `N = 1` guarantees nothing. That was invisible while the scheduler
+clock was dormant: the deadline was armed and simply never expired. Once the tick advanced, the
+supervisor's process-manager round-trip lost the race, the reply alias was correctly invalidated,
+and the peer's later reply was correctly refused with `WrongObject`. **Only that userspace policy
+was recalibrated** — to `3`. The binding constraint is the two `query_*_via_process_manager` callers:
+each sends an `ipc_call` to PM and waits for the reply **with no retry**, and a timeout there
+degrades to `Ok(None)` — a wrong answer rather than a retried one. The peer must be dispatched and
+run a full quantum, and may not be picked first, so the requirement is two guaranteed complete
+periods, i.e. **`N − 1 >= 2`**, and the smallest defensible value is `3`. It is architecture-neutral:
+denominated in scheduler ticks, naming no target. **Kernel timeout semantics were unchanged** — no
+deadline arithmetic or comparison, no reply-token or alias lifetime, no settlement or retirement, no
+`WrongObject` handling, no timer period or tick source, no per-architecture timeout policy, no
+smoke-script BAD-pattern check, no oracle behaviour. Proof that the kernel evidence transfers: the
+AArch64 kernel image built after the supervisor-only amendment is **bit-for-bit identical** to the
+image that produced the ProductionTick and `TimedOut` proof (`sha256=013c8286…`, both `.bin` and
+`.elf`); only the initramfs differs.
+
+**Delivery gates.** Three consecutive AArch64 SMP=1 runs plus SMP=4 all PASS and identical:
+`IPC_REPLY_FAIL` 0, supervisor `WrongObject` 0, `fatal=0 panic=0`, `AARCH64_BSP_TIMER_STARTED`
+exactly once, ticks strictly monotonic, `cpu=0` the only owner, IRQ = tick = EOI, `scan_broad_lock=0`,
+`production=1`; the reply that previously failed now lands (`IPC_REPLY_DELIVER_TO_WAITER tid=2
+endpoint=5`). x86_64 core PASS, RISC-V core PASS. Hosted suite 4568/0; 18 integration targets, 0
+failures; census and doc guards green; fmt and `git diff --check` clean; `cargo metadata --locked`
+exit 0; `cargo check --workspace` 0 errors; all three freestanding checks exit 0;
+`ARTIFACT_BUILD_INTEGRITY … result=ok`. Repository-policy clippy adds **no new error class and no new
+warning class** against exact base `7fe7d06` — the only deltas are count increases inside pre-existing
+classes from the added tests. **The AArch64 reply-timeout retirement profile fails
+character-identically to exact base `7fe7d06`** (same failure lines, same seal) and is deferred as
+pre-existing, not caused by this checkpoint.
+
+**RISC-V's gated S-mode timer bridge is now the only default ProductionTick reachability blocker**
+(`TIMER_IRQ_FEATURE_ENABLED = cfg!(feature = "riscv64-timer-irq")`, default OFF, and
+`STIE_AUDIT_COMPLETE: bool = false`; the `wfi` re-entrancy blocker is recorded in
+`doc/ARCH_RISCV64.md` §13). **Canonical 199E therefore remains OPEN pending RISC-V.** Census delta 0;
 direct production remains OFF (`IPCCALL_DIRECT_PROOF_ENABLED: AtomicBool::new(false)`); ownership
 production callers 0; no U8 or WA3C2 work is begun.
 
