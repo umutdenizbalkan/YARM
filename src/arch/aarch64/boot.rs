@@ -8577,6 +8577,15 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                         );
                     }
                 }
+                // Publish the DTB-derived GIC physical bases to the page-table layer BEFORE any
+                // address-space root exists, so every root created later carries the privileged
+                // Device/XN leaves the kernel needs to reach the GIC once TTBR0 has moved off the
+                // bootstrap identity root. Absent bases (e.g. RPi5 GICv3) publish nothing and the
+                // pages simply stay unmapped.
+                crate::arch::aarch64::page_table::publish_gic_mmio_bases(
+                    parsed.gic_dist_base.unwrap_or(0) as u64,
+                    parsed.gic_cpu_if_base.unwrap_or(0) as u64,
+                );
                 if let Some(gic_base) = parsed.gic_cpu_if_base {
                     let mut desc = [0u8; 40];
                     if let Some(desc_len) = encode_irq_desc_gic_cpu_if_base(gic_base, &mut desc) {

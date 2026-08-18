@@ -158,7 +158,23 @@ gic_dist_base=0x8000000`, normal boot, with `YARM_SCHED_TICK`/`YARM_TIMER_IRQ_DE
 performed here and no interrupt behaviour is activated. Repository-policy clippy is byte-identical
 to exact base `90a52dc` in both errors and warnings; census delta 0.
 
-**AArch64 ProductionTick bring-up remains PENDING** on that now-unblocked prerequisite, and
+**AArch64 runtime GIC MMIO mapping prerequisite — DELIVERED. CENSUS-DELTA 0.** Correct bases were
+necessary but not sufficient: `TTBR1_EL1` is always zero on this port, so all kernel execution runs
+from the active TTBR0 root, and `copy_bootstrap_kernel_root_entries` deliberately skips `L1[0]` —
+the 1 GiB entry covering VA `0..0x3FFF_FFFF`, where both the UART and the GIC live — because user
+code occupies low addresses. Only the UART re-established a leaf in each new root, so any GIC MMIO
+access taken after the first user root was activated (late boot, EL0, or an IRQ claim/EOI, none of
+which switch TTBR) faulted on an unmapped address; a late GICD write hung the boot while CNTP, a
+system register, did not. Every AArch64 address space now carries privileged **Device-nGnRE,
+execute-never, non-user** identity leaves for the DTB-derived GIC distributor and CPU-interface
+pages — one 4 KiB page each, never the enclosing 2 MiB block and never the whole bootstrap 1 GiB
+entry — established at root creation before activation, so no live TLB shootdown is introduced.
+Absent or misaligned bases (notably RPi5's GICv3, for which the parser yields no GICv2 bases) map
+nothing and fail closed. User mappings targeting a reserved device leaf are refused. Live-verified
+under an active user root by reading only harmless identification registers: `GICD_IIDR=0x43b`
+(ARM's JEP106 implementer ID) and `GICC_CTLR=0x1`, at addresses that previously hung the boot.
+
+**AArch64 ProductionTick bring-up remains PENDING** on these now-unblocked prerequisites, and
 **default AArch64/RISC-V scheduler-tick reachability is unresolved**, so end-to-end production
 expiry on those ports is still not demonstrable and **canonical 199E remains OPEN**. Census delta 0;
 direct production remains OFF (`IPCCALL_DIRECT_PROOF_ENABLED: AtomicBool::new(false)`); ownership

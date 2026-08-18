@@ -128780,3 +128780,236 @@ mod aarch64_gicv2_base_derivation {
         );
     }
 }
+
+/// Canonical 199E PREREQUISITE — every AArch64 address space must carry the GIC device pages.
+///
+/// `TTBR1_EL1` is always zero on this port, so all kernel execution runs from whichever TTBR0 root
+/// is active, and `copy_bootstrap_kernel_root_entries` deliberately skips `L1[0]` — the 1 GiB
+/// entry covering VA `0..0x3FFF_FFFF`, where both the UART (`0x0900_0000`) and the GIC
+/// (`0x0800_0000` / `0x0801_0000`) live — because user code occupies low addresses. Only the UART
+/// re-established a leaf inside each new root, so any GIC MMIO access taken after the first user
+/// root was activated (late boot, EL0, or an IRQ claim/EOI — none of which switch TTBR) faulted on
+/// an unmapped address. That is why a late GICD write hung the boot while CNTP, a system register,
+/// did not.
+///
+/// The behavioural fixtures live in `arch/aarch64/page_table.rs` and compile only in an AArch64
+/// test build; these guards run in the canonical hosted suite.
+mod aarch64_gic_device_mapping {
+    const PT_SRC: &str = include_str!("../../arch/aarch64/page_table.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const A64_IRQ_SRC: &str = include_str!("../../arch/aarch64/irq.rs");
+    const X86_PT_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
+
+    /// Every new root goes through the one choke point that establishes all device leaves.
+    #[test]
+    fn every_new_root_gets_the_reserved_device_mappings() {
+        let ensure = PT_SRC
+            .split("fn ensure_asid(&mut self, asid: Asid)")
+            .nth(1)
+            .expect("the root choke point")
+            .split("\n    fn ")
+            .next()
+            .expect("its body");
+        assert!(
+            ensure.contains("copy_bootstrap_kernel_root_entries(self, root_idx)?;")
+                && ensure.contains("ensure_reserved_device_mappings(self, root_idx)?;"),
+            "a fresh root inherits the bootstrap entries and then gains its device leaves"
+        );
+        let reserved = PT_SRC
+            .split("fn ensure_reserved_device_mappings(")
+            .nth(1)
+            .expect("the device-mapping seam")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            reserved.contains("EARLY_UART_MMIO_PA")
+                && reserved.contains("dist_pa")
+                && reserved.contains("cpu_if_pa"),
+            "UART, GIC distributor and GIC CPU interface are all established"
+        );
+    }
+
+    /// Exactly one 4 KiB identity page per device — never the 2 MiB block, never the 1 GiB entry.
+    #[test]
+    fn the_device_helper_maps_exactly_one_identity_page() {
+        let helper = PT_SRC
+            .split("fn ensure_early_device_mapping(")
+            .nth(1)
+            .expect("the device helper")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            helper.contains("let va = pa;"),
+            "identity mapping: VA must equal the DTB-derived PA, because the GIC helpers address \
+             these bases as raw pointers"
+        );
+        assert!(
+            helper.contains("level_index(va, 30)")
+                && helper.contains("level_index(va, 21)")
+                && helper.contains("level_index(va, 12)"),
+            "it walks to an L3 leaf — a 4 KiB page, not a block descriptor"
+        );
+        assert!(
+            helper.contains("PageFlags::DEVICE_RW"),
+            "Device-nGnRE, privileged, execute-never"
+        );
+        assert!(
+            helper.contains("pa == 0 || !pa.is_multiple_of(PAGE_SIZE_U64)"),
+            "a zero or misaligned base maps nothing — fail closed, never a guessed address"
+        );
+    }
+
+    /// The deliberate `L1[0]` skip survives: the fix must not widen bootstrap inheritance.
+    #[test]
+    fn the_bootstrap_copy_still_skips_l1_entry_zero() {
+        let copy = PT_SRC
+            .split("fn copy_bootstrap_kernel_root_entries(")
+            .nth(1)
+            .expect("the bootstrap copy")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            copy.contains("for idx in 1..ENTRIES_PER_TABLE"),
+            "L1[0] stays excluded — user code lives in that 1 GiB window"
+        );
+        assert!(
+            !copy.contains("for idx in 0..ENTRIES_PER_TABLE"),
+            "the whole bootstrap 1 GiB entry must never be inherited wholesale"
+        );
+    }
+
+    /// Bases are DTB-derived runtime values, published before any root exists.
+    #[test]
+    fn gic_bases_are_dtb_derived_and_published_before_the_first_root() {
+        assert!(
+            PT_SRC.contains("pub fn publish_gic_mmio_bases(dist_pa: u64, cpu_if_pa: u64)"),
+            "a one-time runtime publication seam, mirroring EARLY_UART_MMIO_PA"
+        );
+        let publish = PT_SRC
+            .split("pub fn publish_gic_mmio_bases(")
+            .nth(1)
+            .expect("the publication seam")
+            .split("\n/// ")
+            .next()
+            .expect("its body");
+        assert!(
+            publish.contains("dist_pa != 0 && dist_pa.is_multiple_of(PAGE_SIZE_U64)")
+                && publish.contains("cpu_if_pa != 0 && cpu_if_pa.is_multiple_of(PAGE_SIZE_U64)"),
+            "each base is validated nonzero and page-aligned before it is accepted"
+        );
+        assert!(
+            A64_BOOT_SRC.contains("page_table::publish_gic_mmio_bases(")
+                && A64_BOOT_SRC.contains("parsed.gic_dist_base.unwrap_or(0)")
+                && A64_BOOT_SRC.contains("parsed.gic_cpu_if_base.unwrap_or(0)"),
+            "the values come from the delivered DTB parse, never from a constant"
+        );
+    }
+
+    /// A user mapping cannot replace a reserved device leaf.
+    #[test]
+    fn user_mappings_cannot_overwrite_reserved_device_leaves() {
+        let map = PT_SRC
+            .split("pub fn map_page(")
+            .nth(1)
+            .expect("map_page")
+            .split("\npub fn ")
+            .next()
+            .expect("its body");
+        assert!(
+            map.contains("if is_reserved_device_va(virt.0)")
+                && map.contains("return Err(PageTableError::InvalidAddress);"),
+            "a user mapping targeting a device leaf is refused, not silently applied"
+        );
+        let reserved = PT_SRC
+            .split("fn is_reserved_device_va(va: u64)")
+            .nth(1)
+            .expect("the predicate")
+            .split("\nconst ")
+            .next()
+            .expect("its body");
+        assert!(
+            reserved.contains("EARLY_UART_MMIO_VA") && reserved.contains("gic_mmio_bases()"),
+            "the reserved set is the UART plus both GIC pages"
+        );
+        assert!(
+            reserved.contains("va & PAGE_MASK"),
+            "any offset within a reserved page is reserved"
+        );
+    }
+
+    /// This prerequisite performs NO GIC MMIO and activates no interrupt behaviour.
+    #[test]
+    fn no_gic_mmio_or_interrupt_behaviour_is_introduced() {
+        // No GIC REGISTER is named anywhere in the page-table layer: it maps pages, it does not
+        // program the controller. (The file legitimately dereferences page-table memory and the
+        // pre-existing UART marker, so a blanket pointer-cast ban would be the wrong instrument.)
+        for forbidden in [
+            "GICD_ISENABLER",
+            "GICD_CTLR",
+            "GICC_IAR",
+            "GICC_EOIR",
+            "GICC_PMR",
+        ] {
+            assert!(
+                !PT_SRC.contains(forbidden),
+                "{forbidden} would be GIC MMIO — this checkpoint maps pages only"
+            );
+        }
+        // And the two new seams touch no volatile memory at all: they only walk and write PTEs.
+        for (name, seam) in [
+            (
+                "ensure_early_device_mapping",
+                "fn ensure_early_device_mapping(",
+            ),
+            (
+                "ensure_reserved_device_mappings",
+                "fn ensure_reserved_device_mappings(",
+            ),
+        ] {
+            let body = PT_SRC
+                .split(seam)
+                .nth(1)
+                .expect("the seam")
+                .split("\n}")
+                .next()
+                .expect("its body");
+            assert!(
+                !body.contains("read_volatile") && !body.contains("write_volatile"),
+                "{name} must perform no device access — it only establishes a mapping"
+            );
+        }
+        // And the IRQ layer is untouched: no PPI enable, no timer arm, no extra unmask caller.
+        for forbidden in [
+            "GICD_ISENABLER",
+            "enable_timer_ppi",
+            "bring_up_bsp_timer",
+            "claim_interrupt",
+        ] {
+            assert!(
+                !A64_IRQ_SRC.contains(forbidden),
+                "{forbidden} belongs to the ProductionTick bring-up, not to this prerequisite"
+            );
+        }
+        assert_eq!(
+            A64_IRQ_SRC
+                .matches("pub fn enable_interrupts_for_boot()")
+                .count(),
+            3,
+            "the interrupt-enable seam keeps its per-cfg definitions and gains no caller"
+        );
+    }
+
+    /// x86_64 page-table behaviour is untouched by this AArch64-local change.
+    #[test]
+    fn other_architectures_are_unchanged() {
+        assert!(
+            !X86_PT_SRC.contains("ensure_reserved_device_mappings")
+                && !X86_PT_SRC.contains("publish_gic_mmio_bases")
+                && !X86_PT_SRC.contains("is_reserved_device_va"),
+            "the device-leaf mechanism is AArch64-local"
+        );
+    }
+}

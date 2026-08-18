@@ -19,6 +19,61 @@ const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
 const EARLY_UART_MMIO_VA: u64 = 0x0900_0000;
 const EARLY_UART_MMIO_PA: u64 = 0x0900_0000;
 
+// ── Runtime GIC MMIO pages, present in EVERY address-space root ──────────────────────────────
+//
+// `TTBR1_EL1` is always zero on this port: there is no high-half kernel, so all kernel execution
+// runs from whichever TTBR0 root is active. `copy_bootstrap_kernel_root_entries` deliberately
+// skips L1[0] — the 1 GiB entry covering VA 0..0x3FFF_FFFF — because user code and data live at
+// low addresses and blind inheritance would collide with them. Every device the kernel must reach
+// from that low window therefore needs its own leaf re-established inside each new root, which is
+// exactly what the UART already does.
+//
+// The GIC lives in the same skipped window (`0x0800_0000` / `0x0801_0000`), and the AArch64 GIC
+// helpers address it as an identity-mapped VA (`(base + offset) as *mut u32`). Without these
+// leaves any GIC access taken after the first user root is activated — late boot, EL0, or an IRQ
+// claim/EOI, none of which switch TTBR — faults on an unmapped address. These statics carry the
+// DTB-derived PHYSICAL bases so the mapping is never a guessed constant.
+static GIC_DIST_MMIO_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static GIC_CPU_IF_MMIO_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Publish the DTB-derived GIC physical bases for per-root mapping.
+///
+/// Must run before the first address-space root is created; the AArch64 DTB parse in
+/// `prepare_arch_boot` precedes `Bootstrap::init`, so that ordering holds by construction. A base
+/// that is zero or not 4 KiB-aligned is REFUSED and leaves the corresponding page unmapped, so an
+/// unsupported controller — notably RPi5's GICv3, for which the parser deliberately yields no
+/// GICv2 bases — fails closed rather than mapping a guessed address.
+pub fn publish_gic_mmio_bases(dist_pa: u64, cpu_if_pa: u64) {
+    if dist_pa != 0 && dist_pa.is_multiple_of(PAGE_SIZE_U64) {
+        GIC_DIST_MMIO_PA.store(dist_pa, core::sync::atomic::Ordering::Relaxed);
+    }
+    if cpu_if_pa != 0 && cpu_if_pa.is_multiple_of(PAGE_SIZE_U64) {
+        GIC_CPU_IF_MMIO_PA.store(cpu_if_pa, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The GIC physical bases currently published, `0` meaning "not available, do not map".
+pub fn gic_mmio_bases() -> (u64, u64) {
+    (
+        GIC_DIST_MMIO_PA.load(core::sync::atomic::Ordering::Relaxed),
+        GIC_CPU_IF_MMIO_PA.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Is `va` one of the privileged device leaves every root carries?
+///
+/// These pages are established at root creation and are not user memory. A user mapping request
+/// that targeted one would silently replace a Device/XN kernel leaf with a user page — and, for
+/// the GIC, hand userspace the interrupt controller. Such requests are refused.
+fn is_reserved_device_va(va: u64) -> bool {
+    let page = va & PAGE_MASK;
+    if page == EARLY_UART_MMIO_VA {
+        return true;
+    }
+    let (dist, cpu_if) = gic_mmio_bases();
+    (dist != 0 && page == dist) || (cpu_if != 0 && page == cpu_if)
+}
+
 const AARCH64_ASID_TRACE: bool = false;
 macro_rules! asid_trace {
     ($($arg:tt)*) => {
@@ -135,7 +190,7 @@ impl PageTableState {
         let root_idx = self.alloc_page()?;
         let root_phys = self.pages[root_idx].expect("root page").phys;
         copy_bootstrap_kernel_root_entries(self, root_idx)?;
-        ensure_early_uart_mapping(self, root_idx)?;
+        ensure_reserved_device_mappings(self, root_idx)?;
         for slot in &mut self.asids {
             if slot.is_none() {
                 *slot = Some(AsidRoot { asid, root_phys });
@@ -276,17 +331,36 @@ fn copy_bootstrap_kernel_root_entries(
     Ok(())
 }
 
-fn ensure_early_uart_mapping(
+/// Map ONE 4 KiB device page identity (VA == PA) into `root_idx`.
+///
+/// Generalized from the early-UART mapping so the GIC pages ride the same bounded path. Exactly
+/// one page is mapped per call — never the enclosing 2 MiB block and never the whole bootstrap
+/// 1 GiB entry — so no device space beyond what the kernel actually touches becomes reachable.
+/// The identity relation is required: the AArch64 GIC and UART helpers address these bases as raw
+/// pointers, so VA must equal the DTB-derived PA.
+///
+/// `PageFlags::DEVICE_RW` yields Device-nGnRE (MAIR AttrIdx 3), read/write, execute-never and
+/// privileged — `leaf_flags_from_page_flags` omits the USER bit and sets NO_EXECUTE.
+///
+/// A zero or misaligned base maps nothing and is not an error: the caller is fail-closed by
+/// construction, so an unsupported interrupt controller simply has no leaf.
+fn ensure_early_device_mapping(
     state: &mut PageTableState,
     root_idx: usize,
+    pa: u64,
 ) -> Result<(), PageTableError> {
+    if pa == 0 || !pa.is_multiple_of(PAGE_SIZE_U64) {
+        return Ok(());
+    }
     let root_phys = state.pages[root_idx]
         .as_ref()
         .ok_or(PageTableError::InvalidAddress)?
         .phys;
-    let l1 = level_index(EARLY_UART_MMIO_VA, 30);
-    let l2 = level_index(EARLY_UART_MMIO_VA, 21);
-    let l3 = level_index(EARLY_UART_MMIO_VA, 12);
+    // Identity mapping: the virtual address IS the physical base.
+    let va = pa;
+    let l1 = level_index(va, 30);
+    let l2 = level_index(va, 21);
+    let l3 = level_index(va, 12);
     let l2_phys = walk_or_create(state, root_phys, l1, PageFlags::KERNEL_RW)?;
     let l3_phys = walk_or_create(state, l2_phys, l2, PageFlags::KERNEL_RW)?;
     let l3_idx = state
@@ -296,11 +370,23 @@ fn ensure_early_uart_mapping(
         state,
         l3_idx,
         l3,
-        PageTableEntry::with_addr_and_flags(
-            EARLY_UART_MMIO_PA,
-            leaf_flags_from_page_flags(PageFlags::DEVICE_RW),
-        ),
+        PageTableEntry::with_addr_and_flags(pa, leaf_flags_from_page_flags(PageFlags::DEVICE_RW)),
     )
+}
+
+/// Establish every privileged device leaf a fresh root must carry: the early UART, and — when the
+/// DTB published GICv2 bases — the GIC distributor and CPU-interface pages.
+///
+/// Runs at root creation, BEFORE the root can be activated, so no live TLB shootdown is
+/// introduced: nothing can have cached a translation for a root that has never been installed.
+fn ensure_reserved_device_mappings(
+    state: &mut PageTableState,
+    root_idx: usize,
+) -> Result<(), PageTableError> {
+    ensure_early_device_mapping(state, root_idx, EARLY_UART_MMIO_PA)?;
+    let (dist_pa, cpu_if_pa) = gic_mmio_bases();
+    ensure_early_device_mapping(state, root_idx, dist_pa)?;
+    ensure_early_device_mapping(state, root_idx, cpu_if_pa)
 }
 
 #[cfg(all(not(feature = "hosted-dev"), not(test), target_arch = "aarch64"))]
@@ -523,6 +609,13 @@ pub fn map_page(
     {
         return Err(PageTableError::InvalidAddress);
     }
+    // A reserved device leaf (early UART, GIC distributor, GIC CPU interface) is kernel MMIO that
+    // every root carries. Replacing one would drop a Device/XN privileged mapping and, for the
+    // GIC, hand userspace the interrupt controller — so the request is refused rather than
+    // silently overwriting it.
+    if is_reserved_device_va(virt.0) {
+        return Err(PageTableError::InvalidAddress);
+    }
 
     let mut state = PAGE_TABLE_STATE.lock();
     let root = state.ensure_asid(asid)?;
@@ -685,4 +778,159 @@ pub fn repair_user_path_intermediates(_asid: Asid, _virt: VirtAddr) -> u8 {
 #[cfg(test)]
 pub fn take_last_invalidated_asid_for_test() -> Option<Asid> {
     LAST_INVALIDATED_ASID.lock().take()
+}
+
+/// Canonical 199E prerequisite — per-root GIC device mappings.
+///
+/// `TTBR1_EL1` is always zero on this port, so all kernel execution runs from the active TTBR0
+/// root, and `copy_bootstrap_kernel_root_entries` deliberately skips `L1[0]` (VA 0..1 GiB) because
+/// user code occupies low addresses. Every device the kernel reaches through that window must
+/// therefore have its own leaf re-established in each root — previously only the UART did, which
+/// is why any GIC access after the first user root was activated faulted.
+///
+/// These fixtures live here because they exercise `PageTableState` directly. `src/arch/aarch64/**`
+/// is `#[cfg(target_arch = "aarch64")]`, so they compile in an AArch64 test build; the canonical
+/// hosted suite carries matching structural guards in `kernel/boot/tests.rs`.
+#[cfg(test)]
+mod gic_device_mapping_tests {
+    use super::*;
+
+    const QEMU_GICD_PA: u64 = 0x0800_0000;
+    const QEMU_GICC_PA: u64 = 0x0801_0000;
+
+    fn leaf_for(state: &mut PageTableState, root_idx: usize, va: u64) -> Option<PageTableEntry> {
+        let root_phys = state.pages[root_idx].as_ref()?.phys;
+        let l1 = level_index(va, 30);
+        let l2 = level_index(va, 21);
+        let l3 = level_index(va, 12);
+        let root_i = state.page_index_from_phys(root_phys)?;
+        let e1 = read_table_entry(state, root_i, l1).ok()?;
+        let i2 = state.page_index_from_phys(e1.addr())?;
+        let e2 = read_table_entry(state, i2, l2).ok()?;
+        let i3 = state.page_index_from_phys(e2.addr())?;
+        read_table_entry(state, i3, l3).ok()
+    }
+
+    fn fresh_root(state: &mut PageTableState) -> usize {
+        let root_idx = state.alloc_page().expect("root page");
+        ensure_reserved_device_mappings(state, root_idx).expect("device mappings");
+        root_idx
+    }
+
+    /// Every new root receives the UART leaf AND both GIC leaves once bases are published.
+    #[test]
+    fn a_new_root_receives_uart_and_both_gic_leaves() {
+        publish_gic_mmio_bases(QEMU_GICD_PA, QEMU_GICC_PA);
+        let mut state = PageTableState::new();
+        let root = fresh_root(&mut state);
+        for (name, va) in [
+            ("uart", EARLY_UART_MMIO_VA),
+            ("gicd", QEMU_GICD_PA),
+            ("gicc", QEMU_GICC_PA),
+        ] {
+            let leaf = leaf_for(&mut state, root, va).unwrap_or(PageTableEntry::empty());
+            assert!(leaf.is_present(), "{name} leaf must be present");
+            // Identity: the mapped physical address IS the virtual address.
+            assert_eq!(leaf.addr(), va, "{name} must be identity-mapped");
+        }
+    }
+
+    /// Both GIC leaves are Device-nGnRE, execute-never and privileged (non-user).
+    #[test]
+    fn gic_leaves_are_device_xn_and_privileged() {
+        publish_gic_mmio_bases(QEMU_GICD_PA, QEMU_GICC_PA);
+        let mut state = PageTableState::new();
+        let root = fresh_root(&mut state);
+        let device_attr = cache_policy_bits(CachePolicy::Device);
+        for va in [QEMU_GICD_PA, QEMU_GICC_PA] {
+            let leaf = leaf_for(&mut state, root, va).expect("leaf");
+            assert_eq!(
+                leaf.0 & device_attr,
+                device_attr,
+                "Device-nGnRE memory type (MAIR AttrIdx 3)"
+            );
+            assert_ne!(leaf.0 & PageTableEntry::NO_EXECUTE, 0, "execute-never");
+            assert_eq!(leaf.0 & PageTableEntry::USER, 0, "privileged, not user");
+            assert_ne!(leaf.0 & PageTableEntry::VALID, 0, "present");
+        }
+    }
+
+    /// The distributor and CPU-interface pages stay DISTINCT 4 KiB leaves — one page each, never
+    /// the enclosing 2 MiB block and never a shared entry.
+    #[test]
+    fn gicd_and_gicc_are_distinct_pages() {
+        publish_gic_mmio_bases(QEMU_GICD_PA, QEMU_GICC_PA);
+        let mut state = PageTableState::new();
+        let root = fresh_root(&mut state);
+        let d = leaf_for(&mut state, root, QEMU_GICD_PA).expect("gicd");
+        let c = leaf_for(&mut state, root, QEMU_GICC_PA).expect("gicc");
+        assert_ne!(d.addr(), c.addr());
+        assert_eq!(d.addr(), QEMU_GICD_PA);
+        assert_eq!(c.addr(), QEMU_GICC_PA);
+        // The page immediately above the distributor is NOT mapped: only one page was taken.
+        let neighbour = leaf_for(&mut state, root, QEMU_GICD_PA + PAGE_SIZE_U64)
+            .unwrap_or(PageTableEntry::empty());
+        assert!(!neighbour.is_present(), "exactly one page per device");
+    }
+
+    /// A zero or misaligned base maps nothing — fail closed, never a guessed address. This is the
+    /// RPi5/GICv3 case: the parser yields no GICv2 bases, so no GIC leaf exists.
+    #[test]
+    fn absent_or_misaligned_bases_map_nothing() {
+        let mut state = PageTableState::new();
+        let root_idx = state.alloc_page().expect("root");
+        ensure_early_device_mapping(&mut state, root_idx, 0).expect("zero base is a no-op");
+        ensure_early_device_mapping(&mut state, root_idx, QEMU_GICD_PA + 0x40)
+            .expect("misaligned base is a no-op");
+        for va in [0u64, QEMU_GICD_PA, QEMU_GICD_PA + 0x40] {
+            let leaf = leaf_for(&mut state, root_idx, va).unwrap_or(PageTableEntry::empty());
+            assert!(!leaf.is_present(), "no leaf for an invalid base");
+        }
+    }
+
+    /// The UART leaf keeps its exact previous behaviour.
+    #[test]
+    fn uart_mapping_is_unchanged() {
+        let mut state = PageTableState::new();
+        let root_idx = state.alloc_page().expect("root");
+        ensure_early_device_mapping(&mut state, root_idx, EARLY_UART_MMIO_PA).expect("uart");
+        let leaf = leaf_for(&mut state, root_idx, EARLY_UART_MMIO_VA).expect("uart leaf");
+        assert!(leaf.is_present());
+        assert_eq!(leaf.addr(), EARLY_UART_MMIO_PA);
+        assert_eq!(
+            leaf.0 & cache_policy_bits(CachePolicy::Device),
+            cache_policy_bits(CachePolicy::Device)
+        );
+    }
+
+    /// A user mapping request cannot replace a reserved device leaf.
+    #[test]
+    fn user_mapping_cannot_overwrite_a_reserved_device_leaf() {
+        publish_gic_mmio_bases(QEMU_GICD_PA, QEMU_GICC_PA);
+        for va in [EARLY_UART_MMIO_VA, QEMU_GICD_PA, QEMU_GICC_PA] {
+            assert!(is_reserved_device_va(va), "0x{va:x} is reserved");
+            // An offset inside the same page is equally reserved.
+            assert!(is_reserved_device_va(va + 0x40));
+            assert_eq!(
+                map_page(
+                    Asid(9),
+                    VirtAddr(va),
+                    PhysAddr(0x4100_0000),
+                    PageFlags::USER_RW
+                ),
+                Err(PageTableError::InvalidAddress),
+                "user mapping at 0x{va:x} must be refused"
+            );
+        }
+        // An ordinary user VA is still mappable.
+        assert!(
+            map_page(
+                Asid(9),
+                VirtAddr(0x4000_0000),
+                PhysAddr(0x4100_0000),
+                PageFlags::USER_RW
+            )
+            .is_ok()
+        );
+    }
 }

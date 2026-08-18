@@ -404,6 +404,37 @@ completing any of them.
 > rip=0x40307c`. **AArch64 ProductionTick bring-up remains PENDING** on this now-unblocked
 > prerequisite.
 >
+> **AArch64 runtime GIC MMIO mapping prerequisite — DELIVERED. CENSUS-DELTA 0.** Correct bases were
+> necessary but not sufficient. `TTBR1_EL1` is always zero on this port, so all kernel execution
+> runs from whichever TTBR0 root is active, and `copy_bootstrap_kernel_root_entries` deliberately
+> skips `L1[0]` — the 1 GiB entry covering VA `0..0x3FFF_FFFF`, where both the UART (`0x0900_0000`)
+> and the GIC (`0x0800_0000`/`0x0801_0000`) live — because user code and data occupy low addresses
+> and blind inheritance would collide with them. Only the UART re-established its own leaf inside
+> each new root (`ensure_early_uart_mapping`), so any GIC MMIO access taken after the first user
+> root was activated — late boot, EL0, or an IRQ claim/EOI, none of which switch TTBR — faulted on
+> an unmapped address. That is exactly why a late `GICD_CTLR` write hung the boot while `CNTP`, a
+> system register with no MMU involvement, did not.
+>
+> Every AArch64 address space now carries privileged **Device-nGnRE, execute-never, non-user**
+> identity leaves for the DTB-derived distributor and CPU-interface pages, established at the single
+> root-creation choke point. Exactly **one 4 KiB page per device** — never the enclosing 2 MiB block
+> and never the whole bootstrap 1 GiB entry — and the `L1[0]` skip is preserved unchanged. Bases are
+> the runtime values published by the delivered parser, validated nonzero and page-aligned; absent or
+> misaligned bases (notably RPi5's GICv3, where the parser yields no GICv2 bases) map nothing and
+> fail closed rather than writing a guessed address. Because the leaves are added before a root is
+> ever activated, nothing can have cached a stale translation and no live TLB shootdown is
+> introduced. A user mapping request targeting a reserved device leaf is refused, so userspace can
+> neither displace the kernel's Device/XN mapping nor obtain the interrupt controller.
+>
+> Live-verified with a temporary read-only diagnostic under an ACTIVE USER ROOT, reading only
+> identification registers — `GICD_TYPER`, `GICD_IIDR`, `GICC_CTLR`, `GICC_PMR`, never `IAR` and
+> never a write — at the very addresses that previously hung the boot:
+> `dist=0x8000000 cpu_if=0x8010000 typer=0x8 iidr=0x43b cctlr=0x1 pmr=0xff`. `GICD_IIDR=0x43b` is
+> ARM's JEP106 implementer ID, i.e. genuine distributor content rather than a stray read. The
+> diagnostic was removed before committing; the committed build performs no GIC MMIO at all.
+>
+> **AArch64 ProductionTick bring-up remains PENDING** on these now-unblocked prerequisites.
+>
 > **What stays open.** Default AArch64/RISC-V scheduler-tick reachability under a user workload is
 > unresolved, so end-to-end production expiry on those ports is still not demonstrable and
 > **canonical 199E remains OPEN**. Census delta 0; direct production remains OFF
