@@ -129498,29 +129498,52 @@ mod riscv64_s_mode_timer_bridge {
     }
 
     /// The boundary is armed before SIE, and SIE is the last thing enabled.
+    ///
+    /// Canonical 199E split the sequence across two owners when the admission gate was retired.
+    /// The BOOT arm programs the deadline and enables STIE only — it must never unmask, or every
+    /// lock-held S-mode region would become interruptible. The audited IDLE boundary owns the
+    /// S-origin half: sscratch, then the latch, then `sstatus.SIE` last. The invariant this case
+    /// has always protected is unchanged — SIE is enabled at exactly one program point, after
+    /// everything an S-mode trap would need is in place.
     #[test]
     fn the_boundary_is_established_before_interrupts_are_enabled() {
-        let enable = RV_TIMER_SRC
-            .split("fn arm_one_shot_timer_and_enable() -> Option<&'static str> {")
+        let arm = RV_TIMER_SRC
+            .split("fn arm_periodic_timer_for_user_delivery() -> Option<&'static str> {")
             .nth(1)
-            .expect("the enable sequence")
+            .expect("the boot arm")
             .split("\n/// ")
             .next()
             .expect("its body");
-        let sscratch = enable
+        let deadline = arm.find("sbi_set_timer(deadline)").expect("the deadline");
+        let stie = arm.find("set_sie_stie()").expect("STIE");
+        assert!(
+            deadline < stie,
+            "the deadline is programmed before STIE, so the enable bit never stands alone"
+        );
+        assert!(
+            !arm.contains("set_sstatus_sie()"),
+            "the boot arm must NOT unmask: U-origin delivery rides on privilege rules"
+        );
+        let idle = RV_TIMER_SRC
+            .split("pub fn reestablish_idle_boundary() {")
+            .nth(1)
+            .expect("the audited idle boundary")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        let sscratch = idle
             .find("set_sscratch_to_trap_stack_top()")
             .expect("the sscratch re-point");
-        let armed = enable
+        let armed = idle
             .find("arm_s_mode_timer_boundary()")
             .expect("the boundary arm");
-        let stie = enable.find("set_sie_stie()").expect("STIE");
-        let sie = enable.find("set_sstatus_sie()").expect("SIE");
+        let sie = idle.find("set_sstatus_sie()").expect("SIE");
         assert!(
-            sscratch < armed && armed < stie && stie < sie,
-            "sscratch, then the boundary latch, then STIE, then SIE last"
+            sscratch < armed && armed < sie,
+            "sscratch, then the boundary latch, then SIE last"
         );
         assert_eq!(
-            enable.matches("set_sstatus_sie()").count(),
+            idle.matches("set_sstatus_sie()").count(),
             1,
             "there is exactly one place that enables interrupts"
         );
@@ -129553,43 +129576,52 @@ mod riscv64_s_mode_timer_bridge {
             "a non-boot hart defers instead of arming"
         );
         let init = RV_TIMER_SRC
-            .split("pub fn init_timer_after_idle_safe_point() -> Option<&'static str> {")
+            .split("pub fn arm_timer_at_boot_safe_point() -> Option<&'static str> {")
             .nth(1)
-            .expect("the init seam")
+            .expect("the boot arm seam")
             .split("\n/// ")
             .next()
             .expect("its body");
         let boot_hart = init.find("if !on_boot_hart {").expect("the boot-hart gate");
-        let feature = init
-            .find("if !TIMER_IRQ_FEATURE_ENABLED {")
-            .expect("the feature gate");
+        let arm = init
+            .find("arm_periodic_timer_for_user_delivery()")
+            .expect("the arm call");
         assert!(
-            boot_hart < feature,
-            "the boot-hart gate is checked before the feature path is entered"
+            boot_hart < arm,
+            "the boot-hart gate is checked before anything is armed"
+        );
+        // Canonical 199E: ownership is the ONLY remaining gate on this path. A policy gate here
+        // would be the retired admission feature wearing a different name.
+        assert!(
+            !init.contains("TIMER_IRQ_FEATURE_ENABLED") && !init.contains("STIE_AUDIT_COMPLETE"),
+            "no admission gate may guard the arm"
         );
     }
 
-    /// The opt-in feature stays default-OFF: default builds arm nothing.
+    /// Canonical 199E: the timer is DEFAULT and UNCONDITIONAL. This case is the inverse of the
+    /// one it replaces — it used to prove the opt-in feature existed and defaulted off; it now
+    /// proves no such control can come back.
     #[test]
-    fn the_timer_feature_remains_default_off() {
-        assert!(
-            RV_TIMER_SRC.contains(
-                "pub const TIMER_IRQ_FEATURE_ENABLED: bool = cfg!(feature = \"riscv64-timer-irq\");"
-            ),
-            "the live path is gated on an opt-in cargo feature, never on a default"
-        );
+    fn the_timer_admission_gate_is_retired() {
+        let code = RV_TIMER_SRC
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the non-test portion");
+        for banned in [
+            "TIMER_IRQ_FEATURE_ENABLED",
+            "STIE_AUDIT_COMPLETE",
+            "timer_irq_feature_disabled",
+        ] {
+            assert!(
+                !code.contains(banned),
+                "`{banned}` still exists — the RISC-V timer can still be disabled"
+            );
+        }
         let manifest = include_str!("../../../Cargo.toml");
         assert!(
-            manifest.contains("riscv64-timer-irq = []"),
-            "the feature exists and pulls in nothing else"
-        );
-        let default_line = manifest
-            .lines()
-            .find(|l| l.trim_start().starts_with("default ="))
-            .unwrap_or("");
-        assert!(
-            !default_line.contains("riscv64-timer-irq"),
-            "and it is NOT in the default feature set: {default_line}"
+            !manifest.contains("riscv64-timer-irq"),
+            "the cargo feature must be removed outright, not left as an empty no-op that \
+             documentation could mistake for a behaviour gate"
         );
     }
 
@@ -131093,11 +131125,12 @@ mod riscv64_production_timeout_handshake {
             ),
             "the encoder itself is feature-gated, so a default kernel does not carry it"
         );
-        // The timer remains default-OFF and is a separate opt-in from the workload.
+        // Canonical 199E: the timer admission gate is retired, so the PROOF WORKLOAD is the only
+        // remaining opt-in here. The timer itself is unconditional and needs no feature.
         let features = include_str!("../../../Cargo.toml");
         assert!(
-            features.contains("riscv64-timer-irq = []"),
-            "the timer feature exists as its own empty opt-in"
+            !features.contains("riscv64-timer-irq"),
+            "the timer admission feature must be gone: the timer is default and unconditional"
         );
         let default_line = features
             .split("\ndefault = [")
@@ -131107,12 +131140,8 @@ mod riscv64_production_timeout_handshake {
             .next()
             .expect("its contents");
         assert!(
-            !default_line.contains("riscv64-timer-irq"),
-            "the timer must not be in the default feature set"
-        );
-        assert!(
             !default_line.contains("riscv64-ipc-reply-timeout-oracle"),
-            "nor the proof workload"
+            "the proof workload stays out of the default feature set"
         );
     }
 

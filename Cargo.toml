@@ -41,7 +41,6 @@ rpi5-highhalf = ["rpi5-stage1"]
 # the trap-bridge re-entrancy audit has been completed on a CI runner
 # with live QEMU. The feature gate exists so the scaffold can be merged
 # without flipping live IRQ delivery in default builds.
-riscv64-timer-irq = []
 # Stage 198E3C1: compile-time gate for the x86_64 DIRECT shared-region live-oracle marker paths
 # (kernel attestations + `IpcSendSharedRegionDirect` retirement literals). OFF by default so a
 # NORMAL artifact is marker-clean (contains none of the shared-region marker literals). Enabling the

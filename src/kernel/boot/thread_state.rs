@@ -2044,8 +2044,36 @@ impl KernelState {
             let Some(next_generation) = tcb.async_preempt_generation.checked_add(1) else {
                 return false;
             };
-            // Context FIRST …
+            // Context FIRST — but the SYSCALL-ARGUMENT MIRROR is preserved, not overwritten.
+            //
+            // `UserRegisterContext` carries two mirrors of userspace state: `user_gprs` (the raw
+            // register file) and `arg0..arg5` (the decoded syscall lane). They mean different
+            // things and have different owners. The asynchronous resume reads `user_gprs`; the
+            // ORDINARY resume arms — fresh startup and syscall/D2 continuation — treat `arg0..5`
+            // as authoritative for `a0..a5`.
+            //
+            // Capturing a timer frame wholesale would write both, and that is a real defect
+            // rather than a tidy-up: an interrupted task's mid-computation `a0` would land in the
+            // syscall lane, and any later ORDINARY resume of that task — a wake from a blocked
+            // receive, say — would install it as the syscall result. Measured live as
+            // `core::fmt` faulting on `ld a1, 0(a0)` with `a0 = 0x10003`, an ordinary
+            // intermediate value promoted to a pointer. Keeping the lane untouched leaves each
+            // mirror owned by exactly the paths that write and read it.
+            let preserved_syscall_lane = (
+                tcb.user_context.arg0,
+                tcb.user_context.arg1,
+                tcb.user_context.arg2,
+                tcb.user_context.arg3,
+                tcb.user_context.arg4,
+                tcb.user_context.arg5,
+            );
             tcb.user_context = captured;
+            tcb.user_context.arg0 = preserved_syscall_lane.0;
+            tcb.user_context.arg1 = preserved_syscall_lane.1;
+            tcb.user_context.arg2 = preserved_syscall_lane.2;
+            tcb.user_context.arg3 = preserved_syscall_lane.3;
+            tcb.user_context.arg4 = preserved_syscall_lane.4;
+            tcb.user_context.arg5 = preserved_syscall_lane.5;
             tcb.async_preempt_generation = next_generation;
             // … tag LAST, so it can never name a half-written register file.
             tcb.async_preempted = Some(crate::kernel::task::AsyncPreemptedContext {

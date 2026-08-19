@@ -922,28 +922,6 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     for n in 1..32usize {
         tframe.set_user_gpr(n, frame.regs[n - 1] as usize);
     }
-    // Canonical 199E-R1D: keep the TWO mirrors of `UserRegisterContext` coherent for an
-    // asynchronously interrupted user context as well.
-    //
-    // `capture_user_context` stores `user_gprs` AND `arg0..arg5`, and `apply_user_context`
-    // restores both; the argument mirror is what the RISC-V resume treats as authoritative for
-    // `a0..a5`. Only the `ecall` arm below used to populate it, so a timer trap would have
-    // captured a register file with an ALL-ZERO argument mirror beside it. The verbatim restore
-    // added by this stage reads `user_gprs` and never the mirror, so this is not what makes the
-    // repair work — it is what makes the repair's failure mode safe. Should a verbatim restore
-    // ever be declined, the mirror now carries the true `a0..a5` instead of zeros, so the worst
-    // case degrades to "a7 not preserved" rather than "the argument registers are wiped".
-    //
-    // The syscall-number lane is deliberately NOT set here: this trap is not a syscall, and
-    // writing it would make a preempted task look like one to any later reader.
-    if scause != EXC_USER_ECALL && from_u {
-        tframe.set_arg(0, frame.regs[RiscvTrapFrame::A0] as usize);
-        tframe.set_arg(1, frame.regs[RiscvTrapFrame::A1] as usize);
-        tframe.set_arg(2, frame.regs[RiscvTrapFrame::A2] as usize);
-        tframe.set_arg(3, frame.regs[RiscvTrapFrame::A3] as usize);
-        tframe.set_arg(4, frame.regs[RiscvTrapFrame::A4] as usize);
-        tframe.set_arg(5, frame.regs[RiscvTrapFrame::A5] as usize);
-    }
     // RISC-V Linux-style syscall ABI: a7 = syscall number, a0..a5 = args.
     if scause == EXC_USER_ECALL {
         tframe.set_syscall_num(frame.regs[RiscvTrapFrame::A7] as usize);
@@ -1025,14 +1003,14 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // kernel-state pointer are installed; the service chain has reached stable idle. Both
             // init paths default to deferred and never enable STIE / external-IRQ delivery until
             // explicitly audited. No frame is restored and no `sret` is armed for idle.
-            let _ = crate::arch::riscv64::timer::init_timer_after_idle_safe_point();
             let _ = crate::arch::riscv64::plic::init_plic_after_idle_safe_point();
-            // 199E-R1: the first arrival ARMS the timer; every later arrival must RE-ESTABLISH the
-            // entry contract, because it comes from a trap handler where hardware cleared
-            // `sstatus.SIE`. Without this the idle `wfi` loops masked and the pending timer is
-            // never taken — which is why ticks previously stopped the moment anything was
-            // dispatched out of idle. Same single audited boundary, and a no-op unless the opt-in
-            // feature already armed the timer.
+            // Canonical 199E: the timer is already armed (at the boot safe point, before any user
+            // task ran), so this boundary no longer arms it. What it owns is the S-ORIGIN
+            // admission contract: re-point `sscratch` at the trap-stack top, arm the boundary
+            // latch, and enable `sstatus.SIE` — every arrival, because hardware clears `SIE` on
+            // each trap entry and without this the idle `wfi` would loop masked and never take
+            // the pending timer. Same single audited boundary as before; a strict no-op if the
+            // boot arm deferred (no SBI TIME, or not the boot hart).
             crate::arch::riscv64::timer::reestablish_idle_boundary();
             riscv_trap_halt("kernel_idle_awaiting_io");
         }
@@ -3037,6 +3015,30 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.online_cpu_count()
     );
     crate::yarm_log!("RISCV_KERNEL_BOOT_OK");
+    // ── Canonical 199E: arm the periodic supervisor timer BEFORE any user task can run ──
+    //
+    // This is the earliest point at which every precondition holds: the boot hart is identified,
+    // the real trap vector and trap stack are installed and BOTH trap paths exist (the U-origin
+    // bridge with its asynchronous-context save/restore, and the audited S-origin idle fast
+    // path), `SharedKernel` is installed above so the bridge can reach the kernel, SBI TIME is
+    // probed inside the call, and the secondaries brought online just above are wake-only with
+    // every interrupt-enable bit clear — so no other hart can claim ownership.
+    //
+    // Arming here rather than at the terminal-idle boundary is what breaks the old circularity:
+    // a CPU-bound first user task never reaches idle, so an idle-armed timer could never preempt
+    // it. `sstatus.SIE` stays CLEAR — U-mode delivery rides on privilege rules — so nothing
+    // between here and the first `sret` becomes interruptible, and an interrupt that goes pending
+    // in the meantime is taken at that `sret` with a fresh re-arm rather than a catch-up storm.
+    let timer_deferral = crate::arch::riscv64::timer::arm_timer_at_boot_safe_point();
+    crate::yarm_log!(
+        "RISCV_TIMER_BOOT_ARM result={} reason={}",
+        if timer_deferral.is_none() {
+            "ok"
+        } else {
+            "deferred"
+        },
+        timer_deferral.unwrap_or("none")
+    );
     run(kernel);
 }
 

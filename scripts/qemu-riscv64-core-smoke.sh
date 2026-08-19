@@ -403,12 +403,15 @@ EXTIRQ_ACCEPT_REGEX='RISCV_EXTIRQ_SMOKE_OK source=|RISCV_EXTIRQ_DEFERRED reason=
 # values when timer is on the deferred branch; an unknown reason means
 # the kernel emitted a marker the gate doesn't yet understand and the
 # operator must update both sides explicitly.
+#
+# Canonical 199E retired the timer ADMISSION gate, so the policy reasons are gone:
+# "timer_irq_feature_disabled", "trap_bridge_reentrancy_not_ready" and "stie_audit_pending" named
+# a build/audit decision, not a platform fact, and a default build can no longer take any of them.
+# What remains are real facts about the machine or about ownership.
 TIMER_DEFERRED_REASONS=(
-  "timer_irq_feature_disabled"
-  "trap_bridge_reentrancy_not_ready"
   "sbi_time_ext_unavailable"
-  "stie_audit_pending"
   "not_boot_hart"
+  "already_armed"
   "unsafe_under_current_satp"
 )
 

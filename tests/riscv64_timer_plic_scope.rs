@@ -87,13 +87,27 @@ fn smoke_script_pins_canonical_timer_deferred_reasons() {
     let smoke = include_str!("../scripts/qemu-riscv64-core-smoke.sh");
     // The list of accepted deferred reasons must include every reason
     // the kernel emits; an unknown reason fails the gate.
-    for reason in [
+    // Canonical 199E: the ADMISSION gate is retired, so only real platform/ownership facts may
+    // defer the timer. The policy reasons are asserted ABSENT rather than deleted, so a gate
+    // cannot be reintroduced by quietly re-adding its reason string to either side.
+    let accepted = smoke
+        .split("TIMER_DEFERRED_REASONS=(")
+        .nth(1)
+        .expect("the accepted-reason array")
+        .split(')')
+        .next()
+        .expect("its contents");
+    for retired in [
         "timer_irq_feature_disabled",
         "trap_bridge_reentrancy_not_ready",
-        "sbi_time_ext_unavailable",
         "stie_audit_pending",
-        "not_boot_hart",
     ] {
+        assert!(
+            !accepted.contains(retired),
+            "smoke still ACCEPTS retired policy deferral reason: {retired}"
+        );
+    }
+    for reason in ["sbi_time_ext_unavailable", "not_boot_hart", "already_armed"] {
         assert!(
             smoke.contains(&format!("\"{reason}\"")),
             "smoke must list canonical timer-deferred reason: {reason}"
@@ -161,17 +175,24 @@ fn timer_module_emits_required_markers() {
             "timer module missing marker: {marker}"
         );
     }
+    // Canonical 199E: the audit-pending reason is retired along with the admission gate. What
+    // replaces it is the positive evidence that the timer armed before any user task ran.
     assert!(
-        timer.contains("DEFER_REASON_AUDIT_PENDING"),
-        "timer module must expose audit-pending defer reason"
+        !timer.contains("DEFER_REASON_AUDIT_PENDING"),
+        "the audit-pending deferral is retired with the admission gate"
+    );
+    assert!(
+        timer.contains("RISCV_TIMER_ARMED_PRE_IDLE owner=boot_hart"),
+        "timer module must emit the pre-idle boot-arm attestation"
     );
     assert!(
         timer.contains("DEFER_REASON_NO_SBI_TIMER"),
         "timer module must expose no-SBI-Timer defer reason"
     );
     assert!(
-        timer.contains("DEFER_REASON_TRAP_BRIDGE_REENTRANCY"),
-        "timer module must expose trap-bridge-reentrancy defer reason for pass 2"
+        !timer.contains("DEFER_REASON_TRAP_BRIDGE_REENTRANCY"),
+        "the trap-bridge-reentrancy deferral is retired: the S-mode fast path it waited for is \
+         landed and unconditional"
     );
     assert!(
         timer.contains("DEFER_REASON_NOT_BOOT_HART"),
@@ -191,7 +212,7 @@ fn timer_audit_completes_before_any_csr_write() {
         .find("RISCV_TIMER_AUDIT_DONE")
         .expect("AUDIT_DONE missing");
     let arm_call = timer
-        .find("arm_one_shot_timer_and_enable()")
+        .find("arm_periodic_timer_for_user_delivery()")
         .expect("arm fn must exist");
     assert!(
         audit_begin < audit_done,
@@ -220,16 +241,14 @@ fn timer_boot_hart_only_guard_is_present() {
 fn timer_stie_audit_flag_requires_the_s_mode_fast_path() {
     let timer = include_str!("../src/arch/riscv64/timer.rs");
     let boot = include_str!("../src/arch/riscv64/boot.rs");
-    // Flipping `STIE_AUDIT_COMPLETE` without landing the trap vector's kernel-S-mode timer fast
-    // path would let every `wfi` re-enter the bridge as `trap_from_s_mode`, which the smoke gate
-    // rejects. 199E-R1 landed that fast path, so what this guard pins is the DEPENDENCY rather
-    // than the flag's value: the flag may only be true while the fast path and its mechanical
-    // acceptance predicate exist. Default builds stay off via the `riscv64-timer-irq` feature,
-    // which is pinned separately in `riscv64_timer_feature_gate_scope`.
-    if timer.contains("pub const STIE_AUDIT_COMPLETE: bool = true;") {
+    // The DEPENDENCY this guard pins is unchanged, but it is no longer conditional on an audit
+    // flag: canonical 199E made the timer unconditional, so the S-mode fast path and its
+    // mechanical acceptance predicate must exist UNCONDITIONALLY. Without them, every `wfi`
+    // would re-enter the bridge as `trap_from_s_mode` on the first idle arrival.
+    {
         assert!(
             boot.contains("fn riscv_s_mode_timer_trap("),
-            "the audit flag may not be true without the S-mode supervisor-timer fast path"
+            "the unconditional timer requires the S-mode supervisor-timer fast path"
         );
         assert!(
             timer.contains("pub fn is_accepted_s_mode_timer_trap("),
@@ -243,32 +262,56 @@ fn timer_stie_audit_flag_requires_the_s_mode_fast_path() {
             boot.contains("riscv_trap_halt(\"trap_from_s_mode\")"),
             "and every other S-mode trap must still be fail-closed"
         );
-    } else {
-        assert!(
-            timer.contains("pub const STIE_AUDIT_COMPLETE: bool = false;"),
-            "the audit flag is a bool constant, true or false"
-        );
     }
 }
 
+/// Canonical 199E INVERTED this case, and the inversion is the delivery.
+///
+/// The timer used to be armed only at the terminal kernel-idle safe point, which is circular for
+/// the workload that most needs preemption: a CPU-bound first user task never reaches idle, so
+/// the timer that would preempt it was never armed. The arm now happens at the BOOT safe point,
+/// before any user task runs. What the idle boundary still owns is the S-ORIGIN admission
+/// contract, not the arm.
 #[test]
-fn timer_init_is_invoked_only_at_idle_safe_point() {
+fn timer_is_armed_at_the_boot_safe_point_not_at_idle() {
     let boot = include_str!("../src/arch/riscv64/boot.rs");
-    let idle_pos = boot
-        .find("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
-        .expect("idle marker must be emitted in boot.rs");
-    let init_pos = boot
-        .find("init_timer_after_idle_safe_point")
-        .expect("timer init must be wired");
     assert!(
-        init_pos > idle_pos,
-        "timer init must follow the idle marker, not precede it"
+        !boot.contains("init_timer_after_idle_safe_point"),
+        "the idle-first arm must be retired: it could never preempt a CPU-bound first task"
     );
-    // The init call must be sequenced after the idle marker by a small
-    // gap (same block). 4 KiB is a defensive ceiling on intervening lines.
+    // Asserted STRUCTURALLY rather than by file offset: `run_with_prepared_kernel` sits near the
+    // end of boot.rs while the idle block sits above it, so a raw byte comparison would measure
+    // source layout instead of execution order.
+    let boot_fn = boot
+        .split("pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {")
+        .nth(1)
+        .expect("the boot entry point")
+        .split("\n}")
+        .next()
+        .expect("its body");
+    let arm_pos = boot_fn
+        .find("timer::arm_timer_at_boot_safe_point()")
+        .expect("the boot arm must be wired into the boot entry point");
+    let run_pos = boot_fn.find("run(kernel);").expect("the workload handoff");
     assert!(
-        init_pos - idle_pos < 4_096,
-        "timer init must be in the idle-safe block, not elsewhere in boot.rs"
+        arm_pos < run_pos,
+        "the timer must be armed before control passes to the workload"
+    );
+    // The idle block still re-establishes the S-origin contract, and arms nothing.
+    let idle_block = boot
+        .split("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
+        .nth(1)
+        .expect("the idle block")
+        .split("riscv_trap_halt(")
+        .next()
+        .expect("up to the halt");
+    assert!(
+        idle_block.contains("timer::reestablish_idle_boundary()"),
+        "the idle block must still re-establish the S-origin boundary on every arrival"
+    );
+    assert!(
+        !idle_block.contains("arm_timer_at_boot_safe_point"),
+        "the idle block must not arm the timer: that is the retired circular arrangement"
     );
 }
 
