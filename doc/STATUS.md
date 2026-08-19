@@ -62,6 +62,42 @@ evidence for or against the changed restore path, and no live cell is claimed fo
 evidence that does transfer: the x86_64, AArch64 and RISC-V standard core smokes all PASS at this
 checkpoint. Direct production remains **OFF**.
 
+**U3 (canonical 203C) — DELIVERED. The AArch64 FutexWait NO-INCOMING IDLE broad read is retired.
+CENSUS-DELTA 11 → 10. CANONICAL 203C — still OPEN.**
+The deferred-FutexWait drain's no-incoming idle branch re-acquired the broad guard for one read —
+`with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0))).unwrap_or(true)` — purely
+to confirm `current` is absent or idle before diverging into the BSP idle loop. It now calls the
+EXISTING authoritative rank-1 transaction `SharedKernel::current_tid_authoritative(cpu)`; **no new
+seam was created**. That helper is what the retired closure resolved to: the same
+`validate_online_cpu` predicate `set_current_cpu` applies, the same `current_cpu` binding (left
+untouched on refusal), and the same `current_tid_on(current_cpu())` read — including the
+freestanding-AArch64 `MPIDR_EL1`-derived lookup — all under ONE rank-1 acquisition, where the broad
+body took the scheduler lock twice and was coherent only by virtue of the broad guard. The
+predicate and the refusal policy are unchanged outcome for outcome: `Some(0)` is the idle task, and
+both "no current task" and "CPU refused" arrive as `None` and map to `true` through the same
+`unwrap_or(true)`. All four consumer outcomes are preserved exactly: **refusal → `true`**, **no
+current task → `true`**, **current TID `0` → `true`**, **nonzero current TID → `false`**.
+`current_tid_split_read` remains rejected because it does not bind `current_cpu` — the reason the
+earlier substitution here was reverted — and `terminal_idle_on_cpu_split` remains rejected because
+its `runnable_count_on` condition adds runnable-count policy the legacy predicate never had.
+Census: `with_cpu` **10 → 9**, broad `with` **stays 1**, total and runtime-required **11 → 10**,
+`src/arch/trap_entry.rs` **3 → 2**. The two that remain are the canonical Phase-2 broad trap
+dispatch and the D6 controlled-proof restore, still D3-fenced under `AI_AGENT_RULES` §14.4.
+
+**Not live-proven — scoped precisely.** This branch's only live gate is the Stage 195F no-incoming
+idle oracle, whose precondition is unreachable behind the pre-existing SpawnV5/initramfs stall on
+AArch64 — untouched here, and it prevents the target live cell from completing at **both**
+revisions. What is claimed is only this: the **target AArch64 FutexWait-idle marker census was
+identical** at the delivered head and at the exact base `6dd3ca4` —
+`AARCH64_FUTEX_WAIT_IDLE_ORACLE_PROVISION_OK` = 1, `…_SET` = 1, `…_DONE` = **0** — with the same
+`aarch64 FutexWait idle oracle proof missing` failure at both. That is an **exact-base deferral for
+the target AArch64 cell**, and it is **not** live proof of the changed read; no live cell is
+claimed. **The whole cross-architecture seal is not claimed byte- or character-identical, and it
+was not:** one unrelated line differed *favourably* — `riscv64 FutexWait idle oracle proof missing`
+was present at the base and **absent** at the head — and the RISC-V kernel binaries were
+**bit-identical** across the two revisions, so that variance cannot originate in this source
+change. Direct production remains **OFF**.
+
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
 `finalize_split_handled_syscall` broad reacquisition, already retired by Stage 199D; that
 function holds no broad acquisition today. Earlier "U8 is next" pointers are removed.
@@ -70,9 +106,9 @@ function holds no broad acquisition today. Earlier "U8 is next" pointers are rem
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **10** |
+| Production `SharedKernel::with_cpu` callsites | **9** |
 | Production broad `SharedKernel::with` callsites | **1** |
-| **Total production broad-lock acquisition sites** | **11** |
+| **Total production broad-lock acquisition sites** | **10** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **Direct NR6/NR7:** x86_64 (live) + AArch64 (structural, proof-gated) via `offlock_authoritative_dispatch_enabled()`; RISC-V not admitted. **Blocking IpcRecv / IpcSend (U4):** queue-advancing dispatch is authoritative outside the broad lock on **all three** architectures via the canonical `queue_advancing_dispatch_enabled()`. `d6_genuine_enabled()` itself remains compile-time x86_64-only — U4 widened the queue-ADVANCING question only, never the queue-neutral D6 slice. |
@@ -1953,7 +1989,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **11** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **10** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there

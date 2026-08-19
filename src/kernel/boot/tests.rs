@@ -54728,15 +54728,16 @@ mod stage169_d2_send_genuine {
             2,
             "the fatal adapter must reach both architectures' established terminals"
         );
-        // U3 (203C): 7 -> 5 -> 4 -> 3. The x86 FutexWait and Yield switch-success restores
+        // U3 (203C): 7 -> 5 -> 4 -> 3 -> 2. The x86 FutexWait and Yield switch-success restores
         // joined the same transaction, the AArch64 `CurrentTaskExited` VALIDATION reacquisition
-        // was retired onto the shared `post_lock_exit_validation_split`, and its REPLACEMENT
-        // RESTORE reacquisition onto `post_exit_replacement_restore_split`. Their classes and
-        // counters are untouched.
+        // was retired onto the shared `post_lock_exit_validation_split`, its REPLACEMENT RESTORE
+        // reacquisition onto `post_exit_replacement_restore_split`, and the AArch64 deferred
+        // FutexWait no-incoming idle read onto the existing authoritative
+        // `current_tid_authoritative`. Their classes and counters are untouched.
         assert_eq!(
             src.matches(".with_cpu(").count(),
-            3,
-            "trap_entry.rs retains exactly three broad acquisitions"
+            2,
+            "trap_entry.rs retains exactly two broad acquisitions"
         );
         assert!(
             src.contains("FUTEX_WAIT_DISPATCH_COUNT"),
@@ -72950,8 +72951,8 @@ mod stage195f_aarch64_futex_wait_default_on {
                 "the idle outcome must use/emit `{needle}`"
             );
         }
-        // The idle branch confirms current is None via a lock re-acquire, and does NOT restore a
-        // frame (no post_switch_restore in the no-incoming branch — that is only in the switch arm).
+        // The idle branch confirms current is None/idle and does NOT restore a frame (no
+        // post_switch_restore in the no-incoming branch — that is only in the switch arm).
         // Bound it to end at `enter_post_lock_idle` so the subsequent Stage 195G Yield drain
         // (which legitimately restores its incoming frame) is excluded.
         let idle_branch = block
@@ -72962,9 +72963,51 @@ mod stage195f_aarch64_futex_wait_default_on {
                     .unwrap_or(r)
             })
             .unwrap_or("");
+        // U3 (203C): the confirmation is no longer a broad re-acquire. It is the EXISTING
+        // authoritative rank-1 transaction, which validates the CPU with the same predicate,
+        // performs the same `current_cpu` binding, and reads the same current TID.
+        //
+        // Comment-stripped for the bans below, exactly as `tests/broad_lock_census_guard.rs`
+        // counts: the branch's own commentary NAMES the two rejected alternatives on purpose.
+        let idle_branch: alloc::string::String = idle_branch
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let idle_branch = idle_branch.as_str();
         assert!(
-            idle_branch.contains("kernel.current_tid(), None | Some(0)"),
-            "the idle branch must verify current is None/idle"
+            idle_branch.contains(".current_tid_authoritative(cpu)"),
+            "the idle branch must verify current through the authoritative rank-1 transaction"
+        );
+        assert!(
+            idle_branch.contains(".map(|current| current == 0)")
+                && idle_branch.contains(".unwrap_or(true)"),
+            "the legacy predicate and refusal policy must be preserved outcome for outcome: \
+             Some(0) is idle, and both `no current task` and `CPU refused` arrive as None and \
+             are mapped to true by the same unwrap_or(true)"
+        );
+        assert!(
+            !idle_branch.contains("kernel.current_tid(), None | Some(0)"),
+            "the retired broad closure must not survive beside the transaction"
+        );
+        for banned in [
+            ".with_cpu(",
+            ".with(|",
+            "state.lock()",
+            "current_tid_split_read",
+            "terminal_idle_on_cpu_split",
+        ] {
+            assert!(
+                !idle_branch.contains(banned),
+                "the idle branch must hold no `{banned}` after U3: `current_tid_split_read` \
+                 does not bind `current_cpu` (the reverted substitution), and \
+                 `terminal_idle_on_cpu_split` would strengthen the predicate with a \
+                 runnable-count condition"
+            );
+        }
+        assert!(
+            !idle_branch.contains("runnable_count"),
+            "no runnable-count condition may be introduced into this predicate"
         );
         assert!(
             !idle_branch.contains("post_switch_restore_arch_thread_state"),
@@ -99594,8 +99637,9 @@ mod stage200d0c1_aarch64_exit_prep {
         let code = code.join("\n");
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            3,
-            "trap_entry.rs drops from 4 to 3 with_cpu callsites"
+            2,
+            "trap_entry.rs is at 2 with_cpu callsites: this retirement took it 4 -> 3, and the \
+             U3 AArch64 FutexWait no-incoming idle retirement then took it 3 -> 2"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
     }
@@ -121856,10 +121900,11 @@ mod u3_d6_first_resume_bind_transaction {
         let code = code_of(TRAP_ENTRY);
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            3,
-            "trap_entry.rs holds three acquisitions — this cohort touches none of them; the \
-             fourth and fifth were retired separately by the U3 AArch64 exit-validation and \
-             exit replacement-restore retirements"
+            2,
+            "trap_entry.rs holds two acquisitions — this cohort touches neither of them; the \
+             other three were retired separately by the U3 AArch64 exit-validation, exit \
+             replacement-restore and FutexWait no-incoming idle retirements. The two that \
+             remain are the canonical broad Phase-2 trap dispatch and this D6 proof restore"
         );
         // The retained D6 restore/cleanup acquisition passes a REAL frame, so unlike the
         // retired first-resume call it genuinely restores context and is NOT a no-op.

@@ -9338,6 +9338,167 @@ mod tests {
         assert_eq!(kernel.current_tid_authoritative(CpuId(0)), baseline);
     }
 
+    // ── U3 (203C): the AArch64 deferred-FutexWait NO-INCOMING idle consumer ──────────
+    //
+    // `src/arch/trap_entry.rs` held a brief broad re-acquire there,
+    // `with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0))).unwrap_or(true)`.
+    // It is retired onto THIS helper — not a new seam. Because the helper returns
+    // `Option<u64>`, the legacy pattern splits across the two lines it always occupied:
+    // `Some(0)` is the idle task, and BOTH "no current task" and "CPU refused" arrive as
+    // `None` and are mapped to `true` by the same `unwrap_or(true)`. These tests pin all four
+    // legacy outcomes on the real consumer expression.
+
+    /// The exact consumer expression, so the tests exercise the shipped predicate rather than
+    /// a restatement of it.
+    fn u3_futex_idle_current_none(kernel: &SharedKernel, cpu: CpuId) -> bool {
+        kernel
+            .current_tid_authoritative(cpu)
+            .map(|current| current == 0)
+            .unwrap_or(true)
+    }
+
+    #[test]
+    fn u3_futex_idle_predicate_maps_every_legacy_outcome() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|s| s.bring_up_cpu(CpuId(1)).expect("cpu 1 online"));
+
+        // (1) no current task on an ONLINE CPU -> true. Legacy: `current_tid()` was `None`,
+        //     which `matches!(…, None | Some(0))` mapped to true.
+        assert!(
+            u3_futex_idle_current_none(&kernel, CpuId(1)),
+            "an online CPU with no current task is the idle outcome"
+        );
+
+        // (2) the idle task (tid 0) is current -> true. Legacy: `Some(0)`.
+        kernel.with(|state| {
+            state.register_task(0).expect("idle task 0");
+            state.enqueue_current_cpu(0).expect("enqueue 0");
+            state.dispatch_next_task().expect("dispatch 0");
+        });
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), Some(0));
+        assert!(
+            u3_futex_idle_current_none(&kernel, CpuId(0)),
+            "tid 0 is the idle task and must still read as idle"
+        );
+
+        // (3) a real user task is current -> false. Legacy: `Some(n)`, n != 0.
+        kernel.with(|state| {
+            state.register_task(91).expect("task 91");
+            state.enqueue_current_cpu(91).expect("enqueue 91");
+            state.dispatch_next_task().expect("dispatch 91");
+        });
+        assert_eq!(kernel.current_tid_authoritative(CpuId(0)), Some(91));
+        assert!(
+            !u3_futex_idle_current_none(&kernel, CpuId(0)),
+            "a running non-idle task must NOT read as idle"
+        );
+
+        // (4) an invalid or offline CPU -> true, through the same `unwrap_or(true)` the retired
+        //     callsite used for `with_cpu`'s `Err`. Fail-open is the LEGACY policy and is
+        //     preserved deliberately: this branch is already committed to entering idle.
+        for bad in [CpuId(7), CpuId(200)] {
+            assert!(
+                u3_futex_idle_current_none(&kernel, bad),
+                "a refused CPU must still map to true"
+            );
+        }
+        // …and the refusals changed no binding, so the valid CPU still answers as before.
+        assert_eq!(kernel.with(|s| s.current_cpu()), CpuId(0));
+        assert!(!u3_futex_idle_current_none(&kernel, CpuId(0)));
+    }
+
+    #[test]
+    fn u3_futex_idle_observes_the_requested_cpu_not_the_ambient_binding() {
+        // The property the reverted `current_tid_split_read` substitution did not have: the
+        // read must be OF the CPU passed in, after binding it — not of whatever `current_cpu`
+        // happened to hold. Two CPUs with different current tasks make that observable.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+            state.register_task(93).expect("task 93");
+            state.enqueue_on_cpu(CpuId(0), 93).expect("queue on cpu 0");
+            assert_eq!(state.dispatch_next_on_cpu(CpuId(0)), Some(93));
+        });
+        // Ambient binding is CPU 0, whose current task is 93.
+        assert_eq!(kernel.with(|s| s.current_cpu()), CpuId(0));
+        assert!(!u3_futex_idle_current_none(&kernel, CpuId(0)));
+        // Asking about CPU 1 must answer for CPU 1 — and must rebind to it, exactly as
+        // `with_cpu(CpuId(1), …)` did through `set_current_cpu`.
+        assert!(
+            u3_futex_idle_current_none(&kernel, CpuId(1)),
+            "CPU 1 is idle; the answer must not be borrowed from the ambient CPU 0 binding"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_cpu()),
+            CpuId(1),
+            "the requested CPU is bound before the read, as with_cpu bound it"
+        );
+    }
+
+    #[test]
+    fn u3_futex_idle_consumer_is_broad_lock_free_and_reuses_the_existing_transaction() {
+        const TRAP_ENTRY: &str = include_str!("arch/trap_entry.rs");
+        // Bound the AArch64 Stage 195F no-incoming idle branch exactly as it is written.
+        let branch = TRAP_ENTRY
+            .split_once("Stage 195F IDLE OUTCOME")
+            .map(|(_, r)| {
+                r.split_once("enter_post_lock_idle(cpu)")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .expect("the AArch64 FutexWait no-incoming idle branch");
+        // Comment-stripped, exactly as `tests/broad_lock_census_guard.rs` counts: the branch's
+        // own commentary NAMES the two rejected alternatives, and naming them is the point.
+        let branch = u3_code_lines(branch);
+        assert!(branch.contains(".current_tid_authoritative(cpu)"));
+        for banned in [
+            ".with_cpu(",
+            ".with(|",
+            "state.lock()",
+            "current_tid_split_read",
+            "terminal_idle_on_cpu_split",
+            "runnable_count",
+        ] {
+            assert!(
+                !branch.contains(banned),
+                "the retired branch must contain no `{banned}`"
+            );
+        }
+        // No new seam was created for it: the helper still has exactly one definition, and the
+        // branch reaches it directly. The needle is assembled at run time so this assertion's
+        // own source line is not itself a match in the `include_str!` of this very file.
+        let src = include_str!("runtime.rs");
+        let definition =
+            alloc::format!("pub fn {}(&self, cpu: CpuId)", "current_tid_authoritative");
+        assert_eq!(
+            src.matches(definition.as_str()).count(),
+            1,
+            "the authoritative transaction has ONE definition; U3 reuses it"
+        );
+        // The two acquisitions that remain in the file are the canonical broad Phase-2 trap
+        // dispatch and the D6 controlled-proof restore, and neither was touched.
+        let code = u3_code_lines(TRAP_ENTRY);
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            2,
+            "trap_entry.rs drops from 3 to 2 with_cpu callsites"
+        );
+        assert_eq!(code.matches(".with(|").count(), 0);
+        assert!(
+            code.contains(
+                "let inner_result = shared
+        .with_cpu(cpu, |kernel| {"
+            ),
+            "the canonical broad Phase-2 trap dispatch is present and unchanged"
+        );
+        assert!(
+            code.contains(
+                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
+            ) && code.contains("d6_ensure_post_cleanup_task_stacks_mapped"),
+            "the D6 controlled-proof restore and its D3-fenced cleanup are present and unchanged"
+        );
+    }
+
     #[test]
     fn u3_authoritative_entering_exiting_switch_classification() {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));

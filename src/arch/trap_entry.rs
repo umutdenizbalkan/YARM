@@ -1165,22 +1165,43 @@ pub fn handle_trap_entry_shared(
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu={}", cpu.0);
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu={}", cpu.0);
                     crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
-                    // Lock-dropped proof: re-acquiring `with_cpu` here is only possible because
-                    // the broad guard was released above (a held guard would deadlock). Inside,
-                    // confirm `current` is None/idle. We restore NO frame.
-                    // Lock-dropped proof: re-acquiring `with_cpu` here is only possible because
-                    // the broad guard was released above (a held guard would deadlock). Inside,
-                    // confirm `current` is None/idle. We restore NO frame.
+                    // Lock-dropped proof: reaching a lock-taking read here is only possible
+                    // because the broad guard was released above (a held guard would deadlock —
+                    // the broad `SpinLock<KernelState>` contains the rank-1 scheduler domain, so
+                    // the deadlock property is identical for the narrow acquisition). Confirm
+                    // `current` is None/idle. We restore NO frame.
                     //
-                    // BLOCKS U3: this drain was briefly retired onto `current_tid_split_read(cpu)`
-                    // and then RESTORED. Its only live acceptance gate is the Stage 195F
-                    // no-incoming idle oracle, whose precondition ("all servers up and blocked on
-                    // recv") is unreachable behind the pre-existing SpawnV5/initramfs stall — so
-                    // the substitution could not be live-proven. The accepted pre-U3 body is
-                    // retained verbatim rather than shipped unverified. The two FutexWait/Yield
-                    // switch-success restores ARE live-proven and stay retired.
+                    // U3 (canonical 203C): this was a brief broad `with_cpu` re-acquire. It is now
+                    // the EXISTING authoritative rank-1 transaction, `current_tid_authoritative`,
+                    // which is exactly what the retired closure resolved to — not a new seam:
+                    //
+                    //   * `with_cpu` ran `set_current_cpu(cpu)` first, which VALIDATES with
+                    //     `validate_online_cpu` and then binds `sched.current_cpu = cpu`;
+                    //     `current_tid_authoritative` applies the same predicate and performs the
+                    //     same binding, and leaves `current_cpu` unchanged when it refuses.
+                    //   * `kernel.current_tid()` then read `current_tid_on(self.current_cpu())`.
+                    //     `current_tid_authoritative` reproduces that lookup verbatim, including
+                    //     the freestanding-AArch64 branch where `current_cpu()` is derived from
+                    //     `MPIDR_EL1` rather than from the field just bound.
+                    //   * the broad body took the scheduler lock TWICE (once in `set_current_cpu`,
+                    //     once in `current_tid`), coherent only by virtue of the broad guard; the
+                    //     transaction does validate + bind + read under ONE rank-1 acquisition, so
+                    //     it is strictly more coherent and never less.
+                    //
+                    // The predicate and the refusal policy are unchanged, outcome for outcome. The
+                    // helper returns `Option<u64>`, so the legacy `matches!(…, None | Some(0))`
+                    // splits across the same two lines it always did: `Some(0)` is the idle task,
+                    // and BOTH "no current task" and "CPU refused" arrive as `None` and are mapped
+                    // to `true` by the SAME `unwrap_or(true)` the retired callsite used. Every
+                    // other TID is `false`, exactly as before.
+                    //
+                    // Deliberately NOT `current_tid_split_read`: that reader does not bind
+                    // `current_cpu`, which is why the earlier substitution here was reverted.
+                    // Deliberately NOT `terminal_idle_on_cpu_split`: it additionally requires
+                    // `runnable_count_on(cpu) == 0`, which would STRENGTHEN this predicate.
                     let current_none = shared
-                        .with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))
+                        .current_tid_authoritative(cpu)
+                        .map(|current| current == 0)
                         .unwrap_or(true);
                     crate::yarm_log!(
                         "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu={}",

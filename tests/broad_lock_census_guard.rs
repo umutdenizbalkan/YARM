@@ -72,7 +72,18 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // (`d6_ensure_post_cleanup_task_stacks_mapped` maps kernel stack pages into the active root
     // and every live task root), which is D3-fenced by AI_AGENT_RULES §14.4 and has no split form,
     // so splitting it would leave a broad drain behind at census delta 0.
-    ("src/arch/trap_entry.rs", 3),
+    // U3 (203C): 3 -> 2. The AArch64 deferred-FutexWait NO-INCOMING idle read
+    // (`with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))`) became the
+    // EXISTING authoritative rank-1 transaction `SharedKernel::current_tid_authoritative(cpu)` —
+    // no new seam. That helper applies the same `validate_online_cpu` predicate
+    // `set_current_cpu` applies, performs the same `current_cpu` binding, and reads the same
+    // `current_tid_on(current_cpu())` (MPIDR-derived on freestanding AArch64), all under ONE
+    // rank-1 acquisition instead of the broad guard's two separate scheduler acquisitions. The
+    // predicate and the refusal policy are outcome-for-outcome unchanged: `Some(0)` is idle, and
+    // both "no current task" and "CPU refused" arrive as `None` and are mapped to `true` by the
+    // same `unwrap_or(true)`. The TWO that remain are the canonical broad Phase-2 trap dispatch
+    // and the D6 controlled-proof restore, the latter still D3-fenced (see the note above).
+    ("src/arch/trap_entry.rs", 2),
     // U3 (203C): 4 -> 3. The AP saved-resume placement's `with_cpu(cpu, |k| { enqueue; dispatch })`
     // became one authoritative rank-1 -> rank-2 transaction,
     // `SharedKernel::enqueue_then_dispatch_on_cpu_split`: rank 1 acquired once, CPU validated with
@@ -184,7 +195,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 10; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 (the AArch64 CurrentTaskExited validation, then its replacement restore)
+const AUDITED_WITH_CPU_TOTAL: usize = 9; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 (the AArch64 CurrentTaskExited validation, its replacement restore, then the AArch64 FutexWait no-incoming idle read)
 const AUDITED_WITH_BROAD_TOTAL: usize = 1; // U3: 6 -> 2 -> 1 (runtime.rs fully drained; the reached x86 AP SMP read retired)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -193,7 +204,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 11; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 (thirty-three retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 10; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 -> 10 (thirty-four retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
