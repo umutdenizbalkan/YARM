@@ -230,8 +230,23 @@ classes from the added tests. **The AArch64 reply-timeout retirement profile fai
 character-identically to exact base `7fe7d06`** (same failure lines, same seal) and is deferred as
 pre-existing, not caused by this checkpoint.
 
+**199E-R3 — retirement accounting is scoped per oracle identity. CANONICAL 199E — LOCALLY CLOSED
+in one candidate commit. CENSUS-DELTA 0. Direct production remains OFF; U8 is next.**
+The last obstacle was runner accounting, not kernel behaviour: two completion marker FAMILIES were
+asserted `count == 1` over the whole boot, and with ProductionTick default-on a second legitimate
+production caller settles its own reply deadline in the same boot — two DIFFERENT tasks, each
+delivered exactly once. Both families are now bound to the DERIVED oracle identity (caller TID from
+the provisioning marker, ASID and record coordinates from that caller's own registration) AND to a
+global per-identity duplicate bound, so an unrelated caller can never satisfy the oracle's
+assertion and a duplicate belonging to any caller still fails. Exactly-one was not relaxed, no
+production line is discarded, and no timeout or result expectation changed. Seven synthetic
+fixtures ship with the runner (`--self-test`) and the wiring is pinned from Rust. Recorded
+separately: a pre-existing `assert_order` arity defect (three arguments to a four-parameter
+function, `$4: unbound variable` under `set -u`) is repaired by supplying the missing argument
+only; reply-wins and reply-wins-repeat now both pass end to end. Detail: `doc/ARCH_RISCV64.md` §15.
+
 **199E-R2 — the RISC-V timer admission gate is RETIRED and asynchronous-resume ownership is
-repaired. CANONICAL 199E — STILL OPEN. CENSUS-DELTA 0. Direct production remains OFF.**
+repaired. CENSUS-DELTA 0. Direct production remains OFF.**
 RISC-V `ProductionTick` is now default and unconditional: the `riscv64-timer-irq` feature is
 deleted rather than emptied, and every gate, audit latch, cfg, selector and dormant fallback is
 gone. Timer ownership is boot-hart-only; `sstatus.SIE` is masked during ordinary S-mode kernel
@@ -259,14 +274,13 @@ suite 4632 passed / 0 failed; all integration, census and doc guards green; fmt 
 retirement profile fails **mechanically identically to exact base `932bd6f`** (same seven lines,
 same seal) and is deferred as pre-existing.
 
-**199E is not closed.** The RISC-V selector-ON retirement cell still fails. One failure is
-base-identical and deferrable; two are not: `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` and
-`RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED` are asserted `count == 1` and now count 2, because a
-second unrelated production caller legitimately times out in the same boot now that ProductionTick
-is live — the two events name two different tasks, each delivered exactly once. That is correct
-behaviour failing a marker-count assertion scoped to a single caller, the same class the runner's
-author already re-scoped for the `ARMED`/`OK` families. Re-scoping a runtime count assertion was
-outside this pass's authority.
+**Deferred, with the established exact-base signature.** The selector-ON timeout-wins lane fails
+on ONE absent marker, `RISCV_IPC_REPLY_TIMEOUT_DONE … caller_continuations=1 … result=ok`: the
+OracleHardware client emits `caller_continuations=2 … result=fail`, byte-identical to exact base
+`932bd6f`. The selector-OFF production lane — the one default ProductionTick actually drives —
+reports `caller_continuations=1 … result=ok`. The AArch64 reply-timeout retirement profile fails
+mechanically identically to exact base. Both are pre-existing and deferred; every non-deferrable
+gate qualifies.
 
 **199E-R1 — the RISC-V S-mode timer-bridge prerequisite is LIVE-PROVEN under the opt-in feature.
 CENSUS-DELTA 0.** The `wfi` re-entrancy blocker recorded in `doc/ARCH_RISCV64.md` §13 is resolved:

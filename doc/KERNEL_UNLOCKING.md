@@ -763,22 +763,48 @@ completing any of them.
 > async resumes** returning the client to an identical `sepc`/`sp` with every pinned register
 > intact.
 >
-> **Why 199E is not closed here.** The RISC-V selector-ON retirement cell does not pass. One of
-> its failures is mechanically identical at exact base `932bd6f`
-> (`RISCV_IPC_REPLY_TIMEOUT_DONE … caller_continuations=1 … result=ok` absent; the
-> OracleHardware lane reports `caller_continuations=2`, because the client's recv returns
-> `WouldBlock` once before `TimedOut`) and is deferrable. Two are NOT base-identical and are
-> not deferrable: `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` and
-> `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED` are each asserted `count == 1`, and now count 2.
-> The two events name **two different tasks** — tid 2 at `blocked_generation=1` and tid 1 at
-> `blocked_generation=18` — each delivered exactly once. This is a second, unrelated production
-> caller legitimately timing out in the same boot because ProductionTick is finally live, i.e.
-> correct behaviour failing a marker-count assertion that assumes the oracle is the only caller.
-> It is the same class the runner's own author already re-scoped for the `ARMED` and `OK`
-> families, with the in-file note that counting a family and calling it "the oracle's" is
-> "wrong in the dangerous direction — it fails on correct behaviour". Re-scoping a runtime count
-> assertion was outside this pass's authority, so it is reported rather than changed, and
-> **canonical 199E stays OPEN.**
+> **199E-R3 — the retirement runner's accounting is scoped per oracle identity. CANONICAL 199E —
+> LOCALLY CLOSED in one candidate commit. CENSUS-DELTA 0. Direct production remains OFF.**
+>
+> The last obstacle was not in the kernel. The RISC-V retirement runner asserted `count == 1` over
+> two whole marker FAMILIES — `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` and
+> `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED` — and with ProductionTick default-on a second,
+> entirely legitimate production caller settles its own reply deadline in the same boot. The two
+> events name two DIFFERENT tasks (tid 2 at `blocked_generation=1`, tid 1 at
+> `blocked_generation=18`), each delivered exactly once, so the assertion failed on correct
+> behaviour. This is the same correction the runner's author had already applied to the `ARMED`
+> and `OK` families with the in-file note that counting a family and calling it "the oracle's" is
+> "wrong in the dangerous direction — it fails on correct behaviour".
+>
+> The oracle identity is now DERIVED — caller TID from the provisioning marker, ASID and record
+> coordinates from that caller's own registration — never hardcoded and never taken by family
+> order, and a missing/duplicated/malformed identity fails closed. Each family carries an
+> oracle-identity bound AND a global duplicate bound, so an unrelated caller can never satisfy the
+> oracle's assertion and a duplicate belonging to any caller still fails. Exactly-one was not
+> relaxed to at-least-one, no production line is filtered away, and no timeout or result
+> expectation changed. The commit family carries no identity at all, so it is bound positionally
+> inside the oracle's own identity-scoped window plus a cardinality tie to the distinct settled
+> callers; that limitation is documented rather than hidden. The runner ships seven synthetic
+> fixtures covering both directions (`--self-test`, no build, no QEMU), and the wiring is pinned
+> from Rust by `riscv64_retirement_oracle_scoped_accounting`. Detail: `doc/ARCH_RISCV64.md` §15.
+>
+> Recorded separately, a PRE-EXISTING runner defect repaired in the same pass: two of the six
+> `assert_order` calls passed three arguments to a four-parameter function, aborting the whole
+> runner with `$4: unbound variable` under `set -u` as soon as the reply-wins lane became
+> reachable. The function and both call sites are byte-identical to base `932bd6f` and the failure
+> reproduces from the base file in isolation; the repair supplies the missing/mismatched argument
+> only. With it, reply-wins and reply-wins-repeat both pass end to end.
+>
+> **Deferred, with the established exact-base signature.** The selector-ON timeout-wins lane still
+> fails on ONE absent marker — `RISCV_IPC_REPLY_TIMEOUT_DONE … caller_continuations=1 …
+> result=ok`. The client emits `caller_continuations=2 … result=fail`, **byte-identical to exact
+> base**, from the OracleHardware lane's two recv returns. Three checks report that single
+> absence; a direct count of the marker is 0, which ties all three to one cause. The selector-OFF
+> production lane — the one default ProductionTick actually drives — reports
+> `caller_continuations=1 … result=ok`. The AArch64 reply-timeout retirement profile likewise
+> fails mechanically identically to exact base. Both are deferred as pre-existing; every
+> non-deferrable gate qualifies, so **canonical 199E is locally CLOSED** in one candidate commit
+> and **U8 is next**.
 
 > **The off-lock IPC-timeout pipeline is production on all three architectures, and two
 > classes are gone from the broad-lock scan.**

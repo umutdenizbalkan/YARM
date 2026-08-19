@@ -129980,6 +129980,313 @@ mod riscv64_s_mode_timer_bridge {
 ///
 /// `crates/yarm-control-plane-servers/**` userspace and `src/arch/riscv64/**` compile only in
 /// their own targets; these guards read the source and run in the canonical hosted suite.
+/// Canonical 199E-R3 — the RISC-V retirement runner accounts for completions PER ORACLE IDENTITY.
+///
+/// With ProductionTick default-on an unrelated production caller legitimately arms and settles its
+/// own reply deadline in the same boot, so a family-level `count == 1` on the completion markers
+/// failed on correct behaviour: the two events named two DIFFERENT tasks, each delivered exactly
+/// once. These cases pin that the runner's repair scopes to the oracle's derived identity WITHOUT
+/// giving up global duplicate detection, and that its own fixtures cover both directions.
+mod riscv64_retirement_oracle_scoped_accounting {
+    const SMOKE: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh");
+
+    /// The runner MINUS its own synthetic fixtures. The fixture generator necessarily writes
+    /// literal identities (`caller_tid=1`, `tid=2`, …) because it fabricates log lines; those are
+    /// test data, not assertions, so the "nothing is hardcoded" checks read this region instead.
+    fn assertion_regions() -> [&'static str; 2] {
+        let (head, rest) = SMOKE
+            .split_once("fixture_log() {")
+            .expect("the fixture generator");
+        let (_fixtures, tail) = rest
+            .split_once("# Run every scoped check against one fixture.")
+            .expect("the end of the fixture generator");
+        [head, tail]
+    }
+
+    /// `true` when `needle` appears anywhere OUTSIDE the fixture generator.
+    fn asserted_anywhere(needle: &str) -> bool {
+        assertion_regions().iter().any(|r| r.contains(needle))
+    }
+
+    /// (1) The oracle identity is DERIVED — from the provisioning marker and that caller's own
+    /// registration — never hardcoded and never taken by family order.
+    #[test]
+    fn the_oracle_identity_is_derived_and_fails_closed() {
+        let f = SMOKE
+            .split("derive_oracle_identity() {")
+            .nth(1)
+            .expect("the identity derivation")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            f.contains("IPC_REPLY_TIMEOUT_ORACLE_PROVISION_OK init_tid="),
+            "the caller TID comes from the provisioning marker"
+        );
+        assert!(
+            f.contains("oracle provisioning marker count != 1"),
+            "a missing or duplicated provisioning marker must fail closed"
+        );
+        assert!(
+            f.contains("caller_asid")
+                && f.contains("record_index")
+                && f.contains("record_generation"),
+            "the registration's strongest identity fields must be bound"
+        );
+        assert!(
+            f.contains("identity malformed") && f.contains("registration is malformed"),
+            "a malformed identity must fail closed rather than fall through"
+        );
+        assert!(
+            !asserted_anywhere("caller_tid=1 ") && !asserted_anywhere("tid=1 class=IpcRecv"),
+            "no assertion may hardcode the oracle's numeric TID"
+        );
+    }
+
+    /// (2) Both completion families are scoped to the oracle identity, and the two stale global
+    /// singletons are gone by name.
+    #[test]
+    fn the_two_stale_singleton_assertions_are_replaced_by_scoped_ones() {
+        // The old shape: these exact strings were passed to `verify_log`, which asserts count==1
+        // over the whole boot.
+        let tw = SMOKE
+            .split("# ── 3. Scenario A — timeout-wins, feature enabled (fresh boot) ──")
+            .nth(1)
+            .expect("the timeout-wins block")
+            .split("# ── 4. Scenario B")
+            .next()
+            .expect("its body");
+        let verify_args = tw
+            .split("verify_log \"$TW\" \\")
+            .nth(1)
+            .expect("the verify_log call")
+            .split("\n  if [[")
+            .next()
+            .expect("its arguments");
+        assert!(
+            !verify_args.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED"),
+            "the COMMITTED family must no longer be asserted as a global singleton"
+        );
+        assert!(
+            !verify_args.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED"),
+            "the DELIVERED family must no longer be asserted as a global singleton"
+        );
+        // …and both are now asserted through the scoped helpers.
+        assert!(tw.contains("verify_oracle_completion_delivered_once \"$TW\" \"$ORACLE_TID\""));
+        assert!(
+            tw.contains("verify_oracle_completion_committed_once \"$TW\" riscv64 \"$ORACLE_TID\"")
+        );
+        assert!(tw.contains("verify_no_duplicate_completion_delivery \"$TW\""));
+        assert!(tw.contains("derive_oracle_identity \"$TW\" riscv64"));
+    }
+
+    /// (3) Exactly-one is NOT weakened to at-least-one, and global duplicate detection survives.
+    #[test]
+    fn exact_one_and_global_duplicate_detection_are_both_retained() {
+        let d = SMOKE
+            .split("verify_oracle_completion_delivered_once() {")
+            .nth(1)
+            .expect("the delivery check")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            d.contains("!= 1 (got $n) for tid="),
+            "the oracle's own delivery must be EXACTLY one, not at least one"
+        );
+        assert!(
+            !d.contains("-ge 1") && !d.contains(">= 1"),
+            "exact-one must not be relaxed to at-least-one"
+        );
+        assert!(
+            d.contains("duplicate completion delivery for tid="),
+            "a second delivery for the oracle's exact generation must be refused"
+        );
+        let g = SMOKE
+            .split("verify_no_duplicate_completion_delivery() {")
+            .nth(1)
+            .expect("the global duplicate check")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            g.contains("uniq -d"),
+            "duplicate detection across EVERY identity must be retained, not suppressed"
+        );
+        // Unrelated production lines are never discarded — nothing filters them out of the log.
+        assert!(
+            !asserted_anywhere("caller_tid=2") && !asserted_anywhere("grep -v"),
+            "unrelated production identities must be accounted for, never filtered away"
+        );
+    }
+
+    /// (4) The COMMITTED family carries no identity, so it is bound positionally INSIDE the
+    /// oracle's identity-scoped window plus a cardinality tie — and the limitation is documented.
+    #[test]
+    fn the_identityless_committed_family_is_bound_two_independent_ways() {
+        let c = SMOKE
+            .split("verify_oracle_completion_committed_once() {")
+            .nth(1)
+            .expect("the commit check")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            c.contains("IPC_REPLY_TIMEOUT_ARMED arch=${arch} caller_tid=${tid} ")
+                && c.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=${tid} "),
+            "the window must be delimited by two INDEPENDENTLY identity-scoped lines"
+        );
+        assert!(
+            c.contains("oracle-window COMPLETION_COMMITTED count != 1"),
+            "exactly one commit inside the oracle's own window"
+        );
+        assert!(
+            c.contains("distinct settled caller identities"),
+            "a cardinality tie must catch a duplicate commit for any caller"
+        );
+        assert!(
+            SMOKE.contains("NO identity at all") && SMOKE.contains("LIMITATION"),
+            "the field-inventory limitation must be documented in the runner itself"
+        );
+    }
+
+    /// (5) Every ordered position described as the ORACLE's is selected by the oracle's identity,
+    /// not by the family's first occurrence — which in a default-ProductionTick boot belongs to
+    /// the unrelated caller.
+    #[test]
+    fn the_oracle_ordered_chain_uses_scoped_lines_only() {
+        let ch = SMOKE
+            .split("verify_oracle_ordered_chain() {")
+            .nth(1)
+            .expect("the oracle chain")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        for scoped in [
+            "IPC_REPLY_TIMEOUT_ARMED arch=${arch} caller_tid=${tid} ",
+            "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=${tid} ",
+            "USER_LOG tid=${tid} msg=RISCV_IPC_REPLY_TIMEOUT_DONE",
+        ] {
+            assert!(
+                ch.contains(scoped),
+                "the oracle chain must select `{scoped}` by identity"
+            );
+        }
+        assert!(
+            ch.contains("$1 > lo && $1 < hi"),
+            "the commit position must be the one inside the oracle's window"
+        );
+        // The GLOBAL one-shot chain is deliberately family-first and says so.
+        assert!(
+            SMOKE.contains("latch authorized by the FIRST completion consumption in the boot"),
+            "the family-first positions must be justified as the global one-shot they guard"
+        );
+    }
+
+    /// (6) The runner ships its own fixtures, covering both directions, and they need no build.
+    #[test]
+    fn the_runner_carries_self_test_fixtures_for_both_directions() {
+        assert!(SMOKE.contains(r#"[[ "${1:-}" == "--self-test" ]]"#));
+        for case in [
+            "\"oracle_only:pass\"",
+            "\"oracle_plus_unrelated:pass\"",
+            "\"oracle_missing_delivery:fail\"",
+            "\"oracle_duplicate:fail\"",
+            "\"unrelated_duplicate:fail\"",
+            "\"no_provision:fail\"",
+            "\"malformed_armed:fail\"",
+        ] {
+            assert!(SMOKE.contains(case), "missing self-test case {case}");
+        }
+        assert!(
+            SMOKE.contains("if (( ! fail && ! SELF_TEST )); then"),
+            "the fixtures must run without building or booting anything"
+        );
+        assert!(
+            SMOKE.contains("STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST cases=7 result=ok"),
+            "the fixture run must emit a countable seal"
+        );
+    }
+
+    /// (8) PRE-EXISTING RUNNER REPAIR, guarded separately from the accounting work: every
+    /// `assert_order` invocation passes the function's full FOUR arguments.
+    ///
+    /// Two calls passed only three, so the prose reason landed in the `b` (second marker) slot
+    /// and `why` was unset — under `set -u` that aborted the whole runner with
+    /// `$4: unbound variable` the moment the reply-wins lane became reachable. The function
+    /// itself is byte-identical to base `932bd6f`; only the malformed call sites changed.
+    #[test]
+    fn every_assert_order_invocation_passes_all_four_arguments() {
+        // The function's arity is unchanged.
+        assert!(
+            SMOKE.contains(r#"local norm="$1" a="$2" b="$3" why="$4""#),
+            "assert_order's four-parameter signature must be unchanged"
+        );
+        // Each invocation is a line-continued call; count the continued lines belonging to it.
+        let mut checked = 0usize;
+        for call in SMOKE.split("assert_order \"$rw\" \\\n").skip(1) {
+            let args: alloc::vec::Vec<&str> = call
+                .lines()
+                .take_while(|l| l.trim_start().starts_with('"'))
+                .collect();
+            assert_eq!(
+                args.len(),
+                3,
+                "assert_order must receive a, b and why after the log: got {args:?}"
+            );
+            // The middle argument is a MARKER, never prose — prose in the `b` slot is exactly
+            // the defect this guards.
+            assert!(
+                args[1].trim_start().starts_with("\"IPC_")
+                    || args[1].trim_start().starts_with("\"USER_LOG")
+                    || args[1].trim_start().starts_with("\"RISCV_")
+                    || args[1].trim_start().starts_with("\"GLOBAL_"),
+                "assert_order's `b` slot must hold a marker, not prose: {}",
+                args[1].trim()
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 6,
+            "all six ordered-chain invocations must be checked"
+        );
+        // The repaired pair scopes the registration marker to the oracle, because an unrelated
+        // production caller arms tens of thousands of lines earlier.
+        assert!(
+            SMOKE.contains("\"IPC_REPLY_TIMEOUT_ARMED arch=riscv64 caller_tid=${ORACLE_TID} \" \\"),
+            "the repaired calls must use the ORACLE's registration, not the family"
+        );
+        assert!(
+            SMOKE.contains("derive_oracle_identity \"$rw\" riscv64 || return"),
+            "the reply-wins lane must derive the identity its chain is scoped to"
+        );
+    }
+
+    /// (7) Nothing else moved: the settlement-bound, leak, result and terminal-state checks the
+    /// cell already had are still called, and no timeout/result expectation changed.
+    #[test]
+    fn the_surrounding_contract_is_untouched() {
+        for kept in [
+            "verify_oracle_armed_once \"$TW\" riscv64",
+            "verify_no_duplicate_settlement \"$TW\" riscv64",
+            "settlements ($ok) exceed registrations ($armed)",
+            "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=riscv64 scan_broad_lock=0",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReplyTimeout result=ok",
+            "RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok",
+            "IPC_REPLY_WIN_RESERVE arch=riscv64 outcome=decline reason=TimeoutAlreadyClaimed result=ok",
+            "assert_single_boot_instance",
+            "recheck_sha_clean",
+        ] {
+            assert!(SMOKE.contains(kept), "the cell must still assert `{kept}`");
+        }
+        assert!(
+            SMOKE.contains("\"KERNEL PANIC\" \"RUST PANIC\" \"panicked at\""),
+            "the fatal-pattern guard must be unchanged"
+        );
+    }
+}
+
 /// Canonical 199E-R1D — asynchronous U-mode preemption preserves the exact interrupted context.
 ///
 /// Before this stage RISC-V had two resume conventions, both keyed to a syscall boundary:

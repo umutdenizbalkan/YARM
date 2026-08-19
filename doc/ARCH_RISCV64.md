@@ -1580,3 +1580,129 @@ with `IPC_REPLY_TIMEOUT_LOCK_STATUS ... scan_broad_lock=0 production=1 result=ok
 `CLIENT_REGISTER_CANARY mismatches=0x0000 result=ok`. The eight async resumes are genuine
 switch-away/switch-back events — the client is preempted in its bounded U-mode dwell while the
 server runs, and returns to the identical `sepc`/`sp` with every pinned register intact.
+
+
+---
+
+## 15. 199E-R3 — retirement accounting scoped per oracle identity
+
+### 15.1 What default ProductionTick broke in the runner
+
+Nothing in the kernel. `scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh` asserted
+`count == 1` over two whole marker FAMILIES:
+
+* `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED`
+* `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED`
+
+Once the timer became default-on (§14), a second and entirely legitimate production caller — the
+supervisor, tid 2 — arms and settles its OWN reply deadline in the same boot. The two events name
+two DIFFERENT tasks, each delivered exactly once:
+
+```
+RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=2 … blocked_generation=1  … result=ok
+RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=1 … blocked_generation=18 … result=ok
+```
+
+so a family count of 2 was correct behaviour failing an assertion that assumed the oracle was the
+only caller in the boot. The runner's own author had already made this correction for the `ARMED`
+and `OK` families, noting in-file that counting a family and calling it "the oracle's" is *"wrong
+in the dangerous direction — it fails on correct behaviour."* R3 extends it to the last two.
+
+### 15.2 Field inventory, and what it bounds
+
+The scoping can only be as strong as the markers themselves, so the inventory is recorded rather
+than assumed:
+
+| marker | identity fields |
+|---|---|
+| `IPC_REPLY_TIMEOUT_ORACLE_PROVISION_OK` | `init_tid` — no ASID |
+| `IPC_REPLY_TIMEOUT_ARMED` | `caller_tid`, `caller_asid`, `record_index`, `record_generation` |
+| `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED` | `tid`, `blocked_generation` — **no ASID** |
+| `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` | **none at all** |
+
+The oracle's identity is therefore DERIVED, never hardcoded and never taken by family order: the
+caller TID comes from the provisioning marker, and the ASID plus record coordinates come from that
+caller's own registration. A missing, duplicated or malformed identity fails closed.
+
+**Limitations, stated rather than papered over.** The delivery marker carries no ASID, so within a
+single boot a replacement incarnation that reused the numeric TID would be indistinguishable
+*there*; the registration bound, which does carry the ASID, is what closes that gap for the
+oracle's own caller. The committed marker carries no identity whatsoever and cannot be
+field-scoped at all. Widening either marker is a kernel change and was out of scope.
+
+### 15.3 What replaced the family counts
+
+Each family now carries two independent bounds, and together they are strictly stronger than the
+single global count they replace:
+
+* **delivery** — exactly one event for the oracle's `tid`, no second event for that exact
+  `{tid, blocked_generation}`, and the canonical `class=IpcRecv result=TimedOut` contract on the
+  oracle's own line;
+* **commit** — exactly one commit inside the oracle's window, delimited by two *independently*
+  identity-scoped lines (the oracle's `ARMED` and the oracle's `DELIVERED`), plus a cardinality
+  tie requiring the commit count to equal the number of DISTINCT settled caller identities;
+* **global, both families** — no identity anywhere may appear twice for one completion stage.
+
+Exactly-one was not relaxed to at-least-one, unrelated production lines are never filtered away,
+and duplicate detection is not suppressed — a duplicate belonging to a caller the oracle does not
+own still fails the global bound.
+
+The ordered chain is split in two. `GLOBAL_LOCK_RETIRE_CLASS_DONE` is a one-shot latch authorized
+by the FIRST completion consumption in the boot, whichever caller earns it, so those positions
+stay deliberately family-first; every position that is *the oracle's* — its registration, its
+commit, its delivery, its userspace completion — is selected by the oracle's identity.
+
+### 15.4 The runner's own fixtures
+
+`scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh --self-test` runs seven synthetic
+cases in well under a second, with no build, no QEMU and no artifacts, and proves both directions:
+
+| fixture | expected |
+|---|---|
+| one oracle completion alone | pass |
+| one oracle + one unrelated production completion | pass |
+| zero oracle completions | fail |
+| two oracle completions | fail |
+| two completions for one unrelated identity | fail (global duplicate bound) |
+| missing provisioning marker | fail closed |
+| malformed registration identity | fail closed |
+
+It emits `STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST cases=7 result=ok`. The wiring, the
+non-weakening properties and the fixture list are additionally pinned from Rust by
+`riscv64_retirement_oracle_scoped_accounting`.
+
+### 15.5 Pre-existing runner repair, recorded separately
+
+Independent of the accounting work: two of the reply-wins lane's six `assert_order` calls passed
+only THREE arguments to a FOUR-parameter function. The prose reason had landed in the `b` (second
+marker) slot and `why` was unset, so under `set -u` the first of them aborted the entire runner
+with `$4: unbound variable` the moment that lane became reachable.
+
+The function is byte-identical to exact base `932bd6f`, as are both malformed call sites, and the
+failure reproduces in isolation from the base file. The repair supplies the missing/mismatched
+argument only — each call now expresses exactly the ordering its own prose already stated
+(collector-gate-held before the registration; the registration before the reply's reserve) — and
+adds, removes or alters no marker, count, result or ordering requirement. The registration marker
+is oracle-scoped for the same reason as everything else in the cell: measured live, the unrelated
+caller's `ARMED` lands at line 2636 against the collector gate at 39188, so the unscoped family
+would compare against a line unrelated to the reply under test.
+
+With the repair the reply-wins and reply-wins-repeat lanes both pass end to end
+(`reply_wins=1 reply_wins_repeat=1`).
+
+### 15.6 What remains deferred
+
+The selector-ON timeout-wins lane still fails, on ONE absent marker:
+
+```
+USER_LOG tid=1 msg=RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut
+                   caller_continuations=1 late_reply=rejected result=ok
+```
+
+The client emits `caller_result=1 caller_continuations=2 late_reply=1 result=fail` instead —
+**byte-identical to exact base `932bd6f`**, from the same two recv returns (`WouldBlock` then
+`TimedOut`) in the OracleHardware lane. Three runner checks report that one absence (the marker
+count, the global ordered chain's `ud`, and R3's stricter oracle chain's `ou`); a direct count of
+the marker is 0, which is what ties all three to the same cause. The selector-OFF production lane,
+which is the one this stage's default ProductionTick actually drives, reports
+`caller_continuations=1 … result=ok`.
