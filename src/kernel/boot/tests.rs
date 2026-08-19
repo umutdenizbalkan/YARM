@@ -111116,16 +111116,39 @@ mod stage199d_riscv_narrow_trap_snapshots {
         let writeback = body
             .find("if task_switched || scause == EXC_USER_ECALL {")
             .expect("register write-back");
-        let satp = body
+        // Canonical 199E-R2 — the ASID READ moved to just before the write-back, deliberately.
+        // One resolved incarnation now names both the async tag the write-back may consume and
+        // the page table the `sret` lands in, so those two can never disagree. What did NOT move
+        // is the ACTIVATION, which still follows the write-back exactly as before — that is the
+        // ordering the `sret` depends on, and it is pinned separately below.
+        let asid_read = body
             .find("let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {")
             .expect("SATP lookup");
+        let async_decision = body
+            .find("let async_class = if task_switched {")
+            .expect("the async-resume decision");
+        let satp_activate = body
+            .find("if let Some(asid) = resume_asid {")
+            .expect("SATP activation");
         assert!(entering < call, "entering snapshot precedes the wrapper");
         assert!(call < resume, "resume snapshot follows the wrapper");
         assert!(
             resume < writeback,
             "resume snapshot precedes the write-back"
         );
-        assert!(writeback < satp, "SATP selection follows the write-back");
+        assert!(
+            resume < asid_read && asid_read < async_decision,
+            "the incoming ASID is resolved after the resume identity and before the async \
+             decision that must agree with it"
+        );
+        assert!(
+            async_decision < writeback,
+            "the async decision is taken before the register write-back it governs"
+        );
+        assert!(
+            writeback < satp_activate,
+            "SATP ACTIVATION still follows the write-back"
+        );
     }
 
     /// SATP is selected from the EXACT resume TID, and the existing activation + `sfence.vma`
@@ -129972,7 +129995,7 @@ mod riscv64_s_mode_timer_bridge {
 /// `#[cfg(target_arch = "riscv64")]` and so cannot execute in the canonical hosted suite.
 mod riscv64_async_preemption {
     use super::*;
-    use crate::kernel::task::{AsyncPreemptedContext, ThreadControlBlock};
+    use crate::kernel::task::{AsyncPreemptedContext, AsyncResumeClass, ThreadControlBlock};
     use crate::kernel::vm::Asid;
 
     const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
@@ -130022,6 +130045,22 @@ mod riscv64_async_preemption {
         (state, tid)
     }
 
+    /// Canonical 199E-R2 — consume EXACTLY as a live RISC-V write-back does.
+    ///
+    /// The boundary resolves the incoming TID from the scheduler seam and its ASID from the task
+    /// seam, then hands both to the one classifier. Going through this helper rather than
+    /// poking the TCB is what makes these cases a test of the production decision rather than a
+    /// restatement of it.
+    fn resume_as_boundary(state: &mut KernelState, incoming_tid: u64) -> AsyncResumeClass {
+        let asid = state.task_asid(incoming_tid);
+        state.take_async_preempt_for_incoming(incoming_tid, asid)
+    }
+
+    /// `true` only when the boundary was authorized to restore the register file verbatim.
+    fn restores(state: &mut KernelState, incoming_tid: u64) -> bool {
+        resume_as_boundary(state, incoming_tid).restores_verbatim()
+    }
+
     /// (1) A recognizable value in EVERY integer register survives the snapshot and comes back
     /// through the restore. This is the property the whole stage exists for.
     #[test]
@@ -130046,7 +130085,7 @@ mod riscv64_async_preemption {
         }
         assert_eq!(resumed.saved_pc(), 0x4321_0000, "PC must be the interrupt");
         assert_eq!(resumed.saved_sp(), 0x7FFF_0000, "SP must be the user stack");
-        assert!(state.take_async_preempted_resume(tid));
+        assert!(restores(&mut state, tid));
     }
 
     /// (2) The ARGUMENT registers specifically — `a0..a5` nonzero and `a7` nonzero — survive
@@ -130073,7 +130112,7 @@ mod riscv64_async_preemption {
             0xA777_7777,
             "a7 must NOT be forced to zero for an async-preempted task"
         );
-        assert!(state.take_async_preempted_resume(tid));
+        assert!(restores(&mut state, tid));
     }
 
     /// (3) The tag is consumed EXACTLY once. A second resume falls back to the ordinary lane
@@ -130084,12 +130123,9 @@ mod riscv64_async_preemption {
         let frame = canary_frame(0x11, 0x22);
         assert!(state.snapshot_async_preempted_current(&frame));
         assert!(state.async_preempted_resume_pending(tid));
+        assert!(restores(&mut state, tid), "first take succeeds");
         assert!(
-            state.take_async_preempted_resume(tid),
-            "first take succeeds"
-        );
-        assert!(
-            !state.take_async_preempted_resume(tid),
+            !restores(&mut state, tid),
             "a snapshot must not authorize two verbatim restores"
         );
         assert!(!state.async_preempted_resume_pending(tid));
@@ -130107,8 +130143,8 @@ mod riscv64_async_preemption {
         assert_ne!(first.instruction_ptr, second.instruction_ptr);
         assert_eq!(second.instruction_ptr, VirtAddr(0xCC));
         // Still exactly one authorization, naming the NEWEST snapshot.
-        assert!(state.take_async_preempted_resume(tid));
-        assert!(!state.take_async_preempted_resume(tid));
+        assert!(restores(&mut state, tid));
+        assert!(!restores(&mut state, tid));
     }
 
     /// (5) A stale generation cannot restore an older register file. This is the coordinate that
@@ -130170,7 +130206,7 @@ mod riscv64_async_preemption {
             !state.async_preempted_resume_pending(tid),
             "a dead task must carry no resume authorization"
         );
-        assert!(!state.take_async_preempted_resume(tid));
+        assert!(!restores(&mut state, tid));
     }
 
     /// (8) The idle/kernel identity publishes NOTHING: an S-mode timer at the audited idle
@@ -130191,7 +130227,7 @@ mod riscv64_async_preemption {
     fn an_untagged_task_is_never_treated_as_preempted() {
         let (mut state, tid) = fixture();
         assert!(!state.async_preempted_resume_pending(tid));
-        assert!(!state.take_async_preempted_resume(tid));
+        assert!(!restores(&mut state, tid));
         // Even a plain syscall capture leaves it untagged — `sync_current_thread_from_frame` is
         // the syscall path and must not publish a preemption authorization.
         state
@@ -130200,6 +130236,163 @@ mod riscv64_async_preemption {
         assert!(
             !state.async_preempted_resume_pending(tid),
             "the syscall snapshot must not tag an async preemption"
+        );
+    }
+
+    /// (9a) Canonical 199E-R2 — A is preempted, the scheduler selects B: A KEEPS its tag and B
+    /// cannot consume it.
+    ///
+    /// This is the exact live failure, reduced. The old design consumed A's tag at a seam that
+    /// ran while A was still `current`, so B's write-back saw an authorization A had paid for
+    /// and A was left with none.
+    #[test]
+    fn a_snapshot_survives_a_switch_and_cannot_be_consumed_by_the_incoming_task() {
+        let (mut state, a) = fixture();
+        let b = state
+            .spawn_user_thread(19, 0xBBBB_0000, 0x8900_0000, 0x7020)
+            .expect("second thread");
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0xA1, 0xA2)));
+        // The scheduler picks B. B has no snapshot of its own, so its boundary is Ordinary —
+        // and crucially it does NOT spend A's.
+        assert_eq!(
+            resume_as_boundary(&mut state, b),
+            AsyncResumeClass::Ordinary
+        );
+        assert!(
+            state.async_preempted_resume_pending(a),
+            "A's authorization must survive a switch to somebody else"
+        );
+        // (9b) …and when the scheduler later picks A, A consumes it exactly once.
+        assert!(
+            restores(&mut state, a),
+            "A's own boundary restores verbatim"
+        );
+        assert!(
+            !restores(&mut state, a),
+            "one snapshot authorizes exactly one verbatim restore"
+        );
+    }
+
+    /// (9c) Canonical 199E-R2 — the full round trip: A is preempted mid-computation, B runs, A is
+    /// selected again, and EVERY canary comes back — a0..a7 included, plus PC and SP.
+    #[test]
+    fn a_switch_away_and_back_restores_every_canary_verbatim() {
+        let (mut state, a) = fixture();
+        let b = state
+            .spawn_user_thread(19, 0xBBBB_0000, 0x8900_0000, 0x7020)
+            .expect("second thread");
+        let mut interrupted = canary_frame(0x4444_1111, 0x7EEE_0000);
+        // a0..a7 = user_gprs[10..18]: ordinary live registers, not an ABI lane.
+        for (i, n) in (10..18usize).enumerate() {
+            interrupted.set_user_gpr(n, 0xA0A0_0000 + i);
+        }
+        assert!(state.snapshot_async_preempted_current(&interrupted));
+        // Somebody else runs and leaves the frame full of foreign values.
+        assert_eq!(
+            resume_as_boundary(&mut state, b),
+            AsyncResumeClass::Ordinary
+        );
+        // A is selected again. Its boundary authorizes the verbatim restore…
+        assert!(restores(&mut state, a));
+        // …and the saved context it restores is the interrupted one, register for register.
+        let ctx = state.thread_user_context(a).expect("A's saved context");
+        assert_eq!(ctx.instruction_ptr, VirtAddr(0x4444_1111), "PC verbatim");
+        assert_eq!(ctx.stack_ptr, VirtAddr(0x7EEE_0000), "SP verbatim");
+        for (i, n) in (10..18usize).enumerate() {
+            assert_eq!(ctx.user_gprs[n], 0xA0A0_0000 + i, "a{i} must be verbatim");
+        }
+        for n in 1..10usize {
+            assert_eq!(ctx.user_gprs[n], 0xC0DE_0000 + n, "x{n} must be verbatim");
+        }
+    }
+
+    /// (9d) Canonical 199E-R2 — a no-switch tick CANCELS the staged snapshot, and repeating it
+    /// leaves nothing behind.
+    ///
+    /// The trap returns to the same task through the original hardware frame, so no register
+    /// write-back happens and the snapshot describes an instant the task runs straight past.
+    #[test]
+    fn no_switch_ticks_cancel_the_snapshot_and_cannot_accumulate() {
+        let (mut state, tid) = fixture();
+        for tick in 0..8u64 {
+            assert!(
+                state.snapshot_async_preempted_current(&canary_frame(
+                    0x5000 + tick as usize,
+                    0x6000
+                ))
+            );
+            assert!(
+                state.async_preempted_resume_pending(tid),
+                "tick {tick}: the snapshot is staged"
+            );
+            assert!(
+                state.cancel_async_preempt_for(tid),
+                "tick {tick}: the no-switch return cancels it"
+            );
+            assert!(
+                !state.async_preempted_resume_pending(tid),
+                "tick {tick}: nothing may survive a cancelled snapshot"
+            );
+        }
+        // And a cancelled snapshot authorizes nothing afterwards.
+        assert_eq!(
+            resume_as_boundary(&mut state, tid),
+            AsyncResumeClass::Ordinary
+        );
+        assert!(
+            !state.cancel_async_preempt_for(tid),
+            "cancelling twice reports nothing was there"
+        );
+    }
+
+    /// (9e) Canonical 199E-R2 — a boundary that cannot name the incarnation it is entering
+    /// REFUSES rather than falling through to the startup rewrite.
+    #[test]
+    fn an_unresolved_incoming_asid_fails_closed() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0x77, 0x88)));
+        assert_eq!(
+            state.take_async_preempt_for_incoming(tid, None),
+            AsyncResumeClass::Refused("unresolved_incoming_asid"),
+            "an unresolvable incoming ASID must not silently become Ordinary"
+        );
+        assert!(
+            !state.async_preempted_resume_pending(tid),
+            "a refused tag is cleared so it cannot be retried"
+        );
+    }
+
+    /// (9f) Canonical 199E-R2 — a replacement incarnation that reused the numeric TID is refused
+    /// at the BOUNDARY, not merely by the tag predicate.
+    #[test]
+    fn a_boundary_entering_a_different_incarnation_fails_closed() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0x99, 0xAA)));
+        let live = state.task_asid(tid).expect("asid");
+        let other = Asid(live.0.wrapping_add(1).max(1));
+        assert_eq!(
+            state.take_async_preempt_for_incoming(tid, Some(other)),
+            AsyncResumeClass::Refused("identity_mismatch"),
+            "the boundary's own resolved ASID must agree, or nothing is restored"
+        );
+        assert!(!state.async_preempted_resume_pending(tid));
+    }
+
+    /// (9g) Canonical 199E-R2 — async and D2/startup continuation states must never coexist. A
+    /// task holding both is ambiguous, and neither may silently win.
+    #[test]
+    fn async_and_continuation_double_ownership_fails_closed() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0xBB, 0xCC)));
+        state.set_pending_syscall_completion_for_test(tid, 7);
+        assert_eq!(
+            resume_as_boundary(&mut state, tid),
+            AsyncResumeClass::Refused("continuation_coexists"),
+            "a task cannot be both asynchronously preempted and holding a parked completion"
+        );
+        assert!(
+            !state.async_preempted_resume_pending(tid),
+            "the ambiguous authorization is cleared rather than left to be raced"
         );
     }
 
@@ -130230,37 +130423,107 @@ mod riscv64_async_preemption {
         );
     }
 
-    /// (11) SOURCE: the resume mode is read from an EXPLICIT tag. Nothing infers it from zero
-    /// registers, a PC value, a bare TID or incidental scheduler state.
+    /// (11) SOURCE: the resume mode is read from an EXPLICIT tag, consumed at the boundary that
+    /// performs the write-back, keyed on the INCOMING identity — and nowhere else.
+    ///
+    /// This is the 199E-R2 repair pinned as source. The 199E-R1D shape had two consumers, both
+    /// running before the resume identity was published; this pins that there is now exactly one
+    /// decision procedure, that both write-backs reach it, and that the seams which used to
+    /// consume no longer can.
     #[test]
-    fn the_resume_mode_is_explicit_and_never_inferred() {
+    fn the_resume_mode_is_taken_at_the_write_back_for_the_incoming_identity() {
         let take = "crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize)";
         assert_eq!(
             RV_BOOT_SRC.matches(take).count(),
             2,
             "exactly two write-backs decide the ABI lanes: the main bridge and the S-mode \
-             timer dispatch — and both must consult the SAME tag"
+             timer dispatch — and both must consult the SAME decision"
         );
-        // Publication happens only where a tag was actually consumed.
+        // Both boundaries consume through the ONE incoming-identity classifier, and each
+        // resolves the ASID it is about to enter rather than re-reading the TCB.
         assert_eq!(
-            RV_TRAP_SRC
+            RV_BOOT_SRC
+                .matches("shared.take_async_preempt_for_incoming_split(resume_tid, resume_asid)")
+                .count(),
+            2,
+            "the bridge and the S-mode dispatch must use the same exact incoming-identity \
+             consumer, keyed on the resume TID and the ASID that boundary resolved"
+        );
+        assert_eq!(
+            RV_BOOT_SRC
+                .matches("shared.task_asid_for_tid_split_read(resume_tid)")
+                .count(),
+            2,
+            "each boundary resolves the incoming incarnation for itself"
+        );
+        // Publication happens only on a successful consumption, and only at a write-back.
+        assert_eq!(
+            RV_BOOT_SRC
                 .matches("crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize)")
                 .count(),
             2,
-            "one in-lock resume boundary and one post-lock drain boundary"
+            "the decision is published at the two write-backs and nowhere else"
+        );
+        for (label, src) in [("boot", RV_BOOT_SRC), ("trap", RV_TRAP_SRC)] {
+            let publishes = src
+                .matches("crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize)")
+                .count();
+            assert_eq!(
+                publishes,
+                if label == "boot" { 2 } else { 0 },
+                "{label}: publication belongs to the write-back boundaries only"
+            );
+        }
+        // The two seams that used to consume the OUTGOING task's tag are gone, by name.
+        assert!(
+            !RV_TRAP_SRC.contains("take_async_preempted_resume("),
+            "the in-lock restore must never consume a tag for kernel.current_tid()"
         );
         assert!(
-            RV_TRAP_SRC.contains("kernel.take_async_preempted_resume(current_tid)"),
-            "the in-lock boundary consumes through the identity-checked seam"
+            !RV_TRAP_SRC.contains("direct_dispatch_take_async_preempt_split("),
+            "the post-lock drain must not be a second consumer of one authorization"
         );
         assert!(
-            RV_TRAP_SRC.contains("shared.direct_dispatch_take_async_preempt_split(token)"),
-            "the post-lock boundary consumes through the EXACT-TOKEN seam"
+            !THREAD_STATE_SRC.contains("fn take_async_preempted_resume("),
+            "no KernelState method may consume a tag without being given an identity"
+        );
+        assert!(
+            !RUNTIME_SRC.contains("fn direct_dispatch_take_async_preempt_split("),
+            "the token-keyed consumer is retired in favour of the one boundary consumer"
         );
         // The decision cannot be inherited across traps.
         assert!(
             RV_BOOT_SRC.contains("crate::kernel::boot::riscv_async_resume_clear(cpu.0 as usize)"),
             "every trap starts from a cleared decision"
+        );
+    }
+
+    /// (11b) SOURCE: a no-switch return CANCELS the staged snapshot, and does so on the branch
+    /// that returns through the original hardware frame.
+    #[test]
+    fn a_no_switch_return_cancels_the_staged_snapshot() {
+        let decision = RV_BOOT_SRC
+            .split("let async_class = if task_switched {")
+            .nth(1)
+            .expect("the write-back decision")
+            .split("\n    if task_switched || scause == EXC_USER_ECALL {")
+            .next()
+            .expect("its body");
+        assert!(
+            decision.contains("shared.cancel_async_preempt_for_split(entering_tid)"),
+            "the not-switched arm must cancel the snapshot staged by this very trap"
+        );
+        assert!(
+            decision
+                .contains("shared.take_async_preempt_for_incoming_split(resume_tid, resume_asid)"),
+            "the switched arm consumes for the INCOMING identity"
+        );
+        // Cancellation names the ENTERING task — the one this trap interrupted — never the
+        // resume identity, which on this branch is the same task but resolved from a seam that
+        // could disagree.
+        assert!(
+            !decision.contains("cancel_async_preempt_for_split(resume_tid)"),
+            "cancellation is keyed on the interrupted identity"
         );
     }
 
@@ -130371,16 +130634,43 @@ mod riscv64_async_preemption {
             include_str!("restart_state.rs").contains("tcb.async_preempted = None;"),
             "exit must make the snapshot unreachable"
         );
-        // The post-lock seam refuses rather than consuming on a mismatch.
-        let split = RUNTIME_SRC
-            .split("pub(crate) fn direct_dispatch_take_async_preempt_split(")
+        // Canonical 199E-R2 — the ONE classifier checks three-way identity agreement and fails
+        // closed on every path that is not a clean match.
+        let classifier = TASK_SRC
+            .split("pub(crate) fn classify_and_take_async_resume(")
             .nth(1)
-            .expect("the split seam")
-            .split("\n    /// U6 §8")
+            .expect("the canonical classifier")
+            .split("\n/// Canonical 199E-R2 — CANCEL")
             .next()
             .expect("its body");
-        assert!(split.contains("t.asid == Some(expected)"));
-        assert!(split.contains("if !tag.matches_tcb(tcb) {"));
+        assert!(
+            classifier.contains("if tcb.asid != Some(expected) || tag.asid != expected {"),
+            "the boundary's OWN resolved incarnation must agree with both the TCB and the tag"
+        );
+        assert!(classifier.contains("if !tag.matches_tcb(tcb) {"));
+        for reason in [
+            "unresolved_incoming_asid",
+            "identity_mismatch",
+            "stale_generation",
+            "no_saved_context",
+            "continuation_coexists",
+        ] {
+            assert!(
+                classifier.contains(&format!("AsyncResumeClass::Refused(\"{reason}\")")),
+                "{reason} must be a named fail-closed refusal, not a silent Ordinary"
+            );
+        }
+        // Every refusal CLEARS the tag, so a state the boundary could not verify can never be
+        // retried into a later resume.
+        assert_eq!(
+            classifier.matches("tcb.async_preempted = None;").count(),
+            6,
+            "five refusals and the one successful consumption all clear the tag"
+        );
+        assert!(
+            classifier.contains("if tcb.pending_syscall_completion.is_some() {"),
+            "async and D2/startup continuation states must not coexist ambiguously"
+        );
     }
 
     /// (14) The Stage 204A census is unchanged: this stage routes its one cross-phase decision

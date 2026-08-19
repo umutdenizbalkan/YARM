@@ -853,6 +853,11 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // restore on the NEXT one, so every trap starts from a cleared flag. This is a clear, not a
     // take: it consumes no authorization and can never be mistaken for one.
     crate::kernel::boot::riscv_async_resume_clear(cpu.0 as usize);
+    // Canonical 199E-R2: the syscall-continuation decision is cleared on exactly the same terms
+    // and at exactly the same point. The two decisions are mutually exclusive at a write-back,
+    // so letting either survive a diverged trap would let the next one pick the wrong one of the
+    // three conventions.
+    crate::kernel::boot::riscv_syscall_continuation_clear(cpu.0 as usize);
 
     // ── Phase: SAVE_DONE ────────────────────────────────────────────────
     if first_trap {
@@ -1058,6 +1063,48 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         );
     }
 
+    // ── Canonical 199E-R2: the ONE async-resume decision, taken at the write-back ────────────
+    //
+    // The identity is resolved HERE, from the same two split reads this write-back already
+    // trusts for everything else it does: `resume_tid` above, and the ASID it is about to
+    // install into `satp` below. Hoisting the ASID read to this point is what lets the
+    // classifier check the tag against the incarnation this boundary is actually entering,
+    // rather than against whatever the TCB happens to say about itself.
+    //
+    // Two outcomes and no third:
+    //
+    // * SWITCHED — the resumed task is a different one, so its tag (if any) is consumed for its
+    //   exact `{tid, asid, preempt_generation}`. A tag that cannot be verified is REFUSED and
+    //   cleared, never silently downgraded to the startup rewrite.
+    // * NOT SWITCHED — this trap returns to the same task through the ORIGINAL hardware frame,
+    //   so no register write-back happens at all and any snapshot staged by this very trap
+    //   describes an instant the task runs straight past. It is CANCELLED here. Without this,
+    //   repeated no-switch ticks would leave a stale snapshot able to authorize a verbatim
+    //   restore of a register file the task abandoned long ago.
+    let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {
+        0 => None,
+        raw => Some(crate::kernel::vm::Asid(raw as u16)),
+    };
+    let async_class = if task_switched {
+        shared.take_async_preempt_for_incoming_split(resume_tid, resume_asid)
+    } else {
+        if shared.cancel_async_preempt_for_split(entering_tid) {
+            crate::arch::riscv64::timer::note_async_snapshot_cancelled(entering_tid);
+        }
+        crate::kernel::task::AsyncResumeClass::Ordinary
+    };
+    // The decision is published ONLY after a successful consumption, so the write-back below can
+    // never observe an authorization that no tag paid for.
+    match async_class {
+        crate::kernel::task::AsyncResumeClass::AsyncPreempted => {
+            crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize);
+        }
+        crate::kernel::task::AsyncResumeClass::Refused(reason) => {
+            crate::arch::riscv64::timer::note_async_resume_refused(resume_tid, reason);
+        }
+        crate::kernel::task::AsyncResumeClass::Ordinary => {}
+    }
+
     if task_switched || scause == EXC_USER_ECALL {
         // PC/SP come from the (possibly task-switched) generic frame.
         frame.sepc = tframe.saved_pc() as u64;
@@ -1107,6 +1154,12 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         // authorizes exactly one verbatim restore. No zero register, PC value, bare TID or
         // incidental scheduler state participates in the decision.
         let async_resume = crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize);
+        // Canonical 199E-R2 — the SECOND explicit decision, and the sibling of the one above.
+        // A completion consumer that ran earlier in this trap has already encoded the caller's
+        // canonical result into `tframe`'s result lanes; taking the decision here is what stops
+        // the startup arm from overwriting it on a SWITCHED resume, exactly as the S-mode-idle
+        // dispatch now does. Neither decision is inferred from register contents.
+        let continuation = crate::kernel::boot::riscv_syscall_continuation_take(cpu.0 as usize);
         if task_switched && async_resume {
             // State 3. Restore the COMPLETE integer register file: the mirror loop above already
             // wrote every non-ABI register, so all that remains is the ABI block it deliberately
@@ -1133,6 +1186,32 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
                 frame.regs[RiscvTrapFrame::SP],
                 frame.regs[RiscvTrapFrame::A0],
                 frame.regs[RiscvTrapFrame::A7]
+            );
+        } else if task_switched && continuation {
+            // Convention (2) on the SWITCHED route: install the canonical result lane the
+            // completion consumer encoded, not the startup ABI. Same lanes as the same-task
+            // continuation arm below, so a caller's result does not depend on which of the two
+            // routes happened to wake it.
+            if let Some(err) = tframe.error_code() {
+                frame.regs[RiscvTrapFrame::A0] = err as u64;
+                frame.regs[RiscvTrapFrame::A1] = 0;
+                frame.regs[RiscvTrapFrame::A2] = 0;
+                frame.regs[RiscvTrapFrame::A3] = err as u64;
+            } else {
+                frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
+                frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;
+                frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;
+                frame.regs[RiscvTrapFrame::A3] = 0;
+            }
+            frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
+            frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
+            frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+            crate::yarm_log!(
+                "RISCV_SYSCALL_CONTINUATION_RESUME tid={} origin=bridge sepc=0x{:016x} a0={} a1={} startup_rewrite=0 result=ok",
+                resume_tid,
+                frame.sepc,
+                frame.regs[RiscvTrapFrame::A0],
+                frame.regs[RiscvTrapFrame::A1]
             );
         } else if task_switched {
             // First instruction the resumed task will execute consumes the YARM
@@ -1279,10 +1358,10 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // stale or missing resume identity from installing address space 0 — activating SOME task's
     // page table instead of declining is precisely the failure this translation exists to
     // prevent, and `cr3_for_asid` would otherwise materialise a root for it.
-    let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {
-        0 => None,
-        raw => Some(crate::kernel::vm::Asid(raw as u16)),
-    };
+    //
+    // Canonical 199E-R2: the read itself is hoisted to the async-resume decision above — the
+    // same resolved incarnation now names both the page table this `sret` lands in and the tag
+    // the write-back was allowed to consume, so those two can never disagree.
     if let Some(asid) = resume_asid {
         // Make sure the kernel-shared gigapage is present in the resumed
         // task's page table. Idempotent for asids that already have it.
@@ -1449,11 +1528,48 @@ fn riscv_s_mode_timer_trap(
                 }
                 frame.regs[i] = tframe.user_gpr(n) as u64;
             }
-            // Canonical 199E-R1D: this dispatch leaves terminal idle, so the task it resumes may
-            // equally be one that was asynchronously preempted before the system went idle. It
-            // therefore honours the SAME explicit resume tag as the main bridge — the two
-            // write-backs must not disagree about what `a0..a7` mean, or a task's registers
-            // would depend on which of the two paths happened to wake it.
+            // ── Canonical 199E-R2: the SAME incoming-identity consumer as the main bridge ────
+            //
+            // This dispatch leaves terminal idle, so the task it resumes is very often one that
+            // was asynchronously preempted before the system went idle — that is exactly the
+            // shape the live failure took, a mid-computation task woken by an expiring receive
+            // deadline and handed its own `ecall` arguments back.
+            //
+            // It resolves the incoming identity the same way the bridge does (the resume TID
+            // from the rank-1 seam, its ASID from the rank-2 seam) and calls the same
+            // `take_async_preempt_for_incoming_split`. The two write-backs cannot disagree about
+            // what `a0..a7` mean, because there is only one decision procedure.
+            //
+            // There is no cancel branch here: this arm runs only when a task is being resumed,
+            // and the idle identity that was interrupted (tid 0) never carries a snapshot —
+            // `snapshot_async_preempted_current` refuses it by construction.
+            let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {
+                0 => None,
+                raw => Some(crate::kernel::vm::Asid(raw as u16)),
+            };
+            match shared.take_async_preempt_for_incoming_split(resume_tid, resume_asid) {
+                crate::kernel::task::AsyncResumeClass::AsyncPreempted => {
+                    crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize);
+                }
+                crate::kernel::task::AsyncResumeClass::Refused(reason) => {
+                    crate::arch::riscv64::timer::note_async_resume_refused(resume_tid, reason);
+                }
+                crate::kernel::task::AsyncResumeClass::Ordinary => {}
+            }
+            // Canonical 199E-R2 — exactly ONE of three conventions, chosen from explicit
+            // decisions and never inferred from register contents:
+            //
+            //   1. AsyncPreempted           — restore the full integer register file verbatim;
+            //   2. syscall/D2 continuation  — install the canonical RESULT lane a completion
+            //                                 consumer already encoded into this trap's frame;
+            //   3. fresh/startup            — install the startup ABI from the argument mirror.
+            //
+            // (2) was missing here, and its absence is a measured live defect and not a
+            // theoretical one: a caller woken from terminal idle by its own expiring reply
+            // deadline had `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED ... final_a0=9` written
+            // into its frame and then had `a0` overwritten with `tframe.arg(0)` — its own stale
+            // endpoint capability — by the startup arm below, faulting at `addr=0x20006`.
+            let continuation = crate::kernel::boot::riscv_syscall_continuation_take(cpu.0 as usize);
             if crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize) {
                 frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;
                 frame.regs[RiscvTrapFrame::A1] = tframe.user_gpr(11) as u64;
@@ -1469,6 +1585,33 @@ fn riscv_s_mode_timer_trap(
                     frame.regs[RiscvTrapFrame::SP],
                     frame.regs[RiscvTrapFrame::A0],
                     frame.regs[RiscvTrapFrame::A7]
+                );
+            } else if continuation {
+                // Convention (2): a completion consumer already encoded the canonical result
+                // into `tframe` during this trap. Install exactly the lanes the main bridge's
+                // own continuation arm installs — a0 from the error lane when the completion
+                // failed, otherwise the return lane — and leave a4/a5/a7 as the saved register
+                // file holds them, which is the same treatment the bridge gives them.
+                if let Some(err) = tframe.error_code() {
+                    frame.regs[RiscvTrapFrame::A0] = err as u64;
+                    frame.regs[RiscvTrapFrame::A1] = 0;
+                    frame.regs[RiscvTrapFrame::A2] = 0;
+                    frame.regs[RiscvTrapFrame::A3] = err as u64;
+                } else {
+                    frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
+                    frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;
+                    frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;
+                    frame.regs[RiscvTrapFrame::A3] = 0;
+                }
+                frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
+                frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
+                frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+                crate::yarm_log!(
+                    "RISCV_SYSCALL_CONTINUATION_RESUME tid={} origin=s_mode_idle sepc=0x{:016x} a0={} a1={} startup_rewrite=0 result=ok",
+                    resume_tid,
+                    frame.sepc,
+                    frame.regs[RiscvTrapFrame::A0],
+                    frame.regs[RiscvTrapFrame::A1]
                 );
             } else {
                 frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;

@@ -454,6 +454,138 @@ impl AsyncPreemptedContext {
     }
 }
 
+/// Canonical 199E-R2 — the write-back convention ONE resume boundary must use.
+///
+/// A resume boundary has exactly three conventions available and they are mutually exclusive.
+/// Naming them as a type is what stops a boundary from silently defaulting to the startup lane
+/// when it could not establish the async one — the defect this stage repairs, where an
+/// asynchronously preempted task was resumed with its own `ecall` arguments reinstalled over a
+/// live computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AsyncResumeClass {
+    /// No async tag names this incoming identity. The boundary's existing conventions apply:
+    /// a syscall/D2 continuation gets its result lane, a fresh task gets the startup lane.
+    Ordinary,
+    /// Exactly one valid tag was consumed for this exact incarnation. The boundary MUST restore
+    /// the full integer register file verbatim and MUST NOT touch the argument mirror.
+    AsyncPreempted,
+    /// A tag existed but could not be honoured. It has been cleared so it cannot be retried,
+    /// and the boundary falls back to its ordinary conventions. The reason is a stable slug for
+    /// the live marker.
+    Refused(&'static str),
+}
+
+impl AsyncResumeClass {
+    /// `true` only for the one class that authorizes a verbatim register-file restore.
+    #[must_use]
+    pub(crate) fn restores_verbatim(self) -> bool {
+        matches!(self, Self::AsyncPreempted)
+    }
+}
+
+/// Canonical 199E-R2 — THE incoming-identity consumer of an async-preemption tag.
+///
+/// This is the single implementation both RISC-V resume boundaries reach: the main trap bridge's
+/// register write-back and the S-mode-idle timer dispatch. Each gets to it through its own
+/// accessor (`SharedKernel::take_async_preempt_for_incoming_split` off the broad lock,
+/// `KernelState::take_async_preempt_for_incoming` for the hosted probes), so the two boundaries
+/// can never disagree about what `a0..a7` mean.
+///
+/// # Why the INCOMING identity, and nowhere else
+///
+/// The tag belongs to the task that was interrupted in U-mode, and it must stay attached to that
+/// exact `{tid, asid, preempt_generation}` until that same task is selected as the task being
+/// resumed. The previous design consumed it wherever `kernel.current_tid()` happened to be
+/// readable — inside the in-lock restore, which on the post-lock dispatch route still names the
+/// OUTGOING task. Measured live: 407 tags published, 407 consumed at that seam, and 0 of 187
+/// switching write-backs ever saw one, because in every single case the consumed tag named the
+/// outgoing task and never the resumed one. The preempted task's authorization was therefore
+/// spent without effect and its next ordinary resume reinstalled the stale argument mirror over
+/// a live computation.
+///
+/// So the identity is resolved HERE, at the boundary that actually performs the write-back, from
+/// the resume TID and the ASID that boundary is about to activate.
+///
+/// # Fail-closed
+///
+/// Every refusal clears the tag and returns [`AsyncResumeClass::Refused`], never
+/// [`AsyncResumeClass::Ordinary`] — a caller that cannot tell "there was nothing" from "there was
+/// something I could not verify" would silently apply the startup rewrite to a preempted task,
+/// which is the whole defect. Refusals are:
+///
+/// * `unresolved_incoming_asid` — the boundary could not name the incarnation it is resuming
+///   into, so no tag can be validated against it;
+/// * `identity_mismatch` — the tag, the TCB and the boundary's own resolved ASID do not all
+///   agree (a replacement incarnation that reused the numeric TID);
+/// * `stale_generation` — the tag names a superseded preemption cycle;
+/// * `no_saved_context` — the task carries a tag but no saved instruction pointer, so the
+///   context the tag promises does not exist;
+/// * `continuation_coexists` — the task holds BOTH an async tag and a parked syscall
+///   completion. Those states are mutually exclusive by construction (a tag is published only
+///   for a RUNNING task, a completion only for a BLOCKED one), so observing both means the
+///   record is ambiguous and neither may silently win.
+pub(crate) fn classify_and_take_async_resume(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    incoming_tid: u64,
+    incoming_asid: Option<Asid>,
+) -> AsyncResumeClass {
+    let Some(tcb) = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|tcb| tcb.tid.0 == incoming_tid)
+    else {
+        return AsyncResumeClass::Ordinary;
+    };
+    // No tag is the ordinary, overwhelmingly common case, and it is decided BEFORE the identity
+    // checks so a boundary that resumes an untagged task with an unresolved ASID is not told a
+    // refusal happened when nothing was ever at stake.
+    let Some(tag) = tcb.async_preempted else {
+        return AsyncResumeClass::Ordinary;
+    };
+    let Some(expected) = incoming_asid else {
+        tcb.async_preempted = None;
+        return AsyncResumeClass::Refused("unresolved_incoming_asid");
+    };
+    // Three-way agreement: the boundary's own resolved incarnation, the TCB's, and the tag's.
+    // Checking the boundary's separately is what makes this a resume-identity check rather than
+    // a self-consistency check the TCB would always pass.
+    if tcb.asid != Some(expected) || tag.asid != expected {
+        tcb.async_preempted = None;
+        return AsyncResumeClass::Refused("identity_mismatch");
+    }
+    if !tag.matches_tcb(tcb) {
+        tcb.async_preempted = None;
+        return AsyncResumeClass::Refused("stale_generation");
+    }
+    if tcb.user_context.instruction_ptr.0 == 0 {
+        tcb.async_preempted = None;
+        return AsyncResumeClass::Refused("no_saved_context");
+    }
+    if tcb.pending_syscall_completion.is_some() {
+        tcb.async_preempted = None;
+        return AsyncResumeClass::Refused("continuation_coexists");
+    }
+    tcb.async_preempted = None;
+    AsyncResumeClass::AsyncPreempted
+}
+
+/// Canonical 199E-R2 — CANCEL a staged snapshot without consuming it as an authorization.
+///
+/// A snapshot is staged at trap entry, before the scheduler has decided anything. When the trap
+/// then returns to the SAME task through the original hardware frame, no register write-back
+/// happens at all and the snapshot describes an instant the task has already run past. Leaving
+/// the tag in place would let a much later resume restore that stale register file, so the
+/// boundary cancels it exactly there.
+///
+/// Returns `true` when a tag was actually cleared, so the caller can emit a bounded live marker
+/// and so repeated no-switch ticks are observably not accumulating snapshots.
+pub(crate) fn cancel_async_resume(tcbs: &mut [Option<ThreadControlBlock>], tid: u64) -> bool {
+    tcbs.iter_mut()
+        .flatten()
+        .find(|tcb| tcb.tid.0 == tid)
+        .is_some_and(|tcb| tcb.async_preempted.take().is_some())
+}
+
 impl BlockedSyscallCompletion {
     /// U6 §2 — the SINGLE source of truth for "is this parked completion still exactly this
     /// task's, for the cycle it was published for?".

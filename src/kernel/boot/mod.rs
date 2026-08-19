@@ -1274,6 +1274,53 @@ pub(crate) fn riscv_async_resume_clear(cpu_idx: usize) {
     RISCV_ASYNC_RESUME_PENDING[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }
 
+// ─── Canonical 199E-R2: the SYSCALL-CONTINUATION resume decision (RISC-V) ────────────────────
+//
+// The exact sibling of `RISCV_ASYNC_RESUME_PENDING`, and it exists for the same reason: a
+// write-back must choose ONE of three conventions, and the two it cannot infer must be told to
+// it explicitly.
+//
+// A blocked caller that was completed remotely gets its canonical result encoded into the
+// outgoing frame's result lanes by a completion consumer, which runs while the trap is still
+// inside the trap-entry wrapper. The write-back that happens afterwards must then install that
+// RESULT lane — not the startup argument lane. Without this flag the S-mode-idle timer dispatch
+// had no way to know, so it installed the startup lane over a delivered `TimedOut` and the
+// caller observed its own stale endpoint capability as a syscall result: measured live as
+// `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=1 ... final_a0=9` followed immediately by
+// `PAGE_FAULT_UNHANDLED tid=1 addr=0x20006`.
+//
+// Published only where a completion was actually CONSUMED and its lanes encoded, taken once by
+// the write-back, and cleared at every trap entry so no decision is inherited.
+pub(crate) static RISCV_SYSCALL_CONTINUATION_PENDING: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Canonical 199E-R2: record that a blocked-syscall completion was consumed on `cpu_idx` and its
+/// canonical result is already encoded in the outgoing frame's result lanes.
+pub(crate) fn riscv_syscall_continuation_publish(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    RISCV_SYSCALL_CONTINUATION_PENDING[cpu_idx].store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Canonical 199E-R2: TAKE the syscall-continuation decision for `cpu_idx`, clearing it.
+pub(crate) fn riscv_syscall_continuation_take(cpu_idx: usize) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    RISCV_SYSCALL_CONTINUATION_PENDING[cpu_idx].swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// Canonical 199E-R2: clear any stale syscall-continuation decision for `cpu_idx` without
+/// consuming it as an authorization. Called at the START of every RISC-V trap.
+pub(crate) fn riscv_syscall_continuation_clear(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    RISCV_SYSCALL_CONTINUATION_PENDING[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
+}
+
 // ─── Stage 196D: RISC-V queue-advancing context-switch FOUNDATION deferral ───
 // A SEPARATE, default-off, one-shot deferral used ONLY by the RISC-V queue-switch
 // foundation oracle. It is deliberately distinct from `YIELD_DISPATCH_*` so it can

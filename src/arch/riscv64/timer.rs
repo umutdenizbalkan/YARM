@@ -76,6 +76,12 @@ static STIE_ENABLED: AtomicBool = AtomicBool::new(false);
 static SIE_ENABLED: AtomicBool = AtomicBool::new(false);
 static TIMER_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 static USER_ORIGIN_TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Canonical 199E-R2 — staged async snapshots dropped because the trap returned to the same
+/// task through the original hardware frame. Expected to be large and healthy.
+static ASYNC_SNAPSHOTS_CANCELLED: AtomicU64 = AtomicU64::new(0);
+/// Canonical 199E-R2 — async tags a resume boundary could not verify and refused. Expected to
+/// be ZERO; anything else is a fail-closed finding.
+static ASYNC_RESUMES_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Reason strings pinned by `scripts/qemu-riscv64-core-smoke.sh` and by the
 /// source-grep test in `mod tests`. Do not reword without updating both.
@@ -182,6 +188,52 @@ pub fn record_user_origin_timer_irq(tid: u64) -> u64 {
 /// Count of timer interrupts whose origin was U-mode.
 pub fn user_origin_timer_irq_count() -> u64 {
     USER_ORIGIN_TIMER_IRQS.load(Ordering::Relaxed)
+}
+
+/// Canonical 199E-R2 — a staged async snapshot was CANCELLED because the trap returned to the
+/// same task through the original hardware frame.
+///
+/// This is the ordinary outcome of a no-switch tick and is expected to dominate the count, so
+/// emission is bounded; the running total is what proves repeated no-switch ticks leave nothing
+/// behind rather than accumulating stale snapshots.
+pub fn note_async_snapshot_cancelled(tid: u64) -> u64 {
+    let n = ASYNC_SNAPSHOTS_CANCELLED
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    if n <= 4 {
+        emit_marker(format_args!(
+            "RISCV_ASYNC_SNAPSHOT_CANCELLED n={} tid={} reason=no_switch_original_frame",
+            n, tid
+        ));
+    }
+    n
+}
+
+/// Number of staged async snapshots cancelled so far.
+pub fn async_snapshot_cancelled_count() -> u64 {
+    ASYNC_SNAPSHOTS_CANCELLED.load(Ordering::Relaxed)
+}
+
+/// Canonical 199E-R2 — a resume boundary REFUSED an async tag it could not verify.
+///
+/// Unbounded emission on purpose, and deliberately not silent: every refusal means a boundary
+/// fell back to the ordinary lane conventions for a task that claimed to be asynchronously
+/// preempted. In a healthy boot the count is zero, so any occurrence is a real finding rather
+/// than noise to be rate-limited away.
+pub fn note_async_resume_refused(tid: u64, reason: &'static str) -> u64 {
+    let n = ASYNC_RESUMES_REFUSED
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    emit_marker(format_args!(
+        "RISCV_ASYNC_RESUME_REFUSED n={} tid={} reason={} result=fail_closed",
+        n, tid, reason
+    ));
+    n
+}
+
+/// Number of async resume refusals so far. Must be zero in a healthy boot.
+pub fn async_resume_refused_count() -> u64 {
+    ASYNC_RESUMES_REFUSED.load(Ordering::Relaxed)
 }
 
 /// Canonical 199E — arm the periodic supervisor timer at the BOOT safe point.

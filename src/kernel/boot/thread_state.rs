@@ -2085,32 +2085,35 @@ impl KernelState {
         })
     }
 
-    /// Canonical 199E-R1D — consume `tid`'s async-preemption tag if, and only if, it still names
-    /// this exact incarnation and preemption cycle.
+    /// Canonical 199E-R2 — consume `tid`'s async-preemption tag through THE canonical
+    /// incoming-identity classifier, for the incarnation `incoming_asid` names.
     ///
-    /// Consumption is unconditional on a match, so one snapshot authorizes exactly one verbatim
-    /// register-file restore; a second resume of the same task falls back to the ordinary lane
-    /// conventions, which is correct because by then the task has been resumed and any further
-    /// state change is its own.
+    /// The broad-lock twin of `SharedKernel::take_async_preempt_for_incoming_split`, delegating
+    /// to the same [`classify_and_take_async_resume`] so the hosted probes exercise the exact
+    /// decision the live RISC-V write-backs make rather than a re-statement of it.
     ///
-    /// A tag that does NOT match — a replacement `{tid, asid}` incarnation that reused the
-    /// numeric TID, or a stale generation — is REFUSED and left in place for its rightful owner
-    /// rather than silently re-pointed. Refusal returns `false`; callers must fail closed on it
-    /// and must never substitute the startup-argument rewrite.
-    pub(crate) fn take_async_preempted_resume(&mut self, tid: u64) -> bool {
+    /// There is deliberately NO variant keyed on `self.current_tid()`. That was the 199E-R1D
+    /// shape, and on the post-lock dispatch route `current` is still the OUTGOING task when the
+    /// restore runs — so it consumed the preempted task's authorization and handed the resumed
+    /// task nothing. Making the identity a required argument is what makes that shape
+    /// unexpressible.
+    ///
+    /// [`classify_and_take_async_resume`]: crate::kernel::task::classify_and_take_async_resume
+    pub(crate) fn take_async_preempt_for_incoming(
+        &mut self,
+        incoming_tid: u64,
+        incoming_asid: Option<crate::kernel::vm::Asid>,
+    ) -> crate::kernel::task::AsyncResumeClass {
         self.with_tcbs_mut(|tcbs| {
-            let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) else {
-                return false;
-            };
-            let Some(tag) = tcb.async_preempted else {
-                return false;
-            };
-            if !tag.matches_tcb(tcb) {
-                return false;
-            }
-            tcb.async_preempted = None;
-            true
+            crate::kernel::task::classify_and_take_async_resume(tcbs, incoming_tid, incoming_asid)
         })
+    }
+
+    /// Canonical 199E-R2 — the broad-lock twin of
+    /// `SharedKernel::cancel_async_preempt_for_split`: drop a staged snapshot that the trap is
+    /// about to run past by returning through the original frame.
+    pub(crate) fn cancel_async_preempt_for(&mut self, tid: u64) -> bool {
+        self.with_tcbs_mut(|tcbs| crate::kernel::task::cancel_async_resume(tcbs, tid))
     }
 
     /// Canonical 199E-R1D — does `tid` currently carry a VALID async-preemption tag?
