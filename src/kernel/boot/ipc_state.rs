@@ -2292,25 +2292,13 @@ impl KernelState {
         tid: u64,
         class: crate::kernel::task::BlockedSyscallClass,
     ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        // U3 (canonical 203C): the decision itself lives in ONE place —
+        // `crate::kernel::task::take_blocked_syscall_completion_for` — so the in-lock consumer
+        // here and the off-lock post-exit restore transaction can never drift apart. `None` for
+        // `expect_asid` preserves this consumer's resolution exactly: it is called with a TID
+        // already read under the same guard, and exactness still comes from `matches_tcb`.
         self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
-            let pending = tcb.pending_syscall_completion?;
-            // Not this consumer's class: leave it parked for the consumer that owns it.
-            if pending.syscall_class != class {
-                return None;
-            }
-            // Exact identity: same incarnation AND the class's own generation at block time.
-            let exact = pending.matches_tcb(tcb);
-            // Take it either way — a stale entry must not linger to be seen by a later block.
-            tcb.pending_syscall_completion = None;
-            if !exact {
-                return None;
-            }
-            // Clear the residue that belongs to THIS completion only (the deadline + token were
-            // already retired by the completion transaction; this drops the consumed flag).
-            tcb.ipc_timeout_fired = false;
-            tcb.blocked_recv_state = None;
-            Some(pending)
+            crate::kernel::task::take_blocked_syscall_completion_for(tcbs, tid, None, class)
         })
     }
 

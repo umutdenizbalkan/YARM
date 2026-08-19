@@ -1920,15 +1920,42 @@ pub fn handle_trap_entry_shared(
                 );
                 // Arch restore for the REPLACEMENT only: incoming TTBR0_EL1/ASID switch (via
                 // the generic HAL hook, carrying the DSB/ISB/TLBI ordering) + EL0 SPSR/ELR/GPR
-                // frame restore — the same brief `with_cpu` shape the 195E/195G drains use.
-                // The exiting task's ELR/SP_EL0 are never a source here.
+                // frame restore. The exiting task's ELR/SP_EL0 are never a source here.
+                //
+                // U3 (canonical 203C): this was the second brief broad `with_cpu` re-acquire of
+                // this consumer — `d2_recv_switch_incoming_asid(next)` followed by
+                // `post_switch_restore_arch_thread_state`, both under one guard that also
+                // performed the TTBR0 write and every frame write while holding it. It is now
+                // ONE authoritative exact-identity transaction plus a purely off-lock apply:
+                //
+                //   * `post_exit_replacement_restore_split` authenticates the SAME
+                //     `validate_online_cpu` admission predicate `with_cpu` used, binds
+                //     `current_cpu` the same way, resolves the replacement on THIS exact CPU, and
+                //     takes the ASID, the saved context, the TLS request and the parked
+                //     blocked-syscall completion as ONE coherent rank-1 → rank-2 observation
+                //     (ascending canonical order, one acquisition of each). The retired body read
+                //     those facts through four separate re-entrant domain acquisitions underneath
+                //     the broad guard, which could tear between the ASID it activated and the
+                //     context it restored.
+                //   * `post_exit_restore_replacement` then does the TTBR0/frame/hardware work with
+                //     EVERY domain lock released, through the SAME single frame writer the in-lock
+                //     restore uses — so the completion-before-argument-mirror ordering, the
+                //     error-lane convention and the TLS lane have exactly one owner.
+                //
+                // `frame.is_some()` is passed in because the retired body switched the address
+                // space unconditionally and only then discovered it had no frame: with no frame,
+                // nothing may be consumed. The refusal classes are unchanged — an invalid or
+                // offline CPU still yields the identical `KernelError` through the identical
+                // `map_err`, and a stale replacement identity fails closed onto the same
+                // `TrapHandleError::Syscall` path the restore's `TaskMissing` already took.
                 let restore = shared
-                    .with_cpu(cpu, |kernel| {
-                        kernel.d2_recv_switch_incoming_asid(next);
-                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
-                    })
-                    .map_err(|err| TrapHandleError::Syscall(err.into()));
-                restore??;
+                    .post_exit_replacement_restore_split(cpu, tid, next, frame.is_some())
+                    .map_err(|err| TrapHandleError::Syscall(err.into()))?;
+                super::aarch64::trap::post_exit_restore_replacement(
+                    cpu,
+                    frame.as_deref_mut(),
+                    &restore,
+                );
                 crate::yarm_log!(
                     "EXIT_TASK_RESTORE_DONE arch=aarch64 owner=replacement next_tid={} cpu={} result=ok",
                     next,

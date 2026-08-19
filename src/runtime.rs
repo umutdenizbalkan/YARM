@@ -612,6 +612,28 @@ pub(crate) struct PostLockExitValidation {
     pub(crate) in_runqueue: bool,
 }
 
+/// The coherent rank-1 → rank-2 restore transaction taken by
+/// [`SharedKernel::post_exit_replacement_restore_split`].
+///
+/// Named fields rather than a positional tuple, and each names one decision the retired broad
+/// body made inline. Nothing here touches hardware or the trap frame: the caller performs both,
+/// with every domain lock already released.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExitReplacementRestore {
+    /// The replacement's ASID, to activate once the locks are dropped. `None` means the retired
+    /// `d2_recv_switch_incoming_asid` would have switched nothing (the TCB is gone, or carries no
+    /// ASID), so no address space may be activated.
+    pub(crate) asid: Option<crate::kernel::vm::Asid>,
+    /// Every task-owned restore fact, taken in the SAME rank-2 acquisition as `asid`. `None` when
+    /// there is nothing to restore into (no frame) or nothing to restore (no ASID); in both cases
+    /// NOTHING was consumed.
+    pub(crate) facts: Option<crate::kernel::task::ThreadRestoreFacts>,
+    /// The retired restore logged `SCHED_ENTER_IDLE` and returned success instead of restoring:
+    /// a frame exists but the replacement carries no ASID.
+    pub(crate) enter_idle: bool,
+}
+
 /// The coherent rank-2 saved-context snapshot taken by
 /// [`SharedKernel::ap_saved_resume_context_split`].
 ///
@@ -2356,28 +2378,17 @@ impl SharedKernel {
         token: DispatchMarkToken,
     ) -> Option<(crate::kernel::task::UserRegisterContext, Option<usize>)> {
         let incoming = token.tid();
-        if incoming == 0 {
-            return None;
-        }
         let expected = token.expect_asid()?;
+        // U3 (canonical 203C): the read + take itself lives in ONE place —
+        // `crate::kernel::task::read_user_context_and_take_tls` — shared with the post-exit
+        // restore transaction. The token supplies the exact incarnation; nothing else changes.
         self.with_task_return_split_mut(|tcbs, tls_pending| {
-            let tcb = tcbs
-                .iter()
-                .flatten()
-                .find(|t| t.tid.0 == incoming && t.asid == Some(expected))?;
-            let context = tcb.user_context;
-            let tls_base = tcb.tls_ptr.map(|ptr| ptr.0 as usize);
-            let pending = tls_pending
-                .iter()
-                .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == incoming));
-            let tls = match pending {
-                Some(idx) => {
-                    tls_pending[idx] = None;
-                    tls_base
-                }
-                None => None,
-            };
-            Some((context, tls))
+            crate::kernel::task::read_user_context_and_take_tls(
+                tcbs,
+                tls_pending,
+                incoming,
+                Some(expected),
+            )
         })
     }
 
@@ -2584,6 +2595,108 @@ impl SharedKernel {
                 terminal,
                 in_runqueue,
             })
+        })
+    }
+
+    /// U3 (canonical 203C) — the AArch64 post-lock `CurrentTaskExited` REPLACEMENT restore
+    /// transaction.
+    ///
+    /// Replaces the second brief broad `with_cpu` re-acquire the AArch64 exit consumer took, the
+    /// one that ran `d2_recv_switch_incoming_asid(next)` followed by the post-switch arch restore.
+    /// Everything that body read or consumed from kernel state is taken here, and everything it
+    /// did to hardware or to the trap frame is left to the caller — which performs it with every
+    /// domain lock released.
+    ///
+    /// Lock ordering: rank 1 (scheduler) with rank 2 (task) NESTED inside it, the same ascending
+    /// shape [`Self::post_lock_exit_validation_split`] uses. One acquisition of each, so the
+    /// replacement's ASID, its saved context, its TLS request and its parked completion are ONE
+    /// coherent observation of ONE incarnation. Splitting them would let the ASID that gets
+    /// activated belong to a different instant than the context that gets restored.
+    ///
+    /// Rank 1 reproduces exactly what `with_cpu` did on entry: the same `validate_online_cpu`
+    /// admission predicate — so an invalid or offline CPU still yields the identical
+    /// `KernelError` — and the same `current_cpu` binding, which the retired body depended on
+    /// (`d2_recv_switch_incoming_asid` switched the address space of `self.current_cpu()`).
+    ///
+    /// Two refusals are DELIBERATE tightenings of the retired body, and both fail closed:
+    ///
+    /// * `next_tid == exiting_tid` — the exiting task may never be the restore source. The
+    ///   consumer already refuses this above with its own marker; refusing here as well makes the
+    ///   transaction sound on its own terms.
+    /// * `current_tid_on(cpu) != Some(next_tid)` — the replacement named by the caller is no
+    ///   longer the task this CPU is running. The retired body re-read `current_tid()` inside its
+    ///   own separate acquisition and would have restored whatever it found there; resolving the
+    ///   replacement on the exact CPU and refusing a disagreement is what stops a stale identity
+    ///   from being restored at all.
+    ///
+    /// Everything else is the retired body's behaviour, outcome for outcome:
+    ///
+    /// * a replacement with no ASID — including one whose TCB is gone entirely — yields
+    ///   `asid: None`, `facts: None`, `enter_idle: true`. `task_asid` returned `None` in both
+    ///   cases, so no address space was switched and the restore logged `SCHED_ENTER_IDLE` and
+    ///   returned success. Nothing is consumed.
+    /// * `restore_frame == false` (the caller holds no trap frame) yields `facts: None` with the
+    ///   ASID still resolved. The retired body performed the address-space switch unconditionally
+    ///   and only then discovered it had no frame, so nothing was consumed on that path either.
+    ///   Taking the TLS request or a parked completion here would destroy state with nowhere to
+    ///   write it.
+    ///
+    /// The facts are TAKES, not observations: once returned, this value holds the only remaining
+    /// copy of the replacement's TLS request and parked completion.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn post_exit_replacement_restore_split(
+        &self,
+        cpu: CpuId,
+        exiting_tid: u64,
+        next_tid: u64,
+        restore_frame: bool,
+    ) -> Result<ExitReplacementRestore, KernelError> {
+        if next_tid == 0 || next_tid == exiting_tid {
+            return Err(KernelError::TaskMissing);
+        }
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .map_err(crate::kernel::boot::map_scheduler_error)?;
+            // The admission side effect `with_cpu` performed, which the retired body relied on.
+            sched.current_cpu = cpu;
+            if kernel_ref(&sched.scheduler)
+                .current_tid_on(cpu)
+                .map(|t| t.0)
+                != Some(next_tid)
+            {
+                return Err(KernelError::TaskMissing);
+            }
+            // Rank 2 nested here, with the rank-1 guard above still held.
+            Ok(self.with_task_return_split_mut(|tcbs, tls_pending| {
+                let Some(asid) = tcbs
+                    .iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == next_tid)
+                    .and_then(|t| t.asid)
+                else {
+                    return ExitReplacementRestore {
+                        asid: None,
+                        facts: None,
+                        enter_idle: restore_frame,
+                    };
+                };
+                let facts = restore_frame
+                    .then(|| {
+                        crate::kernel::task::take_thread_restore_facts(
+                            tcbs,
+                            tls_pending,
+                            next_tid,
+                            Some(asid),
+                        )
+                    })
+                    .flatten();
+                ExitReplacementRestore {
+                    asid: Some(asid),
+                    facts,
+                    enter_idle: false,
+                }
+            }))
         })
     }
 

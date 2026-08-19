@@ -331,10 +331,69 @@ pub(crate) fn restore_arch_thread_state(
         crate::yarm_log!("SCHED_ENTER_IDLE");
         return Ok(());
     }
-    let tls = kernel
-        .resume_current_thread_with_frame(frame)
+    // U3 (canonical 203C): the GATHER half. Every task-owned fact this restore needs is read or
+    // consumed here, then handed to the single frame writer below. The takes are unchanged in
+    // decision and in order — `IpcSend` before `IpcRecv`, and only when this is not a direct
+    // syscall return — and none of them reads the frame, so performing them all before the first
+    // frame write is behaviour-preserving. Splitting the gather from the write is what lets the
+    // post-lock exit boundary reach the SAME writer with facts taken off the broad lock.
+    let context = kernel
+        .thread_user_context(current_tid)
+        .ok_or(crate::kernel::boot::KernelError::TaskMissing)
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
+    let tls = kernel
+        .take_tls_restore_request(current_tid)
+        .map_err(crate::kernel::syscall::SyscallError::from)
+        .map_err(TrapHandleError::Syscall)?;
+    let send_completion = (!syscall_return)
+        .then(|| {
+            kernel.take_blocked_syscall_completion_of_class(
+                current_tid,
+                crate::kernel::task::BlockedSyscallClass::IpcSend,
+            )
+        })
+        .flatten();
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    let recv_completion = (!syscall_return)
+        .then(|| kernel.take_blocked_syscall_completion(current_tid))
+        .flatten();
+    apply_restored_thread_state(
+        frame,
+        cpu,
+        &crate::kernel::task::ThreadRestoreFacts {
+            tid: current_tid,
+            context,
+            tls,
+            send_completion,
+            #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+            recv_completion,
+        },
+        syscall_return,
+    );
+    Ok(())
+}
+
+/// U3 (canonical 203C) — THE frame-write half of the AArch64 thread-state restore.
+///
+/// One writer, two producers. `restore_arch_thread_state` reaches it with facts gathered under
+/// the broad lock; `post_exit_restore_replacement` reaches it with facts taken by
+/// `SharedKernel::post_exit_replacement_restore_split` with every domain lock released. Neither
+/// carries a second copy of this sequence, so the completion-before-argument-mirror ordering, the
+/// error-lane convention and the TLS lane can only ever be changed in one place.
+///
+/// Touches nothing but `frame`: no kernel state is read, taken or written here. `facts` is already
+/// the only remaining copy of whatever was consumed, so every completion it carries is encoded
+/// exactly once, by construction.
+fn apply_restored_thread_state(
+    frame: &mut TrapFrame,
+    cpu: CpuId,
+    facts: &crate::kernel::task::ThreadRestoreFacts,
+    syscall_return: bool,
+) {
+    let current_tid = facts.tid;
+    let tls = facts.tls;
+    frame.apply_user_context(facts.context);
     frame.set_user_gpr(
         crate::arch::aarch64::syscall_abi::REG_X18_TLS,
         tls.unwrap_or(0),
@@ -351,11 +410,10 @@ pub(crate) fn restore_arch_thread_state(
     if !syscall_return {
         // Stage 200C2C1B — BLOCKED-SYSCALL COMPLETION boundary. A blocked recv on this port is
         // never re-entered (its `ELR_EL1` already points past the `SVC`), so a remotely completed
-        // caller resumes straight to userspace from here. Consume the EXACT parked completion —
-        // BEFORE the argument mirror below — and encode its canonical syscall error into the
-        // resume lanes. This is the one and only consumer: the completion is taken (never
-        // observable twice), its identity `{tid, asid, blocked_generation}` must match exactly, and
-        // the result is ENCODED BEFORE the state is observed as cleared.
+        // caller resumes straight to userspace from here. Encode the EXACT parked completion the
+        // gather consumed — BEFORE the argument mirror below — into the resume lanes. Exactly-once
+        // consumption is a property of the gather (there is one slot and it was emptied there);
+        // exactly-once ENCODING is a property of this block, which sees the only remaining copy.
         //
         // Encoding follows the established AArch64 error convention (mirrors
         // `export_syscall_result_to_user_gprs`'s error path): the error code lands in the x0 lane
@@ -365,10 +423,7 @@ pub(crate) fn restore_arch_thread_state(
         // of the post-lock one in `direct_dispatch_resume_incoming_core`. Ungated: the send
         // class is production-live on every build, and it is class-scoped so it can never
         // consume the reply-timeout consumer's `IpcRecv` entry below.
-        if let Some(done) = kernel.take_blocked_syscall_completion_of_class(
-            current_tid,
-            crate::kernel::task::BlockedSyscallClass::IpcSend,
-        ) {
+        if let Some(done) = facts.send_completion {
             encode_blocked_send_completion(frame, done.result);
             crate::yarm_log!(
                 "AARCH64_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} elr=0x{:016x} result=ok",
@@ -380,7 +435,7 @@ pub(crate) fn restore_arch_thread_state(
             );
         }
         #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-        if let Some(done) = kernel.take_blocked_syscall_completion(current_tid) {
+        if let Some(done) = facts.recv_completion {
             frame.set_arg(0, done.result as usize);
             for lane in 1..=5 {
                 frame.set_arg(lane, 0);
@@ -434,7 +489,43 @@ pub(crate) fn restore_arch_thread_state(
     }
     #[cfg(not(test))]
     let _ = (cpu, tls);
-    Ok(())
+}
+
+/// U3 (canonical 203C) — the post-lock AArch64 `CurrentTaskExited` REPLACEMENT restore.
+///
+/// The off-lock half of the acquisition this stage retired. Everything here runs with EVERY
+/// domain lock released: `SharedKernel::post_exit_replacement_restore_split` already took the
+/// replacement's ASID and its restore facts as one coherent rank-1 → rank-2 observation, so this
+/// performs only hardware and trap-frame work.
+///
+/// Outcome for outcome with the retired `with_cpu` body:
+///
+/// * the ASID activation is the SAME arch primitive the in-lock `d2_recv_switch_incoming_asid`
+///   reached — `hal_adapters::switch_address_space`, carrying the established AArch64
+///   DSB/ISB/TLBI ordering — followed by the same authoritative per-CPU activation record
+///   `Hal::switch_address_space` writes, so every `active_asid_on` consumer observes it
+///   identically. `asid == None` activates nothing, exactly as an absent `task_asid` did;
+/// * `enter_idle` reproduces the restore's `SCHED_ENTER_IDLE` marker and its success return;
+/// * the frame work is the SAME single writer the in-lock restore uses, with `syscall_return`
+///   false — the value `post_switch_restore_arch_thread_state` always passed.
+///
+/// Only the replacement is ever a source: the exiting task's identity never reaches this function.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn post_exit_restore_replacement(
+    cpu: CpuId,
+    frame: Option<&mut TrapFrame>,
+    restore: &crate::runtime::ExitReplacementRestore,
+) {
+    if let Some(asid) = restore.asid {
+        crate::arch::hal_adapters::switch_address_space(asid);
+        crate::arch::hal::note_address_space_activated(cpu, asid);
+    }
+    if restore.enter_idle {
+        crate::yarm_log!("SCHED_ENTER_IDLE");
+    }
+    if let (Some(frame), Some(facts)) = (frame, restore.facts.as_ref()) {
+        apply_restored_thread_state(frame, cpu, facts, false);
+    }
 }
 
 /// Stage 117: post-switch arch thread state restore, called after

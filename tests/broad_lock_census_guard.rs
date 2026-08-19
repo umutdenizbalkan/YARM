@@ -58,7 +58,21 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // body again; both now reuse that transaction unchanged. The five that remain are the
     // canonical broad trap phase, the AArch64 FutexWait no-incoming idle read, the D6
     // controlled-proof restore, and the two AArch64 ExitCurrentTask acquisitions.
-    ("src/arch/trap_entry.rs", 4),
+    // U3 (203C): 5 -> 4. The AArch64 `CurrentTaskExited` VALIDATION reacquisition became
+    // `SharedKernel::post_lock_exit_validation_split`, the same rank-1 -> rank-2 snapshot the
+    // RISC-V exit consumer already used.
+    // U3 (203C): 4 -> 3. The AArch64 `CurrentTaskExited` REPLACEMENT RESTORE reacquisition became
+    // `SharedKernel::post_exit_replacement_restore_split` (one coherent rank-1 -> rank-2
+    // transaction taking the replacement's ASID, saved context, TLS request and parked
+    // blocked-syscall completion) plus `aarch64::trap::post_exit_restore_replacement`, which does
+    // the TTBR0/frame work with every domain lock released through the SAME single frame writer
+    // the in-lock restore uses. The three that remain are the canonical broad trap phase, the
+    // AArch64 FutexWait no-incoming idle read, and the D6 controlled-proof restore — whose
+    // acquisition is DELIBERATELY retained: its body also runs the D6 proof cleanup
+    // (`d6_ensure_post_cleanup_task_stacks_mapped` maps kernel stack pages into the active root
+    // and every live task root), which is D3-fenced by AI_AGENT_RULES §14.4 and has no split form,
+    // so splitting it would leave a broad drain behind at census delta 0.
+    ("src/arch/trap_entry.rs", 3),
     // U3 (203C): 4 -> 3. The AP saved-resume placement's `with_cpu(cpu, |k| { enqueue; dispatch })`
     // became one authoritative rank-1 -> rank-2 transaction,
     // `SharedKernel::enqueue_then_dispatch_on_cpu_split`: rank 1 acquired once, CPU validated with
@@ -170,7 +184,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 11; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 (+ the AArch64 CurrentTaskExited validation)
+const AUDITED_WITH_CPU_TOTAL: usize = 10; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 (the AArch64 CurrentTaskExited validation, then its replacement restore)
 const AUDITED_WITH_BROAD_TOTAL: usize = 1; // U3: 6 -> 2 -> 1 (runtime.rs fully drained; the reached x86 AP SMP read retired)
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -179,7 +193,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 12; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 (thirty-two retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 11; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 (thirty-three retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

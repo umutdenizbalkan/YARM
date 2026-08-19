@@ -127,17 +127,17 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **11** |
+| `SharedKernel::with_cpu` | **10** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **1** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **12** |
+| **Total broad-lock acquisition sites** | **11** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
 | File | Count | Lines |
 |------|-------|-------|
 | `src/runtime.rs` | 8 | U1 deleted the obsolete `handle_trap_with_cpu` acquisition (13 → 12). This row had not been re-derived when U3 retired `current_tid_authoritative` onto the rank-1 scheduler transaction (12 → 11); it is corrected here rather than carried forward. U3 (203C) then retired the three homologous blocked-waiter Phase-C completions — `execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`, `execute_blocked_waiter_ordinary_cap_delivery` — onto ONE shared, class-neutral, rank-ordered transaction, `complete_blocked_waiter_delivery_split` (11 → 8). U3 (203C) then retired the post-drain idle-owner revalidation, `revalidate_idle_owner_after_drains`, onto a CPU-local rank-1/rank-2 transaction (11 → 8 → 7), then the two homologous recv copy-fault completions in `complete_recv_boundary_user_copy` onto ONE class-neutral rank-1 → rank-8 transaction, `record_recv_boundary_user_fault_split` (7 → 5), then the ordinary-cap DEFERRED SENDER WAKE onto `apply_split_sender_wake_plan_split`, which reuses the SHARED `wake_tid_to_runnable_split` body (5 → 4). The capability-rollback re-entry in that same method is dependency-blocked and stays broad. The mechanical per-file count in `tests/broad_lock_census_guard.rs` is the authority for this figure. |
-| `src/arch/trap_entry.rs` | 5 | U3 retired the AArch64 FutexWait and Yield switch-success restores (11 → 9), then the two homologous x86_64 D2 switch-success restores — blocking send and blocking receive — onto one neutral exact-token transaction, `x86_post_lock_resume_marked_incoming` (9 → 7), then the x86_64 FutexWait and Yield switch-success restores, which reuse that same transaction unchanged (7 → 5). The five that remain are the canonical broad trap phase, the AArch64 FutexWait no-incoming idle current-TID read (restored: its live gate is unreachable behind the pre-existing SpawnV5 stall), the D6 controlled-proof restore, and the two AArch64 `ExitCurrentTask` acquisitions. |
+| `src/arch/trap_entry.rs` | 3 | U3 retired the AArch64 FutexWait and Yield switch-success restores (11 → 9), then the two homologous x86_64 D2 switch-success restores — blocking send and blocking receive — onto one neutral exact-token transaction, `x86_post_lock_resume_marked_incoming` (9 → 7), then the x86_64 FutexWait and Yield switch-success restores, which reuse that same transaction unchanged (7 → 5), then the AArch64 `CurrentTaskExited` VALIDATION reacquisition onto the shared `post_lock_exit_validation_split` (5 → 4), then the AArch64 `CurrentTaskExited` REPLACEMENT RESTORE reacquisition onto `post_exit_replacement_restore_split` plus the off-lock `aarch64::trap::post_exit_restore_replacement` (4 → 3). The three that remain are the canonical broad trap phase, the AArch64 FutexWait no-incoming idle current-TID read (restored: its live gate is unreachable behind the pre-existing SpawnV5 stall), and the D6 controlled-proof restore — whose acquisition is DELIBERATELY retained, because its body also runs the D6 proof cleanup (`d6_ensure_post_cleanup_task_stacks_mapped` maps kernel stack pages into the active root and every live task root), which is D3-fenced by `AI_AGENT_RULES` §14.4 and has no split form, so splitting the site would leave a broad drain behind at census delta 0. |
 | `src/arch/riscv64/trap.rs` | 2 | U3 retired six: two read-only current-TID re-acquisitions (foundation-oracle drain 8 → 7, FutexWait no-incoming idle 7 → 6), the three homologous switch/restore drains — queue-switch foundation, FutexWait switch-success, Yield switch-success (6 → 3) — onto the exact-token rank-2 transaction, and the post-lock `CurrentTaskExited` validation snapshot onto `post_lock_exit_validation_split`, one coherent rank-1 scheduler transaction with the rank-2 task acquisition nested inside it (3 → 2). U3 (203C) then retired the post-lock blocked-syscall TERMINAL-IDLE predicate onto `terminal_idle_on_cpu_split`, one coherent rank-1 scheduler snapshot (2 → 1). **`src/arch/riscv64/trap.rs` is now fully drained of reacquisitions**: its sole remaining production `with_cpu` is the canonical broad Phase-2 trap handler. |
 | `src/arch/x86_64/smp.rs` | 2 | 2466, 2688 — U3 retired the AP saved-resume enqueue→dispatch placement onto `enqueue_then_dispatch_on_cpu_split` (4 → 3), then the AP return-to-idle `block_current_on_cpu` onto `block_current_on_cpu_split` (3 → 2) |
 | `src/arch/riscv64/boot.rs` | 1 | 1048 |
@@ -165,6 +165,15 @@ Structural reading of those 40:
 > and the tree from 51 to 50. Blocker 3's post-lock direct dispatch drain (§6.1.13) added **no**
 > replacement — unlike the drains above it takes no `with_cpu` at all — so this table is
 > unchanged at 40 across that increment.
+
+> **Correction — the `trap_entry.rs` row was stale by one before this checkpoint.** It read **5**
+> while the source already held **4**: the U3 AArch64 `CurrentTaskExited` VALIDATION retirement
+> took it 5 → 4 and this table was not re-derived at the time. The U3 AArch64 `CurrentTaskExited`
+> REPLACEMENT RESTORE retirement takes it 4 → **3**, and the row is now recomputed mechanically
+> from source rather than decremented from the stale value. The published TOTALS were never wrong:
+> they are taken from `tests/broad_lock_census_guard.rs`, which counts comment-stripped
+> `.with_cpu(` / `.with(|` / `state.lock()` occurrences in production source on every run. The
+> correction is bookkeeping in this table only.
 
 ### 1.4 Broad `.with(|state| …)` — 1 production callsite
 
@@ -233,7 +242,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **12** |
+| runtime-required | **11** |
 | undocumented | **0** |
 
 #### test-only (0)

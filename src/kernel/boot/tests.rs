@@ -54728,14 +54728,15 @@ mod stage169_d2_send_genuine {
             2,
             "the fatal adapter must reach both architectures' established terminals"
         );
-        // U3 (203C): 7 -> 5 -> 4. The x86 FutexWait and Yield switch-success restores joined
-        // the same transaction, and the AArch64 `CurrentTaskExited` VALIDATION reacquisition
-        // was retired onto the shared `post_lock_exit_validation_split`. Their classes and
+        // U3 (203C): 7 -> 5 -> 4 -> 3. The x86 FutexWait and Yield switch-success restores
+        // joined the same transaction, the AArch64 `CurrentTaskExited` VALIDATION reacquisition
+        // was retired onto the shared `post_lock_exit_validation_split`, and its REPLACEMENT
+        // RESTORE reacquisition onto `post_exit_replacement_restore_split`. Their classes and
         // counters are untouched.
         assert_eq!(
             src.matches(".with_cpu(").count(),
-            4,
-            "trap_entry.rs retains exactly four broad acquisitions"
+            3,
+            "trap_entry.rs retains exactly three broad acquisitions"
         );
         assert!(
             src.contains("FUTEX_WAIT_DISPATCH_COUNT"),
@@ -54751,7 +54752,7 @@ mod stage169_d2_send_genuine {
         );
         assert!(
             src.contains("EXIT_TASK_RESTORE_OWNER arch=aarch64"),
-            "the AArch64 exit restore remains"
+            "the AArch64 exit restore remains — off the broad lock"
         );
     }
 }
@@ -98923,13 +98924,20 @@ mod stage200d0c1_aarch64_exit_prep {
             ),
             "the suppressed call is the real in-lock arch restore"
         );
-        // The consumer performs the restore itself, after validating.
+        // The consumer performs the restore itself, after validating. U3 (203C): the restore is
+        // no longer a broad `with_cpu` re-acquire around `post_switch_restore_arch_thread_state`
+        // — it is the split transaction plus its off-lock apply — but the ORDER is the property
+        // this case owns, and it is unchanged.
         let cb = consumer_code();
         let validated = cb.find("EXIT_TASK_ABSENCE_VALIDATED").expect("absence");
         let restore = cb
-            .find("post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())")
-            .expect("consumer-side restore");
+            .find(".post_exit_replacement_restore_split(cpu, tid, next, frame.is_some())")
+            .expect("consumer-side restore transaction");
         assert!(validated < restore, "validation precedes any restore");
+        assert!(
+            !cb.contains("post_switch_restore_arch_thread_state("),
+            "the retired broad restore shim is gone from the exit consumer"
+        );
     }
 
     // ── 6–10: replacement and idle paths ────────────────────────────────────────────
@@ -98939,12 +98947,34 @@ mod stage200d0c1_aarch64_exit_prep {
     fn c06_c08_replacement_is_the_only_restore_owner() {
         let cb = consumer_code();
         assert!(cb.contains("Some(next) if next != 0 => {"));
-        assert!(cb.contains("kernel.d2_recv_switch_incoming_asid(next);"));
+        // U3 (203C): the address-space switch moved off the broad lock. The transaction resolves
+        // the REPLACEMENT's ASID (`next`, never `tid`) and the off-lock apply activates it.
+        assert!(
+            cb.contains(".post_exit_replacement_restore_split(cpu, tid, next, frame.is_some())")
+        );
+        assert!(cb.contains("super::aarch64::trap::post_exit_restore_replacement("));
+        assert!(
+            !cb.contains("d2_recv_switch_incoming_asid"),
+            "the in-lock ASID switch is retired, not kept alongside the transaction"
+        );
         assert!(cb.contains(
             "EXIT_TASK_RESTORE_OWNER arch=aarch64 owner=replacement exiting_tid={} next_tid={}"
         ));
-        // The exiting tid is never an argument to a restore or an address-space switch.
-        assert!(!cb.contains("d2_recv_switch_incoming_asid(tid)"));
+        // The exiting tid reaches the transaction only as the identity to REFUSE, never as a
+        // restore or address-space source: the seam takes it as `exiting_tid` and errors when it
+        // equals the replacement.
+        let seam = RUNTIME_SRC
+            .split("pub(crate) fn post_exit_replacement_restore_split(")
+            .nth(1)
+            .expect("the restore transaction")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        assert!(seam.contains("if next_tid == 0 || next_tid == exiting_tid {"));
+        assert!(
+            !seam.contains("t.tid.0 == exiting_tid"),
+            "the exiting task is never a source of restore state"
+        );
         // A replacement that IS the exiting task is a hard failure, not a restore.
         assert!(cb.contains("if next == tid {"));
         assert!(cb.contains("EXIT_TASK_RESELECTED_EXITING_TASK"));
@@ -99507,29 +99537,234 @@ mod stage200d0c1_aarch64_exit_prep {
         );
     }
 
-    /// U3-3. The REPLACEMENT restore acquisition is deliberately untouched — U3 retires exactly
-    /// one callsite, and this is the other one.
+    /// U3-3. The REPLACEMENT restore acquisition is RETIRED: the whole AArch64 exit consumer now
+    /// holds no broad-lock acquisition of any form, and the file census drops 4 -> 3.
     #[test]
-    fn u3_replacement_restore_acquisition_is_unchanged() {
+    fn u3_replacement_restore_acquisition_is_retired() {
         let cb = consumer_code();
-        assert!(cb.contains(
-            "let restore = shared\n                    .with_cpu(cpu, |kernel| {\n                        kernel.d2_recv_switch_incoming_asid(next);\n                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())\n                    })"
-        ));
-        // Exactly one `with_cpu` remains in the whole consumer, and it is that one.
-        assert_eq!(
-            cb.matches(".with_cpu(").count(),
-            1,
-            "the consumer keeps exactly one acquisition: the replacement restore"
+        // The retired body, in every one of its parts, is gone from the consumer.
+        for retired in [
+            ".with_cpu(",
+            ".with(|",
+            "state.lock()",
+            "borrow_kernel_for_boot",
+            "d2_recv_switch_incoming_asid",
+            "post_switch_restore_arch_thread_state",
+        ] {
+            assert!(
+                !cb.contains(retired),
+                "the AArch64 exit consumer must hold no `{retired}` after U3"
+            );
+        }
+        // It reaches `KernelState` through no accessor at all — the transaction owns that.
+        assert!(
+            !cb.contains("kernel."),
+            "the exit consumer touches no `&mut KernelState` accessor"
         );
-        // File-level: 5 -> 4, which is the census delta this directive publishes.
+        // What replaced it: ONE transaction call, then ONE off-lock apply.
+        assert_eq!(
+            cb.matches(".post_exit_replacement_restore_split(cpu, tid, next, frame.is_some())")
+                .count(),
+            1,
+            "exactly one call to the replacement-restore transaction"
+        );
+        assert_eq!(
+            cb.matches("super::aarch64::trap::post_exit_restore_replacement(")
+                .count(),
+            1,
+            "exactly one off-lock apply"
+        );
+        assert!(
+            cb.contains(".map_err(|err| TrapHandleError::Syscall(err.into()))?;"),
+            "the refusal path is byte-identical to the retired acquisition's"
+        );
+        // The transaction has ONE definition; nothing was cloned to serve this callsite.
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("pub(crate) fn post_exit_replacement_restore_split(")
+                .count(),
+            1,
+            "the transaction has ONE definition"
+        );
+        // File-level: 4 -> 3, which is the census delta this directive publishes.
         let code: alloc::vec::Vec<&str> = TRAP_ENTRY_SRC
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect();
+        let code = code.join("\n");
         assert_eq!(
-            code.join("\n").matches(".with_cpu(").count(),
-            4,
-            "trap_entry.rs drops from 5 to 4 with_cpu callsites"
+            code.matches(".with_cpu(").count(),
+            3,
+            "trap_entry.rs drops from 4 to 3 with_cpu callsites"
+        );
+        assert_eq!(code.matches(".with(|").count(), 0);
+    }
+
+    /// U3-3b. The D6 controlled-switch proof acquisition is EXCLUDED and byte-for-byte unchanged.
+    ///
+    /// Its body does more than restore: it also runs the D6 proof cleanup, whose
+    /// `d6_ensure_post_cleanup_task_stacks_mapped` maps kernel stack pages into the active root
+    /// and into every live task root. That is cross-address-space page-table mutation, D3-fenced
+    /// by `AI_AGENT_RULES` §14.4, with no split form — so splitting the site into a narrow
+    /// restore plus a broad cleanup would leave a broad drain behind at census delta 0.
+    #[test]
+    fn u3_d6_proof_acquisition_is_excluded_and_unchanged() {
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
+            )
+        );
+        for retained in [
+            "d6_emit_proof_cleanup_arch_markers",
+            "d6_check_asid1_stack_page_mapped",
+            "d6_ensure_post_cleanup_task_stacks_mapped",
+            "D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE",
+        ] {
+            assert!(
+                TRAP_ENTRY_SRC.contains(retained),
+                "the D6 proof cleanup `{retained}` is untouched"
+            );
+        }
+        // No split form of the cleanup was invented to justify a partial retirement.
+        const THREAD_STATE_SRC: &str = include_str!("../../kernel/boot/thread_state.rs");
+        assert_eq!(
+            THREAD_STATE_SRC
+                .matches("fn d6_ensure_post_cleanup_task_stacks_mapped")
+                .count(),
+            1,
+            "the D6 stack-mapping cleanup keeps its single broad-lock definition"
+        );
+    }
+
+    /// U3-3c. The replacement restore is ONE coherent rank-1 -> rank-2 transaction in ascending
+    /// canonical order, and it reproduces the `with_cpu` admission contract exactly.
+    #[test]
+    fn u3_replacement_restore_transaction_is_rank_ordered_and_coherent() {
+        let seam = RUNTIME_SRC
+            .split("pub(crate) fn post_exit_replacement_restore_split(")
+            .nth(1)
+            .expect("the restore transaction")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        // rank 1 acquired first, rank 2 NESTED inside it — ascending, one acquisition of each.
+        let sched = seam
+            .find("self.with_scheduler_split_mut(")
+            .expect("rank 1 first");
+        let task = seam
+            .find("self.with_task_return_split_mut(")
+            .expect("rank 2 nested");
+        assert!(sched < task, "rank 1 is entered before rank 2");
+        assert_eq!(seam.matches("with_scheduler_split_mut(").count(), 1);
+        assert_eq!(
+            seam.matches("with_task_return_split_mut(").count(),
+            1,
+            "every task-owned fact comes from ONE rank-2 acquisition, so they cannot tear"
+        );
+        // No other domain is entered: no IPC, capability, memory or VM seam, and no reverse rank.
+        for banned in [
+            "with_ipc_split",
+            "with_cap_split",
+            "with_memory_split",
+            "with_vm_split",
+            "with_cpu(",
+            "state.lock()",
+        ] {
+            assert!(
+                !seam.contains(banned),
+                "the transaction must not enter `{banned}`"
+            );
+        }
+        // The `with_cpu` admission contract: same predicate, same error, same binding.
+        assert!(seam.contains("validate_online_cpu(cpu)"));
+        assert!(seam.contains("map_err(crate::kernel::boot::map_scheduler_error)"));
+        assert!(seam.contains("sched.current_cpu = cpu;"));
+        // The replacement is resolved on the EXACT trapping CPU and refused when stale.
+        assert!(seam.contains("current_tid_on(cpu)"));
+        assert!(seam.contains("!= Some(next_tid)"));
+        assert_eq!(
+            seam.matches("KernelError::TaskMissing").count(),
+            2,
+            "both refusals fail closed onto the restore's existing error class"
+        );
+        // No fabricated dispatch authority and no broadened eligibility.
+        for fabricated in [
+            "DispatchMarkToken",
+            "dispatch_next_on",
+            "enqueue_on_with_priority",
+            "set_task_status",
+        ] {
+            assert!(
+                !seam.contains(fabricated),
+                "`{fabricated}` would be fabricated authority"
+            );
+        }
+    }
+
+    /// U3-3d. The hardware and frame work happens with every domain lock released, through the
+    /// SAME single frame writer the in-lock restore uses.
+    #[test]
+    fn u3_replacement_restore_apply_is_off_lock_and_has_one_writer() {
+        const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+        let apply = A64_TRAP_SRC
+            .split("pub(crate) fn post_exit_restore_replacement(")
+            .nth(1)
+            .expect("the off-lock apply")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        // It touches no lock and no `KernelState` at all.
+        for banned in [".with_cpu(", "state.lock()", "_split(", "kernel."] {
+            assert!(
+                !apply.contains(banned),
+                "the apply must not reach `{banned}`"
+            );
+        }
+        // The activation is the same arch primitive + the same authoritative per-CPU record
+        // `Hal::switch_address_space` writes, so `active_asid_on` consumers are unaffected.
+        assert!(apply.contains("crate::arch::hal_adapters::switch_address_space(asid)"));
+        assert!(apply.contains("crate::arch::hal::note_address_space_activated(cpu, asid)"));
+        // The two preserved non-restoring outcomes of the retired body.
+        assert!(apply.contains("if restore.enter_idle {"));
+        assert!(apply.contains("SCHED_ENTER_IDLE"));
+        // ONE writer: exactly two callers, and no second copy of the frame sequence anywhere.
+        assert_eq!(
+            A64_TRAP_SRC
+                .matches("fn apply_restored_thread_state(")
+                .count(),
+            1,
+            "the frame writer has ONE definition"
+        );
+        assert_eq!(
+            A64_TRAP_SRC.matches("apply_restored_thread_state(").count(),
+            3,
+            "one definition and exactly two callers: the in-lock restore and the off-lock apply"
+        );
+        assert!(
+            !RUNTIME_SRC.contains("REG_X18_TLS") && !RUNTIME_SRC.contains("set_user_gpr"),
+            "no restore/completion frame policy was cloned into runtime.rs"
+        );
+        // Completion encoding still precedes the argument mirror, in the one writer.
+        let writer = A64_TRAP_SRC
+            .split("fn apply_restored_thread_state(")
+            .nth(1)
+            .expect("the writer")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        let send = writer
+            .find("encode_blocked_send_completion(frame, done.result)")
+            .expect("send completion encode");
+        let mirror = writer
+            .find("frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0))")
+            .expect("the argument mirror");
+        assert!(
+            send < mirror,
+            "completions are encoded BEFORE the argument mirror"
+        );
+        assert!(
+            writer.contains("if !syscall_return {"),
+            "the direct-syscall-return skip is unchanged"
         );
     }
 
@@ -121621,9 +121856,10 @@ mod u3_d6_first_resume_bind_transaction {
         let code = code_of(TRAP_ENTRY);
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            4,
-            "trap_entry.rs holds four acquisitions — this cohort touches none of them; the \
-             fifth was retired separately by the U3 AArch64 exit-validation retirement"
+            3,
+            "trap_entry.rs holds three acquisitions — this cohort touches none of them; the \
+             fourth and fifth were retired separately by the U3 AArch64 exit-validation and \
+             exit replacement-restore retirements"
         );
         // The retained D6 restore/cleanup acquisition passes a REAL frame, so unlike the
         // retired first-resume call it genuinely restores context and is NOT a no-op.
@@ -124784,15 +125020,35 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 "{name} must resolve by the mark TOKEN's exact incarnation"
             );
         }
-        // The token-keyed seams refuse a mismatched incarnation.
+        // The token-keyed seams refuse a mismatched incarnation. U3 (203C): the read + take
+        // itself moved into ONE shared implementation, so the seam passes the token's exact
+        // incarnation down and the refusal lives in that single place.
         let restore = body_of(
             RUNTIME,
             "fn direct_dispatch_restore_context_split",
             "\n    }\n",
         );
         assert!(
-            restore.contains("t.asid == Some(expected)"),
+            restore.contains("crate::kernel::task::read_user_context_and_take_tls(")
+                && restore.contains("Some(expected),"),
+            "the token's exact incarnation must be the identity the shared read is keyed on"
+        );
+        const TASK_SRC: &str = include_str!("../../kernel/task.rs");
+        let shared_read = body_of(
+            TASK_SRC,
+            "pub(crate) fn read_user_context_and_take_tls(",
+            "\n}\n",
+        );
+        assert!(
+            shared_read.contains("expect_asid.is_none_or(|a| t.asid == Some(a))"),
             "a replacement incarnation that reused the TID must be refused"
+        );
+        assert_eq!(
+            TASK_SRC
+                .matches("pub(crate) fn read_user_context_and_take_tls(")
+                .count(),
+            1,
+            "the read + TLS take has ONE definition"
         );
         // RISC-V performs the REAL address-space work through the same shared seam.
         assert!(
@@ -132546,6 +132802,428 @@ mod aarch64_production_tick {
         assert!(
             !arm.contains(".with_cpu(") && !arm.contains(".with(|"),
             "the BSP timer arm drives the kernel through existing accessors only"
+        );
+    }
+}
+
+/// U3 (canonical 203C) — the AArch64 post-lock `CurrentTaskExited` REPLACEMENT RESTORE
+/// transaction.
+///
+/// `SharedKernel::post_exit_replacement_restore_split` replaces the second brief broad `with_cpu`
+/// re-acquire the AArch64 exit consumer held (`d2_recv_switch_incoming_asid(next)` followed by
+/// `post_switch_restore_arch_thread_state`). These tests pin the transaction's own contract —
+/// admission, exact identity, coherent single-acquisition takes, and the two non-restoring
+/// outcomes the retired body had — on a real kernel rather than on the shape of the code.
+///
+/// The frame-write half lives in `arch/aarch64/trap.rs`, which compiles only for
+/// `target_arch = "aarch64"`, so its ordering and encoding are pinned by the source guards in
+/// `stage200d0c1_aarch64_exit_prep`. What is observable here is everything the transaction
+/// consumes or refuses to consume.
+#[cfg(test)]
+mod u3_post_exit_replacement_restore_transaction {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::boot::types::KernelError;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{
+        BlockedSyscallClass, BlockedSyscallCompletion, TaskClass, TaskStatus,
+    };
+    use crate::kernel::vm::{Asid, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    /// The exiting task named by the disposition.
+    const EXITING: u64 = 800;
+    /// The replacement the scheduler selected on the trapping CPU.
+    const NEXT: u64 = 801;
+    const NEXT_ASID: u16 = 11;
+
+    /// A kernel whose CPU 0 currently runs `NEXT` with a recognisable user context, and in which
+    /// `EXITING` still exists as a terminal TCB — exactly the state the exit consumer reaches
+    /// this transaction in.
+    fn fixture() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.bring_up_cpu(CpuId(1)).expect("cpu1");
+            s.register_task_with_class(EXITING, TaskClass::App)
+                .expect("exiting");
+            s.register_task_with_class(NEXT, TaskClass::App)
+                .expect("next");
+            s.with_tcbs_mut(|tcbs| {
+                let e = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == EXITING)
+                    .unwrap();
+                e.status = TaskStatus::Exited(0);
+                e.asid = Some(Asid(3));
+                e.user_context.instruction_ptr = VirtAddr(0xDEAD_0000);
+                e.user_context.stack_ptr = VirtAddr(0xDEAD_1000);
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == NEXT).unwrap();
+                t.status = TaskStatus::Runnable;
+                t.asid = Some(Asid(NEXT_ASID));
+                t.user_context.instruction_ptr = VirtAddr(0x5151_0000);
+                t.user_context.stack_ptr = VirtAddr(0x5252_0000);
+                t.user_context.arg0 = 0xB0;
+                t.user_context.arg1 = 0xB1;
+                t.user_context.user_gprs[5] = 0xB5;
+            });
+            s.enqueue_on_cpu(CpuId(0), NEXT).expect("queue next");
+            assert_eq!(s.dispatch_next_on_cpu(CpuId(0)), Some(NEXT));
+        });
+        k
+    }
+
+    fn park_completion(k: &SharedKernel, tid: u64, asid: u16, class: BlockedSyscallClass) {
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                let blocked_generation = match class {
+                    BlockedSyscallClass::IpcRecv => t.blocked_recv_generation,
+                    BlockedSyscallClass::IpcSend => t.blocked_send_generation,
+                };
+                t.pending_syscall_completion = Some(BlockedSyscallCompletion {
+                    syscall_class: class,
+                    result: 9,
+                    tid,
+                    asid: Asid(asid),
+                    blocked_generation,
+                });
+            });
+        });
+    }
+
+    fn parked(k: &SharedKernel, tid: u64) -> Option<BlockedSyscallCompletion> {
+        k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .and_then(|t| t.pending_syscall_completion)
+            })
+        })
+    }
+
+    // ── the accepted path ────────────────────────────────────────────────────────────────
+
+    /// The exact replacement identity is accepted: its ASID and its own saved context come back,
+    /// and nothing is sourced from the exiting task.
+    #[test]
+    fn the_exact_replacement_identity_is_accepted() {
+        let k = fixture();
+        let out = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("the exact replacement is accepted");
+        assert_eq!(out.asid, Some(Asid(NEXT_ASID)), "the REPLACEMENT's ASID");
+        assert!(!out.enter_idle);
+        let facts = out.facts.expect("restore facts");
+        assert_eq!(facts.tid, NEXT);
+        assert_eq!(facts.context.instruction_ptr, VirtAddr(0x5151_0000));
+        assert_eq!(facts.context.stack_ptr, VirtAddr(0x5252_0000));
+        assert_eq!(facts.context.arg0, 0xB0);
+        assert_eq!(facts.context.user_gprs[5], 0xB5);
+        // Never the exiting task's, in any field.
+        assert_ne!(facts.context.instruction_ptr, VirtAddr(0xDEAD_0000));
+        assert_ne!(out.asid, Some(Asid(3)));
+        // The `with_cpu` admission side effect is reproduced.
+        assert_eq!(k.with(|s| s.current_cpu()), CpuId(0));
+    }
+
+    /// The startup argument lanes reach the caller unmodified, so the mirror the frame writer
+    /// performs still sees the replacement's own startup ABI values.
+    #[test]
+    fn startup_argument_lanes_are_carried_through_verbatim() {
+        let k = fixture();
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == NEXT).unwrap();
+                t.user_context.user_gprs = [0; 32];
+                t.user_context.arg0 = 0xC0;
+                t.user_context.arg1 = 0xC1;
+                t.user_context.arg2 = 0xC2;
+                t.user_context.arg3 = 0xC3;
+                t.user_context.arg4 = 0xC4;
+                t.user_context.arg5 = 0xC5;
+            });
+        });
+        let facts = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("accepted")
+            .facts
+            .expect("facts");
+        assert_eq!(
+            [
+                facts.context.arg0,
+                facts.context.arg1,
+                facts.context.arg2,
+                facts.context.arg3,
+                facts.context.arg4,
+                facts.context.arg5
+            ],
+            [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5]
+        );
+        assert_eq!(
+            facts.context.user_gprs, [0; 32],
+            "a fresh task's register file is untouched; the mirror is the writer's job"
+        );
+    }
+
+    // ── refusals ─────────────────────────────────────────────────────────────────────────
+
+    /// The exiting task can never be reselected as the restore source.
+    #[test]
+    fn the_exiting_task_cannot_be_reselected() {
+        let k = fixture();
+        assert_eq!(
+            k.post_exit_replacement_restore_split(CpuId(0), EXITING, EXITING, true),
+            Err(KernelError::TaskMissing)
+        );
+        // …and neither can the idle task.
+        assert_eq!(
+            k.post_exit_replacement_restore_split(CpuId(0), EXITING, 0, true),
+            Err(KernelError::TaskMissing)
+        );
+    }
+
+    /// A replacement that is no longer this CPU's current task fails closed — the transaction
+    /// resolves the replacement on the EXACT trapping CPU rather than trusting the caller.
+    #[test]
+    fn a_stale_replacement_identity_fails_closed() {
+        let k = fixture();
+        // A different live task that was never made current here.
+        k.with(|s| {
+            s.register_task_with_class(802, TaskClass::App)
+                .expect("802");
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 802).unwrap();
+                t.status = TaskStatus::Runnable;
+                t.asid = Some(Asid(12));
+            });
+        });
+        assert_eq!(
+            k.post_exit_replacement_restore_split(CpuId(0), EXITING, 802, true),
+            Err(KernelError::TaskMissing)
+        );
+        // Nothing was consumed from either task.
+        assert_eq!(k.with(|s| s.tls_restore_pending(NEXT)), Some(false));
+    }
+
+    /// An absent replacement TCB is the retired body's `task_asid == None`: nothing is activated,
+    /// nothing is restored, nothing is consumed — the `SCHED_ENTER_IDLE` outcome.
+    #[test]
+    fn an_absent_replacement_context_fails_closed_as_idle() {
+        let k = fixture();
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let slot = tcbs
+                    .iter_mut()
+                    .position(|slot| slot.as_ref().is_some_and(|t| t.tid.0 == NEXT))
+                    .unwrap();
+                tcbs[slot] = None;
+            });
+        });
+        let out = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("the retired body returned success here, not an error");
+        assert_eq!(out.asid, None, "no address space may be activated");
+        assert!(out.facts.is_none(), "nothing is restored");
+        assert!(out.enter_idle, "the SCHED_ENTER_IDLE outcome is preserved");
+    }
+
+    /// A replacement carrying no ASID is the same outcome, and it consumes nothing.
+    #[test]
+    fn a_replacement_with_no_asid_is_the_idle_outcome_and_consumes_nothing() {
+        let k = fixture();
+        k.with(|s| {
+            s.set_thread_tls_base(NEXT, 0x7000).expect("tls base");
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == NEXT)
+                    .unwrap()
+                    .asid = None;
+            });
+        });
+        park_completion(&k, NEXT, NEXT_ASID, BlockedSyscallClass::IpcSend);
+        let out = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("success, not an error");
+        assert_eq!(out.asid, None);
+        assert!(out.facts.is_none());
+        assert!(out.enter_idle);
+        assert_eq!(
+            k.with(|s| s.tls_restore_pending(NEXT)),
+            Some(true),
+            "the TLS request survives an outcome that restores nothing"
+        );
+        assert!(
+            parked(&k, NEXT).is_some(),
+            "the parked completion survives an outcome that encodes nothing"
+        );
+    }
+
+    /// An invalid or offline CPU is refused with the same `KernelError` the retired `with_cpu`
+    /// produced, and changes nothing at all.
+    #[test]
+    fn an_offline_cpu_changes_nothing() {
+        let k = fixture();
+        k.with(|s| s.set_thread_tls_base(NEXT, 0x7000).expect("tls base"));
+        park_completion(&k, NEXT, NEXT_ASID, BlockedSyscallClass::IpcSend);
+        let before_cpu = k.with(|s| s.current_cpu());
+        // CPU 3 was never brought up, so it fails the same `validate_online_cpu` predicate
+        // `with_cpu` applied.
+        assert!(
+            k.post_exit_replacement_restore_split(CpuId(3), EXITING, NEXT, true)
+                .is_err()
+        );
+        assert_eq!(
+            k.with(|s| s.current_cpu()),
+            before_cpu,
+            "a refused CPU is never bound"
+        );
+        assert_eq!(k.with(|s| s.tls_restore_pending(NEXT)), Some(true));
+        assert!(parked(&k, NEXT).is_some());
+        assert_eq!(k.with(|s| s.current_tid_on_cpu(CpuId(0))), Some(NEXT));
+    }
+
+    // ── exactly-once consumption ─────────────────────────────────────────────────────────
+
+    /// The pending TLS-restore request is taken exactly once.
+    #[test]
+    fn the_tls_restore_request_is_consumed_exactly_once() {
+        let k = fixture();
+        // The production writer: it sets `tls_ptr` AND arms the pending restore request.
+        k.with(|s| s.set_thread_tls_base(NEXT, 0x7000).expect("tls base"));
+        assert_eq!(k.with(|s| s.tls_restore_pending(NEXT)), Some(true));
+        let first = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("accepted")
+            .facts
+            .expect("facts");
+        assert_eq!(first.tls, Some(0x7000));
+        assert_eq!(
+            k.with(|s| s.tls_restore_pending(NEXT)),
+            Some(false),
+            "taken exactly once, as `take_tls_restore_request` took it"
+        );
+        let second = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("accepted")
+            .facts
+            .expect("facts");
+        assert_eq!(second.tls, None, "a second call sees no pending request");
+    }
+
+    /// A blocked `IpcSend` completion is consumed exactly once and carried out for encoding.
+    #[test]
+    fn a_blocked_send_completion_is_consumed_exactly_once() {
+        let k = fixture();
+        park_completion(&k, NEXT, NEXT_ASID, BlockedSyscallClass::IpcSend);
+        let facts = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("accepted")
+            .facts
+            .expect("facts");
+        let done = facts.send_completion.expect("the send completion");
+        assert_eq!(done.result, 9);
+        assert_eq!(done.syscall_class, BlockedSyscallClass::IpcSend);
+        assert!(parked(&k, NEXT).is_none(), "the slot is emptied");
+        let again = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("accepted")
+            .facts
+            .expect("facts");
+        assert!(
+            again.send_completion.is_none(),
+            "a completion can never be observed twice"
+        );
+    }
+
+    /// A blocked `IpcRecv` completion is consumed exactly once, by its own class consumer, and
+    /// never by the send consumer.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    #[test]
+    fn a_blocked_recv_completion_is_consumed_exactly_once_by_its_own_class() {
+        let k = fixture();
+        park_completion(&k, NEXT, NEXT_ASID, BlockedSyscallClass::IpcRecv);
+        let facts = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("accepted")
+            .facts
+            .expect("facts");
+        assert!(
+            facts.send_completion.is_none(),
+            "the send consumer must not eat a receive completion"
+        );
+        let done = facts.recv_completion.expect("the recv completion");
+        assert_eq!(done.result, 9);
+        assert!(parked(&k, NEXT).is_none());
+        let again = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("accepted")
+            .facts
+            .expect("facts");
+        assert!(again.recv_completion.is_none());
+    }
+
+    /// A parked completion belonging to a REPLACED incarnation that reused the numeric TID is
+    /// refused: it is taken (a stale entry must not linger) but never returned for encoding.
+    #[test]
+    fn a_completion_from_a_reused_tid_with_a_different_asid_is_refused() {
+        let k = fixture();
+        // Parked under the incarnation that held ASID 99; the live TCB holds `NEXT_ASID`.
+        park_completion(&k, NEXT, 99, BlockedSyscallClass::IpcSend);
+        let facts = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("accepted")
+            .facts
+            .expect("facts");
+        assert!(
+            facts.send_completion.is_none(),
+            "a different incarnation's completion is never delivered"
+        );
+        assert!(
+            parked(&k, NEXT).is_none(),
+            "and it does not linger to be seen by a later block"
+        );
+    }
+
+    /// With no trap frame the retired body still switched the address space and consumed
+    /// nothing, because it only discovered the missing frame inside the restore.
+    #[test]
+    fn no_frame_activates_the_address_space_and_consumes_nothing() {
+        let k = fixture();
+        k.with(|s| s.set_thread_tls_base(NEXT, 0x7000).expect("tls base"));
+        park_completion(&k, NEXT, NEXT_ASID, BlockedSyscallClass::IpcSend);
+        let out = k
+            .post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, false)
+            .expect("accepted");
+        assert_eq!(out.asid, Some(Asid(NEXT_ASID)), "the switch still happens");
+        assert!(out.facts.is_none());
+        assert!(!out.enter_idle, "no frame is not the idle outcome");
+        assert_eq!(k.with(|s| s.tls_restore_pending(NEXT)), Some(true));
+        assert!(parked(&k, NEXT).is_some());
+    }
+
+    // ── the scheduler side is observed, never rewritten ──────────────────────────────────
+
+    /// The transaction makes no scheduler policy decision: no dequeue, no status change, no
+    /// enqueue. It reads `current` and takes task-owned state, nothing else.
+    #[test]
+    fn no_scheduler_or_task_policy_is_duplicated() {
+        let k = fixture();
+        let before_q0 = k.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let before_q1 = k.with(|s| s.runnable_count_on_cpu(CpuId(1)));
+        let before_next = k.with(|s| s.task_status(NEXT));
+        let before_exiting = k.with(|s| s.task_status(EXITING));
+        k.post_exit_replacement_restore_split(CpuId(0), EXITING, NEXT, true)
+            .expect("accepted");
+        assert_eq!(k.with(|s| s.runnable_count_on_cpu(CpuId(0))), before_q0);
+        assert_eq!(k.with(|s| s.runnable_count_on_cpu(CpuId(1))), before_q1);
+        assert_eq!(k.with(|s| s.task_status(NEXT)), before_next);
+        assert_eq!(k.with(|s| s.task_status(EXITING)), before_exiting);
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CpuId(0))),
+            Some(NEXT),
+            "the replacement stays current; the transaction never dispatches"
         );
     }
 }

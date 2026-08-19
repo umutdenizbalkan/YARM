@@ -27,8 +27,40 @@ read current TID, `{tid, asid}` identity, terminal status and any-runqueue absen
 already used, taken as one snapshot with rank 2 nested inside rank 1 — so no seam, marker or
 mechanism was added. Offline-CPU refusal, full incarnation validation, terminal classification,
 `task_present_anywhere` semantics, every fatal check and marker, and the replacement-versus-idle
-divergence are unchanged. The consumer's SECOND acquisition, the replacement task's arch restore,
-is deliberately untouched. `trap_entry.rs` falls 5 → 4 `with_cpu` callsites.
+divergence are unchanged. `trap_entry.rs` falls 5 → 4 `with_cpu` callsites.
+
+**U3 (canonical 203C) — DELIVERED. The AArch64 `CurrentTaskExited` REPLACEMENT RESTORE
+reacquisition is retired. CENSUS-DELTA 12 → 11. CANONICAL 203C — still OPEN.**
+The consumer's second and last acquisition held the broad guard across
+`d2_recv_switch_incoming_asid(next)` and `post_switch_restore_arch_thread_state`, performing the
+TTBR0_EL1/ASID switch and every trap-frame write under the whole kernel. It is now
+`SharedKernel::post_exit_replacement_restore_split` — one coherent rank-1 → rank-2 transaction
+that authenticates the same `validate_online_cpu` predicate, binds `current_cpu`, resolves the
+replacement on the exact trapping CPU, and takes its ASID, saved context, TLS request and parked
+blocked-syscall completion in a SINGLE rank-2 acquisition — followed by
+`aarch64::trap::post_exit_restore_replacement`, which does the address-space activation and the
+frame work with every domain lock released, through the SAME single frame writer the in-lock
+restore uses. No policy was cloned into `runtime.rs` and no `DispatchMarkToken` was fabricated.
+Preserved: the identical activation pair, the no-ASID/absent-TCB `SCHED_ENTER_IDLE` outcome, the
+no-frame outcome (switch happens, nothing is consumed), the offline-CPU `KernelError`, and every
+marker. Added, fail-closed: `next == exiting tid` and a stale replacement identity now refuse onto
+the restore's existing `TaskMissing` class. The D6 controlled-switch proof acquisition in the same
+file is EXCLUDED and byte-for-byte unchanged: its D6 cleanup maps kernel stack pages into every
+live task root, which is D3-fenced by `AI_AGENT_RULES` §14.4 with no split form, so splitting it
+would leave a broad drain at census delta 0. `trap_entry.rs` falls 4 → 3 `with_cpu` callsites —
+re-derived mechanically from source; the `5` this file's owner tables carried was already stale at
+the base commit, one behind the validation retirement above, and is corrected rather than carried
+forward. Census: `with_cpu` **11 → 10**, broad `with` **stays 1**, total and runtime-required
+**12 → 11**.
+
+**Not live-proven.** `scripts/qemu-aarch64-exit-current-task-smoke.sh` fails at this checkpoint
+with a mechanically identical 35-line failure set and the identical
+`STAGE_200D0C2_AARCH64_EXIT_CURRENT_TASK_LIVE_SEAL … live_cells=0 result=fail` seal at both this
+head and the exact base `3943472`: the oracle workload never activates at either revision, while
+the boot itself completes. This is classified as an **exact-base deferral only** — it is not
+evidence for or against the changed restore path, and no live cell is claimed for it. Live
+evidence that does transfer: the x86_64, AArch64 and RISC-V standard core smokes all PASS at this
+checkpoint. Direct production remains **OFF**.
 
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
 `finalize_split_handled_syscall` broad reacquisition, already retired by Stage 199D; that
@@ -38,9 +70,9 @@ function holds no broad acquisition today. Earlier "U8 is next" pointers are rem
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **11** |
+| Production `SharedKernel::with_cpu` callsites | **10** |
 | Production broad `SharedKernel::with` callsites | **1** |
-| **Total production broad-lock acquisition sites** | **12** |
+| **Total production broad-lock acquisition sites** | **11** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **Direct NR6/NR7:** x86_64 (live) + AArch64 (structural, proof-gated) via `offlock_authoritative_dispatch_enabled()`; RISC-V not admitted. **Blocking IpcRecv / IpcSend (U4):** queue-advancing dispatch is authoritative outside the broad lock on **all three** architectures via the canonical `queue_advancing_dispatch_enabled()`. `d6_genuine_enabled()` itself remains compile-time x86_64-only — U4 widened the queue-ADVANCING question only, never the queue-neutral D6 slice. |
@@ -1921,7 +1953,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **12** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **11** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there

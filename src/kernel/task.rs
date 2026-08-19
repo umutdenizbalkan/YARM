@@ -586,6 +586,151 @@ pub(crate) fn cancel_async_resume(tcbs: &mut [Option<ThreadControlBlock>], tid: 
         .is_some_and(|tcb| tcb.async_preempted.take().is_some())
 }
 
+/// U3 (canonical 203C) — THE rank-2 read of one incarnation's saved user context together with
+/// its pending TLS-restore request.
+///
+/// Both storages live in the task domain, so taking them in ONE acquisition is what stops the
+/// context and the TLS request from straddling a lock boundary. Extracted so the token-keyed
+/// post-lock dispatch seam and the identity-keyed post-exit restore transaction share one
+/// implementation rather than each carrying its own copy of the take.
+///
+/// `expect_asid` is the caller's own resolved incarnation:
+///
+/// * `Some(asid)` — the TCB's ASID must still equal it, so a replacement incarnation that reused
+///   the numeric TID reads as absent rather than having ITS context copied out;
+/// * `None` — resolve by TID alone, which is what an in-lock caller that already read
+///   `current_tid()` under the same guard needs.
+///
+/// Returns `None` when no such incarnation exists (nothing is taken). The TLS request is taken at
+/// most once: the slot is emptied here, exactly as `take_tls_restore_request` empties it.
+pub(crate) fn read_user_context_and_take_tls(
+    tcbs: &[Option<ThreadControlBlock>],
+    tls_pending: &mut [Option<ThreadId>],
+    tid: u64,
+    expect_asid: Option<Asid>,
+) -> Option<(UserRegisterContext, Option<usize>)> {
+    if tid == 0 {
+        return None;
+    }
+    let tcb = tcbs
+        .iter()
+        .flatten()
+        .find(|t| t.tid.0 == tid && expect_asid.is_none_or(|a| t.asid == Some(a)))?;
+    let context = tcb.user_context;
+    let tls_base = tcb.tls_ptr.map(|ptr| ptr.0 as usize);
+    let pending = tls_pending
+        .iter()
+        .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == tid));
+    let tls = match pending {
+        Some(idx) => {
+            tls_pending[idx] = None;
+            tls_base
+        }
+        None => None,
+    };
+    Some((context, tls))
+}
+
+/// U6 §2 / U3 (canonical 203C) — THE class-scoped consume of one incarnation's parked
+/// blocked-syscall completion.
+///
+/// Extracted verbatim from `KernelState::take_blocked_syscall_completion_of_class` so the in-lock
+/// resume boundary and the off-lock post-exit restore transaction cannot drift apart: the class is
+/// checked FIRST and a non-matching entry is left parked, the entry is TAKEN either way within the
+/// requested class (a stale one must never linger to be seen by a later block), it is RETURNED only
+/// on an exact `{tid, asid, generation}` match, and an exact take clears the residue belonging to
+/// that completion alone.
+///
+/// `expect_asid` has the same meaning as in [`read_user_context_and_take_tls`]: `None` resolves by
+/// TID alone (the in-lock caller), `Some(asid)` additionally requires the exact incarnation, so a
+/// replacement task's parked completion is neither taken nor consumed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn take_blocked_syscall_completion_for(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+    expect_asid: Option<Asid>,
+    class: BlockedSyscallClass,
+) -> Option<BlockedSyscallCompletion> {
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|t| t.tid.0 == tid && expect_asid.is_none_or(|a| t.asid == Some(a)))?;
+    let pending = tcb.pending_syscall_completion?;
+    // Not this consumer's class: leave it parked for the consumer that owns it.
+    if pending.syscall_class != class {
+        return None;
+    }
+    // Exact identity: same incarnation AND the class's own generation at block time.
+    let exact = pending.matches_tcb(tcb);
+    // Take it either way — a stale entry must not linger to be seen by a later block.
+    tcb.pending_syscall_completion = None;
+    if !exact {
+        return None;
+    }
+    // Clear the residue that belongs to THIS completion only (the deadline + token were already
+    // retired by the completion transaction; this drops the consumed flag).
+    tcb.ipc_timeout_fired = false;
+    tcb.blocked_recv_state = None;
+    Some(pending)
+}
+
+/// U3 (canonical 203C) — every task-owned fact ONE resume boundary needs, taken coherently under
+/// the rank-2 task lock and carried out of it by value.
+///
+/// This is the split-domain equivalent of the reads and takes the in-lock AArch64 restore performs
+/// while holding the broad lock. Separating the facts from the frame writes is what lets the
+/// writes happen with every domain lock released, while the writer itself stays singular: both the
+/// in-lock and the post-exit boundary build this and hand it to the same frame writer.
+///
+/// Every field is an observation or a CONSUMPTION of ONE incarnation at ONE instant. The two
+/// completion fields are takes: once built, this value is the only remaining copy, so the boundary
+/// that holds it must encode it or lose it.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThreadRestoreFacts {
+    /// The exact incarnation these facts belong to.
+    pub(crate) tid: u64,
+    /// The saved user register context to apply to the frame.
+    pub(crate) context: UserRegisterContext,
+    /// The TLS base to place in the TLS lane, `None` when no restore was pending.
+    pub(crate) tls: Option<usize>,
+    /// The consumed `IpcSend` completion, if one was parked and exact.
+    pub(crate) send_completion: Option<BlockedSyscallCompletion>,
+    /// The consumed `IpcRecv` completion, if one was parked and exact.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) recv_completion: Option<BlockedSyscallCompletion>,
+}
+
+/// U3 (canonical 203C) — build [`ThreadRestoreFacts`] for `tid` from ONE rank-2 acquisition.
+///
+/// The order of the takes is the in-lock boundary's order, fact for fact: context and TLS first,
+/// then the `IpcSend` completion, then (where compiled) the `IpcRecv` one. None of the takes reads
+/// the frame, so performing them all before any frame write is behaviour-preserving.
+///
+/// `None` means there is no such incarnation and NOTHING was taken.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn take_thread_restore_facts(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tls_pending: &mut [Option<ThreadId>],
+    tid: u64,
+    expect_asid: Option<Asid>,
+) -> Option<ThreadRestoreFacts> {
+    let (context, tls) = read_user_context_and_take_tls(tcbs, tls_pending, tid, expect_asid)?;
+    let send_completion =
+        take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcSend);
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    let recv_completion =
+        take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcRecv);
+    Some(ThreadRestoreFacts {
+        tid,
+        context,
+        tls,
+        send_completion,
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        recv_completion,
+    })
+}
+
 impl BlockedSyscallCompletion {
     /// U6 §2 — the SINGLE source of truth for "is this parked completion still exactly this
     /// task's, for the cycle it was published for?".

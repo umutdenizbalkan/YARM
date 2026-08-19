@@ -53,12 +53,12 @@ This file has exactly one status page: §0.3.
 Three methods acquire it — `lock` (test-only), `with`, `with_cpu`. Full unlock = no runtime
 guard exists (canonical **204E**), sealed cross-architecture (canonical **205D**).
 
-Current census: **12** production callsites — **11** through `with_cpu` and **1** through the
-broad `with(|state| …)` form — classified **12 runtime-required**, 0 test-only, 0 obsolete,
+Current census: **11** production callsites — **10** through `with_cpu` and **1** through the
+broad `with(|state| …)` form — classified **11 runtime-required**, 0 test-only, 0 obsolete,
 0 boot-only. See §0.5. U1 deleted the two obsolete acquisitions (49 → 47) and U2 relocated the
 three test-only ones (47 → 44), leaving the census exactly the runtime-required set — every
 counted acquisition is one a real boot performs. U3 is now retiring those and has delivered
-thirty-one (44 → 39 → 37 → 36 → 34 → 32 → 28 → 25 → 24 → 23 → 22 → 21 → 18 → 17 → 15 → 14 → 13). The three raw `self.state.lock()` sites are the bodies of `lock` /
+thirty-three (44 → 39 → 37 → 36 → 34 → 32 → 28 → 25 → 24 → 23 → 22 → 21 → 18 → 17 → 15 → 14 → 13 → 12 → 11). The three raw `self.state.lock()` sites are the bodies of `lock` /
 `with` / `with_cpu` themselves, not callsites, and are deliberately excluded from the total.
 
 The census has crossed U3's numerical **≤24** target, but **U3 is not complete**: other
@@ -185,11 +185,11 @@ count stays at 22; complete + partial + open = 2 + 11 + 22 = 35.
 | boot-only | **0** | — |
 | test-only | **0** | none — U2 relocated all three into test-only modules the census excludes: `ipc_recv_with_deadline_split_bridge` (2 acquisitions, never a trap-seam path) and the `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1) |
 | obsolete | **0** | none — U1 deleted both (`SharedKernel::handle_trap_with_cpu`, which had no in-tree caller at all, and `SharedKernel::run_reply_timeout_completion`, which had no production caller) |
-| runtime-required | **12** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), 3 x86_64 AP paths (U3 retired the AP saved-context read, the AP saved-resume enqueue→dispatch placement and the AP return-to-idle `block_current_on_cpu`; the three that remain — the BSP saved-context read, the BSP preferred dispatch and the next-task placement — are retained because none of those paths is live-reached), RISC-V resume, and the recv/delivery boundary re-acquires. Thread creation is gone: U3 retired the D6 first-resume CPU binding onto `bind_current_cpu_split`, whose broad predecessor called a proven `frame=None` no-op, so `thread_state.rs` holds 0. The three blocked-waiter Phase-C completion re-acquisitions in `runtime.rs` are gone too: U3 retired all three onto ONE shared, class-neutral, rank-ordered transaction, `complete_blocked_waiter_delivery_split`. The x86_64 post-drain idle-owner revalidation is gone too: `revalidate_idle_owner_after_drains` is now a CPU-local rank-1 → rank-2 transaction whose frame, FS-base and CR3 work run with no lock held. So are the two recv copy-fault completions, retired onto one class-neutral rank-1 → rank-8 transaction; the capability-rollback re-entry beside them stays broad and dependency-blocked. `src/arch/riscv64/trap.rs` is now fully drained of reacquisitions — U3 retired its terminal-idle predicate onto `terminal_idle_on_cpu_split`, leaving only the canonical broad Phase-2 trap handler. The ordinary-cap deferred sender wake is gone too, onto `apply_split_sender_wake_plan_split` reusing the shared `wake_tid_to_runnable_split` body |
+| runtime-required | **11** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), 3 x86_64 AP paths (U3 retired the AP saved-context read, the AP saved-resume enqueue→dispatch placement and the AP return-to-idle `block_current_on_cpu`; the three that remain — the BSP saved-context read, the BSP preferred dispatch and the next-task placement — are retained because none of those paths is live-reached), RISC-V resume, and the recv/delivery boundary re-acquires. Thread creation is gone: U3 retired the D6 first-resume CPU binding onto `bind_current_cpu_split`, whose broad predecessor called a proven `frame=None` no-op, so `thread_state.rs` holds 0. The three blocked-waiter Phase-C completion re-acquisitions in `runtime.rs` are gone too: U3 retired all three onto ONE shared, class-neutral, rank-ordered transaction, `complete_blocked_waiter_delivery_split`. The x86_64 post-drain idle-owner revalidation is gone too: `revalidate_idle_owner_after_drains` is now a CPU-local rank-1 → rank-2 transaction whose frame, FS-base and CR3 work run with no lock held. So are the two recv copy-fault completions, retired onto one class-neutral rank-1 → rank-8 transaction; the capability-rollback re-entry beside them stays broad and dependency-blocked. `src/arch/riscv64/trap.rs` is now fully drained of reacquisitions — U3 retired its terminal-idle predicate onto `terminal_idle_on_cpu_split`, leaving only the canonical broad Phase-2 trap handler. The ordinary-cap deferred sender wake is gone too, onto `apply_split_sender_wake_plan_split` reusing the shared `wake_tid_to_runnable_split` body. BOTH AArch64 `CurrentTaskExited` post-lock reacquisitions are gone as well: the VALIDATION snapshot onto the shared `post_lock_exit_validation_split`, and the REPLACEMENT RESTORE onto `post_exit_replacement_restore_split` (rank 1 validate + bind `current_cpu`, rank 2 nested for the exact replacement's ASID/context/TLS/completion in ONE acquisition, all locks released, then TTBR0_EL1 activation and frame restoration through the single shared frame writer). The D6 controlled-switch proof restore in the same file is NOT in that cohort and stays broad — its body also runs the D6 proof cleanup, whose `d6_ensure_post_cleanup_task_stacks_mapped` performs cross-address-space page-table mutation under the `AI_AGENT_RULES` §14.4 D3 fence, with no split form |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
 
-Classified total: **12** acquisition callsites (**11** `with_cpu` + **1** broad `with`), which
-is 0 + 0 + 0 + 12. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
+Classified total: **11** acquisition callsites (**10** `with_cpu` + **1** broad `with`), which
+is 0 + 0 + 0 + 11. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
 
 ### 0.6 Structural blockers
 
@@ -270,13 +270,81 @@ runqueue and current slot, not this CPU's queue) are the same predicates the old
 every marker, the replacement-versus-idle divergence and the zero-fabricated-authority property
 are byte-for-byte as they were.
 
-**The second AArch64 acquisition in that consumer — the replacement task's arch restore — is
-deliberately untouched**, and a focused guard pins that it stays. `src/arch/trap_entry.rs` falls
-5 → 4 `with_cpu` callsites; the census falls **13 → 12** (**11** `with_cpu` + **1** broad
-`with`).
+**The second AArch64 acquisition in that consumer — the replacement task's arch restore — was
+deliberately untouched by that pass** and is retired by the next one, below.
+`src/arch/trap_entry.rs` falls 5 → 4 `with_cpu` callsites; the census falls **13 → 12**
+(**11** `with_cpu` + **1** broad `with`).
 
 **203C remains OPEN.** U3 is a callsite-by-callsite retirement directive, not a stage closure:
 drain-classified acquisitions remain, and the stage closes only when none does.
+
+**U3 (canonical 203C) — DELIVERED. The AArch64 `CurrentTaskExited` REPLACEMENT RESTORE
+reacquisition is retired. CANONICAL 203C — still OPEN. CENSUS-DELTA 12 → 11.**
+
+The second and last acquisition of the AArch64 post-lock exit consumer. It held the broad guard
+across `d2_recv_switch_incoming_asid(next)` and `post_switch_restore_arch_thread_state`, which
+means it performed the TTBR0_EL1/ASID switch and every trap-frame write while holding the whole
+kernel. It is now one authoritative exact-identity transaction plus a purely off-lock apply:
+
+* `SharedKernel::post_exit_replacement_restore_split` authenticates the SAME `validate_online_cpu`
+  admission predicate `with_cpu` used, binds `current_cpu` the same way, resolves the replacement
+  on the EXACT trapping CPU, and takes its ASID, saved user context, pending TLS-restore request
+  and parked blocked-syscall completion as ONE coherent rank-1 → rank-2 observation — rank 1
+  acquired once, rank 2 nested inside it once, canonical ascending order. The retired body reached
+  those facts through four separate re-entrant domain acquisitions underneath the broad guard, so
+  the ASID it activated and the context it restored could describe different instants.
+* `aarch64::trap::post_exit_restore_replacement` then performs the address-space activation and
+  the frame work with EVERY domain lock released, through the SAME single frame writer the in-lock
+  restore uses. `restore_arch_thread_state` was split into a gather half and that writer, so the
+  completion-before-argument-mirror ordering, the AArch64 error-lane convention and the TLS lane
+  have exactly one owner. No restore or completion policy was cloned into `runtime.rs`, and no
+  `DispatchMarkToken` was fabricated: the transaction is keyed on `{tid, asid}` alone.
+
+Preserved outcome for outcome: the activation is the same `hal_adapters::switch_address_space` +
+`note_address_space_activated` pair `Hal::switch_address_space` performs, so every `active_asid_on`
+consumer observes it identically; a replacement with no ASID — including an absent TCB — still
+activates nothing, restores nothing, consumes nothing and logs `SCHED_ENTER_IDLE`; a caller with
+no trap frame still gets the address-space switch and still consumes nothing; an invalid or offline
+CPU yields the identical `KernelError` through the identical `map_err`; and the exiting task is
+never a source of restore state. Two refusals are deliberate tightenings, both fail-closed onto the
+restore's existing `TaskMissing` class: `next == exiting tid`, and a replacement that is no longer
+this CPU's current task.
+
+**The D6 controlled-switch proof acquisition in the same file is EXCLUDED and left byte-for-byte
+unchanged.** Its body carries more than a restore: `d6_emit_proof_cleanup_arch_markers`,
+`d6_check_asid1_stack_page_mapped` and `d6_ensure_post_cleanup_task_stacks_mapped`, the last of
+which maps kernel stack pages into the active root **and every live task root**. That is
+cross-address-space page-table mutation, D3-fenced by `AI_AGENT_RULES` §14.4, and no split form
+exists for any of the three. Splitting the site into a narrow restore plus a broad cleanup would
+leave a broad drain behind at census delta 0, so it was not attempted.
+
+`src/arch/trap_entry.rs` falls 4 → 3 `with_cpu` callsites — re-derived mechanically from source.
+The `5` the owner tables carried for that file was **already stale at the base commit**, one
+behind the validation retirement above; it is corrected here rather than carried forward, and the
+correction is bookkeeping only — it changes no total, because the totals were always taken from
+`tests/broad_lock_census_guard.rs`, which recomputes them from source. The census falls
+**12 → 11**: `with_cpu` **11 → 10**, broad `with` **stays 1**, total and runtime-required
+**12 → 11**, all runtime-required.
+
+**Not live-proven, and not claimed to be.**
+`scripts/qemu-aarch64-exit-current-task-smoke.sh` fails at this checkpoint with a mechanically
+identical 35-line failure set and the identical
+`STAGE_200D0C2_AARCH64_EXIT_CURRENT_TASK_LIVE_SEAL … live_cells=0 result=fail` seal at both the
+delivered head and the exact base `3943472`. The oracle workload never activates at either
+revision — every `EXIT_TASK_*` marker count is 0 — while the boot itself completes. That is an
+**exact-base deferral**, nothing more: it is not evidence for the changed restore path, and no
+live cell is earned. The evidence that does transfer is the hosted matrix (4660 single-threaded
+lib tests, all 16 integration targets, the census guard and the documentation guards), the three
+freestanding kernel builds, the x86_64 / AArch64 / RISC-V standard core smokes — all PASS — and a
+clippy comparison against the exact base that is byte-identical.
+
+**203C remains OPEN** — the canonical broad Phase-2 trap handler, the AArch64 FutexWait
+no-incoming idle read and the D6 proof restore are still there, and the stage closes only when no
+drain-classified acquisition remains. **199C remains OPEN. 199E remains DELIVERED / CLOSED.
+200B/U5 remains OPEN (partially production-wired).** Directive U8 is already source-complete —
+Stage 199D retired `finalize_split_handled_syscall`, so there is no U8 implementation outstanding.
+The canonical stage arithmetic is unchanged at **2 complete / 11 partial / 22 open**: this
+checkpoint retires one runtime acquisition and closes no stage. Direct production remains **OFF**.
 
 > **Correction — there is no U8 implementation left to do.** Earlier revisions of this doc and
 > of `doc/STATUS.md` ended with "U8 is next". Directive U8 was the AArch64
