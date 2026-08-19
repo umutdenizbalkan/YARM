@@ -54728,12 +54728,14 @@ mod stage169_d2_send_genuine {
             2,
             "the fatal adapter must reach both architectures' established terminals"
         );
-        // U3 (203C): 7 -> 5. The x86 FutexWait and Yield switch-success restores joined the
-        // same transaction; their classes and counters are untouched.
+        // U3 (203C): 7 -> 5 -> 4. The x86 FutexWait and Yield switch-success restores joined
+        // the same transaction, and the AArch64 `CurrentTaskExited` VALIDATION reacquisition
+        // was retired onto the shared `post_lock_exit_validation_split`. Their classes and
+        // counters are untouched.
         assert_eq!(
             src.matches(".with_cpu(").count(),
-            5,
-            "trap_entry.rs retains exactly five broad acquisitions"
+            4,
+            "trap_entry.rs retains exactly four broad acquisitions"
         );
         assert!(
             src.contains("FUTEX_WAIT_DISPATCH_COUNT"),
@@ -98698,6 +98700,7 @@ mod stage200d0c1_aarch64_exit_prep {
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
     const RUNNER: &str = include_str!("../../../scripts/qemu-aarch64-exit-current-task-smoke.sh");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
     const ROOT_TOML: &str = include_str!("../../../Cargo.toml");
     const CPS_TOML: &str = include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml");
     const FS_TOML: &str = include_str!("../../../crates/yarm-fs-servers/Cargo.toml");
@@ -98999,10 +99002,29 @@ mod stage200d0c1_aarch64_exit_prep {
     #[test]
     fn c11_c12_identity_is_tid_and_asid() {
         let cb = consumer_code();
-        assert!(cb.contains("let identity_ok = match kernel.task_asid(tid) {"));
-        assert!(cb.contains("Some(bound) => bound == asid,"));
+        // U3 (203C): the four facts now arrive from the SHARED transaction rather than an
+        // inline broad-lock closure, and the consumer destructures them by NAME so the two
+        // booleans cannot be transposed. The decision below is unchanged.
+        assert!(cb.contains("let crate::runtime::PostLockExitValidation {"));
+        assert!(cb.contains("            identity_ok,"));
+        assert!(cb.contains(".post_lock_exit_validation_split(cpu, tid, asid)"));
         assert!(cb.contains("if !identity_ok || !terminal || in_runqueue {"));
         assert!(cb.contains("EXIT_TASK_WRONG_IDENTITY arch=aarch64"));
+        // The retired inline form must not come back.
+        assert!(
+            !cb.contains("let identity_ok = match kernel.task_asid(tid) {"),
+            "the inline broad-lock identity read is retired, not duplicated"
+        );
+        // And the transaction it delegates to still enforces the FULL incarnation.
+        let seam = RUNTIME_SRC
+            .split("pub(crate) fn post_lock_exit_validation_split(")
+            .nth(1)
+            .expect("the shared exit-validation transaction")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        assert!(seam.contains("Some(bound) => bound == asid,"));
+        assert!(seam.contains("None => true,"));
         // Behavioural: the publication carries the ASID, and a mismatched ASID cannot be
         // produced by the store itself (it round-trips exactly what was published).
         let cpu = 0usize;
@@ -99382,14 +99404,206 @@ mod stage200d0c1_aarch64_exit_prep {
     #[test]
     fn c25_absence_validation_uses_full_identity() {
         let cb = consumer_code();
-        assert!(cb.contains("kernel.task_present_in_any_runqueue(tid)"));
-        assert!(cb.contains("kernel.task_asid(tid)"));
-        assert!(cb.contains("kernel.current_tid()"));
+        // U3 (203C): all four facts come from ONE coherent snapshot. The consumer names every
+        // one of them, so none can be silently dropped from the decision.
+        for field in ["current,", "identity_ok,", "terminal,", "in_runqueue,"] {
+            assert!(cb.contains(field), "the consumer must bind `{field}`");
+        }
+        assert!(cb.contains(".post_lock_exit_validation_split(cpu, tid, asid)"));
         assert!(cb.contains(
             "EXIT_TASK_ABSENCE_VALIDATED arch=aarch64 tid={} asid={} current=0 runqueue=0 restore_owner=0 identity=tid_asid"
         ));
+        // The retired inline reads are gone from the consumer, and the transaction supplies
+        // the identical semantics: current on the EXACT trapping CPU, and presence in ANY
+        // CPU's runqueue or current slot rather than this CPU's queue alone.
+        for retired in [
+            "kernel.task_present_in_any_runqueue(tid)",
+            "kernel.task_asid(tid)",
+            "kernel.current_tid()",
+        ] {
+            assert!(
+                !cb.contains(retired),
+                "`{retired}` is retired onto the shared transaction, not kept alongside it"
+            );
+        }
+        let seam = RUNTIME_SRC
+            .split("pub(crate) fn post_lock_exit_validation_split(")
+            .nth(1)
+            .expect("the shared exit-validation transaction")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        assert!(seam.contains("current_tid_on(cpu)"));
+        assert!(seam.contains("task_present_anywhere(crate::kernel::ipc::ThreadId(tid))"));
+        assert!(
+            seam.contains("validate_online_cpu(cpu)"),
+            "offline-CPU refusal is preserved by the transaction"
+        );
         // No general-purpose task-inspection syscall was added for the oracle.
         assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+    }
+
+    // ── U3 (canonical 203C): the validation reacquisition retirement ────────────────
+
+    /// U3-1. The AArch64 `CurrentTaskExited` VALIDATION calls the shared transaction exactly
+    /// once, and nothing else does the job alongside it.
+    #[test]
+    fn u3_validation_calls_the_shared_transaction_exactly_once() {
+        let cb = consumer_code();
+        assert_eq!(
+            cb.matches(".post_lock_exit_validation_split(cpu, tid, asid)")
+                .count(),
+            1,
+            "exactly one call to the shared exit-validation transaction"
+        );
+        // Whole-file: AArch64 adds the second production caller; RISC-V already had the first.
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("post_lock_exit_validation_split(")
+                .count(),
+            1,
+            "trap_entry.rs holds one and only one call"
+        );
+        // No second helper was created to do the same work.
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("pub(crate) fn post_lock_exit_validation_split(")
+                .count(),
+            1,
+            "the transaction has ONE definition; U3 reuses it rather than duplicating it"
+        );
+        assert!(
+            cb.contains(".map_err(|err| TrapHandleError::Syscall(err.into()))?;"),
+            "the refusal path is byte-identical to the retired acquisition's"
+        );
+    }
+
+    /// U3-2. The validation block holds NO broad-lock acquisition of any form.
+    #[test]
+    fn u3_validation_block_holds_no_broad_lock_acquisition() {
+        let cb = consumer_code();
+        // Slice the validation region: from the disposition consumption to the point where the
+        // replacement/idle divergence begins. The replacement restore below is out of scope.
+        let start = cb
+            .find("EXIT_TASK_DISPOSITION_CONSUMED")
+            .expect("consumption marker");
+        let end = cb.find("match current {").expect("the divergence");
+        let validation = &cb[start..end];
+        for banned in [
+            ".with_cpu(",
+            ".with(|",
+            "state.lock()",
+            "borrow_kernel_for_boot",
+        ] {
+            assert!(
+                !validation.contains(banned),
+                "the validation block must hold no `{banned}` after U3"
+            );
+        }
+        // It reaches KernelState through no accessor at all — the transaction owns that.
+        assert!(
+            !validation.contains("kernel."),
+            "the validation block touches no `&mut KernelState` accessor"
+        );
+    }
+
+    /// U3-3. The REPLACEMENT restore acquisition is deliberately untouched — U3 retires exactly
+    /// one callsite, and this is the other one.
+    #[test]
+    fn u3_replacement_restore_acquisition_is_unchanged() {
+        let cb = consumer_code();
+        assert!(cb.contains(
+            "let restore = shared\n                    .with_cpu(cpu, |kernel| {\n                        kernel.d2_recv_switch_incoming_asid(next);\n                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())\n                    })"
+        ));
+        // Exactly one `with_cpu` remains in the whole consumer, and it is that one.
+        assert_eq!(
+            cb.matches(".with_cpu(").count(),
+            1,
+            "the consumer keeps exactly one acquisition: the replacement restore"
+        );
+        // File-level: 5 -> 4, which is the census delta this directive publishes.
+        let code: alloc::vec::Vec<&str> = TRAP_ENTRY_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(
+            code.join("\n").matches(".with_cpu(").count(),
+            4,
+            "trap_entry.rs drops from 5 to 4 with_cpu callsites"
+        );
+    }
+
+    /// U3-4. Every validated property the retired closure enforced is still enforced — by the
+    /// consumer's decision or by the transaction it delegates to.
+    #[test]
+    fn u3_every_validated_property_survives_the_retirement() {
+        let cb = consumer_code();
+        let seam = RUNTIME_SRC
+            .split("pub(crate) fn post_lock_exit_validation_split(")
+            .nth(1)
+            .expect("the shared transaction")
+            .split("\n    /// ")
+            .next()
+            .expect("its body");
+        // Offline/invalid CPU refusal, exact identity, terminal classification, any-runqueue.
+        assert!(seam.contains("validate_online_cpu(cpu)"));
+        assert!(seam.contains("map_err(crate::kernel::boot::map_scheduler_error)"));
+        assert!(seam.contains("Some(bound) => bound == asid,"));
+        assert!(
+            seam.contains("None => (true, true),"),
+            "a missing TCB is identity-safe AND terminal"
+        );
+        assert!(seam.contains("crate::kernel::task::TaskStatus::Exited(_)"));
+        assert!(seam.contains("crate::kernel::task::TaskStatus::Dead"));
+        assert!(seam.contains("task_present_anywhere(crate::kernel::ipc::ThreadId(tid))"));
+        // The consumer still owns every decision and every fatal.
+        assert!(cb.contains("if current == Some(tid) {"));
+        assert!(cb.contains("EXIT_TASK_EXITING_STILL_CURRENT"));
+        assert!(cb.contains("if !identity_ok || !terminal || in_runqueue {"));
+        assert!(cb.contains("EXIT_TASK_WRONG_IDENTITY arch=aarch64"));
+        assert!(cb.contains("EXIT_TASK_EXITING_NOT_CURRENT arch=aarch64"));
+        assert!(cb.contains("EXIT_TASK_ABSENCE_VALIDATED arch=aarch64"));
+        assert!(cb.contains("EXIT_TASK_TRAP_DEPTH_OWNER arch=aarch64"));
+        // Replacement-versus-idle divergence, and zero fabricated authority.
+        assert!(cb.contains("Some(next) if next != 0 => {"));
+        assert!(cb.contains("EXIT_TASK_RESTORE_OWNER arch=aarch64 owner=replacement"));
+        for fabricated in [
+            "enqueue_on_with_priority",
+            "dispatch_next_on",
+            "DispatchMarkToken",
+            "set_task_status",
+        ] {
+            assert!(
+                !cb.contains(fabricated) && !seam.contains(fabricated),
+                "`{fabricated}` would be fabricated rollback/dispatch authority"
+            );
+        }
+    }
+
+    /// U3-5. RISC-V's pre-existing caller and its behaviour are untouched by this pass.
+    #[test]
+    fn u3_riscv_caller_and_behaviour_are_unchanged() {
+        const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        assert_eq!(
+            RV_TRAP_SRC
+                .matches(".post_lock_exit_validation_split(cpu, tid, asid)")
+                .count(),
+            1,
+            "RISC-V keeps exactly its one existing call"
+        );
+        assert!(RV_TRAP_SRC.contains("let crate::runtime::PostLockExitValidation {"));
+        assert!(RV_TRAP_SRC.contains("EXIT_TASK_WRONG_IDENTITY arch=riscv64"));
+        assert!(RV_TRAP_SRC.contains("EXIT_TASK_EXITING_STILL_CURRENT arch=riscv64"));
+        // RISC-V remains fully drained of reacquisitions: its only broad acquisition is the
+        // canonical Phase-2 trap handler, which is not in the exit consumer.
+        let rv_consumer = RV_TRAP_SRC
+            .split("// ── Stage 200D-0D1: the RISC-V `CurrentTaskExited` consumer")
+            .nth(1)
+            .expect("the RISC-V consumer");
+        assert!(
+            !rv_consumer.contains(".with_cpu("),
+            "the RISC-V exit consumer holds no broad acquisition"
+        );
     }
 
     // ── 26–30: runner static contract and feature-off preservation ──────────────────
@@ -121407,8 +121621,9 @@ mod u3_d6_first_resume_bind_transaction {
         let code = code_of(TRAP_ENTRY);
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            5,
-            "trap_entry.rs keeps its five acquisitions — this cohort touches none of them"
+            4,
+            "trap_entry.rs holds four acquisitions — this cohort touches none of them; the \
+             fifth was retired separately by the U3 AArch64 exit-validation retirement"
         );
         // The retained D6 restore/cleanup acquisition passes a REAL frame, so unlike the
         // retired first-resume call it genuinely restores context and is NOT a no-op.

@@ -1448,7 +1448,7 @@ AArch64 core smokes are treated.
 ## 14. 199E-R2 — default timer admission and asynchronous-resume ownership
 
 > **Canonical 199E is DELIVERED and CLOSED.** Sections 14 and 15 record the work that closed it.
-> Direct production remains OFF; U8 is next. CENSUS-DELTA: 0.
+> Direct production remains OFF. CENSUS-DELTA: 0.
 
 ### 14.1 The unconditional timer lifecycle
 

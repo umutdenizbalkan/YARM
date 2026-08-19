@@ -127,10 +127,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **12** |
+| `SharedKernel::with_cpu` | **11** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **1** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **13** |
+| **Total broad-lock acquisition sites** | **12** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
@@ -233,7 +233,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **13** |
+| runtime-required | **12** |
 | undocumented | **0** |
 
 #### test-only (0)

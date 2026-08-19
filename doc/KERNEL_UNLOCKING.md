@@ -53,8 +53,8 @@ This file has exactly one status page: §0.3.
 Three methods acquire it — `lock` (test-only), `with`, `with_cpu`. Full unlock = no runtime
 guard exists (canonical **204E**), sealed cross-architecture (canonical **205D**).
 
-Current census: **13** production callsites — **12** through `with_cpu` and **1** through the
-broad `with(|state| …)` form — classified **13 runtime-required**, 0 test-only, 0 obsolete,
+Current census: **12** production callsites — **11** through `with_cpu` and **1** through the
+broad `with(|state| …)` form — classified **12 runtime-required**, 0 test-only, 0 obsolete,
 0 boot-only. See §0.5. U1 deleted the two obsolete acquisitions (49 → 47) and U2 relocated the
 three test-only ones (47 → 44), leaving the census exactly the runtime-required set — every
 counted acquisition is one a real boot performs. U3 is now retiring those and has delivered
@@ -93,7 +93,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 | Stage | Definition | Status | Evidence / what is missing |
 |-------|-----------|--------|----------------------------|
 | **200A** | **CNode slot mutation seams**: slot lookup, reservation, generation update, install/remove, rollback. No capacity increase, no stale generation accepted, no duplicate occupied slot, no slot leak after failure. | **OPEN** (narrow foundation) | `control_plane_set_process_cnode_slots_split_mut` retires exactly one control-plane operation (NR 8), plus read helpers `cnode_slot_capacity_split_read`, `cnode_registered_split_read`, `process_cnode_for_identity_split_read`. The general five-part decomposition does not exist. |
-| **200B** | **Cap copy / mint / move / release** (and revoke) retired, with object identity/refcount handled separately from CNode slot mutation. | **OPEN** (hosted foundation, zero production wiring) | `src/kernel/cap_transfer_split.rs`, `src/kernel/boot/cap_memory_mint_split.rs`, `cap_transfer_materialize_split.rs`, `cap_transfer_delegation_split.rs` are all explicitly **`M2_SEAM_HELPER_ONLY`** and documented as **"NOT wired into"** `ipc_reply` / `ipc_send` / `recv` / `call` / `materialize_received_message_cap_routed`. |
+| **200B** | **Cap copy / mint / move / release** (and revoke) retired, with object identity/refcount handled separately from CNode slot mutation. | **OPEN** (partially wired) | **Corrected against source.** "Zero production wiring" is no longer true: `materialize_received_message_cap_routed_with_delegation_split` has **two production callers** in `src/runtime.rs`. It is not cleanly closed either — `record_cap_delegation_link_split` and `materialize_received_cap_snapshot_with_delegation_split` still have **zero** production callers, and `src/kernel/cap_transfer_split.rs`, `src/kernel/boot/cap_memory_mint_split.rs`, `cap_transfer_materialize_split.rs` and `cap_transfer_delegation_split.rs` all still carry their **`M2_SEAM_HELPER_ONLY`** fences. The stage closes only when those fences are deleted in the same change that wires their seams. |
 | **200C** | **Object lifetime and transfer-envelope cleanup** sealed for Endpoint, Notification, Reply, MemoryObject, AddressSpace, Task/thread, IRQ objects: exactly-once finalization, no premature destruction, no leaked transfer envelope, no refcount underflow/overflow, **no cap operation under the IPC lock**. | **OPEN** (partial foundation) | Shared-region transaction cleanup is real and 3-arch live for the direct class (executor-owned protocol A, generation-bearing teardown, cancellation fuse, `orphan_pages=0`/`duplicate_unmaps=0`/`leaked_transactions=0`). That is one object class of seven. `with_capability_state_split_mut` has exactly **one** production caller (`src/kernel/boot/capability_lifecycle_state.rs:864`). |
 | **200D** | **Capability subsystem seal** — runtime cap operations no longer use the broad lock, with failure injection for slot full, missing right, stale generation, object already destroyed, copy fault after reservation, receiver crash during transfer. | **OPEN** | Blocked on 200A–200C. |
 
@@ -159,10 +159,13 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 | 6 — Timer/IRQ/sched | 0 of 4 | 203A, 203C, 203D | 203B |
 | 7 — Monolith removal | **1 of 5** (204A) | 204B | 204C, 204D, 204E |
 | 8 — Seal | 0 of 4 | 205A | 205B, 205C, 205D |
-| **Total** | **1 of 35** | 12 | 22 |
+| **Total** | **2 of 35** | 11 | 22 |
 
-**No canonical stage in Phases 2–6 or 8 is complete.** The single completed stage is the
-census (204A), which is documentation, not lock retirement.
+Two canonical stages are complete: **199E** (Phase 2 — the off-lock timeout pipeline is
+production-live and default-reachable on all three architectures) and **204A** (Phase 7 — the
+census itself, which is documentation rather than lock retirement). 199E moved from *partial
+foundation* to *complete*, which is why the partial count falls 12 → **11** while the open
+count stays at 22; complete + partial + open = 2 + 11 + 22 = 35.
 
 > **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
 > was the only row written without an `N of M` denominator, and the totals silently counted it
@@ -182,11 +185,11 @@ census (204A), which is documentation, not lock retirement.
 | boot-only | **0** | — |
 | test-only | **0** | none — U2 relocated all three into test-only modules the census excludes: `ipc_recv_with_deadline_split_bridge` (2 acquisitions, never a trap-seam path) and the `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1) |
 | obsolete | **0** | none — U1 deleted both (`SharedKernel::handle_trap_with_cpu`, which had no in-tree caller at all, and `SharedKernel::run_reply_timeout_completion`, which had no production caller) |
-| runtime-required | **13** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), the AArch64 split return path (`trap_entry.rs:1432`), 3 x86_64 AP paths (U3 retired the AP saved-context read, the AP saved-resume enqueue→dispatch placement and the AP return-to-idle `block_current_on_cpu`; the three that remain — the BSP saved-context read, the BSP preferred dispatch and the next-task placement — are retained because none of those paths is live-reached), RISC-V resume, and the recv/delivery boundary re-acquires. Thread creation is gone: U3 retired the D6 first-resume CPU binding onto `bind_current_cpu_split`, whose broad predecessor called a proven `frame=None` no-op, so `thread_state.rs` holds 0. The three blocked-waiter Phase-C completion re-acquisitions in `runtime.rs` are gone too: U3 retired all three onto ONE shared, class-neutral, rank-ordered transaction, `complete_blocked_waiter_delivery_split`. The x86_64 post-drain idle-owner revalidation is gone too: `revalidate_idle_owner_after_drains` is now a CPU-local rank-1 → rank-2 transaction whose frame, FS-base and CR3 work run with no lock held. So are the two recv copy-fault completions, retired onto one class-neutral rank-1 → rank-8 transaction; the capability-rollback re-entry beside them stays broad and dependency-blocked. `src/arch/riscv64/trap.rs` is now fully drained of reacquisitions — U3 retired its terminal-idle predicate onto `terminal_idle_on_cpu_split`, leaving only the canonical broad Phase-2 trap handler. The ordinary-cap deferred sender wake is gone too, onto `apply_split_sender_wake_plan_split` reusing the shared `wake_tid_to_runnable_split` body |
+| runtime-required | **12** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), 3 x86_64 AP paths (U3 retired the AP saved-context read, the AP saved-resume enqueue→dispatch placement and the AP return-to-idle `block_current_on_cpu`; the three that remain — the BSP saved-context read, the BSP preferred dispatch and the next-task placement — are retained because none of those paths is live-reached), RISC-V resume, and the recv/delivery boundary re-acquires. Thread creation is gone: U3 retired the D6 first-resume CPU binding onto `bind_current_cpu_split`, whose broad predecessor called a proven `frame=None` no-op, so `thread_state.rs` holds 0. The three blocked-waiter Phase-C completion re-acquisitions in `runtime.rs` are gone too: U3 retired all three onto ONE shared, class-neutral, rank-ordered transaction, `complete_blocked_waiter_delivery_split`. The x86_64 post-drain idle-owner revalidation is gone too: `revalidate_idle_owner_after_drains` is now a CPU-local rank-1 → rank-2 transaction whose frame, FS-base and CR3 work run with no lock held. So are the two recv copy-fault completions, retired onto one class-neutral rank-1 → rank-8 transaction; the capability-rollback re-entry beside them stays broad and dependency-blocked. `src/arch/riscv64/trap.rs` is now fully drained of reacquisitions — U3 retired its terminal-idle predicate onto `terminal_idle_on_cpu_split`, leaving only the canonical broad Phase-2 trap handler. The ordinary-cap deferred sender wake is gone too, onto `apply_split_sender_wake_plan_split` reusing the shared `wake_tid_to_runnable_split` body |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
 
-Classified total: **13** acquisition callsites (**12** `with_cpu` + **1** broad `with`), which
-is 0 + 0 + 0 + 13. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
+Classified total: **12** acquisition callsites (**11** `with_cpu` + **1** broad `with`), which
+is 0 + 0 + 0 + 12. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
 
 ### 0.6 Structural blockers
 
@@ -242,7 +245,45 @@ There is no longer any dead or test-only weight in the total, so **every further
 must retire real runtime work.** U1 and U2 served **204C** / **204D** / **204E** without
 completing any of them.
 
-**U6 — DELIVERED. CANONICAL 199C — COMPLETE. CENSUS-DELTA 0.**
+**U6 — DELIVERED. CANONICAL 199C — OPEN. CENSUS-DELTA 0.**
+*(Corrected: this line previously read "CANONICAL 199C — COMPLETE", contradicting §0.3 and §0.4,
+which both classify 199C as OPEN. U6 delivered the blocking-send lifecycle work described below;
+it did not re-prove 199C's complete exit condition, and nothing in this pass does either. The
+§0.3 classification stands.)*
+
+**U3 (canonical 203C) — the AArch64 `CurrentTaskExited` VALIDATION reacquisition is retired.
+CANONICAL 203C — still OPEN. CENSUS-DELTA 13 → 12.**
+
+One callsite, one existing seam, no new mechanism. The AArch64 post-lock exit consumer in
+`src/arch/trap_entry.rs` re-acquired the broad guard to read four facts about the exiting
+incarnation — current TID, `{tid, asid}` identity, terminal status, and absence from every
+runqueue. Those four facts already had an authoritative home:
+`SharedKernel::post_lock_exit_validation_split`, written for the RISC-V consumer, which takes
+them as ONE snapshot with the rank-2 task lock nested inside the rank-1 scheduler lock. AArch64
+now calls the SAME transaction — it is not duplicated, re-implemented, or wrapped.
+
+Nothing about the decision changed: `validate_online_cpu` refusal yields the identical
+`KernelError` through the identical `map_err`; full `{tid, asid}` incarnation validation, the
+`Exited(_)` / `Dead` / absent terminal classification, and `task_present_anywhere` (every CPU's
+runqueue and current slot, not this CPU's queue) are the same predicates the old closure used —
+`task_present_in_any_runqueue` delegated straight to `task_present_anywhere`. Every fatal check,
+every marker, the replacement-versus-idle divergence and the zero-fabricated-authority property
+are byte-for-byte as they were.
+
+**The second AArch64 acquisition in that consumer — the replacement task's arch restore — is
+deliberately untouched**, and a focused guard pins that it stays. `src/arch/trap_entry.rs` falls
+5 → 4 `with_cpu` callsites; the census falls **13 → 12** (**11** `with_cpu` + **1** broad
+`with`).
+
+**203C remains OPEN.** U3 is a callsite-by-callsite retirement directive, not a stage closure:
+drain-classified acquisitions remain, and the stage closes only when none does.
+
+> **Correction — there is no U8 implementation left to do.** Earlier revisions of this doc and
+> of `doc/STATUS.md` ended with "U8 is next". Directive U8 was the AArch64
+> `finalize_split_handled_syscall` broad reacquisition, and Stage 199D already retired it: that
+> function now performs its return work outside every lock plus two bounded rank-2 task-domain
+> transactions (`split_finalize_handled_syscall`), and holds no broad acquisition at all. The
+> "U8 is next" pointers are removed rather than restated.
 
 **U7 — DELIVERED. CANONICAL 199E — OPEN (two classes retired). CENSUS-DELTA 0.**
 
@@ -764,7 +805,7 @@ completing any of them.
 > intact.
 >
 > **199E-R3 — the retirement runner's accounting is scoped per oracle identity. CANONICAL 199E —
-> DELIVERED and CLOSED. CENSUS-DELTA 0. Direct production remains OFF; U8 is next.**
+> DELIVERED and CLOSED. CENSUS-DELTA 0. Direct production remains OFF.**
 >
 > The last obstacle was not in the kernel. The RISC-V retirement runner asserted `count == 1` over
 > two whole marker FAMILIES — `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` and
@@ -803,8 +844,7 @@ completing any of them.
 > production lane — the one default ProductionTick actually drives — reports
 > `caller_continuations=1 … result=ok`. The AArch64 reply-timeout retirement profile likewise
 > fails mechanically identically to exact base. Both are deferred as pre-existing; every
-> non-deferrable gate qualifies, so **canonical 199E is DELIVERED and CLOSED** and **U8 is
-> next**.
+> non-deferrable gate qualifies, so **canonical 199E is DELIVERED and CLOSED**.
 
 > **The off-lock IPC-timeout pipeline is production on all three architectures, and two
 > classes are gone from the broad-lock scan.**

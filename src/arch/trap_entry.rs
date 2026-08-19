@@ -1812,37 +1812,51 @@ pub fn handle_trap_entry_shared(
             asid.0,
             cpu.0
         );
-        // Re-acquiring the broad guard here is itself the lock-dropped proof (Stage 195F
-        // pattern). Inside, read ONLY: is the exiting incarnation still current, is its ASID
-        // still the published one, is it terminal, and is it absent from runnable state.
-        let (current, identity_ok, terminal, in_runqueue) = shared
-            .with_cpu(cpu, |kernel| {
-                let current = kernel.current_tid();
-                // Identity is the FULL incarnation. A numeric TID match alone would let a
-                // restarted task satisfy a stale disposition, so the ASID recorded at
-                // publication must still be bound to that TID — or the TCB must be gone.
-                let identity_ok = match kernel.task_asid(tid) {
-                    Some(bound) => bound == asid,
-                    None => true,
-                };
-                // The lifecycle has no distinct `Exiting` state: `exit_task` commits straight
-                // to `Exited(status)`, and a reaped TCB is `Dead` or absent. All three are
-                // terminal; anything else means the disposition does not describe reality.
-                let terminal = matches!(
-                    kernel.task_status(tid),
-                    Some(crate::kernel::task::TaskStatus::Exited(_))
-                        | Some(crate::kernel::task::TaskStatus::Dead)
-                        | None
-                );
-                // Absence proof: not merely "off this CPU's queue" — the exiting incarnation
-                // must be present in NO runqueue on ANY CPU, so it can never be re-selected.
-                (
-                    current,
-                    identity_ok,
-                    terminal,
-                    kernel.task_present_in_any_runqueue(tid),
-                )
-            })
+        // Lock-dropped proof + identity read in ONE coherent split transaction.
+        //
+        // U3 (canonical 203C): this was a brief broad `with_cpu` re-acquire (the Stage 195F
+        // pattern). It is now `post_lock_exit_validation_split` — the SAME transaction the
+        // RISC-V exit consumer already uses, not a second helper — which takes the same four
+        // read-only facts under the rank-1 scheduler lock with the rank-2 task lock NESTED
+        // inside it. That is canonical ascending rank order and one snapshot that cannot tear
+        // between the scheduler read and the task read, which the old body could: it read
+        // `current_tid` and `task_present_in_any_runqueue` from rank 1 and `task_asid` /
+        // `task_status` from rank 2, each re-entering its own domain lock underneath the broad
+        // guard.
+        //
+        // Every clause this consumer decides on below is unchanged, fact for fact:
+        //
+        //   * `current` — the current TID on the exact trapping CPU. `with_cpu(cpu, …)` bound
+        //     `current_cpu` to this CPU as a side effect of admission, so the old
+        //     `kernel.current_tid()` resolved to `current_tid_on(cpu)`, which is what the
+        //     transaction reads directly.
+        //   * `identity_ok` — the FULL `{tid, asid}` incarnation. A numeric TID match alone
+        //     would let a restarted task satisfy a stale disposition. An absent TCB, and a TCB
+        //     carrying no ASID, are identity-safe — exactly what `task_asid` returning `None`
+        //     meant here.
+        //   * `terminal` — `Exited(_)`, `Dead`, or absent. The lifecycle has no distinct
+        //     `Exiting` state: `exit_task` commits straight to `Exited(status)` and a reaped
+        //     TCB is `Dead` or gone. Anything else means the disposition does not describe
+        //     reality.
+        //   * `in_runqueue` — absence from EVERY CPU's runqueue and current slot, not merely
+        //     this CPU's queue. `task_present_in_any_runqueue` delegated straight to
+        //     `Scheduler::task_present_anywhere`, which is the predicate the transaction calls.
+        //
+        // `validate_online_cpu` refusal is preserved: an invalid or offline CPU still yields
+        // the identical `KernelError` through the identical `map_err`, so the failure path
+        // below is untouched.
+        //
+        // The lock-dropped proof is undiminished. Acquiring EITHER domain lock here is only
+        // possible because the Phase-2 broad guard was released far above — the broad
+        // `SpinLock<KernelState>` contains both domains, so a still-held guard would deadlock
+        // exactly as it would have against the old `with_cpu`.
+        let crate::runtime::PostLockExitValidation {
+            current,
+            identity_ok,
+            terminal,
+            in_runqueue,
+        } = shared
+            .post_lock_exit_validation_split(cpu, tid, asid)
             .map_err(|err| TrapHandleError::Syscall(err.into()))?;
         if current == Some(tid) {
             crate::yarm_log!(
