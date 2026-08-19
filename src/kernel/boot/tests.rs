@@ -130498,6 +130498,120 @@ mod riscv64_async_preemption {
         );
     }
 
+    /// (11c) SOURCE: the S-mode-idle dispatch selects exactly ONE of three write-back
+    /// conventions, and the syscall/D2 continuation arm — the one it was missing — installs the
+    /// canonical RESULT lane rather than the startup argument mirror.
+    #[test]
+    fn the_s_mode_idle_dispatch_has_all_three_write_back_conventions() {
+        let arm = RV_BOOT_SRC
+            .split("let continuation = crate::kernel::boot::riscv_syscall_continuation_take(cpu.0 as usize);")
+            .nth(2)
+            .expect("the S-mode dispatch's decision")
+            .split("\n            let frame_resume: *const RiscvTrapFrame = frame;")
+            .next()
+            .expect("its body");
+        // (1) AsyncPreempted — verbatim register file.
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;"));
+        // (2) syscall/D2 continuation — the result lane, both the error and the success shape.
+        assert!(
+            arm.contains("} else if continuation {"),
+            "the continuation convention must be a distinct arm, chosen from the explicit \
+             decision and not inferred"
+        );
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = err as u64;"));
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;"));
+        // (3) fresh/startup — the argument mirror, unchanged.
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;"));
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A7] = 0;"));
+        // The continuation decision is published only where a completion was consumed, and it is
+        // cleared at every trap entry so it cannot be inherited.
+        assert_eq!(
+            RV_TRAP_SRC
+                .matches("crate::kernel::boot::riscv_syscall_continuation_publish(cpu.0 as usize)")
+                .count(),
+            3,
+            "the two in-lock completion consumers and the post-lock drain all publish"
+        );
+        assert!(
+            RV_BOOT_SRC
+                .contains("crate::kernel::boot::riscv_syscall_continuation_clear(cpu.0 as usize)")
+        );
+        assert_eq!(
+            RV_BOOT_SRC
+                .matches("crate::kernel::boot::riscv_syscall_continuation_take(cpu.0 as usize)")
+                .count(),
+            2,
+            "both write-backs take the continuation decision, exactly once each"
+        );
+    }
+
+    /// (11d) SOURCE: the S-mode-idle dispatch ACTIVATES the resumed task's address space before
+    /// it `sret`s, because it never reaches the main bridge's tail.
+    ///
+    /// Latent until the admission gate was retired: this dispatch resumed nothing in a default
+    /// build. Once it did, a caller woken from terminal idle read its own stack through the
+    /// previous task's page table.
+    #[test]
+    fn the_s_mode_idle_dispatch_activates_the_resumed_address_space() {
+        let body = RV_BOOT_SRC
+            .split("fn riscv_s_mode_timer_trap(")
+            .nth(1)
+            .expect("the S-mode timer fast path")
+            .split("\nfn riscv_trap_halt(")
+            .next()
+            .expect("its body");
+        let map = body
+            .find("map_kernel_shared_into_asid(asid)")
+            .expect("the kernel-shared mapping");
+        let write = body.find("write_satp(satp)").expect("the SATP write");
+        let sret = body
+            .find("let frame_resume: *const RiscvTrapFrame = frame;")
+            .expect("the resume");
+        assert!(
+            map < write,
+            "the kernel-shared mapping must precede the SATP write, as on the bridge"
+        );
+        assert!(
+            write < sret,
+            "the address space must be live before the sret"
+        );
+        assert!(
+            body.contains("if let Some(asid) = resume_asid {"),
+            "an unresolved ASID must skip activation entirely rather than install address space 0"
+        );
+    }
+
+    /// (11e) SOURCE: `sscratch` stays canonical on every resume this stage touches. Neither new
+    /// arm may hand the return tail anything but the per-hart trap-stack top derived from the
+    /// live frame.
+    #[test]
+    fn sscratch_remains_canonical_on_every_repaired_resume() {
+        for (label, marker) in [
+            (
+                "main bridge",
+                "unsafe { yarm_riscv64_trap_return(frame_resume, canonical_top) }",
+            ),
+            (
+                "s-mode timer dispatch",
+                "riscv_canonical_trap_stack_top_for_frame(frame as *const _ as usize),",
+            ),
+        ] {
+            assert!(
+                RV_BOOT_SRC.contains(marker),
+                "{label}: the return tail must restore the canonical per-hart trap-stack top"
+            );
+        }
+        // No repaired arm computes its own stack top or writes sscratch directly.
+        for probe in ["let continuation =", "async_class"] {
+            let at = RV_BOOT_SRC.find(probe).expect("the repaired region");
+            let region = &RV_BOOT_SRC[at..(at + 4000).min(RV_BOOT_SRC.len())];
+            assert!(
+                !region.contains("csrw sscratch") && !region.contains("set_sscratch"),
+                "the 199E-R2 arms must not touch sscratch themselves"
+            );
+        }
+    }
+
     /// (11b) SOURCE: a no-switch return CANCELS the staged snapshot, and does so on the branch
     /// that returns through the original hardware frame.
     #[test]

@@ -706,6 +706,79 @@ completing any of them.
 >
 > The feature stays default-OFF. With the FP-state policy decided, **default timer admission is
 > the sole remaining 199E blocker**, pending the final gate-retirement checkpoint.
+>
+> **199E-R2 — the RISC-V timer admission gate is RETIRED, and asynchronous-resume ownership
+> is repaired. CANONICAL 199E — STILL OPEN. CENSUS-DELTA 0. Direct production remains OFF.**
+>
+> The `riscv64-timer-irq` Cargo feature is **deleted, not emptied**, so no manifest, script,
+> doc or test can mistake an empty feature for a behaviour gate. `TIMER_IRQ_FEATURE_ENABLED`,
+> `STIE_AUDIT_COMPLETE`, `init_timer_after_idle_safe_point` and the deferral reasons
+> `timer_irq_feature_disabled`, `audit_pending` and `trap_bridge_reentrancy` are all gone.
+> There is no cfg, no selector, no dormant fallback and no runtime disable knob. The only
+> deferrals left are genuine platform and ownership facts: `sbi_time_ext_unavailable`,
+> `not_boot_hart`, `already_armed`, `unsafe_under_current_satp`. No second timer owner, clock
+> domain or post-lock drain was introduced.
+>
+> The timer is armed at the **boot safe point** — after `RISCV_KERNEL_BOOT_OK`, before
+> `run(kernel)` — so it is live before the first user task can monopolise the CPU and does not
+> require a prior terminal-idle transition. `sstatus.SIE` stays 0 through the arm; U-mode
+> delivery rides on RISC-V privilege rules, so ordinary S-mode kernel code, including every
+> lock-held region, is still non-interruptible, and `SIE` is enabled only in the audited
+> terminal-idle tail. Re-arm always schedules from a fresh `rdtime` sample, so a delayed
+> delivery is one late tick and never a catch-up storm.
+>
+> **What retiring the gate exposed.** Making the timer default-on made a pre-existing,
+> unreachable defect reachable: the asynchronous-preemption tag was consumed at the in-lock
+> restore, keyed on `kernel.current_tid()`, which on the post-lock dispatch route is still the
+> OUTGOING task. Instrumented boot: 407 tags published, 407 consumed there, **0 of 187**
+> switching write-backs authorized, and in 100% of them the consumed tag named the entering
+> task rather than the resumed one. The preempted task's authorization was spent without
+> effect and its next ordinary resume reinstalled the stale syscall-argument mirror over a live
+> computation — `PAGE_FAULT_UNHANDLED addr=0x10003`, an endpoint capability dereferenced as a
+> pointer, in 4 of 5 default boots.
+>
+> There is now **exactly one** consumer, `classify_and_take_async_resume`, keyed on the
+> INCOMING identity each resume boundary has itself resolved, validating `{tid, asid,
+> preempt_generation}` three ways and failing closed with a named reason on every path that is
+> not a clean match. Both RISC-V write-backs reach it through the same accessor and each selects
+> exactly one of three conventions — `AsyncPreempted`, syscall/D2 continuation, fresh/startup —
+> from explicit decisions, never inferred from register contents. A no-switch return CANCELS
+> the staged snapshot, so repeated ticks cannot accumulate stale register files, and no
+> `KernelState` method can consume a tag without being given an identity. Two further defects
+> latent behind the gate are fixed with it: the S-mode-idle dispatch had no continuation arm
+> (it overwrote a delivered `TimedOut` with the startup lane) and never activated the resumed
+> task's address space (it `sret`s to U-mode directly and never reaches the bridge's tail).
+> Full detail: `doc/ARCH_RISCV64.md` §14.
+>
+> **Live evidence.** Default RISC-V core, no timer or proof feature, six consecutive boots
+> (five `-smp 1`, one `-smp 2`), all PASS: pre-idle arm before the first terminal idle, both
+> interrupt origins live, IRQ = tick = SBI re-arm exactly, boot-hart-only ownership,
+> `PAGE_FAULT_UNHANDLED` = 0, `RISCV_ASYNC_RESUME_REFUSED` = 0, no storm, drift, provenance
+> failure, startup rewrite on an async resume, fatal or panic. Selector-off production expiry
+> (reply-timeout workload feature only, no timer feature, no runtime selector, no
+> `OracleHardware` registration) drives the complete chain once and ends at
+> `RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1
+> late_reply=rejected result=ok`, with `scan_broad_lock=0 production=1`, canary
+> `mismatches=0x0000`, one late reply rejected, and **eight genuine switch-away/switch-back
+> async resumes** returning the client to an identical `sepc`/`sp` with every pinned register
+> intact.
+>
+> **Why 199E is not closed here.** The RISC-V selector-ON retirement cell does not pass. One of
+> its failures is mechanically identical at exact base `932bd6f`
+> (`RISCV_IPC_REPLY_TIMEOUT_DONE … caller_continuations=1 … result=ok` absent; the
+> OracleHardware lane reports `caller_continuations=2`, because the client's recv returns
+> `WouldBlock` once before `TimedOut`) and is deferrable. Two are NOT base-identical and are
+> not deferrable: `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` and
+> `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED` are each asserted `count == 1`, and now count 2.
+> The two events name **two different tasks** — tid 2 at `blocked_generation=1` and tid 1 at
+> `blocked_generation=18` — each delivered exactly once. This is a second, unrelated production
+> caller legitimately timing out in the same boot because ProductionTick is finally live, i.e.
+> correct behaviour failing a marker-count assertion that assumes the oracle is the only caller.
+> It is the same class the runner's own author already re-scoped for the `ARMED` and `OK`
+> families, with the in-file note that counting a family and calling it "the oracle's" is
+> "wrong in the dangerous direction — it fails on correct behaviour". Re-scoping a runtime count
+> assertion was outside this pass's authority, so it is reported rather than changed, and
+> **canonical 199E stays OPEN.**
 
 > **The off-lock IPC-timeout pipeline is production on all three architectures, and two
 > classes are gone from the broad-lock scan.**

@@ -1622,6 +1622,30 @@ fn riscv_s_mode_timer_trap(
                 frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;
                 frame.regs[RiscvTrapFrame::A7] = 0;
             }
+            // ── Canonical 199E-R2: ACTIVATE the resumed task's address space ────────────
+            //
+            // This dispatch `sret`s straight to U-mode from here — it never reaches the main
+            // bridge's tail — so it owns the SATP switch for the task it resumes. Without it the
+            // task returns to userspace under whatever page table the previous one left
+            // installed, because `switch_address_space` defers on RISC-V and the in-lock restore
+            // therefore installs nothing (see the bridge's own activation, which exists for the
+            // same reason).
+            //
+            // Latent until now: before the admission gate was retired this dispatch resumed
+            // nothing in a default build. Measured once it did — a caller woken from terminal
+            // idle by its own expiring reply deadline read its stack through the wrong address
+            // space and faulted at `addr=0x20006` with a garbage pointer, AFTER its canonical
+            // `TimedOut` had been delivered correctly.
+            //
+            // Same two steps, same order, as the bridge: map the kernel-shared gigapage into the
+            // resumed ASID (idempotent), then write `satp`, whose write issues the `sfence.vma`.
+            // Absence of an ASID skips activation entirely rather than installing address space 0.
+            if let Some(asid) = resume_asid {
+                let _ = crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
+                if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid) {
+                    crate::arch::riscv64::page_table::write_satp(satp);
+                }
+            }
             let frame_resume: *const RiscvTrapFrame = frame;
             unsafe {
                 yarm_riscv64_trap_return(

@@ -326,15 +326,15 @@ fn arm_periodic_timer_for_user_delivery() -> Option<&'static str> {
 /// Re-establishes the S-mode timer entry contract on EVERY subsequent arrival at the audited
 /// kernel-idle boundary.
 ///
-/// `init_timer_after_idle_safe_point` arms the timer once, on the first arrival. Every later
-/// arrival comes from a trap handler, where hardware has cleared `sstatus.SIE` — so without this
-/// the idle `wfi` would loop with interrupts masked and the pending timer would never be taken.
-/// That is exactly why the timer previously stopped as soon as anything was dispatched out of
-/// idle.
+/// `arm_timer_at_boot_safe_point` arms the timer once, at boot, and enables U-origin delivery
+/// only. Every arrival here comes from a trap handler, where hardware has cleared `sstatus.SIE` —
+/// so without this the idle `wfi` would loop with interrupts masked and the pending timer would
+/// never be taken. That is exactly why the timer previously stopped as soon as anything was
+/// dispatched out of idle.
 ///
 /// This does NOT widen where interrupts are enabled: it is the same single audited boundary, whose
 /// invariant is that the only S-mode code interruptible with `SIE` set is `riscv_trap_halt`'s `wfi`
-/// loop. It is a strict no-op unless the opt-in feature already armed the timer.
+/// loop. It is a strict no-op until the boot arm has actually enabled `sie.STIE`.
 pub fn reestablish_idle_boundary() {
     if !stie_enabled() {
         return;
@@ -355,7 +355,7 @@ pub fn reestablish_idle_boundary() {
 
 /// Returns true iff the current hart is the OpenSBI-released boot hart.
 /// In default builds `online_cpus=1`, so this is always true on the
-/// only hart that ever calls `init_timer_after_idle_safe_point`; the
+/// only hart that ever calls `arm_timer_at_boot_safe_point`; the
 /// check is here so a future caller from a secondary hart cannot
 /// silently bypass the boot-hart-only invariant.
 fn current_hart_is_boot_hart() -> bool {

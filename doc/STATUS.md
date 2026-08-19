@@ -230,6 +230,44 @@ classes from the added tests. **The AArch64 reply-timeout retirement profile fai
 character-identically to exact base `7fe7d06`** (same failure lines, same seal) and is deferred as
 pre-existing, not caused by this checkpoint.
 
+**199E-R2 — the RISC-V timer admission gate is RETIRED and asynchronous-resume ownership is
+repaired. CANONICAL 199E — STILL OPEN. CENSUS-DELTA 0. Direct production remains OFF.**
+RISC-V `ProductionTick` is now default and unconditional: the `riscv64-timer-irq` feature is
+deleted rather than emptied, and every gate, audit latch, cfg, selector and dormant fallback is
+gone. Timer ownership is boot-hart-only; `sstatus.SIE` is masked during ordinary S-mode kernel
+execution; U-origin and audited S-idle-origin delivery are both live-proven. All production
+timeout classes use the common off-lock collector/drain, and x86_64, AArch64 and RISC-V all reach
+that common pipeline without the broad kernel lock.
+
+Retiring the gate made a pre-existing asynchronous-resume defect reachable, and it is repaired in
+the same pass: the preemption tag was being consumed for the OUTGOING task at an in-lock seam that
+runs before the resume identity is published (407 tags published, 407 spent there, **0 of 187**
+switching write-backs authorized), so a preempted task was resumed with its own stale
+syscall-argument mirror over a live computation. There is now exactly one consumer, keyed on the
+incoming identity each write-back resolves for itself, with an explicit staged/consume/cancel
+lifecycle and named fail-closed refusals. Two defects latent behind the gate are fixed with it:
+the S-mode-idle dispatch had no syscall/D2 continuation arm and never activated the resumed task's
+address space.
+
+Live: default RISC-V core green 6/6 (five `-smp 1`, one `-smp 2`) with `PAGE_FAULT_UNHANDLED` = 0
+and `RISCV_ASYNC_RESUME_REFUSED` = 0; selector-off production expiry drives the full chain once to
+`RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected
+result=ok` with `scan_broad_lock=0 production=1` and no `OracleHardware` registration. Hosted
+suite 4632 passed / 0 failed; all integration, census and doc guards green; fmt clean;
+`cargo metadata --locked` and `cargo check --workspace` exit 0; all three freestanding builds exit
+0; x86_64 core and retirement profiles and the AArch64 core profile PASS. The AArch64 reply-timeout
+retirement profile fails **mechanically identically to exact base `932bd6f`** (same seven lines,
+same seal) and is deferred as pre-existing.
+
+**199E is not closed.** The RISC-V selector-ON retirement cell still fails. One failure is
+base-identical and deferrable; two are not: `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` and
+`RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED` are asserted `count == 1` and now count 2, because a
+second unrelated production caller legitimately times out in the same boot now that ProductionTick
+is live — the two events name two different tasks, each delivered exactly once. That is correct
+behaviour failing a marker-count assertion scoped to a single caller, the same class the runner's
+author already re-scoped for the `ARMED`/`OK` families. Re-scoping a runtime count assertion was
+outside this pass's authority.
+
 **199E-R1 — the RISC-V S-mode timer-bridge prerequisite is LIVE-PROVEN under the opt-in feature.
 CENSUS-DELTA 0.** The `wfi` re-entrancy blocker recorded in `doc/ARCH_RISCV64.md` §13 is resolved:
 the bridge now admits a supervisor timer interrupt taken from the audited kernel-idle boundary, and
@@ -1666,11 +1704,12 @@ scheduling can be enabled.
 | Real S-mode → U-mode `sret` | ✅ `RISCV_ENTER_USER_SRET tid=2`; first trap `from_u=1 spp=0` |
 | Syscall round-trip | ✅ full `RiscvTrapFrame` save/restore; `+4` ecall PC advance via TCB snapshot; task-switch arg seeding; S-mode-fault fail-closed halt |
 | Core service chain | ✅ initramfs / devfs / vfs / ramfs / ext4 reached; `RAMFS_MOUNT_READY`; `EXT4_SRV_READY`; `VFS_MOUNT_REGISTER_*_OK` |
-| Terminal state | ✅ `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked` (event-driven idle, no timer/IRQ scope) |
+| Terminal state | ✅ `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked` (event-driven idle; the periodic supervisor timer is live and re-arms across it) |
 | Regular smoke target (`--smp 1/2/3/4`) | ✅ `scripts/qemu-riscv64-core-smoke.sh` + `scripts/qemu-riscv64-smoke-matrix.sh` enforce the full per-N marker contract on QEMU virt + OpenSBI |
 | Ready for global kernel-unlocking smoke matrix | ✅ **Ready: yes** — see `doc/ARCH_RISCV64.md` §13.5; the regular core smoke is RISC-V's per-arch gate, treated the same way as x86_64 / AArch64 core smokes |
-| Timer audit scaffold | ✅ `RISCV_TIMER_AUDIT_BEGIN` + `RISCV_TIMER_AUDIT_DONE sbi_time=… boot_hart=… trap_bridge_reentrant=… feature=…`; canonical deferred reasons pinned by the smoke gate (`timer_irq_feature_disabled`, `trap_bridge_reentrancy_not_ready`, `sbi_time_ext_unavailable`, `stie_audit_pending`, `not_boot_hart`) |
-| Timer interrupt (live) | ⏸ deferred — accepted as `RISCV_TIMER_DEFERRED reason=timer_irq_feature_disabled`; next pass enables S-mode timer (`stimecmp` + `sstatus.SIE=1` + `mideleg` STI) and flips the gate to live-required |
+| Timer audit scaffold | ✅ `RISCV_TIMER_AUDIT_BEGIN` + `RISCV_TIMER_AUDIT_DONE sbi_time=1 boot_hart=1 gate=none admission=default`; the only deferred reasons the smoke gate still pins are genuine platform/ownership facts (`sbi_time_ext_unavailable`, `not_boot_hart`, `already_armed`, `unsafe_under_current_satp`) |
+| Timer interrupt (live) | ✅ **default ON, unconditional, boot-hart-owned.** The `riscv64-timer-irq` feature is deleted, not emptied; no cfg, selector, dormant fallback or runtime disable knob remains. Armed at the boot safe point — `RISCV_TIMER_ARMED_PRE_IDLE owner=boot_hart sie=0 delivery=u_mode_privilege result=ok` — before the first user task runs and long before the first terminal idle. `sstatus.SIE` stays 0 through the arm; U-mode delivery rides on privilege rules, so ordinary S-mode kernel code stays non-interruptible and SIE is enabled only in the audited idle tail. Live: both interrupt origins, IRQ = tick = SBI re-arm exactly, boot-hart-only under `-smp 2`. See `doc/ARCH_RISCV64.md` §14 |
+| Asynchronous U-mode preemption | ✅ one incoming-identity consumer (`classify_and_take_async_resume`); a snapshot stays attached to its exact `{tid, asid, preempt_generation}` until that task is resumed, is consumed once, is cancelled on a no-switch return, and fails closed with a named reason otherwise. Both write-backs (bridge and S-mode-idle dispatch) select exactly one of `AsyncPreempted` / syscall-D2 continuation / fresh-startup from explicit decisions. Live: 8 genuine switch-away/switch-back resumes with canary `mismatches=0x0000` |
 | PLIC threshold write under active satp | ✅ skipped + reported as `RISCV_PLIC_DEFERRED reason=plic_mmio_unmapped_under_active_satp` (PLIC MMIO is outside the kernel-shared gigapage; raw write would fault) |
 | External IRQ enable | ⏸ deferred — `RISCV_EXTIRQ_DEFERRED reason=no_safe_source`; UART0 (sid=10) is the marked candidate, no source enabled in this pass |
 | SMP scheduler | ⏸ off — `RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled`; `online_cpus` stays at 1 until RISC-V SMP scheduling lands |

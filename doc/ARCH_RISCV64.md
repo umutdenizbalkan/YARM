@@ -1047,7 +1047,7 @@ docs update `doc/BOOT.md`.
 | Real U-mode `sret` | ✅ `RISCV_ENTER_USER_SRET tid=2`; first trap `from_u=1 spp=0` |
 | Syscall round-trip | ✅ full `RiscvTrapFrame` save/restore; `+4` ecall PC advance; fail-closed S-mode-fault halt |
 | Core service chain | ✅ reaches `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked`; required markers include `RAMFS_MOUNT_READY`, `VFS_MOUNT_REGISTER_RAMFS_OK`, `EXT4_SRV_READY`, `VFS_MOUNT_REGISTER_EXT4_OK` |
-| Timer | ⏸ default OFF — defers with canonical `reason=timer_irq_feature_disabled`; **the S-mode trap-bridge prerequisite is live-proven under the opt-in `riscv64-timer-irq` feature** (see §13.6) |
+| Timer | ✅ **default ON, unconditional, boot-hart-owned.** The `riscv64-timer-irq` feature is deleted, not emptied; there is no admission gate, no audit gate and no runtime disable knob. Armed at the boot safe point, before the first user task can run and before any terminal idle. Only genuine platform/ownership deferrals remain: `sbi_time_ext_unavailable`, `not_boot_hart`, `already_armed`, `unsafe_under_current_satp` (see §13.7) |
 | PLIC | ⏸ discovery + threshold-address compute live; threshold write skipped under active satp (`RISCV_PLIC_DEFERRED reason=plic_mmio_unmapped_under_active_satp`); base / context / per-source breadcrumbs emit |
 | External IRQ | ⏸ `RISCV_EXTIRQ_DEFERRED reason=no_safe_source`; UART0 (sid=10) marked as the candidate via `RISCV_EXTIRQ_SELECT`; no source enabled |
 | RISC-V SMP scheduling | ⏸ not implemented; `online_cpus` stays at 1 by design |
@@ -1344,18 +1344,19 @@ Rejected failure markers: `RISCV_EARLY_TRAP`, `PANIC`, `FATAL`,
 `RISCV_TIMER_DEFERRED reason=…` that is not one of the canonical list
 below.
 
-Accepted timer-deferred reasons (canonical, kernel + gate must agree):
+Accepted timer-deferred reasons (canonical, kernel + gate must agree). Since 199E-R2 there is no
+admission gate, so every remaining reason is a genuine platform or ownership fact — none of them
+can be produced by configuration, and a default build on QEMU virt hits none of them:
 
-- `timer_irq_feature_disabled` — default build, cargo feature off (current).
-- `trap_bridge_reentrancy_not_ready` — feature on, but trap vector's
-  kernel-S-mode timer fast path not yet landed; arming STIE would
-  trigger `RISCV_TRAP_UNHANDLED reason=trap_from_s_mode` on the very
-  next `wfi`.
 - `sbi_time_ext_unavailable` — SBI Timer EID probe returned not-supported.
-- `stie_audit_pending` — re-entry case; `init_timer_after_idle_safe_point` already fired.
 - `not_boot_hart` — guard against a future caller from a secondary hart.
+- `already_armed` — re-entry case; `arm_timer_at_boot_safe_point` already fired.
 - `unsafe_under_current_satp` — reserved for a future caller path that
   runs before the kernel-shared gigapage is installed.
+
+The retired reasons `timer_irq_feature_disabled`, `trap_bridge_reentrancy_not_ready` and
+`stie_audit_pending` no longer exist in the kernel or the gate, and their absence is pinned by
+`tests/riscv64_timer_admission_scope.rs`.
 
 Accepted PLIC-deferred reason: `plic_mmio_unmapped_under_active_satp`.
 
@@ -1429,15 +1430,153 @@ Accepted external-IRQ-deferred reason: `no_safe_source`.
 
 The RISC-V64 port satisfies every "before global unlocking" gate above:
 `scripts/qemu-riscv64-smoke-matrix.sh` passes live across `--smp 1/2/3/4`
-on QEMU `virt` + OpenSBI; the service chain reaches the idle terminal;
-the timer is explicitly deferred with the canonical reason
-`timer_irq_feature_disabled`, accepted by the gate. The remaining
-items (live timer tick, PLIC mapping, one-source external IRQ, SMP
-scheduling) are post-unlocking follow-ups, not unlocking blockers, and
-each has a canonical deferred-reason marker today so its absence is
-visible at every boot.
+on QEMU `virt` + OpenSBI, and the service chain reaches the idle
+terminal. The periodic supervisor timer is no longer deferred: it is
+default-on and boot-hart-owned (§13.7). The remaining items (PLIC
+mapping, one-source external IRQ, SMP scheduling) are post-unlocking
+follow-ups, not unlocking blockers, and each has a canonical
+deferred-reason marker today so its absence is visible at every boot.
 
 The next pass therefore should resume the global kernel unlocking work
 with RISC-V included in the smoke matrix, treating its regular core
 smoke as the per-arch acceptance gate the same way the x86_64 and
 AArch64 core smokes are treated.
+
+
+---
+
+## 14. 199E-R2 — default timer admission and asynchronous-resume ownership
+
+### 14.1 The unconditional timer lifecycle
+
+`arm_timer_at_boot_safe_point()` runs from `run_with_prepared_kernel`, immediately after
+`RISCV_KERNEL_BOOT_OK` and before `run(kernel)`. That is the earliest point at which all five
+preconditions hold simultaneously: the boot hart is identified, `stvec`/`sscratch` and both the
+U-origin and S-origin trap paths are installed, `SharedKernel` and the scheduler timer exist,
+SBI TIME is confirmed present, and no secondary hart can claim ownership (secondaries are parked
+via SBI HSM with every interrupt admission disabled and never enter userspace).
+
+At that point it programs the first SBI deadline from a fresh `rdtime` sample, enables
+`sie.STIE`, and stops. `sstatus.SIE` stays **0**. U-mode delivery does not need it: RISC-V
+privilege rules deliver a supervisor interrupt taken while U-mode is running regardless of `SIE`,
+so ordinary S-mode kernel code — including every lock-held region — still runs
+non-interruptible. `SIE` continues to be enabled only in the audited terminal-idle tail
+(`reestablish_idle_boundary`), with no lock held.
+
+The timer is therefore armed **before the first user task can monopolise the CPU**, and does not
+require a prior terminal-idle transition. Re-arming always schedules from a freshly read current
+time, so a delayed delivery produces one late tick rather than a catch-up storm.
+
+Live, every boot:
+
+```
+RISCV_TIMER_AUDIT_DONE sbi_time=1 boot_hart=1 gate=none admission=default
+RISCV_TIMER_STIE_ENABLED
+RISCV_TIMER_ARMED_PRE_IDLE owner=boot_hart sie=0 delivery=u_mode_privilege result=ok
+RISCV_TIMER_BOOT_ARM result=ok reason=none
+```
+
+at log lines ~115–118, against the first `RISCV_KERNEL_IDLE_WAITING_FOR_IO` at ~13 700.
+
+### 14.2 Asynchronous-resume ownership
+
+A task interrupted in U-mode has a snapshot taken before anything can schedule. That snapshot
+belongs to that exact `{tid, asid, preempt_generation}` incarnation and stays attached to it
+until **that same task** is selected as the task being resumed.
+
+`crate::kernel::task::classify_and_take_async_resume` is the single consumer. It is keyed on the
+INCOMING identity the resume boundary has itself resolved — the resume TID from the rank-1
+scheduler seam and the ASID from the rank-2 task seam, the same ASID that boundary is about to
+install into `satp` — and it validates all three coordinates against both the TCB and the
+boundary's own resolved incarnation.
+
+Both RISC-V write-backs reach it through the same accessor:
+
+* the main trap bridge's register write-back, and
+* the S-mode-idle timer dispatch.
+
+Each then selects **exactly one** of three write-back conventions, from explicit decisions and
+never inferred from register contents:
+
+| convention | source of `a0..a7` |
+|---|---|
+| `AsyncPreempted` | the saved integer register file, verbatim; the argument mirror is not read |
+| syscall / D2 continuation | the canonical result lane a completion consumer already encoded |
+| fresh / startup | the startup ABI from the argument mirror, `a7 = 0` |
+
+Tag lifecycle:
+
+* **captured** before scheduling, at trap entry, on a U-origin timer only;
+* **retained** when the task switches out;
+* **consumed** exactly once, when that task is later resumed;
+* **cancelled** when no switch occurs and the original hardware frame returns directly
+  (`RISCV_ASYNC_SNAPSHOT_CANCELLED ... reason=no_switch_original_frame`), so repeated no-switch
+  ticks cannot leave a stale snapshot;
+* **cleared** on death/exit;
+* never overwritten, never spent for another task, and never allowed to coexist with a D2/startup
+  continuation.
+
+Every refusal is fail-closed and named: `unresolved_incoming_asid`, `identity_mismatch`,
+`stale_generation`, `no_saved_context`, `continuation_coexists`. A refusal clears the tag and
+emits `RISCV_ASYNC_RESUME_REFUSED ... result=fail_closed`; the count must be zero in a healthy
+boot.
+
+### 14.3 What the previous shape got wrong
+
+199E-R1D consumed the tag wherever `kernel.current_tid()` was reachable — inside the in-lock
+restore. On the post-lock dispatch route that runs strictly BEFORE the resume identity is
+published, so `current` is still the OUTGOING task. Instrumented boot, before the repair:
+
+| measurement | count |
+|---|---|
+| snapshots published | 407 |
+| tags consumed at the in-lock seam | 407 |
+| post-lock resume boundaries that found a tag | 0 of 187 |
+| switching write-backs that restored verbatim | 0 of 187 |
+
+In 100% of switching write-backs the consumed tag named the entering task and in 0% the resumed
+one. The preempted task's authorization was spent without effect and its next ordinary resume
+reinstalled the stale syscall-argument mirror over a live computation —
+`PAGE_FAULT_UNHANDLED tid=2 addr=0x10003`, an endpoint capability dereferenced as a pointer.
+
+Two further defects were latent behind the admission gate and became reachable the moment the
+S-mode-idle dispatch started resuming tasks in a default build:
+
+* it had no syscall/D2 continuation arm, so a caller woken from terminal idle by its own
+  expiring reply deadline had its delivered `TimedOut` overwritten by the startup argument lane;
+* it never activated the resumed task's address space, so the `sret` landed under whichever page
+  table the previous task left installed. It owns that switch because it returns to U-mode
+  directly and never reaches the bridge's tail, and `switch_address_space` defers on RISC-V.
+
+### 14.4 Live evidence
+
+Default RISC-V core, no timer or proof feature, six consecutive boots (five at `-smp 1`, one at
+`-smp 2`), all PASS:
+
+* `PAGE_FAULT_UNHANDLED` = 0; no stale argument-lane dereference;
+* pre-idle arm precedes the first terminal idle;
+* both interrupt origins live — 8 U-origin (`RISCV_U_MODE_TIMER_ACCEPTED`) and ~13 600 S-origin;
+* IRQ = tick = SBI re-arm exactly (`ACCEPTED` = `TICK` = `REARMED`);
+* boot-hart-only ownership, including under `-smp 2`;
+* no storm, drift, provenance failure, startup rewrite on an async resume, fatal or panic;
+* `RISCV_ASYNC_RESUME_REFUSED` = 0.
+
+Selector-off production expiry (reply-timeout workload feature only, no timer feature, no runtime
+oracle selector, `slot5=12` = `ProductionTimeoutWins`, no `OracleHardware` registration) — the
+full chain in order:
+
+```
+SERVER_REQUEST_CONSUMED -> SERVER_BLOCKED_FOR_LATE_REPLY_TRIGGER -> idle ->
+S-origin ticks -> IPC_REPLY_TIMEOUT_ARMED -> IPC_REPLY_TIMEOUT_DEFERRED ->
+IPC_REPLY_TIMEOUT_OK terminal=Timeout timeout_result=TimedOut ->
+IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED -> GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcReplyTimeout ->
+CLIENT_TIMED_OUT -> 8x RISCV_ASYNC_PREEMPT_RESUME tid=1 entering=2 ->
+LATE_REPLY_TRIGGER_RECV -> SERVER_LATE_REPLY_REJECTED rejected=1 ->
+RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1
+  late_reply=rejected result=ok
+```
+
+with `IPC_REPLY_TIMEOUT_LOCK_STATUS ... scan_broad_lock=0 production=1 result=ok` and
+`CLIENT_REGISTER_CANARY mismatches=0x0000 result=ok`. The eight async resumes are genuine
+switch-away/switch-back events — the client is preempted in its bounded U-mode dwell while the
+server runs, and returns to the identical `sepc`/`sp` with every pinned register intact.
