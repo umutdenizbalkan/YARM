@@ -111116,16 +111116,39 @@ mod stage199d_riscv_narrow_trap_snapshots {
         let writeback = body
             .find("if task_switched || scause == EXC_USER_ECALL {")
             .expect("register write-back");
-        let satp = body
+        // Canonical 199E-R2 — the ASID READ moved to just before the write-back, deliberately.
+        // One resolved incarnation now names both the async tag the write-back may consume and
+        // the page table the `sret` lands in, so those two can never disagree. What did NOT move
+        // is the ACTIVATION, which still follows the write-back exactly as before — that is the
+        // ordering the `sret` depends on, and it is pinned separately below.
+        let asid_read = body
             .find("let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {")
             .expect("SATP lookup");
+        let async_decision = body
+            .find("let async_class = if task_switched {")
+            .expect("the async-resume decision");
+        let satp_activate = body
+            .find("if let Some(asid) = resume_asid {")
+            .expect("SATP activation");
         assert!(entering < call, "entering snapshot precedes the wrapper");
         assert!(call < resume, "resume snapshot follows the wrapper");
         assert!(
             resume < writeback,
             "resume snapshot precedes the write-back"
         );
-        assert!(writeback < satp, "SATP selection follows the write-back");
+        assert!(
+            resume < asid_read && asid_read < async_decision,
+            "the incoming ASID is resolved after the resume identity and before the async \
+             decision that must agree with it"
+        );
+        assert!(
+            async_decision < writeback,
+            "the async decision is taken before the register write-back it governs"
+        );
+        assert!(
+            writeback < satp_activate,
+            "SATP ACTIVATION still follows the write-back"
+        );
     }
 
     /// SATP is selected from the EXACT resume TID, and the existing activation + `sfence.vma`
@@ -129498,29 +129521,52 @@ mod riscv64_s_mode_timer_bridge {
     }
 
     /// The boundary is armed before SIE, and SIE is the last thing enabled.
+    ///
+    /// Canonical 199E split the sequence across two owners when the admission gate was retired.
+    /// The BOOT arm programs the deadline and enables STIE only — it must never unmask, or every
+    /// lock-held S-mode region would become interruptible. The audited IDLE boundary owns the
+    /// S-origin half: sscratch, then the latch, then `sstatus.SIE` last. The invariant this case
+    /// has always protected is unchanged — SIE is enabled at exactly one program point, after
+    /// everything an S-mode trap would need is in place.
     #[test]
     fn the_boundary_is_established_before_interrupts_are_enabled() {
-        let enable = RV_TIMER_SRC
-            .split("fn arm_one_shot_timer_and_enable() -> Option<&'static str> {")
+        let arm = RV_TIMER_SRC
+            .split("fn arm_periodic_timer_for_user_delivery() -> Option<&'static str> {")
             .nth(1)
-            .expect("the enable sequence")
+            .expect("the boot arm")
             .split("\n/// ")
             .next()
             .expect("its body");
-        let sscratch = enable
+        let deadline = arm.find("sbi_set_timer(deadline)").expect("the deadline");
+        let stie = arm.find("set_sie_stie()").expect("STIE");
+        assert!(
+            deadline < stie,
+            "the deadline is programmed before STIE, so the enable bit never stands alone"
+        );
+        assert!(
+            !arm.contains("set_sstatus_sie()"),
+            "the boot arm must NOT unmask: U-origin delivery rides on privilege rules"
+        );
+        let idle = RV_TIMER_SRC
+            .split("pub fn reestablish_idle_boundary() {")
+            .nth(1)
+            .expect("the audited idle boundary")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        let sscratch = idle
             .find("set_sscratch_to_trap_stack_top()")
             .expect("the sscratch re-point");
-        let armed = enable
+        let armed = idle
             .find("arm_s_mode_timer_boundary()")
             .expect("the boundary arm");
-        let stie = enable.find("set_sie_stie()").expect("STIE");
-        let sie = enable.find("set_sstatus_sie()").expect("SIE");
+        let sie = idle.find("set_sstatus_sie()").expect("SIE");
         assert!(
-            sscratch < armed && armed < stie && stie < sie,
-            "sscratch, then the boundary latch, then STIE, then SIE last"
+            sscratch < armed && armed < sie,
+            "sscratch, then the boundary latch, then SIE last"
         );
         assert_eq!(
-            enable.matches("set_sstatus_sie()").count(),
+            idle.matches("set_sstatus_sie()").count(),
             1,
             "there is exactly one place that enables interrupts"
         );
@@ -129553,43 +129599,52 @@ mod riscv64_s_mode_timer_bridge {
             "a non-boot hart defers instead of arming"
         );
         let init = RV_TIMER_SRC
-            .split("pub fn init_timer_after_idle_safe_point() -> Option<&'static str> {")
+            .split("pub fn arm_timer_at_boot_safe_point() -> Option<&'static str> {")
             .nth(1)
-            .expect("the init seam")
+            .expect("the boot arm seam")
             .split("\n/// ")
             .next()
             .expect("its body");
         let boot_hart = init.find("if !on_boot_hart {").expect("the boot-hart gate");
-        let feature = init
-            .find("if !TIMER_IRQ_FEATURE_ENABLED {")
-            .expect("the feature gate");
+        let arm = init
+            .find("arm_periodic_timer_for_user_delivery()")
+            .expect("the arm call");
         assert!(
-            boot_hart < feature,
-            "the boot-hart gate is checked before the feature path is entered"
+            boot_hart < arm,
+            "the boot-hart gate is checked before anything is armed"
+        );
+        // Canonical 199E: ownership is the ONLY remaining gate on this path. A policy gate here
+        // would be the retired admission feature wearing a different name.
+        assert!(
+            !init.contains("TIMER_IRQ_FEATURE_ENABLED") && !init.contains("STIE_AUDIT_COMPLETE"),
+            "no admission gate may guard the arm"
         );
     }
 
-    /// The opt-in feature stays default-OFF: default builds arm nothing.
+    /// Canonical 199E: the timer is DEFAULT and UNCONDITIONAL. This case is the inverse of the
+    /// one it replaces — it used to prove the opt-in feature existed and defaulted off; it now
+    /// proves no such control can come back.
     #[test]
-    fn the_timer_feature_remains_default_off() {
-        assert!(
-            RV_TIMER_SRC.contains(
-                "pub const TIMER_IRQ_FEATURE_ENABLED: bool = cfg!(feature = \"riscv64-timer-irq\");"
-            ),
-            "the live path is gated on an opt-in cargo feature, never on a default"
-        );
+    fn the_timer_admission_gate_is_retired() {
+        let code = RV_TIMER_SRC
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the non-test portion");
+        for banned in [
+            "TIMER_IRQ_FEATURE_ENABLED",
+            "STIE_AUDIT_COMPLETE",
+            "timer_irq_feature_disabled",
+        ] {
+            assert!(
+                !code.contains(banned),
+                "`{banned}` still exists — the RISC-V timer can still be disabled"
+            );
+        }
         let manifest = include_str!("../../../Cargo.toml");
         assert!(
-            manifest.contains("riscv64-timer-irq = []"),
-            "the feature exists and pulls in nothing else"
-        );
-        let default_line = manifest
-            .lines()
-            .find(|l| l.trim_start().starts_with("default ="))
-            .unwrap_or("");
-        assert!(
-            !default_line.contains("riscv64-timer-irq"),
-            "and it is NOT in the default feature set: {default_line}"
+            !manifest.contains("riscv64-timer-irq"),
+            "the cargo feature must be removed outright, not left as an empty no-op that \
+             documentation could mistake for a behaviour gate"
         );
     }
 
@@ -129925,6 +129980,313 @@ mod riscv64_s_mode_timer_bridge {
 ///
 /// `crates/yarm-control-plane-servers/**` userspace and `src/arch/riscv64/**` compile only in
 /// their own targets; these guards read the source and run in the canonical hosted suite.
+/// Canonical 199E-R3 — the RISC-V retirement runner accounts for completions PER ORACLE IDENTITY.
+///
+/// With ProductionTick default-on an unrelated production caller legitimately arms and settles its
+/// own reply deadline in the same boot, so a family-level `count == 1` on the completion markers
+/// failed on correct behaviour: the two events named two DIFFERENT tasks, each delivered exactly
+/// once. These cases pin that the runner's repair scopes to the oracle's derived identity WITHOUT
+/// giving up global duplicate detection, and that its own fixtures cover both directions.
+mod riscv64_retirement_oracle_scoped_accounting {
+    const SMOKE: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh");
+
+    /// The runner MINUS its own synthetic fixtures. The fixture generator necessarily writes
+    /// literal identities (`caller_tid=1`, `tid=2`, …) because it fabricates log lines; those are
+    /// test data, not assertions, so the "nothing is hardcoded" checks read this region instead.
+    fn assertion_regions() -> [&'static str; 2] {
+        let (head, rest) = SMOKE
+            .split_once("fixture_log() {")
+            .expect("the fixture generator");
+        let (_fixtures, tail) = rest
+            .split_once("# Run every scoped check against one fixture.")
+            .expect("the end of the fixture generator");
+        [head, tail]
+    }
+
+    /// `true` when `needle` appears anywhere OUTSIDE the fixture generator.
+    fn asserted_anywhere(needle: &str) -> bool {
+        assertion_regions().iter().any(|r| r.contains(needle))
+    }
+
+    /// (1) The oracle identity is DERIVED — from the provisioning marker and that caller's own
+    /// registration — never hardcoded and never taken by family order.
+    #[test]
+    fn the_oracle_identity_is_derived_and_fails_closed() {
+        let f = SMOKE
+            .split("derive_oracle_identity() {")
+            .nth(1)
+            .expect("the identity derivation")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            f.contains("IPC_REPLY_TIMEOUT_ORACLE_PROVISION_OK init_tid="),
+            "the caller TID comes from the provisioning marker"
+        );
+        assert!(
+            f.contains("oracle provisioning marker count != 1"),
+            "a missing or duplicated provisioning marker must fail closed"
+        );
+        assert!(
+            f.contains("caller_asid")
+                && f.contains("record_index")
+                && f.contains("record_generation"),
+            "the registration's strongest identity fields must be bound"
+        );
+        assert!(
+            f.contains("identity malformed") && f.contains("registration is malformed"),
+            "a malformed identity must fail closed rather than fall through"
+        );
+        assert!(
+            !asserted_anywhere("caller_tid=1 ") && !asserted_anywhere("tid=1 class=IpcRecv"),
+            "no assertion may hardcode the oracle's numeric TID"
+        );
+    }
+
+    /// (2) Both completion families are scoped to the oracle identity, and the two stale global
+    /// singletons are gone by name.
+    #[test]
+    fn the_two_stale_singleton_assertions_are_replaced_by_scoped_ones() {
+        // The old shape: these exact strings were passed to `verify_log`, which asserts count==1
+        // over the whole boot.
+        let tw = SMOKE
+            .split("# ── 3. Scenario A — timeout-wins, feature enabled (fresh boot) ──")
+            .nth(1)
+            .expect("the timeout-wins block")
+            .split("# ── 4. Scenario B")
+            .next()
+            .expect("its body");
+        let verify_args = tw
+            .split("verify_log \"$TW\" \\")
+            .nth(1)
+            .expect("the verify_log call")
+            .split("\n  if [[")
+            .next()
+            .expect("its arguments");
+        assert!(
+            !verify_args.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED"),
+            "the COMMITTED family must no longer be asserted as a global singleton"
+        );
+        assert!(
+            !verify_args.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED"),
+            "the DELIVERED family must no longer be asserted as a global singleton"
+        );
+        // …and both are now asserted through the scoped helpers.
+        assert!(tw.contains("verify_oracle_completion_delivered_once \"$TW\" \"$ORACLE_TID\""));
+        assert!(
+            tw.contains("verify_oracle_completion_committed_once \"$TW\" riscv64 \"$ORACLE_TID\"")
+        );
+        assert!(tw.contains("verify_no_duplicate_completion_delivery \"$TW\""));
+        assert!(tw.contains("derive_oracle_identity \"$TW\" riscv64"));
+    }
+
+    /// (3) Exactly-one is NOT weakened to at-least-one, and global duplicate detection survives.
+    #[test]
+    fn exact_one_and_global_duplicate_detection_are_both_retained() {
+        let d = SMOKE
+            .split("verify_oracle_completion_delivered_once() {")
+            .nth(1)
+            .expect("the delivery check")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            d.contains("!= 1 (got $n) for tid="),
+            "the oracle's own delivery must be EXACTLY one, not at least one"
+        );
+        assert!(
+            !d.contains("-ge 1") && !d.contains(">= 1"),
+            "exact-one must not be relaxed to at-least-one"
+        );
+        assert!(
+            d.contains("duplicate completion delivery for tid="),
+            "a second delivery for the oracle's exact generation must be refused"
+        );
+        let g = SMOKE
+            .split("verify_no_duplicate_completion_delivery() {")
+            .nth(1)
+            .expect("the global duplicate check")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            g.contains("uniq -d"),
+            "duplicate detection across EVERY identity must be retained, not suppressed"
+        );
+        // Unrelated production lines are never discarded — nothing filters them out of the log.
+        assert!(
+            !asserted_anywhere("caller_tid=2") && !asserted_anywhere("grep -v"),
+            "unrelated production identities must be accounted for, never filtered away"
+        );
+    }
+
+    /// (4) The COMMITTED family carries no identity, so it is bound positionally INSIDE the
+    /// oracle's identity-scoped window plus a cardinality tie — and the limitation is documented.
+    #[test]
+    fn the_identityless_committed_family_is_bound_two_independent_ways() {
+        let c = SMOKE
+            .split("verify_oracle_completion_committed_once() {")
+            .nth(1)
+            .expect("the commit check")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            c.contains("IPC_REPLY_TIMEOUT_ARMED arch=${arch} caller_tid=${tid} ")
+                && c.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=${tid} "),
+            "the window must be delimited by two INDEPENDENTLY identity-scoped lines"
+        );
+        assert!(
+            c.contains("oracle-window COMPLETION_COMMITTED count != 1"),
+            "exactly one commit inside the oracle's own window"
+        );
+        assert!(
+            c.contains("distinct settled caller identities"),
+            "a cardinality tie must catch a duplicate commit for any caller"
+        );
+        assert!(
+            SMOKE.contains("NO identity at all") && SMOKE.contains("LIMITATION"),
+            "the field-inventory limitation must be documented in the runner itself"
+        );
+    }
+
+    /// (5) Every ordered position described as the ORACLE's is selected by the oracle's identity,
+    /// not by the family's first occurrence — which in a default-ProductionTick boot belongs to
+    /// the unrelated caller.
+    #[test]
+    fn the_oracle_ordered_chain_uses_scoped_lines_only() {
+        let ch = SMOKE
+            .split("verify_oracle_ordered_chain() {")
+            .nth(1)
+            .expect("the oracle chain")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        for scoped in [
+            "IPC_REPLY_TIMEOUT_ARMED arch=${arch} caller_tid=${tid} ",
+            "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=${tid} ",
+            "USER_LOG tid=${tid} msg=RISCV_IPC_REPLY_TIMEOUT_DONE",
+        ] {
+            assert!(
+                ch.contains(scoped),
+                "the oracle chain must select `{scoped}` by identity"
+            );
+        }
+        assert!(
+            ch.contains("$1 > lo && $1 < hi"),
+            "the commit position must be the one inside the oracle's window"
+        );
+        // The GLOBAL one-shot chain is deliberately family-first and says so.
+        assert!(
+            SMOKE.contains("latch authorized by the FIRST completion consumption in the boot"),
+            "the family-first positions must be justified as the global one-shot they guard"
+        );
+    }
+
+    /// (6) The runner ships its own fixtures, covering both directions, and they need no build.
+    #[test]
+    fn the_runner_carries_self_test_fixtures_for_both_directions() {
+        assert!(SMOKE.contains(r#"[[ "${1:-}" == "--self-test" ]]"#));
+        for case in [
+            "\"oracle_only:pass\"",
+            "\"oracle_plus_unrelated:pass\"",
+            "\"oracle_missing_delivery:fail\"",
+            "\"oracle_duplicate:fail\"",
+            "\"unrelated_duplicate:fail\"",
+            "\"no_provision:fail\"",
+            "\"malformed_armed:fail\"",
+        ] {
+            assert!(SMOKE.contains(case), "missing self-test case {case}");
+        }
+        assert!(
+            SMOKE.contains("if (( ! fail && ! SELF_TEST )); then"),
+            "the fixtures must run without building or booting anything"
+        );
+        assert!(
+            SMOKE.contains("STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST cases=7 result=ok"),
+            "the fixture run must emit a countable seal"
+        );
+    }
+
+    /// (8) PRE-EXISTING RUNNER REPAIR, guarded separately from the accounting work: every
+    /// `assert_order` invocation passes the function's full FOUR arguments.
+    ///
+    /// Two calls passed only three, so the prose reason landed in the `b` (second marker) slot
+    /// and `why` was unset — under `set -u` that aborted the whole runner with
+    /// `$4: unbound variable` the moment the reply-wins lane became reachable. The function
+    /// itself is byte-identical to base `932bd6f`; only the malformed call sites changed.
+    #[test]
+    fn every_assert_order_invocation_passes_all_four_arguments() {
+        // The function's arity is unchanged.
+        assert!(
+            SMOKE.contains(r#"local norm="$1" a="$2" b="$3" why="$4""#),
+            "assert_order's four-parameter signature must be unchanged"
+        );
+        // Each invocation is a line-continued call; count the continued lines belonging to it.
+        let mut checked = 0usize;
+        for call in SMOKE.split("assert_order \"$rw\" \\\n").skip(1) {
+            let args: alloc::vec::Vec<&str> = call
+                .lines()
+                .take_while(|l| l.trim_start().starts_with('"'))
+                .collect();
+            assert_eq!(
+                args.len(),
+                3,
+                "assert_order must receive a, b and why after the log: got {args:?}"
+            );
+            // The middle argument is a MARKER, never prose — prose in the `b` slot is exactly
+            // the defect this guards.
+            assert!(
+                args[1].trim_start().starts_with("\"IPC_")
+                    || args[1].trim_start().starts_with("\"USER_LOG")
+                    || args[1].trim_start().starts_with("\"RISCV_")
+                    || args[1].trim_start().starts_with("\"GLOBAL_"),
+                "assert_order's `b` slot must hold a marker, not prose: {}",
+                args[1].trim()
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 6,
+            "all six ordered-chain invocations must be checked"
+        );
+        // The repaired pair scopes the registration marker to the oracle, because an unrelated
+        // production caller arms tens of thousands of lines earlier.
+        assert!(
+            SMOKE.contains("\"IPC_REPLY_TIMEOUT_ARMED arch=riscv64 caller_tid=${ORACLE_TID} \" \\"),
+            "the repaired calls must use the ORACLE's registration, not the family"
+        );
+        assert!(
+            SMOKE.contains("derive_oracle_identity \"$rw\" riscv64 || return"),
+            "the reply-wins lane must derive the identity its chain is scoped to"
+        );
+    }
+
+    /// (7) Nothing else moved: the settlement-bound, leak, result and terminal-state checks the
+    /// cell already had are still called, and no timeout/result expectation changed.
+    #[test]
+    fn the_surrounding_contract_is_untouched() {
+        for kept in [
+            "verify_oracle_armed_once \"$TW\" riscv64",
+            "verify_no_duplicate_settlement \"$TW\" riscv64",
+            "settlements ($ok) exceed registrations ($armed)",
+            "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=riscv64 scan_broad_lock=0",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReplyTimeout result=ok",
+            "RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok",
+            "IPC_REPLY_WIN_RESERVE arch=riscv64 outcome=decline reason=TimeoutAlreadyClaimed result=ok",
+            "assert_single_boot_instance",
+            "recheck_sha_clean",
+        ] {
+            assert!(SMOKE.contains(kept), "the cell must still assert `{kept}`");
+        }
+        assert!(
+            SMOKE.contains("\"KERNEL PANIC\" \"RUST PANIC\" \"panicked at\""),
+            "the fatal-pattern guard must be unchanged"
+        );
+    }
+}
+
 /// Canonical 199E-R1D — asynchronous U-mode preemption preserves the exact interrupted context.
 ///
 /// Before this stage RISC-V had two resume conventions, both keyed to a syscall boundary:
@@ -129940,7 +130302,7 @@ mod riscv64_s_mode_timer_bridge {
 /// `#[cfg(target_arch = "riscv64")]` and so cannot execute in the canonical hosted suite.
 mod riscv64_async_preemption {
     use super::*;
-    use crate::kernel::task::{AsyncPreemptedContext, ThreadControlBlock};
+    use crate::kernel::task::{AsyncPreemptedContext, AsyncResumeClass, ThreadControlBlock};
     use crate::kernel::vm::Asid;
 
     const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
@@ -129990,6 +130352,22 @@ mod riscv64_async_preemption {
         (state, tid)
     }
 
+    /// Canonical 199E-R2 — consume EXACTLY as a live RISC-V write-back does.
+    ///
+    /// The boundary resolves the incoming TID from the scheduler seam and its ASID from the task
+    /// seam, then hands both to the one classifier. Going through this helper rather than
+    /// poking the TCB is what makes these cases a test of the production decision rather than a
+    /// restatement of it.
+    fn resume_as_boundary(state: &mut KernelState, incoming_tid: u64) -> AsyncResumeClass {
+        let asid = state.task_asid(incoming_tid);
+        state.take_async_preempt_for_incoming(incoming_tid, asid)
+    }
+
+    /// `true` only when the boundary was authorized to restore the register file verbatim.
+    fn restores(state: &mut KernelState, incoming_tid: u64) -> bool {
+        resume_as_boundary(state, incoming_tid).restores_verbatim()
+    }
+
     /// (1) A recognizable value in EVERY integer register survives the snapshot and comes back
     /// through the restore. This is the property the whole stage exists for.
     #[test]
@@ -130014,7 +130392,7 @@ mod riscv64_async_preemption {
         }
         assert_eq!(resumed.saved_pc(), 0x4321_0000, "PC must be the interrupt");
         assert_eq!(resumed.saved_sp(), 0x7FFF_0000, "SP must be the user stack");
-        assert!(state.take_async_preempted_resume(tid));
+        assert!(restores(&mut state, tid));
     }
 
     /// (2) The ARGUMENT registers specifically — `a0..a5` nonzero and `a7` nonzero — survive
@@ -130041,7 +130419,7 @@ mod riscv64_async_preemption {
             0xA777_7777,
             "a7 must NOT be forced to zero for an async-preempted task"
         );
-        assert!(state.take_async_preempted_resume(tid));
+        assert!(restores(&mut state, tid));
     }
 
     /// (3) The tag is consumed EXACTLY once. A second resume falls back to the ordinary lane
@@ -130052,12 +130430,9 @@ mod riscv64_async_preemption {
         let frame = canary_frame(0x11, 0x22);
         assert!(state.snapshot_async_preempted_current(&frame));
         assert!(state.async_preempted_resume_pending(tid));
+        assert!(restores(&mut state, tid), "first take succeeds");
         assert!(
-            state.take_async_preempted_resume(tid),
-            "first take succeeds"
-        );
-        assert!(
-            !state.take_async_preempted_resume(tid),
+            !restores(&mut state, tid),
             "a snapshot must not authorize two verbatim restores"
         );
         assert!(!state.async_preempted_resume_pending(tid));
@@ -130075,8 +130450,8 @@ mod riscv64_async_preemption {
         assert_ne!(first.instruction_ptr, second.instruction_ptr);
         assert_eq!(second.instruction_ptr, VirtAddr(0xCC));
         // Still exactly one authorization, naming the NEWEST snapshot.
-        assert!(state.take_async_preempted_resume(tid));
-        assert!(!state.take_async_preempted_resume(tid));
+        assert!(restores(&mut state, tid));
+        assert!(!restores(&mut state, tid));
     }
 
     /// (5) A stale generation cannot restore an older register file. This is the coordinate that
@@ -130138,7 +130513,7 @@ mod riscv64_async_preemption {
             !state.async_preempted_resume_pending(tid),
             "a dead task must carry no resume authorization"
         );
-        assert!(!state.take_async_preempted_resume(tid));
+        assert!(!restores(&mut state, tid));
     }
 
     /// (8) The idle/kernel identity publishes NOTHING: an S-mode timer at the audited idle
@@ -130159,7 +130534,7 @@ mod riscv64_async_preemption {
     fn an_untagged_task_is_never_treated_as_preempted() {
         let (mut state, tid) = fixture();
         assert!(!state.async_preempted_resume_pending(tid));
-        assert!(!state.take_async_preempted_resume(tid));
+        assert!(!restores(&mut state, tid));
         // Even a plain syscall capture leaves it untagged — `sync_current_thread_from_frame` is
         // the syscall path and must not publish a preemption authorization.
         state
@@ -130168,6 +130543,163 @@ mod riscv64_async_preemption {
         assert!(
             !state.async_preempted_resume_pending(tid),
             "the syscall snapshot must not tag an async preemption"
+        );
+    }
+
+    /// (9a) Canonical 199E-R2 — A is preempted, the scheduler selects B: A KEEPS its tag and B
+    /// cannot consume it.
+    ///
+    /// This is the exact live failure, reduced. The old design consumed A's tag at a seam that
+    /// ran while A was still `current`, so B's write-back saw an authorization A had paid for
+    /// and A was left with none.
+    #[test]
+    fn a_snapshot_survives_a_switch_and_cannot_be_consumed_by_the_incoming_task() {
+        let (mut state, a) = fixture();
+        let b = state
+            .spawn_user_thread(19, 0xBBBB_0000, 0x8900_0000, 0x7020)
+            .expect("second thread");
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0xA1, 0xA2)));
+        // The scheduler picks B. B has no snapshot of its own, so its boundary is Ordinary —
+        // and crucially it does NOT spend A's.
+        assert_eq!(
+            resume_as_boundary(&mut state, b),
+            AsyncResumeClass::Ordinary
+        );
+        assert!(
+            state.async_preempted_resume_pending(a),
+            "A's authorization must survive a switch to somebody else"
+        );
+        // (9b) …and when the scheduler later picks A, A consumes it exactly once.
+        assert!(
+            restores(&mut state, a),
+            "A's own boundary restores verbatim"
+        );
+        assert!(
+            !restores(&mut state, a),
+            "one snapshot authorizes exactly one verbatim restore"
+        );
+    }
+
+    /// (9c) Canonical 199E-R2 — the full round trip: A is preempted mid-computation, B runs, A is
+    /// selected again, and EVERY canary comes back — a0..a7 included, plus PC and SP.
+    #[test]
+    fn a_switch_away_and_back_restores_every_canary_verbatim() {
+        let (mut state, a) = fixture();
+        let b = state
+            .spawn_user_thread(19, 0xBBBB_0000, 0x8900_0000, 0x7020)
+            .expect("second thread");
+        let mut interrupted = canary_frame(0x4444_1111, 0x7EEE_0000);
+        // a0..a7 = user_gprs[10..18]: ordinary live registers, not an ABI lane.
+        for (i, n) in (10..18usize).enumerate() {
+            interrupted.set_user_gpr(n, 0xA0A0_0000 + i);
+        }
+        assert!(state.snapshot_async_preempted_current(&interrupted));
+        // Somebody else runs and leaves the frame full of foreign values.
+        assert_eq!(
+            resume_as_boundary(&mut state, b),
+            AsyncResumeClass::Ordinary
+        );
+        // A is selected again. Its boundary authorizes the verbatim restore…
+        assert!(restores(&mut state, a));
+        // …and the saved context it restores is the interrupted one, register for register.
+        let ctx = state.thread_user_context(a).expect("A's saved context");
+        assert_eq!(ctx.instruction_ptr, VirtAddr(0x4444_1111), "PC verbatim");
+        assert_eq!(ctx.stack_ptr, VirtAddr(0x7EEE_0000), "SP verbatim");
+        for (i, n) in (10..18usize).enumerate() {
+            assert_eq!(ctx.user_gprs[n], 0xA0A0_0000 + i, "a{i} must be verbatim");
+        }
+        for n in 1..10usize {
+            assert_eq!(ctx.user_gprs[n], 0xC0DE_0000 + n, "x{n} must be verbatim");
+        }
+    }
+
+    /// (9d) Canonical 199E-R2 — a no-switch tick CANCELS the staged snapshot, and repeating it
+    /// leaves nothing behind.
+    ///
+    /// The trap returns to the same task through the original hardware frame, so no register
+    /// write-back happens and the snapshot describes an instant the task runs straight past.
+    #[test]
+    fn no_switch_ticks_cancel_the_snapshot_and_cannot_accumulate() {
+        let (mut state, tid) = fixture();
+        for tick in 0..8u64 {
+            assert!(
+                state.snapshot_async_preempted_current(&canary_frame(
+                    0x5000 + tick as usize,
+                    0x6000
+                ))
+            );
+            assert!(
+                state.async_preempted_resume_pending(tid),
+                "tick {tick}: the snapshot is staged"
+            );
+            assert!(
+                state.cancel_async_preempt_for(tid),
+                "tick {tick}: the no-switch return cancels it"
+            );
+            assert!(
+                !state.async_preempted_resume_pending(tid),
+                "tick {tick}: nothing may survive a cancelled snapshot"
+            );
+        }
+        // And a cancelled snapshot authorizes nothing afterwards.
+        assert_eq!(
+            resume_as_boundary(&mut state, tid),
+            AsyncResumeClass::Ordinary
+        );
+        assert!(
+            !state.cancel_async_preempt_for(tid),
+            "cancelling twice reports nothing was there"
+        );
+    }
+
+    /// (9e) Canonical 199E-R2 — a boundary that cannot name the incarnation it is entering
+    /// REFUSES rather than falling through to the startup rewrite.
+    #[test]
+    fn an_unresolved_incoming_asid_fails_closed() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0x77, 0x88)));
+        assert_eq!(
+            state.take_async_preempt_for_incoming(tid, None),
+            AsyncResumeClass::Refused("unresolved_incoming_asid"),
+            "an unresolvable incoming ASID must not silently become Ordinary"
+        );
+        assert!(
+            !state.async_preempted_resume_pending(tid),
+            "a refused tag is cleared so it cannot be retried"
+        );
+    }
+
+    /// (9f) Canonical 199E-R2 — a replacement incarnation that reused the numeric TID is refused
+    /// at the BOUNDARY, not merely by the tag predicate.
+    #[test]
+    fn a_boundary_entering_a_different_incarnation_fails_closed() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0x99, 0xAA)));
+        let live = state.task_asid(tid).expect("asid");
+        let other = Asid(live.0.wrapping_add(1).max(1));
+        assert_eq!(
+            state.take_async_preempt_for_incoming(tid, Some(other)),
+            AsyncResumeClass::Refused("identity_mismatch"),
+            "the boundary's own resolved ASID must agree, or nothing is restored"
+        );
+        assert!(!state.async_preempted_resume_pending(tid));
+    }
+
+    /// (9g) Canonical 199E-R2 — async and D2/startup continuation states must never coexist. A
+    /// task holding both is ambiguous, and neither may silently win.
+    #[test]
+    fn async_and_continuation_double_ownership_fails_closed() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0xBB, 0xCC)));
+        state.set_pending_syscall_completion_for_test(tid, 7);
+        assert_eq!(
+            resume_as_boundary(&mut state, tid),
+            AsyncResumeClass::Refused("continuation_coexists"),
+            "a task cannot be both asynchronously preempted and holding a parked completion"
+        );
+        assert!(
+            !state.async_preempted_resume_pending(tid),
+            "the ambiguous authorization is cleared rather than left to be raced"
         );
     }
 
@@ -130198,37 +130730,221 @@ mod riscv64_async_preemption {
         );
     }
 
-    /// (11) SOURCE: the resume mode is read from an EXPLICIT tag. Nothing infers it from zero
-    /// registers, a PC value, a bare TID or incidental scheduler state.
+    /// (11) SOURCE: the resume mode is read from an EXPLICIT tag, consumed at the boundary that
+    /// performs the write-back, keyed on the INCOMING identity — and nowhere else.
+    ///
+    /// This is the 199E-R2 repair pinned as source. The 199E-R1D shape had two consumers, both
+    /// running before the resume identity was published; this pins that there is now exactly one
+    /// decision procedure, that both write-backs reach it, and that the seams which used to
+    /// consume no longer can.
     #[test]
-    fn the_resume_mode_is_explicit_and_never_inferred() {
+    fn the_resume_mode_is_taken_at_the_write_back_for_the_incoming_identity() {
         let take = "crate::kernel::boot::riscv_async_resume_take(cpu.0 as usize)";
         assert_eq!(
             RV_BOOT_SRC.matches(take).count(),
             2,
             "exactly two write-backs decide the ABI lanes: the main bridge and the S-mode \
-             timer dispatch — and both must consult the SAME tag"
+             timer dispatch — and both must consult the SAME decision"
         );
-        // Publication happens only where a tag was actually consumed.
+        // Both boundaries consume through the ONE incoming-identity classifier, and each
+        // resolves the ASID it is about to enter rather than re-reading the TCB.
         assert_eq!(
-            RV_TRAP_SRC
+            RV_BOOT_SRC
+                .matches("shared.take_async_preempt_for_incoming_split(resume_tid, resume_asid)")
+                .count(),
+            2,
+            "the bridge and the S-mode dispatch must use the same exact incoming-identity \
+             consumer, keyed on the resume TID and the ASID that boundary resolved"
+        );
+        assert_eq!(
+            RV_BOOT_SRC
+                .matches("shared.task_asid_for_tid_split_read(resume_tid)")
+                .count(),
+            2,
+            "each boundary resolves the incoming incarnation for itself"
+        );
+        // Publication happens only on a successful consumption, and only at a write-back.
+        assert_eq!(
+            RV_BOOT_SRC
                 .matches("crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize)")
                 .count(),
             2,
-            "one in-lock resume boundary and one post-lock drain boundary"
+            "the decision is published at the two write-backs and nowhere else"
+        );
+        for (label, src) in [("boot", RV_BOOT_SRC), ("trap", RV_TRAP_SRC)] {
+            let publishes = src
+                .matches("crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize)")
+                .count();
+            assert_eq!(
+                publishes,
+                if label == "boot" { 2 } else { 0 },
+                "{label}: publication belongs to the write-back boundaries only"
+            );
+        }
+        // The two seams that used to consume the OUTGOING task's tag are gone, by name.
+        assert!(
+            !RV_TRAP_SRC.contains("take_async_preempted_resume("),
+            "the in-lock restore must never consume a tag for kernel.current_tid()"
         );
         assert!(
-            RV_TRAP_SRC.contains("kernel.take_async_preempted_resume(current_tid)"),
-            "the in-lock boundary consumes through the identity-checked seam"
+            !RV_TRAP_SRC.contains("direct_dispatch_take_async_preempt_split("),
+            "the post-lock drain must not be a second consumer of one authorization"
         );
         assert!(
-            RV_TRAP_SRC.contains("shared.direct_dispatch_take_async_preempt_split(token)"),
-            "the post-lock boundary consumes through the EXACT-TOKEN seam"
+            !THREAD_STATE_SRC.contains("fn take_async_preempted_resume("),
+            "no KernelState method may consume a tag without being given an identity"
+        );
+        assert!(
+            !RUNTIME_SRC.contains("fn direct_dispatch_take_async_preempt_split("),
+            "the token-keyed consumer is retired in favour of the one boundary consumer"
         );
         // The decision cannot be inherited across traps.
         assert!(
             RV_BOOT_SRC.contains("crate::kernel::boot::riscv_async_resume_clear(cpu.0 as usize)"),
             "every trap starts from a cleared decision"
+        );
+    }
+
+    /// (11c) SOURCE: the S-mode-idle dispatch selects exactly ONE of three write-back
+    /// conventions, and the syscall/D2 continuation arm — the one it was missing — installs the
+    /// canonical RESULT lane rather than the startup argument mirror.
+    #[test]
+    fn the_s_mode_idle_dispatch_has_all_three_write_back_conventions() {
+        let arm = RV_BOOT_SRC
+            .split("let continuation = crate::kernel::boot::riscv_syscall_continuation_take(cpu.0 as usize);")
+            .nth(2)
+            .expect("the S-mode dispatch's decision")
+            .split("\n            let frame_resume: *const RiscvTrapFrame = frame;")
+            .next()
+            .expect("its body");
+        // (1) AsyncPreempted — verbatim register file.
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;"));
+        // (2) syscall/D2 continuation — the result lane, both the error and the success shape.
+        assert!(
+            arm.contains("} else if continuation {"),
+            "the continuation convention must be a distinct arm, chosen from the explicit \
+             decision and not inferred"
+        );
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = err as u64;"));
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;"));
+        // (3) fresh/startup — the argument mirror, unchanged.
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;"));
+        assert!(arm.contains("frame.regs[RiscvTrapFrame::A7] = 0;"));
+        // The continuation decision is published only where a completion was consumed, and it is
+        // cleared at every trap entry so it cannot be inherited.
+        assert_eq!(
+            RV_TRAP_SRC
+                .matches("crate::kernel::boot::riscv_syscall_continuation_publish(cpu.0 as usize)")
+                .count(),
+            3,
+            "the two in-lock completion consumers and the post-lock drain all publish"
+        );
+        assert!(
+            RV_BOOT_SRC
+                .contains("crate::kernel::boot::riscv_syscall_continuation_clear(cpu.0 as usize)")
+        );
+        assert_eq!(
+            RV_BOOT_SRC
+                .matches("crate::kernel::boot::riscv_syscall_continuation_take(cpu.0 as usize)")
+                .count(),
+            2,
+            "both write-backs take the continuation decision, exactly once each"
+        );
+    }
+
+    /// (11d) SOURCE: the S-mode-idle dispatch ACTIVATES the resumed task's address space before
+    /// it `sret`s, because it never reaches the main bridge's tail.
+    ///
+    /// Latent until the admission gate was retired: this dispatch resumed nothing in a default
+    /// build. Once it did, a caller woken from terminal idle read its own stack through the
+    /// previous task's page table.
+    #[test]
+    fn the_s_mode_idle_dispatch_activates_the_resumed_address_space() {
+        let body = RV_BOOT_SRC
+            .split("fn riscv_s_mode_timer_trap(")
+            .nth(1)
+            .expect("the S-mode timer fast path")
+            .split("\nfn riscv_trap_halt(")
+            .next()
+            .expect("its body");
+        let map = body
+            .find("map_kernel_shared_into_asid(asid)")
+            .expect("the kernel-shared mapping");
+        let write = body.find("write_satp(satp)").expect("the SATP write");
+        let sret = body
+            .find("let frame_resume: *const RiscvTrapFrame = frame;")
+            .expect("the resume");
+        assert!(
+            map < write,
+            "the kernel-shared mapping must precede the SATP write, as on the bridge"
+        );
+        assert!(
+            write < sret,
+            "the address space must be live before the sret"
+        );
+        assert!(
+            body.contains("if let Some(asid) = resume_asid {"),
+            "an unresolved ASID must skip activation entirely rather than install address space 0"
+        );
+    }
+
+    /// (11e) SOURCE: `sscratch` stays canonical on every resume this stage touches. Neither new
+    /// arm may hand the return tail anything but the per-hart trap-stack top derived from the
+    /// live frame.
+    #[test]
+    fn sscratch_remains_canonical_on_every_repaired_resume() {
+        for (label, marker) in [
+            (
+                "main bridge",
+                "unsafe { yarm_riscv64_trap_return(frame_resume, canonical_top) }",
+            ),
+            (
+                "s-mode timer dispatch",
+                "riscv_canonical_trap_stack_top_for_frame(frame as *const _ as usize),",
+            ),
+        ] {
+            assert!(
+                RV_BOOT_SRC.contains(marker),
+                "{label}: the return tail must restore the canonical per-hart trap-stack top"
+            );
+        }
+        // No repaired arm computes its own stack top or writes sscratch directly.
+        for probe in ["let continuation =", "async_class"] {
+            let at = RV_BOOT_SRC.find(probe).expect("the repaired region");
+            let region = &RV_BOOT_SRC[at..(at + 4000).min(RV_BOOT_SRC.len())];
+            assert!(
+                !region.contains("csrw sscratch") && !region.contains("set_sscratch"),
+                "the 199E-R2 arms must not touch sscratch themselves"
+            );
+        }
+    }
+
+    /// (11b) SOURCE: a no-switch return CANCELS the staged snapshot, and does so on the branch
+    /// that returns through the original hardware frame.
+    #[test]
+    fn a_no_switch_return_cancels_the_staged_snapshot() {
+        let decision = RV_BOOT_SRC
+            .split("let async_class = if task_switched {")
+            .nth(1)
+            .expect("the write-back decision")
+            .split("\n    if task_switched || scause == EXC_USER_ECALL {")
+            .next()
+            .expect("its body");
+        assert!(
+            decision.contains("shared.cancel_async_preempt_for_split(entering_tid)"),
+            "the not-switched arm must cancel the snapshot staged by this very trap"
+        );
+        assert!(
+            decision
+                .contains("shared.take_async_preempt_for_incoming_split(resume_tid, resume_asid)"),
+            "the switched arm consumes for the INCOMING identity"
+        );
+        // Cancellation names the ENTERING task — the one this trap interrupted — never the
+        // resume identity, which on this branch is the same task but resolved from a seam that
+        // could disagree.
+        assert!(
+            !decision.contains("cancel_async_preempt_for_split(resume_tid)"),
+            "cancellation is keyed on the interrupted identity"
         );
     }
 
@@ -130339,16 +131055,43 @@ mod riscv64_async_preemption {
             include_str!("restart_state.rs").contains("tcb.async_preempted = None;"),
             "exit must make the snapshot unreachable"
         );
-        // The post-lock seam refuses rather than consuming on a mismatch.
-        let split = RUNTIME_SRC
-            .split("pub(crate) fn direct_dispatch_take_async_preempt_split(")
+        // Canonical 199E-R2 — the ONE classifier checks three-way identity agreement and fails
+        // closed on every path that is not a clean match.
+        let classifier = TASK_SRC
+            .split("pub(crate) fn classify_and_take_async_resume(")
             .nth(1)
-            .expect("the split seam")
-            .split("\n    /// U6 §8")
+            .expect("the canonical classifier")
+            .split("\n/// Canonical 199E-R2 — CANCEL")
             .next()
             .expect("its body");
-        assert!(split.contains("t.asid == Some(expected)"));
-        assert!(split.contains("if !tag.matches_tcb(tcb) {"));
+        assert!(
+            classifier.contains("if tcb.asid != Some(expected) || tag.asid != expected {"),
+            "the boundary's OWN resolved incarnation must agree with both the TCB and the tag"
+        );
+        assert!(classifier.contains("if !tag.matches_tcb(tcb) {"));
+        for reason in [
+            "unresolved_incoming_asid",
+            "identity_mismatch",
+            "stale_generation",
+            "no_saved_context",
+            "continuation_coexists",
+        ] {
+            assert!(
+                classifier.contains(&format!("AsyncResumeClass::Refused(\"{reason}\")")),
+                "{reason} must be a named fail-closed refusal, not a silent Ordinary"
+            );
+        }
+        // Every refusal CLEARS the tag, so a state the boundary could not verify can never be
+        // retried into a later resume.
+        assert_eq!(
+            classifier.matches("tcb.async_preempted = None;").count(),
+            6,
+            "five refusals and the one successful consumption all clear the tag"
+        );
+        assert!(
+            classifier.contains("if tcb.pending_syscall_completion.is_some() {"),
+            "async and D2/startup continuation states must not coexist ambiguously"
+        );
     }
 
     /// (14) The Stage 204A census is unchanged: this stage routes its one cross-phase decision
@@ -131093,11 +131836,12 @@ mod riscv64_production_timeout_handshake {
             ),
             "the encoder itself is feature-gated, so a default kernel does not carry it"
         );
-        // The timer remains default-OFF and is a separate opt-in from the workload.
+        // Canonical 199E: the timer admission gate is retired, so the PROOF WORKLOAD is the only
+        // remaining opt-in here. The timer itself is unconditional and needs no feature.
         let features = include_str!("../../../Cargo.toml");
         assert!(
-            features.contains("riscv64-timer-irq = []"),
-            "the timer feature exists as its own empty opt-in"
+            !features.contains("riscv64-timer-irq"),
+            "the timer admission feature must be gone: the timer is default and unconditional"
         );
         let default_line = features
             .split("\ndefault = [")
@@ -131107,12 +131851,8 @@ mod riscv64_production_timeout_handshake {
             .next()
             .expect("its contents");
         assert!(
-            !default_line.contains("riscv64-timer-irq"),
-            "the timer must not be in the default feature set"
-        );
-        assert!(
             !default_line.contains("riscv64-ipc-reply-timeout-oracle"),
-            "nor the proof workload"
+            "the proof workload stays out of the default feature set"
         );
     }
 

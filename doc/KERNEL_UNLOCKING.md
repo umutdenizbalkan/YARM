@@ -84,7 +84,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 |-------|------------------------------|--------|----------------------------|
 | **199C** | **Blocking IpcSend.** Retire sender-waiter publication where endpoint policy blocks a sender: sender → `Blocked(IpcSend)`, waiter enqueued once, receiver later consumes sender, sender wakes once. Full sparse-queue and timeout parity. | **OPEN** | `handle_ipc_send` and its waiter publication run entirely inside the broad `with_cpu`. The only off-lock element is the x86_64 D2-send drain (`src/arch/trap_entry.rs:388`), which relocates the *queue-advancing dispatch* — **not** the waiter publication — and is compile-time absent on AArch64/RISC-V. Sparse-queue and send-timeout parity untouched. The 15 `IpcSend` live cells (plain / ordinary-cap / shared-region) prove **delivery**, not blocking-sender retirement. |
 | **199D** | **IpcCall and reply-object lifecycle** as one transaction: delivery → caller reply-blocked → reply object created → reply cap transferred → server replies → caller wakes → reply object destroyed. Required: no orphan reply object, no duplicate reply, no lost caller, no reply-cap rematerialization, timeout/cancellation cleanup, **server crash cleanup**. | **OPEN** (hosted foundation + knob-gated live proof) | Transaction exists off-lock: `src/kernel/ipccall_direct_txn.rs`, `syscall_split.rs:295/307`, reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 in both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) — but **default-OFF** (`ipccall_direct_proof_enabled()`, `src/kernel/boot/mod.rs:3095`), so **no production boot takes it**. Server-crash cleanup: the reverse-link accounting is **repaired**, and the **first live cell is EARNED on x86_64** — `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`, tree `e2fd0b5c`: scoped vector `[1;9]`, quiescent system balance `created=54 closed=54 live_links=0`, owner revalidation executed with a correct replacement return, zero `result=fail` in the log (`doc/IPC.md` §8.5). **1 of 3 architectures**; AArch64 and RISC-V cells unearned. Timeout/cancellation cleanup depends on 199E. |
-| **199E** | **IPC timeout and cancellation** off the broad lock: `IpcRecvTimeout`, **IpcSend timeout**, **IpcCall timeout**, reply timeout/cancellation. Bounded timer/deadline structures, subsystem-local cleanup. Known sparse sender-waiter behavior must remain fixed. | **OPEN** (partial) | **U7 promoted the off-lock timeout pipeline to production on all three architectures and retired two classes from the broad-lock scan.** `SharedKernel::run_due_ipc_timeout_work` is driven unconditionally from every port's post-lock area — no oracle feature, no runtime selector — and `IPC_REPLY_TIMEOUT_LOCK_STATUS arch=… scan_broad_lock=0 … production=1` is now emitted on an ORDINARY boot of x86_64, AArch64 and RISC-V. `process_ipc_timeout_deadlines` unconditionally SKIPS both retired classes, so the only class it still owns is the ordinary receive timeout. **Blocking-send timeout is fully retired**: production arms it, the arch-neutral cursor-bounded scanner collects it, and `drain_send_timeout_post_work` settles it through the U6 lifecycle (exact `{tid, asid, send_generation}` claim → waiter removal → envelope+pin settle → rank-1 enqueue), with the class seal `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendTimeout` emitted only from the U6 delivery point. **Reply/call timeout is retired as a PIPELINE but is not yet reachable in production**: the only site that registers a token-bearing reply deadline is `maybe_arm_reply_timeout_oracle`, which stays oracle-gated, so the promoted scanner is production-live and idle for that class until a real deadline queue replaces the 4-slot single-pair store (`MAX_DEADLINE_TOKENS = 4`) and the per-arch deadline timebases are unified. **`IpcRecvTimeout` and `IpcCall` timeout registration remain open.** 6 live cells (timeout-wins + reply-wins × 3 arches, `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`). |
+| **199E** | **IPC timeout and cancellation** off the broad lock: `IpcRecvTimeout`, **IpcSend timeout**, **IpcCall timeout**, reply timeout/cancellation. Bounded timer/deadline structures, subsystem-local cleanup. Known sparse sender-waiter behavior must remain fixed. | **DELIVERED / CLOSED** | **The off-lock timeout pipeline is production-live and DEFAULT-REACHABLE on all three architectures.** `SharedKernel::run_due_ipc_timeout_work` is driven unconditionally from every port's post-lock area — no oracle feature, no runtime selector — and `IPC_REPLY_TIMEOUT_LOCK_STATUS arch=… scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok` is emitted on an ORDINARY boot of x86_64, AArch64 and RISC-V. Blocking-send timeout is retired through the U6 lifecycle (`GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendTimeout`). Ordinary receive timeout is retired off-lock and settles in production (`U8_RECV_TIMEOUT_SETTLED … broad_lock=0 result=ok`, 1288 settlements in one default RISC-V boot). Reply/call timeout registration is now ORDINARY production code (`arm_production_reply_deadline`, ungated), and a default RISC-V boot both arms and settles one without any oracle build. **RISC-V was the last default-reachability blocker and 199E-R2/R3 closed it**: the `riscv64-timer-irq` admission gate is deleted, the periodic supervisor timer is unconditional, pre-idle and boot-hart-owned, and asynchronous resume is keyed to the exact incoming task. Live: default core green including `-smp 2`; selector-off production expiry drives the full chain once to `caller_continuations=1 … result=ok`. Remaining work is scaling, not reachability — the deliberately tiny 4-slot deadline store (`MAX_DEADLINE_TOKENS = 4`) and unifying the per-arch deadline timebases — and neither gates this stage. Deferred with exact-base signatures: the AArch64 reply-timeout retirement profile and the RISC-V selector-ON timeout-wins lane both fail mechanically identically to `932bd6f`. |
 | **199F** | **Notification wait/signal parity**: signal, wait, wait-with-timeout, multi-signal accumulation, wake exactly once. No global lock in IRQ-originated notification delivery. | **OPEN** | Only `notification_waiter_count_split_read` (`src/runtime.rs:4341`) exists, and it is a read helper. `signal_notification` (`src/kernel/boot/ipc_state.rs:5196`) takes `&mut self` under the broad lock. IRQ-originated delivery runs inside `handle_trap_entry_shared`'s `with_cpu`. No seams for wait, wait-with-timeout, or multi-signal accumulation. |
 | **199G** | **Full IPC subsystem seal** — send, recv, call, reply, notifications, timeouts, capability transfer, shared-region transfer all operate with **zero** runtime broad-lock acquisitions. Major exit gate. | **OPEN** | Blocked on 199C–199F. The authoritative trap dispatch (`src/arch/trap_entry.rs:299`, `src/arch/riscv64/trap.rs:563`) still serves every non-split IPC syscall. |
 
@@ -152,7 +152,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 
 | Phase | Complete | Partial foundation | Open |
 |-------|----------|--------------------|------|
-| 2 — IPC | 0 of 5 | 199D, 199E | 199C, 199F, 199G |
+| 2 — IPC | **1 of 5** (199E) | 199D | 199C, 199F, 199G |
 | 3 — Capability | 0 of 4 | 200A, 200C | 200B, 200D |
 | 4 — VM | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
 | 5 — Lifecycle | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |
@@ -199,7 +199,7 @@ is 0 + 0 + 0 + 13. `tests/broad_lock_census_guard.rs` recomputes all of these fr
    AArch64/RISC-V cannot retire any queue-advancing class.
 4. **All capability seams are `HELPER_ONLY`** — Phase 3 has zero production wiring.
 5. **`FutexWait` off-lock seams landed helper-only** (`syscall_split.rs:786`).
-6. **Reply-timeout scan is off-lock on x86_64 only**; three quarters of 199E untouched.
+6. ~~**Reply-timeout scan is off-lock on x86_64 only**; three quarters of 199E untouched.~~ **RESOLVED.** The scan and both retired classes are off-lock and production-live on all three architectures, and RISC-V — the last default-reachability blocker — is closed by 199E-R2/R3. Canonical **199E is CLOSED**.
 7. **RISC-V `ExitCurrentTask` live cell** is pure execution debt (202D).
 8. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures.** The
    memory corruption is fixed (see `doc/KERNEL_TEST_RULES.md` Rule H1); what remains is
@@ -706,6 +706,105 @@ completing any of them.
 >
 > The feature stays default-OFF. With the FP-state policy decided, **default timer admission is
 > the sole remaining 199E blocker**, pending the final gate-retirement checkpoint.
+>
+> **199E-R2 — the RISC-V timer admission gate is RETIRED, and asynchronous-resume ownership
+> is repaired. CANONICAL 199E — STILL OPEN. CENSUS-DELTA 0. Direct production remains OFF.**
+>
+> The `riscv64-timer-irq` Cargo feature is **deleted, not emptied**, so no manifest, script,
+> doc or test can mistake an empty feature for a behaviour gate. `TIMER_IRQ_FEATURE_ENABLED`,
+> `STIE_AUDIT_COMPLETE`, `init_timer_after_idle_safe_point` and the deferral reasons
+> `timer_irq_feature_disabled`, `audit_pending` and `trap_bridge_reentrancy` are all gone.
+> There is no cfg, no selector, no dormant fallback and no runtime disable knob. The only
+> deferrals left are genuine platform and ownership facts: `sbi_time_ext_unavailable`,
+> `not_boot_hart`, `already_armed`, `unsafe_under_current_satp`. No second timer owner, clock
+> domain or post-lock drain was introduced.
+>
+> The timer is armed at the **boot safe point** — after `RISCV_KERNEL_BOOT_OK`, before
+> `run(kernel)` — so it is live before the first user task can monopolise the CPU and does not
+> require a prior terminal-idle transition. `sstatus.SIE` stays 0 through the arm; U-mode
+> delivery rides on RISC-V privilege rules, so ordinary S-mode kernel code, including every
+> lock-held region, is still non-interruptible, and `SIE` is enabled only in the audited
+> terminal-idle tail. Re-arm always schedules from a fresh `rdtime` sample, so a delayed
+> delivery is one late tick and never a catch-up storm.
+>
+> **What retiring the gate exposed.** Making the timer default-on made a pre-existing,
+> unreachable defect reachable: the asynchronous-preemption tag was consumed at the in-lock
+> restore, keyed on `kernel.current_tid()`, which on the post-lock dispatch route is still the
+> OUTGOING task. Instrumented boot: 407 tags published, 407 consumed there, **0 of 187**
+> switching write-backs authorized, and in 100% of them the consumed tag named the entering
+> task rather than the resumed one. The preempted task's authorization was spent without
+> effect and its next ordinary resume reinstalled the stale syscall-argument mirror over a live
+> computation — `PAGE_FAULT_UNHANDLED addr=0x10003`, an endpoint capability dereferenced as a
+> pointer, in 4 of 5 default boots.
+>
+> There is now **exactly one** consumer, `classify_and_take_async_resume`, keyed on the
+> INCOMING identity each resume boundary has itself resolved, validating `{tid, asid,
+> preempt_generation}` three ways and failing closed with a named reason on every path that is
+> not a clean match. Both RISC-V write-backs reach it through the same accessor and each selects
+> exactly one of three conventions — `AsyncPreempted`, syscall/D2 continuation, fresh/startup —
+> from explicit decisions, never inferred from register contents. A no-switch return CANCELS
+> the staged snapshot, so repeated ticks cannot accumulate stale register files, and no
+> `KernelState` method can consume a tag without being given an identity. Two further defects
+> latent behind the gate are fixed with it: the S-mode-idle dispatch had no continuation arm
+> (it overwrote a delivered `TimedOut` with the startup lane) and never activated the resumed
+> task's address space (it `sret`s to U-mode directly and never reaches the bridge's tail).
+> Full detail: `doc/ARCH_RISCV64.md` §14.
+>
+> **Live evidence.** Default RISC-V core, no timer or proof feature, six consecutive boots
+> (five `-smp 1`, one `-smp 2`), all PASS: pre-idle arm before the first terminal idle, both
+> interrupt origins live, IRQ = tick = SBI re-arm exactly, boot-hart-only ownership,
+> `PAGE_FAULT_UNHANDLED` = 0, `RISCV_ASYNC_RESUME_REFUSED` = 0, no storm, drift, provenance
+> failure, startup rewrite on an async resume, fatal or panic. Selector-off production expiry
+> (reply-timeout workload feature only, no timer feature, no runtime selector, no
+> `OracleHardware` registration) drives the complete chain once and ends at
+> `RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1
+> late_reply=rejected result=ok`, with `scan_broad_lock=0 production=1`, canary
+> `mismatches=0x0000`, one late reply rejected, and **eight genuine switch-away/switch-back
+> async resumes** returning the client to an identical `sepc`/`sp` with every pinned register
+> intact.
+>
+> **199E-R3 — the retirement runner's accounting is scoped per oracle identity. CANONICAL 199E —
+> DELIVERED and CLOSED. CENSUS-DELTA 0. Direct production remains OFF; U8 is next.**
+>
+> The last obstacle was not in the kernel. The RISC-V retirement runner asserted `count == 1` over
+> two whole marker FAMILIES — `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` and
+> `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED` — and with ProductionTick default-on a second,
+> entirely legitimate production caller settles its own reply deadline in the same boot. The two
+> events name two DIFFERENT tasks (tid 2 at `blocked_generation=1`, tid 1 at
+> `blocked_generation=18`), each delivered exactly once, so the assertion failed on correct
+> behaviour. This is the same correction the runner's author had already applied to the `ARMED`
+> and `OK` families with the in-file note that counting a family and calling it "the oracle's" is
+> "wrong in the dangerous direction — it fails on correct behaviour".
+>
+> The oracle identity is now DERIVED — caller TID from the provisioning marker, ASID and record
+> coordinates from that caller's own registration — never hardcoded and never taken by family
+> order, and a missing/duplicated/malformed identity fails closed. Each family carries an
+> oracle-identity bound AND a global duplicate bound, so an unrelated caller can never satisfy the
+> oracle's assertion and a duplicate belonging to any caller still fails. Exactly-one was not
+> relaxed to at-least-one, no production line is filtered away, and no timeout or result
+> expectation changed. The commit family carries no identity at all, so it is bound positionally
+> inside the oracle's own identity-scoped window plus a cardinality tie to the distinct settled
+> callers; that limitation is documented rather than hidden. The runner ships seven synthetic
+> fixtures covering both directions (`--self-test`, no build, no QEMU), and the wiring is pinned
+> from Rust by `riscv64_retirement_oracle_scoped_accounting`. Detail: `doc/ARCH_RISCV64.md` §15.
+>
+> Recorded separately, a PRE-EXISTING runner defect repaired in the same pass: two of the six
+> `assert_order` calls passed three arguments to a four-parameter function, aborting the whole
+> runner with `$4: unbound variable` under `set -u` as soon as the reply-wins lane became
+> reachable. The function and both call sites are byte-identical to base `932bd6f` and the failure
+> reproduces from the base file in isolation; the repair supplies the missing/mismatched argument
+> only. With it, reply-wins and reply-wins-repeat both pass end to end.
+>
+> **Deferred, with the established exact-base signature.** The selector-ON timeout-wins lane still
+> fails on ONE absent marker — `RISCV_IPC_REPLY_TIMEOUT_DONE … caller_continuations=1 …
+> result=ok`. The client emits `caller_continuations=2 … result=fail`, **byte-identical to exact
+> base**, from the OracleHardware lane's two recv returns. Three checks report that single
+> absence; a direct count of the marker is 0, which ties all three to one cause. The selector-OFF
+> production lane — the one default ProductionTick actually drives — reports
+> `caller_continuations=1 … result=ok`. The AArch64 reply-timeout retirement profile likewise
+> fails mechanically identically to exact base. Both are deferred as pre-existing; every
+> non-deferrable gate qualifies, so **canonical 199E is DELIVERED and CLOSED** and **U8 is
+> next**.
 
 > **The off-lock IPC-timeout pipeline is production on all three architectures, and two
 > classes are gone from the broad-lock scan.**

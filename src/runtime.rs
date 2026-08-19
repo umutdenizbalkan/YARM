@@ -2423,45 +2423,39 @@ impl SharedKernel {
         })
     }
 
-    /// Canonical 199E-R1D — the split consumer of an ASYNC-PREEMPTION tag, for the post-lock
-    /// resume boundaries.
+    /// Canonical 199E-R2 — THE off-lock consumer of an async-preemption tag, keyed on the
+    /// INCOMING identity a resume boundary has actually resolved.
     ///
-    /// The exact-token sibling of `direct_dispatch_take_completion_split`, and identical in its
-    /// identity discipline: the tag is only consumed for the `{tid, asid}` incarnation this
-    /// dispatch transaction actually marked, and only when the tag's own generation still names
-    /// the live preemption cycle. A replacement task that reused the numeric TID fails the ASID
-    /// match and a superseded snapshot fails the generation match, so neither can authorize a
-    /// verbatim register-file restore into somebody else's frame.
+    /// This replaces the 199E-R1D pair of consumers (one in the in-lock restore keyed on
+    /// `kernel.current_tid()`, one in the post-lock dispatch keyed on a mark token). Both ran
+    /// strictly BEFORE the resume identity was published, so on the post-lock route the in-lock
+    /// one consumed the OUTGOING task's tag and the write-back never saw an authorization —
+    /// measured live as 0 verbatim restores out of 187 switching write-backs while 407 tags were
+    /// published and spent. There is now exactly ONE consumer and it runs AT the write-back.
     ///
-    /// Returns `true` when a tag was consumed, which is the caller's authorization to restore
-    /// `a0..a7` verbatim instead of installing the startup ABI lanes. A refusal leaves the tag in
-    /// place for its rightful owner — unlike a parked completion, a snapshot is not "spent" by
-    /// being looked at from the wrong incarnation.
-    pub(crate) fn direct_dispatch_take_async_preempt_split(
+    /// `incoming_asid` is the ASID the boundary itself resolved for `incoming_tid` (on RISC-V,
+    /// the same `task_asid_for_tid_split_read` value it is about to install into `satp`), not a
+    /// value re-read from the TCB. That is what makes the check a resume-identity check.
+    ///
+    /// Rank 2 only — the task lock. No broad-lock acquisition, so the Stage 204A census is
+    /// unchanged.
+    pub(crate) fn take_async_preempt_for_incoming_split(
         &self,
-        token: DispatchMarkToken,
-    ) -> bool {
-        let incoming = token.tid();
-        let Some(expected) = token.expect_asid() else {
-            return false;
-        };
+        incoming_tid: u64,
+        incoming_asid: Option<crate::kernel::vm::Asid>,
+    ) -> crate::kernel::task::AsyncResumeClass {
         self.with_task_tcbs_split_mut(|tcbs| {
-            let Some(tcb) = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|t| t.tid.0 == incoming && t.asid == Some(expected))
-            else {
-                return false;
-            };
-            let Some(tag) = tcb.async_preempted else {
-                return false;
-            };
-            if !tag.matches_tcb(tcb) {
-                return false;
-            }
-            tcb.async_preempted = None;
-            true
+            crate::kernel::task::classify_and_take_async_resume(tcbs, incoming_tid, incoming_asid)
         })
+    }
+
+    /// Canonical 199E-R2 — CANCEL a staged snapshot off the broad lock.
+    ///
+    /// Called by a resume boundary that is returning to the SAME task through the original
+    /// hardware frame: no write-back happens, so the snapshot staged by this trap describes an
+    /// instant the task runs straight past and must not survive to authorize a later restore.
+    pub(crate) fn cancel_async_preempt_for_split(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| crate::kernel::task::cancel_async_resume(tcbs, tid))
     }
 
     /// U6 §8 — the PRODUCTION-LIVE, class-scoped split consumer of a blocked SENDER's parked

@@ -35,13 +35,11 @@ trace_frame_alloc = []
 legacy-tests = []
 rpi5-stage1 = []
 rpi5-highhalf = ["rpi5-stage1"]
-# Opt-in for the RISC-V S-mode timer-interrupt enable path. Default OFF.
-# When enabled, the kernel-idle terminal point will program a one-shot
-# SBI Timer deadline, set sie.STIE, and set sstatus.SIE — but only after
-# the trap-bridge re-entrancy audit has been completed on a CI runner
-# with live QEMU. The feature gate exists so the scaffold can be merged
-# without flipping live IRQ delivery in default builds.
-riscv64-timer-irq = []
+# Canonical 199E: the RISC-V S-mode timer has NO opt-in feature, and deliberately no entry
+# here. Its former gate was deleted outright rather than emptied, so nothing in this manifest
+# can be mistaken for one. The periodic supervisor timer is unconditional, armed pre-idle at the
+# boot safe point and owned by the boot hart; see `doc/ARCH_RISCV64.md` §14. Do not reintroduce
+# a feature for it — two guards in `src/kernel/boot/tests.rs` fail if the old name reappears.
 # Stage 198E3C1: compile-time gate for the x86_64 DIRECT shared-region live-oracle marker paths
 # (kernel attestations + `IpcSendSharedRegionDirect` retirement literals). OFF by default so a
 # NORMAL artifact is marker-clean (contains none of the shared-region marker literals). Enabling the

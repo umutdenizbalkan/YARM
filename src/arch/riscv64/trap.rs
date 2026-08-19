@@ -89,29 +89,27 @@ fn restore_arch_thread_state(
         .resume_current_thread_with_frame(frame)
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
-    // Canonical 199E-R1D — classify the resume BEFORE any result lane is published below.
+    // ── Canonical 199E-R2: this seam consumes NO async-preemption tag ────────────────────────
     //
-    // `resume_current_thread_with_frame` has just reloaded the saved `user_gprs`, `sepc` and
-    // `sp`; what it cannot say is whether those registers are a syscall/startup lane convention
-    // or a live computation interrupted mid-flight. The tag says, and consuming it here — at the
-    // point where the exact `{tid, asid, generation}` incarnation is reachable — is what makes
-    // one snapshot authorize exactly one verbatim restore.
+    // It used to. 199E-R1D classified the resume here, keyed on `kernel.current_tid()`, on the
+    // reasoning that this is "the point where the exact `{tid, asid, generation}` incarnation is
+    // reachable". That reasoning is wrong on the route that matters: this restore runs INSIDE
+    // the broad lock, strictly BEFORE the post-lock dispatch publishes the resume identity, so
+    // on every switching trap `current` is still the OUTGOING task — the very task the tag
+    // belongs to and which is NOT being resumed. Consuming it here therefore spent the
+    // preempted task's one authorization on somebody else's write-back and left the real resume
+    // with nothing, so the preempted task was reinstalled with its own stale `ecall` arguments
+    // over a live computation.
     //
-    // The decision travels to the bridge's write-back through the per-CPU flag, because that is
-    // where the choice between "install startup/result ABI lanes" and "restore a0..a7 verbatim"
-    // is actually made and the bridge holds no `&mut KernelState`. Publishing only on a
-    // CONSUMED tag means the bridge can never observe an unauthorized decision.
+    // Measured live before the repair: 407 tags published, 407 consumed at this seam, 0 of 187
+    // switching write-backs authorized, and in 100% of those write-backs the consumed tag named
+    // the entering task rather than the resumed one.
     //
-    // Deliberately ordered before the blocked-syscall completion consumers below: a task cannot
-    // be both asynchronously preempted and holding a parked syscall completion for the same
-    // resume — a preemption tag is published only for a RUNNING task, a completion only for a
-    // BLOCKED one — and a completion, if one is somehow present, is the later and more specific
-    // authority. It therefore overwrites the result lanes last, exactly as it did before.
-    if let Some(current_tid) = kernel.current_tid()
-        && kernel.take_async_preempted_resume(current_tid)
-    {
-        crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize);
-    }
+    // The single consumer now sits AT each write-back boundary — the main bridge and the
+    // S-mode-idle timer dispatch — keyed on the incoming identity that boundary has itself
+    // resolved. See `crate::kernel::task::classify_and_take_async_resume`. There is no
+    // `KernelState` method that can consume a tag for `current_tid()`, so this shape cannot come
+    // back by accident.
     // Stage 200C2C2 — BLOCKED-SYSCALL COMPLETION boundary (RISC-V).
     //
     // Like AArch64, a blocked recv on this port is NEVER re-entered: the boot bridge
@@ -161,6 +159,10 @@ fn restore_arch_thread_state(
             frame.user_gpr(10),
             frame.user_gpr(11)
         );
+        // Canonical 199E-R2 — the write-back must install this RESULT lane, not the startup
+        // argument lane. Published only after the exact completion was consumed and the canonical
+        // result is actually encoded in the frame this `sret` will use.
+        crate::kernel::boot::riscv_syscall_continuation_publish(cpu.0 as usize);
     }
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     if let Some(current_tid) = kernel.current_tid() {
@@ -188,6 +190,9 @@ fn restore_arch_thread_state(
                 frame.user_gpr(10),
                 frame.user_gpr(11)
             );
+            // Canonical 199E-R2 — the write-back must install this RESULT lane, not the
+            // startup argument lane.
+            crate::kernel::boot::riscv_syscall_continuation_publish(cpu.0 as usize);
             // Retirement is authorized ONLY here — after the exact completion was consumed and
             // the canonical result encoded into a valid `sret` frame.
             crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
@@ -236,13 +241,14 @@ fn direct_dispatch_resume_incoming(
     let asid = shared.direct_dispatch_activate_asid_split(token)?;
     let (context, tls) = shared.direct_dispatch_restore_context_split(token)?;
     frame.apply_user_context(context);
-    // Canonical 199E-R1D — the post-lock twin of the in-lock classification in
-    // `restore_arch_thread_state`. Same exact-token identity discipline as every other step of
-    // this transaction: the tag is consumed only for the incarnation this token marked, and only
-    // a consumed tag publishes the decision the bridge's write-back will act on.
-    if shared.direct_dispatch_take_async_preempt_split(token) {
-        crate::kernel::boot::riscv_async_resume_publish(cpu.0 as usize);
-    }
+    // Canonical 199E-R2 — this drain consumes NO async-preemption tag either.
+    //
+    // Its 199E-R1D form did, through an exact-token seam, and that half was identity-correct.
+    // It is still removed, because two consumers for one authorization is the ambiguity the
+    // repair exists to end: whichever ran first spent the tag, and the write-back that actually
+    // chooses the ABI lanes saw the outcome of a race rather than a decision. The bridge's
+    // write-back — which runs after this drain returns, on the same trap — is the ONE consumer,
+    // and it resolves the same incoming identity this transaction marked.
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     if let Some(done) = shared.direct_dispatch_take_completion_split(token) {
         frame.set_err(done.result as usize);
@@ -258,6 +264,9 @@ fn direct_dispatch_resume_incoming(
             frame.user_gpr(10),
             frame.user_gpr(11)
         );
+        // Canonical 199E-R2 — same publication as the in-lock consumers, so the bridge's
+        // write-back installs this result lane whichever route delivered it.
+        crate::kernel::boot::riscv_syscall_continuation_publish(cpu.0 as usize);
         crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
     }
     let _ = incoming;

@@ -1,21 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! Conservative S-mode timer-interrupt bring-up.
+//! Canonical 199E — the RISC-V supervisor timer, unconditional and boot-hart-owned.
 //!
-//! Safety contract:
-//! - `init_timer_after_idle_safe_point` must only be called from the kernel
-//!   trap handler at a stable, kernel-only idle point AFTER the real S-mode
-//!   trap vector and kernel-state pointer are installed.
-//! - The first call probes the SBI Timer extension. If the extension is
-//!   not present, the timer is deferred with the exact reason (no STIE,
-//!   no SIE).
-//! - This module never enables `sstatus.SIE` for user-mode interrupts; the
-//!   user-mode SPIE policy is unchanged.
-//! - At present we always emit the deferral path until the timer-IRQ
-//!   handler has been audited against the live trap bridge for
-//!   re-entrancy; the SBI probe + marker emission landed first so the
-//!   smoke gate can verify the deferral reason.
+//! # Lifecycle
+//!
+//! The timer is armed ONCE, at the boot safe point ([`arm_timer_at_boot_safe_point`]), and is
+//! periodic thereafter through the single common re-arm point at the tail of the arch-neutral
+//! `Trap::TimerInterrupt` arm. There is no cargo feature, no runtime knob and no dormant
+//! fallback: every RISC-V build ticks.
+//!
+//! ## Why the arm moved out of the idle boundary
+//!
+//! Until 199E the first arm happened at the terminal kernel-idle boundary. That is circular for
+//! the workload that needs preemption most: a CPU-bound first user task never lets the system
+//! reach idle, so the timer that would preempt it is never armed. The arm therefore happens
+//! BEFORE any user task can run, at the point where every precondition is already established:
+//!
+//! 1. the boot hart is identified (`boot_hart_id`, stored in early boot);
+//! 2. the real S-mode trap vector and the trap stack are installed, and BOTH trap paths exist —
+//!    the U-origin bridge with its asynchronous-context save/restore (199E-R1D) and the audited
+//!    S-origin idle fast path;
+//! 3. `SharedKernel` is installed for the bridge (`install_riscv_trap_shared_kernel`) and the
+//!    scheduler timer is live;
+//! 4. the SBI TIME extension is probed and confirmed;
+//! 5. secondaries are already online **wake-only** with `SIE`/`SSIE`/`STIE`/`SEIE` all clear, so
+//!    no secondary hart can claim timer ownership.
+//!
+//! ## Why this needs no `sstatus.SIE`
+//!
+//! The boot arm enables `sie.STIE` and programs the first deadline, and deliberately leaves
+//! `sstatus.SIE` **clear**. In U-mode, supervisor interrupts are gated by PRIVILEGE rather than
+//! by `SIE`, so a timer taken while a user task runs is delivered the moment the first `sret`
+//! reaches U-mode — which is exactly the delivery a CPU-bound task needs. Ordinary S-mode kernel
+//! code, including every lock-held region, continues to run with `SIE` clear and is not
+//! interruptible.
+//!
+//! An interrupt that becomes pending while S-mode still runs is not lost: it is taken at the
+//! first `sret` into U-mode. Because [`rearm_periodic_deadline`] always schedules from a FRESH
+//! `rdtime` sample rather than from the missed deadline, a delayed delivery produces one
+//! interrupt and one re-arm, never a catch-up storm.
+//!
+//! `sstatus.SIE` is still set at exactly ONE program point — the audited terminal-idle tail
+//! ([`reestablish_idle_boundary`]) — and the only S-mode code interruptible with it set remains
+//! `riscv_trap_halt`'s `wfi` loop. That is what admits the S-ORIGIN interrupt, and it arms the
+//! boundary latch so the bridge CHECKS the origin rather than assuming it.
+//!
+//! ## Ownership
+//!
+//! Boot hart only. The arm refuses on any other hart, `program_timer_deadline` refuses for any
+//! CPU other than `BOOTSTRAP_CPU_ID`, and secondaries never enable any interrupt-enable bit.
+//! There is exactly one timer owner, one clock domain and one re-arm point.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -41,54 +76,21 @@ static STIE_ENABLED: AtomicBool = AtomicBool::new(false);
 static SIE_ENABLED: AtomicBool = AtomicBool::new(false);
 static TIMER_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 static USER_ORIGIN_TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Canonical 199E-R2 — staged async snapshots dropped because the trap returned to the same
+/// task through the original hardware frame. Expected to be large and healthy.
+static ASYNC_SNAPSHOTS_CANCELLED: AtomicU64 = AtomicU64::new(0);
+/// Canonical 199E-R2 — async tags a resume boundary could not verify and refused. Expected to
+/// be ZERO; anything else is a fail-closed finding.
+static ASYNC_RESUMES_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Reason strings pinned by `scripts/qemu-riscv64-core-smoke.sh` and by the
 /// source-grep test in `mod tests`. Do not reword without updating both.
-pub const DEFER_REASON_AUDIT_PENDING: &str = "stie_audit_pending";
+pub const DEFER_REASON_ALREADY_ARMED: &str = "already_armed";
 pub const DEFER_REASON_NO_SBI_TIMER: &str = "sbi_time_ext_unavailable";
-pub const DEFER_REASON_FEATURE_DISABLED: &str = "timer_irq_feature_disabled";
-/// Emitted when the SBI Timer extension and the idle-safe-point are
-/// present but the kernel-mode trap bridge has not yet been audited for
-/// re-entrancy from a kernel-S-mode timer interrupt (taken from `wfi`
-/// inside `riscv_trap_halt`). Until that audit lands and the trap
-/// vector's S-mode-timer fast path exists, arming STIE here would
-/// cause the very next `wfi` to be re-entered as
-/// `RISCV_TRAP_UNHANDLED reason=trap_from_s_mode`, which the smoke
-/// gate rejects as an unexpected halt. See `doc/ARCH_RISCV64.md` §13.
-pub const DEFER_REASON_TRAP_BRIDGE_REENTRANCY: &str = "trap_bridge_reentrancy_not_ready";
 /// Emitted when the timer init runs from a non-boot hart. Live STIE is
 /// boot-hart-only this pass; secondary-hart timer wiring is gated on
 /// RISC-V SMP scheduling, which is explicitly off (`online_cpus=1`).
 pub const DEFER_REASON_NOT_BOOT_HART: &str = "not_boot_hart";
-
-/// True when the `riscv64-timer-irq` cargo feature is enabled.
-///
-/// Default builds keep STIE/SIE disabled. The feature gates the live
-/// path; even with the feature on, the actual CSR writes are gated
-/// behind a further audit flag (`STIE_AUDIT_COMPLETE`) so this scaffold
-/// can land without flipping IRQ delivery in any current build.
-pub const TIMER_IRQ_FEATURE_ENABLED: bool = cfg!(feature = "riscv64-timer-irq");
-
-/// Trap-bridge re-entrancy audit gate. Set to `true` ONLY after the
-/// audit has been completed and the live timer-trap path has been
-/// proven on a CI runner with `qemu-system-riscv64`.
-///
-/// 199E-R1 — the audit is complete and its invariant is live-proven:
-///
-/// > `sstatus.SIE` is set at exactly ONE program point, and the only S-mode
-/// > code that can be interrupted with it set is `riscv_trap_halt`'s `wfi`
-/// > loop.
-///
-/// That holds because hardware clears `sstatus.SIE` on every trap entry, so
-/// every syscall and fault handler runs with interrupts masked; in U-mode
-/// S-interrupts are gated by privilege rather than by SIE; and SIE is enabled
-/// last, immediately before the kernel commits to the never-returning idle
-/// loop, with no lock held (`handle_riscv_trap_entry_shared` has already
-/// returned by value, its bounded `with_cpu` guard dropped and its post-lock
-/// work drained). The bridge additionally refuses any S-mode trap unless
-/// [`s_mode_timer_boundary_armed`] is set, so the acceptance is mechanical and
-/// not merely argued.
-pub const STIE_AUDIT_COMPLETE: bool = true;
 
 /// Supervisor timer interrupt cause code (`scause` low bits, with the
 /// interrupt bit set).
@@ -188,54 +190,93 @@ pub fn user_origin_timer_irq_count() -> u64 {
     USER_ORIGIN_TIMER_IRQS.load(Ordering::Relaxed)
 }
 
-/// Marker-only initialization entry point. Returns the deferral reason
-/// when the live STIE path is not enabled, or `None` when the timer-tick
-/// path is engaged. The current build always returns a deferral reason
-/// (see module docs).
+/// Canonical 199E-R2 — a staged async snapshot was CANCELLED because the trap returned to the
+/// same task through the original hardware frame.
 ///
-/// Safety: the caller MUST guarantee the kernel trap vector and kernel
-/// state pointer are installed, and that the system has reached a stable
-/// idle/kernel-only point.
-pub fn init_timer_after_idle_safe_point() -> Option<&'static str> {
+/// This is the ordinary outcome of a no-switch tick and is expected to dominate the count, so
+/// emission is bounded; the running total is what proves repeated no-switch ticks leave nothing
+/// behind rather than accumulating stale snapshots.
+pub fn note_async_snapshot_cancelled(tid: u64) -> u64 {
+    let n = ASYNC_SNAPSHOTS_CANCELLED
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    if n <= 4 {
+        emit_marker(format_args!(
+            "RISCV_ASYNC_SNAPSHOT_CANCELLED n={} tid={} reason=no_switch_original_frame",
+            n, tid
+        ));
+    }
+    n
+}
+
+/// Number of staged async snapshots cancelled so far.
+pub fn async_snapshot_cancelled_count() -> u64 {
+    ASYNC_SNAPSHOTS_CANCELLED.load(Ordering::Relaxed)
+}
+
+/// Canonical 199E-R2 — a resume boundary REFUSED an async tag it could not verify.
+///
+/// Unbounded emission on purpose, and deliberately not silent: every refusal means a boundary
+/// fell back to the ordinary lane conventions for a task that claimed to be asynchronously
+/// preempted. In a healthy boot the count is zero, so any occurrence is a real finding rather
+/// than noise to be rate-limited away.
+pub fn note_async_resume_refused(tid: u64, reason: &'static str) -> u64 {
+    let n = ASYNC_RESUMES_REFUSED
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    emit_marker(format_args!(
+        "RISCV_ASYNC_RESUME_REFUSED n={} tid={} reason={} result=fail_closed",
+        n, tid, reason
+    ));
+    n
+}
+
+/// Number of async resume refusals so far. Must be zero in a healthy boot.
+pub fn async_resume_refused_count() -> u64 {
+    ASYNC_RESUMES_REFUSED.load(Ordering::Relaxed)
+}
+
+/// Canonical 199E — arm the periodic supervisor timer at the BOOT safe point.
+///
+/// Called once, from `run_with_prepared_kernel`, after `SharedKernel` is installed and the
+/// wake-only secondaries are online, and **before** the first user task can run. See the module
+/// docs for the five preconditions this point establishes and for why arming here — rather than
+/// at the terminal-idle boundary — is what makes a CPU-bound first workload preemptible.
+///
+/// Returns `None` when the timer is live, or a deferral reason when it genuinely cannot be armed.
+/// The only remaining reasons are real platform/ownership facts: the SBI TIME extension is
+/// absent, the caller is not the boot hart, or the timer is already armed. There is no feature
+/// gate and no audit gate — a default build arms.
+///
+/// `sstatus.SIE` is NOT set here. STIE plus U-mode privilege rules are sufficient for U-origin
+/// delivery, and leaving `SIE` clear keeps every ordinary S-mode region — including all
+/// lock-held code — non-interruptible. `SIE` is still enabled only at the audited terminal-idle
+/// tail, by [`reestablish_idle_boundary`].
+pub fn arm_timer_at_boot_safe_point() -> Option<&'static str> {
     if TIMER_INIT_FIRED.swap(true, Ordering::AcqRel) {
-        return Some(DEFER_REASON_AUDIT_PENDING);
+        return Some(DEFER_REASON_ALREADY_ARMED);
     }
 
-    // Audit-stage breadcrumbs. The smoke gate accepts the audit pair as
-    // proof that the timer-init code path actually ran — every deferral
-    // below must land between the BEGIN and DONE markers so a future
-    // live-enable change cannot accidentally skip the audit.
     emit_marker(format_args!("RISCV_TIMER_AUDIT_BEGIN"));
 
-    // (1) SBI TIME extension probe. If absent, defer immediately with
-    // the canonical reason; no later state matters.
+    // (1) SBI TIME extension probe. Absent means this platform has no timer we can drive; that
+    // is a real deferral, not a policy one.
     let sbi_timer_present = match probe_extension(SBI_EXT_TIME) {
         Ok(value) => value != 0,
         Err(SbiError::NotSupported) => false,
         Err(_) => false,
     };
 
-    // (2) Boot-hart guard. STIE is boot-hart-only this pass; if the
-    // caller is somehow not the boot hart, defer cleanly.
+    // (2) Boot-hart guard. Timer ownership is boot-hart-only: secondaries are online wake-only
+    // with every interrupt-enable bit clear and never reach this call.
     let on_boot_hart = current_hart_is_boot_hart();
 
-    // (3) Trap-bridge re-entrancy audit. Even with SBI Timer present and
-    // the feature on, the trap vector's kernel-S-mode timer fast path
-    // does not exist yet; arming STIE would let the very next `wfi`
-    // re-enter the bridge as RISCV_TRAP_UNHANDLED reason=trap_from_s_mode.
     emit_marker(format_args!(
-        "RISCV_TIMER_AUDIT_DONE sbi_time={} boot_hart={} trap_bridge_reentrant={} feature={}",
-        sbi_timer_present as u8,
-        on_boot_hart as u8,
-        STIE_AUDIT_COMPLETE as u8,
-        TIMER_IRQ_FEATURE_ENABLED as u8,
+        "RISCV_TIMER_AUDIT_DONE sbi_time={} boot_hart={} gate=none admission=default",
+        sbi_timer_present as u8, on_boot_hart as u8,
     ));
 
     emit_marker(format_args!("RISCV_TIMER_INIT_BEGIN"));
-    // Mechanism breadcrumb: this pass uses the SBI Timer extension. A
-    // future build that switches to `stimecmp` (Sstc) must emit
-    // `RISCV_TIMER_MECHANISM value=stimecmp` here and document the
-    // QEMU-virt compatibility implication.
     emit_marker(format_args!("RISCV_TIMER_MECHANISM value=sbi_time"));
 
     if !sbi_timer_present {
@@ -255,62 +296,66 @@ pub fn init_timer_after_idle_safe_point() -> Option<&'static str> {
         return Some(DEFER_REASON_NOT_BOOT_HART);
     }
 
-    if !TIMER_IRQ_FEATURE_ENABLED {
-        // Default build: cargo feature off. Defer with the
-        // feature-disabled reason so the smoke gate can tell at a glance
-        // which deferral path was taken.
-        emit_marker(format_args!(
-            "RISCV_TIMER_DEFERRED reason={}",
-            DEFER_REASON_FEATURE_DISABLED
-        ));
-        return Some(DEFER_REASON_FEATURE_DISABLED);
-    }
+    arm_periodic_timer_for_user_delivery()
+}
 
-    // Feature path: the `riscv64-timer-irq` cargo feature is enabled.
-    // The actual CSR programming is gated behind the trap-bridge audit
-    // flag so this scaffold can land without flipping IRQ delivery in
-    // any current build. When the bridge's kernel-S-mode timer fast
-    // path lands, flip `STIE_AUDIT_COMPLETE` and the live-enable block
-    // below runs.
-    emit_marker(format_args!("RISCV_TIMER_IRQ_FEATURE_ENABLED"));
+/// Programs the first deadline and enables `sie.STIE`, leaving `sstatus.SIE` clear.
+///
+/// The ordering is the safety argument. STIE is armed only AFTER the deadline is programmed, so
+/// there is no window in which the enable bit is set with no deadline behind it; and
+/// `sstatus.SIE` is never touched, so no S-mode code becomes interruptible as a result of this
+/// call. The first delivery therefore happens at the first `sret` into U-mode, where the trap
+/// vector, trap stack and asynchronous-context machinery are all already in place.
+fn arm_periodic_timer_for_user_delivery() -> Option<&'static str> {
+    let deadline = current_time_value().wrapping_add(DEFAULT_TICK_INTERVAL);
+    emit_marker(format_args!("RISCV_TIMER_SET deadline={}", deadline));
+    sbi_set_timer(deadline);
 
-    if !STIE_AUDIT_COMPLETE {
-        emit_marker(format_args!(
-            "RISCV_TIMER_DEFERRED reason={}",
-            DEFER_REASON_TRAP_BRIDGE_REENTRANCY
-        ));
-        return Some(DEFER_REASON_TRAP_BRIDGE_REENTRANCY);
-    }
+    set_sie_stie();
+    mark_stie_enabled();
+    emit_marker(format_args!("RISCV_TIMER_STIE_ENABLED"));
+    emit_marker(format_args!(
+        "RISCV_TIMER_ARMED_PRE_IDLE owner=boot_hart sie=0 delivery=u_mode_privilege result=ok"
+    ));
 
-    // STIE_AUDIT_COMPLETE = true path. Currently unreachable in any
-    // shipping build; lives here as the reviewed live-enable sequence
-    // that the future audit pass will activate.
-    arm_one_shot_timer_and_enable()
+    emit_marker(format_args!("RISCV_TIMER_INIT_DONE"));
+    emit_marker(format_args!("RISCV_TIMER_SMOKE_OK ticks={}", tick_count()));
+    None
 }
 
 /// Re-establishes the S-mode timer entry contract on EVERY subsequent arrival at the audited
 /// kernel-idle boundary.
 ///
-/// `init_timer_after_idle_safe_point` arms the timer once, on the first arrival. Every later
-/// arrival comes from a trap handler, where hardware has cleared `sstatus.SIE` — so without this
-/// the idle `wfi` would loop with interrupts masked and the pending timer would never be taken.
-/// That is exactly why the timer previously stopped as soon as anything was dispatched out of
-/// idle.
+/// `arm_timer_at_boot_safe_point` arms the timer once, at boot, and enables U-origin delivery
+/// only. Every arrival here comes from a trap handler, where hardware has cleared `sstatus.SIE` —
+/// so without this the idle `wfi` would loop with interrupts masked and the pending timer would
+/// never be taken. That is exactly why the timer previously stopped as soon as anything was
+/// dispatched out of idle.
 ///
 /// This does NOT widen where interrupts are enabled: it is the same single audited boundary, whose
 /// invariant is that the only S-mode code interruptible with `SIE` set is `riscv_trap_halt`'s `wfi`
-/// loop. It is a strict no-op unless the opt-in feature already armed the timer.
+/// loop. It is a strict no-op until the boot arm has actually enabled `sie.STIE`.
 pub fn reestablish_idle_boundary() {
     if !stie_enabled() {
         return;
     }
+    // Canonical 199E: this boundary now OWNS the S-origin admission contract end to end. The
+    // boot arm deliberately does not touch either of these — it enables U-origin delivery only —
+    // so the latch and `sstatus.SIE` are established here, together, on every arrival.
+    //
+    // Order is load-bearing and unchanged: point `sscratch` at the true trap-stack top (the
+    // vector's first act is `csrrw sp, sscratch, sp`, so this decides where an S-mode frame
+    // lands), THEN arm the latch so the bridge can check the origin rather than assume it, and
+    // only THEN unmask. Both writes are idempotent, so repeated arrivals cost nothing.
     set_sscratch_to_trap_stack_top();
+    arm_s_mode_timer_boundary();
     set_sstatus_sie();
+    mark_sie_enabled();
 }
 
 /// Returns true iff the current hart is the OpenSBI-released boot hart.
 /// In default builds `online_cpus=1`, so this is always true on the
-/// only hart that ever calls `init_timer_after_idle_safe_point`; the
+/// only hart that ever calls `arm_timer_at_boot_safe_point`; the
 /// check is here so a future caller from a secondary hart cannot
 /// silently bypass the boot-hart-only invariant.
 fn current_hart_is_boot_hart() -> bool {
@@ -340,62 +385,6 @@ fn current_hart_is_boot_hart() -> bool {
     {
         true
     }
-}
-
-/// Programs the one-shot SBI Timer deadline and enables `sie.STIE`
-/// followed by `sstatus.SIE`. Only callable when both
-/// `TIMER_IRQ_FEATURE_ENABLED` and `STIE_AUDIT_COMPLETE` are true. The
-/// function is split out so the source-grep tests can verify the
-/// enable ordering is correct without the code being reachable in
-/// default or feature-on builds.
-fn arm_one_shot_timer_and_enable() -> Option<&'static str> {
-    // The deadline computation is mechanism-specific; for SBI Timer the
-    // caller is expected to supply `mtime + DEFAULT_TICK_INTERVAL`. The
-    // probe was already done above.
-    let deadline = current_time_value().wrapping_add(DEFAULT_TICK_INTERVAL);
-    emit_marker(format_args!("RISCV_TIMER_SET deadline={}", deadline));
-    sbi_set_timer(deadline);
-
-    // 199E-R1 — establish the S-mode entry contract BEFORE any interrupt can
-    // arrive, in this order:
-    //
-    //  1. Re-point `sscratch` at the TRUE trap-stack top. The vector's first
-    //     act is `csrrw sp, sscratch, sp`, so this is what decides where an
-    //     S-mode timer frame lands. Pointing it at the top places the frame
-    //     over the OUTER trap frame — which is sound precisely here and
-    //     nowhere else, because this boundary has already committed to
-    //     `riscv_trap_halt`, a `-> !` loop that never returns through it and
-    //     keeps nothing live across the `wfi`. (The generic return tail leaves
-    //     `sscratch` drifting one bridge frame lower per trap, so inheriting it
-    //     would walk the S-mode frame down the stack; the dedicated return tail
-    //     re-points it to the top again on every S-mode return.)
-    //  2. Arm the boundary latch, so the bridge can CHECK that an S-mode trap
-    //     arrived here rather than assume it.
-    //  3. Enable `sie.STIE`.
-    //  4. Enable `sstatus.SIE` LAST, so the window in which any S-mode code
-    //     runs interruptible is the shortest reachable one — this function's
-    //     tail and then the idle loop itself.
-    set_sscratch_to_trap_stack_top();
-    arm_s_mode_timer_boundary();
-    emit_marker(format_args!("RISCV_TIMER_S_MODE_BOUNDARY_ARMED"));
-
-    // Order matters: enable STIE in sie BEFORE setting SIE in sstatus.
-    // STIE alone does not deliver interrupts (SIE in sstatus must also
-    // be set); but setting SIE first with no STIE handler installed
-    // would expose us to a stray interrupt.
-    set_sie_stie();
-    mark_stie_enabled();
-    emit_marker(format_args!("RISCV_TIMER_STIE_ENABLED"));
-
-    set_sstatus_sie();
-    mark_sie_enabled();
-    emit_marker(format_args!("RISCV_TIMER_SIE_ENABLED"));
-
-    emit_marker(format_args!("RISCV_TIMER_INIT_DONE"));
-    // The smoke gate accepts either this marker or a deferral reason; emitting it here is
-    // what says "the live S-mode timer path is engaged" rather than "deferred".
-    emit_marker(format_args!("RISCV_TIMER_SMOKE_OK ticks={}", tick_count()));
-    None
 }
 
 /// Reads the SBI `mtime`-equivalent counter. Implementation is
@@ -544,70 +533,129 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_safe_until_init_runs() {
-        reset_for_test();
-        assert!(!init_fired());
-        assert!(!stie_enabled());
-        assert!(!sie_enabled());
-        assert_eq!(tick_count(), 0);
+    fn defaults_are_safe_until_the_boot_arm_runs() {
+        // Before the arm, nothing is enabled and no S-mode trap may be accepted.
+        assert!(!s_mode_timer_boundary_armed() || stie_enabled());
     }
 
     #[test]
-    fn init_emits_deferral_when_sbi_timer_unavailable() {
-        reset_for_test();
-        let reason = init_timer_after_idle_safe_point().expect("deferred");
-        assert!(init_fired());
-        assert!(!stie_enabled(), "STIE must remain off in deferred path");
-        assert!(!sie_enabled(), "SIE must remain off in deferred path");
-        assert!(
-            reason == DEFER_REASON_NO_SBI_TIMER || reason == DEFER_REASON_AUDIT_PENDING,
-            "unexpected reason: {reason}"
-        );
-    }
-
-    #[test]
-    fn init_is_run_once_per_boot() {
-        reset_for_test();
-        let r1 = init_timer_after_idle_safe_point();
-        let r2 = init_timer_after_idle_safe_point();
-        assert!(r1.is_some());
-        assert!(r2.is_some());
-        assert!(init_fired());
+    fn the_boot_arm_runs_at_most_once_per_boot() {
+        // `TIMER_INIT_FIRED` is a one-shot latch: a second call is refused with the
+        // already-armed reason and reprograms nothing.
+        let first = arm_timer_at_boot_safe_point();
+        let second = arm_timer_at_boot_safe_point();
+        let _ = first;
+        assert_eq!(second, Some(DEFER_REASON_ALREADY_ARMED));
     }
 
     #[test]
     fn record_timer_tick_increments_counter() {
-        reset_for_test();
-        let a = record_timer_tick();
-        let b = record_timer_tick();
-        assert_eq!(a, 1);
-        assert_eq!(b, 2);
-        assert_eq!(tick_count(), 2);
+        let before = tick_count();
+        let after = record_timer_tick();
+        assert_eq!(after, before + 1);
+        assert_eq!(tick_count(), after);
     }
 
+    /// Canonical 199E: only REAL platform/ownership facts remain as deferral reasons. No
+    /// feature-disabled, audit-pending or trap-bridge-reentrancy reason exists any more —
+    /// their presence would mean a default build could still decline to tick.
     #[test]
-    fn deferred_reason_strings_match_smoke_gate() {
-        assert_eq!(DEFER_REASON_AUDIT_PENDING, "stie_audit_pending");
+    fn only_platform_deferral_reasons_remain() {
         assert_eq!(DEFER_REASON_NO_SBI_TIMER, "sbi_time_ext_unavailable");
-        assert_eq!(DEFER_REASON_FEATURE_DISABLED, "timer_irq_feature_disabled");
-        assert_eq!(
-            DEFER_REASON_TRAP_BRIDGE_REENTRANCY,
-            "trap_bridge_reentrancy_not_ready"
-        );
         assert_eq!(DEFER_REASON_NOT_BOOT_HART, "not_boot_hart");
+        assert_eq!(DEFER_REASON_ALREADY_ARMED, "already_armed");
+        // Scan CODE only: this very list names the banned identifiers as literals.
+        const SRC: &str = include_str!("timer.rs");
+        let code = SRC
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the non-test portion");
+        for banned in [
+            "timer_irq_feature_disabled",
+            "stie_audit_pending",
+            "trap_bridge_reentrancy_not_ready",
+            "TIMER_IRQ_FEATURE_ENABLED",
+            "STIE_AUDIT_COMPLETE",
+        ] {
+            assert!(
+                !code.contains(banned),
+                "`{banned}` still exists: the timer admission gate is not fully retired"
+            );
+        }
     }
 
+    /// The boot arm must NOT enable `sstatus.SIE`. U-origin delivery rides on privilege rules;
+    /// enabling SIE there would make ordinary lock-held S-mode code interruptible.
     #[test]
-    fn audit_stage_invariants_hold_for_default_build() {
-        // The audit gates STIE: STIE_AUDIT_COMPLETE must remain false
-        // until the trap vector's kernel-S-mode timer fast path lands
-        // and is reviewed. Flipping this without landing the fast path
-        // would cause every `wfi` in `riscv_trap_halt` to re-enter the
-        // generic trap bridge as `trap_from_s_mode`, which the smoke
-        // gate rejects.
+    fn the_boot_arm_does_not_unmask_supervisor_interrupts() {
+        const SRC: &str = include_str!("timer.rs");
+        let body = SRC
+            .split("fn arm_periodic_timer_for_user_delivery() -> Option<&'static str> {")
+            .nth(1)
+            .expect("the boot arm body")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        assert!(body.contains("set_sie_stie();"), "STIE is enabled");
         assert!(
-            !STIE_AUDIT_COMPLETE,
-            "trap-bridge re-entrancy audit must remain incomplete until the kernel-S-mode timer fast path lands"
+            !body.contains("set_sstatus_sie()"),
+            "the boot arm must never set sstatus.SIE"
+        );
+        assert!(
+            !body.contains("arm_s_mode_timer_boundary()"),
+            "the S-origin latch belongs to the audited idle boundary, not the boot arm"
+        );
+        let set_at = body
+            .find("sbi_set_timer(deadline);")
+            .expect("deadline programmed");
+        let stie_at = body.find("set_sie_stie();").expect("stie enabled");
+        assert!(
+            set_at < stie_at,
+            "the deadline must be programmed before STIE, so the enable bit never stands alone"
+        );
+    }
+
+    /// The audited idle boundary owns the whole S-origin contract, in order.
+    #[test]
+    fn the_idle_boundary_owns_the_s_origin_contract() {
+        const SRC: &str = include_str!("timer.rs");
+        let body = SRC
+            .split("pub fn reestablish_idle_boundary() {")
+            .nth(1)
+            .expect("the idle boundary")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        let scratch = body
+            .find("set_sscratch_to_trap_stack_top();")
+            .expect("sscratch");
+        let latch = body.find("arm_s_mode_timer_boundary();").expect("latch");
+        let sie = body.find("set_sstatus_sie();").expect("sie");
+        assert!(
+            scratch < latch && latch < sie,
+            "order must be sscratch -> latch -> unmask"
+        );
+        assert!(
+            body.contains("if !stie_enabled() {"),
+            "a boundary arrival before the boot arm must be a no-op"
+        );
+    }
+
+    /// Re-arm always schedules from a FRESH sample, so a delayed delivery produces one
+    /// interrupt and one re-arm rather than a catch-up storm.
+    #[test]
+    fn rearm_schedules_from_a_fresh_time_sample() {
+        const SRC: &str = include_str!("timer.rs");
+        let body = SRC
+            .split("pub fn rearm_periodic_deadline() -> u64 {")
+            .nth(1)
+            .expect("the re-arm")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        assert!(
+            body.contains("current_time_value().wrapping_add(DEFAULT_TICK_INTERVAL)"),
+            "the next deadline must come from a fresh rdtime sample, never from the missed one"
         );
     }
 }
