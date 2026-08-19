@@ -78889,7 +78889,7 @@ mod stage199a2b2f_wiring {
             ack_seq: seq,
         };
         let out =
-            fx.k.drain_direct_request_post_work(&work)
+            fx.k.drain_direct_request_post_work(CpuId(0), &work)
                 .expect("drain delivers");
         // The wired drain delivers the canonical receiver-visible projection.
         let delivered =
@@ -78941,7 +78941,7 @@ mod stage199a2b2f_wiring {
             ack,
             ack_seq: seq,
         };
-        let r = fx.k.drain_direct_request_post_work(&work);
+        let r = fx.k.drain_direct_request_post_work(CpuId(0), &work);
         assert!(r.is_err(), "delivery rejected for an exited server");
         assert_eq!(
             fx.k.with(|s| (0..crate::kernel::boot::MAX_REPLY_CAPS)
@@ -78983,7 +78983,7 @@ mod stage199a2b2f_wiring {
             ack,
             ack_seq: seq,
         };
-        let r = fx.k.drain_direct_request_post_work(&work);
+        let r = fx.k.drain_direct_request_post_work(CpuId(0), &work);
         assert_eq!(r, Err(IpcCallDirectError::MintFailed));
         assert_eq!(
             fx.k.with(|s| (0..crate::kernel::boot::MAX_REPLY_CAPS)
@@ -80423,7 +80423,7 @@ mod stage199a2b3_wiring {
             ack_seq: seq,
         };
         let out =
-            fx.k.drain_direct_reply_post_work(&work)
+            fx.k.drain_direct_reply_post_work(CpuId(0), &work)
                 .expect("drain delivers");
         assert_eq!(out.record_index, fx.record_index);
         let delivered =
@@ -80474,7 +80474,7 @@ mod stage199a2b3_wiring {
             ack,
             ack_seq: seq,
         };
-        let r = fx.k.drain_direct_reply_post_work(&work);
+        let r = fx.k.drain_direct_reply_post_work(CpuId(0), &work);
         assert!(r.is_err(), "delivery rejected for an exited caller");
         assert_eq!(
             fx.k.with(|s| (0..crate::kernel::boot::MAX_REPLY_CAPS)
@@ -83051,7 +83051,7 @@ mod stage199d_delivery_projection_differential {
             ack,
             ack_seq,
         };
-        fx.k.drain_direct_request_post_work(&work)
+        fx.k.drain_direct_request_post_work(CpuId(0), &work)
             .expect("direct request transaction delivers");
         assert_eq!(
             fx.k.with(|s| s.task_status(2)),
@@ -83220,7 +83220,7 @@ mod stage199d_delivery_projection_differential {
                 ack,
                 ack_seq,
             };
-            fx.k.drain_direct_request_post_work(&work)
+            fx.k.drain_direct_request_post_work(CpuId(0), &work)
                 .expect("direct delivers");
             let o = observe(&fx);
             teardown();
@@ -83459,7 +83459,7 @@ mod stage199d_delivery_projection_differential {
                 ack,
                 ack_seq,
             };
-            let outcome = fx.k.drain_direct_request_post_work(&work);
+            let outcome = fx.k.drain_direct_request_post_work(CpuId(0), &work);
             let disposition = classify_direct_request_outcome(&outcome);
             (outcome, disposition)
         }
@@ -83608,7 +83608,7 @@ mod stage199d_delivery_projection_differential {
                 ack,
                 ack_seq,
             };
-            let outcome = fx.k.drain_direct_request_post_work(&work);
+            let outcome = fx.k.drain_direct_request_post_work(CpuId(0), &work);
             let disposition = classify_direct_request_outcome(&outcome);
             assert_eq!(outcome, Err(IpcCallDirectError::WaiterLost));
             assert_eq!(
@@ -83643,7 +83643,7 @@ mod stage199d_delivery_projection_differential {
                 ack: broken,
                 ack_seq,
             };
-            let outcome = fx.k.drain_direct_request_post_work(&work);
+            let outcome = fx.k.drain_direct_request_post_work(CpuId(0), &work);
             assert_eq!(outcome, Err(IpcCallDirectError::WouldBlock));
             let disposition = classify_direct_request_outcome(&outcome);
             assert_eq!(disposition, DirectDisposition::DeclinedBeforeMutation);
@@ -83703,7 +83703,7 @@ mod stage199d_delivery_projection_differential {
                 ack,
                 ack_seq,
             };
-            let outcome = fx.k.drain_direct_request_post_work(&work);
+            let outcome = fx.k.drain_direct_request_post_work(CpuId(0), &work);
             assert_eq!(outcome, Err(IpcCallDirectError::CallerGone));
             assert_eq!(
                 classify_direct_request_outcome(&outcome),
@@ -83731,7 +83731,7 @@ mod stage199d_delivery_projection_differential {
                 ack: stale,
                 ack_seq,
             };
-            let outcome = fx.k.drain_direct_request_post_work(&work);
+            let outcome = fx.k.drain_direct_request_post_work(CpuId(0), &work);
             assert_eq!(outcome, Err(IpcCallDirectError::EndpointGenerationChanged));
             assert_eq!(
                 classify_direct_request_outcome(&outcome),
@@ -83759,7 +83759,7 @@ mod stage199d_delivery_projection_differential {
                 ack,
                 ack_seq,
             };
-            let outcome = fx.k.drain_direct_request_post_work(&work);
+            let outcome = fx.k.drain_direct_request_post_work(CpuId(0), &work);
             assert!(
                 matches!(outcome, Err(IpcCallDirectError::SendEndpoint(_))),
                 "expected SendEndpoint, got {outcome:?}"
@@ -83785,7 +83785,7 @@ mod stage199d_delivery_projection_differential {
                 ack,
                 ack_seq,
             };
-            let outcome = fx.k.drain_direct_request_post_work(&work);
+            let outcome = fx.k.drain_direct_request_post_work(CpuId(0), &work);
             assert!(
                 matches!(outcome, Err(IpcCallDirectError::ReplyEndpoint(_))),
                 "expected ReplyEndpoint, got {outcome:?}"
@@ -83851,7 +83851,7 @@ mod stage199d_delivery_projection_differential {
                 ack,
                 ack_seq: 1,
             };
-            let outcome = fx.k.drain_direct_reply_post_work(&work);
+            let outcome = fx.k.drain_direct_reply_post_work(CpuId(0), &work);
             assert_eq!(outcome, Err(IpcReplyDirectError::WouldBlock));
             let disposition = classify_direct_reply_outcome(&outcome);
             assert_eq!(disposition, DirectDisposition::DeclinedBeforeMutation);
@@ -83873,7 +83873,7 @@ mod stage199d_delivery_projection_differential {
                 ack,
                 ack_seq: 1,
             };
-            let outcome = fx.k.drain_direct_reply_post_work(&work);
+            let outcome = fx.k.drain_direct_reply_post_work(CpuId(0), &work);
             assert!(
                 matches!(outcome, Err(IpcReplyDirectError::ReplyCapResolve(_))),
                 "expected ReplyCapResolve, got {outcome:?}"
@@ -84213,7 +84213,7 @@ mod stage199d_delivery_projection_differential {
                         ack: broken,
                         ack_seq,
                     };
-                    let outcome = fx.k.drain_direct_request_post_work(&work);
+                    let outcome = fx.k.drain_direct_request_post_work(CpuId(0), &work);
                     let disposition = classify_direct_request_outcome(&outcome);
                     assert_eq!(disposition, DirectDisposition::DeclinedBeforeMutation);
                     crate::kernel::direct_ipc_counters::note_disposition(&counters, disposition);
@@ -87690,12 +87690,28 @@ mod stage199a2d2c2b2_guards {
     }
 
     // (16) One successful request creates exactly one continuation (one-shot request-OK marker).
+    //
+    // U3 (203C, saved-resume prerequisite): the one-shot used to live in the CONTINUATION-side
+    // emitter, which fired only if the delivery had ALREADY been recorded — so the
+    // continuation-first interleaving lost the marker permanently. The exactly-once property is
+    // unchanged but now belongs to the order-independent rendezvous, and this guard pins it
+    // there rather than at the retired `EMITTED.swap` / `delivered_count() < 1` shape.
     #[test]
     fn one_request_one_continuation() {
         assert!(MODRS.contains("fn maybe_emit_ipccall_direct_smp_request_ok"));
-        assert!(MODRS.contains("if EMITTED.swap(true, Ordering::AcqRel)"));
         assert!(MODRS.contains("msg.starts_with(\"X86_AP_RECV_V2_CONTINUED\")"));
-        assert!(MODRS.contains("ipccall_direct_smp_request_delivered_count() < 1"));
+        // Both halves record a fact; neither emits on its own.
+        assert!(
+            MODRS.contains("try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_CONTINUED)")
+        );
+        assert!(
+            MODRS.contains("try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_DELIVERED)")
+        );
+        // Exactly-once: the EMITTED bit is set in the SAME compare-exchange that completes the
+        // pair, so only one caller can ever observe the transition.
+        assert!(MODRS.contains("recorded | REQUEST_OK_FACT_EMITTED"));
+        assert!(MODRS.contains("if observed & REQUEST_OK_FACT_EMITTED != 0 {"));
+        assert!(MODRS.contains("compare_exchange_weak"));
     }
 
     // (17) A duplicate IPI or duplicate drain cannot duplicate delivery.
@@ -107256,6 +107272,13 @@ mod stage199d_aarch64_readiness_audit {
         }
         // The transaction body's only architecture conditionals are the x86 SMP oracle IPI
         // sends, which are selector-gated no-ops and irrelevant to an SMP=1 production boot.
+        //
+        // U3 (203C, saved-resume prerequisite): each of those two gates now has its exact
+        // NEGATION, and nothing else — the `executing_cpu` parameter carries the explicit CPU
+        // authority the IPI decision needs, so on every other configuration it is deliberately
+        // unused and is discarded there. That is the same conditional, not a new architecture
+        // branch, and this guard pins it as such: four `target_arch` occurrences forming two
+        // matched pairs, with the negated arms doing nothing but the discard.
         let txn = include_str!("../ipccall_direct_txn.rs");
         assert_eq!(
             txn.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
@@ -107264,9 +107287,27 @@ mod stage199d_aarch64_readiness_audit {
             "the only arch conditionals in the transaction are the two SMP oracle IPI sends"
         );
         assert_eq!(
-            txn.matches("target_arch").count(),
+            txn.matches(
+                "#[cfg(not(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\")))]"
+            )
+            .count(),
             2,
-            "and there are no others"
+            "each gate has exactly its own negation, for the unused-parameter discard"
+        );
+        for negated in txn
+            .split("#[cfg(not(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\")))]")
+            .skip(1)
+        {
+            let arm = negated.lines().nth(1).unwrap_or("").trim();
+            assert_eq!(
+                arm, "let _ = executing_cpu;",
+                "a negated arm may only discard the unused explicit CPU, never branch behaviour"
+            );
+        }
+        assert_eq!(
+            txn.matches("target_arch").count(),
+            4,
+            "and there are no others: two gates plus their two negations"
         );
     }
 
@@ -110900,9 +110941,15 @@ mod stage199d_riscv_production_readiness_audit {
     /// bridge; the record of the finding stays, and this guard pins the closure, not the defect.
     ///
     /// U3 (203C): the helper itself is no longer a broad acquisition either — it became one
-    /// rank-1 scheduler transaction that still binds `current_cpu`. The historical premise
-    /// ("using it meant entering the broad lock") is therefore recorded here as history, and
-    /// the guard now pins the CURRENT truth: broad-lock-free, but still binding.
+    /// rank-1 scheduler transaction. The historical premise ("using it meant entering the broad
+    /// lock") is therefore recorded here as history, and the guard pins the CURRENT truth.
+    ///
+    /// U3 (203C, saved-resume prerequisite): that transaction no longer BINDS `current_cpu`
+    /// either. `scheduler.current_cpu` is one process-global field that `current_tid()` /
+    /// `current_task_cnode()` resolve through, so writing it from an off-broad seam retargeted
+    /// every ambient reader on every CPU — including a CPU mid-syscall inside the broad lock.
+    /// The helper is now validate-and-read for the EXPLICIT CPU, and this guard pins that
+    /// contract in place of the retired binding assertion; the returned value is unchanged.
     #[test]
     fn blocker_two_is_closed_the_bridge_takes_no_broad_lock() {
         let authoritative = function_body(RUNTIME, "pub fn current_tid_authoritative");
@@ -110912,9 +110959,17 @@ mod stage199d_riscv_production_readiness_audit {
         );
         assert!(
             authoritative.contains("with_scheduler_split_mut")
-                && authoritative.contains("sched.current_cpu = cpu"),
-            "it must still BIND current_cpu — the binding, not the lock, is what made the \
-             bridge's former use authoritative"
+                && authoritative.contains("validate_online_cpu(cpu)")
+                && authoritative.contains("current_tid_on(cpu)"),
+            "it must be ONE rank-1 transaction that validates and reads the EXPLICIT cpu"
+        );
+        assert!(
+            !authoritative.contains("sched.current_cpu = cpu")
+                && !authoritative.contains("set_current_cpu")
+                && !authoritative.contains("bind_current_cpu_split")
+                && !authoritative.contains("current_cpu_split_read")
+                && !authoritative.contains("current_tid()"),
+            "it must NOT bind or otherwise consult the process-global ambient current_cpu"
         );
         let bridge = function_body(RISCV_BRIDGE, "extern \"C\" fn yarm_riscv64_trap_bridge");
         for l in code_lines(&bridge) {
@@ -133269,6 +133324,280 @@ mod u3_post_exit_replacement_restore_transaction {
             k.with(|s| s.current_tid_on_cpu(CpuId(0))),
             Some(NEXT),
             "the replacement stays current; the transaction never dispatches"
+        );
+    }
+}
+
+/// U3 (canonical 203C) — the saved-resume reachability prerequisite: explicit CPU authority for
+/// the two direct-IpcCall remote-wake decisions, and an order-independent, exactly-once
+/// rendezvous for the existing `IPCCALL_DIRECT_SMP_REQUEST_OK` proof marker.
+///
+/// CENSUS-DELTA 0. Nothing here retires an acquisition; it makes the x86_64 BSP saved-resume cell
+/// deterministically reachable so the following U3 10 → 8 pass can retire the two acquisitions in
+/// `c2c_bsp_saved_frame_resume` against a live workload.
+#[cfg(test)]
+mod u3_saved_resume_cpu_authority {
+    use crate::kernel::boot::{
+        REQUEST_OK_FACT_CONTINUED, REQUEST_OK_FACT_DELIVERED,
+        reset_ipccall_direct_smp_request_ok_rendezvous, try_emit_ipccall_direct_smp_request_ok,
+    };
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TXN_SRC: &str = include_str!("../../kernel/ipccall_direct_txn.rs");
+    const SPLIT_SRC: &str = include_str!("../../kernel/syscall_split.rs");
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // ── the proof rendezvous: order-independent, exactly once ────────────────────────────
+    //
+    // These run under the canonical single-threaded suite and reset the shared rendezvous both
+    // before and after, so no ordering between them can leak.
+
+    fn with_fresh_rendezvous<R>(f: impl FnOnce() -> R) -> R {
+        reset_ipccall_direct_smp_request_ok_rendezvous();
+        let out = f();
+        reset_ipccall_direct_smp_request_ok_rendezvous();
+        out
+    }
+
+    #[test]
+    fn delivery_then_continuation_emits_exactly_once() {
+        with_fresh_rendezvous(|| {
+            assert!(
+                !try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_DELIVERED),
+                "a lone delivery fact must not emit"
+            );
+            assert!(
+                try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_CONTINUED),
+                "the call completing the pair emits"
+            );
+        });
+    }
+
+    #[test]
+    fn continuation_then_delivery_emits_exactly_once() {
+        with_fresh_rendezvous(|| {
+            assert!(
+                !try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_CONTINUED),
+                "a lone continuation fact must not emit"
+            );
+            assert!(
+                try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_DELIVERED),
+                "the reverse order is equivalent"
+            );
+        });
+    }
+
+    #[test]
+    fn simultaneous_arrival_emits_exactly_once() {
+        // Both facts in one call is the strongest form of "arrived together": the pair completes
+        // inside a single compare-exchange, so there is exactly one transition to observe.
+        with_fresh_rendezvous(|| {
+            assert!(try_emit_ipccall_direct_smp_request_ok(
+                REQUEST_OK_FACT_DELIVERED | REQUEST_OK_FACT_CONTINUED
+            ));
+        });
+    }
+
+    #[test]
+    fn duplicates_on_either_side_never_emit_twice() {
+        with_fresh_rendezvous(|| {
+            for _ in 0..4 {
+                assert!(!try_emit_ipccall_direct_smp_request_ok(
+                    REQUEST_OK_FACT_DELIVERED
+                ));
+            }
+            assert!(try_emit_ipccall_direct_smp_request_ok(
+                REQUEST_OK_FACT_CONTINUED
+            ));
+            // Everything after the emission is inert, from either side, forever.
+            for fact in [
+                REQUEST_OK_FACT_DELIVERED,
+                REQUEST_OK_FACT_CONTINUED,
+                REQUEST_OK_FACT_DELIVERED | REQUEST_OK_FACT_CONTINUED,
+            ] {
+                for _ in 0..3 {
+                    assert!(
+                        !try_emit_ipccall_direct_smp_request_ok(fact),
+                        "the rendezvous is spent"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn either_fact_alone_never_emits() {
+        with_fresh_rendezvous(|| {
+            for _ in 0..3 {
+                assert!(!try_emit_ipccall_direct_smp_request_ok(
+                    REQUEST_OK_FACT_DELIVERED
+                ));
+            }
+        });
+        with_fresh_rendezvous(|| {
+            for _ in 0..3 {
+                assert!(!try_emit_ipccall_direct_smp_request_ok(
+                    REQUEST_OK_FACT_CONTINUED
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn reset_clears_the_rendezvous_and_it_is_reusable() {
+        with_fresh_rendezvous(|| {
+            assert!(!try_emit_ipccall_direct_smp_request_ok(
+                REQUEST_OK_FACT_DELIVERED
+            ));
+            assert!(try_emit_ipccall_direct_smp_request_ok(
+                REQUEST_OK_FACT_CONTINUED
+            ));
+            assert!(!try_emit_ipccall_direct_smp_request_ok(
+                REQUEST_OK_FACT_CONTINUED
+            ));
+        });
+        // A cleared rendezvous behaves exactly as a fresh one — partial state does not survive.
+        with_fresh_rendezvous(|| {
+            assert!(!try_emit_ipccall_direct_smp_request_ok(
+                REQUEST_OK_FACT_CONTINUED
+            ));
+            assert!(try_emit_ipccall_direct_smp_request_ok(
+                REQUEST_OK_FACT_DELIVERED
+            ));
+        });
+    }
+
+    // ── source guards ───────────────────────────────────────────────────────────────────
+
+    /// The current-task seam is validate-and-read for the EXPLICIT CPU, with no ambient bind or
+    /// ambient read, while broad `with_cpu` keeps its legacy binding.
+    #[test]
+    fn current_tid_authoritative_is_explicit_and_non_binding() {
+        let body = code_only(
+            RUNTIME_SRC
+                .split("pub fn current_tid_authoritative")
+                .nth(1)
+                .expect("the seam")
+                .split("\n    /// ")
+                .next()
+                .expect("its body"),
+        );
+        assert!(body.contains("validate_online_cpu(cpu)") && body.contains("current_tid_on(cpu)"));
+        for banned in [
+            "sched.current_cpu = cpu",
+            "set_current_cpu",
+            "bind_current_cpu_split",
+            "current_cpu_split_read",
+            "current_tid()",
+            "read_mpidr_el1",
+            ".with_cpu(",
+            "self.with(|",
+        ] {
+            assert!(!body.contains(banned), "the seam must not reach `{banned}`");
+        }
+        assert!(
+            code_only(RUNTIME_SRC).contains("guard.set_current_cpu(cpu)?;"),
+            "broad with_cpu retains its legacy ambient binding"
+        );
+    }
+
+    /// Both direct-IpcCall remote-wake decisions take the executing CPU explicitly, and no ambient
+    /// reader was left behind or reintroduced under another name.
+    #[test]
+    fn both_remote_wake_decisions_use_the_explicit_cpu() {
+        let txn = code_only(TXN_SRC);
+        assert_eq!(
+            txn.matches("current_cpu_split_read").count(),
+            0,
+            "no ambient current-CPU reader may remain in the direct-IpcCall transaction file"
+        );
+        assert_eq!(
+            txn.matches("sched.current_cpu = ").count(),
+            0,
+            "and none was replaced by an ambient WRITE"
+        );
+        for sig in [
+            "pub(crate) fn drain_direct_request_post_work(",
+            "pub(crate) fn drain_direct_reply_post_work(",
+        ] {
+            let body = txn.split(sig).nth(1).expect(sig);
+            let head = body.split(") -> Result").next().expect("signature");
+            assert!(
+                head.contains("executing_cpu: crate::kernel::scheduler::CpuId"),
+                "`{sig}` must take the executing CPU explicitly"
+            );
+        }
+        assert_eq!(
+            txn.matches("let enqueueing_cpu = executing_cpu;").count(),
+            2,
+            "both the forward and the reverse decision compare against the explicit CPU"
+        );
+        // The comparison itself, the delivery note and the IPI direction are unchanged.
+        assert_eq!(
+            txn.matches("if success.wake_target_cpu != enqueueing_cpu {")
+                .count(),
+            2
+        );
+        assert!(txn.contains("send_reschedule_ipi_to(\n                        enqueueing_cpu,"));
+        assert!(
+            txn.contains("c2c_send_reschedule_ipi_to(\n                        enqueueing_cpu,")
+        );
+        // Both drains are reached from the trap boundary that owns the explicit CPU.
+        let split = code_only(SPLIT_SRC);
+        assert!(split.contains("shared.drain_direct_request_post_work(cpu, &work)"));
+        assert!(split.contains("shared.drain_direct_reply_post_work(cpu, &work)"));
+    }
+
+    /// The proof marker has ONE emission site, reached only through the rendezvous, and the
+    /// existing smoke still demands it exactly once.
+    #[test]
+    fn request_ok_marker_has_one_rendezvous_gated_emission_site() {
+        const BOOT_SRC: &str = include_str!("mod.rs");
+        let boot = code_only(BOOT_SRC);
+        assert_eq!(
+            boot.matches("\"IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0")
+                .count(),
+            1,
+            "exactly one place emits the marker text"
+        );
+        let emitter = boot
+            .split("fn emit_ipccall_direct_smp_request_ok_marker() {")
+            .nth(1)
+            .expect("the emitter");
+        assert!(
+            emitter.contains("printk_emit_sync"),
+            "a REQUIRED proof marker must not be lost to the drop-prone shared ring"
+        );
+        // Neither side emits unconditionally: both record a fact and defer to the rendezvous.
+        assert!(boot.contains("try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_DELIVERED)"));
+        assert!(boot.contains("try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_CONTINUED)"));
+        // The smoke assertion is untouched.
+        const SMOKE: &str =
+            include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh");
+        assert!(
+            SMOKE.contains("IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0 receiver_cpu=1 cross_cpu=1")
+                && SMOKE.contains("die \"request-ok != 1\""),
+            "the existing smoke must still require the marker exactly once"
+        );
+    }
+
+    /// The two target acquisitions are untouched: this pass is census-neutral.
+    #[test]
+    fn the_saved_resume_cohort_is_still_present_and_unretired() {
+        let smp = code_only(SMP_SRC);
+        assert!(smp.contains("match shared.with(|k| k.ap_saved_resume_context(client_tid)) {"));
+        assert!(smp.contains(".with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu, client_tid))"));
+        assert_eq!(
+            smp.matches(".with_cpu(").count(),
+            2,
+            "x86_64/smp.rs keeps exactly its two audited acquisitions"
         );
     }
 }

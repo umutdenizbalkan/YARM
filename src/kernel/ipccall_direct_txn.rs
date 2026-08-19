@@ -116,10 +116,20 @@ impl SharedKernel {
     /// in-transaction lease disposition — a retryable rollback (lease returned to
     /// `Available`) re-arms the published ack for another drain; success or a stale
     /// discard leaves it claimed (consumed). Does not duplicate the transaction body.
+    /// `executing_cpu` is the CPU actually running this drain, threaded explicitly from the
+    /// trap/post-lock boundary (`try_split_ipccall_direct_into_frame`'s `cpu`). It is the sole
+    /// authority for the remote-wake decision below; the process-global ambient
+    /// `scheduler.current_cpu` is never consulted.
     pub(crate) fn drain_direct_request_post_work(
         &self,
+        executing_cpu: crate::kernel::scheduler::CpuId,
         work: &DirectRequestPostWork,
     ) -> Result<IpcCallDirectSuccess, IpcCallDirectError> {
+        // The remote-wake decision below is x86_64-freestanding only; everywhere else the
+        // explicit CPU is deliberately unused. Discarded here rather than renamed, so the
+        // parameter keeps its contract name at every call site.
+        #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+        let _ = executing_cpu;
         let mut lease = AckLease::new_available();
         // The published ack was claimed at trap-entry publication; re-establish the
         // ClaimedByWork token for the transaction.
@@ -154,10 +164,17 @@ impl SharedKernel {
             // nothing regardless of any selector, and a real remote enqueue is woken on its
             // authoritative home CPU rather than an assumed one. Strictly after the enqueue commit:
             // the transaction has returned `Ok` and no fallible work follows.
+            //
+            // U3 (canonical 203C): the "which CPU is running this drain?" half of that comparison
+            // used to read the process-global ambient `scheduler.current_cpu`. That is not this
+            // drain's identity: it is a single field any CPU may retarget, so two otherwise
+            // identical `-smp 2` boots disagreed about whether the very same enqueue was remote.
+            // It is now `executing_cpu`, threaded explicitly from the trap boundary. There is no
+            // ambient fallback: if the caller has no CPU there is no drain.
             let _ = success;
             #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
             {
-                let enqueueing_cpu = self.current_cpu_split_read();
+                let enqueueing_cpu = executing_cpu;
                 if success.wake_target_cpu != enqueueing_cpu {
                     crate::kernel::boot::ipccall_direct_smp_request_note_delivered();
                     crate::arch::x86_64::smp::send_reschedule_ipi_to(
@@ -986,10 +1003,17 @@ impl SharedKernel {
     /// Drain one owned NR7 reply post-work item post-lock: run the transaction, then
     /// reconcile the published caller-ack claim with the in-transaction lease (retryable
     /// rollback re-arms the ack; success/stale-discard leaves it claimed).
+    /// `executing_cpu` is the CPU actually running this drain, threaded explicitly from the
+    /// trap/post-lock boundary (`try_split_ipcreply_direct_into_frame`'s `cpu`) — the exact
+    /// mirror of the NR6 twin. It is the sole authority for the reverse remote-wake decision.
     pub(crate) fn drain_direct_reply_post_work(
         &self,
+        executing_cpu: crate::kernel::scheduler::CpuId,
         work: &DirectReplyPostWork,
     ) -> Result<IpcReplyDirectSuccess, IpcReplyDirectError> {
+        // See the NR6 twin: the reverse decision is x86_64-freestanding only.
+        #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+        let _ = executing_cpu;
         let mut lease = AckLease::new_available();
         let _ = lease.claim(work.ack_seq);
         let result = self.ipc_reply_direct_txn(&work.snapshot, &work.ack, &mut lease, work.ack_seq);
@@ -1016,10 +1040,14 @@ impl SharedKernel {
             // transaction has returned `Ok` and no fallible work follows. The target sets its own
             // pending flag on IPI receipt (never a self-set from here) and dispatches through its
             // normal scheduler — no dispatch in the IPI handler.
+            //
+            // U3 (canonical 203C): as in the NR6 twin, the executing-CPU half of the comparison is
+            // now the explicitly threaded `executing_cpu` rather than the process-global ambient
+            // `scheduler.current_cpu`. No ambient fallback.
             let _ = success;
             #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
             {
-                let enqueueing_cpu = self.current_cpu_split_read();
+                let enqueueing_cpu = executing_cpu;
                 if success.wake_target_cpu != enqueueing_cpu {
                     crate::kernel::boot::ipcreply_direct_smp_reply_note_delivered();
                     crate::arch::x86_64::smp::c2c_send_reschedule_ipi_to(

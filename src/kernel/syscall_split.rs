@@ -768,7 +768,7 @@ fn try_split_ipccall_direct_into_frame(
     // Stage 199D HARD-STOP B: the transaction outcome is CLASSIFIED, never discarded. The
     // mapping is pure and exhaustive (`crate::kernel::direct_disposition`) — no wildcard arm,
     // so a new error variant cannot silently inherit "success".
-    let outcome = shared.drain_direct_request_post_work(&work);
+    let outcome = shared.drain_direct_request_post_work(cpu, &work);
     let disposition = crate::kernel::direct_disposition::classify_direct_request_outcome(&outcome);
     crate::kernel::direct_ipc_counters::note_disposition(&REQUEST_COUNTERS, disposition);
     // Stage 199D HARD-STOP C: the frame is encoded by the SHARED encoder, which reproduces
@@ -935,7 +935,7 @@ fn try_split_ipcreply_direct_into_frame(
         ack_seq,
     };
     // Stage 199D HARD-STOP B: classified, never discarded — see the NR6 twin.
-    let outcome = shared.drain_direct_reply_post_work(&work);
+    let outcome = shared.drain_direct_reply_post_work(cpu, &work);
     let disposition = crate::kernel::direct_disposition::classify_direct_reply_outcome(&outcome);
     crate::kernel::direct_ipc_counters::note_disposition(&REPLY_COUNTERS, disposition);
     // Same shared encoder as the NR6 twin: legacy `handle_ipc_reply` ends with the identical

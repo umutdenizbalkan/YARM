@@ -3576,36 +3576,128 @@ pub(crate) static X86_IPCCALL_DIRECT_SMP_REQUEST_DELIVERED: core::sync::atomic::
 
 pub(crate) fn ipccall_direct_smp_request_note_delivered() {
     X86_IPCCALL_DIRECT_SMP_REQUEST_DELIVERED.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    // U3 (canonical 203C): record the delivery HALF of the request-OK rendezvous. See
+    // `try_emit_ipccall_direct_smp_request_ok`.
+    try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_DELIVERED);
 }
 
 pub fn ipccall_direct_smp_request_delivered_count() -> u64 {
     X86_IPCCALL_DIRECT_SMP_REQUEST_DELIVERED.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Stage 199A2D2C2B2: emit the TERMINAL cross-CPU request-OK marker EXACTLY ONCE, ONLY after the
-/// resumed CPU-1 server's userspace `X86_AP_RECV_V2_CONTINUED` marker is observed (passed here as
-/// `msg`) AND exactly one committed delivery is recorded. This is the seal's authority that the
-/// COMPLETE real userspace-to-userspace cross-CPU path ran — never emitted merely after enqueue or IPI
-/// receipt. Kernel marker (not userspace). No-op off the C2B2 path or before the continuation.
+/// U3 (canonical 203C) — PROOF BOOKKEEPING for the terminal cross-CPU request-OK marker.
+/// **This BLOCKS U3**: it exists so the x86_64 BSP saved-resume cohort's live cell is
+/// deterministically observable before its two broad acquisitions are retired.
+///
+/// The marker's two preconditions are produced by DIFFERENT CPUs with no ordering between them:
+/// CPU 0's accepted request drain records the committed delivery, and CPU 1's resumed server
+/// emits its single `X86_AP_RECV_V2_CONTINUED` DebugLog. The previous one-shot emitter fired only
+/// from the continuation side and only if the delivery had *already* been recorded, so the
+/// continuation-first interleaving lost the marker permanently — measured as 2 emissions in 6
+/// otherwise-identical matched-artifact boots, with every kernel-path marker deterministic.
+///
+/// This is a RENDEZVOUS, not a retry: each side records its own fact and calls the same helper,
+/// and whichever call completes the pair emits. Both orderings, and simultaneous arrival, are
+/// equivalent.
+///
+/// Confinement: purely observational. It is reached only from the x86_64 direct-SMP proof
+/// workload's two sites, no production IPC decision consults it, and it cannot delay, suppress or
+/// alter any delivery — the emission happens strictly after the fact it reports. It adds no public
+/// marker or counter family: the emitted text is the pre-existing marker, unchanged.
+static X86_IPCCALL_DIRECT_SMP_REQUEST_OK_FACTS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// CPU 0's accepted request drain recorded one committed cross-CPU delivery.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const REQUEST_OK_FACT_DELIVERED: u32 = 1 << 0;
+/// CPU 1's resumed server emitted its single `X86_AP_RECV_V2_CONTINUED` userspace log.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const REQUEST_OK_FACT_CONTINUED: u32 = 1 << 1;
+/// The marker has been emitted; the rendezvous is spent and can never emit again.
+#[cfg_attr(not(test), allow(dead_code))]
+const REQUEST_OK_FACT_EMITTED: u32 = 1 << 2;
+
+/// Record one half of the rendezvous and emit the existing marker iff BOTH halves now hold.
+///
+/// Returns `true` only for the single call that completed the pair. Repeated or duplicate calls
+/// from either side are idempotent, a lone fact never emits, and a concurrent pair emits once:
+/// the `EMITTED` bit is set in the SAME compare-exchange that completes the pair, so exactly one
+/// caller can observe the transition.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn try_emit_ipccall_direct_smp_request_ok(fact: u32) -> bool {
+    use core::sync::atomic::Ordering;
+    const BOTH: u32 = REQUEST_OK_FACT_DELIVERED | REQUEST_OK_FACT_CONTINUED;
+    let mut observed = X86_IPCCALL_DIRECT_SMP_REQUEST_OK_FACTS.load(Ordering::Acquire);
+    loop {
+        if observed & REQUEST_OK_FACT_EMITTED != 0 {
+            return false;
+        }
+        let recorded = observed | fact;
+        let complete = (recorded & BOTH) == BOTH;
+        let next = if complete {
+            recorded | REQUEST_OK_FACT_EMITTED
+        } else {
+            recorded
+        };
+        match X86_IPCCALL_DIRECT_SMP_REQUEST_OK_FACTS.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                if complete {
+                    emit_ipccall_direct_smp_request_ok_marker();
+                    return true;
+                }
+                return false;
+            }
+            Err(seen) => observed = seen,
+        }
+    }
+}
+
+/// Clear the rendezvous completely. Setup/reset only — never a production path.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn reset_ipccall_direct_smp_request_ok_rendezvous() {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_OK_FACTS.store(0, core::sync::atomic::Ordering::Release);
+}
+
+/// The pre-existing marker text, unchanged. Emitted from exactly one place.
+///
+/// Emitted SYNCHRONOUSLY, for the reason `ap_seal_syscall_begin` already documents: the shared
+/// printk ring is drop-prone under concurrent AP+BSP traffic, and this is a REQUIRED proof marker.
+/// Whichever CPU completes the rendezvous emits it, and the completing side is frequently CPU 0
+/// inside the request drain — the busiest console window of the whole cell. Buffered emission was
+/// measured losing it outright in 2 of 6 matched-artifact boots even after the ordering was fixed:
+/// no marker text and no fragment of it reached the log, while every other terminal marker did.
+/// This changes nothing about WHEN or WHETHER the fact holds, only that reporting it cannot be
+/// dropped.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn emit_ipccall_direct_smp_request_ok_marker() {
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0 receiver_cpu=1 cross_cpu=1 request_copies=1 server_wakes=1 server_continuations=1 result=ok"
+    ));
+}
+
+/// Hosted / non-x86: the rendezvous still runs (so it is testable), but emits no kernel marker.
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+fn emit_ipccall_direct_smp_request_ok_marker() {}
+
+/// Stage 199A2D2C2B2: the AP-continuation HALF of the terminal cross-CPU request-OK rendezvous.
+/// Called with every DebugLog message; records the continuation fact only for the resumed CPU-1
+/// server's `X86_AP_RECV_V2_CONTINUED` log. The marker is emitted by
+/// `try_emit_ipccall_direct_smp_request_ok` once the committed delivery is also recorded — in
+/// EITHER order. No-op off the C2B2 path.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub(crate) fn maybe_emit_ipccall_direct_smp_request_ok(msg: &str) {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static EMITTED: AtomicBool = AtomicBool::new(false);
     if !x86_ipccall_direct_smp_request_enabled() {
         return;
     }
     if !msg.starts_with("X86_AP_RECV_V2_CONTINUED") {
         return;
     }
-    if ipccall_direct_smp_request_delivered_count() < 1 {
-        return;
-    }
-    if EMITTED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    crate::yarm_log!(
-        "IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0 receiver_cpu=1 cross_cpu=1 request_copies=1 server_wakes=1 server_continuations=1 result=ok"
-    );
+    try_emit_ipccall_direct_smp_request_ok(REQUEST_OK_FACT_CONTINUED);
 }
 
 /// Hosted / non-x86 no-op so the DebugLog call site compiles unconditionally.

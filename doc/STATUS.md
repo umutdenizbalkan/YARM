@@ -98,6 +98,73 @@ was present at the base and **absent** at the head — and the RISC-V kernel bin
 **bit-identical** across the two revisions, so that variance cannot originate in this source
 change. Direct production remains **OFF**.
 
+**U3 (canonical 203C) — CPU-AUTHORITY PREREQUISITE: DELIVERED. CENSUS-DELTA 0.
+CANONICAL 203C — still OPEN.**
+
+The second and final census-neutral prerequisite for retiring the two broad acquisitions in
+`c2c_bsp_saved_frame_resume`. **No acquisition is retired here**; this makes their existing
+workload genuinely reach them, repeatedly.
+
+* **`current_tid_authoritative(cpu)` is validate-and-READ for an EXPLICIT CPU, not
+  validate-bind-read.** It validates with the same `validate_online_cpu` predicate, reads
+  `current_tid_on(cpu)` under one rank-1 acquisition, and **never writes `scheduler.current_cpu`**
+  or resolves through any ambient selector. Its returned value is unchanged for all fifteen
+  production callers, each of which consumes only that value. On freestanding AArch64 the retired
+  `MPIDR_EL1` lookup is value-identical, because the AArch64 trap entry derives the `cpu` it passes
+  by the same expression.
+* **An off-broad explicit read must not mutate the process-global ambient `current_cpu`.**
+  `scheduler.current_cpu` is ONE field that `current_tid()` / `current_task_cnode()` resolve
+  through, so binding it off the broad lock retargeted every ambient reader on every CPU. Measured:
+  CPU 1 held the broad lock mid-syscall with `current_tid_on(1)` = its server task, CPU 0 called
+  `current_tid_authoritative(CpuId(0))`, and CPU 1's ambient identity flipped to CPU 0's task — so
+  `handle_ipc_recv` validated the receive capability against the WRONG process CNode and correctly
+  refused it with `MissingRight`.
+* **Broad `SharedKernel::with_cpu` retains its legacy ambient binding.** While the broad lock
+  exists that binding is transaction-local state and is out of scope.
+* **The prior AArch64 FutexWait-idle wording overstated the binding side effect as required.** Its
+  returned-value semantics are unchanged; the binding was unsafe under SMP. Those paragraphs are
+  corrected in place rather than removed.
+* **Both direct-IpcCall remote-wake decisions now use the explicit CPU executing the drain.**
+  `drain_direct_request_post_work` and `drain_direct_reply_post_work` take `executing_cpu`,
+  threaded from `try_split_ipccall_direct_into_frame` / `try_split_ipcreply_direct_into_frame`,
+  and compare it against `success.wake_target_cpu`. Both `current_cpu_split_read` calls in
+  `ipccall_direct_txn.rs` are gone with no ambient replacement. Local wake sends no IPI; a remote
+  wake records delivery and sends exactly one IPI, in the existing direction.
+* **`IPCCALL_DIRECT_SMP_REQUEST_OK` now uses an order-independent, exactly-once proof rendezvous.**
+  Its two preconditions are produced by different CPUs with no ordering between them — CPU 0's
+  committed delivery and CPU 1's single `X86_AP_RECV_V2_CONTINUED` DebugLog. The old one-shot fired
+  only from the continuation side and only if the delivery was already recorded, so the
+  continuation-first interleaving lost the marker permanently. Each side now records its own fact
+  and calls the same helper; the `EMITTED` bit is set in the same compare-exchange that completes
+  the pair, so exactly one caller emits, in either order. It is proof bookkeeping only: no
+  production IPC decision consults it, it cannot delay, suppress or alter delivery, and the emitted
+  text is the pre-existing marker. The emission is synchronous for the reason
+  `ap_seal_syscall_begin` already documents — the shared printk ring drops required proof markers
+  under concurrent AP+BSP traffic, measured losing this one outright in 2 of 6 boots even after the
+  ordering was fixed.
+* **No IPC, capability, scheduler-placement or production-admission semantics changed.** Wake
+  targets, enqueue policy, rights and error classes are untouched; `MissingRight` is not weakened.
+* **Other ambient `current_cpu` readers and writers are NOT retired.** Seven off-broad writers
+  remain in `runtime.rs`, plus the general `current_tid()` / `current_task_cnode()` surface (224 and
+  32 production consumers). They remain separately auditable prerequisites — no global retirement is
+  claimed.
+* **The x86_64 BSP saved-resume cohort is now repeatedly live-reachable.** Five consecutive
+  matched-artifact runs of `scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh` each show every
+  required marker exactly once — `IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1`,
+  `X86_BSP_NR6_REQUEST_SENT`, `X86_AP_RECV_V2_CONTINUED`, `X86_AP_RECV_V2_USER_VALIDATED cpu=1`,
+  `IPCREPLY_DIRECT_SMP_CALLER_BLOCKED`, both reschedule IPIs, `IPCCALL_DIRECT_SMP_REQUEST_OK`,
+  `X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved`, `X86_BSP_REPLY_USER_VALIDATED` and
+  `IPCREPLY_DIRECT_SMP_REPLY_OK` — with zero `MissingRight`, zero ring-3 faults, zero panics and the
+  full `STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL … result=ok`. One earlier run was discarded as
+  visibly serial-spliced (fragments of a marker survived without the intact line); its raw log was
+  preserved and it is classified separately, not as a failure.
+* **The two acquisitions in `c2c_bsp_saved_frame_resume` remain present and unchanged**, for the
+  next U3 **10 → 8** retirement pass. **The census remains 10** (`with_cpu` 9, broad `with` 1).
+
+**U3 and 199C remain OPEN. 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN (partially
+production-wired).** Directive U8 is already source-complete. Canonical stage arithmetic is
+unchanged at **2 complete / 11 partial / 22 open**. Direct production remains **OFF**.
+
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
 `finalize_split_handled_syscall` broad reacquisition, already retired by Stage 199D; that
 function holds no broad acquisition today. Earlier "U8 is next" pointers are removed.

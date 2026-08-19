@@ -869,27 +869,50 @@ impl SharedKernel {
     /// a read-only current-task snapshot. The split-dispatch *mutation* still runs
     /// lock-free via the per-domain split-mut helper after this read releases.
     ///
-    /// U3 (203C): this is now the AUTHORITATIVE rank-1 transaction — the broad `with_cpu`
-    /// is retired, but **the binding side effect is not**. That distinction is the whole
-    /// point. `current_tid_split_read` reads a per-CPU slot and deliberately does NOT bind
-    /// `scheduler_state.current_cpu`; substituting it here is exactly the Stage 4T+6R
-    /// experiment that made the live x86 service chain disappear. So this helper still
-    /// validates the CPU and writes `current_cpu` before reading — it just does all of it
-    /// inside ONE rank-1 acquisition instead of the broad lock:
+    /// U3 (203C): this is the AUTHORITATIVE rank-1 transaction — **validate and READ, for the
+    /// CPU the caller names**. It does not write `scheduler.current_cpu`, and it does not
+    /// resolve the lookup through any ambient selector.
     ///
     /// 1. validate with the same online predicate `KernelState::set_current_cpu` applies
-    ///    (`validate_online_cpu`), returning `None` and leaving `current_cpu` UNCHANGED on
-    ///    failure — the old `with_cpu` propagated that error to `.ok().flatten()`;
-    /// 2. bind `sched.current_cpu = cpu`, which happens even when the validated CPU has no
-    ///    current task;
-    /// 3. read the authoritative current TID.
+    ///    (`validate_online_cpu`), returning `None` and leaving ALL state — ambient included —
+    ///    untouched on failure; the old `with_cpu` propagated that error to `.ok().flatten()`;
+    /// 2. read `current_tid_on(cpu)` under that same single rank-1 acquisition.
     ///
-    /// The lookup CPU is resolved exactly as `KernelState::current_tid` resolved it, which
-    /// is NOT uniformly the caller's `cpu`: on freestanding AArch64 `KernelState::current_cpu`
-    /// derives it from `MPIDR_EL1`, so the hardware-derived value is preserved rather than
-    /// silently replaced by an unverified caller CPU; everywhere else it is the field just
-    /// bound, i.e. `cpu`. No task lock, no dispatch, no enqueue, no status mutation, no
-    /// broad fallback.
+    /// # Why the binding side effect was removed (canonical 203C prerequisite)
+    ///
+    /// `scheduler.current_cpu` is ONE process-global field, and `KernelState::current_tid()` /
+    /// `current_task_cnode()` resolve "the current task" through it. Writing it from an
+    /// off-broad rank-1 seam is therefore not transaction-local: it retargets every ambient
+    /// reader on EVERY CPU, including a CPU that is mid-syscall inside the broad lock.
+    ///
+    /// That was observed, not theorised. On the x86_64 `-smp 2` cross-CPU reply workload, CPU 1
+    /// entered Phase 2 with `arg_cpu=1`, `with_cpu` bound `current_cpu=1`, and
+    /// `current_tid_on(1)` was the server task throughout. While that broad transaction was
+    /// still running, CPU 0's trap seam called `current_tid_authoritative(CpuId(0))`, whose bind
+    /// rewrote the shared field to 0. CPU 1's ambient `current_tid()` / `current_task_cnode()`
+    /// consequently flipped to CPU 0's task mid-syscall, so `handle_ipc_recv` validated the
+    /// receive capability against the WRONG process CNode and correctly refused it with
+    /// `MissingRight`. Nothing else was wrong: the trap CPU, the `with_cpu` binding, the
+    /// capability provisioning, the object generation and the rights evaluation on the correct
+    /// capability were all verified correct.
+    ///
+    /// The RETURN VALUE is unchanged for every caller. All fifteen production callers consume the
+    /// returned TID explicitly (threading it into `*_split_read(tid, …)` or comparing it); none
+    /// reads ambient state afterwards expecting this call to have retargeted it. This is also
+    /// `AI_AGENT_RULES` §14.4's D6 rule for `entering_tid`/`exiting_tid`: Class F, authoritative
+    /// read only.
+    ///
+    /// The lookup CPU is now the caller's `cpu`, uniformly. The previous freestanding-AArch64
+    /// branch re-derived it from `MPIDR_EL1` because the bound field could not be trusted; that
+    /// is value-identical here, because the AArch64 trap entry derives the `cpu` it passes from
+    /// `MPIDR_EL1` by the same expression (`arch/aarch64/boot.rs`'s `trap_cpu`).
+    ///
+    /// Broad `SharedKernel::with_cpu` KEEPS its `set_current_cpu` binding: while the broad lock
+    /// exists that binding is legacy transaction-local state, and it is out of scope here. The
+    /// remaining off-broad readers and writers of `scheduler.current_cpu` are NOT all retired —
+    /// they remain separately auditable prerequisites; see `doc/KERNEL_UNLOCKING.md` §0.
+    ///
+    /// No task lock, no dispatch, no enqueue, no status mutation, no broad fallback.
     pub fn current_tid_authoritative(&self, cpu: CpuId) -> Option<u64> {
         self.with_scheduler_split_mut(|sched| {
             if kernel_ref(&sched.scheduler)
@@ -898,18 +921,8 @@ impl SharedKernel {
             {
                 return None;
             }
-            sched.current_cpu = cpu;
-            // `KernelState::current_tid()` reads `self.current_cpu()`, whose AArch64
-            // freestanding branch is MPIDR-derived rather than the bound field.
-            #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-            let lookup = {
-                let mpidr = crate::arch::aarch64::read_mpidr_el1();
-                CpuId((mpidr & 0xff) as u8)
-            };
-            #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
-            let lookup = sched.current_cpu;
             kernel_ref(&sched.scheduler)
-                .current_tid_on(lookup)
+                .current_tid_on(cpu)
                 .map(|tid| tid.0)
         })
     }
@@ -9302,15 +9315,19 @@ mod tests {
     }
 
     #[test]
-    fn u3_authoritative_binds_even_with_no_current_task() {
+    fn u3_authoritative_reads_without_binding_when_no_current_task() {
+        // Re-derived (U3/203C saved-resume prerequisite): this used to pin that the helper BOUND
+        // `current_cpu`. It must now pin the opposite — the ambient selector is never written —
+        // while the returned value is unchanged.
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         kernel.with(|s| s.bring_up_cpu(CpuId(1)).expect("cpu 1 online"));
-        // CPU 1 is online but idle: the read is None and the binding still happens.
+        let ambient_before = kernel.with(|s| s.current_cpu());
+        // CPU 1 is online but idle: the read is None, exactly as before.
         assert_eq!(kernel.current_tid_authoritative(CpuId(1)), None);
         assert_eq!(
             kernel.with(|s| s.current_cpu()),
-            CpuId(1),
-            "binding occurs even when the validated CPU has no current task"
+            ambient_before,
+            "an explicit-CPU read must NOT retarget the process-global ambient current_cpu"
         );
     }
 
@@ -9370,22 +9387,28 @@ mod tests {
         );
 
         // (2) the idle task (tid 0) is current -> true. Legacy: `Some(0)`.
-        kernel.with(|state| {
-            state.register_task(0).expect("idle task 0");
-            state.enqueue_current_cpu(0).expect("enqueue 0");
-            state.dispatch_next_task().expect("dispatch 0");
-        });
+        //
+        // Re-derived: the state is established EXPLICITLY for CPU 0. Bootstrap already leaves the
+        // idle task current on CPU 0 (see `idle_re_enqueue_for_test`, which exists only to restore
+        // that after a dispatch displaces it), so this asserts the precondition rather than
+        // reaching for it through the ambient `current_cpu` this helper no longer binds.
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(CpuId(0))),
+            Some(0),
+            "bootstrap leaves the idle task current on CPU 0"
+        );
         assert_eq!(kernel.current_tid_authoritative(CpuId(0)), Some(0));
         assert!(
             u3_futex_idle_current_none(&kernel, CpuId(0)),
             "tid 0 is the idle task and must still read as idle"
         );
 
-        // (3) a real user task is current -> false. Legacy: `Some(n)`, n != 0.
+        // (3) a real user task is current -> false. Legacy: `Some(n)`, n != 0. Placed and
+        // dispatched on CPU 0 explicitly.
         kernel.with(|state| {
             state.register_task(91).expect("task 91");
-            state.enqueue_current_cpu(91).expect("enqueue 91");
-            state.dispatch_next_task().expect("dispatch 91");
+            state.enqueue_on_cpu(CpuId(0), 91).expect("enqueue 91");
+            assert_eq!(state.dispatch_next_on_cpu(CpuId(0)), Some(91));
         });
         assert_eq!(kernel.current_tid_authoritative(CpuId(0)), Some(91));
         assert!(
@@ -9402,8 +9425,7 @@ mod tests {
                 "a refused CPU must still map to true"
             );
         }
-        // …and the refusals changed no binding, so the valid CPU still answers as before.
-        assert_eq!(kernel.with(|s| s.current_cpu()), CpuId(0));
+        // …and a refusal mutates nothing, so the valid CPU still answers exactly as before.
         assert!(!u3_futex_idle_current_none(&kernel, CpuId(0)));
     }
 
@@ -9424,15 +9446,22 @@ mod tests {
         assert!(!u3_futex_idle_current_none(&kernel, CpuId(0)));
         // Asking about CPU 1 must answer for CPU 1 — and must rebind to it, exactly as
         // `with_cpu(CpuId(1), …)` did through `set_current_cpu`.
+        let ambient_before = kernel.with(|s| s.current_cpu());
         assert!(
             u3_futex_idle_current_none(&kernel, CpuId(1)),
             "CPU 1 is idle; the answer must not be borrowed from the ambient CPU 0 binding"
         );
+        // Re-derived (U3/203C saved-resume prerequisite): the answer is for the REQUESTED CPU and
+        // the ambient selector is left alone. The retired assertion required the opposite — that
+        // the read rebound `current_cpu` — which is precisely what retargeted other CPUs'
+        // in-flight syscalls under SMP.
         assert_eq!(
             kernel.with(|s| s.current_cpu()),
-            CpuId(1),
-            "the requested CPU is bound before the read, as with_cpu bound it"
+            ambient_before,
+            "an explicit-CPU read must NOT retarget the process-global ambient current_cpu"
         );
+        // The CPU-0 answer is likewise unchanged by having asked about CPU 1.
+        assert!(!u3_futex_idle_current_none(&kernel, CpuId(0)));
     }
 
     #[test]
@@ -9549,37 +9578,55 @@ mod tests {
     }
 
     #[test]
-    fn u3_authoritative_is_broad_lock_free_and_still_binds() {
+    fn u3_authoritative_is_broad_lock_free_and_never_binds() {
+        // Re-derived (U3/203C saved-resume prerequisite): the retired assertions pinned
+        // "validate → BIND → read". The contract is now "validate → read, for the EXPLICIT cpu",
+        // with the process-global ambient selector neither written nor consulted.
         let body = u3_authoritative_body();
         assert!(
             !body.contains(".with_cpu(") && !body.contains("self.with(|"),
             "current_tid_authoritative must hold no broad acquisition"
         );
-        // One rank-1 acquisition covers BOTH the bind and the read.
+        // One rank-1 acquisition covers the validate and the read.
         assert_eq!(
             body.matches("with_scheduler_split_mut").count(),
             1,
             "exactly one rank-1 scheduler acquisition"
         );
         let validate = body
-            .find("validate_online_cpu")
+            .find("validate_online_cpu(cpu)")
             .expect("same online predicate set_current_cpu uses");
-        let bind = body
-            .find("sched.current_cpu = cpu")
-            .expect("binds current_cpu");
-        let read = body.find("current_tid_on(").expect("reads the current tid");
-        assert!(
-            validate < bind,
-            "validation must precede any change to current_cpu"
+        let read = body
+            .find("current_tid_on(cpu)")
+            .expect("reads the EXPLICIT cpu's current tid");
+        assert!(validate < read, "validation must precede the read");
+        // No ambient write, and no ambient selector consulted for the lookup.
+        for banned in [
+            "sched.current_cpu = cpu",
+            "set_current_cpu",
+            "bind_current_cpu_split",
+            "current_cpu_split_read",
+            "current_tid()",
+            "read_mpidr_el1",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "the explicit-CPU read must not reach `{banned}`"
+            );
+        }
+        // Broad `with_cpu` keeps its legacy binding — that is deliberately unchanged.
+        let with_cpu = u3_code_lines(
+            include_str!("runtime.rs")
+                .split("pub fn with_cpu<R>")
+                .nth(1)
+                .expect("with_cpu")
+                .split("\n    /// ")
+                .next()
+                .expect("its body"),
         );
-        assert!(bind < read, "the bind must precede the read");
-        // The AArch64 lookup-source policy is preserved structurally: the freestanding
-        // AArch64 branch derives the lookup CPU from MPIDR, not from the caller's `cpu`.
         assert!(
-            body.contains("read_mpidr_el1")
-                && body.contains("target_arch = \"aarch64\"")
-                && body.contains("let lookup = sched.current_cpu"),
-            "the MPIDR-derived AArch64 lookup must not be replaced by the caller CPU"
+            with_cpu.contains("set_current_cpu(cpu)"),
+            "broad with_cpu retains its legacy ambient binding"
         );
         // It is a read-only identity snapshot: no dispatch, enqueue or status mutation.
         for forbidden in [
