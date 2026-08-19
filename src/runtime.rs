@@ -3462,6 +3462,58 @@ impl SharedKernel {
         })
     }
 
+    /// U3 (canonical 203C) — the x86_64 BSP saved-resume PREEMPT-AND-PREFER selection, taken as
+    /// ONE rank-1 scheduler transaction for an EXPLICIT CPU.
+    ///
+    /// Replaces the broad re-acquire `c2c_bsp_saved_frame_resume` performed:
+    ///
+    /// ```ignore
+    /// shared.with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu, client_tid)).unwrap_or(None)
+    /// ```
+    ///
+    /// That acquisition took the WHOLE `KernelState` lock to perform one scheduler-domain
+    /// operation. `KernelState::on_preempt_prefer_on_cpu` was a thin wrapper that immediately
+    /// re-entered the rank-1 scheduler lock and called `Scheduler::on_preempt_prefer_on`; the
+    /// broad guard added nothing but width. Here rank 1 is acquired once and the SAME scheduler
+    /// primitive runs inside it, so the policy is not duplicated — `Scheduler::on_preempt_prefer_on`
+    /// (and beneath it `PriorityScheduler::on_preempt_prefer`) remains the single implementation.
+    ///
+    /// Contract, outcome for outcome:
+    ///
+    /// * **online validation** is the scheduler's own `check_online_cpu(cpu)` inside
+    ///   `on_preempt_prefer_on`, which returns `None` for an invalid or offline CPU. The broad
+    ///   form reached the same `None` by a different route — `with_cpu` refused first and the
+    ///   caller's `.unwrap_or(None)` collapsed the error — so an invalid CPU still yields `None`
+    ///   with NO mutation of any kind;
+    /// * the previous current task is re-enqueued and `preferred` is made current if it is
+    ///   queued on that CPU, exactly as before;
+    /// * **the legacy fallback is preserved, deliberately.** When `preferred` is NOT queued on
+    ///   `cpu`, the scheduler may still select some other runnable task and return it. That is
+    ///   not "improved" here: the caller compares the returned TID against its own and aborts
+    ///   when they differ, so the mutation and the result both stay exactly what they were;
+    /// * the actual selected TID is returned verbatim, `None` included.
+    ///
+    /// Deliberately NOT done: no rank-2 or any other domain is entered, no `TaskStatus` is read
+    /// or written, and the process-global ambient `scheduler.current_cpu` is neither read nor
+    /// written — this transaction is named by the explicit `cpu` its caller trapped on. (The
+    /// retired `with_cpu` bound `current_cpu` as an admission side effect; on this path that was
+    /// a write of CPU 0 over CPU 0, because the consumer returns immediately unless `cpu.0 == 0`
+    /// and the broad Phase-2 trap guard already bound the same value.) No broad fallback, no
+    /// drain, no retry.
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn on_preempt_prefer_on_cpu_split(
+        &self,
+        cpu: CpuId,
+        preferred_tid: u64,
+    ) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            kernel_mut(&mut sched.scheduler)
+                .on_preempt_prefer_on(cpu, crate::kernel::ipc::ThreadId(preferred_tid))
+                .map(|tid| tid.0)
+        })
+    }
+
     /// U3 (canonical 203C) — the RISC-V post-lock TERMINAL-IDLE predicate, taken as ONE
     /// coherent rank-1 scheduler snapshot.
     ///

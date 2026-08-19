@@ -2452,22 +2452,50 @@ pub(crate) fn c2c_bsp_saved_frame_resume(shared: &crate::runtime::SharedKernel, 
     // is Runnable with a committed saved recv-v2 continuation. If it is not yet resumable, return WITHOUT
     // touching `current`, so the normal trap-return path (which already read `exiting_tid`) stays
     // consistent. Only after this check does the function commit to diverging via iretq.
-    let (asid, cr3, rip, rsp, gprs, fs_base, runnable_saved) =
-        match shared.with(|k| k.ap_saved_resume_context(client_tid)) {
-            Some(v) => v,
-            None => return,
-        };
+    //
+    // U3 (canonical 203C): this was `shared.with(|k| k.ap_saved_resume_context(client_tid))`, the
+    // LAST production broad `SharedKernel::with` in the tree. It is now the existing authoritative
+    // rank-2 snapshot, `ap_saved_resume_context_split`, destructured by NAME so no consumer can
+    // transpose `rip`/`rsp` or read `fs_base` where `cr3` was meant. The legacy body answered the
+    // same question through four separate task-domain re-entries (`task_asid`, `cr3_for_asid`,
+    // `task_status`, `with_tcbs`); the snapshot takes every task-owned field in ONE rank-2
+    // acquisition and resolves the ASID to a page-table root only after that guard is released,
+    // because `PAGE_TABLE_STATE` is an independent, unranked lock. Every refusal is unchanged: an
+    // absent TCB, a missing ASID and an ASID with no CR3 each yield `None`; absent TLS is
+    // `fs_base = 0`; `Blocked`/`Faulted`/`Exited`/`Dead`/`Reserved` and an incomplete saved frame
+    // all clear `runnable_saved`. Nothing is consumed and no scheduler state is touched.
+    //
+    // Identity is NOT strengthened: the snapshot is located by numeric `client_tid` and reports
+    // the ASID bound to it, because this caller holds no generation-bearing incarnation token.
+    let crate::runtime::ApSavedResumeContext {
+        asid,
+        cr3,
+        rip,
+        rsp,
+        gprs,
+        fs_base,
+        runnable_saved,
+    } = match shared.ap_saved_resume_context_split(client_tid) {
+        Some(v) => v,
+        None => return,
+    };
     if !runnable_saved || rip == 0 || rsp == 0 {
         return;
     }
     // Make the client the scheduler's `current` on CPU 0 by PREEMPTING the running task (re-enqueued)
-    // in favour of the client (`on_preempt_prefer_on_cpu`) — reliable even with other tasks queued,
-    // unlike a bare `dispatch_next_on_cpu`. This must succeed so that `current_tid` (and thus the
-    // resumed client's DebugLog user-copy asid) is the client. If it cannot be made current (not
-    // queued), abort WITHOUT committing — no mutation escapes to the trap-return path, retry next tick.
-    let made_current = shared
-        .with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu, client_tid))
-        .unwrap_or(None);
+    // in favour of the client — reliable even with other tasks queued, unlike a bare
+    // `dispatch_next_on_cpu`. This must succeed so that `current_tid` (and thus the resumed client's
+    // DebugLog user-copy asid) is the client. If it cannot be made current (not queued), abort
+    // WITHOUT committing — no mutation escapes to the trap-return path, retry next tick.
+    //
+    // U3 (canonical 203C): this was a broad `with_cpu` re-acquire around
+    // `KernelState::on_preempt_prefer_on_cpu`, a thin wrapper that immediately re-entered the rank-1
+    // scheduler lock anyway. It is now ONE rank-1 transaction, `on_preempt_prefer_on_cpu_split`,
+    // running the SAME `Scheduler::on_preempt_prefer_on` primitive — the policy has one
+    // implementation, not two. An invalid or offline CPU still yields `None`, and the legacy
+    // fallback is preserved exactly: when the client is not queued the scheduler may select another
+    // runnable task, and the comparison below still aborts on that.
+    let made_current = shared.on_preempt_prefer_on_cpu_split(cpu, client_tid);
     if made_current != Some(client_tid) {
         return;
     }

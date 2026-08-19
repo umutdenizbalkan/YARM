@@ -53,16 +53,20 @@ This file has exactly one status page: §0.3.
 Three methods acquire it — `lock` (test-only), `with`, `with_cpu`. Full unlock = no runtime
 guard exists (canonical **204E**), sealed cross-architecture (canonical **205D**).
 
-Current census: **10** production callsites — **9** through `with_cpu` and **1** through the
-broad `with(|state| …)` form — classified **10 runtime-required**, 0 test-only, 0 obsolete,
-0 boot-only. See §0.5. U1 deleted the two obsolete acquisitions (49 → 47) and U2 relocated the
+Current census: **8** production callsites — **8** through `with_cpu` and **0** through the
+broad `with(|state| …)` form — classified **8 runtime-required**, 0 test-only, 0 obsolete,
+0 boot-only. See §0.5. **There is no production broad `SharedKernel::with` callsite left
+anywhere in the tree.** U1 deleted the two obsolete acquisitions (49 → 47) and U2 relocated the
 three test-only ones (47 → 44), leaving the census exactly the runtime-required set — every
 counted acquisition is one a real boot performs. U3 is now retiring those and has delivered
-thirty-four (44 → 39 → 37 → 36 → 34 → 32 → 28 → 25 → 24 → 23 → 22 → 21 → 18 → 17 → 15 → 14 → 13 → 12 → 11 → 10). The three raw `self.state.lock()` sites are the bodies of `lock` /
+thirty-six (44 → 39 → 37 → 36 → 34 → 32 → 28 → 25 → 24 → 23 → 22 → 21 → 18 → 17 → 15 → 14 → 13 → 12 → 11 → 10 → 8). The three raw `self.state.lock()` sites are the bodies of `lock` /
 `with` / `with_cpu` themselves, not callsites, and are deliberately excluded from the total.
 
-The census has crossed U3's numerical **≤24** target, but **U3 is not complete**: other
-drain-classified `with_cpu` acquisitions remain, and canonical **203C** stays OPEN.
+The census has crossed U3's numerical **≤24** target, but **U3 is not complete**: canonical
+**203C** stays OPEN. The post-lock drain class is now fully retired; what remains is the
+authoritative trap dispatch itself (2), the D3-fenced D6 controlled-proof restore (1), the
+unreached x86_64 ED-2 placement (1) and the recv/delivery boundary (4) — enumerated site by
+site in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
 These figures are recomputed from source by `tests/broad_lock_census_guard.rs`, which fails if
 the tree and the published census drift apart.
 
@@ -185,11 +189,11 @@ count stays at 22; complete + partial + open = 2 + 11 + 22 = 35.
 | boot-only | **0** | — |
 | test-only | **0** | none — U2 relocated all three into test-only modules the census excludes: `ipc_recv_with_deadline_split_bridge` (2 acquisitions, never a trap-seam path) and the `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1) |
 | obsolete | **0** | none — U1 deleted both (`SharedKernel::handle_trap_with_cpu`, which had no in-tree caller at all, and `SharedKernel::run_reply_timeout_completion`, which had no production caller) |
-| runtime-required | **10** | the authoritative trap dispatch (`trap_entry.rs:299`, `riscv64/trap.rs:563`), ~20 post-lock drain re-acquisitions, the first-resume trampoline (3), 3 x86_64 AP paths (U3 retired the AP saved-context read, the AP saved-resume enqueue→dispatch placement and the AP return-to-idle `block_current_on_cpu`; the three that remain — the BSP saved-context read, the BSP preferred dispatch and the next-task placement — are retained because none of those paths is live-reached), RISC-V resume, and the recv/delivery boundary re-acquires. Thread creation is gone: U3 retired the D6 first-resume CPU binding onto `bind_current_cpu_split`, whose broad predecessor called a proven `frame=None` no-op, so `thread_state.rs` holds 0. The three blocked-waiter Phase-C completion re-acquisitions in `runtime.rs` are gone too: U3 retired all three onto ONE shared, class-neutral, rank-ordered transaction, `complete_blocked_waiter_delivery_split`. The x86_64 post-drain idle-owner revalidation is gone too: `revalidate_idle_owner_after_drains` is now a CPU-local rank-1 → rank-2 transaction whose frame, FS-base and CR3 work run with no lock held. So are the two recv copy-fault completions, retired onto one class-neutral rank-1 → rank-8 transaction; the capability-rollback re-entry beside them stays broad and dependency-blocked. `src/arch/riscv64/trap.rs` is now fully drained of reacquisitions — U3 retired its terminal-idle predicate onto `terminal_idle_on_cpu_split`, leaving only the canonical broad Phase-2 trap handler. The ordinary-cap deferred sender wake is gone too, onto `apply_split_sender_wake_plan_split` reusing the shared `wake_tid_to_runnable_split` body. BOTH AArch64 `CurrentTaskExited` post-lock reacquisitions are gone as well: the VALIDATION snapshot onto the shared `post_lock_exit_validation_split`, and the REPLACEMENT RESTORE onto `post_exit_replacement_restore_split` (rank 1 validate + bind `current_cpu`, rank 2 nested for the exact replacement's ASID/context/TLS/completion in ONE acquisition, all locks released, then TTBR0_EL1 activation and frame restoration through the single shared frame writer). The D6 controlled-switch proof restore in the same file is NOT in that cohort and stays broad — its body also runs the D6 proof cleanup, whose `d6_ensure_post_cleanup_task_stacks_mapped` performs cross-address-space page-table mutation under the `AI_AGENT_RULES` §14.4 D3 fence, with no split form. U3 finally retired the AArch64 deferred-FutexWait NO-INCOMING idle current-TID read onto the EXISTING authoritative rank-1 transaction `current_tid_authoritative(cpu)` — same `validate_online_cpu` predicate, same returned value, all in ONE rank-1 acquisition instead of the broad guard's two separate scheduler acquisitions, and no new seam. (That helper is now validate-and-READ for the explicit CPU and no longer binds `current_cpu`; see §0's CPU-authority prerequisite.) `src/arch/trap_entry.rs` now holds exactly two: the canonical broad Phase-2 trap dispatch and the D3-fenced D6 proof restore |
+| runtime-required | **8** | re-derived from the final tree in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a: the authoritative broad Phase-2 trap dispatch (`arch/trap_entry.rs:310`) and its RISC-V twin (`arch/riscv64/trap.rs:829`); the D3-fenced D6 controlled-proof restore (`arch/trap_entry.rs:1694`), whose body also maps kernel stacks across every live task root; the unreached x86_64 ED-2 next-task placement (`arch/x86_64/smp.rs:2727`), retained byte-for-byte; and four recv/delivery-boundary sites in `runtime.rs` — the Phase-A multi-domain composite (`4093`) plus three re-entries of the same `rollback_materialized_recv_cap` capability-teardown body (`4193`, `4486`, `5278`). The whole post-lock drain class, the first-resume trampoline, the AArch64 split return, the RISC-V resume site and the identity/SMP/deadline helpers are all retired and no longer exist. |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
 
-Classified total: **10** acquisition callsites (**9** `with_cpu` + **1** broad `with`), which
-is 0 + 0 + 0 + 10. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
+Classified total: **8** acquisition callsites (**8** `with_cpu` + **0** broad `with`), which
+is 0 + 0 + 0 + 8. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
 
 ### 0.6 Structural blockers
 
@@ -208,9 +212,10 @@ is 0 + 0 + 0 + 10. `tests/broad_lock_census_guard.rs` recomputes all of these fr
    memory corruption is fixed (see `doc/KERNEL_TEST_RULES.md` Rule H1); what remains is
    process-global test contention — test-infrastructure debt, a prerequisite for using the
    hosted suite as a 205C harness rather than 205C completion work.
-9. **AArch64 re-acquires the broad lock on its split return path**
-   (`src/arch/trap_entry.rs:1432`) — a runtime-required site that 204B/204E must localize.
-   205A will *report* this cell; it is not where it gets retired.
+9. ~~**AArch64 re-acquires the broad lock on its split return path**
+   (`src/arch/trap_entry.rs:1432`).~~ **RESOLVED.** Stage 199D retired it;
+   `finalize_split_handled_syscall` takes no broad acquisition today (verified against the
+   final tree), and the site is absent from the §1.4a inventory.
 
 ### 0.7 Smallest next production stage
 
@@ -489,8 +494,62 @@ workload genuinely reach them, repeatedly.
   full `STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL … result=ok`. One earlier run was discarded as
   visibly serial-spliced (fragments of a marker survived without the intact line); its raw log was
   preserved and it is classified separately, not as a failure.
-* **The two acquisitions in `c2c_bsp_saved_frame_resume` remain present and unchanged**, for the
-  next U3 **10 → 8** retirement pass. **The census remains 10** (`with_cpu` 9, broad `with` 1).
+* **The two acquisitions in `c2c_bsp_saved_frame_resume` remained present and unchanged** at
+  that checkpoint. **The census remained 10** (`with_cpu` 9, broad `with` 1). Both have since
+  been retired — see the next entry.
+
+**U3 (canonical 203C) — DELIVERED. The x86_64 BSP SAVED-RESUME COHORT is retired.
+CENSUS 10 → 8. `with_broad` 1 → 0. Canonical 203C remains OPEN.**
+
+Both broad acquisitions in `c2c_bsp_saved_frame_resume` are gone, retired in one pass against
+the now repeatedly live-reached path.
+
+* **Saved context now uses the authoritative rank-2 snapshot.**
+  `shared.with(|k| k.ap_saved_resume_context(client_tid))` — the last production broad
+  `SharedKernel::with` in the tree — now calls the EXISTING
+  `SharedKernel::ap_saved_resume_context_split`, the same transaction the AP site already ran,
+  so no second reader was created. It is destructured by NAME
+  (`ApSavedResumeContext { asid, cr3, rip, rsp, gprs, fs_base, runnable_saved }`). The legacy
+  body answered the same question through four separate task-domain re-entries (`task_asid`,
+  `cr3_for_asid`, `task_status`, `with_tcbs`); the snapshot takes every task-owned field in ONE
+  rank-2 acquisition and resolves the ASID to a page-table root only after that guard is
+  released, because `PAGE_TABLE_STATE` is an independent, unranked lock.
+* **Scheduler preempt/prefer is one explicit-CPU rank-1 transaction.**
+  `with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu, client_tid))` now calls
+  `SharedKernel::on_preempt_prefer_on_cpu_split`, which runs the SAME
+  `Scheduler::on_preempt_prefer_on` implementation the retired `KernelState` wrapper ran — that
+  wrapper immediately re-entered the rank-1 scheduler lock anyway. The policy keeps exactly one
+  implementation. Neither transaction reads or writes the process-global ambient
+  `scheduler.current_cpu`; both are named by the explicit `cpu` the caller trapped on.
+* **Snapshot-before-selection and the legacy fallback semantics are preserved.** The read-only
+  snapshot still precedes the scheduler mutation — it was not reordered after it — and when the
+  preferred TID is not queued on that CPU the scheduler may still select another runnable task
+  and return it. That fallback is preserved verbatim, not "improved": the caller's
+  `made_current != Some(client_tid)` comparison is what rejects it. An invalid or offline CPU
+  still yields `None` with no mutation.
+* **All hardware/frame/iret work is lock-free.** Every domain guard is released before
+  `DONE.swap`, the `X86_BSP_SAVED_DISPATCH_OK` marker, `configure_syscall_msrs_for_self`, the
+  FS-base WRMSR, the CR3 write, the frame construction and `resume_user_mode_iret`.
+* **No stronger incarnation authority is claimed than the caller possesses.** This path holds
+  only a numeric `client_tid` and the ASID the snapshot discovers; it carries no
+  generation-bearing incarnation token, and no `DispatchMarkToken` or generation authority was
+  fabricated for it.
+* **Both caller-free `KernelState` wrappers were deleted** — `ap_saved_resume_context` and
+  `on_preempt_prefer_on_cpu` — only after confirming neither had any remaining caller.
+  `src/arch/x86_64/smp.rs` now holds exactly one acquisition: the unreached ED-2 next-task
+  placement in `ap_sched_next_or_idle`, retained byte-for-byte with its `Err(_) => None` policy.
+* **Census: `with_broad` 1 → 0, `with_cpu` 9 → 8, runtime-required/total 10 → 8.** The full
+  remaining eight-site inventory is re-derived from the final source tree in
+  `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a, site by site.
+* **Live proof.** Five consecutive clean runs of
+  `scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh` against freshly built matched artifacts,
+  twelve named markers exactly once per run, including
+  `X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved`. **These five seals are the live proof for this
+  changed path.** `scripts/qemu-x86_64-ap-saved-return-smoke.sh` exercises the untouched CPU-1
+  AP-return path; its failure signature reproduced interleaved at exact base `c2b9b77` (head
+  9/10, base 8/9, same assertion and marker counts), so it is recorded as an **exact-base
+  flake/deferral** — evidence neither for nor against this BSP change. That profile is **not**
+  claimed green.
 
 **U3 and 199C remain OPEN. 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN (partially
 production-wired).** Directive U8 is already source-complete. Canonical stage arithmetic is

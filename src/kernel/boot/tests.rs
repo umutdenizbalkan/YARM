@@ -87188,9 +87188,13 @@ mod stage199a2d2c2b_guards {
     // never a hardcoded constant.
     #[test]
     fn fs_base_sourced_from_task_state() {
-        let ex = include_str!("exec_state.rs");
+        // U3 (203C): the last caller of `KernelState::ap_saved_resume_context` was retired, so
+        // the helper was deleted. The fact this guard protects — FS base is read from the task's
+        // own saved TLS, never a constant — is unchanged; it now lives in the single surviving
+        // rank-2 snapshot, `SharedKernel::ap_saved_resume_context_split`.
+        let rt = include_str!("../../runtime.rs");
         assert!(
-            ex.contains("let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);"),
+            rt.contains("let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);"),
             "FS base comes from the task's saved TLS state"
         );
         let smp = include_str!("../../arch/x86_64/smp.rs");
@@ -87676,9 +87680,13 @@ mod stage199a2d2c2b2_guards {
     }
 
     // (14) Task FS base comes from the server task's saved TLS state (never a constant).
+    //
+    // U3 (203C): re-derived onto `SharedKernel::ap_saved_resume_context_split` — the retired
+    // `KernelState::ap_saved_resume_context` was deleted once its last caller converted. The
+    // sourcing rule is identical, the acquisition is narrower.
     #[test]
     fn task_fs_from_server_state() {
-        assert!(EXEC.contains("let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);"));
+        assert!(RUNTIME.contains("let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);"));
         assert!(SMP.contains("in(\"eax\") (fs_base & 0xFFFF_FFFF) as u32"));
     }
 
@@ -87770,15 +87778,16 @@ mod stage199a2d2c2b3_guards {
     const USER_SMOKE: &str =
         include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-user-consume-smoke.sh");
 
-    // (1) The AP saved resume loads the SELECTED SERVER's CR3 (from ap_saved_resume_context), not the
-    // BSP/current CR3.
+    // (1) The AP saved resume loads the SELECTED SERVER's CR3 (from the rank-2
+    // ap_saved_resume_context_split snapshot), not the BSP/current CR3.
     #[test]
     fn saved_resume_loads_server_cr3() {
         // The saved-context snapshot sources cr3 from cr3_for_asid(server asid); the resume
         // loads it. U3 (203C): the AP resume now takes that snapshot through the rank-2
         // transaction `SharedKernel::ap_saved_resume_context_split` instead of a broad read —
         // the CR3 source is unchanged, only the acquisition is.
-        assert!(EXEC.contains("let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;"));
+        // U3 (203C): the BSP counterpart converted too, so the legacy `KernelState` copy was
+        // deleted and `runtime.rs` holds the sole CR3 resolution — after rank 2 is released.
         assert!(
             RUNTIME.contains("let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;")
         );
@@ -87787,9 +87796,14 @@ mod stage199a2d2c2b3_guards {
     }
 
     // (2) ASID/CR3 correspond to the resumed server {tid,asid} (identity-validated).
+    //
+    // U3 (203C): re-derived from `EXEC.contains("let asid = self.task_asid(tid)?;")`. The ASID
+    // is now read inside the SAME rank-2 snapshot that yields the saved context, so ASID and
+    // context cannot be torn apart by an interleaving — a strictly stronger correspondence than
+    // the retired helper's separate `task_asid` re-entry provided.
     #[test]
     fn asid_cr3_correspond_to_server() {
-        assert!(EXEC.contains("let asid = self.task_asid(tid)?;"));
+        assert!(RUNTIME.contains("let asid = tcb.asid?;"));
         assert!(SMP.contains("Some(t) if t == expected => t,"));
     }
 
@@ -88098,8 +88112,11 @@ mod stage199a2d2c2c_reply_guards {
         let body = &f[..f.find("\n}\n").unwrap()];
         assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
         assert!(body.contains("ipcreply_direct_smp_reply_delivered_count() < 1"));
-        assert!(body.contains("on_preempt_prefer_on_cpu(cpu, client_tid)"));
-        assert!(body.contains("ap_saved_resume_context(client_tid)"));
+        // U3 / 203C: both legacy broad acquisitions retired onto narrow rank-ordered
+        // transactions — the rank-2 saved-context snapshot and the rank-1 preempt-prefer
+        // mutation. The 8-step ordering below is unchanged.
+        assert!(body.contains("on_preempt_prefer_on_cpu_split(cpu, client_tid)"));
+        assert!(body.contains("ap_saved_resume_context_split(client_tid)"));
         assert!(body.contains("clear_trap_dispatch_depth(cpu)"));
         assert!(body.contains("resume_user_mode_iret(&frame)"));
         // Invoked from the trap-return path, not the 0xF1 handler.
@@ -88288,7 +88305,7 @@ mod stage199a2d3_freeze_guards {
             .unwrap();
         let body = &f[..f.find("\n}\n").unwrap()];
         let select = body
-            .find("on_preempt_prefer_on_cpu(cpu, client_tid)")
+            .find("on_preempt_prefer_on_cpu_split(cpu, client_tid)")
             .unwrap();
         let publish = body
             .find("X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved")
@@ -90824,14 +90841,19 @@ mod stage200c_reply_timeout_transaction {
         );
     }
 
-    /// U3 (203C) — the x86 SMP saved-context cohort landed as a REDUCED cohort: the AP
-    /// saved-frame resume converted onto `SharedKernel::ap_saved_resume_context_split`; the BSP
-    /// one did not, because its path is not live-reached at this base (the cross-CPU reply
-    /// oracle never emits `X86_BSP_SAVED_DISPATCH_OK`). One broad read therefore remains, and it
-    /// is deliberately the unreached one — an unreached site is never retired merely because it
-    /// is homologous to a reached one.
+    /// U3 (203C) — the x86 SMP saved-context cohort is now COMPLETE. The AP saved-frame resume
+    /// converted onto `SharedKernel::ap_saved_resume_context_split` first; the BSP one followed
+    /// once its path became live-reached (`X86_BSP_SAVED_DISPATCH_OK` is now emitted by the
+    /// cross-CPU reply oracle, five consecutive clean runs). Both sites therefore run narrow
+    /// rank-ordered transactions and **no** production broad `SharedKernel::with` acquisition
+    /// remains anywhere in `arch/x86_64/smp.rs`.
+    ///
+    /// This re-derives the earlier `u3_x86_smp_broad_read_is_the_unreached_bsp_site_only`
+    /// guard, which pinned the reduced-cohort state (exactly one retained broad read). The
+    /// invariant it protected — the broad count in this file is exact and never drifts upward
+    /// — is preserved and tightened from 1 to 0.
     #[test]
-    fn u3_x86_smp_broad_read_is_the_unreached_bsp_site_only() {
+    fn u3_x86_smp_has_no_broad_read_left() {
         const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
         let code: alloc::string::String = SMP_SRC
             .lines()
@@ -90840,18 +90862,24 @@ mod stage200c_reply_timeout_transaction {
             .join("\n");
         assert_eq!(
             code.matches(".with(|").count(),
-            1,
-            "one broad read remains — the unreached BSP saved-frame resume"
+            0,
+            "no broad read remains — both saved-frame resumes run narrow transactions"
         );
         assert!(
-            code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
-            "the retained broad read is the BSP site, not the converted AP one"
+            !code.contains("ap_saved_resume_context(client_tid)"),
+            "the BSP site no longer reads through the retired KernelState helper"
         );
         assert_eq!(
             code.matches("shared.ap_saved_resume_context_split(tid)")
                 .count(),
             1,
             "the AP site runs the narrow rank-2 transaction"
+        );
+        assert_eq!(
+            code.matches("shared.ap_saved_resume_context_split(client_tid)")
+                .count(),
+            1,
+            "the BSP site runs the same narrow rank-2 transaction"
         );
     }
 
@@ -120209,10 +120237,10 @@ mod stage199d_wa3c1_waiter_record {
 /// legacy `KernelState` body produced, and the LOCK SHAPE is one rank-2 acquisition with the
 /// ASID→CR3 resolution outside it.
 ///
-/// The BSP counterpart (`c2c_bsp_saved_frame_resume`) is deliberately NOT converted: its path is
-/// unreachable at this base (the cross-CPU reply oracle never reaches
-/// `X86_BSP_SAVED_DISPATCH_OK`), so it keeps the legacy broad read and
-/// `KernelState::ap_saved_resume_context` is retained for it.
+/// The BSP counterpart (`c2c_bsp_saved_frame_resume`) now runs the SAME transaction. It was
+/// held back while its path was unreachable; once the cross-CPU reply oracle began reaching
+/// `X86_BSP_SAVED_DISPATCH_OK`, it was converted too, and the caller-free
+/// `KernelState::ap_saved_resume_context` was deleted.
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod u3_ap_saved_context_snapshot {
@@ -120570,23 +120598,28 @@ mod u3_ap_saved_context_snapshot {
         );
     }
 
+    /// Re-derived from `u3_unreached_bsp_site_keeps_the_legacy_broad_read`. That guard pinned
+    /// the reduced-cohort state — one retained broad read at the then-unreached BSP site, and
+    /// the `KernelState` helper retained for it. The BSP path is now live-reached, so both
+    /// halves invert: zero broad reads remain, the BSP site shares the AP site's rank-2
+    /// transaction, and the caller-free `KernelState::ap_saved_resume_context` is deleted.
     #[test]
-    fn u3_unreached_bsp_site_keeps_the_legacy_broad_read() {
+    fn u3_bsp_site_shares_the_narrow_snapshot_and_the_legacy_helper_is_gone() {
         let code = code_of(SMP);
         assert_eq!(
             code.matches(".with(|").count(),
-            1,
-            "exactly one broad read remains: the BSP saved-frame resume, whose path is not \
-             live-reached at this base and is therefore not converted"
+            0,
+            "no broad read remains: the BSP saved-frame resume is converted onto the same \
+             narrow rank-2 snapshot the AP site uses"
         );
         assert!(
-            code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
-            "the retained broad read is the BSP one"
+            code.contains("shared.ap_saved_resume_context_split(client_tid)"),
+            "the BSP site runs the narrow rank-2 transaction"
         );
         const EXEC: &str = include_str!("exec_state.rs");
         assert!(
-            EXEC.contains("pub(crate) fn ap_saved_resume_context("),
-            "KernelState::ap_saved_resume_context is retained for that unconverted caller"
+            !EXEC.contains("pub(crate) fn ap_saved_resume_context("),
+            "KernelState::ap_saved_resume_context is deleted — it has no caller left"
         );
     }
 }
@@ -121102,11 +121135,12 @@ mod u3_ap_enqueue_dispatch_transaction {
         let code = code_of(SMP);
         // U3 (203C) has since retired the AP return-to-idle `block_current_on_cpu` acquisition
         // as well, onto `block_current_on_cpu_split`.
+        // U3 (203C) has since also retired the BSP saved-resume preempt-prefer acquisition onto
+        // `on_preempt_prefer_on_cpu_split`, leaving ED-2 as the only one.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            2,
-            "two with_cpu acquisitions remain: on_preempt_prefer_on_cpu and the unreached ED-2 \
-             next-task placement"
+            1,
+            "one with_cpu acquisition remains: the unreached ED-2 next-task placement"
         );
         // ED-2's exact historical body, unchanged — including its distinct refusal policy.
         assert!(
@@ -121116,12 +121150,18 @@ mod u3_ap_enqueue_dispatch_transaction {
             "the ED-2 site keeps its broad acquisition and its `Err(_) => None` policy verbatim: \
              no existing workload reaches its success body"
         );
-        // The retained deliberately-excluded acquisitions.
+        // Re-derived: the two BSP saved-resume acquisitions that this guard used to pin as
+        // deliberately-excluded have since been retired onto narrow transactions. What the
+        // guard still protects is that ED-2 was NOT swept along with them.
         assert!(
-            code.contains("k.on_preempt_prefer_on_cpu(cpu, client_tid)")
-                && code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
-            "the BSP preempt and BSP saved-context acquisitions are out of this cohort and \
-             stay exactly as they were"
+            !code.contains("k.on_preempt_prefer_on_cpu(cpu, client_tid)")
+                && !code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
+            "the BSP preempt and BSP saved-context acquisitions are retired; only ED-2 remains"
+        );
+        assert!(
+            code.contains("on_preempt_prefer_on_cpu_split(cpu, client_tid)")
+                && code.contains("shared.ap_saved_resume_context_split(client_tid)"),
+            "both BSP sites now run narrow rank-ordered transactions"
         );
     }
 }
@@ -121518,23 +121558,28 @@ mod u3_ap_block_current_transaction {
         );
     }
 
+    /// Re-derived from `u3_bc_the_three_retained_smp_acquisitions_are_untouched`. Of the three
+    /// acquisitions this guard pinned as retained, two — the BSP preferred dispatch and the BSP
+    /// saved-context broad read — have since been retired onto narrow rank-ordered
+    /// transactions, once the BSP saved-resume path became live-reached. ED-2 remains the sole
+    /// retained acquisition in this file, and the guard keeps it pinned verbatim.
     #[test]
-    fn u3_bc_the_three_retained_smp_acquisitions_are_untouched() {
+    fn u3_bc_the_sole_retained_smp_acquisition_is_ed2() {
         let code = code_of(SMP);
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            2,
-            "two with_cpu acquisitions remain: the BSP preferred dispatch and the unreached \
-             ED-2 next-task placement"
+            1,
+            "one with_cpu acquisition remains: the unreached ED-2 next-task placement"
         );
         assert_eq!(
             code.matches(".with(|").count(),
-            1,
-            "one broad read remains: the unreached BSP saved-context read"
+            0,
+            "no broad read remains: the BSP saved-context read is converted"
         );
         assert!(
-            code.contains("k.on_preempt_prefer_on_cpu(cpu, client_tid)"),
-            "the BSP preferred-dispatch acquisition is retained verbatim"
+            !code.contains("k.on_preempt_prefer_on_cpu(cpu, client_tid)")
+                && code.contains("on_preempt_prefer_on_cpu_split(cpu, client_tid)"),
+            "the BSP preferred-dispatch acquisition runs the narrow rank-1 transaction"
         );
         assert!(
             code.contains("k.enqueue_on_cpu(cpu, next_tid)")
@@ -121543,8 +121588,9 @@ mod u3_ap_block_current_transaction {
             "the unreached ED-2 site is retained verbatim, including its refusal policy"
         );
         assert!(
-            code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
-            "the unreached BSP saved-context broad read is retained verbatim"
+            !code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))")
+                && code.contains("shared.ap_saved_resume_context_split(client_tid)"),
+            "the BSP saved-context read runs the narrow rank-2 transaction"
         );
         assert!(
             !code.contains("k.block_current_on_cpu(cpu)"),
@@ -133588,16 +133634,420 @@ mod u3_saved_resume_cpu_authority {
         );
     }
 
-    /// The two target acquisitions are untouched: this pass is census-neutral.
+    /// Re-derived from `the_saved_resume_cohort_is_still_present_and_unretired`, which pinned
+    /// the census-neutrality of the reachability prerequisite that made this path live. With
+    /// the path reached, the cohort is retired: both acquisitions are gone and only ED-2 is
+    /// left. The invariant this guard carries forward is the same one — the acquisition count
+    /// in `x86_64/smp.rs` is exact and never drifts.
     #[test]
-    fn the_saved_resume_cohort_is_still_present_and_unretired() {
+    fn the_saved_resume_cohort_is_retired_onto_narrow_transactions() {
         let smp = code_only(SMP_SRC);
-        assert!(smp.contains("match shared.with(|k| k.ap_saved_resume_context(client_tid)) {"));
-        assert!(smp.contains(".with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu, client_tid))"));
+        assert!(!smp.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"));
+        assert!(!smp.contains(".with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu, client_tid))"));
+        assert!(smp.contains("shared.ap_saved_resume_context_split(client_tid)"));
+        assert!(smp.contains("shared.on_preempt_prefer_on_cpu_split(cpu, client_tid)"));
         assert_eq!(
             smp.matches(".with_cpu(").count(),
-            2,
-            "x86_64/smp.rs keeps exactly its two audited acquisitions"
+            1,
+            "x86_64/smp.rs keeps exactly one audited acquisition (ED-2)"
+        );
+        assert_eq!(
+            smp.matches(".with(|").count(),
+            0,
+            "x86_64/smp.rs has no broad acquisition left"
+        );
+    }
+}
+
+/// U3 (canonical 203C) — retiring BOTH x86_64 BSP saved-resume broad acquisitions.
+///
+/// `c2c_bsp_saved_frame_resume` used to take two broad guards: `shared.with(|k|
+/// k.ap_saved_resume_context(client_tid))` — the LAST production broad `SharedKernel::with` in
+/// the tree — and `shared.with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu, client_tid))`. Both
+/// are now narrow rank-ordered transactions:
+///
+/// * the rank-2 snapshot is the EXISTING `ap_saved_resume_context_split`, already proven by
+///   `u3_ap_saved_context_snapshot` — the BSP site adds no second reader, it shares the one the
+///   AP site runs, destructured by NAME;
+/// * the rank-1 mutation is the ONE new transaction, `on_preempt_prefer_on_cpu_split`, running
+///   the SAME `Scheduler::on_preempt_prefer_on` primitive the retired `KernelState` wrapper ran.
+///
+/// These pin the rank-1 transaction's behaviour outcome-for-outcome (including the legacy
+/// fallback, which is deliberately NOT improved) and the consumer's unchanged 8-step ordering
+/// with every domain guard released before the divergence.
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod u3_bsp_saved_resume_retirement {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskStatus;
+    use crate::runtime::SharedKernel;
+
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SCHED_STATE: &str = include_str!("scheduler_state.rs");
+
+    const A: u64 = 7701;
+    const B: u64 = 7702;
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of_resume() -> alloc::string::String {
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_saved_frame_resume(")
+            .nth(1)
+            .expect("the consumer");
+        f[..f.find("\n}\n").expect("bounded")].into()
+    }
+
+    fn kernel() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    fn make_runnable(k: &SharedKernel, tid: u64) {
+        k.with(|s| {
+            s.register_task(tid).expect("task");
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .unwrap()
+                    .status = TaskStatus::Runnable;
+            });
+        });
+    }
+
+    fn current_on(k: &SharedKernel, cpu: CpuId) -> Option<u64> {
+        k.with(|s| s.current_tid_on_cpu(cpu))
+    }
+
+    fn queue_len(k: &SharedKernel, cpu: CpuId) -> usize {
+        k.with(|s| s.runnable_count_on_cpu(cpu))
+    }
+
+    // ── the rank-1 transaction, outcome for outcome ───────────────────────────────────────
+
+    /// The preferred TID is queued on the named CPU: it is dequeued and made current, and the
+    /// transaction reports exactly it. This is the only outcome the consumer commits on.
+    #[test]
+    fn u3_pp_queued_preferred_is_made_current_and_returned() {
+        let k = kernel();
+        make_runnable(&k, A);
+        k.with(|s| s.enqueue_on_cpu(CpuId(0), A).expect("queue A on cpu0"));
+        assert_eq!(
+            k.on_preempt_prefer_on_cpu_split(CpuId(0), A),
+            Some(A),
+            "the queued preferred TID is selected"
+        );
+        assert_eq!(
+            current_on(&k, CpuId(0)),
+            Some(A),
+            "and installed as current"
+        );
+    }
+
+    /// The task that was current is RE-ENQUEUED rather than dropped — the preempt half of
+    /// `on_preempt_prefer`. Nothing is lost from the runqueue.
+    #[test]
+    fn u3_pp_the_preempted_current_is_re_enqueued() {
+        let k = kernel();
+        make_runnable(&k, A);
+        make_runnable(&k, B);
+        k.with(|s| {
+            s.enqueue_on_cpu(CpuId(0), B).expect("queue B");
+            s.enqueue_on_cpu(CpuId(0), A).expect("queue A");
+        });
+        // Install B as current by preferring it first.
+        assert_eq!(k.on_preempt_prefer_on_cpu_split(CpuId(0), B), Some(B));
+        let queued = queue_len(&k, CpuId(0));
+        // Now prefer A; B must go back onto the queue, not vanish.
+        assert_eq!(k.on_preempt_prefer_on_cpu_split(CpuId(0), A), Some(A));
+        assert_eq!(current_on(&k, CpuId(0)), Some(A));
+        assert_eq!(
+            queue_len(&k, CpuId(0)),
+            queued,
+            "the preempted current is re-enqueued, so the queue length is conserved"
+        );
+    }
+
+    /// An offline/invalid CPU yields `None` with NO mutation. The broad form reached the same
+    /// `None` by a different route (`with_cpu` refused, `.unwrap_or(None)` collapsed it); the
+    /// scheduler's own `check_online_cpu` reaches it here.
+    #[test]
+    fn u3_pp_offline_cpu_yields_none_and_mutates_nothing() {
+        let k = kernel();
+        make_runnable(&k, A);
+        k.with(|s| s.enqueue_on_cpu(CpuId(0), A).expect("queue A on cpu0"));
+        let before_q0 = queue_len(&k, CpuId(0));
+        let before_c0 = current_on(&k, CpuId(0));
+        assert_eq!(
+            k.on_preempt_prefer_on_cpu_split(CpuId(1), A),
+            None,
+            "CPU 1 is not online in this fixture"
+        );
+        assert_eq!(queue_len(&k, CpuId(0)), before_q0, "no queue was touched");
+        assert_eq!(
+            current_on(&k, CpuId(0)),
+            before_c0,
+            "no current was touched"
+        );
+    }
+
+    /// **The legacy fallback is preserved exactly, not improved.** When the preferred TID is not
+    /// queued on that CPU the scheduler falls back to normal FIFO dispatch and may return a
+    /// DIFFERENT task. The transaction reports that other TID verbatim — the caller, not this
+    /// seam, is what rejects it.
+    #[test]
+    fn u3_pp_absent_preferred_keeps_the_legacy_fallback_selection() {
+        let k = kernel();
+        make_runnable(&k, B);
+        k.with(|s| s.enqueue_on_cpu(CpuId(0), B).expect("queue B on cpu0"));
+        // A is never queued on CPU 0.
+        let got = k.on_preempt_prefer_on_cpu_split(CpuId(0), A);
+        assert_eq!(
+            got,
+            Some(B),
+            "the legacy FIFO fallback selects another runnable task; it is NOT suppressed"
+        );
+        assert_ne!(got, Some(A), "and it is not the preferred TID");
+        assert_eq!(current_on(&k, CpuId(0)), Some(B));
+    }
+
+    /// A CPU carrying only its bootstrap idle current re-enqueues that current and the FIFO
+    /// fallback re-selects it. This is the legacy behaviour verbatim: absent the preferred TID,
+    /// the transaction returns whatever the scheduler picked — here tid 0 — and does NOT
+    /// synthesise a refusal.
+    #[test]
+    fn u3_pp_bootstrap_only_cpu_reselects_its_idle_current() {
+        let k = kernel();
+        assert_eq!(
+            current_on(&k, CpuId(0)),
+            Some(0),
+            "precondition: tid 0 is CPU 0's bootstrap current"
+        );
+        let got = k.on_preempt_prefer_on_cpu_split(CpuId(0), A);
+        assert_eq!(got, Some(0), "the fallback re-selects the idle current");
+        assert_ne!(got, Some(A), "it is never the absent preferred TID");
+    }
+
+    /// CPU confinement: preferring on CPU 0 never steals a task queued on CPU 1. The fallback
+    /// stays inside CPU 0's own queues, so it re-selects CPU 0's idle current instead.
+    #[test]
+    fn u3_pp_never_steals_from_another_cpu() {
+        let k = kernel();
+        k.with(|s| s.bring_up_cpu(CpuId(1)).expect("cpu1"));
+        make_runnable(&k, A);
+        k.with(|s| s.enqueue_on_cpu(CpuId(1), A).expect("queue A on cpu1"));
+        let got = k.on_preempt_prefer_on_cpu_split(CpuId(0), A);
+        assert_ne!(got, Some(A), "CPU 0 must not steal A from CPU 1");
+        assert_eq!(got, Some(0), "it selects only from CPU 0's own queues");
+        assert_eq!(queue_len(&k, CpuId(1)), 1, "cpu1's task stays on cpu1");
+    }
+
+    // ── lock shape ────────────────────────────────────────────────────────────────────────
+
+    /// Exactly ONE rank-1 acquisition, no other domain, and no ambient `current_cpu` touch —
+    /// the CPU is the explicit one the caller trapped on.
+    #[test]
+    fn u3_pp_is_one_rank1_acquisition_and_touches_no_ambient_cpu() {
+        let body = RUNTIME
+            .split("pub(crate) fn on_preempt_prefer_on_cpu_split(")
+            .nth(1)
+            .expect("the transaction")
+            .split("\n    }\n")
+            .next()
+            .expect("bounded");
+        assert_eq!(
+            body.matches("with_scheduler_split_mut").count(),
+            1,
+            "exactly one rank-1 acquisition"
+        );
+        for banned in [
+            "with_task_tcbs_split_mut",
+            "with_ipc_split_mut",
+            "with_cnodes_split",
+            "with_vm_split_mut",
+            ".with_cpu(",
+            "self.with(",
+            "current_cpu",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "`{banned}` must not appear in the rank-1 transaction"
+            );
+        }
+        assert!(
+            body.contains("on_preempt_prefer_on(cpu,"),
+            "it runs the SAME scheduler primitive the retired wrapper ran"
+        );
+    }
+
+    /// The policy has ONE implementation. The retired `KernelState` wrappers are gone, and
+    /// nothing re-introduced a second copy of the preempt-prefer logic.
+    #[test]
+    fn u3_the_retired_kernelstate_wrappers_are_deleted() {
+        assert!(
+            !SCHED_STATE.contains("pub(crate) fn on_preempt_prefer_on_cpu("),
+            "KernelState::on_preempt_prefer_on_cpu is deleted — it has no caller left"
+        );
+        const EXEC: &str = include_str!("exec_state.rs");
+        assert!(
+            !EXEC.contains("pub(crate) fn ap_saved_resume_context("),
+            "KernelState::ap_saved_resume_context is deleted — it has no caller left"
+        );
+        assert_eq!(
+            RUNTIME
+                .matches("pub(crate) fn on_preempt_prefer_on_cpu_split(")
+                .count(),
+            1,
+            "exactly one authoritative rank-1 preempt-prefer transaction exists"
+        );
+    }
+
+    // ── the consumer: the 8-step ordering is unchanged ────────────────────────────────────
+
+    /// The consumer keeps its exact legacy order: reply/client gates -> READ-ONLY snapshot ->
+    /// reject a partial frame -> scheduler mutation -> require `selected == client_tid` -> DONE
+    /// once -> clear pending + marker -> lock-free MSR/frame/CR3/iret. In particular the
+    /// snapshot is NOT moved after the scheduler mutation.
+    #[test]
+    fn u3_consumer_ordering_is_unchanged() {
+        let body = body_of_resume();
+        let gate_reply = body
+            .find("ipcreply_direct_smp_reply_delivered_count() < 1")
+            .expect("reply gate");
+        let gate_client = body.find("if client_tid == 0 {").expect("client gate");
+        let snapshot = body
+            .find("shared.ap_saved_resume_context_split(client_tid)")
+            .expect("snapshot");
+        let partial = body.find("if !runnable_saved").expect("partial reject");
+        let mutate = body
+            .find("shared.on_preempt_prefer_on_cpu_split(cpu, client_tid)")
+            .expect("mutation");
+        let require = body
+            .find("if made_current != Some(client_tid) {")
+            .expect("identity check");
+        let done = body.find("DONE.swap(true").expect("one-shot latch");
+        let pending = body
+            .find("C2C_BSP_RESCHEDULE_PENDING.store(false")
+            .expect("pending clear");
+        let marker = body
+            .find("X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved")
+            .expect("marker");
+        let msrs = body
+            .find("configure_syscall_msrs_for_self()")
+            .expect("syscall MSRs");
+        let frame = body.find("ApSavedResumeFrame").expect("frame");
+        let cr3 = body.find("mov cr3, {}").expect("CR3 load");
+        let iret = body
+            .find("resume_user_mode_iret(&frame)")
+            .expect("divergence");
+        for (a, b, what) in [
+            (gate_reply, gate_client, "reply gate before client gate"),
+            (gate_client, snapshot, "both gates before the snapshot"),
+            (
+                snapshot,
+                partial,
+                "snapshot before the partial-frame reject",
+            ),
+            (partial, mutate, "reject a partial frame BEFORE mutating"),
+            (mutate, require, "mutate then require selected == client"),
+            (require, done, "identity check before the one-shot latch"),
+            (done, pending, "latch before clearing pending"),
+            (pending, marker, "pending cleared before the marker"),
+            (marker, msrs, "marker before the MSR writes"),
+            (msrs, frame, "MSRs before frame construction"),
+            (frame, cr3, "frame before the CR3 load"),
+            (cr3, iret, "CR3 loaded before diverging"),
+        ] {
+            assert!(a < b, "{what}");
+        }
+    }
+
+    /// §D — no domain guard is held across the divergence. Every acquisition in the body sits
+    /// BEFORE the one-shot latch; the latch, the marker, the MSR writes, the CR3 load, the
+    /// frame construction and the iretq all run guard-free.
+    #[test]
+    fn u3_consumer_holds_no_guard_across_the_divergence() {
+        let body = body_of_resume();
+        let code = code_of(&body);
+        let done = code.find("DONE.swap(true").expect("one-shot latch");
+        let tail = &code[done..];
+        for banned in [
+            "with_scheduler_split_mut",
+            "with_task_tcbs_split_mut",
+            "with_ipc_split_mut",
+            "with_cnodes_split",
+            "with_vm_split_mut",
+            ".with_cpu(",
+            "shared.with(",
+            "ap_saved_resume_context_split",
+            "on_preempt_prefer_on_cpu_split",
+        ] {
+            assert!(
+                !tail.contains(banned),
+                "`{banned}` must not run after the one-shot latch — the divergence is lock-free"
+            );
+        }
+        // Both transactions are *values by then*: the snapshot's fields and the selection are
+        // plain locals, so the tail can still name them.
+        for step in [
+            "X86_BSP_SAVED_DISPATCH_OK",
+            "configure_syscall_msrs_for_self()",
+            "ApSavedResumeFrame",
+            "resume_user_mode_iret(&frame)",
+        ] {
+            assert!(tail.contains(step), "`{step}` still runs, guard-free");
+        }
+    }
+
+    /// The snapshot is destructured BY NAME, so no consumer can transpose `rip`/`rsp` or read
+    /// `fs_base` where `cr3` was meant — the retired positional 7-tuple could.
+    #[test]
+    fn u3_consumer_destructures_the_snapshot_by_name() {
+        let body = body_of_resume();
+        assert!(
+            body.contains("let crate::runtime::ApSavedResumeContext {"),
+            "named-struct destructuring, not a positional tuple"
+        );
+        for field in [
+            "asid,",
+            "cr3,",
+            "rip,",
+            "rsp,",
+            "gprs,",
+            "fs_base,",
+            "runnable_saved,",
+        ] {
+            assert!(body.contains(field), "`{field}` is bound by name");
+        }
+    }
+
+    /// Identity is NOT strengthened. This path holds only a numeric TID and the ASID the
+    /// snapshot discovers; it has no generation-bearing incarnation token, and the retirement
+    /// must not fabricate one.
+    #[test]
+    fn u3_consumer_identity_authority_is_unchanged() {
+        let code = code_of(&body_of_resume());
+        for fabricated in [
+            "DispatchMarkToken",
+            "generation",
+            "incarnation",
+            "exact_incarnation",
+        ] {
+            assert!(
+                !code.contains(fabricated),
+                "`{fabricated}` must not appear — this path has no such authority to claim"
+            );
+        }
+        assert!(
+            code.contains("x86_c2c_client_tid()"),
+            "the client is still located by its numeric TID, exactly as before"
         );
     }
 }

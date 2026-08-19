@@ -102,7 +102,19 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // `block_current_on` primitive runs inside that guard. Rank 2 is never taken and no task
     // status changes. The two that remain are the BSP `on_preempt_prefer_on_cpu` and the
     // unreached ED-2 next-task placement, neither of which is live-reached.
-    ("src/arch/x86_64/smp.rs", 2),
+    // U3 (203C): 2 -> 1. The BSP saved-resume `with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu,
+    // client_tid))` became `SharedKernel::on_preempt_prefer_on_cpu_split`, ONE rank-1 scheduler
+    // transaction for the EXPLICIT trapping CPU that runs the SAME `Scheduler::on_preempt_prefer_on`
+    // primitive. The retired `KernelState::on_preempt_prefer_on_cpu` wrapper was a thin re-entry
+    // into that same rank-1 lock and has been deleted now that it is caller-free; the scheduler
+    // policy keeps a single implementation. Online validation, the previous-current re-enqueue, the
+    // preferred-task selection and the legacy fallback (another runnable task may be selected when
+    // the preferred one is not queued) are all unchanged; the consumer still aborts unless the
+    // returned TID is its own. The ONE that remains is the ED-2 next-task placement in
+    // `ap_sched_next_or_idle` — `with_cpu(cpu, |k| match k.enqueue_on_cpu(cpu, next_tid) { Ok(()) =>
+    // k.dispatch_next_on_cpu(cpu), Err(_) => None })` — retained byte-for-byte, including its
+    // distinct `Err(_) => None` refusal policy, because its success body is still not live-reached.
+    ("src/arch/x86_64/smp.rs", 1),
     // U3 (203C): 1 -> 0. `src/kernel/boot/thread_state.rs` is now FULLY DRAINED. The x86_64 D6
     // first-resume trampoline's `with_cpu(ctx.cpu_id, |kernel| …)` existed to call
     // `post_switch_restore_arch_thread_state(kernel, cpu, None)` — and with `frame == None` the
@@ -164,11 +176,16 @@ const EXPECTED_WITH_BROAD: &[(&str, usize)] = &[
     // U3 (203C): 2 -> 1. The AP saved-frame resume's broad read became one authoritative rank-2
     // snapshot transaction (`SharedKernel::ap_saved_resume_context_split`): a single task-domain
     // acquisition copies ASID + status + full `UserRegisterContext` + TLS by value, and the
-    // ASID -> CR3 resolution runs only after that guard is released. The BSP counterpart is
-    // deliberately NOT converted: its path is not live-reached at this base (the cross-CPU reply
-    // oracle never emits `X86_BSP_SAVED_DISPATCH_OK`), and an unreached site is never retired
-    // merely because it is homologous to a reached one.
-    ("src/arch/x86_64/smp.rs", 1),
+    // ASID -> CR3 resolution runs only after that guard is released. The BSP counterpart was NOT
+    // converted at that point: its path was not live-reached, and an unreached site is never
+    // retired merely because it is homologous to a reached one.
+    // U3 (203C): 1 -> 0. Two census-neutral prerequisites made that BSP path live-reachable
+    // (explicit-CPU authority for the current-task read and both direct-IpcCall remote-wake
+    // decisions, then an order-independent request-OK proof rendezvous), and the BSP saved-resume
+    // read is now retired onto the SAME `ap_saved_resume_context_split` its AP twin already used.
+    // `KernelState::ap_saved_resume_context` was deleted with it, being caller-free.
+    // **There is no production broad `SharedKernel::with` callsite left in the tree**; the only
+    // remaining match is the thread-local false positive counted below.
     ("src/kernel/boot/orchestrator_state.rs", 1),
     // U1: 8 -> 7. The obsolete `SharedKernel::run_reply_timeout_completion` wrapper had no
     // production caller and was deleted; the single completion body
@@ -195,8 +212,8 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 9; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 (the AArch64 CurrentTaskExited validation, its replacement restore, then the AArch64 FutexWait no-incoming idle read)
-const AUDITED_WITH_BROAD_TOTAL: usize = 1; // U3: 6 -> 2 -> 1 (runtime.rs fully drained; the reached x86 AP SMP read retired)
+const AUDITED_WITH_CPU_TOTAL: usize = 8; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 -> 8 (… then the x86_64 BSP saved-resume preempt-and-prefer reacquisition)
+const AUDITED_WITH_BROAD_TOTAL: usize = 0; // U3: 6 -> 2 -> 1 -> 0 (runtime.rs fully drained, then both x86 SMP saved-resume reads retired). ZERO production broad `SharedKernel::with` callsites remain.
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
 
@@ -204,7 +221,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 10; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 -> 10 (thirty-four retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 8; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 -> 10 -> 8 (thirty-six retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

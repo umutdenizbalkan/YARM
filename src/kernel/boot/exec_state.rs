@@ -2208,45 +2208,12 @@ impl KernelState {
         Ok((cr3, PROBE_CODE_VA, user_stack_top))
     }
 
-    /// Stage 199A2D2C2A: read a task's committed SAVED userspace continuation for the AP saved-frame
-    /// return. Returns `(asid, cr3, rip, rsp, gprs[15], runnable_with_saved)` where `rip`/`rsp` are
-    /// the exact post-syscall user instruction/stack pointers captured when the task last left ring 3
-    /// (e.g. after a Yield), and `gprs` are its 15 user GPRs (rax..r15). `runnable_with_saved` is true
-    /// ONLY when the task is Runnable/Running AND carries a valid (non-null RIP+RSP) saved frame — the
-    /// AP dispatcher must NOT resume from a partial/uncommitted frame.
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    pub(crate) fn ap_saved_resume_context(
-        &self,
-        tid: u64,
-    ) -> Option<(u16, u64, u64, u64, [u64; 15], u64, bool)> {
-        let asid = self.task_asid(tid)?;
-        let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;
-        let runnable = matches!(
-            self.task_status(tid),
-            Some(TaskStatus::Runnable | TaskStatus::Running)
-        );
-        self.with_tcbs(|tcbs| {
-            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == tid)?;
-            let uc = &tcb.user_context;
-            let mut gprs = [0u64; 15];
-            for (i, g) in gprs.iter_mut().enumerate() {
-                *g = uc.user_gprs[i] as u64;
-            }
-            let rip = uc.instruction_ptr.0;
-            let rsp = uc.stack_ptr.0;
-            // Stage 199A2D2C2B: FS base is sourced from the SELECTED TASK's saved TLS state, never a
-            // hardcoded constant (a task with a real TLS resumes with its own FS.base).
-            let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);
-            let has_saved = rip != 0 && rsp != 0;
-            Some((asid.0, cr3, rip, rsp, gprs, fs_base, runnable && has_saved))
-        })
-    }
-
     /// Stage 199A2D2C2B1: true iff `tid` carries a COMMITTED saved userspace continuation
     /// (non-null instruction pointer AND stack pointer captured in `user_context`). Unlike
-    /// [`ap_saved_resume_context`] this does NOT require the task to be runnable — it proves the
-    /// blocked recv-v2 server captured its post-syscall frame BEFORE the authoritative block, which
-    /// the blocked-server acknowledgement asserts (`saved_frame=1`). Read-only.
+    /// `SharedKernel::ap_saved_resume_context_split` this does NOT require the task to be runnable
+    /// — it proves the blocked recv-v2 server captured its post-syscall frame BEFORE the
+    /// authoritative block, which the blocked-server acknowledgement asserts (`saved_frame=1`).
+    /// Read-only.
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     pub(crate) fn task_has_saved_frame(&self, tid: u64) -> bool {
         self.with_tcbs(|tcbs| {

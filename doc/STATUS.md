@@ -158,8 +158,85 @@ workload genuinely reach them, repeatedly.
   full `STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL … result=ok`. One earlier run was discarded as
   visibly serial-spliced (fragments of a marker survived without the intact line); its raw log was
   preserved and it is classified separately, not as a failure.
-* **The two acquisitions in `c2c_bsp_saved_frame_resume` remain present and unchanged**, for the
-  next U3 **10 → 8** retirement pass. **The census remains 10** (`with_cpu` 9, broad `with` 1).
+* **The two acquisitions in `c2c_bsp_saved_frame_resume` remained present and unchanged** at that
+  checkpoint, for the next U3 **10 → 8** retirement pass. **The census remained 10** (`with_cpu` 9,
+  broad `with` 1). Both have since been retired — see the next entry.
+
+**U3 (canonical 203C) — x86_64 BSP SAVED-RESUME COHORT: DELIVERED. CENSUS 10 → 8.
+CANONICAL 203C — still OPEN.**
+
+Both remaining broad acquisitions in `c2c_bsp_saved_frame_resume` are gone, retired in one pass
+against the now live-reached path. **`with_cpu` 9 → 8, broad `with` 1 → 0, total 10 → 8.**
+
+* **The saved-context read moved onto the EXISTING rank-2 snapshot,
+  `SharedKernel::ap_saved_resume_context_split`** — the same transaction the AP site already ran,
+  so no second reader was created. It is destructured by NAME (`ApSavedResumeContext { asid, cr3,
+  rip, rsp, gprs, fs_base, runnable_saved }`); the retired positional 7-tuple could not stop a
+  consumer transposing `rip`/`rsp` or reading `fs_base` where `cr3` was meant. The legacy body
+  answered the same question through four separate task-domain re-entries (`task_asid`,
+  `cr3_for_asid`, `task_status`, `with_tcbs`); the snapshot takes every task-owned field in ONE
+  rank-2 acquisition and resolves the ASID to a page-table root only after that guard is released,
+  because `PAGE_TABLE_STATE` is an independent, unranked lock. Refusals are unchanged outcome for
+  outcome: absent TCB, missing ASID and an ASID with no CR3 each yield `None`; absent TLS is
+  `fs_base = 0`; `Blocked`/`Faulted`/`Exited`/`Dead`/`Reserved` and an incomplete saved frame all
+  clear `runnable_saved`.
+* **The preempt-prefer mutation moved onto ONE new rank-1 transaction,
+  `SharedKernel::on_preempt_prefer_on_cpu_split`**, running the SAME
+  `Scheduler::on_preempt_prefer_on` primitive the retired `KernelState::on_preempt_prefer_on_cpu`
+  wrapper ran — that wrapper immediately re-entered the rank-1 scheduler lock anyway, so the broad
+  guard added nothing but width. The policy still has exactly one implementation.
+* **The legacy fallback is preserved deliberately and was NOT "improved".** When the preferred TID
+  is not queued on that CPU the scheduler may still select some other runnable task and return it;
+  the caller's `made_current != Some(client_tid)` comparison is what rejects that, unchanged. An
+  invalid or offline CPU still yields `None` with no mutation, reached now by the scheduler's own
+  `check_online_cpu` instead of `with_cpu` refusing and `.unwrap_or(None)` collapsing the error.
+* **Neither transaction touches the process-global ambient `scheduler.current_cpu`.** Both are
+  named by the explicit `cpu` the caller trapped on. The explicit-CPU authority and the REQUEST_OK
+  rendezvous delivered in the previous entry are unaltered.
+* **Identity is NOT strengthened.** This path holds only a numeric `client_tid` and the ASID the
+  snapshot discovers; it carries no generation-bearing incarnation token, and no `DispatchMarkToken`
+  or generation authority was fabricated for it.
+* **The consumer's 8-step ordering is intact** — reply/client gates → read-only snapshot → reject a
+  partial frame → scheduler mutation → require `selected == client_tid` → `DONE` once → clear
+  pending + marker → lock-free MSR/frame/CR3/iret. The context snapshot was **not** moved after the
+  scheduler mutation, and every domain guard is released before `DONE.swap`, the
+  `X86_BSP_SAVED_DISPATCH_OK` marker, `configure_syscall_msrs_for_self`, the FS-base WRMSR, the CR3
+  write, the frame construction and `resume_user_mode_iret`.
+* **Census: `with_broad` 1 → 0, `with_cpu` 9 → 8, runtime-required/total 10 → 8.** The full
+  remaining eight-site inventory is re-derived from the final source tree, site by site, in
+  `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a — file, line, enclosing symbol, form, class, role, why it
+  remains and the canonical directive expected to retire it.
+* **Both caller-free `KernelState` helpers were deleted** — `ap_saved_resume_context` and
+  `on_preempt_prefer_on_cpu`. `src/arch/x86_64/smp.rs` now holds exactly ONE acquisition, the
+  unreached ED-2 next-task placement in `ap_sched_next_or_idle`, retained byte-for-byte with its
+  distinct `Err(_) => None` refusal policy. **There is no production broad `SharedKernel::with`
+  callsite left anywhere in the tree.**
+* **Live evidence: five consecutive clean runs** of
+  `scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh` against freshly built matched artifacts, each
+  with twelve named markers exactly once — `IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1`,
+  `X86_BSP_NR6_REQUEST_SENT cpu=0`, `IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0 receiver_cpu=1
+  cross_cpu=1`, `X86_AP_RECV_V2_USER_VALIDATED cpu=1`, `IPCREPLY_DIRECT_SMP_CALLER_BLOCKED
+  arch=x86_64 caller_cpu=0`, `X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0`,
+  `X86_BSP_RESCHEDULE_IPI_RECEIVED cpu=0`, `X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved`,
+  `X86_BSP_REPLY_USER_VALIDATED cpu=0`, `X86_BSP_RECV_V2_CONTINUED cpu=0`,
+  `IPCREPLY_DIRECT_SMP_REPLY_OK sender_cpu=1 receiver_cpu=0 cross_cpu=1` and
+  `IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED arch=x86_64` — with the full
+  `STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL … result=ok`, zero panics and zero ring-3 faults.
+  **These five consecutive clean seals are the live proof for this changed path**, and no
+  exact-base deferral was used for it. **The retirement evidence is the census reduction, not the
+  markers**; the markers prove the retired path still behaves identically.
+* **One regression script flakes, identically at the exact base.**
+  `scripts/qemu-x86_64-ap-saved-return-smoke.sh` failed once during the matrix with
+  `RESUMED continuation != 1` — the AP entered ring 3 twice as usual and every kernel-side marker
+  fired exactly once (`X86_AP_GENERIC_DISPATCH_OK cpu=1 mode=fresh`, `X86_AP_SAVED_RESUME_BEFORE`,
+  `X86_AP_SAVED_FRAME_COMMITTED cpu=1 syscall=Yield`, `X86_AP_SAVED_DISPATCH_OK cpu=1 mode=saved`),
+  but the ring-3 `X86_AP_SAVED_FRAME_RESUMED cpu=1` never appeared, not even as a fragment. An
+  interleaved head-versus-exact-base sample settles it: **head 9/10, base `c2b9b77` 8/9**, with a
+  byte-identical failure signature on both sides — same assertion, same marker, same counts. This
+  script exercises the untouched **CPU-1 AP-return** path (`ap_saved_frame_resume`); the retired
+  acquisitions are in the **BSP** counterpart on CPU 0. It is recorded as an **exact-base
+  flake / deferral** — evidence neither for nor against this BSP change — and that profile is
+  **not** claimed green.
 
 **U3 and 199C remain OPEN. 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN (partially
 production-wired).** Directive U8 is already source-complete. Canonical stage arithmetic is
@@ -173,9 +250,9 @@ function holds no broad acquisition today. Earlier "U8 is next" pointers are rem
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **9** |
-| Production broad `SharedKernel::with` callsites | **1** |
-| **Total production broad-lock acquisition sites** | **10** |
+| Production `SharedKernel::with_cpu` callsites | **8** |
+| Production broad `SharedKernel::with` callsites | **0** |
+| **Total production broad-lock acquisition sites** | **8** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **Direct NR6/NR7:** x86_64 (live) + AArch64 (structural, proof-gated) via `offlock_authoritative_dispatch_enabled()`; RISC-V not admitted. **Blocking IpcRecv / IpcSend (U4):** queue-advancing dispatch is authoritative outside the broad lock on **all three** architectures via the canonical `queue_advancing_dispatch_enabled()`. `d6_genuine_enabled()` itself remains compile-time x86_64-only — U4 widened the queue-ADVANCING question only, never the queue-neutral D6 slice. |
@@ -2056,7 +2133,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **10** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **8** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there
