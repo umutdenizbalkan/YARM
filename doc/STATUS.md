@@ -238,7 +238,66 @@ against the now live-reached path. **`with_cpu` 9 → 8, broad `with` 1 → 0, t
   flake / deferral** — evidence neither for nor against this BSP change — and that profile is
   **not** claimed green.
 
-**U3 and 199C remain OPEN. 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN (partially
+**U3 (canonical 203C) — x86_64 ED-2 NEXT-TASK PLACEMENT: DELIVERED. CENSUS 8 → 7.
+Execution directive U3 COMPLETE (exit met); CANONICAL 203C still OPEN / PARTIAL.**
+
+The last broad acquisition in `src/arch/x86_64/smp.rs` is gone. **`with_cpu` 8 → 7, `with_broad`
+stays 0, runtime-required/total 8 → 7.**
+
+* **ED-2 is live-reached by an EXISTING workload — the retention premise was about the scripts,
+  not the kernel.** The audit held ED-2 back because every scripted profile that set
+  `yarm.ap_user_dispatch=1` also set the direct-IpcCall oracle, which pins
+  `ap_workload_task_count()` to 1, so `AP_DISPATCH_COUNT < count` is false after the first ring-3
+  entry. With the oracle selector OFF the same production workload runs `AP_WORKLOAD_TASKS` = 2.
+  Proven live at `39c75dc` BEFORE any edit, twice: `X86_AP_WORKLOAD_PLACEMENT_READY cpu=1
+  base_tid=20205 count=2`, both TIDs admitted and issuing a real ring-3 syscall
+  (`X86_AP_USER_SYSCALL_REENTRY_OK` for 20205 and 20206), `X86_AP_NEXT_TASK_DISPATCH_BEGIN cpu=1`
+  exactly once, `X86_AP_REPEATED_DISPATCH_OK cpu=1 count=2`, `X86_AP_SCHED_POLICY_SEAL_DONE
+  result=ok cpu=1 count=2`, clean return to idle, no oracle markers, no refusal or fault. No
+  script, knob, marker or workload was added or edited to obtain this.
+* **Retired through the EXISTING transaction under `Decline`.** ED-2 now calls
+  `enqueue_then_dispatch_on_cpu_split(cpu, next_tid, EnqueueRefusalPolicy::Decline)` — no new
+  seam. `Decline` IS this site's historical `Err(_) => None` policy, expressed as a type.
+  `DispatchAnyway` is forbidden here: on a refusal it can select a DIFFERENT task than the one
+  being placed, which the caller's `placed == Some(next_tid)` comparison would then reject —
+  a behaviour change on a live path. An outer refusal collapses to `None` exactly as
+  `.unwrap_or(None)` collapsed the `with_cpu` refusal. Enqueue still precedes dispatch inside one
+  rank-1 critical section; eligibility is not strengthened and no retry or fallback was added.
+* **Explicit-CPU validation replaces unsafe off-broad ambient binding.** The shared transaction no
+  longer writes `scheduler.current_cpu`. That field is ONE process-global selector which
+  `current_tid()` and `current_task_cnode()` resolve through, so binding it from an off-broad seam
+  retargets every ambient reader on every CPU — the failure measured directly on the SMP
+  saved-resume path, where it made `handle_ipc_recv` validate against the wrong process CNode.
+  Every step names the CPU explicitly (`validate_online_cpu(cpu)`,
+  `enqueue_on_with_priority(cpu, ..)`, `dispatch_next_on(cpu)`), so the binding was never
+  load-bearing for the returned outcome; both production callers supply an explicit `CpuId`,
+  consume only the typed `CpuEnqueueDispatch`, and carry the CPU and selected TID forward as plain
+  values. `validate_online_cpu` is retained and an invalid CPU yields the same refusal with no
+  mutation. The per-CPU `current` is still updated — that is CPU-local scheduler state, not the
+  ambient selector.
+* **All post-transaction work is lock-free.** Every guard is released before
+  `X86_AP_ADMIT_PLACED`, the seal-probe activation, `X86_AP_NEXT_TASK_DISPATCH_BEGIN` and
+  `ap_enter_task_ring3`. The dispatch-count gate, next-TID calculation, marker order and text,
+  denied wake-only fallthrough, saved-resume branch and idle tail are all unchanged.
+* **`src/arch/x86_64/smp.rs` now holds ZERO broad acquisitions of any form.** The seven that
+  remain are: two authoritative broad trap dispatches (`arch/trap_entry.rs:310`,
+  `arch/riscv64/trap.rs:829`), one D3-fenced D6 controlled-proof restore
+  (`arch/trap_entry.rs:1694`), one recv Phase-A multi-domain composite (`runtime.rs:4093`), and
+  three capability-teardown rollback sites (`runtime.rs:4193`, `4486`, `5278`). **No post-lock
+  drain reacquisition remains anywhere in the tree.** Full per-site inventory in
+  `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
+* **203C remains OPEN / PARTIAL**, because scheduler operations still execute inside the two
+  authoritative trap dispatches and the D3-fenced proof site remains.
+
+**Execution directive U3 is COMPLETE — exit MET.** Its exit is the census reaching **≤24** with
+every post-lock drain re-acquisition deleted in the same increment as the seam it blocked. The
+total is **7** and the drain class is fully retired (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a lists the
+seven survivors; none is a drain). **Canonical 203C nevertheless remains OPEN / PARTIAL** — its
+own exit, the rank-1/rank-2 seams being authoritative rather than compatibility helpers, is still
+false while scheduler operations execute inside the two authoritative trap dispatches and the
+D3-fenced controlled-proof restore remains. A completed directive is not a completed stage.
+
+**199C remains OPEN. 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN (partially
 production-wired).** Directive U8 is already source-complete. Canonical stage arithmetic is
 unchanged at **2 complete / 11 partial / 22 open**. Direct production remains **OFF**.
 
@@ -250,9 +309,9 @@ function holds no broad acquisition today. Earlier "U8 is next" pointers are rem
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **8** |
+| Production `SharedKernel::with_cpu` callsites | **7** |
 | Production broad `SharedKernel::with` callsites | **0** |
-| **Total production broad-lock acquisition sites** | **8** |
+| **Total production broad-lock acquisition sites** | **7** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **Direct NR6/NR7:** x86_64 (live) + AArch64 (structural, proof-gated) via `offlock_authoritative_dispatch_enabled()`; RISC-V not admitted. **Blocking IpcRecv / IpcSend (U4):** queue-advancing dispatch is authoritative outside the broad lock on **all three** architectures via the canonical `queue_advancing_dispatch_enabled()`. `d6_genuine_enabled()` itself remains compile-time x86_64-only — U4 widened the queue-ADVANCING question only, never the queue-neutral D6 slice. |
@@ -2133,7 +2192,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **8** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **7** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there

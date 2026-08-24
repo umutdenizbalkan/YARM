@@ -687,9 +687,11 @@ pub(crate) enum EnqueueRefusalPolicy {
     /// the first time, so a refused enqueue means there is nothing to select and no dispatch may
     /// happen. This is the `Err(_) => None` shape.
     ///
-    /// No production caller yet: that site is not live-reached by any existing workload, so it
-    /// keeps its broad acquisition byte-for-byte. This variant exists so the transaction states
-    /// both policies explicitly and the tests can pin that they stay different.
+    /// This is the live policy of `ap_sched_next_or_idle`, whose broad acquisition U3 retired
+    /// onto this transaction once the existing selector-off two-task AP workload was proven to
+    /// reach it (`X86_AP_NEXT_TASK_DISPATCH_BEGIN cpu=1`). The two policies must stay distinct:
+    /// dispatching through a refusal here could select a DIFFERENT task than the one being
+    /// placed, which that caller then rejects — a behaviour change on a live path.
     Decline,
 }
 
@@ -3579,14 +3581,26 @@ impl SharedKernel {
     /// 1. rank 1 (scheduler) is acquired exactly once, for the whole transaction;
     /// 2. the CPU is validated with `validate_online_cpu` — the SAME predicate
     ///    `KernelState::set_current_cpu` uses, which is what `with_cpu` called on entry. On
-    ///    failure the same `KernelError` class is returned and `current_cpu` is left UNCHANGED;
-    /// 3. on success `scheduler.current_cpu = cpu` is bound, exactly as `with_cpu` did, and
-    ///    unconditionally — including when no task is selected below;
-    /// 4. rank 2 (task) is nested INSIDE the still-held rank-1 guard, and resolves the entire
+    ///    failure the same `KernelError` class is returned and nothing below has run;
+    /// 3. rank 2 (task) is nested INSIDE the still-held rank-1 guard, and resolves the entire
     ///    enqueue policy — idle-TID shortcut, task existence, class → priority,
     ///    spawn-reservation refusal — in one acquisition;
-    /// 5. the existing scheduler primitives run under the rank-1 guard already held:
+    /// 4. the existing scheduler primitives run under the rank-1 guard already held:
     ///    `enqueue_on_with_priority`, then `dispatch_next_on` per the typed policy.
+    ///
+    /// **Validate-EXPLICIT-CPU, not validate-BIND.** This transaction does NOT write
+    /// `scheduler.current_cpu`. That field is ONE process-global selector which `current_tid()`
+    /// and `current_task_cnode()` resolve through, so binding it from an off-broad seam
+    /// retargets every ambient reader on every CPU — including a CPU sitting mid-syscall inside
+    /// the broad lock. That failure was measured directly on the SMP saved-resume path, where an
+    /// off-broad bind flipped the other CPU's ambient identity and made `handle_ipc_recv`
+    /// validate a receive capability against the wrong process CNode. Every step above is named
+    /// by the explicit `cpu` argument, so the binding was never load-bearing for the returned
+    /// outcome: `validate_online_cpu(cpu)`, `enqueue_on_with_priority(cpu, ..)` and
+    /// `dispatch_next_on(cpu)` all take the CPU explicitly and read no ambient selector.
+    /// Removing it therefore changes no result this transaction can produce, and both callers
+    /// carry the CPU and the selected TID forward as plain values. Broad `with_cpu` keeps its
+    /// own legacy binding; that is transaction-local state and out of scope here.
     ///
     /// Neither nested step re-enters its domain through a `KernelState` accessor: `task_priority`
     /// and `refuse_enqueue_of_spawn_reservation` would each re-take the task lock, and
@@ -3618,13 +3632,13 @@ impl SharedKernel {
         const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 
         self.with_scheduler_split_mut(|sched| {
-            // (2) Same admission predicate `set_current_cpu` uses. A refusal leaves
-            // `current_cpu` exactly as it was — nothing below has run.
+            // (2) Same admission predicate `set_current_cpu` uses. A refusal returns the same
+            // error class with nothing below having run.
             kernel_ref(&sched.scheduler)
                 .validate_online_cpu(cpu)
                 .map_err(map_scheduler_error)?;
-            // (3) Bind, unconditionally, before any selection can fail.
-            sched.current_cpu = cpu;
+            // (3) No ambient binding. `scheduler.current_cpu` is deliberately NOT written here —
+            // see the contract above. Every step below names the CPU explicitly.
 
             // (4) One rank-2 acquisition, nested while rank 1 is held (ascending 1 -> 2),
             // resolving the whole task-domain policy `enqueue_on_cpu` reads across two.

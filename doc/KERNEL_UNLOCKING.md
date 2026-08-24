@@ -53,20 +53,29 @@ This file has exactly one status page: §0.3.
 Three methods acquire it — `lock` (test-only), `with`, `with_cpu`. Full unlock = no runtime
 guard exists (canonical **204E**), sealed cross-architecture (canonical **205D**).
 
-Current census: **8** production callsites — **8** through `with_cpu` and **0** through the
-broad `with(|state| …)` form — classified **8 runtime-required**, 0 test-only, 0 obsolete,
+Current census: **7** production callsites — **7** through `with_cpu` and **0** through the
+broad `with(|state| …)` form — classified **7 runtime-required**, 0 test-only, 0 obsolete,
 0 boot-only. See §0.5. **There is no production broad `SharedKernel::with` callsite left
 anywhere in the tree.** U1 deleted the two obsolete acquisitions (49 → 47) and U2 relocated the
 three test-only ones (47 → 44), leaving the census exactly the runtime-required set — every
-counted acquisition is one a real boot performs. U3 is now retiring those and has delivered
-thirty-six (44 → 39 → 37 → 36 → 34 → 32 → 28 → 25 → 24 → 23 → 22 → 21 → 18 → 17 → 15 → 14 → 13 → 12 → 11 → 10 → 8). The three raw `self.state.lock()` sites are the bodies of `lock` /
+counted acquisition is one a real boot performs. U3 retired those — thirty-seven in all
+(44 → 39 → 37 → 36 → 34 → 32 → 28 → 25 → 24 → 23 → 22 → 21 → 18 → 17 → 15 → 14 → 13 → 12 → 11 → 10 → 8 → 7). The three raw `self.state.lock()` sites are the bodies of `lock` /
 `with` / `with_cpu` themselves, not callsites, and are deliberately excluded from the total.
 
-The census has crossed U3's numerical **≤24** target, but **U3 is not complete**: canonical
-**203C** stays OPEN. The post-lock drain class is now fully retired; what remains is the
-authoritative trap dispatch itself (2), the D3-fenced D6 controlled-proof restore (1), the
-unreached x86_64 ED-2 placement (1) and the recv/delivery boundary (4) — enumerated site by
-site in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
+**The execution directive U3 is COMPLETE — its exit condition is MET.** U3's exit is twofold:
+the census reaches **≤24**, and every post-lock drain re-acquisition is deleted in the same
+increment as the seam it was blocking. Both hold: the total is **7**, and the drain class is
+**fully retired** — §1.4a enumerates the seven survivors and **none** of them is a drain.
+
+**That is not the same as canonical 203C, which stays OPEN / PARTIAL.** A directive is a bounded
+unit of retirement work; a canonical stage is a property of the kernel. 203C's own exit condition
+— the rank-1/rank-2 seams being authoritative rather than compatibility helpers — is still false,
+because scheduler operations continue to execute inside the two authoritative trap dispatches and
+the D3-fenced controlled-proof restore remains. Retiring the drain class was necessary for 203C,
+not sufficient for it. The post-lock drain class is fully
+retired; what remains is the authoritative trap dispatch itself (2), the D3-fenced D6
+controlled-proof restore (1) and the recv/delivery boundary (4) — enumerated site by site in
+`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a. `src/arch/x86_64/smp.rs` contributes **0**.
 These figures are recomputed from source by `tests/broad_lock_census_guard.rs`, which fails if
 the tree and the published census drift apart.
 
@@ -189,11 +198,11 @@ count stays at 22; complete + partial + open = 2 + 11 + 22 = 35.
 | boot-only | **0** | — |
 | test-only | **0** | none — U2 relocated all three into test-only modules the census excludes: `ipc_recv_with_deadline_split_bridge` (2 acquisitions, never a trap-seam path) and the `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1) |
 | obsolete | **0** | none — U1 deleted both (`SharedKernel::handle_trap_with_cpu`, which had no in-tree caller at all, and `SharedKernel::run_reply_timeout_completion`, which had no production caller) |
-| runtime-required | **8** | re-derived from the final tree in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a: the authoritative broad Phase-2 trap dispatch (`arch/trap_entry.rs:310`) and its RISC-V twin (`arch/riscv64/trap.rs:829`); the D3-fenced D6 controlled-proof restore (`arch/trap_entry.rs:1694`), whose body also maps kernel stacks across every live task root; the unreached x86_64 ED-2 next-task placement (`arch/x86_64/smp.rs:2727`), retained byte-for-byte; and four recv/delivery-boundary sites in `runtime.rs` — the Phase-A multi-domain composite (`4093`) plus three re-entries of the same `rollback_materialized_recv_cap` capability-teardown body (`4193`, `4486`, `5278`). The whole post-lock drain class, the first-resume trampoline, the AArch64 split return, the RISC-V resume site and the identity/SMP/deadline helpers are all retired and no longer exist. |
+| runtime-required | **7** | re-derived from the final tree in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a: the authoritative broad Phase-2 trap dispatch (`arch/trap_entry.rs:310`) and its RISC-V twin (`arch/riscv64/trap.rs:829`); the D3-fenced D6 controlled-proof restore (`arch/trap_entry.rs:1694`), whose body also maps kernel stacks across every live task root; and four recv/delivery-boundary sites in `runtime.rs` — the Phase-A multi-domain composite (`4093`) plus three re-entries of the same `rollback_materialized_recv_cap` capability-teardown body (`4193`, `4486`, `5278`). The whole post-lock drain class, the first-resume trampoline, the AArch64 split return, the RISC-V resume site, the identity/SMP/deadline helpers and every `arch/x86_64/smp.rs` acquisition (the last being ED-2) are retired and no longer exist. |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
 
-Classified total: **8** acquisition callsites (**8** `with_cpu` + **0** broad `with`), which
-is 0 + 0 + 0 + 8. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
+Classified total: **7** acquisition callsites (**7** `with_cpu` + **0** broad `with`), which
+is 0 + 0 + 0 + 7. `tests/broad_lock_census_guard.rs` recomputes all of these from source.
 
 ### 0.6 Structural blockers
 
@@ -551,7 +560,35 @@ the now repeatedly live-reached path.
   flake/deferral** — evidence neither for nor against this BSP change. That profile is **not**
   claimed green.
 
-**U3 and 199C remain OPEN. 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN (partially
+**U3 (canonical 203C) — DELIVERED. The x86_64 ED-2 NEXT-TASK PLACEMENT is retired.
+CENSUS 8 → 7. Canonical 203C remains OPEN / PARTIAL.**
+
+* **ED-2 is now live-reached by the existing selector-off two-task workload.** Its retention
+  premise was about the SCRIPTS, not the kernel: every scripted profile that armed
+  `yarm.ap_user_dispatch=1` also armed the direct-IpcCall oracle, which pins
+  `ap_workload_task_count()` to 1. Selector off, the same production workload runs
+  `AP_WORKLOAD_TASKS` = 2 and reaches ED-2 — proven twice at `39c75dc` before any edit, and again
+  after it, with `X86_AP_NEXT_TASK_DISPATCH_BEGIN cpu=1` exactly once per boot and both TIDs
+  issuing a real ring-3 syscall. No script, knob, marker or workload was added or edited.
+* **Retired through the EXISTING `Decline` transaction.** The acquisition became
+  `enqueue_then_dispatch_on_cpu_split(cpu, next_tid, EnqueueRefusalPolicy::Decline)`; no new seam
+  was created. `Decline` is this site's historical `Err(_) => None` policy as a type, and
+  `DispatchAnyway` is forbidden here because on a refusal it can select a different task than the
+  one being placed.
+* **Explicit-CPU validation replaces unsafe off-broad ambient binding.** The shared transaction no
+  longer writes the process-global `scheduler.current_cpu`; `validate_online_cpu` is retained and
+  every step names the CPU explicitly, so no returned outcome changes.
+* **All hardware/logging work is lock-free** — markers, seal-probe activation and ring-3 entry all
+  run with every guard released.
+* **`src/arch/x86_64/smp.rs` now holds zero broad acquisitions**, and **no post-lock drain
+  reacquisition remains anywhere in the tree**. The seven survivors are two authoritative broad
+  trap dispatches, one D3-fenced controlled-proof restore, one recv Phase-A multi-domain composite
+  and three capability-teardown rollback sites.
+* **203C remains OPEN / PARTIAL** because scheduler operations still execute inside those two
+  authoritative trap dispatches and the D3-fenced proof site remains. Direct production remains
+  **OFF**.
+
+**Execution directive U3 is COMPLETE (exit met); canonical 203C remains OPEN / PARTIAL. 199C remains OPEN. 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN (partially
 production-wired).** Directive U8 is already source-complete. Canonical stage arithmetic is
 unchanged at **2 complete / 11 partial / 22 open**. Direct production remains **OFF**.
 
@@ -1461,7 +1498,9 @@ architecture-neutral body**; both of its real branches execute under hosted test
 recomputation proves that same producer and its drain protocol are compiled and drained on all
 three architectures; and the freestanding builds prove every target accepts that routing.
 
-**U3 — IN PROGRESS, nineteen retired (44 → 39 → 37 → 36 → 34 → 32 → 28 → 25).** U3 promotes existing rank-1
+**U3 — COMPLETE, exit MET; thirty-seven retired (44 → 39 → 37 → 36 → 34 → 32 → 28 → 25 → … → 8 → 7).**
+The narrative below is the historical increment record, kept as provenance; the counts inside it are
+snapshots, not claims about the current tree. U3 promotes existing rank-1
 (scheduler) and rank-2 (task) seams from compatibility helpers to **authoritative**, deleting
 each corresponding post-lock drain re-acquisition **in the same increment** — a seam that is
 authoritative while its drain survives has retired nothing.

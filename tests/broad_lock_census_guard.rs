@@ -110,11 +110,19 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // policy keeps a single implementation. Online validation, the previous-current re-enqueue, the
     // preferred-task selection and the legacy fallback (another runnable task may be selected when
     // the preferred one is not queued) are all unchanged; the consumer still aborts unless the
-    // returned TID is its own. The ONE that remains is the ED-2 next-task placement in
-    // `ap_sched_next_or_idle` — `with_cpu(cpu, |k| match k.enqueue_on_cpu(cpu, next_tid) { Ok(()) =>
-    // k.dispatch_next_on_cpu(cpu), Err(_) => None })` — retained byte-for-byte, including its
-    // distinct `Err(_) => None` refusal policy, because its success body is still not live-reached.
-    ("src/arch/x86_64/smp.rs", 1),
+    // returned TID is its own.
+    // U3 (203C): 1 -> 0. **`src/arch/x86_64/smp.rs` is now FULLY DRAINED** — it holds no broad
+    // acquisition of any form. The last one was the ED-2 next-task placement in
+    // `ap_sched_next_or_idle`, `with_cpu(cpu, |k| match k.enqueue_on_cpu(cpu, next_tid) { Ok(()) =>
+    // k.dispatch_next_on_cpu(cpu), Err(_) => None }).unwrap_or(None)`. It was retained while its
+    // success body was believed unreachable; the existing SELECTOR-OFF two-task AP workload
+    // (`yarm.ap_user_dispatch=1` with NO direct-IpcCall oracle, where `ap_workload_task_count()`
+    // returns `AP_WORKLOAD_TASKS` = 2) was then proven to reach it live — `X86_AP_ADMIT_PLACED
+    // cpu=1 tid=20206`, `X86_AP_NEXT_TASK_DISPATCH_BEGIN cpu=1`, both TIDs issuing a real ring-3
+    // syscall, `X86_AP_REPEATED_DISPATCH_OK cpu=1 count=2` — so it was retired onto the EXISTING
+    // `enqueue_then_dispatch_on_cpu_split` with `EnqueueRefusalPolicy::Decline`, which is this
+    // site's historical `Err(_) => None` policy verbatim. No new seam was added; `DispatchAnyway`
+    // stays the saved-resume policy and the two remain distinct.
     // U3 (203C): 1 -> 0. `src/kernel/boot/thread_state.rs` is now FULLY DRAINED. The x86_64 D6
     // first-resume trampoline's `with_cpu(ctx.cpu_id, |kernel| …)` existed to call
     // `post_switch_restore_arch_thread_state(kernel, cpu, None)` — and with `frame == None` the
@@ -212,7 +220,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 8; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 -> 8 (… then the x86_64 BSP saved-resume preempt-and-prefer reacquisition)
+const AUDITED_WITH_CPU_TOTAL: usize = 7; // U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 -> 8 -> 7 (… the x86_64 BSP saved-resume preempt-and-prefer reacquisition, then the x86_64 ED-2 next-task placement)
 const AUDITED_WITH_BROAD_TOTAL: usize = 0; // U3: 6 -> 2 -> 1 -> 0 (runtime.rs fully drained, then both x86 SMP saved-resume reads retired). ZERO production broad `SharedKernel::with` callsites remain.
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -221,7 +229,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 8; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 -> 10 -> 8 (thirty-six retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 7; // U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 -> 10 -> 8 -> 7 (thirty-seven retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

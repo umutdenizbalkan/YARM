@@ -60778,13 +60778,28 @@ mod stage190a_ap_sched_loop {
     // syscall; return-to-idle blocks under `with_cpu` (the global lock).
     #[test]
     fn no_global_lock_retirement() {
-        // U3 (203C): return-to-idle itself no longer takes the global lock — it runs one rank-1
-        // scheduler transaction. The NON-OVERCLAIM this test exists to protect is unchanged and
-        // still true: the global lock is NOT retired. The AP's syscall still enters it, and
-        // `smp.rs` still holds broad acquisitions on the paths this cohort did not convert.
+        // U3 (203C): re-derived. `smp.rs` itself is now fully drained — every acquisition it
+        // once held is retired onto a narrow transaction — so this file can no longer serve as
+        // the evidence. The NON-OVERCLAIM this test exists to protect is unchanged and still
+        // true, and is now pinned where the global lock actually lives: the AP's syscall still
+        // enters the authoritative broad Phase-2 trap dispatch.
+        {
+            let code: alloc::string::String = SMP_SRC
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                code.matches(".with_cpu(").count() + code.matches(".with(|").count(),
+                0,
+                "smp.rs is fully drained — assert the non-overclaim against the trap dispatch"
+            );
+        }
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         assert!(
-            SMP_SRC.contains(".with_cpu(") && SMP_SRC.contains("shared.with(|k|"),
-            "the global lock is NOT retired: smp.rs still holds broad acquisitions"
+            TRAP_ENTRY.contains("shared\n        .with_cpu(cpu, |kernel| {"),
+            "the global lock is NOT retired: the authoritative Phase-2 trap dispatch still \
+             takes it, and every AP syscall runs through that closure"
         );
         assert!(
             SMP_SRC.contains("shared.block_current_on_cpu_split(cpu)"),
@@ -60894,9 +60909,13 @@ mod stage190b_controlled_workload {
             count_fn.contains("x86_ipccall_direct_smp_oracle_enabled()"),
             "only the SMP oracle selector may narrow the sequence to a single task"
         );
-        // Placement is via the audited wake-only-guarded enqueue.
+        // Placement is via the audited wake-only-guarded enqueue. U3 (203C): the placement is
+        // now the rank-1 -> rank-2 `enqueue_then_dispatch_on_cpu_split` transaction under its
+        // historical `Decline` policy, instead of the broad `with_cpu` re-acquire. The audit and
+        // marking requirement this guard protects is unchanged.
         assert!(
-            SMP_SRC.contains("k.enqueue_on_cpu(cpu, next_tid)")
+            SMP_SRC.contains("enqueue_then_dispatch_on_cpu_split(")
+                && SMP_SRC.contains("EnqueueRefusalPolicy::Decline")
                 && SMP_SRC.contains("MARK_ADMIT_PLACED")
                 && SMP_SRC.contains("MARK_NEXT_TASK_DISPATCH_BEGIN"),
             "each next-task placement must be audited + marked"
@@ -60937,9 +60956,19 @@ mod stage190b_controlled_workload {
                 && SMP_SRC.contains("super::descriptor_tables::ap_idle_halt_loop();"),
             "the seal must emit repeated-dispatch + policy-seal, then return to idle"
         );
+        // U3 (203C): re-derived. This used to assert the placement still ran under the broad
+        // `with_cpu`. The existing selector-off two-task AP workload was proven to reach ED-2
+        // live, so the acquisition was retired onto the EXISTING transaction. What the guard now
+        // pins is that the placement is a SINGLE rank-ordered transaction with the site's
+        // historical refusal policy — never a broad re-acquire, and never `DispatchAnyway`,
+        // which could select a task other than the one being placed.
         assert!(
-            SMP_SRC.contains(".with_cpu(cpu, |k| match k.enqueue_on_cpu(cpu, next_tid)"),
-            "next-task placement must run under the global lock (with_cpu); not retired"
+            !SMP_SRC.contains(".with_cpu(cpu, |k| match k.enqueue_on_cpu(cpu, next_tid)"),
+            "the broad next-task placement is retired"
+        );
+        assert!(
+            SMP_SRC.contains("crate::runtime::EnqueueRefusalPolicy::Decline"),
+            "next-task placement declines the dispatch when the enqueue refuses"
         );
     }
 }
@@ -120664,9 +120693,12 @@ mod u3_ap_enqueue_dispatch_transaction {
 
     // ── CPU validation and binding ────────────────────────────────────────────────────────
 
+    /// Re-derived from `u3_ed_valid_cpu_binds_current_cpu_and_selects`: the selection half is
+    /// unchanged, the binding half is inverted (see the test above for why).
     #[test]
-    fn u3_ed_valid_cpu_binds_current_cpu_and_selects() {
+    fn u3_ed_valid_cpu_selects_without_touching_ambient_cpu() {
         let k = kernel();
+        let before = current_cpu(&k);
         register(&k, 90, TaskClass::App);
         let out = k
             .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 90, EnqueueRefusalPolicy::DispatchAnyway)
@@ -120679,16 +120711,28 @@ mod u3_ap_enqueue_dispatch_transaction {
         );
         assert_eq!(
             current_cpu(&k),
-            CpuId(AP),
-            "the transaction binds current_cpu"
+            before,
+            "selection is driven by the EXPLICIT cpu argument, not by binding the ambient one"
+        );
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CpuId(AP))),
+            Some(90),
+            "the per-CPU current IS updated — that is CPU-local scheduler state, not the \
+             process-global ambient selector"
         );
     }
 
+    /// Re-derived from `u3_ed_binds_even_when_no_user_task_is_selected`. That test pinned the
+    /// unconditional `scheduler.current_cpu = cpu` write. U3 removed it: the field is one
+    /// process-global selector that `current_tid()` resolves through, so writing it from an
+    /// off-broad seam retargets ambient readers on OTHER CPUs. The outcome half of the contract
+    /// is unchanged and still pinned here; the binding half is now pinned as its absence.
     #[test]
-    fn u3_ed_binds_even_when_no_user_task_is_selected() {
+    fn u3_ed_no_selection_still_refuses_and_leaves_ambient_cpu_alone() {
         let k = kernel();
+        let before = current_cpu(&k);
         // An empty run queue: the enqueue refuses (unknown TID, no class) and, under the ED-2
-        // policy, no dispatch runs — so nothing is selected. The bind must still have happened.
+        // policy, no dispatch runs — so nothing is selected.
         let out = k
             .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 7_777, EnqueueRefusalPolicy::Decline)
             .expect("admitted");
@@ -120696,8 +120740,8 @@ mod u3_ap_enqueue_dispatch_transaction {
         assert_eq!(out.selected, None, "an empty selection is not a failure");
         assert_eq!(
             current_cpu(&k),
-            CpuId(AP),
-            "current_cpu is bound unconditionally, including when no task is selected"
+            before,
+            "the transaction must not write the process-global ambient current_cpu"
         );
     }
 
@@ -120806,7 +120850,25 @@ mod u3_ap_enqueue_dispatch_transaction {
             out.selected, legacy_selected,
             "tid {tid}: the selected task must match the retired broad body exactly"
         );
-        assert_eq!(current_cpu(&b), current_cpu(&a), "same resulting binding");
+        // The ONE authorized divergence from the legacy body: it bound the process-global
+        // ambient `current_cpu` (via `with_cpu` -> `set_current_cpu`); the transaction does not.
+        // Every OUTCOME above still matches exactly, which is the point — the binding was never
+        // load-bearing for what this transaction returns.
+        assert_eq!(
+            current_cpu(&a),
+            CpuId(AP),
+            "tid {tid}: the legacy broad body did bind the ambient CPU"
+        );
+        assert_eq!(
+            current_cpu(&b),
+            CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID),
+            "tid {tid}: the transaction leaves the ambient CPU untouched"
+        );
+        assert_eq!(
+            b.with(|s| s.current_tid_on_cpu(CpuId(AP))),
+            a.with(|s| s.current_tid_on_cpu(CpuId(AP))),
+            "tid {tid}: the CPU-LOCAL current still matches the legacy body exactly"
+        );
     }
 
     #[test]
@@ -120982,11 +121044,11 @@ mod u3_ap_enqueue_dispatch_transaction {
             1,
             "exactly one rank-2 task acquisition — never a second task read"
         );
+        // U3 (203C): re-derived. The transaction no longer writes the process-global ambient
+        // `scheduler.current_cpu` — see `u3_ed_transaction_is_explicit_cpu_and_non_binding`.
+        // The chronology it guarantees is otherwise unchanged, minus the retired bind step.
         let rank1 = body.find("with_scheduler_split_mut").expect("rank 1");
         let validate = body.find("validate_online_cpu").expect("CPU validation");
-        let bind = body
-            .find("sched.current_cpu = cpu")
-            .expect("the current_cpu bind");
         let rank2 = body
             .find("with_task_enqueue_policy_split_mut")
             .expect("rank 2");
@@ -120997,12 +121059,8 @@ mod u3_ap_enqueue_dispatch_transaction {
             .find("dispatch_next_on(cpu)")
             .expect("the existing dispatch primitive");
         assert!(
-            rank1 < validate
-                && validate < bind
-                && bind < rank2
-                && rank2 < enqueue
-                && enqueue < dispatch,
-            "chronology must be: rank 1 -> validate -> bind -> rank 2 (nested, ascending) -> \
+            rank1 < validate && validate < rank2 && rank2 < enqueue && enqueue < dispatch,
+            "chronology must be: rank 1 -> validate -> rank 2 (nested, ascending) -> \
              enqueue -> dispatch"
         );
         // The primitives are the existing ones, not reimplementations.
@@ -121130,33 +121188,37 @@ mod u3_ap_enqueue_dispatch_transaction {
         }
     }
 
+    /// Re-derived from `u3_ed2_site_is_retained_byte_for_byte`. That guard pinned ED-2's broad
+    /// acquisition and its `Err(_) => None` body verbatim while the site was believed
+    /// unreachable. The existing selector-off two-task AP workload was then proven to reach it
+    /// live, so ED-2 was retired onto the EXISTING `enqueue_then_dispatch_on_cpu_split` with
+    /// `EnqueueRefusalPolicy::Decline` — which IS that `Err(_) => None` policy, now expressed as
+    /// a type. The invariant carried forward is the same one: this file's acquisition count is
+    /// exact and never drifts, and ED-2's refusal policy is never collapsed into DispatchAnyway.
     #[test]
-    fn u3_ed2_site_is_retained_byte_for_byte() {
+    fn u3_ed2_site_is_retired_onto_the_decline_transaction() {
         let code = code_of(SMP);
-        // U3 (203C) has since retired the AP return-to-idle `block_current_on_cpu` acquisition
-        // as well, onto `block_current_on_cpu_split`.
-        // U3 (203C) has since also retired the BSP saved-resume preempt-prefer acquisition onto
-        // `on_preempt_prefer_on_cpu_split`, leaving ED-2 as the only one.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            1,
-            "one with_cpu acquisition remains: the unreached ED-2 next-task placement"
+            0,
+            "no with_cpu acquisition remains anywhere in this file"
         );
-        // ED-2's exact historical body, unchanged — including its distinct refusal policy.
         assert!(
-            code.contains("k.enqueue_on_cpu(cpu, next_tid)")
-                && code.contains("Ok(()) => k.dispatch_next_on_cpu(cpu),")
-                && code.contains("Err(_) => None,"),
-            "the ED-2 site keeps its broad acquisition and its `Err(_) => None` policy verbatim: \
-             no existing workload reaches its success body"
+            !code.contains("k.enqueue_on_cpu(cpu, next_tid)")
+                && !code.contains("Ok(()) => k.dispatch_next_on_cpu(cpu),"),
+            "ED-2's broad body is gone"
         );
-        // Re-derived: the two BSP saved-resume acquisitions that this guard used to pin as
-        // deliberately-excluded have since been retired onto narrow transactions. What the
-        // guard still protects is that ED-2 was NOT swept along with them.
+        assert!(
+            code.contains("enqueue_then_dispatch_on_cpu_split(")
+                && code.contains("crate::runtime::EnqueueRefusalPolicy::Decline"),
+            "ED-2 runs the existing transaction under its historical Decline policy"
+        );
+        // The BSP saved-resume acquisitions this guard once pinned as deliberately-excluded are
+        // retired too; ED-2 was the last one in the file.
         assert!(
             !code.contains("k.on_preempt_prefer_on_cpu(cpu, client_tid)")
                 && !code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))"),
-            "the BSP preempt and BSP saved-context acquisitions are retired; only ED-2 remains"
+            "the BSP preempt and BSP saved-context acquisitions are retired"
         );
         assert!(
             code.contains("on_preempt_prefer_on_cpu_split(cpu, client_tid)")
@@ -121558,18 +121620,19 @@ mod u3_ap_block_current_transaction {
         );
     }
 
-    /// Re-derived from `u3_bc_the_three_retained_smp_acquisitions_are_untouched`. Of the three
-    /// acquisitions this guard pinned as retained, two — the BSP preferred dispatch and the BSP
-    /// saved-context broad read — have since been retired onto narrow rank-ordered
-    /// transactions, once the BSP saved-resume path became live-reached. ED-2 remains the sole
-    /// retained acquisition in this file, and the guard keeps it pinned verbatim.
+    /// Re-derived twice. Originally `u3_bc_the_three_retained_smp_acquisitions_are_untouched`
+    /// pinned three retained acquisitions; the BSP preferred dispatch and the BSP saved-context
+    /// broad read were retired when that path became live-reached, leaving ED-2. ED-2 has now
+    /// been retired too, so **`src/arch/x86_64/smp.rs` holds no broad acquisition of any form**.
+    /// The invariant is unchanged in kind — this file's acquisition count is exact — and is now
+    /// pinned at zero.
     #[test]
-    fn u3_bc_the_sole_retained_smp_acquisition_is_ed2() {
+    fn u3_bc_smp_holds_no_acquisition_at_all() {
         let code = code_of(SMP);
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            1,
-            "one with_cpu acquisition remains: the unreached ED-2 next-task placement"
+            0,
+            "no with_cpu acquisition remains: ED-2 is retired onto the Decline transaction"
         );
         assert_eq!(
             code.matches(".with(|").count(),
@@ -121582,10 +121645,9 @@ mod u3_ap_block_current_transaction {
             "the BSP preferred-dispatch acquisition runs the narrow rank-1 transaction"
         );
         assert!(
-            code.contains("k.enqueue_on_cpu(cpu, next_tid)")
-                && code.contains("Ok(()) => k.dispatch_next_on_cpu(cpu),")
-                && code.contains("Err(_) => None,"),
-            "the unreached ED-2 site is retained verbatim, including its refusal policy"
+            !code.contains("k.enqueue_on_cpu(cpu, next_tid)")
+                && code.contains("crate::runtime::EnqueueRefusalPolicy::Decline"),
+            "ED-2 runs the existing transaction under its historical Decline policy"
         );
         assert!(
             !code.contains("shared.with(|k| k.ap_saved_resume_context(client_tid))")
@@ -133646,10 +133708,12 @@ mod u3_saved_resume_cpu_authority {
         assert!(!smp.contains(".with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu, client_tid))"));
         assert!(smp.contains("shared.ap_saved_resume_context_split(client_tid)"));
         assert!(smp.contains("shared.on_preempt_prefer_on_cpu_split(cpu, client_tid)"));
+        // U3 (203C): ED-2 has since been retired too, once the selector-off two-task AP
+        // workload was proven to reach it live. This file now holds NO acquisition at all.
         assert_eq!(
             smp.matches(".with_cpu(").count(),
-            1,
-            "x86_64/smp.rs keeps exactly one audited acquisition (ED-2)"
+            0,
+            "x86_64/smp.rs keeps no audited acquisition — ED-2 is retired"
         );
         assert_eq!(
             smp.matches(".with(|").count(),
@@ -134048,6 +134112,396 @@ mod u3_bsp_saved_resume_retirement {
         assert!(
             code.contains("x86_c2c_client_tid()"),
             "the client is still located by its numeric TID, exactly as before"
+        );
+    }
+}
+
+/// U3 (canonical 203C) — retiring the x86_64 ED-2 next-task placement acquisition.
+///
+/// ED-2 (`ap_sched_next_or_idle`) was the LAST broad acquisition in `src/arch/x86_64/smp.rs`.
+/// It was held back because its success body was believed unreachable: every scripted profile
+/// that set `yarm.ap_user_dispatch=1` also set the direct-IpcCall oracle, which pins
+/// `ap_workload_task_count()` to 1, so `AP_DISPATCH_COUNT < count` is false after the first
+/// ring-3 entry. That premise was about the SCRIPTS, not the kernel: with the oracle selector
+/// OFF the same production workload runs `AP_WORKLOAD_TASKS` = 2 tasks and reaches ED-2. Proven
+/// live before the edit (`X86_AP_NEXT_TASK_DISPATCH_BEGIN cpu=1`, both TIDs issuing a real
+/// ring-3 syscall, `X86_AP_REPEATED_DISPATCH_OK cpu=1 count=2`), then retired onto the EXISTING
+/// `enqueue_then_dispatch_on_cpu_split` under `EnqueueRefusalPolicy::Decline` — no new seam.
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod u3_ed2_next_task_retirement {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskClass;
+    use crate::runtime::{EnqueueRefusalPolicy, SharedKernel};
+
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const AP: u8 = 1;
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn next_or_idle_body() -> alloc::string::String {
+        let f = SMP
+            .split("pub(crate) fn ap_sched_next_or_idle(")
+            .nth(1)
+            .expect("the ED-2 consumer");
+        f[..f.find("\n}\n").expect("bounded")].into()
+    }
+
+    fn kernel() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| s.bring_up_cpu(CpuId(AP)).expect("AP online"));
+        k
+    }
+
+    fn register(k: &SharedKernel, tid: u64, class: TaskClass) {
+        k.with(|s| s.register_task_with_class(tid, class).expect("task"));
+    }
+
+    fn current_cpu(k: &SharedKernel) -> CpuId {
+        k.with(|s| s.current_cpu())
+    }
+
+    // ── reachability structure: why ED-2 became retirable ─────────────────────────────────
+
+    /// The two-task workload is a source constant, not a script artifact. If this drops to 1 the
+    /// live proof underpinning this retirement no longer exists.
+    #[test]
+    fn u3_ed2_workload_is_two_tasks_in_source() {
+        let code = code_of(SMP);
+        assert!(
+            code.contains("const AP_WORKLOAD_TASKS: u64 = 2;"),
+            "the controlled AP sequence must stay at 2 tasks — 1 would never reach ED-2"
+        );
+    }
+
+    /// `ap_workload_task_count()` narrows to 1 ONLY under the direct-IpcCall oracle selector.
+    /// Selector off → 2 → ED-2 is reached. This is the whole reachability argument.
+    #[test]
+    fn u3_ed2_only_the_oracle_selector_narrows_the_sequence_to_one() {
+        let code = code_of(SMP);
+        let f = code
+            .split("fn ap_workload_task_count() -> u64 {")
+            .nth(1)
+            .expect("the count fn")
+            .split("\n}")
+            .next()
+            .expect("bounded");
+        assert!(
+            f.contains("x86_ipccall_direct_smp_oracle_enabled()"),
+            "only the oracle selector may narrow the sequence"
+        );
+        assert!(f.contains('1'), "oracle mode runs exactly one task");
+        assert!(
+            f.contains("AP_WORKLOAD_TASKS"),
+            "selector-off runs the full two-task sequence"
+        );
+    }
+
+    /// ED-2 is gated behind the count of tasks that ALREADY entered ring 3, so it can only run
+    /// after the first task returned to the scheduler — never as a duplicate first dispatch.
+    #[test]
+    fn u3_ed2_runs_only_after_the_first_task_returned() {
+        let body = code_of(&next_or_idle_body());
+        let gate = body
+            .find("if (n as u64) < ap_workload_task_count() {")
+            .expect("the dispatch-count gate");
+        let load = body
+            .find("AP_DISPATCH_COUNT[idx].load(Ordering::Acquire)")
+            .expect("the count load");
+        let txn = body
+            .find("enqueue_then_dispatch_on_cpu_split(")
+            .expect("the transaction");
+        assert!(load < gate, "the count is read before the gate");
+        assert!(gate < txn, "the transaction runs only inside the gate");
+        assert!(
+            body.contains("let next_tid = ap_workload_base_tid(cpu) + n as u64;"),
+            "the next TID is derived from the count — a DISTINCT task, never a re-place"
+        );
+    }
+
+    // ── Decline semantics at this site ────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_ed2_enqueue_success_dispatches_that_task() {
+        let k = kernel();
+        register(&k, 4_101, TaskClass::App);
+        let out = k
+            .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 4_101, EnqueueRefusalPolicy::Decline)
+            .expect("online CPU admitted");
+        assert_eq!(out.enqueued, Ok(()));
+        assert_eq!(out.selected, Some(4_101), "the placed task is selected");
+    }
+
+    #[test]
+    fn u3_ed2_enqueue_failure_performs_no_dispatch() {
+        let k = kernel();
+        // A queued, selectable task exists — so a DispatchAnyway run here would select it.
+        register(&k, 4_102, TaskClass::App);
+        k.enqueue_then_dispatch_on_cpu_split(CpuId(AP), 4_102, EnqueueRefusalPolicy::Decline)
+            .expect("admitted");
+        register(&k, 4_103, TaskClass::App);
+        k.enqueue_then_dispatch_on_cpu_split(CpuId(AP), 4_103, EnqueueRefusalPolicy::Decline)
+            .expect("admitted");
+        let out = k
+            .enqueue_then_dispatch_on_cpu_split(CpuId(AP), 4_999, EnqueueRefusalPolicy::Decline)
+            .expect("admitted");
+        assert!(out.enqueued.is_err(), "the unknown TID refuses");
+        assert_eq!(
+            out.selected, None,
+            "Decline performs NO dispatch when the enqueue refused"
+        );
+    }
+
+    /// The substitution ED-2's caller must never see: on a refusal `DispatchAnyway` can return a
+    /// DIFFERENT task than the one being placed. That is why this site must stay `Decline`.
+    #[test]
+    fn u3_ed2_decline_never_substitutes_another_task() {
+        let build = |policy| {
+            let k = kernel();
+            register(&k, 4_201, TaskClass::App);
+            k.enqueue_then_dispatch_on_cpu_split(CpuId(AP), 4_201, policy)
+                .expect("admitted");
+            register(&k, 4_202, TaskClass::App);
+            k.enqueue_then_dispatch_on_cpu_split(CpuId(AP), 4_202, policy)
+                .expect("admitted");
+            k.enqueue_then_dispatch_on_cpu_split(CpuId(AP), 4_888, policy)
+                .expect("admitted")
+                .selected
+        };
+        let anyway = build(EnqueueRefusalPolicy::DispatchAnyway);
+        let decline = build(EnqueueRefusalPolicy::Decline);
+        assert_ne!(
+            anyway, None,
+            "DispatchAnyway does select some other task on a refusal"
+        );
+        assert_ne!(
+            anyway,
+            Some(4_888),
+            "and it is NOT the task that was being placed"
+        );
+        assert_eq!(
+            decline, None,
+            "Decline refuses instead — ED-2's caller must never see a substituted task"
+        );
+    }
+
+    #[test]
+    fn u3_ed2_offline_cpu_refuses_like_the_legacy_outer_with_cpu() {
+        let k = kernel();
+        register(&k, 4_301, TaskClass::App);
+        let before = current_cpu(&k);
+        let out =
+            k.enqueue_then_dispatch_on_cpu_split(CpuId(9), 4_301, EnqueueRefusalPolicy::Decline);
+        assert!(out.is_err(), "an offline CPU is refused by the transaction");
+        // The caller collapses that to `None` exactly as `.unwrap_or(None)` collapsed the
+        // legacy `with_cpu` refusal.
+        assert_eq!(
+            out.map(|o| o.selected).unwrap_or(None),
+            None,
+            "the refusal collapses to the legacy None"
+        );
+        assert_eq!(current_cpu(&k), before, "a refusal mutates nothing");
+    }
+
+    #[test]
+    fn u3_ed2_site_uses_decline_and_adds_no_retry_or_fallback() {
+        let body = code_of(&next_or_idle_body());
+        assert!(
+            body.contains("crate::runtime::EnqueueRefusalPolicy::Decline"),
+            "ED-2 must use Decline"
+        );
+        assert!(
+            !body.contains("DispatchAnyway"),
+            "DispatchAnyway is forbidden at this site"
+        );
+        assert!(
+            !body.contains("loop {") && !body.contains("for _ in"),
+            "no retry loop was introduced"
+        );
+        assert_eq!(
+            body.matches("enqueue_then_dispatch_on_cpu_split(").count(),
+            1,
+            "exactly one placement attempt — no fallback second try"
+        );
+        assert!(
+            body.contains("if placed == Some(next_tid) {"),
+            "the caller still proceeds only for its own TID"
+        );
+    }
+
+    // ── the shared transaction, after the ambient binding was removed ─────────────────────
+
+    #[test]
+    fn u3_ed_transaction_is_explicit_cpu_and_non_binding() {
+        let body = RUNTIME
+            .split("pub(crate) fn enqueue_then_dispatch_on_cpu_split(")
+            .nth(1)
+            .expect("the transaction")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded");
+        let code = code_of(body);
+        assert!(
+            !code.contains("sched.current_cpu = cpu")
+                && !code.contains("set_current_cpu")
+                && !code.contains("bind_current_cpu_split")
+                && !code.contains("current_cpu_split_read")
+                && !code.contains("current_tid()"),
+            "the transaction must neither read nor write the process-global ambient current_cpu"
+        );
+        assert!(
+            code.contains("validate_online_cpu(cpu)"),
+            "explicit-CPU validation is retained"
+        );
+        for explicit in [
+            "validate_online_cpu(cpu)",
+            "enqueue_on_with_priority(cpu, ThreadId(tid), priority)",
+            "dispatch_next_on(cpu)",
+        ] {
+            assert!(
+                code.contains(explicit),
+                "`{explicit}` must name the CPU explicitly"
+            );
+        }
+        assert_eq!(
+            code.matches("with_scheduler_split_mut").count(),
+            1,
+            "rank 1 acquired exactly once"
+        );
+        assert_eq!(
+            code.matches("with_task_enqueue_policy_split_mut").count(),
+            1,
+            "rank 2 nested exactly once, only for the enqueue policy"
+        );
+        for other in [
+            "with_ipc_split_mut",
+            "with_cnodes_split",
+            "with_vm_split_mut",
+            "with_memory_split_mut",
+            ".with_cpu(",
+            "self.with(|",
+        ] {
+            assert!(!code.contains(other), "`{other}` must not appear");
+        }
+    }
+
+    /// Both production callers hand the transaction an explicit CPU and consume only the typed
+    /// outcome — the precondition that made removing the ambient binding safe.
+    #[test]
+    fn u3_ed_every_caller_supplies_an_explicit_cpu() {
+        let code = code_of(SMP);
+        assert_eq!(
+            code.matches("enqueue_then_dispatch_on_cpu_split(").count(),
+            2,
+            "exactly two production callers: ED-1 (saved resume) and ED-2 (next task)"
+        );
+        assert_eq!(
+            code.matches(".map(|outcome| outcome.selected)").count(),
+            2,
+            "both callers consume ONLY the typed selected field"
+        );
+        assert_eq!(
+            code.matches("cpu,\n            expected,").count()
+                + code.matches("cpu,\n                next_tid,").count(),
+            2,
+            "both pass the explicit `cpu` binding as the first argument"
+        );
+    }
+
+    /// Nothing after the transaction holds a guard: the markers, the seal-probe activation and
+    /// the ring-3 entry all run lock-free.
+    #[test]
+    fn u3_ed2_holds_no_guard_across_markers_or_ring3_entry() {
+        let code = code_of(&next_or_idle_body());
+        let txn = code
+            .find("enqueue_then_dispatch_on_cpu_split(")
+            .expect("the transaction");
+        let tail = &code[txn..];
+        for banned in [
+            "with_scheduler_split_mut",
+            "with_task_enqueue_policy_split_mut",
+            "with_task_tcbs_split_mut",
+            ".with_cpu(",
+            "shared.with(",
+        ] {
+            assert!(
+                !tail.contains(banned),
+                "`{banned}` must not run after the transaction returns"
+            );
+        }
+        for step in [
+            "MARK_ADMIT_PLACED",
+            "set_ap_seal_probe_active(cpu, true)",
+            "MARK_NEXT_TASK_DISPATCH_BEGIN",
+            "ap_enter_task_ring3(cpu, next_tid)",
+        ] {
+            assert!(tail.contains(step), "`{step}` still runs, guard-free");
+        }
+    }
+
+    /// The surrounding structure ED-2 sits in is unchanged: gate, marker order, seal probe,
+    /// denied fallthrough and the idle tail.
+    #[test]
+    fn u3_ed2_surrounding_structure_is_unchanged() {
+        let code = code_of(&next_or_idle_body());
+        let ordered = [
+            "AP_DISPATCH_COUNT[idx].load(Ordering::Acquire)",
+            "if (n as u64) < ap_workload_task_count() {",
+            "let next_tid = ap_workload_base_tid(cpu) + n as u64;",
+            "enqueue_then_dispatch_on_cpu_split(",
+            "if placed == Some(next_tid) {",
+            "MARK_ADMIT_PLACED",
+            "set_ap_seal_probe_active(cpu, true)",
+            "MARK_NEXT_TASK_DISPATCH_BEGIN",
+            "ap_enter_task_ring3(cpu, next_tid)",
+            "MARK_ADMIT_DENIED_WAKE_ONLY",
+            "MARK_REPEATED_DISPATCH_OK",
+            "ap_sched_return_to_idle_markers(cpu)",
+            "MARK_SCHED_POLICY_SEAL_DONE",
+        ];
+        let mut last = 0usize;
+        for step in ordered {
+            let at = code
+                .find(step)
+                .unwrap_or_else(|| panic!("missing `{step}`"));
+            assert!(at >= last, "`{step}` is out of order");
+            last = at;
+        }
+        assert!(
+            code.contains("ap_saved_frame_resume(shared, cpu)"),
+            "the saved-resume branch is untouched"
+        );
+        assert!(
+            code.contains("super::descriptor_tables::ap_idle_halt_loop()"),
+            "the idle tail is untouched"
+        );
+    }
+
+    // ── census ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn u3_ed2_smp_file_is_fully_drained() {
+        let code = code_of(SMP);
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            0,
+            "src/arch/x86_64/smp.rs holds no with_cpu acquisition"
+        );
+        assert_eq!(
+            code.matches(".with(|").count(),
+            0,
+            "src/arch/x86_64/smp.rs holds no broad with acquisition"
+        );
+        assert!(
+            !code.contains("state.lock()"),
+            "and no raw state lock either"
         );
     }
 }

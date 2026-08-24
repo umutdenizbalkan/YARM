@@ -127,22 +127,22 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **8** |
+| `SharedKernel::with_cpu` | **7** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **0** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **8** |
+| **Total broad-lock acquisition sites** | **7** |
 
-### 1.3 `with_cpu` — 8 production callsites
+### 1.3 `with_cpu` — 7 production callsites
 
 | File | Count | Lines |
 |------|-------|-------|
 | `src/runtime.rs` | 8 | U1 deleted the obsolete `handle_trap_with_cpu` acquisition (13 → 12). This row had not been re-derived when U3 retired `current_tid_authoritative` onto the rank-1 scheduler transaction (12 → 11); it is corrected here rather than carried forward. U3 (203C) then retired the three homologous blocked-waiter Phase-C completions — `execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`, `execute_blocked_waiter_ordinary_cap_delivery` — onto ONE shared, class-neutral, rank-ordered transaction, `complete_blocked_waiter_delivery_split` (11 → 8). U3 (203C) then retired the post-drain idle-owner revalidation, `revalidate_idle_owner_after_drains`, onto a CPU-local rank-1/rank-2 transaction (11 → 8 → 7), then the two homologous recv copy-fault completions in `complete_recv_boundary_user_copy` onto ONE class-neutral rank-1 → rank-8 transaction, `record_recv_boundary_user_fault_split` (7 → 5), then the ordinary-cap DEFERRED SENDER WAKE onto `apply_split_sender_wake_plan_split`, which reuses the SHARED `wake_tid_to_runnable_split` body (5 → 4). The capability-rollback re-entry in that same method is dependency-blocked and stays broad. The mechanical per-file count in `tests/broad_lock_census_guard.rs` is the authority for this figure. |
 | `src/arch/trap_entry.rs` | 2 | U3 retired the AArch64 FutexWait and Yield switch-success restores (11 → 9), then the two homologous x86_64 D2 switch-success restores — blocking send and blocking receive — onto one neutral exact-token transaction, `x86_post_lock_resume_marked_incoming` (9 → 7), then the x86_64 FutexWait and Yield switch-success restores, which reuse that same transaction unchanged (7 → 5), then the AArch64 `CurrentTaskExited` VALIDATION reacquisition onto the shared `post_lock_exit_validation_split` (5 → 4), then the AArch64 `CurrentTaskExited` REPLACEMENT RESTORE reacquisition onto `post_exit_replacement_restore_split` plus the off-lock `aarch64::trap::post_exit_restore_replacement` (4 → 3), then the AArch64 deferred-FutexWait NO-INCOMING idle current-TID read onto the EXISTING authoritative rank-1 transaction `SharedKernel::current_tid_authoritative(cpu)` — no new seam — which applies the same `validate_online_cpu` predicate `set_current_cpu` applies, performs the same `current_cpu` binding, and reads the same `current_tid_on(current_cpu())` (MPIDR-derived on freestanding AArch64), all under ONE rank-1 acquisition instead of the broad guard's two separate scheduler acquisitions (3 → 2). That read had previously been retired onto `current_tid_split_read` and RESTORED. `current_tid_authoritative` is the correct consumer — not the split reader, and not `terminal_idle_on_cpu_split`, whose extra `runnable_count_on` condition would strengthen the predicate. **Superseded — see the CPU-authority correction below.** That wording described `current_tid_authoritative` as validate-BIND-read. It no longer binds: `scheduler.current_cpu` is one process-global field, so an off-broad bind retargeted every ambient reader on every CPU. The helper is now validate-and-READ for the EXPLICIT CPU; its returned value is unchanged, and broad `with_cpu` keeps its own legacy binding. The predicate and the refusal policy are outcome-for-outcome unchanged: `Some(0)` is the idle task, and BOTH `no current task` and `CPU refused` arrive as `None` and are mapped to `true` by the same `unwrap_or(true)`. The TWO that remain are the canonical broad Phase-2 trap dispatch and the D6 controlled-proof restore — the latter DELIBERATELY retained, because its body also runs the D6 proof cleanup (`d6_ensure_post_cleanup_task_stacks_mapped` maps kernel stack pages into the active root and every live task root), which is D3-fenced by `AI_AGENT_RULES` §14.4 and has no split form, so splitting the site would leave a broad drain behind at census delta 0. |
 | `src/arch/riscv64/trap.rs` | 2 | U3 retired six: two read-only current-TID re-acquisitions (foundation-oracle drain 8 → 7, FutexWait no-incoming idle 7 → 6), the three homologous switch/restore drains — queue-switch foundation, FutexWait switch-success, Yield switch-success (6 → 3) — onto the exact-token rank-2 transaction, and the post-lock `CurrentTaskExited` validation snapshot onto `post_lock_exit_validation_split`, one coherent rank-1 scheduler transaction with the rank-2 task acquisition nested inside it (3 → 2). U3 (203C) then retired the post-lock blocked-syscall TERMINAL-IDLE predicate onto `terminal_idle_on_cpu_split`, one coherent rank-1 scheduler snapshot (2 → 1). **`src/arch/riscv64/trap.rs` is now fully drained of reacquisitions**: its sole remaining production `with_cpu` is the canonical broad Phase-2 trap handler. |
-| `src/arch/x86_64/smp.rs` | 1 | U3 retired the AP saved-resume enqueue→dispatch placement onto `enqueue_then_dispatch_on_cpu_split` (4 → 3), then the AP return-to-idle `block_current_on_cpu` onto `block_current_on_cpu_split` (3 → 2), then the BSP saved-resume preempt-prefer acquisition onto the new rank-1 `on_preempt_prefer_on_cpu_split` (2 → 1) — the same pass that retired this file's last broad `with` (§1.4). The ONE that remains is the unreached ED-2 next-task placement in `ap_sched_next_or_idle`, retained byte-for-byte with its distinct `Err(_) => None` refusal policy. |
+| `src/arch/x86_64/smp.rs` | 0 | U3 retired the AP saved-resume enqueue→dispatch placement onto `enqueue_then_dispatch_on_cpu_split` (4 → 3), the AP return-to-idle `block_current_on_cpu` onto `block_current_on_cpu_split` (3 → 2), the BSP saved-resume preempt-prefer onto `on_preempt_prefer_on_cpu_split` (2 → 1), and finally the ED-2 next-task placement onto the same `enqueue_then_dispatch_on_cpu_split` under `EnqueueRefusalPolicy::Decline` (1 → **0**), once the existing SELECTOR-OFF two-task AP workload was proven to reach it live. **This file is now fully drained.** |
 | `src/arch/riscv64/boot.rs` | 1 | 1048 |
 
-Structural reading of those 8, re-derived from the final tree (full per-site inventory in
+Structural reading of those 7, re-derived from the final tree (full per-site inventory in
 §1.4a):
 
 * **2 are the authoritative trap dispatch** — `trap_entry.rs:310`
@@ -155,8 +155,9 @@ Structural reading of those 8, re-derived from the final tree (full per-site inv
   hold none; `trap_entry.rs` keeps only the D3-fenced D6 controlled-**proof** restore at
   `trap_entry.rs:1694`, which is not a plain restore drain — its body also performs
   cross-address-space page-table mutation.
-* **1 is the unreached x86_64 ED-2 placement** — `x86_64/smp.rs:2727`
-  (`ap_sched_next_or_idle`), retained byte-for-byte including its `Err(_) => None` policy.
+* **`src/arch/x86_64/smp.rs` contributes 0.** Its last acquisition, the ED-2 next-task
+  placement in `ap_sched_next_or_idle`, was retired once the existing selector-off two-task AP
+  workload was proven to reach it live. That file is now fully drained.
 * **4 are the recv / delivery boundary in `runtime.rs`** — one Phase-A multi-domain composite
   (`try_split_ipc_recv_queued_plain_into_frame:4093`) and three re-entries of the same
   `rollback_materialized_recv_cap` capability-teardown body (`4193`, `4486`, `5278`).
@@ -283,7 +284,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **8** |
+| runtime-required | **7** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -304,7 +305,7 @@ and `SharedKernel::run_reply_timeout_completion` (no production caller; supersed
 `OffLockReplyTimeout` composition). Neither deletion changed runtime behavior, and the
 reply-timeout completion body itself was not touched.
 
-#### runtime-required (8)
+#### runtime-required (7)
 
 Re-derived mechanically from the final tree by replaying the census guard's own algorithm
 (`production_rs_files` → `test_module_cutoff` → `is_comment` → `with_cpu_line` /
@@ -317,11 +318,10 @@ are from that same pass, not carried forward. Source and
 | 1 | `src/arch/trap_entry.rs:310` | `handle_trap_entry_shared` | `with_cpu` | runtime-required | **The** authoritative broad Phase-2 trap dispatch (x86_64 + AArch64): every syscall not on the split whitelist, plus every timer IRQ, external IRQ and page fault, runs its whole handler inside this closure | This *is* the global lock. It is the terminal target of the entire unlock programme, not a callsite to be moved onto a seam | End state of canonical **203C** (rank-1/rank-2 seams authoritative end-to-end on all three architectures) |
 | 2 | `src/arch/riscv64/trap.rs:829` | `handle_riscv_trap_entry_shared` | `with_cpu` | runtime-required | The RISC-V twin of the same authoritative Phase-2 trap dispatch | Same as row 1. **This file is otherwise fully drained** — it holds no post-lock reacquisition at all | End state of canonical **203C** |
 | 3 | `src/arch/trap_entry.rs:1694` | `yarm_kernel_thread_switch_trampoline` | `with_cpu` | runtime-required | D6 controlled-switch **proof** restore: `post_switch_restore_arch_thread_state` with a live frame, plus the D6 proof cleanup | Deliberately retained. Its body also runs `d6_ensure_post_cleanup_task_stacks_mapped`, which maps kernel-stack pages into the active root **and every live task root** — cross-address-space page-table mutation, to which the `AI_AGENT_RULES` §14.4 **D3 fence** applies, and no split form exists. Splitting the site would leave a broad drain behind at census delta 0 | Blocked on the **D3** lock-free `await_tlb_shootdown_ack` design; not retirable by U3 alone |
-| 4 | `src/arch/x86_64/smp.rs:2727` | `ap_sched_next_or_idle` | `with_cpu` | runtime-required | **ED-2** next-task placement: `enqueue_on_cpu` then `dispatch_next_on_cpu`, one workload task at a time | Retained **byte-for-byte**, including its distinct `Err(_) => None` refusal policy, because its success body is not live-reached: every script that sets `yarm.ap_user_dispatch=1` also sets `yarm.ipccall_direct_smp_oracle=1`, which pins `ap_workload_task_count()` to 1, so `AP_DISPATCH_COUNT < count` is false after the first ring-3 entry and its unique marker `X86_AP_NEXT_TASK_DISPATCH_BEGIN` never fires. An unreached site is never retired merely because it is homologous to a reached one | **U3 / 203C**, once an existing workload genuinely reaches its success body — exactly how the BSP saved-resume cohort became retirable |
-| 5 | `src/runtime.rs:4093` | `try_split_ipc_recv_queued_plain_into_frame` | `with_cpu` | runtime-required | Recv delivery boundary **Phase A**: plan + rank-3 dequeue + legacy cap materialization + deferred sender wake (§56 order) + kernel-register writeback, returning a by-value `PendingUserCopy` so the user copy runs after the broad borrow is dead | Not a drain re-acquisition but a genuine **multi-domain composite** spanning IPC, capability and task state in one closure. Retiring it means decomposing the recv boundary itself, not substituting a seam | Canonical **205A** recv-boundary decomposition (every runtime cell localized) |
-| 6 | `src/runtime.rs:4193` | `complete_recv_boundary_user_copy` | `with_cpu` | runtime-required | §58 **capability rollback** on user-copy failure — `rollback_materialized_recv_cap` | Dependency-blocked cohort (see note below) | Canonical **204B** / **205A**, after the capability-teardown dependencies are resolved |
-| 7 | `src/runtime.rs:4486` | `complete_recv_boundary_ordinary_cap` | `with_cpu` | runtime-required | The same `rollback_materialized_recv_cap`, on the ordinary-cap return-register encode-failure path | Same cohort as row 6 | Canonical **204B** / **205A** |
-| 8 | `src/runtime.rs:5278` | `execute_blocked_waiter_ordinary_cap_delivery` | `with_cpu` | runtime-required | The same `rollback_materialized_recv_cap`, on the blocked-waiter ordinary-cap copy-failure path | Same cohort as row 6 | Canonical **204B** / **205A** |
+| 4 | `src/runtime.rs:4093` | `try_split_ipc_recv_queued_plain_into_frame` | `with_cpu` | runtime-required | Recv delivery boundary **Phase A**: plan + rank-3 dequeue + legacy cap materialization + deferred sender wake (§56 order) + kernel-register writeback, returning a by-value `PendingUserCopy` so the user copy runs after the broad borrow is dead | Not a drain re-acquisition but a genuine **multi-domain composite** spanning IPC, capability and task state in one closure. Retiring it means decomposing the recv boundary itself, not substituting a seam | Canonical **205A** recv-boundary decomposition (every runtime cell localized) |
+| 5 | `src/runtime.rs:4193` | `complete_recv_boundary_user_copy` | `with_cpu` | runtime-required | §58 **capability rollback** on user-copy failure — `rollback_materialized_recv_cap` | Dependency-blocked cohort (see note below) | Canonical **204B** / **205A**, after the capability-teardown dependencies are resolved |
+| 6 | `src/runtime.rs:4486` | `complete_recv_boundary_ordinary_cap` | `with_cpu` | runtime-required | The same `rollback_materialized_recv_cap`, on the ordinary-cap return-register encode-failure path | Same cohort as row 5 | Canonical **204B** / **205A** |
+| 7 | `src/runtime.rs:5278` | `execute_blocked_waiter_ordinary_cap_delivery` | `with_cpu` | runtime-required | The same `rollback_materialized_recv_cap`, on the blocked-waiter ordinary-cap copy-failure path | Same cohort as row 5 | Canonical **204B** / **205A** |
 
 Per-file subtotals, matching source and guard exactly:
 
@@ -330,10 +330,12 @@ Per-file subtotals, matching source and guard exactly:
 | `src/runtime.rs` | 4 | 0 |
 | `src/arch/trap_entry.rs` | 2 | 0 |
 | `src/arch/riscv64/trap.rs` | 1 | 0 |
-| `src/arch/x86_64/smp.rs` | 1 | 0 |
-| **Total** | **8** | **0** |
+| **Total** | **7** | **0** |
 
-**The capability-rollback cohort (rows 6–8).** All three call the single body
+`src/arch/x86_64/smp.rs` is absent from this table because it now holds **zero** broad
+acquisitions of any form — U3 retired its last one, the ED-2 next-task placement.
+
+**The capability-rollback cohort (rows 5–7).** All three call the single body
 `KernelState::rollback_materialized_recv_cap`, on three different failure paths. They are
 dependency-blocked, not merely unconverted: unwinding a materialized receive capability
 touches the delegation graph and notification teardown, and the reclaim path is subject to the
@@ -345,8 +347,9 @@ re-acquisitions* (14 sites across `trap_entry.rs` and `riscv64/trap.rs`), a thre
 resume trampoline* group, an *AArch64 split return path*, a *RISC-V resume* site in
 `riscv64/boot.rs`, and an *identity / SMP / deadline helpers* group in `runtime.rs`. Every one
 of those has been retired onto a narrow seam by Stage 199D and directives U1–U3; none appears
-in the current tree. `src/kernel/boot/thread_state.rs`, `src/arch/riscv64/boot.rs` and
-`src/arch/x86_64/descriptor_tables.rs` now hold **zero** acquisitions each.
+in the current tree. `src/kernel/boot/thread_state.rs`, `src/arch/riscv64/boot.rs`,
+`src/arch/x86_64/descriptor_tables.rs` and now `src/arch/x86_64/smp.rs` hold **zero**
+acquisitions each.
 
 > **The earlier naming hazard is resolved.** A previous revision of this section warned that
 > `smp_request_wake_target_split_read` was named `*_split_read` while taking the broad lock via
@@ -355,7 +358,7 @@ in the current tree. `src/kernel/boot/thread_state.rs`, `src/arch/riscv64/boot.r
 > No `*_split*`-named function in the tree takes a broad lock today.
 
 > **Historical snapshot, retained as provenance only.** The counts quoted in older paragraphs of
-> this document — 51, 50, 49, 47, 44, 39, 21 runtime-required, and the per-group line numbers
+> this document — 51, 50, 49, 47, 44, 39, 21 runtime-required, 8, and the per-group line numbers
 > that went with them — are historical and are **not** claims about the current tree. The
 > authority for the current census is `tests/broad_lock_census_guard.rs`, which recomputes it
 > from source on every run.
@@ -536,7 +539,7 @@ counts as done:
 |-------|--------------------|--------|------------------|
 | **199C** | Blocking `IpcSend` — sender-waiter publication retired, sparse-queue + timeout parity | **OPEN** | `handle_ipc_send` and its waiter publication run inside the broad `with_cpu`. The only off-lock element is the x86_64 D2-send drain (`trap_entry.rs:388`), which relocates the queue-advancing **dispatch**, not the publication, and is compile-time absent on the other two architectures. The 15 `IpcSend` live cells prove **delivery**, not blocking-sender retirement. |
 | **199D** | `IpcCall` + reply-object lifecycle as one transaction, incl. **server crash cleanup** | **OPEN** — hosted foundation + knob-gated live proof | Off-lock transaction exists (`ipccall_direct_txn.rs`; `syscall_split.rs:295/307`), reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) but **default-OFF** (`mod.rs:3095`), so no production boot takes it. Server-crash cleanup: accounting **repaired** and the **first live cell EARNED on x86_64** — `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL` at `f5669cb5`/`e2fd0b5c`, scoped vector `[1;9]`, quiescent `created=54 closed=54 live_links=0`, `EXIT_TASK_OWNER_REVALIDATED … committed=replacement`, zero `result=fail` (`doc/IPC.md` §8.5). **Still open as a stage: 1 of 3 architectures, and the NR6/NR7 gate is default-OFF.** |
-| **199E** | IPC timeout + cancellation: recv, **send**, **call**, reply | **OPEN** — one quarter retired | Reply timeout only: narrow completion on 3 arches, scan off-lock **x86_64 only**, 6 live cells (`STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, `72a4ebf`). `IpcRecvTimeout` pre-reads its deadline off-lock; the receive is broad. **`IpcSend` timeout and `IpcCall` timeout are not retired at all.** Broad fallback `runtime.rs:3725` present. |
+| **199E** | IPC timeout + cancellation: recv, **send**, **call**, reply | **DELIVERED / CLOSED** | U7 delivered this stage; the row is corrected here from source, having been carried forward stale. **The off-lock scan is NOT x86_64-only:** the production entry `SharedKernel::run_due_ipc_timeout_work` carries no `cfg(target_arch)` and is wired on all three architectures — `src/arch/trap_entry.rs:1759` (x86_64 + AArch64) and `src/arch/riscv64/trap.rs:931`. **`IpcSend` timeout IS retired:** `run_due_ipc_timeout_work_at` runs one scan (`collect_due_ipc_timeout_work`) then the class drains — `drain_reply_timeout_post_work` and `drain_send_timeout_post_work` — in that fixed order, off the broad lock. `IpcCall`'s timeout is the reply-wait deadline and is covered by the reply class; no separate call-timeout machinery exists. The cited broad fallback at `runtime.rs:3725` no longer exists — that line is now inside an unrelated transaction, and the obsolete `SharedKernel::run_reply_timeout_completion` wrapper was deleted by U1. The single completion body `KernelState::run_reply_timeout_completion_locked` is unchanged and is still reached directly by the in-lock timer scan, which is not a fallback. Live: `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL` (`72a4ebf`). |
 | **199F** | Notification signal / wait / wait-timeout / multi-signal; no global lock in IRQ-originated delivery | **OPEN** | Only `notification_waiter_count_split_read` exists, and it is a read helper. `signal_notification` (`ipc_state.rs:5196`) takes `&mut self` under the broad lock. IRQ-originated delivery runs inside the broad trap closure. |
 | **199G** | Full IPC seal — zero IPC broad-lock acquisitions | **OPEN** | Blocked on 199C–199F. |
 
@@ -582,14 +585,14 @@ counts as done:
 |-------|-------|--------|------------------|
 | **203A** | Timer tick + deadline processing; **no broad lock from timer interrupt context** | **OPEN** — partial foundation | The tick is handled inside `handle_trap_entry_with_fault_bookkeeping_mode`, i.e. inside `with_cpu`. `scheduler_tick_now_split_read` and the post-lock reply-timeout drain are partial foundations. |
 | **203B** | IRQ delivery — ack, notification delivery, waiter wake, mask/unmask; fast paths never take the broad lock | **OPEN** | External IRQs enter the same broad trap closure. |
-| **203C** | Scheduler core; rank-1/rank-2 seams become **authoritative, not compatibility helpers** | **OPEN** — partial | The rank-1 seam is authoritative for queue-advancing dispatch on **x86_64 only**: `d6_genuine_enabled()` (`mod.rs:766`) is compile-time **false** on AArch64 and RISC-V. The drain re-acquisition class is now fully retired: of the **8** remaining runtime-required callsites, **0** are post-lock drains (§1.4a). What remains is the authoritative trap dispatch itself (2), the D3-fenced D6 controlled-proof restore (1), the unreached x86_64 ED-2 placement (1) and the recv/delivery boundary (4). |
+| **203C** | Scheduler core; rank-1/rank-2 seams become **authoritative, not compatibility helpers** | **OPEN** — partial | **Correction, from source.** This row previously read "the rank-1 seam is authoritative for queue-advancing dispatch on **x86_64 only**", citing `d6_genuine_enabled()`. That cites the wrong predicate: U4 introduced `queue_advancing_dispatch_enabled()` (`src/kernel/boot/mod.rs`) as the CANONICAL predicate for queue-advancing blocking dispatch, and it is **architecture-neutral** — `!d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()`, with no `cfg!(target_arch)`. `d6_genuine_enabled()` still exists and still is `cfg!(target_arch = "x86_64") && …`, but it governs the D6 genuine-seam observation, a different question its own doc comment spells out. Queue-advancing dispatch is therefore not x86_64-only. The drain re-acquisition class is fully retired: of the **7** remaining runtime-required callsites, **0** are post-lock drains (§1.4a). What remains is the authoritative trap dispatch itself (2), the D3-fenced D6 controlled-proof restore (1) and the recv/delivery boundary (4). **203C stays OPEN/PARTIAL** because scheduler operations still execute inside those two authoritative trap dispatches and the D3-fenced proof site remains. |
 | **203D** | Cross-CPU work; AArch64/RISC-V may stay BSP-only **provided APs are explicitly wake-only and no runnable task can be stranded** | **OPEN** — x86_64 live-proven, knob-gated | x86_64: shootdown mailboxes, reschedule IPIs both directions, remote wake, cross-CPU placement, per-CPU current — all live at SMP=2 under default-off knobs; production scheduler still BSP-only. The AArch64/RISC-V wake-only + no-stranding argument the stage requires is **not documented**. |
 
 ### 3.6 Phase 7 — Remove the monolithic runtime path
 
 | Stage | Scope | Status | Evidence and gap |
 |-------|-------|--------|------------------|
-| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all **8** callsites enumerated with file, line, enclosing symbol, form, role, why it remains and expected retiring directive. **0 boot-only, 0 test-only, 0 obsolete, 8 runtime-required, 0 undocumented.** (Stage 199D retired the AArch64 handled-split syscall return; U1 deleted the two obsolete acquisitions, 49 → 47; U2 relocated the three test-only ones, 47 → 44; U3 has since retired the entire drain class and both x86_64 BSP saved-resume acquisitions, 44 → … → 10 → **8**. The census is exactly the runtime-required set.) Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (7 tests), which recomputes the census from source and fails on any added or removed production callsite. |
+| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all **7** callsites enumerated with file, line, enclosing symbol, form, role, why it remains and expected retiring directive. **0 boot-only, 0 test-only, 0 obsolete, 7 runtime-required, 0 undocumented.** (Stage 199D retired the AArch64 handled-split syscall return; U1 deleted the two obsolete acquisitions, 49 → 47; U2 relocated the three test-only ones, 47 → 44; U3 has since retired the entire drain class, both x86_64 BSP saved-resume acquisitions and the x86_64 ED-2 next-task placement, 44 → … → 10 → 8 → **7**. The census is exactly the runtime-required set.) Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (7 tests), which recomputes the census from source and fails on any added or removed production callsite. |
 | **204B** | Decompose `KernelState` ownership; `SharedKernel` may remain a container but must not serialize the kernel | **OPEN** — partial foundation | 11 ranked domain locks and a full seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`. |
 | **204C** | Remove fallback-to-global handlers | **OPEN** | Five families live: default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding | **OPEN** | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, one-shot class logging and the foundation oracles are all live. |
@@ -599,7 +602,7 @@ counts as done:
 
 | Stage | Scope | Status | Evidence and gap |
 |-------|-------|--------|------------------|
-| **205A** | Complete syscall matrix — arch, class, locks, blocking, post-lock work, rollback, **address-space restore**, live proof. **Every runtime cell localized.** | **OPEN** — matrix drafted, localization false | §2 supplies the matrix across all three architectures with locks / blocking / post-lock / rollback / hosted / live columns. Two gaps: the **address-space restore** column is not populated per cell, and the exit condition (every runtime cell localized) is false while **8** runtime-required broad callsites remain. **205A reports cells; it is not where defects are retired.** |
+| **205A** | Complete syscall matrix — arch, class, locks, blocking, post-lock work, rollback, **address-space restore**, live proof. **Every runtime cell localized.** | **OPEN** — matrix drafted, localization false | §2 supplies the matrix across all three architectures with locks / blocking / post-lock / rollback / hosted / live columns. Two gaps: the **address-space restore** column is not populated per cell, and the exit condition (every runtime cell localized) is false while **7** runtime-required broad callsites remain. **205A reports cells; it is not where defects are retired.** |
 | **205B** | Fault-injection matrix at every transactional boundary | **OPEN** — isolated precedents | Shared-region 12-case race seal, reply-cap 18-case negative seal, 24 deterministic ServerDies races. No unified matrix; no coverage of allocation failure, slot exhaustion, queue full, or shootdown failure. |
 | **205C** | Long-running concurrency torture with all anomaly counters zero | **OPEN** | No sustained harness exists, and no torture load has been run. Separately, the hosted suite cannot currently *serve* as such a harness because its own fixtures contend (§0) — that is test-infrastructure debt, a prerequisite rather than a part of this stage. |
 | **205D** | Cross-arch full-unlock seal — `KERNEL_RUNTIME_GLOBAL_LOCK_CALLS … count=0` ×3, `KERNEL_FULL_UNLOCK_SEAL … result=ok` ×3, `KERNEL_FULL_UNLOCK_CROSS_ARCH_SEAL arches=3 result=ok` | **OPEN** | **None of the three marker families exists anywhere in the tree** (grep over `src`, `crates`, `tests`, `scripts`). |

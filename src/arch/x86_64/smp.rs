@@ -2723,11 +2723,34 @@ pub(crate) fn ap_sched_next_or_idle(shared: &crate::runtime::SharedKernel, cpu: 
     if (n as u64) < ap_workload_task_count() {
         let next_tid = ap_workload_base_tid(cpu) + n as u64;
         // Audited placement (the wake-only guard still applies) + make it current.
+        //
+        // U3 (canonical 203C): this was the broad
+        // `with_cpu(cpu, |k| match k.enqueue_on_cpu(cpu, next_tid) { Ok(()) =>
+        // k.dispatch_next_on_cpu(cpu), Err(_) => None }).unwrap_or(None)` re-acquire — the LAST
+        // broad acquisition in this file. It is now the EXISTING authoritative rank-1 -> rank-2
+        // transaction `enqueue_then_dispatch_on_cpu_split`, with no new seam added.
+        //
+        // `EnqueueRefusalPolicy::Decline` is this site's historical policy verbatim, and is the
+        // only admissible one here: the task is being placed for the FIRST time, so a refused
+        // enqueue means there is nothing to select and no dispatch may happen — the `Err(_) =>
+        // None` arm. `DispatchAnyway` (the saved-resume policy, where the task may already be
+        // queued) would dispatch through a refusal and could select a DIFFERENT task, which the
+        // `placed == Some(next_tid)` comparison below would then reject — changing this live
+        // path. The two policies stay distinct on purpose.
+        //
+        // Outcome mapping is exactly the legacy one: an outer transaction error collapses to
+        // `None` just as `.unwrap_or(None)` collapsed the `with_cpu` refusal, and the selected
+        // TID is carried through verbatim. Eligibility is not strengthened, no retry or fallback
+        // is added, and enqueue still precedes dispatch inside the single rank-1 critical
+        // section. Every guard is released before the markers, the seal-probe activation and the
+        // ring-3 entry below.
         let placed = shared
-            .with_cpu(cpu, |k| match k.enqueue_on_cpu(cpu, next_tid) {
-                Ok(()) => k.dispatch_next_on_cpu(cpu),
-                Err(_) => None,
-            })
+            .enqueue_then_dispatch_on_cpu_split(
+                cpu,
+                next_tid,
+                crate::runtime::EnqueueRefusalPolicy::Decline,
+            )
+            .map(|outcome| outcome.selected)
             .unwrap_or(None);
         if placed == Some(next_tid) {
             crate::kernel::printk::printk_emit_sync(format_args!(
