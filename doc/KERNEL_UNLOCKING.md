@@ -717,6 +717,117 @@ byte-identical to `0912a279` across all fourteen workspace members.
 COMPLETE and canonical 203C remains OPEN / PARTIAL. Stage arithmetic: 3 complete / 11 partial /
 21 open. U9 is next.**
 
+---
+
+## U9 — TERMINAL BROAD-LOCK RETIREMENT. SUBSTAGE REACHED: **U9-A (inventory + boundary
+derivation). NO CENSUS REDUCTION. CENSUS-DELTA 0 — 7 / 0 / 7 unchanged.**
+
+U9's own stop rule was reached on both of its candidate targets. Nothing was retired, nothing was
+deleted, and no approximation was shipped. What this pass produced is the thing the next pass
+needs: the seven-site inventory re-derived from source, and the two exact boundaries that block
+every remaining site.
+
+### The seven sites, re-derived (not carried forward)
+
+Replaying the census guard's own algorithm — `production_rs_files` → `test_module_cutoff` →
+`is_comment` → `with_cpu_line` / `with_broad_line` — and resolving each hit's enclosing `fn` from
+source:
+
+| # | Site | Enclosing symbol | Domains held | Classification |
+|---|---|---|---|---|
+| 1 | `src/arch/trap_entry.rs:310` | `handle_trap_entry_shared` | broad (all) | **TERMINAL DISPATCHER** |
+| 2 | `src/arch/riscv64/trap.rs:829` | `handle_riscv_trap_entry_shared` | broad (all) | **TERMINAL DISPATCHER** |
+| 3 | `src/arch/trap_entry.rs:1694` | `handle_trap_entry_shared`, post-switch restore | broad + cross-address-space arch thread state | **D3/D6-FENCED** |
+| 4 | `src/runtime.rs:4141` | `try_split_ipc_recv_queued_plain_into_frame` | container for IPC 3, capability 4, scheduler 1 | **CAP-FENCED** (reply-cap rank inversion) |
+| 5 | `src/runtime.rs:4241` | `complete_recv_boundary_user_copy` | capability 4 → IPC 3 rollback | **CAP/VM-TEARDOWN-FENCED** |
+| 6 | `src/runtime.rs:4534` | `complete_recv_boundary_ordinary_cap` | same body | **CAP/VM-TEARDOWN-FENCED** |
+| 7 | `src/runtime.rs:5326` | `execute_blocked_waiter_ordinary_cap_delivery` | same body | **CAP/VM-TEARDOWN-FENCED** |
+
+Per-file: `runtime.rs` 4, `trap_entry.rs` 2, `riscv64/trap.rs` 1. Source and
+`tests/broad_lock_census_guard.rs` agree site-for-site. **RETIRABLE NOW: none.**
+
+Two corrections to `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a fell out of the re-derivation: all four
+`runtime.rs` line numbers were stale, and row 3's enclosing symbol was recorded as
+`yarm_kernel_thread_switch_trampoline`, which is an `extern "C"` **declaration** at
+`trap_entry.rs:1602`, not the enclosing function.
+
+### Boundary 1 — the primary target (site 4) is blocked by the reply-cap rank inversion
+
+Phase A is a composite, but no longer an undecomposed one. Every dependency except one already
+has an authoritative off-lock form (`task_asid_for_tid_split_read`,
+`runtime_capacity_config_split_read`, `with_ipc_split_mut`, the already-off-lock 186D2/186D3 mint,
+`apply_split_sender_wake_plan_split`, and the Phase-B 186E user copy). The single exception is
+the **reply-cap materialization arm**: `materialize_received_message_cap_routed_with_delegation_split`
+explicitly refuses that class, returning `CapTransferMaterializeOutcome::DeferredReplyCap`.
+
+That arm is live on an **ordinary default x86_64 core smoke** — no oracle, no selector — exactly
+once per boot: `YARM_D5_SPLIT_MATERIALIZE kind=reply receiver_tid=3 local_cap=65538`,
+`IPC_REPLY_CAP_ONESHOT_OK`, `IPC_RECV_BOUNDARY_SNAPSHOT_OK … reply=true`. It is PM receiving a
+call carrying a reply cap.
+
+Both available exits are therefore closed. A **pre-dequeue** refusal would not be an exact refusal
+of a non-admitted case — the class is admitted and live-served, so refusing it would reroute a
+default production path back onto the terminal dispatcher U9 exists to delete. A **post-dequeue**
+refusal is impossible: the message is already consumed. Retiring site 4 requires minting a
+receiver-local reply cap (capability rank 4) while the reply-object record is bound in the IPC
+domain (rank 3) — the unsolved `reply_cap_ipc_rank_inversion`.
+
+Sites 5–7 were re-verified against source and are the same inversion in the opposite direction:
+the Reply arm of `rollback_materialized_recv_cap` (`transfer_state.rs:193`) runs
+`fast_revoke_reply_cap_in_cnode` and then `clear_reply_cap_waiter_cap` — a capability-domain
+rollback that must mutate the IPC reply record.
+
+**One fence, four sites.** Solving `reply_cap_ipc_rank_inversion` is the single prerequisite for
+`runtime.rs` reaching zero — census 7 → 3 in one cohort. That is the correct next U9 target.
+
+### Boundary 2 — the terminal dispatchers (sites 1–2) still serve most of the ABI
+
+`classify_split_eligible_nr_only` (`src/kernel/syscall_split.rs:1060`) admits exactly **five**
+classes: `ControlPlaneSetCnodeSlots`, `IpcRecv`, `VmBrk`, `DebugLog`, `FutexWake`. `IpcCall` and
+`IpcReply` are admitted only behind `ipccall_direct_admission_enabled()`, whose production term is
+`false` on every architecture. Every other class — `IpcSend`, `IpcRecvTimeout`, `RecvSharedV3`,
+`Yield`, `FutexWait`, `SpawnThread`, `Fork`, `VmMap`, `VmAnonMap`, the four `Spawn*` classes,
+`ExitCurrentTask`, `ReapFaultedTask`, `TransferRelease`, `CreateInitramfsFileSliceMo`,
+`SpawnFromMemoryObject` — plus **every** timer IRQ, external IRQ and page fault still runs its
+whole handler inside the broad closure. The dispatchers cannot be deleted until each of those
+names a narrow owner. §5's continuation condition ("no unsupported syscall class") is false by a
+wide margin.
+
+### 204C / 204D source-truth cleanup — nothing qualified
+
+Every family named in the U9 directive was audited from source and is still depended upon:
+
+| Family | Finding |
+|---|---|
+| syscall split default-deny fallback | live — `classify_split_eligible_nr_only`'s `_ => None` is the admission gate itself |
+| in-helper `None` declines | live — the documented fallback contract for all five admitted classes |
+| `reason=state_changed` drain/reacquisition | live on all three ports (8 distinct deferral sites) |
+| reply-timeout broad completion | already deleted by U1; `run_reply_timeout_completion_locked` is the live body |
+| compile-time-false D6 genuine/fallback path | site 3's body performs cross-address-space stack mapping — D3-fenced, not dead |
+| `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` | live — 4 readers in `syscall.rs`, 3 in `ipc_state.rs` |
+| retirement-enable flags | only `ipccall_direct_production_enabled()` is compile-time constant, and it is the deliberate direct-production OFF switch |
+| class-specific one-shot retirement logging | dead in all three **default** builds but live under their oracle features (`ipc-reply-timeout-oracle-core`, `shared-region-direct-oracle`) |
+| obsolete foundation-only oracles/helpers | same — feature-gated, not obsolete |
+
+The mechanical sweep intersected the "never used" sets of all three freestanding builds (72 /
+81 / 102 symbols, intersection 37). Every intersection member is either feature-gated,
+referenced by hosted tests, a field/variant name rather than a symbol, or — for the three that
+are genuinely caller-free (`server_death_work_published_count`,
+`server_death_work_drained_count`, `current_arch_tag`) — a reader whose removal would only turn
+a live production counter into a write-only static. Deleting those is churn, not retirement, and
+§4's rule ("do not delete a fallback merely to make a source guard pass") applies. **Nothing was
+deleted.**
+
+### Status
+
+**U9 substage A reached. Census 7 / 0 / 7 unchanged. No commit touches production source.**
+U3 remains COMPLETE and canonical 203C remains OPEN / PARTIAL. 199C and 199E remain DELIVERED /
+CLOSED. Direct production remains **OFF**. Stage arithmetic is unchanged at **3 complete / 11
+partial / 21 open**. RPi5, futex, WA3C2 and direct-IpcCall production were untouched.
+
+**The next U9 target is `reply_cap_ipc_rank_inversion`, not another callsite.** It is the single
+fence holding four of the seven sites, and it is worth a directive of its own.
+
 > **Correction — there is no U8 implementation left to do.** Earlier revisions of this doc and
 > of `doc/STATUS.md` ended with "U8 is next". Directive U8 was the AArch64
 > `finalize_split_handled_syscall` broad reacquisition, and Stage 199D already retired it: that

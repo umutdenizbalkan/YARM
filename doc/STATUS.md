@@ -321,6 +321,21 @@ no new syscall, ABI lane, script, marker family, cap slot or seam file.
 **AArch64 keeps the strict exact-base pre-admission deferral at `INIT_SPAWN_V5_CALL_BEGIN`; no
 live U6 proof is claimed there.** See `doc/KERNEL_UNLOCKING.md` § U6-FRAME. **U9 is next.**
 
+**U9 — substage A reached (inventory + boundary derivation). CENSUS-DELTA 0; 7 / 0 / 7
+unchanged.** The seven sites were re-derived from source by replaying the census guard's own
+algorithm, and **none is retirable now**: two are the terminal trap dispatchers, one is the
+D3/D6-fenced post-switch restore, and **four** — the recv Phase-A composite plus the three
+`rollback_materialized_recv_cap` callers — are held by a single fence,
+`reply_cap_ipc_rank_inversion`. Phase A's every other dependency already has an authoritative
+off-lock form; only the reply-cap mint does not, and that arm runs once on an **ordinary default
+x86_64 boot** (`IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3`), so it can be neither refused
+pre-dequeue (it is admitted and live-served) nor post-dequeue (the message is already consumed).
+The terminal dispatchers still serve 19 of ~24 syscall classes plus every IRQ and page fault.
+The named 204C/204D families were all audited from source and are still depended upon or
+feature-gated; nothing qualified for deletion. **Solving `reply_cap_ipc_rank_inversion` would
+take the census 7 → 3 in one cohort and is the correct next U9 target.** See
+`doc/KERNEL_UNLOCKING.md` § U9 and `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
+
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
 `finalize_split_handled_syscall` broad reacquisition, already retired by Stage 199D; that
 function holds no broad acquisition today. Earlier "U8 is next" pointers are removed.
