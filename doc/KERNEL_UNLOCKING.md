@@ -777,8 +777,39 @@ the Reply arm of `rollback_materialized_recv_cap` (`transfer_state.rs:193`) runs
 `fast_revoke_reply_cap_in_cnode` and then `clear_reply_cap_waiter_cap` — a capability-domain
 rollback that must mutate the IPC reply record.
 
-**One fence, four sites.** Solving `reply_cap_ipc_rank_inversion` is the single prerequisite for
-`runtime.rs` reaching zero — census 7 → 3 in one cohort. That is the correct next U9 target.
+> **CORRECTION (U9-B). "One fence, four sites" was wrong — and rows 5-7 are the harder fence.**
+> U9-A asserted that solving `reply_cap_ipc_rank_inversion` would take the census 7 -> 3 in one
+> cohort. Source disproves that for the two ordinary-cap rollback sites, which can **never carry a
+> Reply object at all**: `runtime.rs:4512` states it outright — *"Cannot occur: ordinary
+> (non-reply) objects only reach here."* Their rollback therefore always takes the **non-Reply
+> arm** of `rollback_materialized_recv_cap`, which calls `revoke_capability_in_cnode`
+> (`capability_lifecycle_state.rs:525`). That function unconditionally performs, in one body:
+>
+> * `collect_delegated_descendants` + `revoke_capability_direct_in_process_cnode` — recursive
+>   revocation across **other processes'** cnodes;
+> * `revoke_active_transfer_mappings_for_cap` -> `unmap_range_two_phase(asid, base, len)` — a
+>   cross-address-space page-table unmap whose own comment names
+>   `execute_tlb_shootdown_wait_plan`. **This is the D3 fence verbatim** (`AI_AGENT_RULES` §14.4);
+> * `adjust_memory_object_cap_refcount(-1)` then `reclaim_memory_object_if_unreferenced` ->
+>   `with_memory_state_mut` + `free_frame` — **rank-6 memory reclaim**;
+> * `destroy_notification_for_revoked_cap` -> `destroy_notification` +
+>   `wake_destroyed_notification_waiter` — notification teardown plus a **scheduler wake (rank 1)
+>   issued from a rank-4 capability rollback**, i.e. the reverse-rank wake policy.
+>
+> The third rollback site is reachable by that same arm: Phase A excludes `OPCODE_SHARED_MEM` from
+> the ordinary route (`syscall.rs:1671`), so a shared-region message falls to
+> `materialize_received_message_cap_routed`, its `MemoryObject` becomes
+> `pending.materialized_cap`, and a copy failure rolls back a MemoryObject **carrying an active
+> transfer mapping** — the `unmap_range_two_phase` path exactly.
+>
+> So the cohort is **two fences, not one**. The Phase-A site is reply-cap-fenced; the three
+> rollback sites are fenced by capability-revoke-with-object-teardown (D3 + rank-6 reclaim +
+> reverse-rank wake). Solving the reply-cap inversion alone yields **7 -> 6**, not 7 -> 3, and no
+> class filter reaches 7 -> 3 without an approximation the directive forbids.
+
+**The Phase-A site alone.** Solving `reply_cap_ipc_rank_inversion` retires it — census 7 -> 6.
+The three rollback sites need a separate off-lock capability-revoke-with-teardown transaction,
+which is D3-gated.
 
 ### Boundary 2 — the terminal dispatchers (sites 1–2) still serve most of the ABI
 
@@ -825,8 +856,10 @@ U3 remains COMPLETE and canonical 203C remains OPEN / PARTIAL. 199C and 199E rem
 CLOSED. Direct production remains **OFF**. Stage arithmetic is unchanged at **3 complete / 11
 partial / 21 open**. RPi5, futex, WA3C2 and direct-IpcCall production were untouched.
 
-**The next U9 target is `reply_cap_ipc_rank_inversion`, not another callsite.** It is the single
-fence holding four of the seven sites, and it is worth a directive of its own.
+**Two fences remain, not one** (see the U9-B correction above). `reply_cap_ipc_rank_inversion`
+retires the Phase-A site (7 -> 6). The three rollback sites need an off-lock
+capability-revoke-with-object-teardown transaction and are **D3-gated**, so they cannot be
+retired ahead of the D3 `await_tlb_shootdown_ack` design.
 
 > **Correction — there is no U8 implementation left to do.** Earlier revisions of this doc and
 > of `doc/STATUS.md` ended with "U8 is next". Directive U8 was the AArch64

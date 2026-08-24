@@ -332,8 +332,12 @@ x86_64 boot** (`IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3`), so it can be neither 
 pre-dequeue (it is admitted and live-served) nor post-dequeue (the message is already consumed).
 The terminal dispatchers still serve 19 of ~24 syscall classes plus every IRQ and page fault.
 The named 204C/204D families were all audited from source and are still depended upon or
-feature-gated; nothing qualified for deletion. **Solving `reply_cap_ipc_rank_inversion` would
-take the census 7 → 3 in one cohort and is the correct next U9 target.** See
+feature-gated; nothing qualified for deletion. **Corrected by U9-B: that is TWO fences, not one.** The three
+`rollback_materialized_recv_cap` sites can never carry a Reply object (`runtime.rs:4512`), so
+they always take `revoke_capability_in_cnode`, which performs cross-address-space
+`unmap_range_two_phase` (the D3 fence), rank-6 memory reclaim, and a scheduler wake issued from a
+rank-4 rollback. Solving `reply_cap_ipc_rank_inversion` retires only the Phase-A site — **7 → 6**;
+the rollback cohort is D3-gated. See
 `doc/KERNEL_UNLOCKING.md` § U9 and `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
 
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
