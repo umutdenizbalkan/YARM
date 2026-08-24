@@ -714,6 +714,17 @@ pub(super) fn handle_ipc_recv(
     // endpoint queue under ipc_state_lock (Stage 4D). Lock is released; safe to wake.
     if let IpcSchedulerPlan::WakeSender(wake_tid) = split_scheduler_plan {
         let _ = kernel.apply_split_sender_wake_plan(wake_tid);
+        // U6-FRAME §5C: the wake-application observability marker belongs to EVERY route
+        // that applies a sender wake, not only the queued-split one
+        // (`try_split_recv_queued_plain_with_snapshot_locked`). This legacy route performs the
+        // identical Stage-4D refill + wake and is the route a user-ASID `recv-v2` receiver
+        // actually takes on RISC-V, so without this emission the same event is observable on
+        // one architecture and invisible on another. Emitted exactly once, after the wake is
+        // applied and before any writeback — the same §56 position as the queued-split site.
+        crate::yarm_log!(
+            "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+            wake_tid.tid.0
+        );
     }
     // Stage 35: use canonical meta_target to detect recv-v2 instead of raw frame
     // arg checks — semantically identical to the previous inline check.
@@ -911,6 +922,14 @@ pub(super) fn handle_ipc_recv_timeout(
     // Apply deferred scheduler plan from Stage 4D/4G/4I split recv refill if any.
     if let IpcSchedulerPlan::WakeSender(wake_tid) = try_recv_scheduler_plan {
         let _ = kernel.apply_split_sender_wake_plan(wake_tid);
+        // U6-FRAME §5C: same wake-application observability as every other route (see
+        // `handle_ipc_recv`). The bounded non-blocking drain — `ipc_recv_with_deadline(ep, 0)` —
+        // lands here, so this is the route that actually refills and wakes for most of the
+        // proof's drain iterations. Emitted once, after the wake, before writeback.
+        crate::yarm_log!(
+            "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+            wake_tid.tid.0
+        );
     }
     // Skip the timeout-fired check when the split path already delivered a message.
     // A stale ipc_timeout_fired flag from a prior syscall must not corrupt the result

@@ -95,7 +95,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 
 | Stage | Definition (owner-supplied) | Status | Evidence / what is missing |
 |-------|------------------------------|--------|----------------------------|
-| **199C** | **Blocking IpcSend.** Retire sender-waiter publication where endpoint policy blocks a sender: sender → `Blocked(IpcSend)`, waiter enqueued once, receiver later consumes sender, sender wakes once. Full sparse-queue and timeout parity. | **OPEN** | `handle_ipc_send` and its waiter publication run entirely inside the broad `with_cpu`. The only off-lock element is the x86_64 D2-send drain (`src/arch/trap_entry.rs:388`), which relocates the *queue-advancing dispatch* — **not** the waiter publication — and is compile-time absent on AArch64/RISC-V. Sparse-queue and send-timeout parity untouched. The 15 `IpcSend` live cells (plain / ordinary-cap / shared-region) prove **delivery**, not blocking-sender retirement. |
+| **199C** | **Blocking IpcSend.** Retire sender-waiter publication where endpoint policy blocks a sender: sender → `Blocked(IpcSend)`, waiter enqueued once, receiver later consumes sender, sender wakes once. Full sparse-queue and timeout parity. | **DELIVERED / CLOSED** | **The blocking-send lifecycle is off-lock and LIVE-PROVEN on x86_64 and RISC-V, and the blocked sender's exact envelope is preserved end-to-end.** `handle_ipc_send` → `ipc_send_with_deadline_publishing` routes an eligible blocking send to `BlockingSendRoute::PublicationEligible`, which mutates nothing in-lock and stashes a `BlockingSendCommitSnapshot` carrying the **complete canonical `Message`**; the post-lock drain runs `commit_blocking_send_split`, a rank 1 → 2 → 3 transaction that publishes the waiter once, blocks the TCB and clears `current` inside the same rank-1 section. Live on both architectures: `U6_BLOCKING_SEND_INLOCK=0`, `U6_BLOCKING_SEND_PUBLISHED=1`, waiter publication once, `U6_SEND_COMPLETION_PUBLISHED … result=0 result=ok` once, `U6_SEND_COMPLETION_REFUSED_STALE=0`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid=10008 phase=before_writeback` once, and the receiver observes the child's exact envelope — `IPC_RECV_OUT_META_REPLY status=10008 opcode=0 len=10 flags=0 sender_tid=10008` — **exactly once, at the FIFO tail**, with `IPC_RECV_PROOF_SENDER_WAKE_SENDER_MSG_ABSENT=0` and `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE=1`. Three consecutive clean runs per architecture; `scan_broad_lock=0 production=1`; zero fault/panic. Sparse-queue behaviour is unchanged (a gap at slot 0 still falls back to the full path) and timeout parity is carried by the closed 199E pipeline. **AArch64 retains the strict exact-base pre-admission deferral at `INIT_SPAWN_V5_CALL_BEGIN`** — its signature is mechanically identical to `0912a279`, the workload never reaches a blocking send there, and no live U6 proof is claimed for that port. |
 | **199D** | **IpcCall and reply-object lifecycle** as one transaction: delivery → caller reply-blocked → reply object created → reply cap transferred → server replies → caller wakes → reply object destroyed. Required: no orphan reply object, no duplicate reply, no lost caller, no reply-cap rematerialization, timeout/cancellation cleanup, **server crash cleanup**. | **OPEN** (hosted foundation + knob-gated live proof) | Transaction exists off-lock: `src/kernel/ipccall_direct_txn.rs`, `syscall_split.rs:295/307`, reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 in both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) — but **default-OFF** (`ipccall_direct_proof_enabled()`, `src/kernel/boot/mod.rs:3095`), so **no production boot takes it**. Server-crash cleanup: the reverse-link accounting is **repaired**, and the **first live cell is EARNED on x86_64** — `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`, tree `e2fd0b5c`: scoped vector `[1;9]`, quiescent system balance `created=54 closed=54 live_links=0`, owner revalidation executed with a correct replacement return, zero `result=fail` in the log (`doc/IPC.md` §8.5). **1 of 3 architectures**; AArch64 and RISC-V cells unearned. Timeout/cancellation cleanup depends on 199E. |
 | **199E** | **IPC timeout and cancellation** off the broad lock: `IpcRecvTimeout`, **IpcSend timeout**, **IpcCall timeout**, reply timeout/cancellation. Bounded timer/deadline structures, subsystem-local cleanup. Known sparse sender-waiter behavior must remain fixed. | **DELIVERED / CLOSED** | **The off-lock timeout pipeline is production-live and DEFAULT-REACHABLE on all three architectures.** `SharedKernel::run_due_ipc_timeout_work` is driven unconditionally from every port's post-lock area — no oracle feature, no runtime selector — and `IPC_REPLY_TIMEOUT_LOCK_STATUS arch=… scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok` is emitted on an ORDINARY boot of x86_64, AArch64 and RISC-V. Blocking-send timeout is retired through the U6 lifecycle (`GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendTimeout`). Ordinary receive timeout is retired off-lock and settles in production (`U8_RECV_TIMEOUT_SETTLED … broad_lock=0 result=ok`, 1288 settlements in one default RISC-V boot). Reply/call timeout registration is now ORDINARY production code (`arm_production_reply_deadline`, ungated), and a default RISC-V boot both arms and settles one without any oracle build. **RISC-V was the last default-reachability blocker and 199E-R2/R3 closed it**: the `riscv64-timer-irq` admission gate is deleted, the periodic supervisor timer is unconditional, pre-idle and boot-hart-owned, and asynchronous resume is keyed to the exact incoming task. Live: default core green including `-smp 2`; selector-off production expiry drives the full chain once to `caller_continuations=1 … result=ok`. Remaining work is scaling, not reachability — the deliberately tiny 4-slot deadline store (`MAX_DEADLINE_TOKENS = 4`) and unifying the per-arch deadline timebases — and neither gates this stage. Deferred with exact-base signatures: the AArch64 reply-timeout retirement profile and the RISC-V selector-ON timeout-wins lane both fail mechanically identically to `932bd6f`. |
 | **199F** | **Notification wait/signal parity**: signal, wait, wait-with-timeout, multi-signal accumulation, wake exactly once. No global lock in IRQ-originated notification delivery. | **OPEN** | Only `notification_waiter_count_split_read` (`src/runtime.rs:4341`) exists, and it is a read helper. `signal_notification` (`src/kernel/boot/ipc_state.rs:5196`) takes `&mut self` under the broad lock. IRQ-originated delivery runs inside `handle_trap_entry_shared`'s `with_cpu`. No seams for wait, wait-with-timeout, or multi-signal accumulation. |
@@ -165,20 +165,22 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 
 | Phase | Complete | Partial foundation | Open |
 |-------|----------|--------------------|------|
-| 2 — IPC | **1 of 5** (199E) | 199D | 199C, 199F, 199G |
+| 2 — IPC | **2 of 5** (199C, 199E) | 199D | 199F, 199G |
 | 3 — Capability | 0 of 4 | 200A, 200C | 200B, 200D |
 | 4 — VM | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
 | 5 — Lifecycle | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |
 | 6 — Timer/IRQ/sched | 0 of 4 | 203A, 203C, 203D | 203B |
 | 7 — Monolith removal | **1 of 5** (204A) | 204B | 204C, 204D, 204E |
 | 8 — Seal | 0 of 4 | 205A | 205B, 205C, 205D |
-| **Total** | **2 of 35** | 11 | 22 |
+| **Total** | **3 of 35** | 11 | 21 |
 
-Two canonical stages are complete: **199E** (Phase 2 — the off-lock timeout pipeline is
-production-live and default-reachable on all three architectures) and **204A** (Phase 7 — the
-census itself, which is documentation rather than lock retirement). 199E moved from *partial
-foundation* to *complete*, which is why the partial count falls 12 → **11** while the open
-count stays at 22; complete + partial + open = 2 + 11 + 22 = 35.
+Three canonical stages are complete: **199C** (Phase 2 — the blocking-send lifecycle is
+off-lock and its exact envelope is live-proven preserved on x86_64 and RISC-V), **199E**
+(Phase 2 — the off-lock timeout pipeline is production-live and default-reachable on all three
+architectures) and **204A** (Phase 7 — the census itself, which is documentation rather than
+lock retirement). 199E moved from *partial foundation* to *complete*, which is why the partial
+count fell 12 → **11**; U6-FRAME then moved **199C** from *open* to *complete*, so the open
+count falls 22 → **21**: complete + partial + open = 3 + 11 + 21 = 35.
 
 > **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
 > was the only row written without an `N of M` denominator, and the totals silently counted it
@@ -591,6 +593,129 @@ CENSUS 8 → 7. Canonical 203C remains OPEN / PARTIAL.**
 **Execution directive U3 is COMPLETE (exit met); canonical 203C remains OPEN / PARTIAL. 199C remains OPEN. 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN (partially
 production-wired).** Directive U8 is already source-complete. Canonical stage arithmetic is
 unchanged at **2 complete / 11 partial / 22 open**. Direct production remains **OFF**.
+
+> **Superseded by U6-FRAME (below).** The "199C remains OPEN" and "2 complete / 11 partial /
+> 22 open" statements above were true at the U3 checkpoint. U6-FRAME closes 199C and moves the
+> arithmetic to **3 complete / 11 partial / 21 open**; §0.3 and §0.4 carry the current values.
+
+---
+
+## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
+
+**U6 — COMPLETE. CANONICAL 199C — DELIVERED / CLOSED. CENSUS-DELTA 0.**
+*(This supersedes the earlier "U6 — DELIVERED. CANONICAL 199C — OPEN" headline: U6 delivered the
+lifecycle, and U6-FRAME supplies the live envelope proof 199C's exit condition required.)*
+
+### The envelope, boundary by boundary
+
+The blocked sender's envelope is one value — a canonical `Message`
+(`crates/yarm-kernel/src/ipc.rs:78`: `{sender_tid, opcode, flags, transferred_cap, len,
+payload}`) — and it is **moved**, never rebuilt, at every boundary:
+
+| # | boundary | owner / type | identity | how the envelope travels |
+|---|----------|--------------|----------|--------------------------|
+| 1 | userspace child | `yarm_user_rt::ipc::Message` | none (`sender_tid = 0`) | opcode + 8 × `0x5E`; user-rt prepends the 2-byte opcode, so the kernel payload is 10 bytes |
+| 2 | send admission (`src/kernel/syscall/ipc.rs`) | kernel `Message` | authoritative `sender_tid` from `current_tid()` | `Message::with_header(sender_tid, …)` — stamped exactly once, never from a user lane |
+| 3 | publication snapshot (`blocking_send_publication_snapshot`, `ipc_state.rs:4031`) | `BlockingSendCommitSnapshot` | `{tid, asid}` + endpoint `{idx, generation}` | the whole `Message` is stored by value in `snap.msg` |
+| 4 | waiter slot (`commit_blocking_send_split`, `runtime.rs`) | `SenderWaiter` | `{tid, asid, send_generation}` | `msg: snap.msg` — a move, inside the rank-3 section; the commit contains no `Message::with_header`, no `Message::new`, no `current_tid()` |
+| 5 | receiver refill (`ipc_try_recv_queued_plain_endpoint_only` / `…_with_cap_transfer`) | endpoint queue | waiter claimed at slot 0, queue compacted | the receiver takes the **dequeued head**; `ep.send(waiter_msg)` appends the waiter's envelope at the **tail** — the just-dequeued message is never requeued |
+| 6 | later dequeue | endpoint queue | `sender_tid` intact | delivered in FIFO order, exactly once |
+| 7 | return / decode | `IpcRecvMetaV2` (40 bytes) | `meta.sender_tid` | `encode_recv_v2_meta(…, msg.sender_tid.0)`; user-rt rebuilds the message from `meta.sender_tid`/`meta.opcode`/`meta.payload_len` |
+
+Completion ordering follows from the shape rather than from a comment: the refill commits inside
+the rank-3 section and the wake plan is only *returned* from it, so
+`apply_split_sender_wake_plan` — and therefore
+`publish_blocking_send_completion_split` — cannot run until the envelope transfer has committed.
+
+**Live, the two architectures produce byte-identical envelope fields.** x86_64 and RISC-V both
+show eight fill frames (`sender_tid=1`) and then exactly one
+`IPC_RECV_OUT_META_REPLY status=10008 opcode=0 len=10 flags=0 sender_tid=10008` — the child's
+exact `0x5E` envelope, at the tail, once.
+
+### The repaired boundary
+
+**The kernel never corrupted or lost the envelope. The loss was at boundary 6, and it was a
+second receiver.**
+
+The proof workload's forked child parked with `ipc_recv(e1_recv)` — a *blocking receive on the
+endpoint under proof*. Its blocking send completes the instant the parent's first drain refills
+the queue, so the child woke as an **E1 receiver** while the parent was still draining and
+dequeued messages out from under it. Live on RISC-V it dequeued **its own refilled envelope**:
+`IPC_RECV_OUT_META_REPLY … sender_tid=10008` followed by
+`IPC_RECV_COPY_TO_USER tid=10008` — the frame copied into the *child's* buffer. The parent's
+next drain then found E1 empty and reported `SENDER_MSG_ABSENT`, even though the kernel had
+refilled, woken and delivered correctly.
+
+x86_64 passed the same build only because the parent won that race. The proof was
+**scheduling-dependent, not architecture-dependent** — which is why three prior investigation
+chains, all looking for an architecture divergence in the kernel, found none.
+
+The repair is one line of proof workload: the child parks on the **coordination** endpoint
+instead. That park can never steal the coordination signal either — the signal exists only if
+the child became an E1 sender-waiter, and in that case the child's send returns only *after* the
+parent has already consumed the signal and drained.
+
+### Three carried repairs
+
+* **§5A — waiter-present coordination parity.** `KernelState::enqueue_sender_waiter` pushes the
+  proof coordination signal from inside the same `ipc_state_lock` section that fills the waiter
+  slot. The publication route fills the *same slot* without calling that function, so on any
+  architecture taking it the signal was never pushed and the receiver could not tell the sender
+  had become a waiter — observable as `E2_POLL_EXHAUSTED` on RISC-V. `commit_blocking_send_split`
+  now emits it after the exact slot fill, inside the same rank-3 section, on the success path
+  only. Every refusal returns before that point, and with the sub-knob off
+  `proof_sender_wake_coordination_target` returns `None`, so it is a strict no-op on every
+  ordinary boot.
+* **§5B — RISC-V core-smoke selector forwarding.** `scripts/qemu-riscv64-core-smoke.sh` did not
+  translate `IPC_RECV_PROOF_SENDER_WAKE` into `yarm.ipc_recv_proof_sender_wake=1`, so the RISC-V
+  sender-wake workload had **never run**. It now forwards it exactly as the x86_64 and AArch64
+  core smokes do.
+* **§5C — `ORDER_OK` on every wake-application route.** The ordering marker existed only on the
+  queued-split route. The legacy `handle_ipc_recv`, the legacy `handle_ipc_recv_timeout` and
+  `recv_shared_v3` all apply `WakeSender` and emitted nothing — so the same event was observable
+  on one architecture and invisible on another. All four routes now emit it once, after the wake
+  and before writeback.
+
+**Not carried:** the disproven "same-route drain" change. `ipc_recv_v2` has no deadline lane and
+blocks unconditionally; `ipc_recv_with_deadline(ep, 0)` is this codebase's non-blocking poll
+idiom (`service.rs:4444`, `:4513`), and the proof client's mixed-route drain is deliberate and
+correct.
+
+### Live acceptance
+
+Three consecutive clean runs per architecture, artifacts rebuilt from the final tree before the
+first run of each:
+
+| | x86_64 | RISC-V | AArch64 |
+|---|---|---|---|
+| `U6_BLOCKING_SEND_INLOCK` | 0 | 0 | — |
+| `U6_BLOCKING_SEND_PUBLISHED` | 1 | 1 | — |
+| waiter-present signal | 1 | 1 | — |
+| refill + wake apply | 1 | 1 | — |
+| `U6_SEND_COMPLETION_PUBLISHED … result=0` | 1 | 1 | — |
+| `U6_SEND_COMPLETION_REFUSED_STALE` | 0 | 0 | — |
+| `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` | 1 | 1 | — |
+| child envelope observed (`sender_tid`, `0x5E`) | 1 | 1 | — |
+| `SENDER_MSG_ABSENT` | 0 | 0 | — |
+| `SEQUENCE_DONE` | 1 | 1 | — |
+| `scan_broad_lock=0 production=1` | yes | yes | yes |
+| fault / panic | 0 | 0 | 0 |
+
+**AArch64 keeps the strict exact-base pre-admission deferral at `INIT_SPAWN_V5_CALL_BEGIN`.**
+Its signature is mechanically identical to base `0912a279`; the workload never reaches a blocking
+send on that port, so **no live U6 proof is claimed for AArch64** and no SpawnV5/VFS/initramfs
+repair was attempted.
+
+### Scope
+
+Census delta **0** (7 / 0 / 7 unchanged). No new syscall, ABI lane, script, marker family, cap
+slot or seam file. `EnqueueRefusalPolicy`, sparse-queue fallback, FIFO order, endpoint capacity
+and every timeout structure are untouched. Direct production remains **OFF**. Policy clippy is
+byte-identical to `0912a279` across all fourteen workspace members.
+
+**Canonical 199C is DELIVERED / CLOSED. Canonical 199E remains DELIVERED / CLOSED. U3 is
+COMPLETE and canonical 203C remains OPEN / PARTIAL. Stage arithmetic: 3 complete / 11 partial /
+21 open. U9 is next.**
 
 > **Correction — there is no U8 implementation left to do.** Earlier revisions of this doc and
 > of `doc/STATUS.md` ended with "U8 is next". Directive U8 was the AArch64

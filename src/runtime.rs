@@ -3085,37 +3085,71 @@ impl SharedKernel {
                     asid: Some(snap.sender_asid),
                     send_generation: next_generation,
                 };
-                let ipc_outcome = self.with_ipc_split_mut(|ipc| {
-                    if ipc
-                        .endpoints
-                        .get(snap.endpoint_idx)
-                        .and_then(Option::as_ref)
-                        .is_none()
-                    {
-                        return Err(BlockingSendCommitOutcome::RefusedEndpointMissing);
-                    }
-                    if ipc.endpoint_generations.get(snap.endpoint_idx).copied()
-                        != Some(snap.endpoint_generation)
-                    {
-                        return Err(BlockingSendCommitOutcome::RefusedEndpointGenerationChanged);
-                    }
-                    let queue = &mut ipc.endpoint_sender_waiters[snap.endpoint_idx];
-                    if queue[..MAX_ENDPOINT_SENDER_WAITERS]
-                        .iter()
-                        .flatten()
-                        .any(|w| w.tid.0 == snap.sender_tid)
-                    {
-                        return Err(BlockingSendCommitOutcome::RefusedDuplicateWaiter);
-                    }
-                    let Some(slot) = queue[..MAX_ENDPOINT_SENDER_WAITERS]
-                        .iter_mut()
-                        .find(|s| s.is_none())
-                    else {
-                        return Err(BlockingSendCommitOutcome::RefusedWaiterQueueFull);
-                    };
-                    *slot = Some(waiter);
-                    Ok(())
-                });
+                let ipc_outcome =
+                    self.with_ipc_split_mut(|ipc| {
+                        if ipc
+                            .endpoints
+                            .get(snap.endpoint_idx)
+                            .and_then(Option::as_ref)
+                            .is_none()
+                        {
+                            return Err(BlockingSendCommitOutcome::RefusedEndpointMissing);
+                        }
+                        if ipc.endpoint_generations.get(snap.endpoint_idx).copied()
+                            != Some(snap.endpoint_generation)
+                        {
+                            return Err(
+                                BlockingSendCommitOutcome::RefusedEndpointGenerationChanged,
+                            );
+                        }
+                        let queue = &mut ipc.endpoint_sender_waiters[snap.endpoint_idx];
+                        if queue[..MAX_ENDPOINT_SENDER_WAITERS]
+                            .iter()
+                            .flatten()
+                            .any(|w| w.tid.0 == snap.sender_tid)
+                        {
+                            return Err(BlockingSendCommitOutcome::RefusedDuplicateWaiter);
+                        }
+                        let Some(slot) = queue[..MAX_ENDPOINT_SENDER_WAITERS]
+                            .iter_mut()
+                            .find(|s| s.is_none())
+                        else {
+                            return Err(BlockingSendCommitOutcome::RefusedWaiterQueueFull);
+                        };
+                        *slot = Some(waiter);
+                        // U6-FRAME §5A — waiter-present coordination PARITY with the in-lock route.
+                        //
+                        // `KernelState::enqueue_sender_waiter` pushes the proof coordination signal
+                        // into E2 from inside the SAME `ipc_state_lock` section that fills the waiter
+                        // slot. This publication route fills the very same slot without ever calling
+                        // that function, so on any architecture that takes it the signal was never
+                        // pushed and the proof's receiver could not tell that the sender had become a
+                        // real waiter. Emitting it HERE — after the exact slot fill, inside the same
+                        // rank-3 section, and only on the success path — restores the identical
+                        // atomic proxy: "E2 has the signal" ⇔ "this sender is a waiter on E1".
+                        //
+                        // Every refusal above returns before this point, so a refused commit signals
+                        // nothing; and with the sub-knob off
+                        // `proof_sender_wake_coordination_target` returns `None`, so this is a strict
+                        // no-op on every ordinary boot and on every endpoint except the proof E1.
+                        if let Some(e2_idx) =
+                            crate::kernel::boot::proof_sender_wake_coordination_target(
+                                snap.endpoint_idx,
+                            )
+                        {
+                            crate::kernel::boot::proof_sender_wake_push_coordination_locked(
+                                ipc,
+                                e2_idx,
+                                snap.sender_tid,
+                            );
+                            crate::yarm_log!(
+                                "IPC_RECV_PROOF_SENDER_WAKE_WAITER_PRESENT endpoint={} tid={}",
+                                snap.endpoint_idx,
+                                snap.sender_tid
+                            );
+                        }
+                        Ok(())
+                    });
                 if let Err(refusal) = ipc_outcome {
                     // Nothing was mutated in any domain: rank 3 refused before writing, and
                     // ranks 2 and 1 have not been touched.

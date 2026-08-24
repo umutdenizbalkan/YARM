@@ -134505,3 +134505,587 @@ mod u3_ed2_next_task_retirement {
         );
     }
 }
+
+/// U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION.
+///
+/// The U6 blocking-send lifecycle was already correct end-to-end; what this module pins is the
+/// property the live proof could not previously observe: the blocked sender's **exact canonical
+/// envelope** — `{sender_tid, opcode, flags, len, payload}` — survives every boundary from send
+/// admission, through the waiter slot, through the receiver's refill, to the later endpoint
+/// dequeue, exactly once and with no substitution.
+///
+/// The live failure that motivated this was NOT a kernel corruption. The kernel moved the exact
+/// envelope every time; the proof workload's forked child parked on a blocking receive against
+/// **the endpoint under proof**, woke as a second receiver the instant its send completed, and
+/// dequeued its own envelope out from under the parent — visible on RISC-V as
+/// `IPC_RECV_OUT_META_REPLY … sender_tid=<child>` copied into the CHILD's buffer. x86_64 passed
+/// only because the parent won that race, so the proof was scheduling-dependent rather than
+/// architecture-dependent. The behavioural tests below drive the real refill body, so a future
+/// substitution/loss regression fails here rather than in a flaky boot.
+mod u6_frame_exact_envelope_preservation {
+    use super::*;
+    use crate::kernel::boot::{IpcEndpointRecvResult, SenderWaiter};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const BOOT_MOD: &str = include_str!("mod.rs");
+    const SYSCALL_IPC: &str = include_str!("../syscall/ipc.rs");
+    const SYSCALL: &str = include_str!("../syscall.rs");
+    const RECV_V3: &str = include_str!("../syscall/recv_shared_v3.rs");
+    const SERVICE: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const X86_SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+
+    /// The proof's own shape: an 8-deep endpoint filled to capacity, then one blocked sender.
+    const DEPTH: usize = 8;
+    const CHILD: u64 = 10_008;
+    const FILLER: u64 = 1;
+    const OPCODE: u16 = 0;
+    /// The child's payload, byte-for-byte the live workload's.
+    const CHILD_PAYLOAD: [u8; 8] = [0x5E; 8];
+    const FILL_PAYLOAD: [u8; 8] = [0xF1; 8];
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_between<'a>(src: &'a str, open: &str, close: &str) -> &'a str {
+        let after = src.split(open).nth(1).unwrap_or_else(|| {
+            panic!("missing `{open}`");
+        });
+        let end = after
+            .find(close)
+            .unwrap_or_else(|| panic!("missing terminator `{close}` after `{open}`"));
+        &after[..end]
+    }
+
+    fn child_msg() -> Message {
+        Message::with_header(CHILD, OPCODE, 0, None, &CHILD_PAYLOAD).expect("child envelope")
+    }
+
+    fn fill_msg(nth: u8) -> Message {
+        let mut bytes = FILL_PAYLOAD;
+        // Distinguish the fills from each other so a FIFO transposition is observable.
+        bytes[0] = nth;
+        Message::with_header(FILLER, OPCODE, 0, None, &bytes).expect("fill envelope")
+    }
+
+    /// A full endpoint plus exactly one blocked sender holding `waiter_msg` — the state the live
+    /// proof reaches at `IPC_RECV_PROOF_SENDER_WAKE_RECV_BEGIN`.
+    fn full_endpoint_with_waiter(k: &SharedKernel, waiter_msg: Message) -> usize {
+        k.with(|state| {
+            let (ep_idx, _send, _recv) = state.create_endpoint(DEPTH).expect("endpoint");
+            state.with_ipc_state_mut(|ipc| {
+                let ep = super::kernel_mut(ipc.endpoints[ep_idx].as_mut().expect("present"));
+                for nth in 0..DEPTH {
+                    ep.send(fill_msg(nth as u8)).expect("fill within capacity");
+                }
+                ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+                    tid: ThreadId(CHILD),
+                    msg: waiter_msg,
+                    asid: Some(crate::kernel::vm::Asid(12)),
+                    send_generation: 1,
+                });
+            });
+            ep_idx
+        })
+    }
+
+    /// The queue contents in FIFO order. `Endpoint` exposes only `peek`/`recv`/`queued`, so this
+    /// drains and re-appends: the queue starts empty after the drain, so re-sending in the order
+    /// taken restores byte-identical state.
+    fn queued(k: &SharedKernel, ep_idx: usize) -> alloc::vec::Vec<Message> {
+        k.with(|state| {
+            state.with_ipc_state_mut(|ipc| {
+                let ep = super::kernel_mut(ipc.endpoints[ep_idx].as_mut().expect("present"));
+                let mut out = alloc::vec::Vec::new();
+                while let Some(msg) = ep.recv() {
+                    out.push(msg);
+                }
+                for msg in &out {
+                    ep.send(*msg).expect("restore");
+                }
+                out
+            })
+        })
+    }
+
+    fn fresh() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    // ── (1) admission: the envelope is stamped once, from the authoritative sender ───────────
+
+    /// The kernel-side message is built with the AUTHORITATIVE sender TID resolved from the
+    /// current task — never from a user-supplied lane. Userspace passes `sender_tid = 0`.
+    #[test]
+    fn admission_stamps_sender_tid_from_the_authoritative_sender() {
+        let code = code_of(SYSCALL_IPC);
+        // Every kernel-side construction in the send path stamps the resolved `sender_tid`.
+        let constructions = code
+            .matches("Message::with_header(\n                sender_tid,")
+            .count();
+        assert!(
+            constructions >= 4,
+            "every send-admission Message construction must stamp the resolved sender_tid \
+             (found {constructions})"
+        );
+        assert!(
+            !code.contains("Message::with_header(0,"),
+            "send admission must never stamp a literal/ambient zero sender"
+        );
+        // And the publication snapshot names the same authoritative sender, not a frame lane.
+        let ipc_code = code_of(IPC_STATE);
+        let snap = body_between(
+            ipc_code.as_str(),
+            "fn blocking_send_publication_snapshot(",
+            "fn block_current_on_send_with_deadline(",
+        );
+        assert!(
+            snap.contains("let sender_tid = self.current_tid()?;")
+                && snap.contains("let sender_asid = self.task_asid(sender_tid)?;"),
+            "the snapshot must bind {{tid, asid}} from authoritative current-task state"
+        );
+    }
+
+    /// The snapshot carries the WHOLE canonical `Message` — not an opcode, a length and a TID
+    /// from which a later path could rebuild one.
+    #[test]
+    fn the_split_snapshot_retains_the_exact_canonical_message() {
+        let snap = crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot {
+            cpu: CpuId(0),
+            sender_tid: CHILD,
+            sender_asid: crate::kernel::vm::Asid(12),
+            endpoint_idx: 3,
+            endpoint_generation: 1,
+            send_cap: crate::kernel::capabilities::CapId(9),
+            msg: child_msg(),
+            deadline: None,
+            transfer_envelope: None,
+        };
+        assert_eq!(snap.msg.sender_tid, ThreadId(CHILD));
+        assert_eq!(snap.msg.opcode, OPCODE);
+        assert_eq!(snap.msg.flags, 0);
+        assert_eq!(snap.msg.as_slice(), &CHILD_PAYLOAD);
+        assert_eq!(snap.msg.transferred_cap(), None, "the plain/no-cap form");
+    }
+
+    /// The waiter slot is filled by MOVING the snapshot's message, so no reconstruction from a
+    /// TID / argument lane / current task can ever occur between the two.
+    #[test]
+    fn the_waiter_record_owns_the_complete_envelope_by_move() {
+        let commit = body_between(
+            RUNTIME,
+            "pub(crate) fn commit_blocking_send_split(",
+            "/// U6 §2 — the split (rank-2 only) form of",
+        );
+        assert!(
+            commit.contains("msg: snap.msg,"),
+            "the waiter must take the snapshot's exact message"
+        );
+        for rebuilt in ["Message::with_header(", "Message::new(", "current_tid()"] {
+            assert!(
+                !commit.contains(rebuilt),
+                "the commit must not rebuild the envelope ({rebuilt})"
+            );
+        }
+    }
+
+    // ── (2) refill: the child envelope moves, the dequeued fill does not come back ───────────
+
+    /// The refill returns the DEQUEUED message to the receiver and enqueues the WAITER's message
+    /// — never the other way round, and never the just-dequeued message twice.
+    #[test]
+    fn the_refill_moves_the_child_envelope_not_the_dequeued_message() {
+        let k = fresh();
+        let ep_idx = full_endpoint_with_waiter(&k, child_msg());
+        let before = queued(&k, ep_idx);
+        assert_eq!(before.len(), DEPTH, "the endpoint starts full");
+
+        let outcome = k.with(|state| state.ipc_try_recv_queued_plain_endpoint_only(ep_idx));
+        let IpcEndpointRecvResult::ReceivedWithSenderWake(received, wake) = outcome else {
+            panic!("a plain head waiter must produce a refill + wake, got {outcome:?}");
+        };
+
+        // The receiver got the FILL that was at the head — not the child's envelope.
+        assert_eq!(received, before[0], "the receiver takes the dequeued head");
+        assert_eq!(received.sender_tid, ThreadId(FILLER));
+        assert_ne!(received.as_slice(), &CHILD_PAYLOAD);
+        // The wake names the exact blocked sender.
+        assert_eq!(wake.tid, ThreadId(CHILD));
+
+        let after = queued(&k, ep_idx);
+        assert_eq!(after.len(), DEPTH, "depth is restored, not exceeded");
+        // The surviving fills keep their order, and the child's envelope is the new tail.
+        assert_eq!(&after[..DEPTH - 1], &before[1..], "no FIFO transposition");
+        assert_eq!(after[DEPTH - 1], child_msg(), "the child's exact envelope");
+        assert_eq!(
+            after.iter().filter(|m| **m == before[0]).count(),
+            0,
+            "the just-dequeued fill is never requeued"
+        );
+    }
+
+    /// The child's envelope lands at the FIFO tail, so it is delivered after — and only after —
+    /// every message that was already queued ahead of it.
+    #[test]
+    fn the_child_envelope_occupies_the_expected_fifo_position() {
+        let k = fresh();
+        let ep_idx = full_endpoint_with_waiter(&k, child_msg());
+        let _ = k.with(|state| state.ipc_try_recv_queued_plain_endpoint_only(ep_idx));
+
+        let after = queued(&k, ep_idx);
+        let position = after
+            .iter()
+            .position(|m| m.sender_tid == ThreadId(CHILD))
+            .expect("the child envelope is queued");
+        assert_eq!(
+            position,
+            DEPTH - 1,
+            "the refill appends at the tail; the live proof's drain depends on exactly this"
+        );
+    }
+
+    /// Draining the endpoint to empty yields the child's exact `{tid, opcode, flags, payload}`
+    /// EXACTLY once — no duplicate, no loss, no substituted fill frame.
+    #[test]
+    fn a_later_dequeue_returns_the_exact_child_envelope_once() {
+        let k = fresh();
+        let ep_idx = full_endpoint_with_waiter(&k, child_msg());
+
+        let mut drained = alloc::vec::Vec::new();
+        let first = k.with(|state| state.ipc_try_recv_queued_plain_endpoint_only(ep_idx));
+        match first {
+            IpcEndpointRecvResult::ReceivedWithSenderWake(msg, _) => drained.push(msg),
+            other => panic!("expected a refill, got {other:?}"),
+        }
+        loop {
+            match k.with(|state| state.ipc_try_recv_queued_plain_endpoint_only(ep_idx)) {
+                IpcEndpointRecvResult::Received(msg) => drained.push(msg),
+                IpcEndpointRecvResult::ReceivedWithSenderWake(msg, _) => drained.push(msg),
+                IpcEndpointRecvResult::Ineligible(_) => break,
+            }
+        }
+
+        assert_eq!(
+            drained.len(),
+            DEPTH + 1,
+            "eight fills plus one child envelope"
+        );
+        let child: alloc::vec::Vec<&Message> = drained
+            .iter()
+            .filter(|m| m.sender_tid == ThreadId(CHILD))
+            .collect();
+        assert_eq!(child.len(), 1, "delivered exactly once");
+        assert_eq!(
+            child[0].as_slice(),
+            &CHILD_PAYLOAD,
+            "the exact 0x5E payload"
+        );
+        assert_eq!(child[0].opcode, OPCODE);
+        assert_eq!(child[0].flags, 0);
+        assert_eq!(child[0].transferred_cap(), None);
+        assert_eq!(
+            drained.last().expect("non-empty").sender_tid,
+            ThreadId(CHILD),
+            "and last, matching its tail position"
+        );
+    }
+
+    /// A cap-flagged waiter envelope is REFUSED rather than partially transferred: nothing is
+    /// dequeued, nothing is refilled, and the waiter keeps its envelope.
+    #[test]
+    fn a_refused_refill_neither_loses_nor_duplicates_the_envelope() {
+        let k = fresh();
+        let flagged = Message::with_header(
+            CHILD,
+            OPCODE,
+            Message::FLAG_CAP_TRANSFER,
+            Some(7),
+            &CHILD_PAYLOAD,
+        )
+        .expect("cap-flagged envelope");
+        let ep_idx = full_endpoint_with_waiter(&k, flagged);
+        let before = queued(&k, ep_idx);
+
+        let outcome = k.with(|state| state.ipc_try_recv_queued_plain_endpoint_only(ep_idx));
+        assert!(
+            matches!(outcome, IpcEndpointRecvResult::Ineligible(_)),
+            "a cap-flagged waiter envelope must refuse the split refill, got {outcome:?}"
+        );
+        assert_eq!(queued(&k, ep_idx), before, "the queue is untouched");
+        let waiter =
+            k.with(|state| state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[ep_idx][0]));
+        assert_eq!(
+            waiter.expect("waiter retained").msg,
+            flagged,
+            "the refusal retains the envelope rather than retiring it"
+        );
+    }
+
+    /// The transfer commits INSIDE the rank-3 section; the wake — and therefore the sender's
+    /// completion — can only be applied by the caller after that section returns.
+    #[test]
+    fn completion_cannot_publish_before_the_envelope_transfer_commits() {
+        let body = body_between(
+            IPC_STATE,
+            "pub(crate) fn ipc_try_recv_queued_plain_endpoint_only(",
+            "/// Stage 42+43: like [`ipc_try_recv_queued_plain_endpoint_only`]",
+        );
+        let refill = body
+            .find("ep.send(waiter_msg)")
+            .expect("the refill move exists");
+        let handoff = body
+            .find("IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid)")
+            .expect("the wake is handed to the caller");
+        assert!(
+            refill < handoff,
+            "the envelope must be transferred before the wake plan is returned"
+        );
+        for wake in [
+            "apply_split_sender_wake_plan",
+            "publish_blocking_send_completion",
+        ] {
+            assert!(
+                !body.contains(wake),
+                "no completion/wake may be published inside the rank-3 section ({wake})"
+            );
+        }
+    }
+
+    /// One refill owner per split route, and neither clones the envelope into a second queue.
+    #[test]
+    fn no_clone_creates_a_second_queue_owner() {
+        let code = code_of(IPC_STATE);
+        assert_eq!(
+            code.matches("ep.send(waiter_msg)").count(),
+            2,
+            "exactly the two existing split refill owners (plain, cap-transfer)"
+        );
+        for owner in [
+            "pub(crate) fn ipc_try_recv_queued_plain_endpoint_only(",
+            "pub(crate) fn ipc_try_recv_queued_with_cap_transfer(",
+        ] {
+            let body = code.split(owner).nth(1).expect("owner present");
+            let head = &body[..body
+                .find("IpcEndpointRecvResult::Received(received)")
+                .unwrap_or(body.len().min(6000))];
+            assert_eq!(
+                head.matches("queue[0] = None;").count(),
+                1,
+                "each owner removes the claimed waiter exactly once"
+            );
+        }
+    }
+
+    // ── (3) the three carried repairs ───────────────────────────────────────────────────────
+
+    /// §5A — the publication route signals waiter-presence from the SAME rank-3 section that
+    /// fills the slot, after the fill, and only on the success path.
+    #[test]
+    fn the_coordination_parity_signals_after_the_exact_slot_fill_and_never_on_refusal() {
+        let commit = body_between(
+            RUNTIME,
+            "pub(crate) fn commit_blocking_send_split(",
+            "/// U6 §2 — the split (rank-2 only) form of",
+        );
+        let fill = commit.find("*slot = Some(waiter);").expect("the slot fill");
+        let signal = commit
+            .find("proof_sender_wake_push_coordination_locked(")
+            .expect("§5A coordination parity");
+        let ok = commit[fill..].find("Ok(())").expect("the success return");
+        assert!(fill < signal, "the signal follows the exact slot fill");
+        assert!(signal < fill + ok, "and precedes the rank-3 success return");
+        // Every refusal returns before the fill, so no refused commit can signal.
+        let refusals = &commit[..fill];
+        assert!(
+            refusals.contains("BlockingSendCommitOutcome::RefusedDuplicateWaiter")
+                && refusals.contains("BlockingSendCommitOutcome::RefusedWaiterQueueFull"),
+            "the refusal arms must all precede the fill"
+        );
+        assert!(
+            !refusals.contains("proof_sender_wake_push_coordination_locked("),
+            "refusal paths signal nothing"
+        );
+        // Same predicate as the in-lock route — one gate, not two.
+        assert!(
+            commit.contains("proof_sender_wake_coordination_target("),
+            "the parity must reuse the canonical gate, so knob-off is a strict no-op"
+        );
+    }
+
+    /// Both waiter-publication routes now push through the SAME gate and the same helper.
+    #[test]
+    fn both_waiter_publication_routes_share_one_coordination_gate() {
+        for (name, src) in [("in-lock", IPC_STATE), ("publication", RUNTIME)] {
+            let code = code_of(src);
+            assert_eq!(
+                code.matches("proof_sender_wake_push_coordination_locked(")
+                    .count(),
+                1,
+                "{name}: exactly one coordination push"
+            );
+            assert_eq!(
+                code.matches("proof_sender_wake_coordination_target(")
+                    .count(),
+                1,
+                "{name}: gated exactly once"
+            );
+        }
+    }
+
+    /// With the sub-knob off the gate resolves to `None`, so the parity is a strict boot no-op.
+    #[test]
+    fn the_coordination_parity_is_a_no_op_with_the_proof_knob_off() {
+        crate::kernel::boot::set_ipc_recv_proof_sender_wake_enabled(false);
+        assert!(
+            !crate::kernel::boot::ipc_recv_proof_sender_wake_active(),
+            "the sub-knob is off by default"
+        );
+        for endpoint_idx in [0usize, 6, 7, 42] {
+            assert_eq!(
+                crate::kernel::boot::proof_sender_wake_coordination_target(endpoint_idx),
+                None,
+                "knob-off must never resolve a coordination target"
+            );
+        }
+    }
+
+    /// §5B — RISC-V forwards the sender-wake selector exactly as the other two ports do.
+    #[test]
+    fn every_core_smoke_forwards_the_sender_wake_selector() {
+        for (arch, src) in [
+            ("x86_64", X86_SMOKE),
+            ("aarch64", A64_SMOKE),
+            ("riscv64", RV_SMOKE),
+        ] {
+            assert!(
+                src.contains("IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-0}"),
+                "{arch}: must read the selector env var"
+            );
+            assert!(
+                src.contains("yarm.ipc_recv_proof_sender_wake=1"),
+                "{arch}: must append the sub-knob to the kernel cmdline"
+            );
+        }
+    }
+
+    /// §5C — every route that APPLIES a sender wake also publishes the ordering marker, once,
+    /// after the wake and before writeback. Without this the same event is observable on one
+    /// architecture and invisible on another.
+    #[test]
+    fn order_ok_is_emitted_on_every_route_that_applies_a_sender_wake() {
+        const MARKER: &str = "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback";
+        for (route, src, applications) in [
+            ("queued split", SYSCALL, 1usize),
+            ("legacy recv + recv-timeout", SYSCALL_IPC, 2),
+            ("recv-shared-v3", RECV_V3, 1),
+            ("cap-transfer boundary", RUNTIME, 1),
+        ] {
+            let code = code_of(src);
+            let applied = code.matches("apply_split_sender_wake_plan").count()
+                + code.matches("apply_split_sender_wake_plan_split").count();
+            assert!(
+                applied >= applications,
+                "{route}: expected at least {applications} wake application(s), found {applied}"
+            );
+            assert_eq!(
+                code.matches(MARKER).count(),
+                applications,
+                "{route}: exactly one ordering marker per wake application"
+            );
+        }
+        // The marker belongs to the kernel; the proof client must never fabricate it.
+        assert!(
+            !SERVICE.contains("user_log!(\"IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
+            "userspace must never emit the kernel ordering marker"
+        );
+    }
+
+    // ── (4) the repaired boundary: the proof client is not a second receiver on E1 ───────────
+
+    /// The forked child parks OFF the endpoint under proof. Parking on E1 made the child a
+    /// second receiver that dequeued its own refilled envelope — the exact loss this pass
+    /// repaired — and made the whole proof a scheduling race.
+    #[test]
+    fn the_proof_child_parks_off_the_endpoint_under_proof() {
+        let workload = body_between(
+            SERVICE,
+            "fn run_ipc_recv_proof_sender_wake(",
+            "/// Stage 193B: the plain payload the IpcSend-plain live oracle delivers",
+        );
+        let park = body_between(
+            workload,
+            "IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=child",
+            "// (6) PARENT only",
+        );
+        assert!(
+            park.contains("ipc_recv(e2_recv)"),
+            "the child must park on the coordination endpoint"
+        );
+        assert!(
+            !park.contains("e1_recv"),
+            "the child must never receive from the endpoint under proof"
+        );
+        // The parent remains the only E1 receiver, and its drain stays the bounded NON-BLOCKING
+        // poll — `ipc_recv_v2` has no deadline lane and would block the parent forever.
+        assert!(
+            workload.contains("ipc_recv_with_deadline(e1_recv, 0)"),
+            "the parent's drain stays the bounded non-blocking poll"
+        );
+        assert!(
+            workload.contains("if msg.sender_tid.0 == pid"),
+            "acceptance still requires the child's own TID, never a synthesized payload"
+        );
+        assert!(
+            !workload.contains("0x5E") || workload.matches("[0x5Eu8; 8]").count() == 1,
+            "the 0x5E payload is produced once, by the child, and never synthesized by the receiver"
+        );
+    }
+
+    // ── (5) the increment adds no new surface ───────────────────────────────────────────────
+
+    /// No new ABI/syscall lane, no new script, no new marker family, no new cap slot, no new
+    /// seam file: this is one bounded envelope-preservation repair.
+    #[test]
+    fn the_repair_adds_no_new_abi_script_marker_or_seam() {
+        // The two recv syscalls keep their existing numbers and argument lanes.
+        let code = code_of(SYSCALL_IPC);
+        assert!(
+            !code.contains("SYSCALL_IPC_RECV_V3_NR") && !code.contains("SYSCALL_ARG_DEADLINE"),
+            "no new recv syscall or argument lane"
+        );
+        // The ordering marker family is the existing one; no new marker prefix was introduced.
+        for src in [SYSCALL, SYSCALL_IPC, RECV_V3, RUNTIME, IPC_STATE] {
+            assert!(!src.contains("ZDBG_"), "no diagnostic residue may ship");
+            assert!(
+                !src.contains("IPC_RECV_V3_SENDER_WAKE"),
+                "no new marker family"
+            );
+        }
+        // The refill/coordination helpers stay where they already lived — no new seam file.
+        assert_eq!(
+            code_of(RUNTIME)
+                .matches("fn commit_blocking_send_split(")
+                .count(),
+            1,
+            "one commit seam"
+        );
+        assert_eq!(
+            code_of(BOOT_MOD)
+                .matches("fn proof_sender_wake_push_coordination_locked(")
+                .count(),
+            1,
+            "one coordination helper"
+        );
+    }
+}

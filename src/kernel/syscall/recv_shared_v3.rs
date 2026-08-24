@@ -364,6 +364,13 @@ pub(super) fn handle_recv_shared_v3(
             // Deferred sender wake BEFORE writeback — matches §58 ordering.
             if let RecvSchedulerWakePlan::WakeSender(wake_tid) = delivery.scheduler {
                 let _ = kernel.apply_split_sender_wake_plan(wake_tid);
+                // U6-FRAME §5C: wake-application observability parity with the other routes
+                // (`handle_ipc_recv`, `handle_ipc_recv_timeout`, queued split). Emitted once,
+                // after the wake is applied and before this route's writeback.
+                crate::yarm_log!(
+                    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+                    wake_tid.tid.0
+                );
             }
 
             let payload_len = delivery.msg.as_slice().len();

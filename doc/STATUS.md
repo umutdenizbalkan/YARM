@@ -297,9 +297,29 @@ own exit, the rank-1/rank-2 seams being authoritative rather than compatibility 
 false while scheduler operations execute inside the two authoritative trap dispatches and the
 D3-fenced controlled-proof restore remains. A completed directive is not a completed stage.
 
-**199C remains OPEN. 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN (partially
-production-wired).** Directive U8 is already source-complete. Canonical stage arithmetic is
-unchanged at **2 complete / 11 partial / 22 open**. Direct production remains **OFF**.
+**199C is DELIVERED / CLOSED (U6-FRAME). 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN
+(partially production-wired).** Directive U8 is already source-complete. Canonical stage
+arithmetic is **3 complete / 11 partial / 21 open**. Direct production remains **OFF**.
+
+**U6 is COMPLETE — canonical 199C is closed.** The blocking-send lifecycle runs off the broad
+lock (`U6_BLOCKING_SEND_INLOCK=0`, `U6_BLOCKING_SEND_PUBLISHED=1`) and the blocked sender's
+**exact envelope** is now live-proven preserved from send admission through the waiter slot and
+endpoint refill to the receiver's dequeue, on **x86_64 and RISC-V**: three consecutive clean runs
+each, waiter publication once, `U6_SEND_COMPLETION_PUBLISHED … result=0 result=ok` once, zero
+stale refusals, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` once, and the receiver observing the child's
+exact frame — `IPC_RECV_OUT_META_REPLY status=10008 opcode=0 len=10 flags=0 sender_tid=10008` —
+once, at the FIFO tail, with `SENDER_MSG_ABSENT=0` and `SEQUENCE_DONE=1`.
+
+The kernel never corrupted the envelope. The loss was a **second receiver**: the proof
+workload's forked child parked on a blocking receive against the endpoint under proof and, on
+RISC-V, dequeued its own refilled frame into its own buffer. x86_64 passed only because the
+parent won that race — the proof was scheduling-dependent, not architecture-dependent. Three
+carried repairs land with it: waiter-present coordination parity on the publication route,
+RISC-V core-smoke forwarding of the sender-wake selector (the RISC-V workload had never run),
+and `ORDER_OK` coverage on all four routes that apply a sender wake. Census delta **0**;
+no new syscall, ABI lane, script, marker family, cap slot or seam file.
+**AArch64 keeps the strict exact-base pre-admission deferral at `INIT_SPAWN_V5_CALL_BEGIN`; no
+live U6 proof is claimed there.** See `doc/KERNEL_UNLOCKING.md` § U6-FRAME. **U9 is next.**
 
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
 `finalize_split_handled_syscall` broad reacquisition, already retired by Stage 199D; that
@@ -343,17 +363,19 @@ complete the canonical stage.**
 
 | Phase | Complete | Partial foundation | Open |
 |-------|----------|--------------------|------|
-| 2 — IPC (199C–199G) | 1 of 5 (199C) | 199D, 199E | 199F, 199G |
+| 2 — IPC (199C–199G) | **2 of 5** (199C, 199E) | 199D | 199F, 199G |
 | 3 — Capability (200A–200D) | 0 of 4 | 200A, 200C | 200B, 200D |
 | 4 — VM (201A–201G) | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
 | 5 — Lifecycle (202A–202F) | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |
 | 6 — Timer/IRQ/sched (203A–203D) | 0 of 4 | 203A, 203C, 203D | 203B |
 | 7 — Monolith removal (204A–204E) | **1 of 5** (204A) | 204B | 204C, 204D, 204E |
 | 8 — Seal (205A–205D) | 0 of 4 | 205A | 205B, 205C, 205D |
-| **Total** | **1 of 35** | 12 | 22 |
+| **Total** | **3 of 35** | 11 | 21 |
 
-**No canonical stage in Phases 2–6 or 8 is complete.** The one complete stage, 204A
-(broad-lock callsite census), is documentation rather than lock retirement: 25 callsites
+**Three canonical stages are complete: 199C, 199E and 204A.** 199E closed the off-lock timeout
+pipeline on all three architectures; U6-FRAME closed 199C by live-proving exact blocked-send
+envelope preservation on x86_64 and RISC-V. 204A (broad-lock callsite census) is
+documentation rather than lock retirement: 25 callsites
 classified as 0 boot-only, 0 test-only, 0 obsolete, 25 runtime-required, 0 undocumented
 (U1 deleted the two obsolete acquisitions, 49 → 47; U2 relocated the three test-only ones,
 47 → 44; U3 is in progress and has retired sixteen — six RISC-V, two AArch64, four x86_64

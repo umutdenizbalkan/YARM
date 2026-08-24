@@ -5329,12 +5329,28 @@ fn run_ipc_recv_proof_sender_wake(
             };
         }
         yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_CHILD_DONE");
-        // Park the child: do NOT return into init's post-proof flow.
-        // Block on the proof endpoint rather than spinning on yield (nr=0) to
-        // avoid polluting the syscall trace with repeated nr=0 noise.
+        // Park the child: do NOT return into init's post-proof flow, and do NOT become a
+        // SECOND receiver on E1.
+        //
+        // U6-FRAME: the child used to park on `ipc_recv(e1_recv)` — a blocking receive on the
+        // very endpoint under proof. Its send completes the moment the parent's first drain
+        // refills the queue, so the child then woke as an E1 RECEIVER while the parent was
+        // still draining, and dequeued messages out from under it — including, live on
+        // RISC-V, its OWN 0x5E envelope (`IPC_RECV_OUT_META_REPLY sender_tid=<child>` copied
+        // to the CHILD's buffer). The parent's next drain then found E1 empty and reported
+        // SENDER_MSG_ABSENT even though the kernel had refilled and delivered the exact
+        // envelope correctly. On x86_64 the parent simply won the race, which is why the same
+        // build passed there — the proof was scheduling-dependent, not architecture-dependent.
+        //
+        // Park on E2 instead: nothing is ever pushed into E2 after the single waiter-present
+        // signal, so this is a genuine never-woken park with no syscall-trace noise (the
+        // reason the park blocks rather than spinning on `yield_now`, nr=0). It cannot steal
+        // that signal either: the signal exists only if the child became an E1 sender-waiter,
+        // and in that case the child's send returns only after the parent has already
+        // consumed the signal and drained.
         yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=child");
         loop {
-            let _ = unsafe { yarm_user_rt::syscall::ipc_recv(e1_recv) };
+            let _ = unsafe { yarm_user_rt::syscall::ipc_recv(e2_recv) };
         }
     };
 
