@@ -4508,6 +4508,12 @@ pub(crate) fn install_server_reply_link(
 /// direct behavioural test rather than only a structural one. It stays a narrow-domain helper
 /// with no production callers outside `ipc_state`.
 pub(crate) use ipc_state::rt_detach_server_link;
+// U9-C: the two rank-3 queued-split recv bodies, re-exported so the `SharedKernel` seams in
+// `runtime.rs` drive the SAME implementation the broad `KernelState` methods drive.
+pub(crate) use ipc_state::{
+    ipc_try_recv_queued_admitted_locked, ipc_try_recv_queued_plain_endpoint_only_locked,
+    ipc_try_recv_queued_with_cap_transfer_locked,
+};
 
 /// Which reverse link a close is entitled to remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

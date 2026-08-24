@@ -4541,115 +4541,7 @@ impl KernelState {
         endpoint_idx: usize,
     ) -> IpcEndpointRecvResult {
         self.with_ipc_state_mut(|ipc| {
-            if endpoint_idx >= ipc.endpoints.len() {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
-                );
-            }
-            if ipc.endpoint_waiter_present(endpoint_idx) {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
-                );
-            }
-
-            // Stage 4D: peek at sender waiter queue head (position 0) before touching the
-            // endpoint. Copies data so no reference is held across the endpoint borrow below.
-            // U6 §7: the peek carries the waiter's EXACT blocking cycle, not just its TID —
-            // the wake site must publish a completion against that cycle.
-            let head_waiter: Option<(crate::kernel::ipc::SenderWakeTarget, Message)> =
-                ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.wake_target(), w.msg));
-
-            // If the queue is sparse (position 0 is None but later positions are Some), the
-            // gap was left by a timed-out sender; fall back to the full path which handles
-            // arbitrary queue state correctly.
-            if head_waiter.is_none()
-                && ipc.endpoint_sender_waiters[endpoint_idx]
-                    .iter()
-                    .any(Option::is_some)
-            {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                );
-            }
-
-            // If a sender waiter exists at position 0, validate their message before
-            // dequeuing anything — ensures we can commit to the full two-phase refill.
-            if let Some((_, waiter_msg)) = head_waiter {
-                let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
-                    | Message::FLAG_CAP_TRANSFER_PLAIN
-                    | Message::FLAG_REPLY_CAP;
-                if (waiter_msg.flags & split_unsafe_flags) != 0
-                    || waiter_msg.transferred_cap().is_some()
-                {
-                    return IpcEndpointRecvResult::Ineligible(
-                        IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                    );
-                }
-            }
-
-            // Borrow endpoint, validate mode and message, then dequeue.
-            // Scoped block so the &mut Endpoint borrow ends before the sender-waiter
-            // refill accesses ipc.endpoint_sender_waiters and re-borrows ipc.endpoints.
-            let received = {
-                let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
-                    return IpcEndpointRecvResult::Ineligible(
-                        IpcEndpointSplitRejectReason::EndpointMissing,
-                    );
-                };
-                let endpoint = kernel_mut(endpoint_storage);
-                if endpoint.mode() != EndpointMode::Buffered {
-                    return IpcEndpointRecvResult::Ineligible(
-                        IpcEndpointSplitRejectReason::NonBufferedEndpoint,
-                    );
-                }
-                let Some(message) = endpoint.peek().copied() else {
-                    return IpcEndpointRecvResult::Ineligible(
-                        IpcEndpointSplitRejectReason::EmptyQueue,
-                    );
-                };
-                let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
-                    | Message::FLAG_CAP_TRANSFER_PLAIN
-                    | Message::FLAG_REPLY_CAP;
-                if (message.flags & split_unsafe_flags) != 0 || message.transferred_cap().is_some()
-                {
-                    return IpcEndpointRecvResult::Ineligible(
-                        IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
-                    );
-                }
-                endpoint
-                    .recv()
-                    .expect("peeked plain endpoint message must remain queued")
-            };
-
-            // Stage 4D two-phase refill: only reached when head_waiter is Some with a
-            // plain message (validated above). All mutations stay under ipc_state_lock.
-            if let Some((waiter_tid, waiter_msg)) = head_waiter {
-                // Phase 1a: remove first sender waiter and compact the queue.
-                {
-                    let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
-                    queue[0] = None;
-                    for idx in 1..queue.len() {
-                        queue[idx - 1] = queue[idx].take();
-                    }
-                }
-                // Phase 1b: enqueue the sender's message into the slot freed by recv.
-                {
-                    let ep = kernel_mut(
-                        ipc.endpoints[endpoint_idx]
-                            .as_mut()
-                            .expect("endpoint must remain present after recv dequeue"),
-                    );
-                    ep.send(waiter_msg)
-                        .expect("one slot must be free after recv dequeue");
-                }
-                crate::yarm_log!(
-                    "IPC_RECV_SPLIT_REFILL_QUEUED waiter_tid={}",
-                    waiter_tid.tid.0
-                );
-                return IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid);
-            }
-
-            IpcEndpointRecvResult::Received(received)
+            ipc_try_recv_queued_plain_endpoint_only_locked(ipc, endpoint_idx)
         })
     }
 
@@ -4670,94 +4562,7 @@ impl KernelState {
         endpoint_idx: usize,
     ) -> IpcEndpointRecvResult {
         self.with_ipc_state_mut(|ipc| {
-            if endpoint_idx >= ipc.endpoints.len() {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
-                );
-            }
-            if ipc.endpoint_waiter_present(endpoint_idx) {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
-                );
-            }
-
-            // U6 §7: the peek carries the waiter's EXACT blocking cycle, not just its TID —
-            // the wake site must publish a completion against that cycle.
-            let head_waiter: Option<(crate::kernel::ipc::SenderWakeTarget, Message)> =
-                ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.wake_target(), w.msg));
-
-            if head_waiter.is_none()
-                && ipc.endpoint_sender_waiters[endpoint_idx]
-                    .iter()
-                    .any(Option::is_some)
-            {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                );
-            }
-
-            // Reject if the SENDER'S refill message is cap-flagged (unchanged guard).
-            if let Some((_, waiter_msg)) = head_waiter {
-                let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
-                    | Message::FLAG_CAP_TRANSFER_PLAIN
-                    | Message::FLAG_REPLY_CAP;
-                if (waiter_msg.flags & split_unsafe_flags) != 0
-                    || waiter_msg.transferred_cap().is_some()
-                {
-                    return IpcEndpointRecvResult::Ineligible(
-                        IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                    );
-                }
-            }
-
-            let received = {
-                let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
-                    return IpcEndpointRecvResult::Ineligible(
-                        IpcEndpointSplitRejectReason::EndpointMissing,
-                    );
-                };
-                let endpoint = kernel_mut(endpoint_storage);
-                if endpoint.mode() != EndpointMode::Buffered {
-                    return IpcEndpointRecvResult::Ineligible(
-                        IpcEndpointSplitRejectReason::NonBufferedEndpoint,
-                    );
-                }
-                let Some(_message) = endpoint.peek() else {
-                    return IpcEndpointRecvResult::Ineligible(
-                        IpcEndpointSplitRejectReason::EmptyQueue,
-                    );
-                };
-                // Cap-transfer check intentionally omitted — caller handles materialization.
-                endpoint
-                    .recv()
-                    .expect("peeked endpoint message must remain queued")
-            };
-
-            if let Some((waiter_tid, waiter_msg)) = head_waiter {
-                {
-                    let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
-                    queue[0] = None;
-                    for idx in 1..queue.len() {
-                        queue[idx - 1] = queue[idx].take();
-                    }
-                }
-                {
-                    let ep = kernel_mut(
-                        ipc.endpoints[endpoint_idx]
-                            .as_mut()
-                            .expect("endpoint must remain present after recv dequeue"),
-                    );
-                    ep.send(waiter_msg)
-                        .expect("one slot must be free after recv dequeue");
-                }
-                crate::yarm_log!(
-                    "IPC_RECV_SPLIT_CAP_REFILL_QUEUED waiter_tid={}",
-                    waiter_tid.tid.0
-                );
-                return IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid);
-            }
-
-            IpcEndpointRecvResult::Received(received)
+            ipc_try_recv_queued_with_cap_transfer_locked(ipc, endpoint_idx)
         })
     }
 
@@ -7465,4 +7270,248 @@ impl KernelState {
         }
         Ok(msg)
     }
+}
+
+/// U9-C — the rank-3 body of [`KernelState::ipc_try_recv_queued_plain_endpoint_only`],
+/// expressed over the IPC subsystem alone so BOTH owners can drive it: the broad
+/// `KernelState` method (which reaches it through `with_ipc_state_mut`) and
+/// [`crate::runtime::SharedKernel::ipc_try_recv_queued_plain_endpoint_only_split`]
+/// (which reaches it through `with_ipc_split_mut`). Moving the body here rather than
+/// copying it is what keeps the two routes from drifting: there is exactly one dequeue +
+/// two-phase refill implementation in the tree.
+pub(crate) fn ipc_try_recv_queued_plain_endpoint_only_locked(
+    ipc: &mut IpcSubsystem,
+    endpoint_idx: usize,
+) -> IpcEndpointRecvResult {
+    if endpoint_idx >= ipc.endpoints.len() {
+        return IpcEndpointRecvResult::Ineligible(
+            IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+        );
+    }
+    if ipc.endpoint_waiter_present(endpoint_idx) {
+        return IpcEndpointRecvResult::Ineligible(
+            IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
+        );
+    }
+
+    // Stage 4D: peek at sender waiter queue head (position 0) before touching the
+    // endpoint. Copies data so no reference is held across the endpoint borrow below.
+    // U6 §7: the peek carries the waiter's EXACT blocking cycle, not just its TID —
+    // the wake site must publish a completion against that cycle.
+    let head_waiter: Option<(crate::kernel::ipc::SenderWakeTarget, Message)> =
+        ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.wake_target(), w.msg));
+
+    // If the queue is sparse (position 0 is None but later positions are Some), the
+    // gap was left by a timed-out sender; fall back to the full path which handles
+    // arbitrary queue state correctly.
+    if head_waiter.is_none()
+        && ipc.endpoint_sender_waiters[endpoint_idx]
+            .iter()
+            .any(Option::is_some)
+    {
+        return IpcEndpointRecvResult::Ineligible(
+            IpcEndpointSplitRejectReason::SenderWaiterPresent,
+        );
+    }
+
+    // If a sender waiter exists at position 0, validate their message before
+    // dequeuing anything — ensures we can commit to the full two-phase refill.
+    if let Some((_, waiter_msg)) = head_waiter {
+        let split_unsafe_flags =
+            Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN | Message::FLAG_REPLY_CAP;
+        if (waiter_msg.flags & split_unsafe_flags) != 0 || waiter_msg.transferred_cap().is_some() {
+            return IpcEndpointRecvResult::Ineligible(
+                IpcEndpointSplitRejectReason::SenderWaiterPresent,
+            );
+        }
+    }
+
+    // Borrow endpoint, validate mode and message, then dequeue.
+    // Scoped block so the &mut Endpoint borrow ends before the sender-waiter
+    // refill accesses ipc.endpoint_sender_waiters and re-borrows ipc.endpoints.
+    let received = {
+        let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+            return IpcEndpointRecvResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointMissing,
+            );
+        };
+        let endpoint = kernel_mut(endpoint_storage);
+        if endpoint.mode() != EndpointMode::Buffered {
+            return IpcEndpointRecvResult::Ineligible(
+                IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+            );
+        }
+        let Some(message) = endpoint.peek().copied() else {
+            return IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::EmptyQueue);
+        };
+        let split_unsafe_flags =
+            Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN | Message::FLAG_REPLY_CAP;
+        if (message.flags & split_unsafe_flags) != 0 || message.transferred_cap().is_some() {
+            return IpcEndpointRecvResult::Ineligible(
+                IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+            );
+        }
+        endpoint
+            .recv()
+            .expect("peeked plain endpoint message must remain queued")
+    };
+
+    // Stage 4D two-phase refill: only reached when head_waiter is Some with a
+    // plain message (validated above). All mutations stay under ipc_state_lock.
+    if let Some((waiter_tid, waiter_msg)) = head_waiter {
+        // Phase 1a: remove first sender waiter and compact the queue.
+        {
+            let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
+            queue[0] = None;
+            for idx in 1..queue.len() {
+                queue[idx - 1] = queue[idx].take();
+            }
+        }
+        // Phase 1b: enqueue the sender's message into the slot freed by recv.
+        {
+            let ep = kernel_mut(
+                ipc.endpoints[endpoint_idx]
+                    .as_mut()
+                    .expect("endpoint must remain present after recv dequeue"),
+            );
+            ep.send(waiter_msg)
+                .expect("one slot must be free after recv dequeue");
+        }
+        crate::yarm_log!(
+            "IPC_RECV_SPLIT_REFILL_QUEUED waiter_tid={}",
+            waiter_tid.tid.0
+        );
+        return IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid);
+    }
+
+    IpcEndpointRecvResult::Received(received)
+}
+
+/// U9-C — peek the queued head under the SAME rank-3 acquisition that will dequeue it, and
+/// dequeue only if `admit` accepts the class.
+///
+/// This is what lets the off-lock Phase A refuse a class it cannot service **before** anything
+/// is consumed. A post-dequeue refusal is not available — the message is gone by then — and a
+/// separate peek-then-dequeue pair would be a race. One acquisition closes both gaps.
+///
+/// A refusal returns `Ineligible(TransferOrReplyCapMessage)`, which the shared mapping turns
+/// into `WouldBlock` and Phase A turns into `Fallback`: the unchanged legacy global-lock path
+/// then services the message, exactly as it services every other case Phase A declines.
+pub(crate) fn ipc_try_recv_queued_admitted_locked(
+    ipc: &mut IpcSubsystem,
+    endpoint_idx: usize,
+    admit: impl Fn(&Message, &IpcSubsystem) -> bool,
+) -> IpcEndpointRecvResult {
+    if endpoint_idx >= ipc.endpoints.len() {
+        return IpcEndpointRecvResult::Ineligible(
+            IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+        );
+    }
+    let head = match ipc.endpoints[endpoint_idx].as_ref() {
+        Some(storage) => kernel_ref(storage).peek().copied(),
+        None => {
+            return IpcEndpointRecvResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointMissing,
+            );
+        }
+    };
+    if let Some(msg) = head
+        && !admit(&msg, ipc)
+    {
+        return IpcEndpointRecvResult::Ineligible(
+            IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+        );
+    }
+    ipc_try_recv_queued_with_cap_transfer_locked(ipc, endpoint_idx)
+}
+
+/// U9-C — the rank-3 body of [`KernelState::ipc_try_recv_queued_with_cap_transfer`], for the
+/// same reason as its plain sibling above: one implementation, two owners.
+pub(crate) fn ipc_try_recv_queued_with_cap_transfer_locked(
+    ipc: &mut IpcSubsystem,
+    endpoint_idx: usize,
+) -> IpcEndpointRecvResult {
+    if endpoint_idx >= ipc.endpoints.len() {
+        return IpcEndpointRecvResult::Ineligible(
+            IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+        );
+    }
+    if ipc.endpoint_waiter_present(endpoint_idx) {
+        return IpcEndpointRecvResult::Ineligible(
+            IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
+        );
+    }
+
+    // U6 §7: the peek carries the waiter's EXACT blocking cycle, not just its TID —
+    // the wake site must publish a completion against that cycle.
+    let head_waiter: Option<(crate::kernel::ipc::SenderWakeTarget, Message)> =
+        ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.wake_target(), w.msg));
+
+    if head_waiter.is_none()
+        && ipc.endpoint_sender_waiters[endpoint_idx]
+            .iter()
+            .any(Option::is_some)
+    {
+        return IpcEndpointRecvResult::Ineligible(
+            IpcEndpointSplitRejectReason::SenderWaiterPresent,
+        );
+    }
+
+    // Reject if the SENDER'S refill message is cap-flagged (unchanged guard).
+    if let Some((_, waiter_msg)) = head_waiter {
+        let split_unsafe_flags =
+            Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN | Message::FLAG_REPLY_CAP;
+        if (waiter_msg.flags & split_unsafe_flags) != 0 || waiter_msg.transferred_cap().is_some() {
+            return IpcEndpointRecvResult::Ineligible(
+                IpcEndpointSplitRejectReason::SenderWaiterPresent,
+            );
+        }
+    }
+
+    let received = {
+        let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+            return IpcEndpointRecvResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointMissing,
+            );
+        };
+        let endpoint = kernel_mut(endpoint_storage);
+        if endpoint.mode() != EndpointMode::Buffered {
+            return IpcEndpointRecvResult::Ineligible(
+                IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+            );
+        }
+        let Some(_message) = endpoint.peek() else {
+            return IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::EmptyQueue);
+        };
+        // Cap-transfer check intentionally omitted — caller handles materialization.
+        endpoint
+            .recv()
+            .expect("peeked endpoint message must remain queued")
+    };
+
+    if let Some((waiter_tid, waiter_msg)) = head_waiter {
+        {
+            let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
+            queue[0] = None;
+            for idx in 1..queue.len() {
+                queue[idx - 1] = queue[idx].take();
+            }
+        }
+        {
+            let ep = kernel_mut(
+                ipc.endpoints[endpoint_idx]
+                    .as_mut()
+                    .expect("endpoint must remain present after recv dequeue"),
+            );
+            ep.send(waiter_msg)
+                .expect("one slot must be free after recv dequeue");
+        }
+        crate::yarm_log!(
+            "IPC_RECV_SPLIT_CAP_REFILL_QUEUED waiter_tid={}",
+            waiter_tid.tid.0
+        );
+        return IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid);
+    }
+
+    IpcEndpointRecvResult::Received(received)
 }

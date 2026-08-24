@@ -127,10 +127,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **7** |
+| `SharedKernel::with_cpu` | **6** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **0** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **7** |
+| **Total broad-lock acquisition sites** | **6** |
 
 ### 1.3 `with_cpu` — 7 production callsites
 
@@ -284,7 +284,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **7** |
+| runtime-required | **6** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -305,37 +305,43 @@ and `SharedKernel::run_reply_timeout_completion` (no production caller; supersed
 `OffLockReplyTimeout` composition). Neither deletion changed runtime behavior, and the
 reply-timeout completion body itself was not touched.
 
-#### runtime-required (7)
+#### runtime-required (6)
 
 Re-derived mechanically from the final tree by replaying the census guard's own algorithm
 (`production_rs_files` → `test_module_cutoff` → `is_comment` → `with_cpu_line` /
 `with_broad_line`), then resolving each hit's enclosing `fn` from source. Line numbers below
 are from that same pass, not carried forward. Source and
-`tests/broad_lock_census_guard.rs` agree site-for-site: **`with_cpu` 7, broad `with` 0.**
+`tests/broad_lock_census_guard.rs` agree site-for-site: **`with_cpu` 6, broad `with` 0.**
 
 | # | File : line | Enclosing symbol | Form | Class | Role / path | Why it remains | Expected to retire under |
 |---|-------------|------------------|------|-------|-------------|----------------|--------------------------|
 | 1 | `src/arch/trap_entry.rs:310` | `handle_trap_entry_shared` | `with_cpu` | runtime-required | **The** authoritative broad Phase-2 trap dispatch (x86_64 + AArch64): every syscall not on the split whitelist, plus every timer IRQ, external IRQ and page fault, runs its whole handler inside this closure | This *is* the global lock. It is the terminal target of the entire unlock programme, not a callsite to be moved onto a seam | End state of canonical **203C** (rank-1/rank-2 seams authoritative end-to-end on all three architectures) |
 | 2 | `src/arch/riscv64/trap.rs:829` | `handle_riscv_trap_entry_shared` | `with_cpu` | runtime-required | The RISC-V twin of the same authoritative Phase-2 trap dispatch | Same as row 1. **This file is otherwise fully drained** — it holds no post-lock reacquisition at all | End state of canonical **203C** |
 | 3 | `src/arch/trap_entry.rs:1694` | `handle_trap_entry_shared` (post-switch restore section) | `with_cpu` | runtime-required | D6 controlled-switch **proof** restore: `post_switch_restore_arch_thread_state` with a live frame, plus the D6 proof cleanup | Deliberately retained. Its body also runs `d6_ensure_post_cleanup_task_stacks_mapped`, which maps kernel-stack pages into the active root **and every live task root** — cross-address-space page-table mutation, to which the `AI_AGENT_RULES` §14.4 **D3 fence** applies, and no split form exists. Splitting the site would leave a broad drain behind at census delta 0 | Blocked on the **D3** lock-free `await_tlb_shootdown_ack` design; not retirable by U3 alone |
-| 4 | `src/runtime.rs:4141` | `try_split_ipc_recv_queued_plain_into_frame` | `with_cpu` | runtime-required | Recv delivery boundary **Phase A**: plan + rank-3 dequeue + legacy cap materialization + deferred sender wake (§56 order) + kernel-register writeback, returning a by-value `PendingUserCopy` so the user copy runs after the broad borrow is dead | **U9 refined this from source (see below): every Phase-A dependency except one already has an authoritative off-lock form. The single blocker is the reply-cap materialization arm — `reply_cap_ipc_rank_inversion`.** | Blocked on the **reply-cap rank inversion**, not on 205A decomposition |
-| 5 | `src/runtime.rs:4241` | `complete_recv_boundary_user_copy` | `with_cpu` | runtime-required | §58 **capability rollback** on user-copy failure — `rollback_materialized_recv_cap` | Dependency-blocked cohort (see note below) | Canonical **204B** / **205A**, after the capability-teardown dependencies are resolved |
-| 6 | `src/runtime.rs:4534` | `complete_recv_boundary_ordinary_cap` | `with_cpu` | runtime-required | The same `rollback_materialized_recv_cap`, on the ordinary-cap return-register encode-failure path | Same cohort as row 5 | Canonical **204B** / **205A** |
-| 7 | `src/runtime.rs:5326` | `execute_blocked_waiter_ordinary_cap_delivery` | `with_cpu` | runtime-required | The same `rollback_materialized_recv_cap`, on the blocked-waiter ordinary-cap copy-failure path | Same cohort as row 5 | Canonical **204B** / **205A** |
+| 4 | `src/runtime.rs:4241` | `complete_recv_boundary_user_copy` | `with_cpu` | runtime-required | §58 **capability rollback** on user-copy failure — `rollback_materialized_recv_cap`, for NON-Reply objects only (U9-C routes the Reply class to `rollback_reply_cap_split`, off the broad lock) | Dependency-blocked cohort (see note below) | Blocked on **D3** `await_tlb_shootdown_ack` |
+| 5 | `src/runtime.rs:4534` | `complete_recv_boundary_ordinary_cap` | `with_cpu` | runtime-required | The same body on the ordinary-cap return-register encode-failure path. **Ordinary objects only** — `runtime.rs` states it: *"Cannot occur: ordinary (non-reply) objects only reach here."* | Same cohort as row 4 | Blocked on **D3** |
+| 6 | `src/runtime.rs:5326` | `execute_blocked_waiter_ordinary_cap_delivery` | `with_cpu` | runtime-required | The same body on the blocked-waiter ordinary-cap copy-failure path; ordinary objects only | Same cohort as row 4 | Blocked on **D3** |
 
 Per-file subtotals, matching source and guard exactly:
 
 | File | `with_cpu` | Broad `with` |
 |------|-----------|--------------|
-| `src/runtime.rs` | 4 | 0 |
+| `src/runtime.rs` | 3 | 0 |
 | `src/arch/trap_entry.rs` | 2 | 0 |
 | `src/arch/riscv64/trap.rs` | 1 | 0 |
-| **Total** | **7** | **0** |
+| **Total** | **6** | **0** |
 
 `src/arch/x86_64/smp.rs` is absent from this table because it now holds **zero** broad
 acquisitions of any form — U3 retired its last one, the ED-2 next-task placement.
 
-**Row 4 — the exact blocking boundary, derived under U9.** Phase A is a composite, but it is no
+> **RETIRED BY U9-C.** The Phase-A row that stood here — `src/runtime.rs:4141`,
+> `try_split_ipc_recv_queued_plain_into_frame` — **no longer exists**. Its body now runs off the
+> broad lock as `SharedKernel::recv_queued_split_phase_a_split`, and the reply-cap arm that was
+> its only remaining blocker is served by `materialize_reply_cap_split`. The analysis below is
+> retained as the derivation that identified the boundary; it is history, not current state.
+> Census: **7 → 6**, `runtime.rs` **4 → 3**.
+
+**Row 4 (as it was) — the exact blocking boundary, derived under U9.** Phase A is a composite, but it is no
 longer an *undecomposed* one. Replaying each of its dependencies against the existing seam set
 shows that all but one already have an authoritative off-lock form:
 

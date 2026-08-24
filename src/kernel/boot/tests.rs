@@ -43147,24 +43147,63 @@ mod stage160_aarch64_split_recv_routing {
     //    with_cpu (mirroring the global-lock path), not the unbound `with`.
     #[test]
     fn stage160_split_recv_binds_current_cpu() {
+        // U9-C RE-DERIVATION — the binding requirement is retired because its CAUSE is gone,
+        // not because the guard was relaxed.
+        //
+        // Stage 160 required `with_cpu(cpu, …)` around the snapshot dispatch for exactly one
+        // reason: Phase A derived `is_kernel_task` from `current_task_has_user_asid`, i.e. from
+        // the AMBIENT current task, which is read off `current_cpu`. On an SMP boot an unbound
+        // `current_cpu` could observe another CPU's task and misclassify the receiver. Binding
+        // the CPU made the ambient read correct.
+        //
+        // U9-C removes the ambient read itself: Phase A now classifies from
+        // `snapshot.requester_tid` — the authoritative TID `current_tid_authoritative(cpu)`
+        // already resolved — through a rank-2 split read. With no ambient reader left there is
+        // nothing to bind a CPU for, and the broad acquisition is deleted. The guard therefore
+        // pins the STRONGER property: the classification is exact, and no ambient
+        // current-task read may return.
         let m = RUNTIME_SRC
+            .split("fn recv_queued_split_phase_a_split(")
+            .nth(1)
+            .and_then(|s| {
+                s.split("\n    /// U9-C — rank-2 `Option<Asid>` read")
+                    .next()
+            })
+            .expect("the off-lock Phase A must exist");
+        assert!(
+            m.contains("self.task_asid_option_split_read(receiver_tid).is_none()"),
+            "the receiver class must be read from the EXACT requester, not the ambient task"
+        );
+        assert!(
+            !m.contains("current_task_has_user_asid"),
+            "no ambient current-task classification may return to Phase A"
+        );
+        for broad in ["self.with_cpu(", "self.with(|"] {
+            assert!(
+                !m.contains(broad),
+                "the off-lock Phase A must hold no broad acquisition ({broad})"
+            );
+        }
+        let entry = RUNTIME_SRC
             .split("fn try_split_ipc_recv_queued_plain_into_frame")
             .nth(1)
-            .and_then(|s| s.split("\n    pub fn ").next())
+            .and_then(|s| s.split("\n    /// Stage 187A — Phase B").next())
             .expect("split recv method must exist");
         assert!(
-            m.contains("self.with_cpu(cpu, |state|")
-                && m.contains("try_split_recv_queued_plain_with_snapshot_locked("),
-            "split recv must bind current_cpu (with_cpu) before the snapshot dispatch"
+            entry.contains("self.recv_queued_split_phase_a_split(cpu, frame, &snapshot)"),
+            "the entry must dispatch Phase A through the off-lock transaction"
         );
-        assert!(
-            !m.contains("self.with(|state|"),
-            "split recv must not run the snapshot dispatch under the unbound `with`"
-        );
-        // Document the why: the global-lock path also binds the CPU.
+        for broad in ["self.with_cpu(", "self.with(|"] {
+            assert!(
+                !entry.contains(broad),
+                "the split recv entry must hold no broad acquisition ({broad})"
+            );
+        }
+        // The global-lock trap dispatch remains the CPU-binding reference for every class the
+        // split path still declines; U9-C does not touch it.
         assert!(
             TRAP_ENTRY_SRC.contains(".with_cpu(cpu, |kernel|"),
-            "global-lock path must remain the with_cpu parity reference"
+            "the terminal dispatcher remains the with_cpu reference"
         );
     }
 
@@ -48237,16 +48276,26 @@ mod stage187a_ipc_recv_delivery_boundary_split {
     // Phase A call — no seam helper runs while the broad borrow is live.
     #[test]
     fn stage187a_no_seam_call_inside_with_cpu_closure() {
+        // U9-C RE-DERIVATION — Stage 186D4's hazard was that a `data_ptr()`-derived seam called
+        // INSIDE the Phase-A `with_cpu` closure would alias the live broad `&mut KernelState`.
+        // U9-C deletes that closure: Phase A now runs entirely off the broad lock, so every
+        // seam below is not merely permitted but is how Phase A works. The guard is inverted
+        // accordingly — it now pins that the aliasing window CANNOT exist, which is strictly
+        // stronger than pinning that nothing entered it.
         let body = RUNTIME_SRC
             .split("fn try_split_ipc_recv_queued_plain_into_frame(")
             .nth(1)
-            .and_then(|rest| rest.split("\n    fn ").next())
+            .and_then(|rest| rest.split("\n    /// Stage 187A — Phase B").next())
             .expect("runtime recv entry must exist");
-        let closure = body
-            .split("self.with_cpu(cpu, |state| {")
-            .nth(1)
-            .and_then(|rest| rest.split("})").next())
-            .expect("Phase A with_cpu closure must exist");
+        assert!(
+            !body.contains("self.with_cpu(cpu, |state| {"),
+            "the Phase A broad closure must not be reintroduced — U9-C retired it"
+        );
+        assert!(
+            !body.contains("try_split_recv_queued_plain_with_snapshot_locked"),
+            "the entry must not call the broad locked Phase A"
+        );
+        let closure = body;
         for seam in [
             "copy_to_user_split",
             "copy_from_user_split",
@@ -48264,8 +48313,8 @@ mod stage187a_ipc_recv_delivery_boundary_split {
             );
         }
         assert!(
-            closure.contains("try_split_recv_queued_plain_with_snapshot_locked"),
-            "the Phase A closure must call the locked Phase A function"
+            closure.contains("self.recv_queued_split_phase_a_split(cpu, frame, &snapshot)"),
+            "the entry must dispatch Phase A through the off-lock transaction"
         );
     }
 
@@ -123553,6 +123602,7 @@ mod u3_recv_copy_fault_completion {
             },
             materialized_cap: None,
             is_reply_cap: false,
+            reply_record: None,
         }
     }
 
@@ -123574,6 +123624,7 @@ mod u3_recv_copy_fault_completion {
             },
             materialized_cap: None,
             is_reply_cap: false,
+            reply_record: None,
         }
     }
 
@@ -134836,10 +134887,15 @@ mod u6_frame_exact_envelope_preservation {
     /// completion — can only be applied by the caller after that section returns.
     #[test]
     fn completion_cannot_publish_before_the_envelope_transfer_commits() {
+        // U9-C moved this rank-3 body into the free function
+        // `ipc_try_recv_queued_plain_endpoint_only_locked`, so BOTH owners — the broad
+        // `KernelState` method and `SharedKernel::…_split` — drive one implementation.
+        // The ordering contract is unchanged; the guard follows the body to its new home
+        // rather than being weakened.
         let body = body_between(
             IPC_STATE,
-            "pub(crate) fn ipc_try_recv_queued_plain_endpoint_only(",
-            "/// Stage 42+43: like [`ipc_try_recv_queued_plain_endpoint_only`]",
+            "pub(crate) fn ipc_try_recv_queued_plain_endpoint_only_locked(",
+            "\n/// U9-C — the rank-3 body of [`KernelState::ipc_try_recv_queued_with_cap_transfer`]",
         );
         let refill = body
             .find("ep.send(waiter_msg)")
@@ -134989,7 +135045,10 @@ mod u6_frame_exact_envelope_preservation {
             ("queued split", SYSCALL, 1usize),
             ("legacy recv + recv-timeout", SYSCALL_IPC, 2),
             ("recv-shared-v3", RECV_V3, 1),
-            ("cap-transfer boundary", RUNTIME, 1),
+            // U9-C: runtime.rs now applies a sender wake at THREE sites — the cap-transfer
+            // boundary, and the two arms of the off-lock Phase A (reply/plain writeback and
+            // the kernel-register ordinary-cap completion). Each emits the marker exactly once.
+            ("runtime wake sites", RUNTIME, 3),
         ] {
             let code = code_of(src);
             let applied = code.matches("apply_split_sender_wake_plan").count()
@@ -135086,6 +135145,470 @@ mod u6_frame_exact_envelope_preservation {
                 .count(),
             1,
             "one coordination helper"
+        );
+    }
+}
+
+/// U9-C (200B) — REPLY-CAP MATERIALIZATION AND ROLLBACK AS ONE ORDERED TRANSACTION.
+///
+/// The recv Phase-A broad acquisition is retired. What made that possible is not a new fallback
+/// but a genuine ownership change: the reply-cap arm — the only Phase-A class a real boot still
+/// materialized under `&mut KernelState` — now runs as five sequential phases, each releasing
+/// its domain before the next acquires one. Stage 188D built the rank-3 halves and proved them
+/// by unit test while explicitly leaving the producer unwired; U9-C wires it.
+///
+/// These tests pin the properties that make the transaction safe to run off-lock: exact
+/// identity at every phase, fail-closed on every stale window, and — critically — that the
+/// ORDINARY object classes were neither narrowed nor rerouted. That last point is the one a
+/// future pass is most likely to erode, because doing so would look like progress.
+mod u9c_reply_cap_ordered_transaction {
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const RECV_CORE: &str = include_str!("../recv_core.rs");
+    const SYSCALL: &str = include_str!("../syscall.rs");
+    const REPLY_SPLIT: &str = include_str!("reply_cap_rank_split.rs");
+
+    /// Production source only, comment-stripped — the SAME shape
+    /// `tests/broad_lock_census_guard.rs` counts, so this module's totals and the census
+    /// cannot disagree.
+    fn code_of(src: &str) -> alloc::string::String {
+        let cutoff = src.find("\n#[cfg(test)]\nmod tests {").unwrap_or(src.len());
+        src[..cutoff]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of<'a>(src: &'a str, open: &str, close: &str) -> &'a str {
+        let after = src
+            .split(open)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing `{open}`"));
+        let end = after
+            .find(close)
+            .unwrap_or_else(|| panic!("missing terminator after `{open}`"));
+        &after[..end]
+    }
+
+    fn materialize_body() -> &'static str {
+        body_of(
+            RUNTIME,
+            "pub(crate) fn materialize_reply_cap_split(",
+            "\n    /// U9-C — off-lock materialization of an ORDINARY",
+        )
+    }
+
+    fn rollback_body() -> &'static str {
+        body_of(
+            RUNTIME,
+            "pub(crate) fn rollback_reply_cap_split(",
+            "\n    /// U9-C — rank-2 then rank-4",
+        )
+    }
+
+    fn phase_a_body() -> &'static str {
+        body_of(
+            RUNTIME,
+            "pub(crate) fn recv_queued_split_phase_a_split(",
+            "\n    /// U9-C — rank-2 `Option<Asid>` read",
+        )
+    }
+
+    // ── (1) the retirement itself ───────────────────────────────────────────────────────────
+
+    /// The census moved because a callsite was DELETED, not because a guard was relaxed.
+    #[test]
+    fn the_phase_a_broad_acquisition_is_gone() {
+        let code = code_of(RUNTIME);
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            3,
+            "runtime.rs holds exactly the three ordinary rollback acquisitions"
+        );
+        assert_eq!(
+            code.matches(".with(|").count(),
+            0,
+            "no production broad `with` may return"
+        );
+        // Comment-stripped: the retirement's own doc comment NAMES the acquisition it deleted.
+        let entry = code_of(body_of(
+            RUNTIME,
+            "pub fn try_split_ipc_recv_queued_plain_into_frame(",
+            "\n    /// Stage 187A — Phase B",
+        ));
+        assert!(
+            !entry.contains("with_cpu(") && !entry.contains("self.with(|"),
+            "the split recv entry must hold no broad acquisition"
+        );
+        assert!(
+            entry.contains("self.recv_queued_split_phase_a_split(cpu, frame, &snapshot)"),
+            "and must dispatch Phase A through the off-lock transaction"
+        );
+    }
+
+    /// Phase A itself holds no broad acquisition and reaches no user copy / frame write while a
+    /// domain lock is held — the writeback is still deferred to Phase B by value.
+    #[test]
+    fn phase_a_holds_no_broad_lock_and_defers_every_user_copy() {
+        let body = code_of(phase_a_body());
+        for forbidden in [
+            "with_cpu(",
+            "self.with(|",
+            "copy_to_user_split",
+            "copy_from_user_split",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "off-lock Phase A must not contain `{forbidden}`"
+            );
+        }
+        assert!(
+            body.contains("RecvQueuedSplitPhaseA::PendingUserCopy"),
+            "user writeback stays deferred past Phase A"
+        );
+    }
+
+    // ── (2) the materialization contract ────────────────────────────────────────────────────
+
+    /// The five phases run in ascending rank and — the point of the whole exercise — the
+    /// capability lock is never held while the IPC lock is taken.
+    #[test]
+    fn materialization_runs_five_sequential_phases_in_ascending_rank() {
+        let body = materialize_body();
+        let order = [
+            ("take_transfer_envelope_facts_split", "rank 3 consume"),
+            ("reply_object_live_split", "rank 3 liveness"),
+            ("task_cnode_split", "rank 2 -> 4 CNode"),
+            ("mint_capability_with_memory_ref_split", "rank 4 mint"),
+            ("try_record_reply_waiter_cap_split", "rank 3 record"),
+        ];
+        let mut last = 0usize;
+        for (needle, what) in order {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("{what} (`{needle}`) must be present"));
+            assert!(at > last, "{what} is out of order");
+            last = at;
+        }
+        // Nothing nests: each seam is its own acquisition, so there is no `with_*` wrapping
+        // another `with_*` in this body.
+        assert!(
+            !body.contains("with_capability_state_split_mut(|"),
+            "the transaction must reach rank 4 through the mint seam, not by opening the \
+             capability domain around other work"
+        );
+    }
+
+    /// Exactness: nothing is derived from a bare TID, a bare slot, or the ambient current task.
+    #[test]
+    fn every_phase_is_keyed_by_exact_identity() {
+        let body = materialize_body();
+        assert!(
+            body.contains("CapObject::Reply {\n            index: reply_index,\n            generation: reply_generation,\n        }")
+                || body.contains("index: reply_index,"),
+            "the Reply object carries its own index AND generation"
+        );
+        assert!(
+            body.contains("reply_object_live_split(reply_index, reply_generation)"),
+            "liveness is checked against the exact generation"
+        );
+        assert!(
+            body.contains(
+                "try_record_reply_waiter_cap_split(reply_index, reply_generation, minted)"
+            ),
+            "the record write is generation-guarded again, closing the mint->record window"
+        );
+        assert!(
+            !body.contains("current_tid"),
+            "no ambient current-task read may appear in the transaction"
+        );
+    }
+
+    /// A stale record between mint and record rolls the mint ALL the way back and fails closed:
+    /// no published cap, no alias, and the envelope is not resurrected.
+    #[test]
+    fn a_stale_record_rolls_the_mint_back_and_fails_closed() {
+        let body = materialize_body();
+        let record = body
+            .find("try_record_reply_waiter_cap_split")
+            .expect("record phase");
+        let stale = body[record..]
+            .find("stale =>")
+            .expect("the non-Set arm must be handled");
+        let rollback = body[record..]
+            .find("rollback_minted_cap_split(receiver_cnode, minted, reply_object)")
+            .expect("the mint must be rolled back on a stale record");
+        assert!(stale < rollback, "the rollback belongs to the stale arm");
+        assert!(
+            body[record + stale..].contains("Err(SyscallError::WrongObject)"),
+            "and the transaction fails closed"
+        );
+    }
+
+    /// A shared-region envelope owes a rank-6 pin release this transaction does not perform, so
+    /// it is refused rather than half-settled.
+    #[test]
+    fn a_shared_region_envelope_is_refused_not_half_settled() {
+        let body = materialize_body();
+        assert!(
+            body.contains("if facts.pinned_object.is_some()"),
+            "the pin obligation must be checked"
+        );
+        let at = body.find("facts.pinned_object.is_some()").expect("checked");
+        assert!(
+            body[at..].contains("return Err(SyscallError::WrongObject)"),
+            "and refused"
+        );
+        assert!(
+            at < body
+                .find("mint_capability_with_memory_ref_split")
+                .expect("mint"),
+            "the refusal precedes the mint"
+        );
+    }
+
+    // ── (3) the rollback contract ───────────────────────────────────────────────────────────
+
+    /// The rollback revokes only a slot that STILL names the exact object and generation it
+    /// minted, so a reused slot or an advanced record is a typed refusal, not a wrong revoke —
+    /// which is also what makes a repeated rollback harmless.
+    #[test]
+    fn rollback_refuses_a_reused_slot_or_advanced_record() {
+        let body = rollback_body();
+        let resolve = body
+            .find("self.resolved_capability_split(receiver_cnode, minted)")
+            .expect("the slot must be re-resolved before anything is revoked");
+        let revoke = body
+            .find("rollback_minted_cap_split(receiver_cnode, minted, expected)")
+            .expect("the revoke");
+        assert!(resolve < revoke, "validate before revoking");
+        assert!(
+            body.contains("Some(capability) if capability.object == expected => {}"),
+            "the slot must still name the EXACT Reply object and generation"
+        );
+        assert!(
+            body.contains("return false"),
+            "a mismatch is a typed refusal, not a revoke"
+        );
+        let clear = body
+            .find("clear_reply_waiter_cap_split(reply_index, reply_generation)")
+            .expect("the alias clear");
+        assert!(revoke < clear, "rank 4 completes before rank 3 is taken");
+    }
+
+    /// The rank-3 half is itself generation-guarded, so it cannot clear a successor's alias.
+    #[test]
+    fn the_alias_clear_is_generation_guarded_at_the_seam() {
+        let body = body_of(
+            REPLY_SPLIT,
+            "pub(crate) fn clear_reply_waiter_cap_split(",
+            "\n}",
+        );
+        assert!(
+            body.contains("if ipc.reply_cap_generations[reply_index] != reply_generation"),
+            "the seam must refuse a mismatched generation"
+        );
+    }
+
+    /// The Reply rollback never reaches the ordinary-object teardown family.
+    #[test]
+    fn reply_rollback_never_reaches_ordinary_object_teardown() {
+        let body = rollback_body();
+        for forbidden in [
+            "rollback_materialized_recv_cap",
+            "revoke_capability_in_cnode",
+            "revoke_active_transfer_mappings_for_cap",
+            "reclaim_memory_object_if_unreferenced",
+            "destroy_notification_for_revoked_cap",
+            "unmap_range_two_phase",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the Reply rollback must not reach `{forbidden}`"
+            );
+        }
+    }
+
+    // ── (4) SEPARATION — the ordinary classes are untouched. This is the load-bearing one. ──
+
+    /// Only the Reply class is diverted. Every other object keeps the unchanged broad rollback,
+    /// with its full teardown effects. Narrowing this would be the "reply-only approximation"
+    /// the U9-B stop explicitly forbade, and it would silently drop TLB shootdowns and memory
+    /// reclaim for MemoryObject/DmaRegion/Notification transfers.
+    #[test]
+    fn only_reply_is_diverted_and_ordinary_rollback_keeps_every_effect() {
+        let body = body_of(
+            RUNTIME,
+            "fn complete_recv_boundary_user_copy(",
+            "\n    /// Stage 187B",
+        );
+        let reply_arm = body
+            .find("if let Some((reply_index, reply_generation)) = pending.reply_record")
+            .expect("the Reply class must be selected by its RECORD identity");
+        let else_arm = body[reply_arm..]
+            .find("} else {")
+            .expect("every other class must have an else arm");
+        assert!(
+            body[reply_arm + else_arm..].contains("kernel.rollback_materialized_recv_cap("),
+            "non-Reply objects must still take the unchanged broad rollback"
+        );
+        assert!(
+            body[reply_arm + else_arm..].contains("shared.with_cpu(cpu, |kernel|"),
+            "…including its broad acquisition, which remains counted in the census"
+        );
+    }
+
+    /// The ordinary teardown body is untouched: every effect the U9-B stop enumerated is still
+    /// there. A future pass that "simplifies" this is removing real obligations.
+    #[test]
+    fn the_ordinary_teardown_body_retains_every_obligation() {
+        let lifecycle = include_str!("capability_lifecycle_state.rs");
+        let body = body_of(
+            lifecycle,
+            "pub(crate) fn revoke_capability_in_cnode(",
+            "\n    /// Stage 181C",
+        );
+        for effect in [
+            "collect_delegated_descendants",
+            "revoke_capability_direct_in_process_cnode",
+            "remove_delegation_links_for",
+            "revoke_active_transfer_mappings_for_cap",
+            "adjust_memory_object_cap_refcount",
+            "reclaim_memory_object_if_unreferenced",
+            "destroy_notification_for_revoked_cap",
+        ] {
+            assert!(
+                body.contains(effect),
+                "ordinary teardown must retain `{effect}`"
+            );
+        }
+    }
+
+    /// The three ordinary rollback callsites all remain — the census says 6, not 3.
+    #[test]
+    fn all_three_ordinary_rollback_callsites_remain() {
+        let code = code_of(RUNTIME);
+        assert_eq!(
+            code.matches("kernel.rollback_materialized_recv_cap(")
+                .count(),
+            3,
+            "all three broad rollback callers must remain; U9-C retires none of them"
+        );
+    }
+
+    // ── (5) admission: classes are refused BEFORE anything is consumed ──────────────────────
+
+    /// Phase A declines only what it cannot serve, and does so pre-dequeue — never by consuming
+    /// a message and then failing. Envelope validity is deliberately NOT an admission
+    /// criterion, so a bad handle still surfaces its real error instead of degrading to a
+    /// silent fallback.
+    #[test]
+    fn unserviceable_classes_are_refused_before_the_dequeue() {
+        let admitted = body_of(
+            IPC_STATE,
+            "pub(crate) fn ipc_try_recv_queued_admitted_locked(",
+            "\n}",
+        );
+        let peek = admitted.find("peek()").expect("the head is peeked");
+        let admit = admitted
+            .find("!admit(&msg, ipc)")
+            .expect("admission is consulted");
+        let dequeue = admitted
+            .find("ipc_try_recv_queued_with_cap_transfer_locked(ipc, endpoint_idx)")
+            .expect("the dequeue");
+        assert!(peek < admit && admit < dequeue, "peek -> admit -> dequeue");
+
+        let body = phase_a_body();
+        assert!(
+            body.contains("if msg.opcode == OPCODE_SHARED_MEM {"),
+            "shared-region must be declined"
+        );
+        // An unresolvable handle stays ADMITTED so its error is raised rather than swallowed:
+        // every early-out in the envelope-resolution ladder returns `true`, not `false`.
+        let ladder = body
+            .split("let Ok(idx) = usize::try_from(handle & 0xFFFF)")
+            .nth(1)
+            .expect("the envelope-resolution ladder must exist");
+        let ladder = &ladder[..ladder.find("!matches!(").expect("ends at the Reply check")];
+        assert!(
+            !ladder.contains("return false"),
+            "an unresolvable or stale handle must stay admitted (return true), so its real \
+             error is surfaced instead of degrading into a silent fallback"
+        );
+        assert!(
+            ladder.matches("return true").count() >= 2,
+            "the early-outs admit"
+        );
+    }
+
+    // ── (6) one implementation, no new surface ──────────────────────────────────────────────
+
+    /// The dequeue and the post-dequeue mapping have exactly ONE implementation each, driven by
+    /// both the broad and the off-lock owner. A divergence between the two recv routes is
+    /// therefore not expressible.
+    #[test]
+    fn the_dequeue_and_mapping_have_one_implementation_each() {
+        assert_eq!(
+            code_of(IPC_STATE)
+                .matches("fn ipc_try_recv_queued_with_cap_transfer_locked(")
+                .count(),
+            1,
+            "one dequeue body"
+        );
+        assert_eq!(
+            code_of(RECV_CORE)
+                .matches("fn map_queued_recv_outcome(")
+                .count(),
+            1,
+            "one post-dequeue mapping"
+        );
+        assert_eq!(
+            code_of(RECV_CORE)
+                .matches("extract_cap_transfer_plan(&msg)")
+                .count(),
+            1,
+            "one canonical cap-transfer extraction"
+        );
+        for owner in ["KernelState", "SharedKernel"] {
+            let _ = owner;
+        }
+        assert!(
+            code_of(RUNTIME).contains("ipc_try_recv_queued_with_cap_transfer_locked(")
+                && code_of(IPC_STATE)
+                    .contains("ipc_try_recv_queued_with_cap_transfer_locked(ipc, endpoint_idx)"),
+            "both owners must drive the same body"
+        );
+    }
+
+    /// No new drain, seam file, script, marker family or fabricated token.
+    #[test]
+    fn the_retirement_adds_no_new_surface() {
+        for src in [RUNTIME, IPC_STATE, RECV_CORE, SYSCALL] {
+            assert!(!src.contains("ZDBG_"), "no diagnostic residue may ship");
+        }
+        // The markers used by the off-lock reply arm are the EXISTING D5 family.
+        let body = phase_a_body();
+        for existing in [
+            "YARM_D5_SPLIT_MATERIALIZE kind=reply",
+            "IPC_REPLY_CAP_ONESHOT_OK",
+            "YARM_RECV_CORE_CAP_MATERIALIZE",
+            "IPC_RECV_V2_SENDER_WAKE_ORDER_OK",
+        ] {
+            assert!(
+                body.contains(existing),
+                "the off-lock arm must keep emitting the existing marker `{existing}`"
+            );
+        }
+        assert!(
+            !body.contains("drain_"),
+            "no new post-lock drain may be introduced"
+        );
+        // Stage 188D's seams gained a production caller; they were never a new file.
+        assert!(
+            REPLY_SPLIT.contains("Stage 188D"),
+            "the rank-3 reply seams remain where 188D put them"
         );
     }
 }

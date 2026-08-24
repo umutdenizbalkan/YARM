@@ -806,6 +806,29 @@ pub(crate) fn dispatch_torn_fatal(cpu: CpuId, tid: u64, site: &'static str) -> !
     panic!("dispatch torn: scheduler and task table disagree");
 }
 
+/// U9-C — what an exact reply-cap materialization published: the receiver-local one-shot cap
+/// AND the reply record it is aliased from. The rollback needs BOTH — the cap alone cannot
+/// prove which record's alias to clear, and a bare index would let a reused record be cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplyCapMaterialization {
+    pub(crate) cap: CapId,
+    pub(crate) reply_index: usize,
+    pub(crate) reply_generation: u64,
+}
+
+/// U9-C — the by-value facts a single rank-3 transfer-envelope consume yields.
+///
+/// `pinned_object` is `Some` exactly when the consumed envelope was a shared-region one and
+/// therefore still owes ONE rank-6 pin release. The reply-cap and ordinary-cap classes never
+/// carry one, so a `Some` is the caller's signal that it took a class it must not service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TakenTransferEnvelopeFacts {
+    pub(crate) source_object: CapObject,
+    pub(crate) source_tid: u64,
+    pub(crate) source_cap: CapId,
+    pub(crate) pinned_object: Option<CapObject>,
+}
+
 impl SharedKernel {
     /// Stage 114 fix: this used to also cache `scheduler_state` /
     /// `boot_config_state_lock` / `boot_config` raw pointers computed from
@@ -3912,6 +3935,840 @@ impl SharedKernel {
         f(kernel_mut(ipc))
     }
 
+    // ── U9-C: the rank-3 (IPC) halves of the queued-split recv Phase A ──────────────────
+    //
+    // Each of these drives the SAME body the broad `KernelState` method drives — the
+    // `*_locked` free functions in `kernel/boot/ipc_state.rs` — through `with_ipc_split_mut`
+    // instead of a broad `&mut KernelState`. One implementation, two owners; a divergence
+    // between the split recv route and the legacy route is therefore not expressible.
+
+    /// U9-C — rank-3 dequeue + two-phase sender refill, plain (no cap) receiver form.
+    pub(crate) fn ipc_try_recv_queued_plain_endpoint_only_split(
+        &self,
+        endpoint_idx: usize,
+    ) -> crate::kernel::boot::IpcEndpointRecvResult {
+        self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::ipc_try_recv_queued_plain_endpoint_only_locked(ipc, endpoint_idx)
+        })
+    }
+
+    /// U9-C — rank-3 dequeue + two-phase sender refill, cap-transfer-tolerant receiver form.
+    pub(crate) fn ipc_try_recv_queued_with_cap_transfer_split(
+        &self,
+        endpoint_idx: usize,
+    ) -> crate::kernel::boot::IpcEndpointRecvResult {
+        self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::ipc_try_recv_queued_with_cap_transfer_locked(ipc, endpoint_idx)
+        })
+    }
+
+    /// U9-C — rank-3 endpoint-index resolution with the same generation/liveness checks
+    /// `KernelState::resolve_endpoint_index` performs. The capacity limit is read from the
+    /// existing config split-read BEFORE the IPC lock is taken, so the two never nest.
+    pub(crate) fn resolve_endpoint_index_split(
+        &self,
+        object: CapObject,
+    ) -> Result<usize, KernelError> {
+        let limits = self.runtime_capacity_config_split_read();
+        match object {
+            CapObject::Endpoint { index, generation } => self.with_ipc_split_mut(|ipc| {
+                if index >= limits.max_endpoints {
+                    return Err(KernelError::WrongObject);
+                }
+                if ipc.endpoints[index].is_none() {
+                    return Err(KernelError::WrongObject);
+                }
+                if ipc.endpoint_generations[index] != generation {
+                    return Err(KernelError::StaleCapability);
+                }
+                Ok(index)
+            }),
+            _ => Err(KernelError::WrongObject),
+        }
+    }
+
+    /// U9-C — rank-3 read of a transfer envelope's source object, generation-guarded exactly
+    /// as `KernelState::peek_transfer_envelope_source_object`. Reads only; consumes nothing.
+    pub(crate) fn peek_transfer_envelope_source_object_split(
+        &self,
+        handle: u64,
+    ) -> Option<CapObject> {
+        let idx = usize::try_from(handle & 0xFFFF).ok()?;
+        if idx >= crate::kernel::boot::MAX_TRANSFER_ENVELOPES {
+            return None;
+        }
+        let generation = handle >> 16;
+        if generation == 0 {
+            return None;
+        }
+        self.with_ipc_split_mut(|ipc| {
+            if ipc.transfer_envelope_generations[idx] != generation {
+                return None;
+            }
+            ipc.transfer_envelopes[idx].map(|e| e.source_object)
+        })
+    }
+
+    /// U9-C — the queued-split recv **Phase A**, off the broad lock.
+    ///
+    /// This is the off-lock twin of `crate::kernel::syscall::try_split_recv_queued_plain_with_snapshot_locked`,
+    /// and the reason `try_split_ipc_recv_queued_plain_into_frame` no longer needs a broad
+    /// `with_cpu`. Every step below either drives the SAME shared body the broad path drives, or
+    /// is one of the ordered split transactions added by U9-C:
+    ///
+    /// | step | rank(s) | seam |
+    /// |---|---|---|
+    /// | receiver class | 2 | `task_asid_option_split_read` on the AUTHORITATIVE requester |
+    /// | plan | — | `plan_recv_core` (pure) |
+    /// | endpoint index | 3 | `resolve_endpoint_index_split` |
+    /// | admit + dequeue + refill | 3 | `ipc_try_recv_queued_admitted_locked` (one acquisition) |
+    /// | telemetry | 3 | `note_endpoint_only_queued_recv_split_seam` |
+    /// | outcome mapping | — | `map_queued_recv_outcome` (shared with the broad cores) |
+    /// | reply-cap materialization | 3→2→4→3 | `materialize_reply_cap_split` |
+    /// | ordinary-cap snapshot | 3, 4, 2 | envelope facts + capability + CNode splits |
+    /// | sender wake | 1 | `apply_split_sender_wake_plan_split` |
+    ///
+    /// # `is_kernel_task` is now exact, not ambient
+    ///
+    /// The broad body derived it from `current_task_has_user_asid`, i.e. from the AMBIENT current
+    /// task — which is precisely why that closure had to be `with_cpu(cpu, …)` rather than `with`
+    /// (the Stage 160 parity fix: on an SMP boot an unbound `current_cpu` could observe another
+    /// CPU's task and misclassify the receiver). Here it is read from
+    /// `snapshot.requester_tid`, the authoritative TID `current_tid_authoritative(cpu)` already
+    /// resolved before Phase A. The ambient dependency — and with it the reason to bind a CPU —
+    /// is gone rather than relocated.
+    ///
+    /// # What Phase A admits, and what it refuses BEFORE consuming anything
+    ///
+    /// Admitted: plain messages, `FLAG_REPLY_CAP` reply caps (the one class a real boot
+    /// materializes here), and ordinary caps to a user receiver (whose mint was already off-lock).
+    ///
+    /// Refused pre-dequeue, via `ipc_try_recv_queued_admitted_locked`, because no off-lock
+    /// materializer exists for them: shared-region (`OPCODE_SHARED_MEM`) messages, whose
+    /// receiver-side mapping obligations sit outside the materialize step; cap transfers to a
+    /// kernel-register receiver; and non-`FLAG_REPLY_CAP` messages whose envelope names a `Reply`
+    /// object, which the broad router deliberately fails closed. Each returns `Fallback` with the
+    /// message still queued, so the unchanged legacy path services it — the same contract Phase A
+    /// has always had for a case it cannot serve.
+    pub(crate) fn recv_queued_split_phase_a_split(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        snapshot: &EndpointRecvCapSnapshot,
+    ) -> crate::kernel::syscall::RecvQueuedSplitPhaseA {
+        use crate::kernel::ipc::{Message, pack_register_payload};
+        use crate::kernel::recv_core::{
+            RecvOutcome, RecvPlan, RecvSchedulerWakePlan, RecvWritebackPlan, kernel_register_plan,
+            map_queued_recv_outcome, plan_recv_core, queued_recv_result_delivered,
+            user_memory_plan, user_memory_v2_plan,
+        };
+        use crate::kernel::syscall::{
+            OPCODE_SHARED_MEM, RecvQueuedSplitPhaseA, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0,
+            SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError,
+            recv_boundary_encode_transfer_cap_ret,
+        };
+
+        let receiver_tid = snapshot.requester_tid;
+        // Rank 2 on the EXACT requester — never the ambient current task.
+        let is_kernel_task = self.task_asid_option_split_read(receiver_tid).is_none();
+        let recv_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+        let request = crate::kernel::recv_core::RecvRequest::from_legacy_ipc_recv(
+            receiver_tid,
+            recv_cap,
+            frame.arg(SYSCALL_ARG_PTR),
+            frame.arg(SYSCALL_ARG_LEN),
+            frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+            frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+            is_kernel_task,
+        );
+
+        let plan = plan_recv_core(&request);
+        crate::yarm_log!("YARM_RECV_CORE_PLAN plan={:?}", plan);
+        let (kind, is_user_writeback) = match plan {
+            RecvPlan::KernelPlainEligible => ("kernel_plain", false),
+            RecvPlan::UserPlainEligible => ("user_plain", true),
+            RecvPlan::UserPlainV2Eligible => ("user_plain_v2", true),
+            RecvPlan::FallbackRequired(reason) => {
+                crate::yarm_log!("YARM_RECV_CORE_FALLBACK reason={:?}", reason);
+                return RecvQueuedSplitPhaseA::Fallback;
+            }
+        };
+        crate::yarm_log!("YARM_RECV_CORE_ADAPTER kind={}", kind);
+
+        let endpoint = snapshot.endpoint;
+        let endpoint_idx = match self.resolve_endpoint_index_split(endpoint) {
+            Ok(idx) => idx,
+            Err(e) => {
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                    SyscallError::from(e),
+                )));
+            }
+        };
+
+        // ── rank 3: admit + dequeue + two-phase refill, in ONE acquisition ──────────────────
+        let result = self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::ipc_try_recv_queued_admitted_locked(
+                ipc,
+                endpoint_idx,
+                |msg, ipc| {
+                    // Admission classifies by MESSAGE SHAPE only. Envelope validity is
+                    // deliberately NOT an admission criterion: a stale or missing handle must
+                    // still be dequeued so it surfaces the same `InvalidCapability` the broad
+                    // path raised, rather than degrading into a silent fallback.
+                    let Some(handle) = msg.transferred_cap().map(|c| c.0) else {
+                        return true; // plain: always serviceable
+                    };
+                    if msg.opcode == OPCODE_SHARED_MEM {
+                        // Shared-region transfers carry receiver-side MAPPING obligations outside
+                        // the materialize step; no off-lock materializer exists for them. Decline
+                        // BEFORE consuming, so the unchanged legacy owner services the message.
+                        return false;
+                    }
+                    if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+                        return true; // the exact reply-cap transaction serves this
+                    }
+                    // A Reply object tagged as an ORDINARY transfer is the forbidden queued
+                    // reply-cap shape; the broad router sends it to the canonical materialize,
+                    // which fails closed. Declining here is that same refusal one step earlier —
+                    // and only when the envelope actually RESOLVES to a Reply. An unresolvable
+                    // handle stays admitted so its error is raised, not swallowed.
+                    let Ok(idx) = usize::try_from(handle & 0xFFFF) else {
+                        return true;
+                    };
+                    if idx >= crate::kernel::boot::MAX_TRANSFER_ENVELOPES {
+                        return true;
+                    }
+                    let generation = handle >> 16;
+                    if generation == 0 || ipc.transfer_envelope_generations[idx] != generation {
+                        return true;
+                    }
+                    !matches!(
+                        ipc.transfer_envelopes[idx].map(|e| e.source_object),
+                        Some(CapObject::Reply { .. })
+                    )
+                },
+            )
+        });
+        if queued_recv_result_delivered(&result) {
+            self.note_endpoint_only_queued_recv_split_seam();
+        }
+        let outcome = match plan {
+            RecvPlan::KernelPlainEligible => map_queued_recv_outcome(result, kernel_register_plan),
+            RecvPlan::UserPlainEligible => {
+                map_queued_recv_outcome(result, |_m, tid| user_memory_plan(&request, tid))
+            }
+            RecvPlan::UserPlainV2Eligible => {
+                map_queued_recv_outcome(result, |_m, tid| user_memory_v2_plan(&request, tid))
+            }
+            RecvPlan::FallbackRequired(_) => unreachable!("fallback returned above"),
+        };
+
+        let delivery = match outcome {
+            RecvOutcome::Delivered(d) => d,
+            RecvOutcome::WouldBlock | RecvOutcome::FallbackRequired(_) | RecvOutcome::TimedOut => {
+                return RecvQueuedSplitPhaseA::Fallback;
+            }
+            RecvOutcome::Error(e) => {
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                    SyscallError::from(e),
+                )));
+            }
+        };
+
+        let is_reply_cap = (delivery.msg.flags & Message::FLAG_REPLY_CAP) != 0;
+
+        // ── ordinary cap to a USER receiver: unchanged route, its mint already off-lock ─────
+        if is_user_writeback
+            && !is_reply_cap
+            && let Some(plan) = delivery.cap_transfer
+            && !plan.is_reply_cap
+        {
+            let Some(facts) = self.take_transfer_envelope_facts_split(
+                plan.raw_handle,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(receiver_tid),
+            ) else {
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                    SyscallError::InvalidCapability,
+                )));
+            };
+            let source_capability =
+                match self.resolve_capability_for_task_split(facts.source_tid, facts.source_cap) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                            SyscallError::from(e),
+                        )));
+                    }
+                };
+            let Some(receiver_cnode) = self.task_cnode_split(receiver_tid) else {
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                    SyscallError::InvalidCapability,
+                )));
+            };
+            let wake_tid = match delivery.scheduler {
+                RecvSchedulerWakePlan::WakeSender(t) => Some(t),
+                RecvSchedulerWakePlan::None => None,
+            };
+            return RecvQueuedSplitPhaseA::PendingOrdinaryCapUserCopy(
+                crate::kernel::recv_core::RecvBoundaryOrdinaryCapSnapshot {
+                    receiver_cnode,
+                    object: source_capability.object,
+                    rights: source_capability.rights(),
+                    source_tid: facts.source_tid,
+                    source_cap: facts.source_cap,
+                    wake_tid,
+                    asid: self.task_asid_option_split_read(receiver_tid),
+                    receiver_tid,
+                    msg: delivery.msg,
+                    writeback: delivery.writeback,
+                },
+            );
+        }
+
+        // ── ordinary cap to a KERNEL-REGISTER receiver: same off-lock seam, no user copy ────
+        //
+        // The user-receiver form of this class already mints off-lock through
+        // `complete_recv_boundary_ordinary_cap`; a kernel-register receiver differs only in
+        // having no user copy to defer, so it mints through the SAME seam and completes here.
+        // Keeping it ADMITTED is what preserves the split path's long-standing contract that a
+        // cap-transfer message is dequeued and materialized rather than handed back — including
+        // surfacing a bad handle as `Some(Err(InvalidCapability))` instead of `None`.
+        if !is_user_writeback
+            && !is_reply_cap
+            && let Some(plan) = delivery.cap_transfer
+            && !plan.is_reply_cap
+        {
+            let local_cap = match self.materialize_ordinary_cap_split(
+                endpoint_idx,
+                receiver_tid,
+                plan.raw_handle,
+            ) {
+                Ok(cap) => cap,
+                Err(e) => {
+                    crate::yarm_log!(
+                        "IPC_RECV_CAP_MATERIALIZE_FAILED kind=transfer raw={} err={:?}",
+                        plan.raw_handle,
+                        e
+                    );
+                    return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(e)));
+                }
+            };
+            if recv_boundary_encode_transfer_cap_ret(frame, Some(local_cap.0)).is_err() {
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                    SyscallError::Internal,
+                )));
+            }
+            crate::yarm_log!(
+                "YARM_D1_SPLIT_MATERIALIZE kind=transfer receiver_tid={} local_cap={}",
+                receiver_tid,
+                local_cap.0
+            );
+            crate::yarm_log!(
+                "IPC_TRANSFER_CAP_MATERIALIZE_OK receiver_tid={} local_cap={}",
+                receiver_tid,
+                local_cap.0
+            );
+            crate::yarm_log!(
+                "YARM_RECV_CORE_CAP_MATERIALIZE receiver_tid={} local_cap={}",
+                receiver_tid,
+                local_cap.0
+            );
+            if let RecvSchedulerWakePlan::WakeSender(wake_tid) = delivery.scheduler {
+                let _ = self.apply_split_sender_wake_plan_split(cpu, wake_tid);
+                crate::yarm_log!(
+                    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+                    wake_tid.tid.0
+                );
+            }
+            let RecvWritebackPlan::KernelRegister {
+                sender_tid,
+                raw_len,
+            } = delivery.writeback
+            else {
+                unreachable!("!is_user_writeback implies a KernelRegister plan");
+            };
+            frame.set_ok(sender_tid, raw_len, frame.ret2());
+            let words = match pack_register_payload(delivery.msg.as_slice()) {
+                Ok(w) => w,
+                Err(_) => {
+                    return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                        SyscallError::InvalidArgs,
+                    )));
+                }
+            };
+            frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
+            frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
+            crate::yarm_log!("YARM_RECV_CORE_LIVE kind=kernel_plain");
+            return RecvQueuedSplitPhaseA::Completed(Ok(()));
+        }
+
+        // ── reply cap: the exact ordered transaction ────────────────────────────────────────
+        let mut reply_record: Option<(usize, u64)> = None;
+        let materialized_cap: Option<u64> = if let Some(plan) = delivery.cap_transfer {
+            match self.materialize_reply_cap_split(endpoint_idx, receiver_tid, plan.raw_handle) {
+                Ok(materialized) => {
+                    let local_cap = materialized.cap;
+                    reply_record = Some((materialized.reply_index, materialized.reply_generation));
+                    if recv_boundary_encode_transfer_cap_ret(frame, Some(local_cap.0)).is_err() {
+                        return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                            SyscallError::Internal,
+                        )));
+                    }
+                    self.note_d5_split_reply_materialize_split();
+                    crate::yarm_log!(
+                        "YARM_D5_SPLIT_MATERIALIZE kind=reply receiver_tid={} local_cap={}",
+                        receiver_tid,
+                        local_cap.0
+                    );
+                    crate::yarm_log!(
+                        "IPC_REPLY_CAP_ONESHOT_OK receiver_tid={} local_reply_cap={}",
+                        receiver_tid,
+                        local_cap.0
+                    );
+                    crate::yarm_log!(
+                        "YARM_RECV_CORE_CAP_MATERIALIZE receiver_tid={} local_cap={}",
+                        receiver_tid,
+                        local_cap.0
+                    );
+                    Some(local_cap.0)
+                }
+                Err(e) => {
+                    crate::yarm_log!(
+                        "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err={:?}",
+                        plan.raw_handle,
+                        e
+                    );
+                    return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(e)));
+                }
+            }
+        } else {
+            if recv_boundary_encode_transfer_cap_ret(frame, None).is_err() {
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                    SyscallError::Internal,
+                )));
+            }
+            None
+        };
+
+        // ── rank 1: deferred sender wake, BEFORE any writeback (§56 order) ─────────────────
+        if let RecvSchedulerWakePlan::WakeSender(wake_tid) = delivery.scheduler {
+            let _ = self.apply_split_sender_wake_plan_split(cpu, wake_tid);
+            crate::yarm_log!(
+                "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+                wake_tid.tid.0
+            );
+        }
+
+        match delivery.writeback {
+            RecvWritebackPlan::KernelRegister {
+                sender_tid,
+                raw_len,
+            } => {
+                frame.set_ok(sender_tid, raw_len, frame.ret2());
+                let words = match pack_register_payload(delivery.msg.as_slice()) {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                            SyscallError::InvalidArgs,
+                        )));
+                    }
+                };
+                frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
+                frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
+                crate::yarm_log!("YARM_RECV_CORE_LIVE kind=kernel_plain");
+                RecvQueuedSplitPhaseA::Completed(Ok(()))
+            }
+            RecvWritebackPlan::UserMemory { .. } | RecvWritebackPlan::UserMemoryV2 { .. } => {
+                RecvQueuedSplitPhaseA::PendingUserCopy(
+                    crate::kernel::recv_core::RecvBoundaryUserCopySnapshot {
+                        asid: self.task_asid_option_split_read(receiver_tid),
+                        receiver_tid,
+                        msg: delivery.msg,
+                        writeback: delivery.writeback,
+                        materialized_cap,
+                        is_reply_cap,
+                        reply_record,
+                    },
+                )
+            }
+        }
+    }
+
+    /// U9-C — rank-2 `Option<Asid>` read for an exact TID. `task_asid_for_tid_split_read` flattens
+    /// "no ASID" and "ASID 0" into the same `u64`; the recv boundary snapshot needs them
+    /// distinguished, so this reads the TCB field directly under the task lock.
+    pub(crate) fn task_asid_option_split_read(&self, tid: u64) -> Option<crate::kernel::vm::Asid> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.asid)
+        })
+    }
+
+    /// U9-C — rank-3 D5 telemetry bump, the split twin of
+    /// `KernelState::note_d5_split_reply_materialize`.
+    pub(crate) fn note_d5_split_reply_materialize_split(&self) {
+        self.with_ipc_split_mut(|ipc| {
+            ipc.telemetry.d5_split_reply_materializations = ipc
+                .telemetry
+                .d5_split_reply_materializations
+                .saturating_add(1);
+        });
+    }
+
+    /// U9-C — the authoritative reply-cap materialization transaction, off the broad lock.
+    ///
+    /// This is the production wiring Stage 188D deliberately left open: 188D built the rank-3
+    /// halves (`try_record_reply_waiter_cap_split` / `clear_reply_waiter_cap_split`) and proved
+    /// them by unit test, but said "wiring a live producer there is out of Stage 188D scope".
+    /// U9-C wires the producer, so the ONE live reply-cap materialization a real boot performs
+    /// (PM receiving a call that carries a reply cap) no longer needs a broad `&mut KernelState`.
+    ///
+    /// # Rank order — sequential, never nested
+    ///
+    /// | phase | rank | effect |
+    /// |---|---|---|
+    /// | A | 3 (IPC) | consume the transfer envelope exactly once; read its `source_object` |
+    /// | B | 3 (IPC) | the named `Reply{index,generation}` is still live |
+    /// | C | 2 then 4 | resolve the receiver's process CNode |
+    /// | D | 4 (+6 no-op) | mint the receiver-local one-shot Reply cap |
+    /// | E | 3 (IPC) | record the exact CapId as the reply record's waiter alias |
+    ///
+    /// Each phase fully RELEASES its domain before the next acquires one, so the capability lock
+    /// is never held while the IPC lock is taken. That is what removes the
+    /// `reply_cap_ipc_rank_inversion` at this site: the inversion was never the order 4-then-3, it
+    /// was holding 4 *while* taking 3.
+    ///
+    /// # Exactness
+    ///
+    /// Nothing here is derived from a bare TID, a bare slot or the ambient current task. The
+    /// envelope consume is generation-guarded and endpoint-matched; the Reply object carries its
+    /// own `{index, generation}`; the record write is generation-guarded again in phase E, which is
+    /// what closes the mint→record window. If phase E finds the reply object revoked or reused, the
+    /// phase-D mint is rolled all the way back (slot + refcount) and the whole transaction fails
+    /// closed — no cap published, no alias set, no envelope resurrected.
+    ///
+    /// A shared-region envelope (`pinned_object.is_some()`) is NOT serviced here: it owes a rank-6
+    /// pin release this transaction deliberately does not perform. Its arrival is a routing bug, so
+    /// it fails closed rather than being half-settled.
+    pub(crate) fn materialize_reply_cap_split(
+        &self,
+        endpoint_idx: usize,
+        receiver_tid: u64,
+        raw_handle: u64,
+    ) -> Result<ReplyCapMaterialization, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::capabilities::{CapRights, Capability};
+        use crate::kernel::syscall::SyscallError;
+
+        // ── Phase A (rank 3): consume the envelope exactly once ────────────────────────────
+        let facts = self
+            .take_transfer_envelope_facts_split(
+                raw_handle,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(receiver_tid),
+            )
+            .ok_or(SyscallError::InvalidCapability)?;
+        if facts.pinned_object.is_some() {
+            // A shared-region envelope owes a rank-6 pin release this transaction does not do.
+            return Err(SyscallError::WrongObject);
+        }
+        let CapObject::Reply {
+            index: reply_index,
+            generation: reply_generation,
+        } = facts.source_object
+        else {
+            return Err(SyscallError::WrongObject);
+        };
+
+        // ── Phase B (rank 3): the exact Reply object is still live ─────────────────────────
+        if !self.reply_object_live_split(reply_index, reply_generation) {
+            return Err(SyscallError::InvalidCapability);
+        }
+
+        // ── Phase C (rank 2 → rank 4): the receiver's exact CNode ──────────────────────────
+        let receiver_cnode = self
+            .task_cnode_split(receiver_tid)
+            .ok_or(SyscallError::InvalidCapability)?;
+
+        // ── Phase D (rank 4): mint the one-shot Reply cap. A Reply object holds no memory
+        // reference, so the rank-6 half of this seam is a no-op for it. ─────────────────────
+        let reply_object = CapObject::Reply {
+            index: reply_index,
+            generation: reply_generation,
+        };
+        let minted = self
+            .mint_capability_with_memory_ref_split(
+                receiver_cnode,
+                Capability::new(reply_object, CapRights::SEND),
+            )
+            .map_err(SyscallError::from)?;
+
+        // ── Phase E (rank 3): record the exact CapId as the record's waiter alias ──────────
+        match self.try_record_reply_waiter_cap_split(reply_index, reply_generation, minted) {
+            crate::kernel::boot::ReplyRecordSetOutcome::Set => {
+                crate::yarm_log!(
+                    "YARM_D5_SPLIT_RECORD reply_index={} reply_gen={} cap={}",
+                    reply_index,
+                    reply_generation,
+                    minted.0
+                );
+                Ok(ReplyCapMaterialization {
+                    cap: minted,
+                    reply_index,
+                    reply_generation,
+                })
+            }
+            stale => {
+                // The reply object was revoked or reused inside the mint→record window. Roll the
+                // mint all the way back so no cap is published against a record that will never
+                // reference it, then fail exactly as the broad path did.
+                self.rollback_minted_cap_split(receiver_cnode, minted, reply_object);
+                crate::yarm_log!(
+                    "YARM_D5_SPLIT_RECORD_ROLLBACK reply_index={} reply_gen={} cap={} reason={}",
+                    reply_index,
+                    reply_generation,
+                    minted.0,
+                    stale.stale_reason().unwrap_or("unknown")
+                );
+                Err(SyscallError::WrongObject)
+            }
+        }
+    }
+
+    /// U9-C — off-lock materialization of an ORDINARY (non-Reply) transferred cap, for the
+    /// kernel-register receiver class. Same three ordered steps the user-receiver form already
+    /// runs after the boundary: rank 3 consume the envelope exactly once, rank 4 (+2) resolve
+    /// the source object/rights and the receiver CNode, then the existing 186D2/186D3 seam
+    /// mints atomically and records the delegation edge.
+    ///
+    /// A shared-region envelope is refused (`pinned_object.is_some()`): it owes a rank-6 pin
+    /// release this transaction does not perform, and its class is declined pre-dequeue anyway.
+    pub(crate) fn materialize_ordinary_cap_split(
+        &self,
+        endpoint_idx: usize,
+        receiver_tid: u64,
+        raw_handle: u64,
+    ) -> Result<CapId, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::boot::{
+            CapTransferMaterializeOutcome, TransferCapDelegation, TransferCapSnapshot,
+        };
+        use crate::kernel::syscall::SyscallError;
+
+        let facts = self
+            .take_transfer_envelope_facts_split(
+                raw_handle,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(receiver_tid),
+            )
+            .ok_or(SyscallError::InvalidCapability)?;
+        if facts.pinned_object.is_some() {
+            return Err(SyscallError::WrongObject);
+        }
+        let source_capability = self
+            .resolve_capability_for_task_split(facts.source_tid, facts.source_cap)
+            .map_err(SyscallError::from)?;
+        let receiver_cnode = self
+            .task_cnode_split(receiver_tid)
+            .ok_or(SyscallError::InvalidCapability)?;
+        let snap = TransferCapSnapshot {
+            receiver_cnode,
+            object: source_capability.object,
+            rights: source_capability.rights(),
+        };
+        let delegation = TransferCapDelegation {
+            source_tid: facts.source_tid,
+            source_cap: facts.source_cap,
+            dest_tid: receiver_tid,
+        };
+        match self
+            .materialize_received_message_cap_routed_with_delegation_split(snap, Some(delegation))
+        {
+            Ok(CapTransferMaterializeOutcome::Materialized(cap)) => Ok(cap),
+            // Unreachable: a Reply source object is declined at admission, before the dequeue.
+            Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => Err(SyscallError::WrongObject),
+            Err(e) => Err(SyscallError::from(e)),
+        }
+    }
+
+    /// U9-C — the authoritative Reply-ONLY rollback, off the broad lock.
+    ///
+    /// Undoes exactly what [`Self::materialize_reply_cap_split`] published when a Phase-B/C
+    /// writeback later fails: the receiver-local Reply cap and the reply record's alias to it.
+    /// Rank order is again sequential — rank 4 (validate + revoke), then rank 3 (clear the alias).
+    ///
+    /// # Exact identity, so a reused slot or record is never touched
+    ///
+    /// The caller passes the `{reply_index, reply_generation}` it materialized against. Before
+    /// revoking anything this re-resolves the receiver-local slot and requires it to still name
+    /// **that same Reply object at that same generation**. If the slot was already reclaimed and
+    /// re-minted for something else, or the record advanced, the resolve fails or mismatches and
+    /// this returns `false` — a typed stale/already-retired refusal — without revoking a
+    /// replacement or clearing a successor's alias. `clear_reply_waiter_cap_split` is itself
+    /// generation-guarded, so the rank-3 half fails closed for the same reason.
+    ///
+    /// Repeated rollback is therefore harmless: the second call finds no matching slot and refuses.
+    ///
+    /// This function NEVER reaches the ordinary-object teardown family
+    /// (`revoke_capability_in_cnode` → delegated-descendant revocation, active-mapping unmap +
+    /// TLB shootdown, memory refcount/reclaim, notification destroy + wake). A Reply object has
+    /// none of those obligations, which is exactly why the Reply arm can be retired off-lock while
+    /// the ordinary arms cannot.
+    pub(crate) fn rollback_reply_cap_split(
+        &self,
+        receiver_tid: u64,
+        minted: CapId,
+        reply_index: usize,
+        reply_generation: u64,
+    ) -> bool {
+        let Some(receiver_cnode) = self.task_cnode_split(receiver_tid) else {
+            return false;
+        };
+        let expected = CapObject::Reply {
+            index: reply_index,
+            generation: reply_generation,
+        };
+        // Rank 4: the slot must still name the EXACT object/generation we minted.
+        match self.resolved_capability_split(receiver_cnode, minted) {
+            Some(capability) if capability.object == expected => {}
+            _ => {
+                crate::yarm_log!(
+                    "YARM_D5_SPLIT_ROLLBACK_STALE receiver_tid={} cap={} reply_index={} reply_gen={}",
+                    receiver_tid,
+                    minted.0,
+                    reply_index,
+                    reply_generation
+                );
+                return false;
+            }
+        }
+        // Rank 4: revoke the exact slot (and its mint-time memory reference, a no-op for Reply).
+        self.rollback_minted_cap_split(receiver_cnode, minted, expected);
+        // Rank 3, after rank 4 is released: drop the record's alias to the cap just revoked. The
+        // `ReplyCapRecord` itself stays live and re-deliverable, matching the broad policy.
+        self.clear_reply_waiter_cap_split(reply_index, reply_generation);
+        crate::yarm_log!(
+            "IPC_RECV_V2_ROLLBACK_OK site=reply_split tid={} reply=true",
+            receiver_tid
+        );
+        true
+    }
+
+    /// U9-C — rank-2 then rank-4, sequentially (never nested): resolve the process CNode that
+    /// owns `tid`. The broad `KernelState::task_cnode` takes both domains at once through
+    /// `with_task_then_capability`; this reads the thread-group id under rank 2, RELEASES it,
+    /// then looks the CNode up under rank 4.
+    pub(crate) fn task_cnode_split(
+        &self,
+        tid: u64,
+    ) -> Option<crate::kernel::capabilities::CNodeId> {
+        let pid = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.thread_group_id.0)
+        })?;
+        self.with_capability_state_split_mut(|capability| {
+            capability
+                .process_cnodes
+                .iter()
+                .flatten()
+                .find(|record| record.pid == pid)
+                .map(|record| record.cnode)
+        })
+    }
+
+    /// U9-C — rank-4 capability resolution for an exact task, the split twin of
+    /// `KernelState::resolve_capability_for_task`. Composes the two seams above in
+    /// ascending order.
+    pub(crate) fn resolve_capability_for_task_split(
+        &self,
+        tid: u64,
+        cap: CapId,
+    ) -> Result<crate::kernel::capabilities::Capability, KernelError> {
+        let cnode = self.task_cnode_split(tid).ok_or(KernelError::TaskMissing)?;
+        self.resolved_capability_split(cnode, cap)
+            .ok_or(KernelError::InvalidCapability)
+    }
+
+    /// U9-C — rank-3 liveness of an exact Reply object. This is the `Reply` arm of
+    /// `KernelState::capability_object_live`, narrowed to the one class the reply-cap
+    /// transaction needs, so no wider object-store read is introduced.
+    pub(crate) fn reply_object_live_split(&self, index: usize, generation: u64) -> bool {
+        if index >= crate::kernel::boot::MAX_REPLY_CAPS {
+            return false;
+        }
+        self.with_ipc_split_mut(|ipc| ipc.reply_cap_generations[index] == generation)
+    }
+
+    /// U9-C — rank-3 consume of a transfer envelope, returning the FACTS the caller needs
+    /// (`source_object`, `source_tid`, `source_cap`) instead of only the pin obligation.
+    ///
+    /// This is the same single-consume transition the broad `take_transfer_envelope` performs
+    /// — generation-guarded, endpoint-matched, receiver-bound-checked, `TransferState::Released`
+    /// exactly once — with one deliberate difference: a shared-region envelope's rank-6 pin
+    /// release is REPORTED, not performed, so rank 3 and rank 6 stay strictly sequential. The
+    /// reply-cap and ordinary-cap classes this serves never carry a shared region, so
+    /// `pinned_object` is always `None` for them; a `Some` means the caller was handed a class
+    /// it must not service and must settle through the existing owner.
+    pub(crate) fn take_transfer_envelope_facts_split(
+        &self,
+        handle: u64,
+        endpoint_idx: usize,
+        receiver_tid: crate::kernel::ipc::ThreadId,
+    ) -> Option<TakenTransferEnvelopeFacts> {
+        use crate::kernel::boot::{MAX_TRANSFER_ENVELOPES, TransferState};
+        let idx = usize::try_from(handle & 0xFFFF).ok()?;
+        if idx >= MAX_TRANSFER_ENVELOPES {
+            return None;
+        }
+        let generation = handle >> 16;
+        if generation == 0 {
+            return None;
+        }
+        self.with_ipc_split_mut(|ipc| {
+            if ipc.transfer_envelope_generations[idx] != generation {
+                return None;
+            }
+            let envelope = ipc.transfer_envelopes[idx]?;
+            let endpoint_matches = matches!(
+                envelope.endpoint,
+                CapObject::Endpoint { index, .. } if index == endpoint_idx);
+            if !endpoint_matches {
+                return None;
+            }
+            if let Some(bound_receiver) = envelope.receiver_tid
+                && bound_receiver != receiver_tid
+            {
+                return None;
+            }
+            let envelope = envelope.transition(TransferState::Released)?;
+            ipc.telemetry.transfer_records_materialized = ipc
+                .telemetry
+                .transfer_records_materialized
+                .saturating_add(1);
+            ipc.transfer_envelopes[idx] = None;
+            Some(TakenTransferEnvelopeFacts {
+                source_object: envelope.source_object,
+                source_tid: envelope.source_tid.0,
+                source_cap: envelope.source_cap,
+                pinned_object: envelope
+                    .shared_region
+                    .is_some()
+                    .then_some(envelope.source_object),
+            })
+        })
+    }
+
+    /// U9-C — rank-3 telemetry bump, the split twin of
+    /// `KernelState::note_endpoint_only_queued_recv_split`.
+    pub(crate) fn note_endpoint_only_queued_recv_split_seam(&self) {
+        self.with_ipc_split_mut(|ipc| {
+            ipc.telemetry.queued_recvs = ipc.telemetry.queued_recvs.saturating_add(1);
+        });
+    }
+
     /// Stage 186A: capability/cnode/object-store (rank 4) split-mut seam.
     ///
     /// Completes the per-domain split-mut seam set — ranks 1/2/3/5/6 predate this
@@ -4138,22 +4995,13 @@ impl SharedKernel {
         // user-ASID receiver the closure returns a by-value PendingUserCopy
         // snapshot instead of copying; the copy runs AFTER this closure
         // returns, i.e. after the broad borrow is dead (Phase B, 186E seam).
-        let phase_a = match self.with_cpu(cpu, |state| {
-            crate::kernel::syscall::try_split_recv_queued_plain_with_snapshot_locked(
-                state, frame, &snapshot,
-            )
-        }) {
-            Ok(phase_a) => phase_a,
-            Err(_) => {
-                // current_cpu bind failed (e.g. CPU offline) — fall back to the
-                // unchanged global-lock path for the canonical handling.
-                crate::yarm_log!(
-                    "YARM_SPLIT_RECV_PROBE step=bind_cpu result=err cpu={}",
-                    cpu.0
-                );
-                return None;
-            }
-        };
+        // U9-C — Phase A runs OFF the broad lock. The former `with_cpu(cpu, …)` existed for two
+        // reasons, and both are gone: it supplied the `&mut KernelState` every step now reaches
+        // through its own ordered split seam, and it bound `current_cpu` so the ambient
+        // `current_task_has_user_asid` classified the receiver correctly (the Stage 160 parity
+        // fix). The receiver class is now read from `snapshot.requester_tid` — the authoritative
+        // TID resolved above — so there is no ambient reader left to bind a CPU for.
+        let phase_a = self.recv_queued_split_phase_a_split(cpu, frame, &snapshot);
         let result = match phase_a {
             crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback => None,
             crate::kernel::syscall::RecvQueuedSplitPhaseA::Completed(r) => Some(r),
@@ -4238,13 +5086,34 @@ impl SharedKernel {
         // inside this closure.
         let rollback_cap = |shared: &Self, frame: &mut TrapFrame| {
             if let Some(cap_id) = pending.materialized_cap {
-                let _ = shared.with_cpu(cpu, |kernel| {
-                    kernel.rollback_materialized_recv_cap(
+                // U9-C — REPLY caps roll back through the exact ordered transaction, off the
+                // broad lock: rank 4 validate-the-same-object-and-generation + revoke, then
+                // rank 3 clear that record's alias. A Reply object owes none of the ordinary
+                // teardown obligations, which is why this arm can be retired while the
+                // ordinary ones cannot.
+                //
+                // Every OTHER object class keeps the unchanged broad
+                // `rollback_materialized_recv_cap`, with its full effects intact: delegated
+                // descendant revocation, active-transfer-mapping unmap + TLB shootdown,
+                // memory refcount/reclaim, and notification destroy + wake. Nothing is
+                // narrowed, filtered or skipped here — that cohort remains D3-fenced and
+                // remains counted in the census.
+                if let Some((reply_index, reply_generation)) = pending.reply_record {
+                    let _ = shared.rollback_reply_cap_split(
                         pending.receiver_tid,
                         crate::kernel::capabilities::CapId(cap_id),
-                        pending.is_reply_cap,
+                        reply_index,
+                        reply_generation,
                     );
-                });
+                } else {
+                    let _ = shared.with_cpu(cpu, |kernel| {
+                        kernel.rollback_materialized_recv_cap(
+                            pending.receiver_tid,
+                            crate::kernel::capabilities::CapId(cap_id),
+                            pending.is_reply_cap,
+                        );
+                    });
+                }
                 crate::kernel::syscall::recv_boundary_clear_transfer_cap_ret(frame);
                 true
             } else {
@@ -4556,6 +5425,8 @@ impl SharedKernel {
 
         // Step 4 — 186E user copy + §58 completion, shared with the plain path.
         let user_copy = crate::kernel::recv_core::RecvBoundaryUserCopySnapshot {
+            // Ordinary object cap: not a Reply, so no reply record and no split reply rollback.
+            reply_record: None,
             asid: pending.asid,
             receiver_tid: pending.receiver_tid,
             msg: pending.msg,

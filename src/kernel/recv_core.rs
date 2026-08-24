@@ -665,98 +665,6 @@ pub(crate) fn plan_recv_core(request: &RecvRequest) -> RecvPlan {
 
 // ─── Core execution ───────────────────────────────────────────────────────────
 
-/// Execute the fast kernel-plain split recv path.
-///
-/// Attempts to dequeue one plain (unflagged) message from `endpoint` under
-/// the IPC domain (`ipc_state_lock`, rank 3) and returns a [`RecvDelivery`]
-/// with the kernel-task writeback plan.  All locks are released before any
-/// frame write; the caller applies the plan.
-///
-/// # Preconditions (caller-enforced via [`plan_recv_core`])
-///
-/// - `request.payload_target == KernelRegister`
-/// - `request.meta_target == None`
-/// - No capability lock or `ipc_state_lock` held by caller.
-///
-/// # Lock order
-///
-/// Acquires and releases `ipc_state_lock` (rank 3) only.
-/// Must not be called while holding scheduler (1), task (2), or cap (4) locks.
-///
-/// # Returns
-///
-/// - [`RecvOutcome::Delivered`] — plain message dequeued; apply writeback.
-/// - [`RecvOutcome::WouldBlock`] — queue empty or another receiver waiter
-///   present; caller should block or return `WouldBlock`.
-/// - [`RecvOutcome::FallbackRequired`] — ineligible case (sender-waiter wake,
-///   cap-transfer message at head, etc.); caller must use global-lock path.
-/// - [`RecvOutcome::Error`] — domain error identical to the global-lock path.
-pub(crate) fn try_recv_core_kernel_plain(
-    kernel: &mut KernelState,
-    _request: &RecvRequest,
-    endpoint: CapObject,
-) -> RecvOutcome {
-    let endpoint_idx = match kernel.resolve_endpoint_index(endpoint) {
-        Ok(idx) => idx,
-        Err(e) => return RecvOutcome::Error(e),
-    };
-
-    // Stage 42+43: use cap-transfer–aware dequeue; cap materialization is deferred
-    // to the caller via RecvCapTransferPlan in the delivery.
-    match kernel.ipc_try_recv_queued_with_cap_transfer(endpoint_idx) {
-        IpcEndpointRecvResult::Received(msg) => {
-            kernel.note_endpoint_only_queued_recv_split();
-            let sender_tid = match usize::try_from(msg.sender_tid.0) {
-                Ok(s) => s,
-                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
-            };
-            let raw_len = msg.as_slice().len();
-            let cap_transfer = extract_cap_transfer_plan(&msg);
-            RecvOutcome::Delivered(RecvDelivery {
-                writeback: RecvWritebackPlan::KernelRegister {
-                    sender_tid,
-                    raw_len,
-                },
-                scheduler: RecvSchedulerWakePlan::None,
-                msg,
-                cap_transfer,
-            })
-        }
-
-        IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
-            // Stage 38+39: plain sender-waiter refill — deliver original message
-            // to receiver and carry deferred wake in RecvSchedulerWakePlan::WakeSender.
-            // Stage 42+43: cap_transfer populated for cap-flagged messages; the
-            // sender's refill was validated to be plain (§58).
-            kernel.note_endpoint_only_queued_recv_split();
-            let sender_tid = match usize::try_from(msg.sender_tid.0) {
-                Ok(s) => s,
-                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
-            };
-            let raw_len = msg.as_slice().len();
-            let cap_transfer = extract_cap_transfer_plan(&msg);
-            RecvOutcome::Delivered(RecvDelivery {
-                writeback: RecvWritebackPlan::KernelRegister {
-                    sender_tid,
-                    raw_len,
-                },
-                scheduler: RecvSchedulerWakePlan::WakeSender(wake_tid),
-                msg,
-                cap_transfer,
-            })
-        }
-
-        IpcEndpointRecvResult::Ineligible(reason) => match reason {
-            IpcEndpointSplitRejectReason::EmptyQueue
-            | IpcEndpointSplitRejectReason::ReceiverWaiterPresent => RecvOutcome::WouldBlock,
-            IpcEndpointSplitRejectReason::SenderWaiterPresent => {
-                RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
-            }
-            _ => RecvOutcome::WouldBlock,
-        },
-    }
-}
-
 // ─── Stage 36: user-ASID plain recv execution ────────────────────────────────
 
 /// Outcome of a user-ASID plain writeback attempt (`execute_user_asid_plain_writeback`).
@@ -796,76 +704,26 @@ pub enum RecvUserWritebackOutcome {
 ///
 /// Acquires and releases `ipc_state_lock` (rank 3) only.
 /// Must not be called while holding scheduler (1), task (2), or cap (4) locks.
+/// User-ASID plain queued-recv core. U9-C: dequeue + the shared mapping.
 pub(crate) fn try_recv_core_user_plain(
     kernel: &mut KernelState,
     request: &RecvRequest,
     endpoint: CapObject,
 ) -> RecvOutcome {
+    let _ = request;
     let endpoint_idx = match kernel.resolve_endpoint_index(endpoint) {
         Ok(idx) => idx,
         Err(e) => return RecvOutcome::Error(e),
     };
-
-    // Stage 42+43: use cap-transfer–aware dequeue; cap materialization is deferred
-    // to the caller via RecvCapTransferPlan in the delivery.
-    match kernel.ipc_try_recv_queued_with_cap_transfer(endpoint_idx) {
-        IpcEndpointRecvResult::Received(msg) => {
-            kernel.note_endpoint_only_queued_recv_split();
-            let sender_tid = match usize::try_from(msg.sender_tid.0) {
-                Ok(s) => s,
-                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
-            };
-            let (ptr, user_buf_len) = match request.payload_target {
-                RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
-                _ => unreachable!("try_recv_core_user_plain: non-UserMemory payload_target"),
-            };
-            let cap_transfer = extract_cap_transfer_plan(&msg);
-            RecvOutcome::Delivered(RecvDelivery {
-                writeback: RecvWritebackPlan::UserMemory {
-                    ptr,
-                    user_buf_len,
-                    sender_tid,
-                },
-                scheduler: RecvSchedulerWakePlan::None,
-                msg,
-                cap_transfer,
-            })
-        }
-
-        IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
-            kernel.note_endpoint_only_queued_recv_split();
-            let sender_tid = match usize::try_from(msg.sender_tid.0) {
-                Ok(s) => s,
-                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
-            };
-            let (ptr, user_buf_len) = match request.payload_target {
-                RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
-                _ => unreachable!(
-                    "try_recv_core_user_plain: ReceivedWithSenderWake: non-UserMemory payload_target"
-                ),
-            };
-            let cap_transfer = extract_cap_transfer_plan(&msg);
-            RecvOutcome::Delivered(RecvDelivery {
-                writeback: RecvWritebackPlan::UserMemory {
-                    ptr,
-                    user_buf_len,
-                    sender_tid,
-                },
-                scheduler: RecvSchedulerWakePlan::WakeSender(wake_tid),
-                msg,
-                cap_transfer,
-            })
-        }
-
-        IpcEndpointRecvResult::Ineligible(reason) => match reason {
-            IpcEndpointSplitRejectReason::EmptyQueue
-            | IpcEndpointSplitRejectReason::ReceiverWaiterPresent => RecvOutcome::WouldBlock,
-            IpcEndpointSplitRejectReason::SenderWaiterPresent => {
-                RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
-            }
-            _ => RecvOutcome::WouldBlock,
-        },
+    // Stage 42+43: cap-transfer-aware dequeue; materialization is deferred to the caller
+    // through the delivery's `RecvCapTransferPlan`.
+    let result = kernel.ipc_try_recv_queued_with_cap_transfer(endpoint_idx);
+    if queued_recv_result_delivered(&result) {
+        kernel.note_endpoint_only_queued_recv_split();
     }
+    map_queued_recv_outcome(result, |_msg, sender_tid| {
+        user_memory_plan(request, sender_tid)
+    })
 }
 
 /// Perform the user-space copy for a dequeued plain message.
@@ -926,111 +784,6 @@ pub enum RecvV2WritebackOutcome {
     /// Message consumed.  Caller should call `record_user_fault(kernel, frame,
     /// user_ptr, Write)` and return `Ok(())`.
     PayloadCopyFault { user_ptr: usize },
-}
-
-/// Execute the fast user-ASID recv-v2 plain split recv path.
-///
-/// Attempts to dequeue one plain (unflagged) message from `endpoint` under
-/// the IPC domain (`ipc_state_lock`, rank 3) and returns a [`RecvDelivery`]
-/// with a `UserMemoryV2` writeback plan containing both the meta and payload
-/// buffer pointers.  The ipc_state_lock is released before this function returns.
-/// The actual copies are performed by the caller via
-/// [`execute_user_asid_plain_v2_writeback`].
-///
-/// # Preconditions (caller-enforced via [`plan_recv_core`])
-///
-/// - `request.payload_target == UserMemory { .. }`
-/// - `request.meta_target == V2 { .. }`
-/// - `request.map_intent == None`
-/// - No capability lock or `ipc_state_lock` held by caller.
-///
-/// # Lock order
-///
-/// Acquires and releases `ipc_state_lock` (rank 3) only.
-pub(crate) fn try_recv_core_user_plain_v2(
-    kernel: &mut KernelState,
-    request: &RecvRequest,
-    endpoint: CapObject,
-) -> RecvOutcome {
-    let endpoint_idx = match kernel.resolve_endpoint_index(endpoint) {
-        Ok(idx) => idx,
-        Err(e) => return RecvOutcome::Error(e),
-    };
-
-    // Stage 42+43: use cap-transfer–aware dequeue; cap materialization is deferred
-    // to the caller via RecvCapTransferPlan in the delivery.
-    match kernel.ipc_try_recv_queued_with_cap_transfer(endpoint_idx) {
-        IpcEndpointRecvResult::Received(msg) => {
-            kernel.note_endpoint_only_queued_recv_split();
-            let sender_tid = match usize::try_from(msg.sender_tid.0) {
-                Ok(s) => s,
-                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
-            };
-            let (ptr, user_buf_len) = match request.payload_target {
-                RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
-                _ => unreachable!("try_recv_core_user_plain_v2: non-UserMemory payload_target"),
-            };
-            let (meta_ptr, meta_len) = match request.meta_target {
-                RecvMetaTarget::V2 { ptr, len } => (ptr, len),
-                _ => unreachable!("try_recv_core_user_plain_v2: non-V2 meta_target"),
-            };
-            let cap_transfer = extract_cap_transfer_plan(&msg);
-            RecvOutcome::Delivered(RecvDelivery {
-                writeback: RecvWritebackPlan::UserMemoryV2 {
-                    ptr,
-                    user_buf_len,
-                    sender_tid,
-                    meta_ptr,
-                    meta_len,
-                },
-                scheduler: RecvSchedulerWakePlan::None,
-                msg,
-                cap_transfer,
-            })
-        }
-
-        IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
-            kernel.note_endpoint_only_queued_recv_split();
-            let sender_tid = match usize::try_from(msg.sender_tid.0) {
-                Ok(s) => s,
-                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
-            };
-            let (ptr, user_buf_len) = match request.payload_target {
-                RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
-                _ => unreachable!(
-                    "try_recv_core_user_plain_v2: ReceivedWithSenderWake: non-UserMemory payload_target"
-                ),
-            };
-            let (meta_ptr, meta_len) = match request.meta_target {
-                RecvMetaTarget::V2 { ptr, len } => (ptr, len),
-                _ => unreachable!(
-                    "try_recv_core_user_plain_v2: ReceivedWithSenderWake: non-V2 meta_target"
-                ),
-            };
-            let cap_transfer = extract_cap_transfer_plan(&msg);
-            RecvOutcome::Delivered(RecvDelivery {
-                writeback: RecvWritebackPlan::UserMemoryV2 {
-                    ptr,
-                    user_buf_len,
-                    sender_tid,
-                    meta_ptr,
-                    meta_len,
-                },
-                scheduler: RecvSchedulerWakePlan::WakeSender(wake_tid),
-                msg,
-                cap_transfer,
-            })
-        }
-
-        IpcEndpointRecvResult::Ineligible(reason) => match reason {
-            IpcEndpointSplitRejectReason::EmptyQueue
-            | IpcEndpointSplitRejectReason::ReceiverWaiterPresent => RecvOutcome::WouldBlock,
-            IpcEndpointSplitRejectReason::SenderWaiterPresent => {
-                RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
-            }
-            _ => RecvOutcome::WouldBlock,
-        },
-    }
 }
 
 /// Perform the user-space copies for a dequeued recv-v2 plain message.
@@ -1149,6 +902,11 @@ pub(crate) struct RecvBoundaryUserCopySnapshot {
     pub(crate) materialized_cap: Option<u64>,
     /// Reply-cap flag for the rollback flavor (legacy §58).
     pub(crate) is_reply_cap: bool,
+    /// U9-C — when the materialized cap is a Reply cap, the EXACT reply record it was aliased
+    /// from. Present only for the reply class; `None` for plain and ordinary caps, which keep
+    /// the unchanged broad rollback. The rollback needs the record identity so a reused slot or
+    /// an advanced record is refused rather than a successor's alias cleared.
+    pub reply_record: Option<(usize, u64)>,
 }
 
 /// Stage 187B — by-value snapshot of an **ordinary** cap-transfer queued-split
@@ -1860,6 +1618,151 @@ pub mod recv_shared_v3 {
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+/// U9-C — the ONE post-dequeue mapping every queued-recv core shares.
+///
+/// The three cores below (`kernel_plain`, `user_plain`, `user_plain_v2`) differed only in the
+/// `RecvWritebackPlan` they built; the dequeue-result match, the `sender_tid` narrowing, the
+/// cap-transfer extraction and the four ineligibility mappings were copied three times. They
+/// are now written once here, with the per-core difference supplied as `plan_for`.
+///
+/// This matters beyond tidiness: `SharedKernel`'s off-lock Phase A drives the SAME mapping, so
+/// the split recv route and the broad route cannot diverge in how they classify a dequeue.
+///
+/// Telemetry is deliberately NOT bumped here — the owner does it, before mapping, exactly where
+/// the broad cores did, so the `TaskMissing` edge case keeps its original ordering.
+pub(crate) fn map_queued_recv_outcome(
+    result: IpcEndpointRecvResult,
+    plan_for: impl Fn(&Message, usize) -> RecvWritebackPlan,
+) -> RecvOutcome {
+    let build = |msg: Message, scheduler: RecvSchedulerWakePlan| -> RecvOutcome {
+        let sender_tid = match usize::try_from(msg.sender_tid.0) {
+            Ok(s) => s,
+            Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
+        };
+        let writeback = plan_for(&msg, sender_tid);
+        let cap_transfer = extract_cap_transfer_plan(&msg);
+        RecvOutcome::Delivered(RecvDelivery {
+            writeback,
+            scheduler,
+            msg,
+            cap_transfer,
+        })
+    };
+    match result {
+        IpcEndpointRecvResult::Received(msg) => build(msg, RecvSchedulerWakePlan::None),
+        IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
+            build(msg, RecvSchedulerWakePlan::WakeSender(wake_tid))
+        }
+        IpcEndpointRecvResult::Ineligible(reason) => match reason {
+            IpcEndpointSplitRejectReason::EmptyQueue
+            | IpcEndpointSplitRejectReason::ReceiverWaiterPresent => RecvOutcome::WouldBlock,
+            IpcEndpointSplitRejectReason::SenderWaiterPresent => {
+                RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
+            }
+            _ => RecvOutcome::WouldBlock,
+        },
+    }
+}
+
+/// U9-C — did the dequeue actually hand over a message? The owner bumps the queued-recv
+/// telemetry exactly for these two cases, matching the broad cores.
+pub(crate) fn queued_recv_result_delivered(result: &IpcEndpointRecvResult) -> bool {
+    matches!(
+        result,
+        IpcEndpointRecvResult::Received(_) | IpcEndpointRecvResult::ReceivedWithSenderWake(..)
+    )
+}
+
+/// Kernel-task (register writeback) queued-recv core.
+///
+/// **U9-C: production-dead, deliberately retained.** Its only production caller was the broad
+/// Phase A, which is retired; `SharedKernel`'s off-lock Phase A drives the same dequeue and the
+/// same `map_queued_recv_outcome` directly. This wrapper is kept — fenced, not deleted — because
+/// the semantics-equivalence regression tests compare the off-lock route against it, which is
+/// exactly the guarantee that would be lost by removing it. Same reason
+/// `try_split_recv_queued_plain_into_frame_locked` and `execute_user_asid_plain_v2_writeback`
+/// are retained.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn try_recv_core_kernel_plain(
+    kernel: &mut KernelState,
+    request: &RecvRequest,
+    endpoint: CapObject,
+) -> RecvOutcome {
+    let _ = request;
+    let endpoint_idx = match kernel.resolve_endpoint_index(endpoint) {
+        Ok(idx) => idx,
+        Err(e) => return RecvOutcome::Error(e),
+    };
+    let result = kernel.ipc_try_recv_queued_with_cap_transfer(endpoint_idx);
+    if queued_recv_result_delivered(&result) {
+        kernel.note_endpoint_only_queued_recv_split();
+    }
+    map_queued_recv_outcome(result, kernel_register_plan)
+}
+
+/// User-ASID recv-v2 queued-recv core. Production-dead and retained for the same reason as
+/// [`try_recv_core_kernel_plain`] above.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn try_recv_core_user_plain_v2(
+    kernel: &mut KernelState,
+    request: &RecvRequest,
+    endpoint: CapObject,
+) -> RecvOutcome {
+    let endpoint_idx = match kernel.resolve_endpoint_index(endpoint) {
+        Ok(idx) => idx,
+        Err(e) => return RecvOutcome::Error(e),
+    };
+    let result = kernel.ipc_try_recv_queued_with_cap_transfer(endpoint_idx);
+    if queued_recv_result_delivered(&result) {
+        kernel.note_endpoint_only_queued_recv_split();
+    }
+    map_queued_recv_outcome(result, |_m, tid| user_memory_v2_plan(request, tid))
+}
+
+/// U9-C — the `RecvWritebackPlan` builders, one per receiver class, shared by every owner.
+///
+/// `kernel_register_plan` and `user_memory_v2_plan` are driven by `SharedKernel`'s off-lock
+/// Phase A; `user_memory_plan` additionally by `try_recv_core_user_plain`, which `recv_shared_v3`
+/// still calls. The two broad cores that used to wrap the first and third
+/// (`try_recv_core_kernel_plain`, `try_recv_core_user_plain_v2`) died with the broad Phase A and
+/// were deleted rather than left as unreachable duplicates.
+pub(crate) fn kernel_register_plan(msg: &Message, sender_tid: usize) -> RecvWritebackPlan {
+    RecvWritebackPlan::KernelRegister {
+        sender_tid,
+        raw_len: msg.as_slice().len(),
+    }
+}
+
+pub(crate) fn user_memory_plan(request: &RecvRequest, sender_tid: usize) -> RecvWritebackPlan {
+    let (ptr, user_buf_len) = match request.payload_target {
+        RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
+        _ => unreachable!("user_memory_plan: non-UserMemory payload_target"),
+    };
+    RecvWritebackPlan::UserMemory {
+        ptr,
+        user_buf_len,
+        sender_tid,
+    }
+}
+
+pub(crate) fn user_memory_v2_plan(request: &RecvRequest, sender_tid: usize) -> RecvWritebackPlan {
+    let (ptr, user_buf_len) = match request.payload_target {
+        RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
+        _ => unreachable!("user_memory_v2_plan: non-UserMemory payload_target"),
+    };
+    let (meta_ptr, meta_len) = match request.meta_target {
+        RecvMetaTarget::V2 { ptr, len } => (ptr, len),
+        _ => unreachable!("user_memory_v2_plan: non-V2 meta_target"),
+    };
+    RecvWritebackPlan::UserMemoryV2 {
+        ptr,
+        user_buf_len,
+        sender_tid,
+        meta_ptr,
+        meta_len,
+    }
+}
 
 #[cfg(test)]
 mod tests {

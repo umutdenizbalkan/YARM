@@ -340,6 +340,21 @@ rank-4 rollback. Solving `reply_cap_ipc_rank_inversion` retires only the Phase-A
 the rollback cohort is D3-gated. See
 `doc/KERNEL_UNLOCKING.md` § U9 and `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
 
+**U9-C — DELIVERED. Census 7 → 6; `runtime.rs` 4 → 3.** The recv Phase-A broad acquisition is
+retired. Its last blocking class, reply-cap materialization, now runs as
+`materialize_reply_cap_split` — five phases each releasing its domain before the next acquires
+one (rank 3 consume → rank 3 liveness → rank 2/4 CNode → rank 4 mint → rank 3 record). The
+inversion was never the order 4-then-3; it was holding 4 while taking 3. This wires the producer
+Stage 188D built the rank-3 seams for and explicitly left unwired. Phase A itself moved to
+`SharedKernel::recv_queued_split_phase_a_split`, and its receiver classification became exact —
+read from the authoritative requester TID instead of the ambient current task, which is why no
+CPU binding is needed any more. **Live on a default x86_64 boot every recv-path marker count is
+identical to base `4e9643f`** (115 Phase-A entries / 114 fallbacks / 1 serviced, 11 transfer
+materializations, 1 reply-cap one-shot): no class changed route. **The three ordinary
+`rollback_materialized_recv_cap` acquisitions are untouched and still counted** — they remain
+D3/capability-object-teardown fenced. Six survivors: two terminal dispatchers, the D6 restore,
+and those three.
+
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
 `finalize_split_handled_syscall` broad reacquisition, already retired by Stage 199D; that
 function holds no broad acquisition today. Earlier "U8 is next" pointers are removed.
@@ -348,9 +363,9 @@ function holds no broad acquisition today. Earlier "U8 is next" pointers are rem
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **7** |
+| Production `SharedKernel::with_cpu` callsites | **6** |
 | Production broad `SharedKernel::with` callsites | **0** |
-| **Total production broad-lock acquisition sites** | **7** |
+| **Total production broad-lock acquisition sites** | **6** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **Direct NR6/NR7:** x86_64 (live) + AArch64 (structural, proof-gated) via `offlock_authoritative_dispatch_enabled()`; RISC-V not admitted. **Blocking IpcRecv / IpcSend (U4):** queue-advancing dispatch is authoritative outside the broad lock on **all three** architectures via the canonical `queue_advancing_dispatch_enabled()`. `d6_genuine_enabled()` itself remains compile-time x86_64-only — U4 widened the queue-ADVANCING question only, never the queue-neutral D6 slice. |
@@ -2233,7 +2248,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **7** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **6** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there

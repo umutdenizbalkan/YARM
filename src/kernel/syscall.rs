@@ -1584,6 +1584,14 @@ fn phase_a_snapshot_ordinary_transfer(
     ))
 }
 
+// U9-C — this is the BROAD Phase A. It no longer has a production caller: the live queued-split
+// recv runs `SharedKernel::recv_queued_split_phase_a_split`, off the broad lock, inside which
+// the reply-cap arm is served by the exact `materialize_reply_cap_split` transaction. It is
+// RETAINED — fenced, not deleted — because the semantics-equivalence regression tests compare
+// the off-lock route against it; deleting it would remove the very comparison that proves the
+// two routes agree. Same pattern as `try_split_recv_queued_plain_into_frame_locked` and
+// `execute_user_asid_plain_v2_writeback`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
@@ -1813,6 +1821,10 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                             writeback: delivery.writeback,
                             materialized_cap,
                             is_reply_cap,
+                            // The broad Phase A materializes reply caps through the legacy
+                            // router, which owns its own rollback; only U9-C's exact reply
+                            // transaction publishes a record identity for the split rollback.
+                            reply_record: None,
                         },
                     )
                 }
@@ -5275,12 +5287,41 @@ mod tests {
         let syscall = include_str!("syscall.rs");
         assert!(recv.contains("pub struct RecvCapTransferPlan"));
         assert!(recv.contains("fn extract_cap_transfer_plan"));
-        let consumers = recv.matches("extract_cap_transfer_plan(&msg)").count();
-        assert!(
-            consumers >= 6,
-            "extract_cap_transfer_plan must be consumed by both arms of all \
-             three try_recv_core_* paths (got {consumers})"
+        // U9-C re-derivation. This previously counted six literal copies of
+        // `extract_cap_transfer_plan(&msg)` — "both arms of all three try_recv_core_* paths".
+        // U9-C factored those six copies into ONE shared post-dequeue mapping
+        // (`map_queued_recv_outcome`), which the three cores and `SharedKernel`'s off-lock
+        // Phase A all drive. Counting copies would now fail for the right reason, so the guard
+        // asserts the invariant the count stood for — every queued-recv delivery is built by
+        // the canonical extractor — which the single-implementation form proves more strongly.
+        assert_eq!(
+            recv.matches("extract_cap_transfer_plan(&msg)").count(),
+            1,
+            "exactly one canonical extraction site: the shared mapping"
         );
+        assert!(
+            recv.contains("fn map_queued_recv_outcome("),
+            "the shared post-dequeue mapping must exist"
+        );
+        for core in [
+            "fn try_recv_core_kernel_plain(",
+            "fn try_recv_core_user_plain(",
+            "fn try_recv_core_user_plain_v2(",
+        ] {
+            let body = recv
+                .split(core)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{core} must exist"));
+            let body = &body[..body.find("\n}").expect("bounded body")];
+            assert!(
+                body.contains("map_queued_recv_outcome(result,"),
+                "{core} must build its delivery through the shared mapping"
+            );
+            assert!(
+                !body.contains("RecvOutcome::Delivered"),
+                "{core} must not construct a delivery of its own"
+            );
+        }
         assert!(syscall.contains("fn materialize_received_message_cap"));
         assert!(syscall.contains("fn materialize_received_transfer_cap"));
     }

@@ -53,7 +53,7 @@ This file has exactly one status page: §0.3.
 Three methods acquire it — `lock` (test-only), `with`, `with_cpu`. Full unlock = no runtime
 guard exists (canonical **204E**), sealed cross-architecture (canonical **205D**).
 
-Current census: **7** production callsites — **7** through `with_cpu` and **0** through the
+Current census: **6** production callsites — **6** through `with_cpu` and **0** through the
 broad `with(|state| …)` form — classified **7 runtime-required**, 0 test-only, 0 obsolete,
 0 boot-only. See §0.5. **There is no production broad `SharedKernel::with` callsite left
 anywhere in the tree.** U1 deleted the two obsolete acquisitions (49 → 47) and U2 relocated the
@@ -200,7 +200,7 @@ count falls 22 → **21**: complete + partial + open = 3 + 11 + 21 = 35.
 | boot-only | **0** | — |
 | test-only | **0** | none — U2 relocated all three into test-only modules the census excludes: `ipc_recv_with_deadline_split_bridge` (2 acquisitions, never a trap-seam path) and the `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1) |
 | obsolete | **0** | none — U1 deleted both (`SharedKernel::handle_trap_with_cpu`, which had no in-tree caller at all, and `SharedKernel::run_reply_timeout_completion`, which had no production caller) |
-| runtime-required | **7** | re-derived from the final tree in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a: the authoritative broad Phase-2 trap dispatch (`arch/trap_entry.rs:310`) and its RISC-V twin (`arch/riscv64/trap.rs:829`); the D3-fenced D6 controlled-proof restore (`arch/trap_entry.rs:1694`), whose body also maps kernel stacks across every live task root; and four recv/delivery-boundary sites in `runtime.rs` — the Phase-A multi-domain composite (`4093`) plus three re-entries of the same `rollback_materialized_recv_cap` capability-teardown body (`4193`, `4486`, `5278`). The whole post-lock drain class, the first-resume trampoline, the AArch64 split return, the RISC-V resume site, the identity/SMP/deadline helpers and every `arch/x86_64/smp.rs` acquisition (the last being ED-2) are retired and no longer exist. |
+| runtime-required | **6** | re-derived from the final tree in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a: the authoritative broad Phase-2 trap dispatch (`arch/trap_entry.rs:310`) and its RISC-V twin (`arch/riscv64/trap.rs:829`); the D3-fenced D6 controlled-proof restore (`arch/trap_entry.rs:1694`), whose body also maps kernel stacks across every live task root; and four recv/delivery-boundary sites in `runtime.rs` — the Phase-A multi-domain composite (`4093`) plus three re-entries of the same `rollback_materialized_recv_cap` capability-teardown body (`4193`, `4486`, `5278`). The whole post-lock drain class, the first-resume trampoline, the AArch64 split return, the RISC-V resume site, the identity/SMP/deadline helpers and every `arch/x86_64/smp.rs` acquisition (the last being ED-2) are retired and no longer exist. |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
 
 Classified total: **7** acquisition callsites (**7** `with_cpu` + **0** broad `with`), which
@@ -855,6 +855,126 @@ deleted.**
 U3 remains COMPLETE and canonical 203C remains OPEN / PARTIAL. 199C and 199E remain DELIVERED /
 CLOSED. Direct production remains **OFF**. Stage arithmetic is unchanged at **3 complete / 11
 partial / 21 open**. RPi5, futex, WA3C2 and direct-IpcCall production were untouched.
+
+---
+
+## U9-C (canonical 200B) — REPLY-CAP MATERIALIZATION BECOMES AN ORDERED TRANSACTION
+
+**CENSUS-DELTA 7 → 6. `runtime.rs` 4 → 3. Callsites deleted: 1. Rollback broad sites retained: 3.**
+
+U9-B established that the four-site cohort is **two fences**. U9-C retires the first of them: the
+recv Phase-A acquisition, `try_split_ipc_recv_queued_plain_into_frame`. The three ordinary
+`rollback_materialized_recv_cap` callers are **untouched and still counted** — they remain
+D3/capability-object-teardown fenced, exactly as U9-B recorded.
+
+### The reply-cap transaction
+
+The reply-cap arm was Phase A's last class that still needed a broad `&mut KernelState`. It now
+runs as `SharedKernel::materialize_reply_cap_split`, five phases, each RELEASING its domain
+before the next acquires one:
+
+| phase | rank | effect |
+|---|---|---|
+| A | 3 (IPC) | consume the transfer envelope exactly once; read its `source_object` |
+| B | 3 (IPC) | the named `Reply{index, generation}` is still live |
+| C | 2 then 4 | resolve the receiver's process CNode |
+| D | 4 (+6 no-op) | mint the receiver-local one-shot Reply cap |
+| E | 3 (IPC) | record that exact CapId as the reply record's waiter alias |
+
+**The inversion was never the order 4-then-3 — it was holding 4 *while* taking 3.** Phase
+separation removes it without inventing a lock-order exception.
+
+This is the production wiring **Stage 188D deliberately left open**. 188D built the rank-3 halves
+(`try_record_reply_waiter_cap_split`, `clear_reply_waiter_cap_split`), proved them by unit test,
+and said in its own module docs that "wiring a live producer there is out of Stage 188D scope".
+U9-C supplies the producer; no new seam file was created.
+
+Exactness: every phase is keyed by `{reply_index, reply_generation}` plus the receiver's exact
+CNode — never a bare TID, a bare slot, or the ambient current task. Phase E is generation-guarded
+a second time, which is what closes the mint→record window; a stale record rolls the phase-D mint
+all the way back (slot + refcount) and fails closed.
+
+`rollback_reply_cap_split` is the mirror: rank 4 re-resolves the slot and requires it to still
+name **that same Reply object at that same generation** before revoking, then rank 3 clears that
+record's alias. A reused slot or an advanced record is a typed refusal, not a wrong revoke — which
+is also what makes a repeated rollback harmless. It never reaches the ordinary teardown family.
+
+### Phase A moved off-lock — and got more exact doing it
+
+The broad closure existed for two reasons, and **both are gone**. It supplied the
+`&mut KernelState` every step now reaches through its own ordered split seam; and it bound
+`current_cpu` because Phase A derived `is_kernel_task` from `current_task_has_user_asid`, i.e.
+from the AMBIENT current task (the Stage 160 SMP parity fix — an unbound `current_cpu` could
+observe another CPU's task and misclassify the receiver). The classification now reads
+`snapshot.requester_tid`, the authoritative TID `current_tid_authoritative(cpu)` already resolved.
+**With no ambient reader left there is nothing to bind a CPU for.**
+
+Two bodies were **factored, not copied**, so the split route and the broad route cannot drift:
+the two queued dequeues moved into `*_locked` free functions over `&mut IpcSubsystem` that both
+`KernelState` and `SharedKernel` delegate to, and the three `try_recv_core_*` cores — which had
+six copies of the same post-dequeue match — now share one `map_queued_recv_outcome`.
+
+### What Phase A refuses, and when
+
+Admission classifies by **message shape only**, under the SAME rank-3 acquisition that will
+dequeue (`ipc_try_recv_queued_admitted_locked`), so a refusal consumes nothing. Declined:
+shared-region (`OPCODE_SHARED_MEM`) messages, whose receiver-side mapping obligations sit outside
+the materialize step; and non-`FLAG_REPLY_CAP` messages whose envelope resolves to a `Reply`
+object, which the broad router already failed closed. Each returns `Fallback` with the message
+still queued, so the unchanged legacy owner services it.
+
+Envelope validity is deliberately **not** an admission criterion: a stale or missing handle stays
+admitted so it surfaces the same `InvalidCapability` the broad path raised, rather than degrading
+into a silent fallback. Three long-standing tests pin exactly that.
+
+### Live: no class changed route
+
+Default x86_64 core smoke, no oracle, compared marker-for-marker against base `4e9643f`:
+
+| marker | base | U9-C |
+|---|---|---|
+| Phase-A entries / fallbacks / serviced | 115 / 114 / 1 | **115 / 114 / 1** |
+| `IPC_TRANSFER_CAP_MATERIALIZE_OK` | 11 | **11** |
+| `IPC_REPLY_CAP_ONESHOT_OK` | 1 | **1** |
+| `YARM_D1_SPLIT_MATERIALIZE` | 0 | **0** |
+
+Every count identical. The reply cap materializes through the new transaction with the same
+identity — `YARM_D5_SPLIT_RECORD reply_index=0 reply_gen=1 cap=65538`,
+`YARM_D5_SPLIT_MATERIALIZE kind=reply receiver_tid=3 local_cap=65538`,
+`IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3` — once, with zero rollbacks and zero materialize
+failures.
+
+### The ordinary cohort is untouched
+
+Only the Reply class is diverted, and it is selected by its **record identity**
+(`pending.reply_record`), not by a flag. Every other object keeps the unchanged broad
+`rollback_materialized_recv_cap` with its full effects: delegated-descendant revocation,
+active-transfer-mapping unmap + TLB shootdown, memory refcount/reclaim, notification destroy +
+wake. A focused test pins each of those effects still present in `revoke_capability_in_cnode`,
+because narrowing them later would look like progress while silently dropping real obligations.
+
+**All three broad rollback callsites remain. The census says 6, not 3.**
+
+### Re-derived guards
+
+Three pre-existing guards broke and each was re-derived onto its now-stronger contract rather
+than weakened: `stage160_split_recv_binds_current_cpu` (the binding requirement is retired
+because its CAUSE is gone — the guard now pins exact classification and no ambient read);
+`stage187a_no_seam_call_inside_with_cpu_closure` (inverted — the 186D4 aliasing window can no
+longer exist); and `stage101_d1_audit_recv_core_cap_transfer_plumbing_present` (counted six
+copies of the extractor; now pins one canonical extraction plus every core routing through it).
+
+### Status
+
+**U9-C DELIVERED. Census 6 / 0 / 6.** The six survivors: the shared x86_64/AArch64 terminal
+dispatcher, the RISC-V terminal dispatcher, the D3-fenced D6 restore, and the three ordinary
+rollback acquisitions. U3 remains COMPLETE; canonical 203C remains OPEN / PARTIAL; 199C and 199E
+remain DELIVERED / CLOSED; direct production remains **OFF**. Canonical stage arithmetic is
+unchanged at 3 complete / 11 partial / 21 open — no stage row moved.
+
+**Next:** the ordinary rollback cohort needs the D3 lock-free `await_tlb_shootdown_ack` design
+and must not be attempted before it. The terminal dispatchers still serve 19 of ~24 syscall
+classes plus every IRQ and page fault.
 
 **Two fences remain, not one** (see the U9-B correction above). `reply_cap_ipc_rank_inversion`
 retires the Phase-A site (7 -> 6). The three rollback sites need an off-lock
