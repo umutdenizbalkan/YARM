@@ -122,7 +122,15 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
 /// Stage 117: arch-specific post-switch restore, called after `switch_frames`
 /// in the incoming task's context under a re-acquired global lock. Restores
 /// the incoming task's user-mode register state to its trap frame.
+///
+/// U9 (canonical 203C): the stash drain now reaches the x86_64 and AArch64 arms through
+/// [`post_switch_restore_arch_thread_state_split`] instead, so only the RISC-V arm still has a
+/// caller. All three arms stay compiled rather than being cfg'd down to one: this is the
+/// cross-arch FOUNDATION the drain is defined against, and the two split twins are proven against
+/// these bodies, outcome for outcome. Losing an arm would leave the twin with nothing to be
+/// equivalent to.
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 pub(crate) fn post_switch_restore_arch_thread_state(
     kernel: &mut KernelState,
     cpu: CpuId,
@@ -132,6 +140,7 @@ pub(crate) fn post_switch_restore_arch_thread_state(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 pub(crate) fn post_switch_restore_arch_thread_state(
     kernel: &mut KernelState,
     cpu: CpuId,
@@ -156,6 +165,177 @@ pub(crate) fn post_switch_restore_arch_thread_state(
     // activation (with `sfence.vma`) is performed by the trap bridge today; a
     // future genuine cross-task switch drain would pair that with this restore.
     super::riscv64::trap::restore_arch_thread_state_post_switch(kernel, cpu, frame)
+}
+
+/// U9 (canonical 203C) — the broad-lock-free twin of
+/// [`post_switch_restore_arch_thread_state`], for the Stage 117 switch-plan stash drain.
+///
+/// # Why this transaction is safe to take apart
+///
+/// The drain it serves is entered only when `maybe_switch_kernel_context` stashed a plan, and that
+/// gate (`exec_state.rs`) requires `online_cpu_count() <= 1`. Interrupts are additionally disabled
+/// for the whole drain — hardware disabled them at trap entry and `SpinLock<KernelState>` neither
+/// saves nor restores IRQ state. So between the rank-1 and rank-2 phases below there is no other
+/// CPU and no interrupt that could observe or mutate the state in flight; releasing rank 1 before
+/// taking rank 2 is a lock-ordering improvement, not a new window.
+///
+/// # Shape
+///
+/// 1. **rank 1** — [`crate::runtime::SharedKernel::post_switch_restore_admit_split`] reproduces
+///    both halves of `with_cpu`: the online-CPU admission and the `current_cpu` bind the retired
+///    body's `KernelState::current_tid()` depended on, then reads that TID under the same guard.
+/// 2. **rank 1 is fully released** before any task-domain work.
+/// 3. **rank 2**, ONE acquisition — the whole restore payload, TAKEN coherently.
+/// 4. **rank 2 is fully released** before the frame, MSR, page-table and CR3 work.
+/// 5. The arch application runs with NO lock held, through the SAME single frame writer the
+///    in-lock restore uses.
+///
+/// The admission `Err` is mapped exactly as the retired callsite mapped it
+/// (`TrapHandleError::Syscall(err.into())`), so a refused CPU still refuses the drain and the
+/// restore never runs — as before, nothing was mutated when it does.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn post_switch_restore_arch_thread_state_split(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    // (1) rank 1. This happens unconditionally, exactly as `with_cpu` bound and validated the CPU
+    // before the restore hook ran — including when the hook then returned early.
+    let tid = shared
+        .post_switch_restore_admit_split(cpu)
+        .map_err(|err| TrapHandleError::Syscall(err.into()))?;
+    // The retired hook's first statement. An absent frame is NOT an error.
+    let Some(frame) = frame else {
+        return Ok(());
+    };
+    // `apply_current_thread_to_frame` raised `TaskMissing` here, which `restore_arch_thread_state`
+    // swallowed into `Ok(())` as "no user task scheduled yet (normal during early boot)".
+    let Some(tid) = tid else {
+        return Ok(());
+    };
+    // (3) rank 2, one acquisition. `None` is the same early-boot `TaskMissing` swallow: the TCB is
+    // gone, so there is no context to apply and nothing was taken.
+    let Some(snapshot) = shared.post_switch_restore_snapshot_split(tid) else {
+        return Ok(());
+    };
+    // (5) No lock held: frame, FS base, per-CPU TLS record, and the pre-IRET CR3 invariant with its
+    // rare repair path — `x86_apply_owner_revalidation_restore` is the established off-lock tail of
+    // `restore_arch_thread_state`, reused rather than re-implemented.
+    super::x86_64::trap::x86_apply_owner_revalidation_restore(shared, cpu, tid, snapshot, frame);
+    Ok(())
+}
+
+/// U9 (canonical 203C) — the AArch64 broad-lock-free twin of
+/// [`post_switch_restore_arch_thread_state`]. See the x86_64 twin above for the safety argument
+/// and the phase shape; only the payload differs.
+///
+/// `syscall_return` is `false`, the value `post_switch_restore_arch_thread_state` always passed —
+/// the incoming task is resuming from a context switch, not returning from a direct syscall.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn post_switch_restore_arch_thread_state_split(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    use crate::runtime::PostSwitchRestoreOutcome;
+
+    // (1) rank 1, unconditional — see the x86_64 twin.
+    let tid = shared
+        .post_switch_restore_admit_split(cpu)
+        .map_err(|err| TrapHandleError::Syscall(err.into()))?;
+    // The retired body checked the frame BEFORE `current_tid()`, so an absent frame emitted neither
+    // idle marker. That order is preserved.
+    let Some(frame) = frame else {
+        return Ok(());
+    };
+    let Some(tid) = tid else {
+        crate::yarm_log!("SCHED_NO_RUNNABLE_USER_TASK");
+        crate::yarm_log!("SCHED_ENTER_IDLE");
+        return Ok(());
+    };
+    // (3) rank 2, one acquisition.
+    match shared.post_switch_restore_facts_split(tid) {
+        PostSwitchRestoreOutcome::Idle => {
+            crate::yarm_log!("SCHED_ENTER_IDLE");
+            Ok(())
+        }
+        PostSwitchRestoreOutcome::Missing => Err(TrapHandleError::Syscall(
+            crate::kernel::syscall::SyscallError::from(
+                crate::kernel::boot::KernelError::TaskMissing,
+            ),
+        )),
+        // (5) No lock held: the SAME single frame writer the in-lock restore uses.
+        PostSwitchRestoreOutcome::Facts(facts) => {
+            super::aarch64::trap::apply_restored_thread_state(frame, cpu, &facts, false);
+            Ok(())
+        }
+    }
+}
+
+/// U9 (canonical 203C) — the ONE broad acquisition still required at the Stage 117 switch-plan
+/// stash drain, and the two disjoint consumers that still need it.
+///
+/// Neither is an ordinary production switch. On x86_64 and AArch64 a normal switch now returns
+/// through [`post_switch_restore_arch_thread_state_split`] without entering this at all.
+///
+/// * **The D6 cleanup overlay** (`is_proof_done`), reached under `yarm.d6_switch_proof=1` or
+///   `yarm.d6_switch_a=1`. It is NOT obsolete diagnostics:
+///   `d6_ensure_post_cleanup_task_stacks_mapped` is a functional repair — it shares every live
+///   task's kernel-stack pages into the active root and into every task root, without which a
+///   post-cleanup trap faults on a supervisor stack write (Stage 165D/165F/165G) — and
+///   `D6_SWITCH_A_DONE` is emitted only here, for the D6-SWITCH-A *production* unlocked-switch
+///   milestone, whose knob runs this path with the controlled-proof knob OFF.
+///   `scripts/qemu-x86_64-core-smoke.sh` hard-asserts both.
+/// * **The RISC-V restore**, kept verbatim because the drain is statically unreachable there (see
+///   the callsite).
+///
+/// It cannot be split, and that is a D3 question rather than a missing-effort one: the cleanup
+/// allocates backing frames (`alloc_user_data_frame`, rank 6) and maps them across address spaces,
+/// so a split form would have to add `with_memory_split_mut` — fenced by `AI_AGENT_RULES` §14.4
+/// until the lock-free `await_tlb_shootdown_ack` design and its multi-CPU smoke land. This is the
+/// same conclusion U3 recorded when it excluded this site.
+fn post_switch_restore_broad_tail(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    frame: Option<&mut TrapFrame>,
+    is_proof_done: bool,
+    d6_switch_a_mode: bool,
+) -> Result<(), TrapHandleError> {
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = frame;
+    shared
+        .with_cpu(cpu, |kernel| {
+            let _ = &kernel;
+            // Only the statically-unreachable RISC-V arm still restores in-lock.
+            #[cfg(target_arch = "riscv64")]
+            let result = post_switch_restore_arch_thread_state(kernel, cpu, frame);
+            #[cfg(not(target_arch = "riscv64"))]
+            let result: Result<(), TrapHandleError> = Ok(());
+            if is_proof_done {
+                #[cfg(target_arch = "x86_64")]
+                kernel.d6_emit_proof_cleanup_arch_markers();
+                // Stage 133: verify ASID 1 maps the fault page before emitting DONE.
+                #[cfg(target_arch = "x86_64")]
+                kernel.d6_check_asid1_stack_page_mapped();
+                // Stage 165D: the proof restored CR3 to asid 1, but normal
+                // scheduling/trap/idle can land a post-cleanup trap on
+                // another task's kernel stack (observed: tid=3) while asid 1
+                // is active — and per-task kernel stacks are mapped only in
+                // their own root.  Share every live task's kernel stack
+                // pages into the active root and all task roots so no
+                // post-cleanup trap faults on a supervisor stack write.
+                #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+                if let Err(err) = kernel.d6_ensure_post_cleanup_task_stacks_mapped() {
+                    crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_FAILED err={:?}", err);
+                }
+                crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE");
+                if d6_switch_a_mode {
+                    crate::yarm_log!("D6_SWITCH_A_DONE");
+                }
+            }
+            result
+        })
+        .map_err(|err| TrapHandleError::Syscall(err.into()))?
 }
 
 pub fn handle_trap_entry_shared(
@@ -1688,37 +1868,38 @@ pub fn handle_trap_entry_shared(
                 } else {
                     false
                 };
-            // Re-acquire the global lock to restore the incoming task's arch thread
-            // state (populate its trap frame with its user-mode register context).
-            shared
-                .with_cpu(cpu, |kernel| {
-                    let result =
-                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut());
-                    if is_proof_done {
-                        #[cfg(target_arch = "x86_64")]
-                        kernel.d6_emit_proof_cleanup_arch_markers();
-                        // Stage 133: verify ASID 1 maps the fault page before emitting DONE.
-                        #[cfg(target_arch = "x86_64")]
-                        kernel.d6_check_asid1_stack_page_mapped();
-                        // Stage 165D: the proof restored CR3 to asid 1, but normal
-                        // scheduling/trap/idle can land a post-cleanup trap on
-                        // another task's kernel stack (observed: tid=3) while asid 1
-                        // is active — and per-task kernel stacks are mapped only in
-                        // their own root.  Share every live task's kernel stack
-                        // pages into the active root and all task roots so no
-                        // post-cleanup trap faults on a supervisor stack write.
-                        #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
-                        if let Err(err) = kernel.d6_ensure_post_cleanup_task_stacks_mapped() {
-                            crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_FAILED err={:?}", err);
-                        }
-                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE");
-                        if d6_switch_a_mode {
-                            crate::yarm_log!("D6_SWITCH_A_DONE");
-                        }
-                    }
-                    result
-                })
-                .map_err(|err| TrapHandleError::Syscall(err.into()))??;
+            // U9 (canonical 203C): restore the incoming task's arch thread state (populate its
+            // trap frame with its user-mode register context) with NO broad lock re-acquired.
+            //
+            // Reached on x86_64 and AArch64 — the only architectures whose stash gate can
+            // populate `DISPATCH_SWITCH_PLAN_STASH` at all, since that gate (`exec_state.rs`)
+            // opens with `!cfg!(target_arch = "riscv64") && …`. This drain is therefore
+            // statically unreachable on RISC-V, which keeps its verbatim in-lock restore inside
+            // the tail below rather than an unproven split.
+            #[cfg(not(target_arch = "riscv64"))]
+            let restore_result =
+                post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut());
+            #[cfg(target_arch = "riscv64")]
+            let restore_result: Result<(), TrapHandleError> = Ok(());
+
+            // The D6 cleanup overlay and the RISC-V restore are the ONLY remaining reasons this
+            // site touches the broad lock. An ordinary production switch on x86_64 or AArch64
+            // now skips this entirely — `is_proof_done` is false and the `cfg!` is a
+            // compile-time false — so it re-acquires nothing.
+            //
+            // Order is preserved: the restore ran first and its result was propagated last, so
+            // the overlay still observes exactly the state it did before, and a restore error
+            // still surfaces only after the cleanup has run.
+            if is_proof_done || cfg!(target_arch = "riscv64") {
+                post_switch_restore_broad_tail(
+                    shared,
+                    cpu,
+                    frame.as_deref_mut(),
+                    is_proof_done,
+                    d6_switch_a_mode,
+                )?;
+            }
+            restore_result?;
             // Stage 132: arm the first post-cleanup trap diagnostic.
             if is_proof_done {
                 let cpu_idx_set = cpu.0 as usize;

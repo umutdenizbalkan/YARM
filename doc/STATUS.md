@@ -281,8 +281,9 @@ stays 0, runtime-required/total 8 → 7.**
   denied wake-only fallthrough, saved-resume branch and idle tail are all unchanged.
 * **`src/arch/x86_64/smp.rs` now holds ZERO broad acquisitions of any form.** The seven that
   remain are: two authoritative broad trap dispatches (`arch/trap_entry.rs:310`,
-  `arch/riscv64/trap.rs:829`), one D3-fenced D6 controlled-proof restore
-  (`arch/trap_entry.rs:1694`), one recv Phase-A multi-domain composite (`runtime.rs:4093`), and
+  `arch/riscv64/trap.rs:829`), one D3-fenced D6 proof-cleanup tail
+  (`arch/trap_entry.rs`, `post_switch_restore_broad_tail`; U9/203C corrected the former
+  "D6 controlled-proof restore" label and moved the production restore off the broad lock), one recv Phase-A multi-domain composite (`runtime.rs:4093`), and
   three capability-teardown rollback sites (`runtime.rs:4193`, `4486`, `5278`). **No post-lock
   drain reacquisition remains anywhere in the tree.** Full per-site inventory in
   `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
@@ -295,7 +296,7 @@ total is **7** and the drain class is fully retired (`doc/KERNEL_UNLOCK_AUDIT.md
 seven survivors; none is a drain). **Canonical 203C nevertheless remains OPEN / PARTIAL** — its
 own exit, the rank-1/rank-2 seams being authoritative rather than compatibility helpers, is still
 false while scheduler operations execute inside the two authoritative trap dispatches and the
-D3-fenced controlled-proof restore remains. A completed directive is not a completed stage.
+D3-fenced D6 proof-cleanup tail remains. A completed directive is not a completed stage.
 
 **199C is DELIVERED / CLOSED (U6-FRAME). 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN
 (partially production-wired).** Directive U8 is already source-complete. Canonical stage

@@ -36726,15 +36726,62 @@ mod stage130_d6_proof_cleanup {
         &THREAD_STATE_SRC[start..end]
     }
 
+    /// U9 (canonical 203C): the cleanup block still OPENS at `CLEANUP_BEGIN`, but it now CLOSES
+    /// at the call to `post_switch_restore_broad_tail` — the named function that owns the one
+    /// broad acquisition left at this site and that emits `CLEANUP_DONE`.
+    ///
+    /// Bounding it by the `CLEANUP_DONE` marker no longer works, and must not be repaired by
+    /// widening the window: the tail is DEFINED earlier in the file than the drain that calls it,
+    /// so a marker search from `CLEANUP_BEGIN` would run off the end rather than find it. The
+    /// window this returns is exactly the `is_proof_done` computation — the stash- and
+    /// state-quiescence checks these tests own — up to the acquisition that finishes the cleanup,
+    /// which is strictly tighter than the old span.
     fn cleanup_block_source() -> &'static str {
         let start = TRAP_ENTRY_SRC
             .find("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN")
             .expect("Stage 130 CLEANUP_BEGIN marker");
         let end = TRAP_ENTRY_SRC[start..]
-            .find("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE")
-            .map(|offset| start + offset + "D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE".len())
-            .expect("Stage 130 CLEANUP_DONE marker after CLEANUP_BEGIN");
+            .find("post_switch_restore_broad_tail(")
+            .map(|offset| start + offset)
+            .expect("the broad tail call that finishes the Stage 130 cleanup");
         &TRAP_ENTRY_SRC[start..end]
+    }
+
+    /// U9 (canonical 203C): `CLEANUP_DONE` and the three arch-gated cleanup steps moved into
+    /// `post_switch_restore_broad_tail` together, and are still gated on `is_proof_done`.
+    /// Splitting them apart — emitting the marker outside the acquisition that performs the
+    /// repair — would let the smoke read DONE for a cleanup that never ran.
+    #[test]
+    fn stage130_cleanup_done_is_emitted_by_the_retained_broad_tail() {
+        let tail_start = TRAP_ENTRY_SRC
+            .find("fn post_switch_restore_broad_tail(")
+            .expect("the retained broad tail is a named function");
+        let tail_end = TRAP_ENTRY_SRC[tail_start..]
+            .find("\npub fn handle_trap_entry_shared(")
+            .map(|offset| tail_start + offset)
+            .expect("the tail ends before the shared trap entry");
+        let tail = &TRAP_ENTRY_SRC[tail_start..tail_end];
+        assert!(
+            tail.contains(".with_cpu(cpu, |kernel| {"),
+            "the tail owns the acquisition"
+        );
+        assert!(
+            tail.contains("if is_proof_done {"),
+            "the cleanup is still gated on the proof having completed"
+        );
+        for step in [
+            "d6_emit_proof_cleanup_arch_markers",
+            "d6_check_asid1_stack_page_mapped",
+            "d6_ensure_post_cleanup_task_stacks_mapped",
+            "D6_POST_CLEANUP_STACK_MAP_FAILED",
+            "D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE",
+            "D6_SWITCH_A_DONE",
+        ] {
+            assert!(
+                tail.contains(step),
+                "`{step}` must stay inside the acquisition that performs the cleanup"
+            );
+        }
     }
 
     // 1. Trampoline switch-back passes ctx.outgoing_stack_top — not None — so TSS
@@ -53868,11 +53915,21 @@ mod stage168b_d2_recv_genuine_completion {
     // switch mechanism.
     #[test]
     fn stage168b_reuses_hardened_switch_restore() {
+        // U9 (canonical 203C): the hardened restore is still the ONE the drain reuses — it is now
+        // reached off the broad lock, through the split twin, so the property this case owns ("no
+        // second switch mechanism") is unchanged and the reuse is stronger.
         assert!(
             TRAP_ENTRY_SRC.contains(
-                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
+                "post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut())"
             ),
             "the recv drain must reuse the hardened post_switch restore"
+        );
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("fn post_switch_restore_arch_thread_state_split(")
+                .count(),
+            2,
+            "exactly one split twin per architecture that can reach the drain (x86_64, aarch64)"
         );
         // No new switch_frames call is introduced in the recv drain.
         let drain_start = TRAP_ENTRY_SRC
@@ -99775,10 +99832,17 @@ mod stage200d0c1_aarch64_exit_prep {
     /// restore plus a broad cleanup would leave a broad drain behind at census delta 0.
     #[test]
     fn u3_d6_proof_acquisition_is_excluded_and_unchanged() {
+        // U9 (canonical 203C): the exclusion still holds, and for exactly the reason recorded
+        // above — but it is now the ONLY thing left in the acquisition. The production restore
+        // moved out to the split twin, so an ordinary switch on x86_64 or AArch64 no longer enters
+        // this at all; the cleanup is what keeps the site broad, unchanged and D3-fenced.
         assert!(
-            TRAP_ENTRY_SRC.contains(
-                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
-            )
+            TRAP_ENTRY_SRC.contains("fn post_switch_restore_broad_tail("),
+            "the D6 cleanup keeps its own named broad acquisition"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("if is_proof_done || cfg!(target_arch = \"riscv64\") {"),
+            "and it is entered only by the cleanup, or by the unreachable RISC-V restore"
         );
         for retained in [
             "d6_emit_proof_cleanup_arch_markers",
@@ -104904,7 +104968,7 @@ mod stage200d2b1d5b_restore_contract {
         // captures the payload, so the two can no longer disagree. `Replacement` is reachable
         // only through that `Some`, which is a stronger gate than the old ordered pair.
         let check = body
-            .find("let snapshot = self.owner_revalidation_snapshot_split(selection);")
+            .find("let snapshot = self.owner_revalidation_snapshot_split(next);")
             .expect("the seam must establish restorability");
         let ok = body
             .find("return OwnerRevalidation::Replacement(next);")
@@ -122129,17 +122193,23 @@ mod u3_d6_first_resume_bind_transaction {
              replacement-restore and FutexWait no-incoming idle retirements. The two that \
              remain are the canonical broad Phase-2 trap dispatch and this D6 proof restore"
         );
-        // The retained D6 restore/cleanup acquisition passes a REAL frame, so unlike the
-        // retired first-resume call it genuinely restores context and is NOT a no-op.
+        // U9 (canonical 203C): the second acquisition is no longer a restore at all. The
+        // production restore left it for the split twin; what remains is the D6 cleanup, whose own
+        // D3 fence is why it stays broad. It is still NOT a no-op — it performs the cross-root
+        // stack repair — but it no longer needs the frame.
         assert!(
-            code.contains(
-                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
-            ),
-            "the real D6 restore/cleanup acquisition passes a live frame and stays broad"
+            code.contains("fn post_switch_restore_broad_tail("),
+            "the retained acquisition is the named D6 cleanup tail"
         );
         assert!(
             code.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE"),
             "its cleanup path is untouched"
+        );
+        assert!(
+            code.contains(
+                "post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut())"
+            ),
+            "and the production restore that left it passes the live frame off-lock"
         );
     }
 }
@@ -136731,5 +136801,721 @@ mod u9f_split_capability_revocation {
             !DM.contains("CapObject::Notification"),
             "…nor name the object class at a mint"
         );
+    }
+}
+
+/// U9 (canonical 203C) — the PRODUCTION post-switch architectural-state restore, off the broad
+/// lock.
+///
+/// The Stage 117 switch-plan stash drain used to re-acquire `with_cpu` for two unrelated things:
+/// the ordinary production restore of the incoming task's user context, and — only when a D6 proof
+/// or D6-SWITCH-A run had just completed — the proof cleanup overlay. This module proves the first
+/// of those now runs with every lock released, and that the second is the ONLY reason the site is
+/// still broad.
+///
+/// Wherever the fact is observable, the proof is EQUIVALENCE against the retired body run on a
+/// twin kernel state, not a restatement of the new code.
+///
+/// The census is deliberately unchanged (6 / 0 / 3). The cleanup cannot follow the restore
+/// off-lock: `d6_ensure_post_cleanup_task_stacks_mapped` allocates backing frames
+/// (`alloc_user_data_frame`, rank 6) and maps them across address spaces, so a split form would
+/// have to introduce `with_memory_split_mut` — fenced by `AI_AGENT_RULES` §14.4 until the
+/// lock-free `await_tlb_shootdown_ack` design and its multi-CPU smoke land.
+#[cfg(test)]
+mod u9_production_post_switch_restore {
+    use crate::kernel::boot::{Bootstrap, KernelState};
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+    const EXEC_STATE: &str = include_str!("exec_state.rs");
+
+    const OFFLINE: u8 = 5;
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of one function, bounded by BRACE MATCHING rather than by the next doc comment.
+    /// The doc-comment bound is what the older guards in this file use, and it is wrong for both
+    /// shapes here: an `impl`-level method's next doc comment is indented, and
+    /// `post_switch_restore_broad_tail` is followed by an item with no doc comment at all. In both
+    /// cases the window would silently run on into unrelated source and read acquisitions that are
+    /// not the ones under test.
+    fn fn_body(src: &str, signature: &str) -> alloc::string::String {
+        let after = src
+            .split(signature)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{signature}` must exist"));
+        // `signature` stops before the body's `{`, so start at the first one that follows.
+        let open = after.find('{').expect("a function body");
+        let mut depth = 0usize;
+        let mut end = after.len();
+        for (idx, ch) in after.char_indices().skip(open) {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = idx + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        code_of(&after[open..end])
+    }
+
+    /// A CPU-`cpu` current task with a real user context and an ARMED TLS-restore request — the
+    /// shape the drain restores.
+    fn dispatched_task(state: &mut KernelState, tid: u64, cpu: CpuId, pc: u64, tls: usize) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("register");
+        let ctx = crate::kernel::task::UserRegisterContext {
+            instruction_ptr: crate::kernel::vm::VirtAddr(pc),
+            stack_ptr: crate::kernel::vm::VirtAddr(pc + 0x1000),
+            ..Default::default()
+        };
+        state.set_thread_user_context(tid, ctx).expect("ctx");
+        state.set_thread_tls_base(tid, tls).expect("tls");
+        // A dispatched user task carries an address space. `register_task_with_class` does not
+        // assign one, and the AArch64 gather's FIRST decision is `task_asid(tid).is_none()` —
+        // without this the fixture would only ever exercise the idle arm.
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == tid {
+                    tcb.asid = Some(crate::kernel::vm::Asid(7));
+                }
+            }
+        });
+        state.set_current_cpu(cpu).expect("bind");
+        state.enqueue_on_cpu(cpu, tid).expect("enqueue");
+        assert_eq!(
+            state.dispatch_next_on_cpu(cpu),
+            Some(tid),
+            "fixture: current"
+        );
+    }
+
+    fn twin(tid: u64, cpu: CpuId, pc: u64, tls: usize) -> SharedKernel {
+        let mut state = Bootstrap::init().expect("init");
+        dispatched_task(&mut state, tid, cpu, pc, tls);
+        SharedKernel::new(state)
+    }
+
+    /// The retired body, verbatim: `with_cpu` + the in-lock arch restore.
+    fn retired(k: &SharedKernel, cpu: CpuId, frame: Option<&mut TrapFrame>) -> bool {
+        k.with_cpu(cpu, |kernel| {
+            crate::arch::trap_entry::post_switch_restore_arch_thread_state(kernel, cpu, frame)
+        })
+        .map(|inner| inner.is_ok())
+        .unwrap_or(false)
+    }
+
+    fn split(k: &SharedKernel, cpu: CpuId, frame: Option<&mut TrapFrame>) -> bool {
+        crate::arch::trap_entry::post_switch_restore_arch_thread_state_split(k, cpu, frame).is_ok()
+    }
+
+    // ── equivalence against the retired body ──────────────────────────────────────────────
+
+    /// The whole claim, run for real: on twin states the split transaction leaves the trap frame,
+    /// the TLS-restore slot, the per-CPU TLS record and the CPU binding in EXACTLY the state the
+    /// broad body left them.
+    #[test]
+    fn u9_split_restore_matches_the_retired_body_on_twin_states() {
+        let cpu = CpuId(0);
+        let (a, b) = (
+            twin(90101, cpu, 0x4321_0000, 0x7f00_1000),
+            twin(90101, cpu, 0x4321_0000, 0x7f00_1000),
+        );
+
+        let mut fa = TrapFrame::zeroed();
+        let mut fb = TrapFrame::zeroed();
+        assert!(retired(&a, cpu, Some(&mut fa)), "the retired body succeeds");
+        assert!(split(&b, cpu, Some(&mut fb)), "so does the split twin");
+
+        assert_eq!(fa, fb, "the restored trap frames are identical");
+        assert_eq!(
+            fa.saved_pc, 0x4321_0000,
+            "fixture check: the frame really was restored, so equality is not vacuous"
+        );
+        assert_eq!(
+            a.with(|s| s.tls_restore_pending(90101)),
+            b.with(|s| s.tls_restore_pending(90101)),
+            "the TLS-restore request is consumed identically"
+        );
+        assert_eq!(
+            a.with(|s| s.tls_restore_pending(90101)),
+            Some(false),
+            "fixture check: it really was armed and really was taken"
+        );
+        assert_eq!(
+            a.with(|s| s.current_cpu()),
+            b.with(|s| s.current_cpu()),
+            "the `with_cpu` binding side effect is reproduced"
+        );
+        assert_eq!(
+            crate::arch::x86_64::trap::last_restored_tls_base(cpu),
+            Some(0x7f00_1000),
+            "the per-CPU TLS record is written by both routes"
+        );
+    }
+
+    /// The TLS-restore request is a TAKE, and taking it twice must not resurrect it. A second
+    /// restore still succeeds and still applies the context — it simply has no request to take.
+    #[test]
+    fn u9_split_restore_takes_the_tls_request_exactly_once() {
+        let cpu = CpuId(0);
+        let k = twin(90102, cpu, 0x5000_0000, 0x7f00_2000);
+
+        let mut first = TrapFrame::zeroed();
+        assert!(split(&k, cpu, Some(&mut first)));
+        assert_eq!(k.with(|s| s.tls_restore_pending(90102)), Some(false));
+
+        let mut second = TrapFrame::zeroed();
+        assert!(split(&k, cpu, Some(&mut second)));
+        assert_eq!(
+            second.saved_pc, 0x5000_0000,
+            "the context is still applied on a repeat restore"
+        );
+        assert_eq!(
+            k.with(|s| s.tls_restore_pending(90102)),
+            Some(false),
+            "and nothing is resurrected"
+        );
+    }
+
+    /// `frame == None` was NOT an error, and the admission still happened: `with_cpu` bound and
+    /// validated the CPU before the restore hook ran, and the hook's first statement returned.
+    /// Nothing is consumed.
+    #[test]
+    fn u9_split_restore_with_no_frame_admits_binds_and_consumes_nothing() {
+        let cpu = CpuId(0);
+        let (a, b) = (
+            twin(90103, cpu, 0x6000_0000, 0x7f00_3000),
+            twin(90103, cpu, 0x6000_0000, 0x7f00_3000),
+        );
+
+        assert!(retired(&a, cpu, None));
+        assert!(split(&b, cpu, None));
+
+        for (label, k) in [("retired", &a), ("split", &b)] {
+            assert_eq!(
+                k.with(|s| s.tls_restore_pending(90103)),
+                Some(true),
+                "{label}: an absent frame consumes nothing"
+            );
+            assert_eq!(
+                k.with(|s| s.current_cpu()),
+                cpu,
+                "{label}: but the CPU is still bound"
+            );
+        }
+    }
+
+    /// A reaped TCB is the early-boot / no-user-task shape: `apply_current_thread_to_frame` raised
+    /// `TaskMissing`, which the arch restore swallowed into `Ok(())`. The split reports the same
+    /// success and leaves the frame untouched.
+    #[test]
+    fn u9_split_restore_on_a_reaped_tcb_reports_success_and_touches_nothing() {
+        let cpu = CpuId(0);
+        let (a, b) = (
+            twin(90104, cpu, 0x7000_0000, 0x7f00_4000),
+            twin(90104, cpu, 0x7000_0000, 0x7f00_4000),
+        );
+        for k in [&a, &b] {
+            k.with(|s| {
+                s.with_tcbs_mut(|tcbs| {
+                    for slot in tcbs.iter_mut() {
+                        if slot.as_ref().is_some_and(|t| t.tid.0 == 90104) {
+                            *slot = None;
+                        }
+                    }
+                })
+            });
+        }
+
+        let mut fa = TrapFrame::zeroed();
+        let mut fb = TrapFrame::zeroed();
+        assert!(retired(&a, cpu, Some(&mut fa)), "the swallow is a success");
+        assert!(split(&b, cpu, Some(&mut fb)), "and so is the split's");
+        assert_eq!(fa, fb);
+        assert_eq!(fb, TrapFrame::zeroed(), "no context reached the frame");
+    }
+
+    /// An offline CPU fails the SAME admission `with_cpu` applied, on both routes, and the restore
+    /// never runs.
+    #[test]
+    fn u9_split_restore_refuses_an_offline_cpu_exactly_as_with_cpu_did() {
+        let cpu = CpuId(0);
+        let k = twin(90105, cpu, 0x8000_0000, 0x7f00_5000);
+        let offline = CpuId(OFFLINE);
+
+        assert!(
+            k.with_cpu(offline, |_| ()).is_err(),
+            "fixture check: the CPU really is offline"
+        );
+        assert!(
+            k.post_switch_restore_admit_split(offline).is_err(),
+            "the split admission refuses it too"
+        );
+        let mut frame = TrapFrame::zeroed();
+        assert!(
+            crate::arch::trap_entry::post_switch_restore_arch_thread_state_split(
+                &k,
+                offline,
+                Some(&mut frame)
+            )
+            .is_err(),
+            "so the whole transaction refuses"
+        );
+        assert_eq!(frame, TrapFrame::zeroed(), "and nothing was restored");
+        assert_eq!(
+            k.with(|s| s.tls_restore_pending(90105)),
+            Some(true),
+            "and nothing was consumed"
+        );
+    }
+
+    // ── the admission: why it is not `current_tid_split_read` ─────────────────────────────
+
+    /// The admission returns the same TID `with_cpu(cpu, |k| k.current_tid())` returned, and —
+    /// unlike the deliberately NON-binding `current_tid_split_read` — it BINDS `current_cpu`.
+    /// Losing the bind would silently answer for the wrong CPU, which is precisely the Stage
+    /// 4T+6R revert.
+    #[test]
+    fn u9_admit_matches_with_cpu_current_tid_and_binds_the_cpu() {
+        let ap = CpuId(1);
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(ap).expect("AP online");
+        dispatched_task(&mut state, 90106, ap, 0x9000_0000, 0x7f00_6000);
+        let k = SharedKernel::new(state);
+
+        k.with(|s| s.set_current_cpu(CpuId(0)).expect("rebind to the BSP"));
+        assert_eq!(k.with(|s| s.current_cpu()), CpuId(0));
+
+        assert_eq!(k.post_switch_restore_admit_split(ap), Ok(Some(90106)));
+        assert_eq!(
+            k.with(|s| s.current_cpu()),
+            ap,
+            "the admission binds, exactly as `set_current_cpu` did inside `with_cpu`"
+        );
+        assert_eq!(
+            k.with_cpu(ap, |s| s.current_tid()).expect("admitted"),
+            Some(90106),
+            "and it agrees with the value the retired body read"
+        );
+    }
+
+    /// A CPU with no current task admits successfully and answers `None` — the retired
+    /// `current_tid()` verdict the arch restores treated as "no user task yet", never an error.
+    #[test]
+    fn u9_admit_reports_no_current_task_without_failing() {
+        let ap = CpuId(1);
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(ap).expect("AP online");
+        let k = SharedKernel::new(state);
+
+        assert_eq!(k.with(|s| s.current_tid_on_cpu(ap)), None);
+        assert_eq!(k.post_switch_restore_admit_split(ap), Ok(None));
+    }
+
+    // ── structure: the transaction holds no broad lock, and is rank-ordered ───────────────
+
+    /// Neither split twin touches a broad accessor. This is the property the whole increment
+    /// exists for, so it is asserted directly rather than inferred from the census.
+    #[test]
+    fn u9_neither_split_twin_holds_a_broad_lock() {
+        let code = code_of(TRAP_ENTRY);
+        assert_eq!(
+            code.matches("pub(crate) fn post_switch_restore_arch_thread_state_split(")
+                .count(),
+            2,
+            "one twin per architecture that can reach the drain (x86_64, aarch64)"
+        );
+        // Everything from the first twin up to the retained broad tail: both twin bodies and
+        // nothing else.
+        let twins = code
+            .split("pub(crate) fn post_switch_restore_arch_thread_state_split(")
+            .nth(1)
+            .expect("the first twin")
+            .split("fn post_switch_restore_broad_tail(")
+            .next()
+            .expect("bounded by the retained tail");
+        for banned in [
+            ".with_cpu(",
+            ".with(|",
+            "state.lock()",
+            "current_tid_split_read",
+        ] {
+            assert!(
+                !twins.contains(banned),
+                "the split twins must contain no `{banned}`"
+            );
+        }
+    }
+
+    /// The x86_64 twin is rank-ordered — rank 1, then rank 2, then the lock-free apply — and the
+    /// admission is UNCONDITIONAL: it precedes the frame-absent early return, because `with_cpu`
+    /// bound and validated the CPU before the hook that returned there ever ran.
+    #[test]
+    fn u9_x86_twin_is_admit_then_gather_then_apply() {
+        let body = fn_body(
+            TRAP_ENTRY,
+            "#[cfg(target_arch = \"x86_64\")]\npub(crate) fn post_switch_restore_arch_thread_state_split(",
+        );
+        let admit = body
+            .find(".post_switch_restore_admit_split(cpu)")
+            .expect("rank 1");
+        let early = body
+            .find("let Some(frame) = frame else {")
+            .expect("the frame-absent early return");
+        let gather = body
+            .find(".post_switch_restore_snapshot_split(tid)")
+            .expect("rank 2");
+        let apply = body
+            .find("x86_apply_owner_revalidation_restore(")
+            .expect("the lock-free apply");
+        assert!(admit < early, "the admission is unconditional");
+        assert!(
+            early < gather,
+            "no frame means nothing is gathered or taken"
+        );
+        assert!(gather < apply, "rank 2 is released before the apply");
+    }
+
+    /// The rank-2 gather has ONE definition, shared with the idle-owner revalidation. Growing a
+    /// second copy is how the two resume boundaries would drift apart.
+    #[test]
+    fn u9_the_rank2_gather_has_a_single_definition() {
+        assert_eq!(
+            RUNTIME
+                .matches("fn owner_revalidation_snapshot_split(&self, tid: u64)")
+                .count(),
+            1,
+            "one gather"
+        );
+        let forwarder = fn_body(RUNTIME, "pub(crate) fn post_switch_restore_snapshot_split(");
+        assert!(
+            forwarder.contains("self.owner_revalidation_snapshot_split(tid)"),
+            "the post-switch boundary reuses it rather than re-implementing it"
+        );
+    }
+
+    /// The admission reproduces BOTH halves of `with_cpu`: `validate_online_cpu` and the
+    /// `current_cpu` bind, in that order, and reads the TID under the same rank-1 guard.
+    #[test]
+    fn u9_admission_reproduces_both_halves_of_with_cpu() {
+        let body = fn_body(RUNTIME, "pub(crate) fn post_switch_restore_admit_split(");
+        let validate = body.find("validate_online_cpu(cpu)").expect("admission");
+        let bind = body.find("sched.current_cpu = cpu;").expect("bind");
+        let read = body.find("current_tid_on(cpu)").expect("the TID read");
+        assert!(validate < bind, "a refused CPU must not be bound");
+        assert!(
+            bind < read,
+            "the TID is read after the bind, as `with_cpu` did"
+        );
+        assert!(
+            body.contains("with_scheduler_split_mut"),
+            "and all three happen under rank 1"
+        );
+        for banned in [".with_cpu(", ".with(|", "state.lock()"] {
+            assert!(
+                !body.contains(banned),
+                "the admission is not broad: `{banned}`"
+            );
+        }
+    }
+
+    // ── the AArch64 twin ──────────────────────────────────────────────────────────────────
+    //
+    // The AArch64 stash drain is not reached by ANY existing profile: at `-smp 2` the gate's
+    // `online_cpu_count() <= 1` refuses, and at `-smp 1` the core smoke produces no task-to-task
+    // kernel-context switch at all (one `D6_GLOBAL_LOCK_DROP_DEFERRED`, zero
+    // `D6_GLOBAL_LOCK_DROP_PLAN_READY`), so the twin has no live coverage and none is claimed.
+    // That is exactly why the rank-2 gather is compiled on every architecture rather than cfg'd to
+    // AArch64: these cases run the REAL transaction against the REAL `KernelState`.
+
+    /// The gather's three outcomes, against the facts the retired in-lock body would have read.
+    /// `Idle` and `Missing` must both consume NOTHING — they are the two paths on which the
+    /// retired body returned without taking the TLS request or a parked completion.
+    #[test]
+    fn u9_aarch64_gather_returns_the_retired_verdict_and_consumes_nothing_unless_it_restores() {
+        let cpu = CpuId(0);
+
+        // A live, dispatched task with an ASID: `Facts`, carrying the exact context and TLS.
+        let k = twin(90107, cpu, 0xa000_0000, 0x7f00_7000);
+        let expected = k.with(|s| s.thread_user_context(90107)).expect("context");
+        match k.post_switch_restore_facts_split(90107) {
+            crate::runtime::PostSwitchRestoreOutcome::Facts(facts) => {
+                assert_eq!(facts.tid, 90107);
+                assert_eq!(facts.context, expected, "the exact saved user context");
+                assert_eq!(facts.tls, Some(0x7f00_7000), "the armed TLS request, taken");
+            }
+            other => panic!("expected Facts, got {other:?}"),
+        }
+        assert_eq!(
+            k.with(|s| s.tls_restore_pending(90107)),
+            Some(false),
+            "the TLS request is consumed exactly once"
+        );
+
+        // The idle task: the retired body short-circuited on `current_tid == 0` before touching
+        // the task domain at all.
+        assert_eq!(
+            k.post_switch_restore_facts_split(0),
+            crate::runtime::PostSwitchRestoreOutcome::Idle
+        );
+
+        // A task with no ASID: `task_asid(tid).is_none()` — the retired body's OTHER idle arm.
+        let no_asid = twin(90108, cpu, 0xb000_0000, 0x7f00_8000);
+        no_asid.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                for tcb in tcbs.iter_mut().flatten() {
+                    if tcb.tid.0 == 90108 {
+                        tcb.asid = None;
+                    }
+                }
+            })
+        });
+        assert_eq!(
+            no_asid.post_switch_restore_facts_split(90108),
+            crate::runtime::PostSwitchRestoreOutcome::Idle
+        );
+        assert_eq!(
+            no_asid.with(|s| s.tls_restore_pending(90108)),
+            Some(true),
+            "the idle verdict consumes nothing"
+        );
+
+        // A reaped TCB: no ASID either, so it is the SAME idle verdict the retired body reached
+        // through `task_asid` returning `None` — never the `TaskMissing` error, which the retired
+        // body could only raise after `task_asid` had already answered `Some`.
+        let reaped = twin(90109, cpu, 0xc000_0000, 0x7f00_9000);
+        reaped.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                for slot in tcbs.iter_mut() {
+                    if slot.as_ref().is_some_and(|t| t.tid.0 == 90109) {
+                        *slot = None;
+                    }
+                }
+            })
+        });
+        assert_eq!(
+            reaped.post_switch_restore_facts_split(90109),
+            crate::runtime::PostSwitchRestoreOutcome::Idle
+        );
+    }
+
+    /// The gather consumes a parked `IpcSend` completion exactly once, and a second gather sees
+    /// none — the property that makes the facts the ONLY remaining copy, so the boundary holding
+    /// them must encode them or lose them.
+    #[test]
+    fn u9_aarch64_gather_consumes_a_parked_completion_exactly_once() {
+        use crate::kernel::task::{BlockedSyscallClass, BlockedSyscallCompletion};
+        let cpu = CpuId(0);
+        let k = twin(90110, cpu, 0xd000_0000, 0x7f00_a000);
+
+        let parked = k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == 90110)
+                    .expect("tcb");
+                let done = BlockedSyscallCompletion {
+                    syscall_class: BlockedSyscallClass::IpcSend,
+                    result: 0,
+                    blocked_generation: tcb.blocked_send_generation,
+                    tid: tcb.tid.0,
+                    asid: tcb.asid.expect("fixture: the task carries an ASID"),
+                };
+                tcb.pending_syscall_completion = Some(done);
+                done
+            })
+        });
+
+        match k.post_switch_restore_facts_split(90110) {
+            crate::runtime::PostSwitchRestoreOutcome::Facts(facts) => {
+                assert_eq!(
+                    facts.send_completion,
+                    Some(parked),
+                    "the exact parked completion is taken"
+                );
+            }
+            other => panic!("expected Facts, got {other:?}"),
+        }
+        match k.post_switch_restore_facts_split(90110) {
+            crate::runtime::PostSwitchRestoreOutcome::Facts(facts) => {
+                assert_eq!(
+                    facts.send_completion, None,
+                    "a second gather finds nothing left to take"
+                );
+            }
+            other => panic!("expected Facts, got {other:?}"),
+        }
+    }
+
+    /// The AArch64 twin preserves the retired body's three-way outcome exactly: the frame check
+    /// FIRST (so an absent frame emits no idle marker), then both idle markers for a missing
+    /// current TID, the single marker for a task with no ASID, and `TaskMissing` — an ERROR, not a
+    /// success — when the context is gone.
+    #[test]
+    fn u9_aarch64_twin_preserves_every_outcome_of_the_retired_body() {
+        let body = fn_body(
+            TRAP_ENTRY,
+            "#[cfg(target_arch = \"aarch64\")]\npub(crate) fn post_switch_restore_arch_thread_state_split(",
+        );
+        let early = body
+            .find("let Some(frame) = frame else {")
+            .expect("the frame check");
+        let no_task = body
+            .find("SCHED_NO_RUNNABLE_USER_TASK")
+            .expect("the no-current-task marker");
+        assert!(
+            early < no_task,
+            "an absent frame must emit no idle marker, as the retired body did not"
+        );
+        assert!(
+            body.contains("PostSwitchRestoreOutcome::Missing => Err(TrapHandleError::Syscall("),
+            "a missing context is an error, never a swallowed success"
+        );
+        assert!(
+            body.contains("KernelError::TaskMissing"),
+            "and it is the same error the retired body raised"
+        );
+        assert_eq!(
+            body.matches("SCHED_ENTER_IDLE").count(),
+            2,
+            "both idle arms keep their marker: no current TID, and no ASID"
+        );
+    }
+
+    /// The twin reaches the SAME single frame writer, with the `syscall_return = false` the
+    /// retired `restore_arch_thread_state_post_switch` always passed.
+    #[test]
+    fn u9_aarch64_twin_reuses_the_single_frame_writer() {
+        let body = fn_body(
+            TRAP_ENTRY,
+            "#[cfg(target_arch = \"aarch64\")]\npub(crate) fn post_switch_restore_arch_thread_state_split(",
+        );
+        assert!(
+            body.contains("apply_restored_thread_state(frame, cpu, &facts, false)"),
+            "one writer, `syscall_return = false`"
+        );
+        assert_eq!(
+            AARCH64_TRAP
+                .matches("pub(crate) fn apply_restored_thread_state(")
+                .count(),
+            1,
+            "the writer still has exactly one definition"
+        );
+        assert!(
+            AARCH64_TRAP.contains("One writer, THREE producers."),
+            "and its contract records the third producer"
+        );
+    }
+
+    /// The AArch64 gather takes the ASID and every restore fact in ONE rank-2 acquisition, and the
+    /// `Idle` verdict is decided before any take — so a task with no ASID consumes nothing.
+    #[test]
+    fn u9_aarch64_gather_decides_idle_before_it_takes_anything() {
+        let body = fn_body(RUNTIME, "pub(crate) fn post_switch_restore_facts_split(");
+        assert_eq!(
+            body.matches("with_task_return_split_mut").count(),
+            1,
+            "ONE rank-2 acquisition"
+        );
+        let idle = body
+            .find("return PostSwitchRestoreOutcome::Idle;")
+            .expect("the no-ASID idle arm");
+        let take = body.find("take_thread_restore_facts(").expect("the take");
+        assert!(idle < take, "the idle verdict precedes every take");
+        assert!(
+            body.contains("Some(asid)"),
+            "and the take is keyed on the ASID resolved in this same acquisition"
+        );
+    }
+
+    // ── the retained acquisition, and the census ──────────────────────────────────────────
+
+    /// The one broad acquisition left at this site is entered ONLY by the D6 cleanup or by the
+    /// statically-unreachable RISC-V restore. An ordinary production switch on x86_64 or AArch64
+    /// evaluates `is_proof_done == false` against a compile-time-false `cfg!` and acquires
+    /// nothing.
+    #[test]
+    fn u9_the_retained_acquisition_is_entered_only_by_d6_or_riscv() {
+        let code = code_of(TRAP_ENTRY);
+        assert!(
+            code.contains("if is_proof_done || cfg!(target_arch = \"riscv64\") {"),
+            "the gate on the retained acquisition"
+        );
+        let tail = fn_body(TRAP_ENTRY, "fn post_switch_restore_broad_tail(");
+        assert_eq!(
+            tail.matches(".with_cpu(").count(),
+            1,
+            "the tail holds exactly one acquisition"
+        );
+        assert!(
+            tail.contains("d6_ensure_post_cleanup_task_stacks_mapped"),
+            "the D3-fenced cleanup that keeps it broad is here"
+        );
+        // The RISC-V arm is the only one that still restores in-lock, and it is the only arm whose
+        // stash gate can never fire — the two facts are stated together on purpose.
+        assert!(
+            tail.contains(
+                "let result = post_switch_restore_arch_thread_state(kernel, cpu, frame);"
+            ),
+            "only the unreachable RISC-V arm restores in-lock"
+        );
+        assert!(
+            code_of(EXEC_STATE)
+                .contains("!cfg!(target_arch = \"riscv64\") && self.online_cpu_count() <= 1"),
+            "and the gate that makes it unreachable is a compile-time `cfg!`"
+        );
+    }
+
+    /// CENSUS-DELTA 0 at this site: `trap_entry.rs` keeps exactly two broad acquisitions — the
+    /// canonical Phase-2 trap dispatch and the D6 cleanup tail. What changed is that an ordinary
+    /// switch no longer ENTERS the second one.
+    #[test]
+    fn u9_the_site_census_is_unchanged() {
+        let code = code_of(TRAP_ENTRY);
+        assert_eq!(code.matches(".with_cpu(").count(), 2);
+        assert_eq!(code.matches(".with(|").count(), 0);
+        assert_eq!(code.matches("state.lock()").count(), 0);
+    }
+
+    /// The callsite order is the retired order: restore first, cleanup second, and the restore's
+    /// error propagated LAST — so the cleanup still observes exactly the state it did, and a
+    /// failing restore does not skip it.
+    #[test]
+    fn u9_the_callsite_preserves_restore_then_cleanup_then_error() {
+        let code = code_of(TRAP_ENTRY);
+        // Anchor on CODE, not on a comment: `code_of` strips comment lines, so a comment anchor
+        // would silently fall through to the whole file — where the tail's DEFINITION precedes the
+        // drain and the order assertion would read backwards.
+        let drain = code
+            .split("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()")
+            .nth(1)
+            .expect("the stash drain");
+        let restore = drain
+            .find("post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut())")
+            .expect("the split restore");
+        let tail = drain
+            .find("post_switch_restore_broad_tail(")
+            .expect("the cleanup tail");
+        let propagate = drain.find("restore_result?;").expect("the error lane");
+        assert!(restore < tail, "the restore still runs first");
+        assert!(tail < propagate, "the cleanup still runs before the error");
     }
 }

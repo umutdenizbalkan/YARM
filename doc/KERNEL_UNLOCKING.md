@@ -74,7 +74,7 @@ because scheduler operations continue to execute inside the two authoritative tr
 the D3-fenced controlled-proof restore remains. Retiring the drain class was necessary for 203C,
 not sufficient for it. The post-lock drain class is fully
 retired; what remains is the authoritative trap dispatch itself (2), the D3-fenced D6
-controlled-proof restore (1) and the recv/delivery boundary (4) — enumerated site by site in
+proof-cleanup tail (1 — see U9/203C for the label correction) and the recv/delivery boundary (4) — enumerated site by site in
 `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a. `src/arch/x86_64/smp.rs` contributes **0**.
 These figures are recomputed from source by `tests/broad_lock_census_guard.rs`, which fails if
 the tree and the published census drift apart.
@@ -200,7 +200,7 @@ count falls 22 → **21**: complete + partial + open = 3 + 11 + 21 = 35.
 | boot-only | **0** | — |
 | test-only | **0** | none — U2 relocated all three into test-only modules the census excludes: `ipc_recv_with_deadline_split_bridge` (2 acquisitions, never a trap-seam path) and the `SharedKernel::control_plane_set_process_cnode_slots_via_syscall` wrapper (1) |
 | obsolete | **0** | none — U1 deleted both (`SharedKernel::handle_trap_with_cpu`, which had no in-tree caller at all, and `SharedKernel::run_reply_timeout_completion`, which had no production caller) |
-| runtime-required | **6** | re-derived from the final tree in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a: the authoritative broad Phase-2 trap dispatch (`arch/trap_entry.rs:310`) and its RISC-V twin (`arch/riscv64/trap.rs:829`); the D3-fenced D6 controlled-proof restore (`arch/trap_entry.rs:1694`), whose body also maps kernel stacks across every live task root; and four recv/delivery-boundary sites in `runtime.rs` — the Phase-A multi-domain composite (`4093`) plus three re-entries of the same `rollback_materialized_recv_cap` capability-teardown body (`4193`, `4486`, `5278`). The whole post-lock drain class, the first-resume trampoline, the AArch64 split return, the RISC-V resume site, the identity/SMP/deadline helpers and every `arch/x86_64/smp.rs` acquisition (the last being ED-2) are retired and no longer exist. |
+| runtime-required | **6** | re-derived from the final tree in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a: the authoritative broad Phase-2 trap dispatch (`arch/trap_entry.rs:310`) and its RISC-V twin (`arch/riscv64/trap.rs:829`); the D3-fenced **D6 proof-cleanup tail** (`arch/trap_entry.rs`, `post_switch_restore_broad_tail`), whose body maps kernel stacks across every live task root — U9/203C corrected this row's former label, "the D3-fenced D6 controlled-proof restore": the site was never D6-exclusive (the production post-switch restore lived inside it) and is no longer a restore at all, since that restore is now the off-lock `post_switch_restore_arch_thread_state_split`; and four recv/delivery-boundary sites in `runtime.rs` — the Phase-A multi-domain composite (`4093`) plus three re-entries of the same `rollback_materialized_recv_cap` capability-teardown body (`4193`, `4486`, `5278`). The whole post-lock drain class, the first-resume trampoline, the AArch64 split return, the RISC-V resume site, the identity/SMP/deadline helpers and every `arch/x86_64/smp.rs` acquisition (the last being ED-2) are retired and no longer exist. |
 | undocumented | **0** | every site is enumerated in `doc/KERNEL_UNLOCK_AUDIT.md` §1 with file, line and enclosing function |
 
 Classified total: **7** acquisition callsites (**7** `with_cpu` + **0** broad `with`), which
@@ -584,7 +584,7 @@ CENSUS 8 → 7. Canonical 203C remains OPEN / PARTIAL.**
   run with every guard released.
 * **`src/arch/x86_64/smp.rs` now holds zero broad acquisitions**, and **no post-lock drain
   reacquisition remains anywhere in the tree**. The seven survivors are two authoritative broad
-  trap dispatches, one D3-fenced controlled-proof restore, one recv Phase-A multi-domain composite
+  trap dispatches, one D3-fenced D6 proof-cleanup tail, one recv Phase-A multi-domain composite
   and three capability-teardown rollback sites.
 * **203C remains OPEN / PARTIAL** because scheduler operations still execute inside those two
   authoritative trap dispatches and the D3-fenced proof site remains. Direct production remains
@@ -1153,6 +1153,130 @@ on the broad D3-dependent route; all three broad rollback acquisitions remain co
 OPEN**, and no canonical stage is closed by this prerequisite. When `await_tlb_shootdown_ack`
 lands, the remaining work at those three callsites is obligations (4) and (5) for
 `MemoryObject`/`DmaRegion` alone.
+
+## U9/203C — THE PRODUCTION POST-SWITCH RESTORE LEAVES THE BROAD LOCK
+
+**CENSUS-DELTA 0 (6 / 0 / 3).** `src/arch/trap_entry.rs` keeps exactly two `with_cpu` callsites.
+What changed is that an ordinary production context switch on x86_64 or AArch64 no longer ENTERS
+the second one.
+
+### The two premises this increment set out from, and what source says about them
+
+Both were wrong, in ways that matter more than the increment itself.
+
+**Premise 1 — "the `if is_proof_done` block is obsolete D6 controlled-proof diagnostics."** It is
+neither obsolete nor controlled-proof-exclusive nor purely diagnostic.
+
+* `D6_SWITCH_A_DONE` is emitted ONLY inside that block, and D6-SWITCH-A is by this tree's own
+  label "the first narrow **production** Outcome A" — a real unlocked production switch. Its knob
+  runs the block with the controlled-proof knob OFF: `maybe_run_d6_controlled_switch_proof` is
+  gated on `proof_enabled || switch_a_enabled`, and it calls
+  `d6_controlled_switch_proof_mark_pending_done()` in both modes, which is what makes
+  `is_proof_done` true.
+* `d6_ensure_post_cleanup_task_stacks_mapped` is a functional repair, not telemetry: Stage
+  165D/165F/165G record that without it a post-cleanup trap faults on a supervisor stack write
+  (observed `tid=3` at `0xffff_8000_0001_0dd8`, `tid=0` at `0xffff_8000_0000_7d78`). Deleting it
+  would fault the profile, not merely remove a marker.
+* `scripts/qemu-x86_64-core-smoke.sh` hard-asserts `D6_SWITCH_A_DONE` under `D6_SWITCH_A=1`, and
+  uses `D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE` plus `D6_POST_CLEANUP_STACK_MAP_DONE …
+  failures=0` under `D6_SWITCH_PROOF=1` as the gate that suppresses its stale
+  CHECK_FAILED-without-CHECK_OK heuristic.
+
+The block was therefore NOT deleted. Because it stays, the census cannot fall: its cleanup
+allocates backing frames (`alloc_user_data_frame`, rank 6) and maps them across address spaces, so
+a split form would have to add `with_memory_split_mut` — fenced by `AI_AGENT_RULES` §14.4 until
+the lock-free `await_tlb_shootdown_ack` design and its multi-CPU smoke land. **A census target of
+6 → 5 is D3-blocked at this site**, which is the same conclusion U3 recorded when it excluded the
+site.
+
+**Premise 2 — "D3-fenced cross-address-space page-table mutation belongs only to the
+`if is_proof_done` overlay."** The PRODUCTION restore performs it too:
+`x86_64::trap::ensure_user_return_cr3`, on `hw_cr3 != task_cr3`, samples live RIP/RSP, scans every
+TCB for the stack containing RSP, and calls
+`page_table::ensure_kernel_return_context_mapped_for_asid` before `write_cr3_for_asid`.
+
+That is not a hard stop, and the distinction is the whole point: the mutation only MAPS, never
+unmaps, so it owes no shootdown and is D3-independent; it reaches the page tables through the
+`page_table` module, which takes no `KernelState` lock; and U3 already ships its production-live
+broad-lock-free twin, `ensure_user_return_cr3_split`, repair path and fail-safe skip included.
+
+### The transaction
+
+`post_switch_restore_arch_thread_state_split`, one twin per architecture whose stash gate can
+reach the drain:
+
+1. **rank 1** — `post_switch_restore_admit_split` reproduces BOTH halves of `with_cpu`, which is
+   exactly `lock` + `set_current_cpu(cpu)?` + body: the `validate_online_cpu` admission (whose
+   `Err` the caller still maps to `TrapHandleError::Syscall`) and the `current_cpu` BIND that the
+   retired body's `KernelState::current_tid()` — a `current_tid_on(self.current_cpu())` read —
+   depended on. The TID is read there, under that same guard. `current_tid_split_read` is
+   deliberately NOT used: it does not bind, which is the Stage 4T+6R revert.
+2. rank 1 released.
+3. **rank 2, ONE acquisition** — the whole payload, taken coherently. x86_64 reuses the EXISTING
+   `owner_revalidation_snapshot_split` (re-keyed from an `OwnerRevalidationSelection` to the bare
+   `tid` it always read out of it, so the idle-owner revalidation and this boundary share one
+   gather); AArch64 reuses the EXISTING `take_thread_restore_facts`, the same definition
+   `post_exit_replacement_restore_split` uses.
+4. rank 2 released.
+5. **the arch apply, with NO lock held** — x86_64 through the established
+   `x86_apply_owner_revalidation_restore` (frame, FS base, `LAST_RESTORED_TLS_BASE`, and the
+   complete pre-IRET CR3 invariant via `ensure_user_return_cr3_split`); AArch64 through
+   `apply_restored_thread_state`, which now has **one writer and three producers**.
+
+Releasing rank 1 before taking rank 2 opens no window: the drain runs only when
+`maybe_switch_kernel_context` stashed a plan, and that gate requires `online_cpu_count() <= 1`,
+with interrupts disabled for the whole drain.
+
+Every outcome of the retired bodies is preserved, including the ones that returned success: an
+absent frame is not an error and still admits first; `TaskMissing` from a reaped TCB is still
+swallowed into `Ok(())` on x86_64; AArch64 still emits `SCHED_NO_RUNNABLE_USER_TASK` +
+`SCHED_ENTER_IDLE` for no current TID and `SCHED_ENTER_IDLE` alone for a task with no ASID, still
+checks the frame BEFORE either, and still raises `TaskMissing` — an error, not a success — when a
+task with an ASID has no restorable context.
+
+**RISC-V is not split.** Its stash gate opens with `!cfg!(target_arch = "riscv64")`, so the drain
+is statically unreachable there; it keeps its verbatim in-lock restore inside the retained tail
+rather than an unproven split.
+
+### What still holds the lock
+
+`post_switch_restore_broad_tail` — one named function, one acquisition, two disjoint consumers:
+the D6 cleanup overlay (`is_proof_done`) and the unreachable RISC-V restore. Callsite order is the
+retired order — restore first, cleanup second, the restore's error propagated last — so the
+cleanup observes exactly the state it did and a failing restore does not skip it.
+
+### Evidence, stated exactly
+
+**x86_64 — LIVE-PROVEN.** The drain is reached under both `D6_SWITCH_PROOF=1` and `D6_SWITCH_A=1`
+(`D6_GLOBAL_LOCK_DROP_PLAN_READY`, `D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH` and
+`D6_SWITCH_FRAMES_RETURNED_UNLOCKED` each exactly once), so the split restore ran off-lock and the
+retained tail ran after it. Both profiles' complete `[ok]`/`[error]` gate output is BYTE-IDENTICAL
+to freshly built base `e9a7750` artifacts. Both exit 1 at base and at head for one pre-existing
+reason: `unlock_graduated_enabled()` IS `d6_genuine_enabled()`, which is false whenever either D6
+knob is set, so the script's unconditional REMOVE-FALLBACKS gate can never pass under those two
+profiles. That is a script/kernel contradiction provable from source, not a regression. The
+ordinary x86_64 core smoke passes and never reaches the drain at all
+(`D6_GLOBAL_LOCK_DROP_PLAN_READY` = 0), which is itself the statement that the ordinary path is
+unchanged.
+
+**AArch64 — NOT live-proven, and none is claimed.** No existing profile reaches the drain: at
+`-smp 2` the gate's `online_cpu_count() <= 1` refuses, and at `QEMU_SMP=1` the core smoke produces
+no task-to-task kernel-context switch (one `D6_GLOBAL_LOCK_DROP_DEFERRED`, zero `…_PLAN_READY`).
+The AArch64 rank-2 gather is therefore compiled on every architecture rather than cfg'd away, so
+the focused tests exercise the REAL transaction against the REAL `KernelState`: the three
+verdicts, exactly-once TLS consumption, exactly-once parked-completion consumption, and "nothing
+is consumed unless it restores". The AArch64 core smoke itself passes 6/6.
+
+Verification: `cargo fmt --all --check`; `git diff --check`; `cargo metadata --locked`; the hosted
+suite across all targets with `--test-threads=1`; the broad-lock census guard; three freestanding
+builds; three core smokes; and a clippy diagnostic set IDENTICAL to base `e9a7750` (881
+diagnostics either side, cargo's per-crate "generated N warnings" bookkeeping excluded).
+
+**Label correction.** `trap_entry.rs`'s second acquisition was published as "the D3-fenced D6
+controlled-proof restore". That was wrong twice: it was never D6-exclusive — the production
+post-switch restore lived inside it — and it is no longer a restore at all. Its current name is
+**the D6 proof-cleanup tail** (`post_switch_restore_broad_tail`), still D3-fenced, and now the
+only reason the site is broad.
 
 > **Correction — there is no U8 implementation left to do.** Earlier revisions of this doc and
 > of `doc/STATUS.md` ended with "U8 is next". Directive U8 was the AArch64
