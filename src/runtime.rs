@@ -634,6 +634,33 @@ pub(crate) struct ExitReplacementRestore {
     pub(crate) enter_idle: bool,
 }
 
+/// U9 (canonical 203C) — what the rank-2 half of a post-switch restore found.
+///
+/// Three outcomes, one per branch of the retired in-lock body, so no consumer has to re-derive
+/// which `None` meant what — the distinction is load-bearing, because two of them return success
+/// and the third is an error:
+///
+/// * `Idle` — `tid == 0`, or the task carries no ASID (including a reaped TCB). The retired body
+///   logged `SCHED_ENTER_IDLE` and returned success. NOTHING was consumed.
+/// * `Missing` — the task exists with an ASID but has no restorable context, which
+///   `thread_user_context` reported as `None` and the retired body raised as
+///   `KernelError::TaskMissing`. NOTHING was consumed.
+/// * `Facts` — the complete restore payload. These are TAKES: once returned, this value holds the
+///   only remaining copy of the TLS request and any parked completion, so the boundary holding it
+///   must encode them or lose them.
+///
+/// The only production consumer is the AArch64 split twin, so a hosted build sees no live
+/// construction; like [`ApSavedResumeContext`] the type is kept compiled everywhere — rather than
+/// cfg'd away — so the behavioural tests can exercise the REAL transaction on twin kernel states
+/// instead of a hosted-only re-implementation of it.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostSwitchRestoreOutcome<T> {
+    Idle,
+    Missing,
+    Facts(T),
+}
+
 /// The coherent rank-2 saved-context snapshot taken by
 /// [`SharedKernel::ap_saved_resume_context_split`].
 ///
@@ -1281,7 +1308,7 @@ impl SharedKernel {
         // (4) rank 2, one acquisition. `None` is the legacy `thread_user_context(next).is_none()`
         // verdict: a task still in a run queue whose TCB has been reaped must be a restore
         // failure, never a silent return into ring 3 on the previous task's frame.
-        let snapshot = self.owner_revalidation_snapshot_split(selection);
+        let snapshot = self.owner_revalidation_snapshot_split(next);
         if let Some(snapshot) = snapshot {
             // (6) No lock held: frame, FS base, per-CPU TLS record, pre-IRET CR3 invariant.
             crate::arch::x86_64::trap::x86_apply_owner_revalidation_restore(
@@ -1317,12 +1344,14 @@ impl SharedKernel {
     /// request is TAKEN here, exactly as `take_tls_restore_request` took it, and only when the
     /// TCB was found — so a rolled-back selection leaves the request pending for the task's
     /// real resume, which is what the legacy short-circuit did.
+    ///
+    /// U9 (203C): keyed on the bare `tid` rather than on an `OwnerRevalidationSelection`, which is
+    /// all this ever read out of it. That is what lets the production post-switch restore reach
+    /// the SAME gather ([`Self::post_switch_restore_snapshot_split`]) instead of growing a second
+    /// copy of it — the two boundaries resolve their TID differently (a queue advance versus the
+    /// scheduler's standing `current`), but what they need from the task domain is identical.
     #[cfg(target_arch = "x86_64")]
-    fn owner_revalidation_snapshot_split(
-        &self,
-        selection: OwnerRevalidationSelection,
-    ) -> Option<OwnerRevalidationSnapshot> {
-        let tid = selection.tid;
+    fn owner_revalidation_snapshot_split(&self, tid: u64) -> Option<OwnerRevalidationSnapshot> {
         self.with_task_return_split_mut(|tcbs, tls_pending| {
             let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == tid)?;
             let context = tcb.user_context;
@@ -2736,6 +2765,106 @@ impl SharedKernel {
                 }
             }))
         })
+    }
+
+    /// U9 (canonical 203C) — the rank-1 half of the PRODUCTION post-switch restore.
+    ///
+    /// `with_cpu(cpu, …)` is exactly `lock` + `set_current_cpu(cpu)?` + body, and `set_current_cpu`
+    /// is itself `validate_online_cpu` + `sched.current_cpu = cpu` under the rank-1 guard. Both
+    /// halves are reproduced here, so nothing the retired body depended on is dropped:
+    ///
+    /// * the ONLINE-CPU **admission**, whose `Err` the caller still propagates as
+    ///   `TrapHandleError::Syscall`, before any task state is read or taken;
+    /// * the **binding** of `current_cpu`, which the retired body silently relied on — the arch
+    ///   restore's `KernelState::current_tid()` is `current_tid_on(self.current_cpu())`, so without
+    ///   the bind it would have answered for the wrong CPU.
+    ///
+    /// The current TID is therefore read HERE, under the same rank-1 guard that just bound the
+    /// CPU — never through [`Self::current_tid_split_read`], which is deliberately NON-binding
+    /// (see the Stage 4T+6R revert) and would reintroduce exactly the staleness the bind exists to
+    /// prevent.
+    ///
+    /// `Ok(None)` is the retired `current_tid()` answering `None`, which the arch restores treated
+    /// as "no user task yet" rather than as an error.
+    pub(crate) fn post_switch_restore_admit_split(
+        &self,
+        cpu: CpuId,
+    ) -> Result<Option<u64>, KernelError> {
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .map_err(crate::kernel::boot::map_scheduler_error)?;
+            // The admission side effect `with_cpu` performed, which the retired body relied on.
+            sched.current_cpu = cpu;
+            Ok(kernel_ref(&sched.scheduler)
+                .current_tid_on(cpu)
+                .map(|tid| tid.0))
+        })
+    }
+
+    /// U9 (canonical 203C) — the rank-2 half of the AArch64 post-switch restore, ONE acquisition.
+    ///
+    /// The retired in-lock body reached the task domain four separate times — `task_asid`,
+    /// `thread_user_context`, `take_tls_restore_request`, and one take per completion class.
+    /// Fusing them into a single acquisition is strictly more coherent than that sequence and
+    /// changes no decision: every one of them resolved the SAME `tid` against the SAME `tcbs`, and
+    /// none of them read the trap frame, so performing them all before the first frame write is
+    /// behaviour-preserving (the argument U3 already established for
+    /// `apply_restored_thread_state`'s two producers).
+    ///
+    /// The takes are ordered exactly as the retired body ordered them — context and TLS, then
+    /// `IpcSend`, then (where compiled) `IpcRecv` — because
+    /// [`crate::kernel::task::take_thread_restore_facts`] is the single definition both producers
+    /// use.
+    ///
+    /// `expect_asid` is the ASID read from the same TCB in this same acquisition, so the exactness
+    /// check can only ever agree; it is passed rather than `None` so a future caller cannot reach
+    /// this gather with an ASID it did not itself resolve.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn post_switch_restore_facts_split(
+        &self,
+        tid: u64,
+    ) -> PostSwitchRestoreOutcome<crate::kernel::task::ThreadRestoreFacts> {
+        if tid == 0 {
+            return PostSwitchRestoreOutcome::Idle;
+        }
+        self.with_task_return_split_mut(|tcbs, tls_pending| {
+            // `task_asid(tid)`: `None` for a reaped TCB and for a task with no address space. The
+            // retired body treated BOTH as the idle outcome, before it read any context.
+            let Some(asid) = tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.asid)
+            else {
+                return PostSwitchRestoreOutcome::Idle;
+            };
+            match crate::kernel::task::take_thread_restore_facts(tcbs, tls_pending, tid, Some(asid))
+            {
+                Some(facts) => PostSwitchRestoreOutcome::Facts(facts),
+                None => PostSwitchRestoreOutcome::Missing,
+            }
+        })
+    }
+
+    /// U9 (canonical 203C) — the rank-2 half of the x86_64 post-switch restore, ONE acquisition.
+    ///
+    /// The retired in-lock body read the task domain four times as well —
+    /// `apply_current_thread_to_frame`'s `thread_user_context`, `take_tls_restore_request`, and
+    /// then `task_asid(tid)` for the pre-IRET CR3 block. This is the SAME fused gather
+    /// [`Self::owner_revalidation_snapshot_split`] already performs for the idle-owner
+    /// revalidation, reused rather than re-implemented so the two boundaries cannot drift.
+    ///
+    /// `None` is the retired `thread_user_context(tid).is_none()` verdict, which
+    /// `apply_current_thread_to_frame` raised as `KernelError::TaskMissing` and
+    /// `restore_arch_thread_state` then swallowed into `Ok(())` as the early-boot "no user task
+    /// scheduled yet" case. Nothing is consumed on that path.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn post_switch_restore_snapshot_split(
+        &self,
+        tid: u64,
+    ) -> Option<OwnerRevalidationSnapshot> {
+        self.owner_revalidation_snapshot_split(tid)
     }
 
     /// U3 (canonical 203C) — the class-neutral blocked-waiter Phase-C completion transaction.
@@ -10496,7 +10625,7 @@ mod tests {
             "the authoritative transaction has ONE definition; U3 reuses it"
         );
         // The two acquisitions that remain in the file are the canonical broad Phase-2 trap
-        // dispatch and the D6 controlled-proof restore, and neither was touched.
+        // dispatch and the D6 proof cleanup tail, and neither was touched.
         let code = u3_code_lines(TRAP_ENTRY);
         assert_eq!(
             code.matches(".with_cpu(").count(),
@@ -10511,11 +10640,13 @@ mod tests {
             ),
             "the canonical broad Phase-2 trap dispatch is present and unchanged"
         );
+        // U9 (canonical 203C): the second acquisition kept its D3-fenced cleanup and LOST the
+        // production restore, which is now the off-lock split twin. The cleanup is what still
+        // makes the site broad, so it is the thing this assertion pins.
         assert!(
-            code.contains(
-                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
-            ) && code.contains("d6_ensure_post_cleanup_task_stacks_mapped"),
-            "the D6 controlled-proof restore and its D3-fenced cleanup are present and unchanged"
+            code.contains("fn post_switch_restore_broad_tail(")
+                && code.contains("d6_ensure_post_cleanup_task_stacks_mapped"),
+            "the D6 cleanup tail and its D3-fenced stack repair are present and unchanged"
         );
     }
 

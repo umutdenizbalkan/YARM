@@ -82,7 +82,7 @@ earlier substitution here was reverted — and `terminal_idle_on_cpu_split` rema
 its `runnable_count_on` condition adds runnable-count policy the legacy predicate never had.
 Census: `with_cpu` **10 → 9**, broad `with` **stays 1**, total and runtime-required **11 → 10**,
 `src/arch/trap_entry.rs` **3 → 2**. The two that remain are the canonical Phase-2 broad trap
-dispatch and the D6 controlled-proof restore, still D3-fenced under `AI_AGENT_RULES` §14.4.
+dispatch and the production post-switch architectural-state restore, whose ordinary x86_64/AArch64 path is split and lock-free, with a retained broad tail for functional D6 stack-repair cleanup, whose retained tail is still D3-fenced under `AI_AGENT_RULES` §14.4.
 
 **Not live-proven — scoped precisely.** This branch's only live gate is the Stage 195F no-incoming
 idle oracle, whose precondition is unreachable behind the pre-existing SpawnV5/initramfs stall on
@@ -281,13 +281,15 @@ stays 0, runtime-required/total 8 → 7.**
   denied wake-only fallthrough, saved-resume branch and idle tail are all unchanged.
 * **`src/arch/x86_64/smp.rs` now holds ZERO broad acquisitions of any form.** The seven that
   remain are: two authoritative broad trap dispatches (`arch/trap_entry.rs:310`,
-  `arch/riscv64/trap.rs:829`), one D3-fenced D6 controlled-proof restore
-  (`arch/trap_entry.rs:1694`), one recv Phase-A multi-domain composite (`runtime.rs:4093`), and
+  `arch/riscv64/trap.rs:829`), one production post-switch architectural-state restore (ordinary x86_64/AArch64 path split and lock-free; retained broad tail for functional D6 stack-repair cleanup)
+  (`arch/trap_entry.rs`, `post_switch_restore_broad_tail`; U9/203C corrected the former
+  "D6 controlled-proof restore" label and moved the ordinary production restore off the broad
+  lock), one recv Phase-A multi-domain composite (`runtime.rs:4093`), and
   three capability-teardown rollback sites (`runtime.rs:4193`, `4486`, `5278`). **No post-lock
   drain reacquisition remains anywhere in the tree.** Full per-site inventory in
   `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
 * **203C remains OPEN / PARTIAL**, because scheduler operations still execute inside the two
-  authoritative trap dispatches and the D3-fenced proof site remains.
+  authoritative trap dispatches and that site's D3-fenced broad tail remains.
 
 **Execution directive U3 is COMPLETE — exit MET.** Its exit is the census reaching **≤24** with
 every post-lock drain re-acquisition deleted in the same increment as the seam it blocked. The
@@ -295,7 +297,7 @@ total is **7** and the drain class is fully retired (`doc/KERNEL_UNLOCK_AUDIT.md
 seven survivors; none is a drain). **Canonical 203C nevertheless remains OPEN / PARTIAL** — its
 own exit, the rank-1/rank-2 seams being authoritative rather than compatibility helpers, is still
 false while scheduler operations execute inside the two authoritative trap dispatches and the
-D3-fenced controlled-proof restore remains. A completed directive is not a completed stage.
+D3-fenced broad tail of that restore site remains. A completed directive is not a completed stage.
 
 **199C is DELIVERED / CLOSED (U6-FRAME). 199E remains DELIVERED / CLOSED. 200B/U5 remains OPEN
 (partially production-wired).** Directive U8 is already source-complete. Canonical stage

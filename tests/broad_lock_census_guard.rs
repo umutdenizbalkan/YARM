@@ -67,7 +67,8 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // blocked-syscall completion) plus `aarch64::trap::post_exit_restore_replacement`, which does
     // the TTBR0/frame work with every domain lock released through the SAME single frame writer
     // the in-lock restore uses. The three that remain are the canonical broad trap phase, the
-    // AArch64 FutexWait no-incoming idle read, and the D6 controlled-proof restore — whose
+    // AArch64 FutexWait no-incoming idle read, and the production post-switch
+    // architectural-state restore site — whose
     // acquisition is DELIBERATELY retained: its body also runs the D6 proof cleanup
     // (`d6_ensure_post_cleanup_task_stacks_mapped` maps kernel stack pages into the active root
     // and every live task root), which is D3-fenced by AI_AGENT_RULES §14.4 and has no split form,
@@ -82,7 +83,9 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // predicate and the refusal policy are outcome-for-outcome unchanged: `Some(0)` is idle, and
     // both "no current task" and "CPU refused" arrive as `None` and are mapped to `true` by the
     // same `unwrap_or(true)`. The TWO that remain are the canonical broad Phase-2 trap dispatch
-    // and the D6 controlled-proof restore, the latter still D3-fenced (see the note above).
+    // and the production post-switch architectural-state restore
+    // site, whose ordinary x86_64/AArch64 path is split and lock-free and whose retained broad
+    // tail for functional D6 stack-repair cleanup is still D3-fenced (see the note above).
     ("src/arch/trap_entry.rs", 2),
     // U3 (203C): 4 -> 3. The AP saved-resume placement's `with_cpu(cpu, |k| { enqueue; dispatch })`
     // became one authoritative rank-1 -> rank-2 transaction,

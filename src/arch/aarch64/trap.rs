@@ -376,16 +376,18 @@ pub(crate) fn restore_arch_thread_state(
 
 /// U3 (canonical 203C) — THE frame-write half of the AArch64 thread-state restore.
 ///
-/// One writer, two producers. `restore_arch_thread_state` reaches it with facts gathered under
+/// One writer, THREE producers. `restore_arch_thread_state` reaches it with facts gathered under
 /// the broad lock; `post_exit_restore_replacement` reaches it with facts taken by
-/// `SharedKernel::post_exit_replacement_restore_split` with every domain lock released. Neither
-/// carries a second copy of this sequence, so the completion-before-argument-mirror ordering, the
+/// `SharedKernel::post_exit_replacement_restore_split` with every domain lock released; and U9's
+/// `post_switch_restore_arch_thread_state_split` reaches it with facts taken by
+/// `SharedKernel::post_switch_restore_facts_split`, likewise off every lock. None of them carries
+/// a second copy of this sequence, so the completion-before-argument-mirror ordering, the
 /// error-lane convention and the TLS lane can only ever be changed in one place.
 ///
 /// Touches nothing but `frame`: no kernel state is read, taken or written here. `facts` is already
 /// the only remaining copy of whatever was consumed, so every completion it carries is encoded
 /// exactly once, by construction.
-fn apply_restored_thread_state(
+pub(crate) fn apply_restored_thread_state(
     frame: &mut TrapFrame,
     cpu: CpuId,
     facts: &crate::kernel::task::ThreadRestoreFacts,
@@ -532,6 +534,13 @@ pub(crate) fn post_exit_restore_replacement(
 /// `switch_frames` in the incoming task's context. `syscall_return` is always
 /// `false` here — the incoming task is resuming from a context switch, not a
 /// direct syscall return.
+///
+/// U9 (canonical 203C): the stash drain now reaches AArch64 through
+/// `trap_entry::post_switch_restore_arch_thread_state_split`, so this in-lock body no longer has a
+/// production caller. It is kept, not deleted: it is the FOUNDATION the split twin is proven
+/// equivalent to, branch for branch, and its `syscall_return = false` choice is the fact that twin
+/// inherits.
+#[allow(dead_code)]
 pub(crate) fn restore_arch_thread_state_post_switch(
     kernel: &mut KernelState,
     cpu: CpuId,
