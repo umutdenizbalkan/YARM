@@ -54,6 +54,128 @@ const DEBUG_YIELD_LOG: bool = false;
 const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 static DISPATCH_CONTEXT_LOAD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
+// U9-D3 — the AP TLB-proof variant of the seal stub. Two-phase `0xA9C6` with a bounded
+// ring-3 RDTSC dwell between the phases, so CPU 1 is DEMONSTRABLY resident in ring 3
+// under its own user CR3 while the BSP drives a real shootdown at it. That residency is
+// the thing the tree could not previously produce: the old stub's single `0xA9C6` parked
+// in ring 0 immediately, so no CPL3-origin ACK was reachable.
+//
+//   xor eax, eax        ; RAX = 0  (SYSCALL_YIELD_NR — normal range)
+//   syscall             ; → normal global-lock dispatch (handle_yield), returns
+//   mov r12..r15, <canaries>
+//   mov eax, 0xA9C6     ; phase 1
+//   syscall             ; → LSTAR magic fast path: publish gs:[168]=1, SYSRETQ back
+//   <bounded RDTSC dwell — no syscall, no memory access, no privileged insn>
+//   cmp r12..r15, <canaries> ; any mismatch → diverge to `fail`, never reaching phase 2
+//   mov eax, 0xA9C6     ; phase 2
+//   syscall             ; → LSTAR magic fast path: park (existing behaviour)
+//   jmp .
+// fail:
+//   jmp .
+//
+// The canary compare is the LIVE context-preservation proof: reaching the phase-2 park at
+// all (observable as gs:[168] plus the existing 'R' serial breadcrumb) is only possible if
+// every callee-saved GPR survived the 0xF1 interrupt that fired during the dwell. A
+// corrupted context diverges to `fail` and the BSP's bounded poll reports a timeout
+// instead of a false pass.
+//
+// The dwell keeps its deadline in RCX and uses RAX/RDX as RDTSC's own clobbers, so no
+// canary register is touched by the dwell itself. It always terminates: the loop exits as
+// soon as the 64-bit TSC reaches a deadline computed once, up-front.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_CANARY_R12: u32 = 0x0111_1111;
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_CANARY_R13: u32 = 0x0222_2222;
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_CANARY_R14: u32 = 0x0333_3333;
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_CANARY_R15: u32 = 0x0444_4444;
+// ~134M TSC cycles. Long enough for the BSP to observe the `0 -> 1` edge and drive
+// bounded serialized shootdowns under QEMU, short enough to stay a bounded smoke step.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_DWELL_TSC_DELTA: u32 = 0x0800_0000;
+#[rustfmt::skip]
+    pub(crate) const AP_PROBE_STUB: [u8; 119] = [
+        //   0: xor eax, eax  (RAX = 0 = Yield)
+        0x31, 0xC0,
+        //   2: syscall
+        0x0F, 0x05,
+        //   4: mov r12, AP_CANARY_R12
+        0x49, 0xC7, 0xC4, 0x11, 0x11, 0x11, 0x01,
+        //  11: mov r13, AP_CANARY_R13
+        0x49, 0xC7, 0xC5, 0x22, 0x22, 0x22, 0x02,
+        //  18: mov r14, AP_CANARY_R14
+        0x49, 0xC7, 0xC6, 0x33, 0x33, 0x33, 0x03,
+        //  25: mov r15, AP_CANARY_R15
+        0x49, 0xC7, 0xC7, 0x44, 0x44, 0x44, 0x04,
+        //  32: mov eax, 0xA9C6          (phase 1)
+        0xB8, 0xC6, 0xA9, 0x00, 0x00,
+        //  37: syscall                  -> returns to offset 39
+        0x0F, 0x05,
+        //  39: rdtsc
+        0x0F, 0x31,
+        //  41: shl rdx, 32
+        0x48, 0xC1, 0xE2, 0x20,
+        //  45: or  rax, rdx             (RAX = full TSC now)
+        0x48, 0x09, 0xD0,
+        //  48: mov rcx, rax
+        0x48, 0x89, 0xC1,
+        //  51: add rcx, AP_DWELL_TSC_DELTA   (RCX = deadline)
+        0x48, 0x81, 0xC1, 0x00, 0x00, 0x00, 0x08,
+        //  58: rdtsc                    <- dwell loop head
+        0x0F, 0x31,
+        //  60: shl rdx, 32
+        0x48, 0xC1, 0xE2, 0x20,
+        //  64: or  rax, rdx
+        0x48, 0x09, 0xD0,
+        //  67: cmp rax, rcx
+        0x48, 0x39, 0xC8,
+        //  70: jb  58                   (rel8 = 58 - 72 = -14)
+        0x72, 0xF2,
+        //  72: cmp r12, AP_CANARY_R12
+        0x49, 0x81, 0xFC, 0x11, 0x11, 0x11, 0x01,
+        //  79: jne fail                 (rel8 = 117 - 81 = 36)
+        0x75, 0x24,
+        //  81: cmp r13, AP_CANARY_R13
+        0x49, 0x81, 0xFD, 0x22, 0x22, 0x22, 0x02,
+        //  88: jne fail                 (rel8 = 117 - 90 = 27)
+        0x75, 0x1B,
+        //  90: cmp r14, AP_CANARY_R14
+        0x49, 0x81, 0xFE, 0x33, 0x33, 0x33, 0x03,
+        //  97: jne fail                 (rel8 = 117 - 99 = 18)
+        0x75, 0x12,
+        //  99: cmp r15, AP_CANARY_R15
+        0x49, 0x81, 0xFF, 0x44, 0x44, 0x44, 0x04,
+        // 106: jne fail                 (rel8 = 117 - 108 = 9)
+        0x75, 0x09,
+        // 108: mov eax, 0xA9C6          (phase 2)
+        0xB8, 0xC6, 0xA9, 0x00, 0x00,
+        // 113: syscall                  -> parks in ring 0
+        0x0F, 0x05,
+        // 115: jmp .                    (unreachable: phase 2 never returns)
+        0xEB, 0xFE,
+        // 117: fail: jmp .              (canary mismatch — never reaches phase 2)
+        0xEB, 0xFE,
+    ];
+// The canary immediates and the dwell delta are encoded little-endian in the stub above;
+// pin them so an edit to either constant cannot silently disagree with the machine code.
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_CANARY_R12.to_le_bytes()[3] == 0x01);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_CANARY_R13.to_le_bytes()[3] == 0x02);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_CANARY_R14.to_le_bytes()[3] == 0x03);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_CANARY_R15.to_le_bytes()[3] == 0x04);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_DWELL_TSC_DELTA.to_le_bytes()[3] == 0x08);
+
+/// U9-D3: the two-phase AP probe stub, for the focused tests that decode it.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn ap_probe_stub_bytes() -> &'static [u8] {
+    &AP_PROBE_STUB
+}
+
 impl KernelState {
     fn page_flags_from_elf_pflags(p_flags: u32) -> Result<PageFlags, KernelError> {
         let mut read = (p_flags & PF_R) != 0;
@@ -1484,19 +1606,6 @@ impl KernelState {
     ) -> Result<(u64, u64, u64), KernelError> {
         const PROBE_CODE_VA: u64 = 0x0000_0000_2000_0000;
         const PROBE_STACK_VA: u64 = 0x0000_0000_2001_0000;
-        // Seal stub (normal syscall FIRST, magic park SECOND):
-        //   xor eax, eax        ; RAX = 0  (SYSCALL_YIELD_NR — normal range)
-        //   syscall             ; → normal global-lock dispatch (handle_yield), returns
-        //   mov eax, 0xA9C6     ; magic park number (early diagnostic only)
-        //   syscall             ; → LSTAR magic fast path: set flag + hlt (parks)
-        //   jmp .
-        const PROBE_STUB: [u8; 13] = [
-            0x31, 0xC0, // xor eax, eax  (RAX = 0 = Yield)
-            0x0F, 0x05, // syscall
-            0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6
-            0x0F, 0x05, // syscall
-            0xEB, 0xFE, // jmp .
-        ];
         // Stage 199A2D2C1/C2A: when the x86_64 SMP cross-CPU request oracle is armed, the AP proof
         // task runs an ORDINARY userspace stub that (a) emits X86_AP_GENERIC_USER_ENTRY, (b) runs a
         // real Yield syscall, and (c) — reached ONLY through the saved-frame return path — emits
@@ -1517,25 +1626,49 @@ impl KernelState {
         const _: () = assert!(AP_SAVED_RESUMED_MARKER.len() == 99);
         // Stub: DebugLog(GENERIC) -> DebugLog(BEFORE) -> Yield -> [saved-frame resume lands here] ->
         // DebugLog(RESUMED) -> park. 64 bytes; the post-Yield continuation RIP = PROBE_CODE_VA + 38.
-        const PROBE_STUB_SMP: [u8; 64] = [
-            0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax, 15   (DebugLog NR)
-            0xBF, 0x00, 0x00, 0x02, 0x20, // mov edi, 0x20020000 (GENERIC ptr)
-            0xBE, 0x3F, 0x00, 0x00, 0x00, // mov esi, 63   (GENERIC len)
-            0x0F, 0x05, // syscall  (DebugLog GENERIC)
-            0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax, 15
-            0xBF, 0x00, 0x01, 0x02, 0x20, // mov edi, 0x20020100 (BEFORE ptr)
-            0xBE, 0x1B, 0x00, 0x00, 0x00, // mov esi, 27   (BEFORE len)
-            0x0F, 0x05, // syscall  (DebugLog BEFORE)
-            0x31, 0xC0, // xor eax, eax  (Yield)
-            0x0F,
-            0x05, // syscall  (Yield) -- continuation RIP = next byte (PROBE_CODE_VA + 38)
-            0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax, 15
-            0xBF, 0x00, 0x02, 0x02, 0x20, // mov edi, 0x20020200 (RESUMED ptr)
-            0xBE, 0x63, 0x00, 0x00, 0x00, // mov esi, 99   (RESUMED len)
-            0x0F, 0x05, // syscall  (DebugLog RESUMED)
-            0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6  (park)
-            0x0F, 0x05, // syscall
-            0xEB, 0xFE, // jmp .
+        // U9-D3 §4: this is the AP stub that actually RESUMES past its `Yield` (via the
+        // saved-frame resume at +38); the selector-off PROBE_STUB blocks there and is
+        // descheduled, so it never reaches the magic syscall at all. The bounded ring-3 RDTSC
+        // dwell therefore lives HERE, between the two `0xA9C6` phases, because this is the only
+        // stub that gives CPU 1 a durable ring-3 window for a CPL3-origin shootdown to land in.
+        // Bytes 0..55 are unchanged, so the saved-frame continuation RIP (PROBE_CODE_VA + 38)
+        // and every offset the existing smoke asserts are untouched.
+        #[rustfmt::skip]
+        const PROBE_STUB_SMP: [u8; 170] = [
+            //   0: DebugLog(GENERIC)
+            0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x3F, 0x00, 0x00, 0x00, 0x0F, 0x05,
+            //  17: DebugLog(BEFORE)
+            0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x01, 0x02, 0x20, 0xBE, 0x1B, 0x00, 0x00, 0x00, 0x0F, 0x05,
+            //  34: Yield  (saved-frame resume lands at +38)
+            0x31, 0xC0, 0x0F, 0x05,
+            //  38: DebugLog(RESUMED)
+            0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x02, 0x02, 0x20, 0xBE, 0x63, 0x00, 0x00, 0x00, 0x0F, 0x05,
+            //  55: mov r12, canary
+            0x49, 0xC7, 0xC4, 0x11, 0x11, 0x11, 0x01,
+            //  62: mov r13, canary
+            0x49, 0xC7, 0xC5, 0x22, 0x22, 0x22, 0x02,
+            //  69: mov r14, canary
+            0x49, 0xC7, 0xC6, 0x33, 0x33, 0x33, 0x03,
+            //  76: mov r15, canary
+            0x49, 0xC7, 0xC7, 0x44, 0x44, 0x44, 0x04,
+            //  83: mov eax,0xA9C6 ; syscall   (phase 1 -> returns)
+            0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05,
+            //  90: bounded RDTSC dwell in ring 3 (deadline in RCX)
+            0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xD0, 0x48, 0x89, 0xC1, 0x48, 0x81, 0xC1, 0x00, 0x00, 0x00, 0x08,
+            // 109: dwell loop head
+            0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xD0, 0x48, 0x39, 0xC8, 0x72, 0xF2,
+            // 123: cmp r12, canary ; jne fail
+            0x49, 0x81, 0xC4, 0x11, 0x11, 0x11, 0x01, 0x75, 0x24,
+            // 132: cmp r13, canary ; jne fail
+            0x49, 0x81, 0xC5, 0x22, 0x22, 0x22, 0x02, 0x75, 0x1B,
+            // 141: cmp r14, canary ; jne fail
+            0x49, 0x81, 0xC6, 0x33, 0x33, 0x33, 0x03, 0x75, 0x12,
+            // 150: cmp r15, canary ; jne fail
+            0x49, 0x81, 0xC7, 0x44, 0x44, 0x44, 0x04, 0x75, 0x09,
+            // 159: mov eax,0xA9C6 ; syscall   (phase 2 -> parks) ; jmp .
+            0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
+            // 168: fail: jmp .
+            0xEB, 0xFE,
         ];
         // Stage 199A2D2C2B1: when the recv-v2-server sub-selector is armed the SMP AP workload is a
         // REAL IPC server instead of the C2A Yield proof. Its stub (a) emits the userspace marker
@@ -1602,8 +1735,8 @@ impl KernelState {
             0x10, 0x00, 0x04, 0x20, 0x8B, 0x07, 0x85, 0xC0, 0x0F, 0x84, 0x2B, 0x00, 0x00, 0x00,
             0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00,
             0x00, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x05, 0x02, 0x20, 0xBE,
-            0x75, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB,
-            0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x04, 0x02, 0x20, 0xBE, 0x2F, 0x00,
+            0x75, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0x0F,
+            0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x04, 0x02, 0x20, 0xBE, 0x2F, 0x00,
             0x00, 0x00, 0x0F, 0x05, 0xEB, 0xE4,
         ];
         // Stage 199A2D2C2C: the REVERSE-direction server stub. Prefix identical to RECV_V2_SERVER_STUB_
@@ -1744,7 +1877,7 @@ impl KernelState {
             0x00, 0x00, 0x0F, 0x05, 0x85, 0xC9, 0x74, 0x10, 0x83, 0xF9, 0x07, 0x75, 0x25, 0x83,
             0xFB, 0x40, 0x73, 0x20, 0x31, 0xC0, 0x0F, 0x05, 0xEB, 0xCE, 0xB8, 0x0F, 0x00, 0x00,
             0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x37, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8,
-            0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF,
+            0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF,
             0x00, 0x01, 0x02, 0x20, 0xBE, 0x26, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xE4,
         ];
         const CLIENT_STUB_SEND_CAP_PATCH_OFFSET: usize = 10;
@@ -1781,10 +1914,10 @@ impl KernelState {
             0x8B, 0x07, 0x85, 0xC0, 0x74, 0x2B, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x02,
             0x02, 0x20, 0xBE, 0x2A, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00,
             0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6,
-            0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00,
+            0xA9, 0x00, 0x00, 0x0F, 0x05, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00,
             0x04, 0x02, 0x20, 0xBE, 0x2E, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F,
             0x00, 0x00, 0x00, 0xBF, 0x00, 0x01, 0x02, 0x20, 0xBE, 0x26, 0x00, 0x00, 0x00, 0x0F,
-            0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
+            0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0x0F, 0x05,
         ];
         const CLIENT_C2C_SEND_CAP_PATCH_OFFSET: usize = 10;
         // Same tie for the reverse-direction client: its NR6 send uses the framed wire length.
@@ -1935,7 +2068,7 @@ impl KernelState {
                     AP_SAVED_RESUMED_MARKER,
                 )?;
             } else {
-                self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB)?;
+                self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &AP_PROBE_STUB)?;
             }
             // Stack page: user + read + write (sequential single-AP use).
             let stack_phys = self.alloc_user_data_frame()?;
@@ -3662,12 +3795,95 @@ impl KernelState {
         }
     }
 
+    /// U9-D3 §7 — the broad-lock-free twin of [`Self::d6_emit_proof_cleanup_arch_markers`].
+    ///
+    /// Every effect is preserved, in the same order, reached through single-rank seams and
+    /// lock-free HAL primitives instead of a broad `&mut KernelState`:
+    ///
+    /// * `current_tid` — rank 1, read for the EXPLICIT `cpu` the drain is running on. That is the
+    ///   same value the broad form read, because `with_cpu(cpu, …)` bound `current_cpu` to `cpu`
+    ///   before the body ran, so its `self.current_tid()` was this CPU's current task.
+    /// * the active ASID — `arch::hal::active_address_space`, a per-CPU atomic. The broad form
+    ///   reached it via `self.hal.active_asid_on(..)`, which is that same function; no lock was
+    ///   ever involved.
+    /// * `task_asid` — rank 2.
+    /// * the CR3 force-restore — `hal_adapters::switch_address_space` plus
+    ///   `note_address_space_activated`, both free functions, exactly what `Hal::switch_address_space`
+    ///   does. It runs with NO lock held, which is where a CR3 write belongs.
+    ///
+    /// `d6_emit_proof_cleanup_arch_markers` is left unmodified as the foundation this mirrors.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_emit_proof_cleanup_arch_markers_split(
+        shared: &crate::runtime::SharedKernel,
+        cpu: CpuId,
+    ) {
+        let current_tid = shared.current_tid_split_read(cpu).unwrap_or(u64::MAX);
+        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK tid={}", current_tid);
+        let active_asid = crate::arch::hal::active_address_space(cpu).map_or(0, |asid| asid.0);
+        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CR3_OK asid={}", active_asid);
+        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_TSS_OK");
+        // Stage 139, unchanged: force-restore hardware CR3 to the current task's address space so
+        // subsequent ASID switches see a consistent starting state.
+        #[cfg(not(feature = "hosted-dev"))]
+        if let Some(task_asid) = shared.task_asid_opt_split_read(current_tid) {
+            let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+            crate::yarm_log!(
+                "D6_PROOF_CR3_CLEANUP_RESTORE hw_cr3=0x{:016x} task_asid={}",
+                hw_cr3,
+                task_asid.0
+            );
+            crate::arch::hal_adapters::switch_address_space(task_asid);
+            crate::arch::hal::note_address_space_activated(cpu, task_asid);
+            crate::yarm_log!("D6_PROOF_CR3_CLEANUP_OK");
+        }
+    }
+
+    /// U9-D3 §7 — the lock-free form of [`Self::d6_check_asid1_stack_page_mapped`].
+    ///
+    /// It takes no `self` because the broad form never used any: the body reads CR3 and walks the
+    /// page tables through the direct map, touching no kernel-state domain. Taking `&self` was the
+    /// only thing that made it look like it belonged inside the broad acquisition. Byte-identical
+    /// markers; the broad form is left unmodified as the foundation this mirrors.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_check_asid1_stack_page_mapped_split() {
+        const CHECK_PAGE: u64 = 0xffff_8000_0000_d000;
+        #[cfg(not(test))]
+        {
+            const VIRT_OFFSET: u64 = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
+            let pml4_phys = unsafe {
+                let mut cr3: u64;
+                core::arch::asm!(
+                    "mov {}, cr3",
+                    out(reg) cr3,
+                    options(nomem, preserves_flags)
+                );
+                cr3 & 0x000F_FFFF_FFFF_F000
+            };
+            crate::yarm_log!("D6_ASID1_PAGE_CHECK_CR3 phys=0x{:x}", pml4_phys);
+            let pte = unsafe { d6_x86_walk_4level(CHECK_PAGE, pml4_phys, VIRT_OFFSET) };
+            match pte {
+                Some(p) => crate::yarm_log!(
+                    "D6_ASID1_PAGE_CHECK_MAPPED present=yes pte=0x{:x} page=0x{:016x}",
+                    p,
+                    CHECK_PAGE
+                ),
+                None => crate::yarm_log!(
+                    "D6_ASID1_PAGE_CHECK_MAPPED present=no page=0x{:016x}",
+                    CHECK_PAGE
+                ),
+            }
+        }
+        #[cfg(test)]
+        let _ = CHECK_PAGE;
+    }
+
     /// Stage 133: software page-table walk to verify ASID 1 maps page 0xffff80000000d000.
     ///
     /// Reads the current CR3 (which at CLEANUP_DONE is TID1/ASID1's root) and walks
     /// the 4-level page table for the exact page that contained the observed
     /// CR2=0xffff80000000d9d8.  Emits D6_ASID1_PAGE_CHECK_* markers before CLEANUP_DONE.
     #[cfg(target_arch = "x86_64")]
+    #[allow(dead_code)]
     pub(crate) fn d6_check_asid1_stack_page_mapped(&self) {
         const CHECK_PAGE: u64 = 0xffff_8000_0000_d000;
         #[cfg(not(test))]

@@ -1285,6 +1285,16 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
             halt_forever();
         }
+        // U9-D3 §4: the USER-ORIGIN TLB shootdown cell, driven from the x86 post-lock epilogue.
+        // `dispatch_trap_entry_with_shared_kernel` has returned, so the broad lock is RELEASED —
+        // which this cell requires, because it polls CPU 1 for the ring-3 residency edge and that
+        // CPU may still need the global lock to finish its `Yield` before it reaches its dwell.
+        // BSP-only: the AP traps through here too, and only the BSP drives shootdowns. Inert
+        // unless `yarm.ap_user_dispatch=1`, and one-shot once it fires.
+        if cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+            crate::arch::x86_64::smp::ap_tlb_shootdown_user_origin_proof();
+        }
+
         // Stage 189D: the AP probe's normal syscall reached the global-lock dispatch
         // and returned Ok — emit the seal completion markers (one-shot; clears the
         // per-CPU seal-probe flag). Stage 190A: then RETURN the probe to the AP
@@ -1573,15 +1583,45 @@ yarm_x86_lstar_entry:
     // and adds one compare+branch to the proven baseline.
     //
     // On a match we do NOT descend into the shared kernel dispatch (that would
-    // run the whole global-lock kernel on the AP without the lock). Instead we
-    // prove per-CPU LSTAR entry executed ON THIS CPU by setting the per-CPU
-    // ap_syscall_reentry_ok flag (gs:[168], kernel .bss addressable under the
-    // task CR3) and parking. The BSP polls the flag and emits the marker. RAX
-    // and the serial scratch registers are safe to clobber here — the probe
-    // path never returns to userspace.
+    // run the whole global-lock kernel on the AP without the lock).
+    //
+    // U9-D3 — TWO-PHASE HANDSHAKE. This path used to set gs:[168] and park
+    // unconditionally, so CPU 1 had no durable ring-3 residency and a CPL3-origin
+    // shootdown ACK was unreachable. It is now return-once / park-second:
+    //
+    //   first  0xA9C6 (gs:[168] == 0): publish gs:[168] = 1 and SYSRETQ back to the
+    //                                  exact next ring-3 instruction;
+    //   second 0xA9C6 (gs:[168] == 1): the existing permanent ring-0 park.
+    //
+    // The 0 -> 1 edge is what tells the BSP that CPU 1 is RESIDENT IN RING 3.
+    //
+    // This is proof-private, NOT public syscall ABI: real YARM syscall numbers are
+    // 0..32, so 0xA9C6 (43462) can never be a production (BSP) syscall, and no
+    // public dispatch arm is added or changed by either phase.
+    //
+    // REGISTER DISCIPLINE on the returning phase: not one GPR is written. The
+    // discriminator and the publish are both gs-relative memory operands, and
+    // SYSCALL already placed the user's return RIP in RCX and the user's RFLAGS in
+    // R11 — exactly what SYSRETQ consumes. RAX still holds 0xA9C6 on return, and
+    // every other GPR (including RSP, which was never switched to the kernel stack)
+    // is the user's authentic value. Interrupts are masked here by IA32_FMASK, and
+    // the only memory this phase touches is the per-CPU record, which is mapped in
+    // every task root — so no fault can take the still-user RSP.
+    //
+    // SYSRETQ is correct here because `configure_syscall_msrs_for_self` programs
+    // STAR[63:48] = USER_CODE_SELECTOR - 16, so SYSRETQ loads exactly the ring-3
+    // CS/SS pair (0x23/0x1b) the iretq return path builds by hand.
+    //
+    // The parking phase keeps its serial breadcrumb; the returning phase emits
+    // nothing, because serial output is not synchronization and a port write would
+    // clobber user DX/AL.
     cmp rax, 0xA9C6
     jne 2f
-    mov dword ptr gs:[168], 1        // ap_syscall_reentry_ok = 1 (persistent)
+    cmp dword ptr gs:[168], 0
+    jne 4f                           // already returned once -> permanent park
+    mov dword ptr gs:[168], 1        // ap_syscall_reentry_ok = 1 (ring-3 resident)
+    sysretq                          // -> exact next ring-3 instruction
+4:
     mov dx, 0x3f8
     mov al, 0x52                     // 'R' — AP ring3 SYSCALL re-entry observed
     out dx, al
@@ -2263,14 +2303,71 @@ yarm_ap_irq_smoke_stub:
 
     .align 16
 yarm_ap_remote_wake_stub:
-    // Stage 183.5 remote-wake handler (vector 0xF1): count the wake via gs:,
-    // EOI, iretq. The scheduler-idle loop observes the count change, publishes
-    // the re-entry, and returns to idle. Preserves every register it touches.
+    // Stage 183.5 remote-wake handler (vector 0xF1) — U9-D3: now ALSO the SOLE
+    // target-side TLB invalidation and generation-matched ACK producer, for BOTH
+    // CPL0 and CPL3 origins. The AP sched-idle loop's independent invlpg + ack_gen
+    // write is deleted, so there is exactly one producer of `tlb_ack_gen` in the
+    // tree and it works whether the IPI lands on kernel idle or on a live ring-3
+    // task.
+    //
+    // FRAME SHAPE. This is an INTERRUPT gate with no error code. In long mode the
+    // CPU pushes SS:RSP unconditionally — including for a same-privilege interrupt —
+    // so the entry frame is always five qwords and the saved CS is at a FIXED
+    // offset regardless of the interrupted CPL:
+    //     [rsp+ 0] RIP   [rsp+ 8] CS   [rsp+16] RFLAGS   [rsp+24] RSP   [rsp+32] SS
+    // (The sibling #PF stub below documents the same layout shifted by its error
+    // code.) After the three pushes here, CS is at [rsp+32]. Nothing weaker than
+    // that is relied on: the frames are NOT assumed to be otherwise identical.
+    //
+    // ORDER. Invalidate, then record origin, then publish the ACK — so an observer
+    // that sees `ack_gen == want` is guaranteed the invalidation already happened
+    // and the origin already belongs to THAT generation (x86-TSO store ordering).
+    // A spurious or duplicate IPI (`req_gen == ack_gen`) only EOIs and returns,
+    // touching neither the origin nor the ACK.
+    //
+    // No broad lock, no Rust trap dispatcher, no scheduler policy, no current_cpu
+    // mutation, no mailbox impersonation, no yield_current.
     push rax
+    push rcx
+    push rdx
+    // (2) existing wake accounting, unchanged.
     add dword ptr gs:[{wake_count_off}], 1
+    // (3) origin from the saved CS.RPL, read BEFORE anything can modify the frame.
+    //     RPL 0 -> KERNEL(1), RPL 3 -> USER(2), branch-free.
+    mov rax, qword ptr [rsp + 32]
+    and eax, 3
+    shr eax, 1
+    inc eax
+    // (4) coherent request read: generation FIRST, then VA — the mirror of the
+    //     BSP's publication order (VA written, then gen bumped).
+    mov ecx, dword ptr gs:[{tlb_req_gen_off}]
+    mov rdx, qword ptr gs:[{tlb_req_va_off}]
+    // (5) nothing pending for this CPU: EOI and return, produce no ACK.
+    cmp ecx, dword ptr gs:[{tlb_ack_gen_off}]
+    je 91f
+    test rdx, rdx
+    jz 92f
+    // (6) single-page invalidation.
+    invlpg [rdx]
+    jmp 93f
+92:
+    // (7) va == 0: the existing full non-global flush convention (CR3 reload).
+    mov rdx, cr3
+    mov cr3, rdx
+93:
+    // (8) origin for this generation, published BEFORE the ACK it belongs to.
+    mov dword ptr gs:[{tlb_ack_origin_off}], eax
+    // (9) the ACK itself, last.
+    mov dword ptr gs:[{tlb_ack_gen_off}], ecx
+91:
+    // (10) LAPIC EOI exactly once, on every path.
     movabs rax, {lapic_eoi}
     mov dword ptr [rax], 0
+    // (11) restore every register this handler touched.
+    pop rdx
+    pop rcx
     pop rax
+    // (12) back to the exact interrupted context, at either CPL.
     iretq
 
     .align 16
@@ -2300,6 +2397,10 @@ yarm_ap_page_fault_stub:
     wake_count_off = const super::percpu::REMOTE_WAKE_COUNT_OFFSET,
     irq_stage_off = const super::percpu::IRQ_STAGE_OFFSET,
     lapic_eoi = const super::platform_layout::LAPIC_MMIO_BASE + 0xB0,
+    tlb_req_gen_off = const super::percpu::TLB_REQ_GEN_OFFSET,
+    tlb_ack_gen_off = const super::percpu::TLB_ACK_GEN_OFFSET,
+    tlb_req_va_off = const super::percpu::TLB_REQ_VA_OFFSET,
+    tlb_ack_origin_off = const super::percpu::TLB_ACK_ORIGIN_OFFSET,
 );
 
 #[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]

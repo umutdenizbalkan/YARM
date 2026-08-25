@@ -272,70 +272,59 @@ pub(crate) fn post_switch_restore_arch_thread_state_split(
     }
 }
 
-/// U9 (canonical 203C) — the ONE broad acquisition still required at the Stage 117 switch-plan
-/// stash drain, and the two disjoint consumers that still need it.
+/// U9-D3 §7 — the D6 cleanup overlay at the Stage 117 switch-plan stash drain, now with NO broad
+/// lock. This replaced `post_switch_restore_broad_tail`, the last broad acquisition on this path.
 ///
-/// Neither is an ordinary production switch. On x86_64 and AArch64 a normal switch now returns
-/// through [`post_switch_restore_arch_thread_state_split`] without entering this at all.
+/// The overlay is reached only under `yarm.d6_switch_proof=1` or `yarm.d6_switch_a=1`, and it is
+/// NOT obsolete diagnostics. `d6_ensure_post_cleanup_task_stacks_mapped` is a functional repair —
+/// it shares every live task's kernel-stack pages into the active root and into every task root,
+/// without which a post-cleanup trap faults on a supervisor stack write (Stage 165D/165F/165G) —
+/// and `D6_SWITCH_A_DONE` is emitted only here, for the D6-SWITCH-A *production* unlocked-switch
+/// milestone, whose knob runs this path with the controlled-proof knob OFF.
+/// `scripts/qemu-x86_64-core-smoke.sh` hard-asserts both. Every one of those effects is preserved
+/// here, in the same order; only the lock shape changed.
 ///
-/// * **The D6 cleanup overlay** (`is_proof_done`), reached under `yarm.d6_switch_proof=1` or
-///   `yarm.d6_switch_a=1`. It is NOT obsolete diagnostics:
-///   `d6_ensure_post_cleanup_task_stacks_mapped` is a functional repair — it shares every live
-///   task's kernel-stack pages into the active root and into every task root, without which a
-///   post-cleanup trap faults on a supervisor stack write (Stage 165D/165F/165G) — and
-///   `D6_SWITCH_A_DONE` is emitted only here, for the D6-SWITCH-A *production* unlocked-switch
-///   milestone, whose knob runs this path with the controlled-proof knob OFF.
-///   `scripts/qemu-x86_64-core-smoke.sh` hard-asserts both.
-/// * **The RISC-V restore**, kept verbatim because the drain is statically unreachable there (see
-///   the callsite).
-///
-/// It cannot be split, and that is a D3 question rather than a missing-effort one: the cleanup
+/// **Why it can be split now.** U3 and U9/203C both recorded the same blocker: the cleanup
 /// allocates backing frames (`alloc_user_data_frame`, rank 6) and maps them across address spaces,
-/// so a split form would have to add `with_memory_split_mut` — fenced by `AI_AGENT_RULES` §14.4
-/// until the lock-free `await_tlb_shootdown_ack` design and its multi-CPU smoke land. This is the
-/// same conclusion U3 recorded when it excluded this site.
-fn post_switch_restore_broad_tail(
+/// so a split form needs `with_memory_split_mut` — fenced by `AI_AGENT_RULES` §14.4 "without the
+/// lock-free `await_tlb_shootdown_ack` design and multi-CPU smoke". U9-D3 delivered exactly that:
+/// vector 0xF1 is the sole target-side invalidation and generation-matched ACK producer, proven
+/// live from CPL0 and CPL3. The fence is lifted, and this site is no longer excluded.
+///
+/// It owes no shootdown of its own: it only ADDS supervisor mappings for frames that were
+/// unmapped in the target root, and a mapping that fails hands its frame straight back
+/// (`free_unmapped_user_data_frame_split`) before any page table could refer to it.
+///
+/// The **RISC-V restore** that used to share this tail is gone with it, and nothing is weakened:
+/// the drain is statically unreachable on RISC-V. `maybe_switch_kernel_context`
+/// (`exec_state.rs`) gates the stash on `!cfg!(target_arch = "riscv64") && …`, so
+/// `DISPATCH_SWITCH_PLAN_STASH` is never populated there and `has_plan()` — this whole block's
+/// entry condition — is never true. `post_switch_restore_arch_thread_state`'s RISC-V arm remains
+/// defined as the cross-arch FOUNDATION, exactly as the x86_64 and AArch64 arms do.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+fn post_switch_d6_cleanup_split(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
-    frame: Option<&mut TrapFrame>,
-    is_proof_done: bool,
     d6_switch_a_mode: bool,
-) -> Result<(), TrapHandleError> {
-    #[cfg(not(target_arch = "riscv64"))]
-    let _ = frame;
-    shared
-        .with_cpu(cpu, |kernel| {
-            let _ = &kernel;
-            // Only the statically-unreachable RISC-V arm still restores in-lock.
-            #[cfg(target_arch = "riscv64")]
-            let result = post_switch_restore_arch_thread_state(kernel, cpu, frame);
-            #[cfg(not(target_arch = "riscv64"))]
-            let result: Result<(), TrapHandleError> = Ok(());
-            if is_proof_done {
-                #[cfg(target_arch = "x86_64")]
-                kernel.d6_emit_proof_cleanup_arch_markers();
-                // Stage 133: verify ASID 1 maps the fault page before emitting DONE.
-                #[cfg(target_arch = "x86_64")]
-                kernel.d6_check_asid1_stack_page_mapped();
-                // Stage 165D: the proof restored CR3 to asid 1, but normal
-                // scheduling/trap/idle can land a post-cleanup trap on
-                // another task's kernel stack (observed: tid=3) while asid 1
-                // is active — and per-task kernel stacks are mapped only in
-                // their own root.  Share every live task's kernel stack
-                // pages into the active root and all task roots so no
-                // post-cleanup trap faults on a supervisor stack write.
-                #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
-                if let Err(err) = kernel.d6_ensure_post_cleanup_task_stacks_mapped() {
-                    crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_FAILED err={:?}", err);
-                }
-                crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE");
-                if d6_switch_a_mode {
-                    crate::yarm_log!("D6_SWITCH_A_DONE");
-                }
-            }
-            result
-        })
-        .map_err(|err| TrapHandleError::Syscall(err.into()))?
+) {
+    // rank 1 → rank 2 → lock-free CR3 restore, all inside; no lock spans any of it.
+    #[cfg(target_arch = "x86_64")]
+    KernelState::d6_emit_proof_cleanup_arch_markers_split(shared, cpu);
+    // Stage 133: verify ASID 1 maps the fault page before emitting DONE. This reads CR3 and walks
+    // page tables directly — it never needed kernel state at all.
+    #[cfg(target_arch = "x86_64")]
+    KernelState::d6_check_asid1_stack_page_mapped_split();
+    // Stage 165D/165F/165G, unchanged in every effect: share every live task's kernel stack pages
+    // into the active root and all task roots so no post-cleanup trap faults on a supervisor stack
+    // write. Rank 6 is now taken for the frame ALLOCATION alone and released before each mapping.
+    #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
+    if let Err(err) = KernelState::d6_ensure_post_cleanup_task_stacks_mapped_split(shared, cpu) {
+        crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_FAILED err={:?}", err);
+    }
+    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE");
+    if d6_switch_a_mode {
+        crate::yarm_log!("D6_SWITCH_A_DONE");
+    }
 }
 
 pub fn handle_trap_entry_shared(
@@ -1882,22 +1871,21 @@ pub fn handle_trap_entry_shared(
             #[cfg(target_arch = "riscv64")]
             let restore_result: Result<(), TrapHandleError> = Ok(());
 
-            // The D6 cleanup overlay and the RISC-V restore are the ONLY remaining reasons this
-            // site touches the broad lock. An ordinary production switch on x86_64 or AArch64
-            // now skips this entirely — `is_proof_done` is false and the `cfg!` is a
-            // compile-time false — so it re-acquires nothing.
+            // U9-D3 §7: the D6 cleanup overlay is the ONLY remaining consumer here, and it no
+            // longer touches the broad lock — this site holds NO broad acquisition at all. An
+            // ordinary production switch skips it entirely (`is_proof_done` is false).
             //
-            // Order is preserved: the restore ran first and its result was propagated last, so
-            // the overlay still observes exactly the state it did before, and a restore error
-            // still surfaces only after the cleanup has run.
-            if is_proof_done || cfg!(target_arch = "riscv64") {
-                post_switch_restore_broad_tail(
-                    shared,
-                    cpu,
-                    frame.as_deref_mut(),
-                    is_proof_done,
-                    d6_switch_a_mode,
-                )?;
+            // The `|| cfg!(target_arch = "riscv64")` arm went with the tail. It existed to run
+            // RISC-V's in-lock restore, and that arm was already statically unreachable: the stash
+            // gate in `maybe_switch_kernel_context` opens with `!cfg!(target_arch = "riscv64")`,
+            // so `has_plan()` — this block's entry condition — is never true on RISC-V. Removing
+            // an unreachable branch weakens nothing; the FOUNDATION restore stays defined.
+            //
+            // Order is preserved: the restore ran first and its result is propagated last, so the
+            // overlay still observes exactly the state it did before, and a restore error still
+            // surfaces only after the cleanup has run.
+            if is_proof_done {
+                post_switch_d6_cleanup_split(shared, cpu, d6_switch_a_mode);
             }
             restore_result?;
             // Stage 132: arm the first post-cleanup trap diagnostic.

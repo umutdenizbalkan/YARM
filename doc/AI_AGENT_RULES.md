@@ -1006,6 +1006,27 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   the lock-free `await_tlb_shootdown_ack` design and multi-CPU smoke.
   The shootdown-before-reclaim source order inside
   `execute_tlb_shootdown_wait_plan` is UAF-load-bearing.
+  - **U9-D3 DISCHARGED this precondition.** The design exists and is live:
+    vector `0xF1` is the SOLE target-side invalidation and generation-matched
+    ACK producer (the trampoline's mailbox service block is deleted, so nothing
+    races it), and it earns real ACKs from BOTH CPL0 and CPL3 —
+    `qemu-x86_64-ap-saved-return-smoke`, three identical runs,
+    `kernel_acks=2, user_acks=1`, `DONE result=ok context=user_origin`.
+    `SharedKernel::complete_unmap_shootdown_split` drives it with NO domain or
+    broad lock held, targeting `live_cpu_bitmap_for_asid_split` rather than the
+    complement `online_wake_only_ap_bitmap`.
+  - The fence itself is NOT retired, and what it now requires is stricter, not
+    looser: a new `with_vm_split_mut` / `with_memory_split_mut` must reach the
+    shootdown through that coordinator and must preserve
+    **unmap before ACK before reclaim** — reclaim only after every target has
+    published `ack_gen == req_gen`. A shootdown that does not complete must
+    leave the frame UNAVAILABLE for reuse rather than recycling memory a remote
+    CPU may still translate; that is the fail-safe direction, and it is why the
+    refcount drop is never gated while the reclaim always is.
+  - Do NOT reach for `request_live_asid_shootdown` to satisfy this: it
+    impersonates the requester onto each target (`set_current_cpu`), drains the
+    targets' mailboxes from the requester, and calls `yield_current` — none of
+    which is permissible off the broad lock.
 - D6: no per-CPU scheduler lock types until the x86_64 SMP trampoline split
   lands and D2/D3 are smoke-stable. `entering_tid`/`exiting_tid` remain
   Class F (authoritative read only).

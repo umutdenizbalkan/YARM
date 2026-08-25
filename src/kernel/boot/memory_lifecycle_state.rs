@@ -34,6 +34,68 @@ impl KernelState {
         });
     }
 
+    /// U9-D3 §6: `&mut MemorySubsystem` sibling of [`Self::adjust_memory_object_cap_refcount`] for
+    /// use inside `SharedKernel::with_memory_split_mut` (rank 6 only). Byte-identical semantics —
+    /// the broad form is three `with_memory_state(_mut)` cycles (slot lookup, then mutate) and this
+    /// is the same find-by-id → saturating adjust with the one acquisition the seam already holds.
+    /// `adjust_memory_object_cap_refcount` itself is left unmodified.
+    pub(crate) fn adjust_memory_object_cap_refcount_locked(
+        memory: &mut MemorySubsystem,
+        object: CapObject,
+        delta: i32,
+    ) {
+        let id = match object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return,
+        };
+        if let Some(slot) = memory
+            .memory_objects
+            .iter()
+            .position(|entry| entry.is_some_and(|mem| mem.id == id))
+            && let Some(memory_object) = memory.memory_objects[slot].as_mut()
+        {
+            if delta > 0 {
+                memory_object.cap_refcount =
+                    memory_object.cap_refcount.saturating_add(delta as u32);
+            } else {
+                memory_object.cap_refcount =
+                    memory_object.cap_refcount.saturating_sub((-delta) as u32);
+            }
+        }
+    }
+
+    /// U9-D3 §6: `&mut MemorySubsystem` sibling of [`Self::reclaim_memory_object_if_unreferenced`]
+    /// for use inside `SharedKernel::with_memory_split_mut` (rank 6 only). Same class gate, same
+    /// all-three-refcounts-zero condition, same `free_frame` + slot clear.
+    /// `reclaim_memory_object_if_unreferenced` itself is left unmodified.
+    pub(crate) fn reclaim_memory_object_if_unreferenced_locked(
+        memory: &mut MemorySubsystem,
+        object: CapObject,
+    ) {
+        let id = match object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return,
+        };
+        let Some(slot_index) = memory
+            .memory_objects
+            .iter()
+            .position(|entry| entry.is_some_and(|mem| mem.id == id))
+        else {
+            return;
+        };
+        let Some(memory_object) = memory.memory_objects[slot_index] else {
+            return;
+        };
+        if memory_object.cap_refcount != 0
+            || memory_object.map_refcount != 0
+            || memory_object.pin_refcount != 0
+        {
+            return;
+        }
+        let _ = kernel_mut(&mut memory.frame_allocator).free_frame(memory_object.phys.0);
+        memory.memory_objects[slot_index] = None;
+    }
+
     pub(crate) fn adjust_memory_object_pin_refcount(&mut self, object: CapObject, delta: i32) {
         let id = match object {
             CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,

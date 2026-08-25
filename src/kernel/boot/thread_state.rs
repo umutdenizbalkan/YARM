@@ -1714,6 +1714,365 @@ impl KernelState {
         Ok(())
     }
 
+    /// U9-D3 §7 — rank 6 ONLY: the split twin of [`Self::alloc_user_data_frame`] (`memory_state.rs`).
+    ///
+    /// Same allocation, same PT-pool sanity panic, same trace marker; the one difference is that
+    /// the memory domain is entered through `with_memory_split_mut` instead of a broad
+    /// `&mut KernelState`, so nothing else is held while the frame allocator runs. Placed beside its ONLY caller,
+    /// the split D6 stack repair below, because `memory_state.rs` carries a Stage 112/114 fence
+    /// forbidding `with_memory_split_mut` in that file (the deferred `VmBrk` shrink live-wire);
+    /// relocating this helper keeps that fence intact and unweakened rather than relaxing it. `alloc_user_data_frame` is left unmodified.
+    #[allow(dead_code)]
+    pub(crate) fn alloc_user_data_frame_split(
+        shared: &crate::runtime::SharedKernel,
+    ) -> Result<u64, KernelError> {
+        let pa = shared.with_memory_split_mut(|memory| {
+            crate::kernel::boot::kernel_mut(&mut memory.frame_allocator)
+                .alloc_frame()
+                .map_err(|_| KernelError::MemoryObjectFull)
+        })?;
+        #[cfg(not(feature = "hosted-dev"))]
+        if let Some((rs, re)) = crate::kernel::frame_allocator::is_pa_in_pt_pool(pa) {
+            crate::yarm_log!(
+                "PMEM_ALLOC_PT_POOL_BUG pa=0x{:x} pt_range=0x{:x}..0x{:x}",
+                pa,
+                rs,
+                re
+            );
+            panic!("PMEM_ALLOC_PT_POOL_BUG: main frame allocator returned a PT-pool PA");
+        }
+        #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
+        crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user", pa);
+        Ok(pa)
+    }
+
+    /// U9-D3 §7 — rank 6 ONLY: return a frame that [`Self::alloc_user_data_frame_split`] produced
+    /// but whose intended mapping FAILED, so it was never reachable from any address space.
+    ///
+    /// This is the "exact rollback of unused frames" the split D6 cleanup owes. The broad path had
+    /// no equivalent — a frame whose `map_page` failed was simply lost — so this is strictly
+    /// tighter, and it is safe precisely because the mapping failed: no page table refers to the
+    /// frame, and no TLB entry can exist for it, so no shootdown is owed before it is reusable.
+    #[allow(dead_code)]
+    pub(crate) fn free_unmapped_user_data_frame_split(
+        shared: &crate::runtime::SharedKernel,
+        pa: u64,
+    ) {
+        shared.with_memory_split_mut(|memory| {
+            let _ = crate::kernel::boot::kernel_mut(&mut memory.frame_allocator).free_frame(pa);
+        });
+    }
+
+    /// U9-D3 §7 — the broad-lock-free twin of
+    /// [`Self::d6_ensure_post_cleanup_task_stacks_mapped`], the FUNCTIONAL repair that was the
+    /// last reason the Stage 117 switch-plan stash drain touched the broad lock.
+    ///
+    /// Nothing is deleted or weakened. Every marker, every counter, every source/root decision and
+    /// the `VmFull` failure verdict are byte-for-byte what the broad body produces; the change is
+    /// purely that the work is decomposed into bounded, value-owned phases with at most ONE domain
+    /// lock held at a time, and none held across a page-table write.
+    ///
+    /// # Phases
+    ///
+    /// 1. **Lock-free** — the active ASID (`arch::hal::active_address_space`, a per-CPU atomic)
+    ///    and the hardware CR3. Neither ever needed a lock.
+    /// 2. **rank 1** — this CPU's current TID, then released.
+    /// 3. **rank 2, ONE acquisition** — every live task's `(tid, stack_base, stack_top)` copied
+    ///    BY VALUE into the same bounded `D6_PROOF_MAX_TASKS` array the broad body uses, plus each
+    ///    task's owner ASID. Nothing borrows a TCB past this phase, and rank 2 is released before
+    ///    any page-table work.
+    /// 4. **No lock held** — the root set, the TSS RSP0 audit, and the per-page source/share walk.
+    ///    A page that needs backing takes rank 6 for the ALLOCATION ALONE
+    ///    ([`KernelState::alloc_user_data_frame_split`]), releases it, and only then maps — so no
+    ///    lock is held across `page_table::map_page`.
+    ///
+    /// # Exact rollback of unused frames
+    ///
+    /// If the allocation succeeds and the mapping then fails, the frame was never reachable from
+    /// any address space, so it is returned to the allocator
+    /// ([`KernelState::free_unmapped_user_data_frame_split`]) instead of being lost. No shootdown
+    /// is owed for it: no page table ever referred to it, so no TLB anywhere can hold a
+    /// translation. The broad body leaked such a frame; this is strictly tighter, and the observed
+    /// `result=failed` marker and counted failure are unchanged.
+    #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
+    pub(crate) fn d6_ensure_post_cleanup_task_stacks_mapped_split(
+        shared: &crate::runtime::SharedKernel,
+        cpu: crate::kernel::scheduler::CpuId,
+    ) -> Result<(), KernelError> {
+        use crate::arch::selected_isa::page_table::{self, PageTableEntry};
+        use crate::kernel::vm::{PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+        fn validate_entry(entry: PageTableEntry) -> bool {
+            (entry.0 & PageTableEntry::WRITABLE) != 0 && (entry.0 & PageTableEntry::USER) == 0
+        }
+
+        // (1) Lock-free: the active root.
+        let Some(active_asid) = crate::arch::hal::active_address_space(cpu) else {
+            crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_BEGIN active_asid=none");
+            crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_DONE tasks=0 failures=0");
+            return Ok(());
+        };
+        // (2) rank 1, released immediately.
+        let current_tid = shared.current_tid_split_read(cpu).unwrap_or(u64::MAX);
+        let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+        crate::yarm_log!(
+            "D6_POST_CLEANUP_STACK_MAP_BEGIN active_asid={}",
+            active_asid.0
+        );
+        crate::yarm_log!(
+            "D6_POST_CLEANUP_CURRENT_STATE current_tid={} active_asid={} cr3=0x{:016x}",
+            current_tid,
+            active_asid.0,
+            hw_cr3
+        );
+
+        // (3) rank 2, ONE acquisition — every live task's kernel stack, BY VALUE.
+        let mut stacks = [(0u64, 0usize, 0usize); D6_PROOF_MAX_TASKS];
+        let n = shared.d6_live_kernel_stacks_split(&mut stacks);
+        // rank 2 released. Each owner ASID is then resolved through the same rank-2 seam, one
+        // task at a time — the broad body's `self.task_asid(tid)`.
+        let mut owners = [None; D6_PROOF_MAX_TASKS];
+        for (i, owner) in owners[..n].iter_mut().enumerate() {
+            *owner = shared.task_asid_opt_split_read(stacks[i].0);
+        }
+
+        // (4) No lock held from here on. The set of roots a post-cleanup trap can run under.
+        let mut roots = [None; D6_PROOF_MAX_TASKS];
+        roots[0] = Some(active_asid);
+        let mut roots_len = 1usize;
+        for owner in owners[..n].iter().copied() {
+            let Some(asid) = owner else {
+                continue;
+            };
+            if roots[..roots_len].iter().any(|e| *e == Some(asid)) {
+                continue;
+            }
+            if roots_len < roots.len() {
+                roots[roots_len] = Some(asid);
+                roots_len += 1;
+            }
+        }
+
+        // TSS RSP0 audit — unchanged.
+        let rsp0 = crate::arch::x86_64::descriptor_tables::read_boot_tss_rsp0() as usize;
+        let rsp0_page = rsp0.saturating_sub(8) & !(PAGE_SIZE - 1);
+        let rsp0_tid = {
+            let mut found = u64::MAX;
+            for (tid, base, top) in stacks[..n].iter().copied() {
+                if base <= rsp0 && rsp0 <= top {
+                    found = tid;
+                    break;
+                }
+            }
+            found
+        };
+        let rsp0_mapped = rsp0_page != 0
+            && page_table::resolve_page(active_asid, VirtAddr(rsp0_page as u64))
+                .map(validate_entry)
+                .unwrap_or(false);
+        crate::yarm_log!(
+            "D6_POST_CLEANUP_TSS_RSP0 tid={} rsp0=0x{:016x} page=0x{:x} mapped_active={}",
+            rsp0_tid,
+            rsp0,
+            rsp0_page,
+            rsp0_mapped as u8
+        );
+
+        let mut failures = 0usize;
+        let mut guard_pages = 0usize;
+        for i in 0..n {
+            let (tid, base, top) = stacks[i];
+            if base == 0 || base >= top {
+                continue;
+            }
+            let top_page = top.saturating_sub(8) & !(PAGE_SIZE - 1);
+            let owner = owners[i];
+            let owner_num: i64 = owner.map(|a| a.0 as i64).unwrap_or(-1);
+            // Stage 165F/165G: the mapped range extends one guard page BELOW stack_base for every
+            // live task, unchanged.
+            let region_base = (base & !(PAGE_SIZE - 1)).saturating_sub(KERNEL_STACK_GUARD_SIZE);
+            crate::yarm_log!(
+                "D6_POST_CLEANUP_STACK_MAP_TASK tid={} region_base=0x{:x} base=0x{:x} top=0x{:x} page=0x{:x}",
+                tid,
+                region_base,
+                base,
+                top,
+                top_page
+            );
+            let mut page_addr = region_base;
+            while page_addr < top {
+                let page = VirtAddr(page_addr as u64);
+                let is_top = page_addr == top_page;
+                let is_guard = page_addr < (base & !(PAGE_SIZE - 1));
+                let log_page = is_top || is_guard;
+
+                // Step 1 — SOURCE. Identical decision tree to the broad body; the only difference
+                // is that the allocation takes rank 6 alone and releases it BEFORE `map_page`, and
+                // that a frame whose mapping fails is returned rather than leaked.
+                let mut phys = None;
+                let mut source = "missing";
+                if let Some(oa) = owner {
+                    if let Some(e) = page_table::resolve_page(oa, page)
+                        && validate_entry(e)
+                    {
+                        phys = Some(e.addr());
+                        source = "found";
+                    }
+                    if phys.is_none() {
+                        match KernelState::alloc_user_data_frame_split(shared) {
+                            Ok(p) => {
+                                // rank 6 already released — the map runs with nothing held.
+                                match page_table::map_page(
+                                    oa,
+                                    page,
+                                    PhysAddr(p),
+                                    PageFlags::KERNEL_RW,
+                                ) {
+                                    Ok(_) => {
+                                        phys = Some(p);
+                                        source = "created";
+                                    }
+                                    Err(_) => {
+                                        KernelState::free_unmapped_user_data_frame_split(shared, p);
+                                        source = "failed";
+                                    }
+                                }
+                            }
+                            Err(_) => source = "failed",
+                        }
+                    }
+                } else {
+                    // No owner asid (e.g. tid=0) — Stage 165G, unchanged: reuse an existing frame
+                    // from any root, else allocate a proof-only frame in the ACTIVE root.
+                    for root in roots[..roots_len].iter().flatten().copied() {
+                        if let Some(e) = page_table::resolve_page(root, page)
+                            && validate_entry(e)
+                        {
+                            phys = Some(e.addr());
+                            source = "found";
+                            break;
+                        }
+                    }
+                    if phys.is_none() {
+                        match KernelState::alloc_user_data_frame_split(shared) {
+                            Ok(p) => {
+                                match page_table::map_page(
+                                    active_asid,
+                                    page,
+                                    PhysAddr(p),
+                                    PageFlags::KERNEL_RW,
+                                ) {
+                                    Ok(_) => {
+                                        phys = Some(p);
+                                        source = "created";
+                                    }
+                                    Err(_) => {
+                                        KernelState::free_unmapped_user_data_frame_split(shared, p);
+                                        source = "failed";
+                                    }
+                                }
+                            }
+                            Err(_) => source = "failed",
+                        }
+                    }
+                    if log_page {
+                        crate::yarm_log!(
+                            "D6_POST_CLEANUP_STACK_MAP_NO_OWNER_ACTIVE_SOURCE tid={} page=0x{:x} result={}",
+                            tid,
+                            page_addr,
+                            source
+                        );
+                    }
+                }
+
+                if is_guard {
+                    let included = if phys.is_some() { 1 } else { 0 };
+                    crate::yarm_log!(
+                        "D6_POST_CLEANUP_STACK_MAP_GUARD_PAGE tid={} page=0x{:x} included={}",
+                        tid,
+                        page_addr,
+                        included
+                    );
+                    if included == 1 {
+                        guard_pages += 1;
+                    }
+                }
+
+                if log_page {
+                    crate::yarm_log!(
+                        "D6_POST_CLEANUP_STACK_MAP_SOURCE tid={} owner_asid={} page=0x{:x} result={}",
+                        tid,
+                        owner_num,
+                        page_addr,
+                        source
+                    );
+                }
+
+                let Some(phys) = phys else {
+                    crate::yarm_log!(
+                        "D6_POST_CLEANUP_STACK_MAP_SKIP tid={} reason=no_source_frame page=0x{:x}",
+                        tid,
+                        page_addr
+                    );
+                    failures += 1;
+                    page_addr = page_addr.saturating_add(PAGE_SIZE);
+                    continue;
+                };
+
+                // Step 2 — ROOT: share the authoritative frame into every root, unchanged. No lock
+                // is held here either; these are page-table writes, not domain-state writes.
+                for root in roots[..roots_len].iter().flatten().copied() {
+                    let result = match page_table::resolve_page(root, page) {
+                        Some(e) if validate_entry(e) && e.addr() == phys => "already_ok",
+                        Some(e) if validate_entry(e) => {
+                            let _ = e;
+                            failures += 1;
+                            "failed"
+                        }
+                        Some(_) => {
+                            failures += 1;
+                            "failed"
+                        }
+                        None => match page_table::map_page(
+                            root,
+                            page,
+                            PhysAddr(phys),
+                            PageFlags::KERNEL_RW,
+                        ) {
+                            Ok(_) => "mapped",
+                            Err(_) => {
+                                failures += 1;
+                                "failed"
+                            }
+                        },
+                    };
+                    if log_page {
+                        crate::yarm_log!(
+                            "D6_POST_CLEANUP_STACK_MAP_ROOT tid={} asid={} page=0x{:x} result={}",
+                            tid,
+                            root.0,
+                            page_addr,
+                            result
+                        );
+                    }
+                }
+                page_addr = page_addr.saturating_add(PAGE_SIZE);
+            }
+        }
+
+        crate::yarm_log!(
+            "D6_POST_CLEANUP_STACK_MAP_DONE tasks={} roots={} failures={} guard_pages={}",
+            n,
+            roots_len,
+            failures,
+            guard_pages
+        );
+        if failures > 0 {
+            return Err(KernelError::VmFull);
+        }
+        Ok(())
+    }
+
     pub fn initialize_thread_kernel_switch_frame(
         &mut self,
         tid: u64,

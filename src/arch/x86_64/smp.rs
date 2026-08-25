@@ -1675,11 +1675,27 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
             cpu_relax();
         }
         if got {
-            // The target published ack_gen == want, which it does only AFTER the
-            // local invalidation — so this observation attests both the handling
-            // and the acknowledgement.
-            crate::yarm_log!("{} cpu={} gen={}", tlb_shootdown::MARK_HANDLE, cpu.0, want);
-            crate::yarm_log!("{} cpu={} gen={}", tlb_shootdown::MARK_ACK, cpu.0, want);
+            // The target published ack_gen == want, which it does only AFTER the local
+            // invalidation AND after recording the origin — so this observation attests the
+            // handling, the acknowledgement, and the privilege level the acknowledging 0xF1
+            // interrupted. U9-D3 extends the EXISTING marker text with `origin=`; no new marker
+            // family is introduced.
+            let origin = super::percpu::tlb_ack_origin(cpu);
+            let origin_str = super::percpu::tlb_ack_origin_str(origin);
+            crate::yarm_log!(
+                "{} cpu={} gen={} origin={}",
+                tlb_shootdown::MARK_HANDLE,
+                cpu.0,
+                want,
+                origin_str
+            );
+            crate::yarm_log!(
+                "{} cpu={} gen={} origin={}",
+                tlb_shootdown::MARK_ACK,
+                cpu.0,
+                want,
+                origin_str
+            );
             acked += 1;
         } else {
             let got_gen = super::percpu::tlb_ack_gen(cpu);
@@ -1771,6 +1787,88 @@ pub fn ap_tlb_shootdown_proof(kernel: &KernelState) -> (bool, bool) {
     }
     (cow_ok, unmap_ok)
 }
+
+/// U9-D3 §4 — the USER-ORIGIN half of the AP TLB shootdown proof.
+///
+/// `ap_tlb_shootdown_proof` above drives the KERNEL/idle-origin cell: it shoots at wake-only APs
+/// that are halted in ring 0, so every ACK it collects has `origin=kernel`. That cell could never
+/// produce a CPL3 ACK, because before U9-D3 an AP had no durable ring-3 residency at all — the
+/// magic `0xA9C6` parked it in ring 0 immediately.
+///
+/// The two-phase handshake changes that. This cell waits for the `0 -> 1` edge on
+/// `ap_syscall_reentry_ok`, which the AP publishes from ring 3 as its FIRST `0xA9C6` returns, and
+/// then drives bounded, serialized shootdowns at that CPU while it is dwelling in ring 3. It is
+/// the same `smp_tlb_shootdown_cpus` coordinator, the same mailbox and the same 0xF1 handler — the
+/// only difference is the privilege level the IPI lands on, which the handler now records.
+///
+/// MUST be called with NO broad lock held: it polls a CPU that may still need the global lock to
+/// finish its `Yield` before it reaches the dwell.
+///
+/// Nothing here fabricates anything: the BSP only ever READS `tlb_ack_gen` and `tlb_ack_origin`,
+/// both of which are written solely by the target's own 0xF1 handler.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static AP_TLB_USER_ORIGIN_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The ring-3 VA the AP proof stub executes from; a safe single-page shootdown target while that
+/// CPU dwells (invalidating a TLB entry for a still-valid PTE only forces a re-walk).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+const AP_PROBE_CODE_VA: u64 = 0x0000_0000_2000_0000;
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn ap_tlb_shootdown_user_origin_proof() {
+    use super::tlb_shootdown;
+    if !crate::kernel::boot::ap_user_dispatch_enabled() {
+        return;
+    }
+    if AP_TLB_USER_ORIGIN_DONE.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu = CpuId(1);
+    // The ring-3 residency edge, read EXACTLY ONCE. If the AP has not reached its dwell yet this
+    // returns WITHOUT latching, so a later trap retries. Serial output is never used as
+    // synchronization.
+    //
+    // This must not spin. This hook runs on EVERY BSP trap until it latches, so the retry is the
+    // trap itself; an `AP_READY_POLL_ITERS` (20_000_000) wait here would be paid again on every
+    // subsequent trap for as long as the edge never arrives — and it never arrives on any profile
+    // whose AP workload does not run the two-phase `0xA9C6` stub at all, which is every x86 SMP
+    // profile except the saved-return proof. Measured: with the spin in place the BSP made no
+    // forward progress on `qemu-x86_64-ap-cross-cpu-request-smoke` (the client task never issued
+    // its NR6 within the boot timeout) while the same profile is green without it.
+    if super::percpu::ap_syscall_reentry_ok(cpu) == 0 {
+        return;
+    }
+    if AP_TLB_USER_ORIGIN_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let targets = 1u64 << cpu.0;
+    // Bounded, SERIALIZED attempts. `smp_tlb_shootdown_cpus` posts, IPIs and waits for the ACK of
+    // its own generation before returning, so no request can overwrite another before its ACK.
+    // A first attempt can legitimately land in CPL0 — the AP publishes the edge two instructions
+    // before `SYSRETQ` retires — so a kernel-origin ACK is retried, not accepted as the proof.
+    for attempt in 0..8u32 {
+        let acked = smp_tlb_shootdown_cpus(targets, AP_PROBE_CODE_VA);
+        let origin = super::percpu::tlb_ack_origin(cpu);
+        if acked == 1 && origin == super::percpu::TLB_ACK_ORIGIN_USER {
+            crate::yarm_log!(
+                "{} result=ok context=user_origin targets=0x{:x} attempt={}",
+                tlb_shootdown::MARK_DONE,
+                targets,
+                attempt
+            );
+            return;
+        }
+    }
+    crate::yarm_log!(
+        "{} reason=user_origin_unproven targets=0x{:x} last_origin={}",
+        tlb_shootdown::MARK_FAIL,
+        targets,
+        super::percpu::tlb_ack_origin_str(super::percpu::tlb_ack_origin(cpu))
+    );
+}
+
+#[cfg(any(test, feature = "hosted-dev"))]
+pub fn ap_tlb_shootdown_user_origin_proof() {}
 
 #[cfg(any(test, feature = "hosted-dev"))]
 pub fn ap_tlb_shootdown_proof(_kernel: &KernelState) -> (bool, bool) {
@@ -2935,6 +3033,12 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     // markers fire from the AP's syscall as it enters the global-lock dispatch.
     set_ap_seal_probe_active(cpu, true);
     super::percpu::set_ap_dispatch_stage(cpu, 0);
+    // U9-D3: clear the two-phase `0xA9C6` handshake flag BEFORE the task becomes dispatchable, so
+    // the `0 -> 1` edge the BSP later polls can only have been published by THIS workload's first
+    // `0xA9C6`. Nothing cleared this flag before U9-D3 — it was a write-once probe latch — and
+    // without the clear every task after the first would take the park arm on its first `0xA9C6`
+    // and never reach ring 3 again.
+    super::percpu::clear_ap_syscall_reentry_ok(cpu);
     super::percpu::set_ap_dispatch_request(cpu, 1);
     crate::yarm_log!(
         "X86_AP_LIVE_DISPATCH_ARMED cpu={} tid={} cr3=0x{:x} entry=0x{:x} stack=0x{:x} rsp0=0x{:x}",

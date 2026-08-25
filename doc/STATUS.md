@@ -387,6 +387,93 @@ its shared-region cell is likewise unreachable by U9-F, whose class gate refuses
 `MemoryObject`/`DmaRegion` outright. Both are recorded as pre-existing.
 `doc/KERNEL_UNLOCKING.md` § U9-F.
 
+**U9-D3 — DELIVERED. CENSUS 6 → 2 (2 / 0 / 2).** U9-F left the memory-backed cohort and the D6
+functional tail behind the D3 fence of `AI_AGENT_RULES` §14.4, which required "the lock-free
+`await_tlb_shootdown_ack` design and multi-CPU smoke" before `with_vm_split_mut` /
+`with_memory_split_mut` could be added at those sites. U9-D3 delivered that design and then spent
+it.
+
+*The handler.* Vector `0xF1` is now the SOLE target-side invalidation and generation-matched ACK
+producer: the trampoline's sched-idle mailbox service block is deleted, so no second producer can
+race it. The handler reads its saved `CS` at an offset that is CPL-invariant in the current entry
+shape (a long-mode interrupt gate with no error code always pushes SS:RSP:RFLAGS:CS:RIP, including
+same-privilege), and records `origin=kernel|user` alongside the ACK by extending the EXISTING
+`X86_TLB_SHOOTDOWN_*` marker text — no new marker family. The `0xA9C6` proof-private convention
+became two-phase (return-once / park-second) so CPU 1 has a durable ring-3 residency; the public
+userspace syscall ABI is untouched.
+
+*The live proof.* Three consecutive identical runs of `qemu-x86_64-ap-saved-return-smoke`:
+`kernel_acks=2, user_acks=1, user_cell_ok=1`, with `X86_TLB_SHOOTDOWN_ACK cpu=1 gen=3
+origin=user` and `DONE result=ok context=user_origin targets=0x2 attempt=0`. **0xF1 earns real
+generation-matched ACKs from both CPL0 and CPL3.**
+
+*§5.* Production split unmap drives that coordinator for real:
+`SharedKernel::unmap_range_two_phase_split` removes each PTE under rank 5, releases it, completes
+the shootdown with NOTHING held, and reclaims under rank 6 only after every target acknowledged.
+The target mask comes from `live_cpu_bitmap_for_asid_split`, not `online_wake_only_ap_bitmap`
+(the complement set). It is deliberately NOT `request_live_asid_shootdown`, which impersonates the
+requester onto each target, drains their mailboxes from the requester and calls `yield_current`.
+
+*§6.* `MemoryObject`/`DmaRegion` now go through the phased composition, which PERFORMS the
+obligations it used to avoid: the active-transfer-mapping unmap with real D3 completion, the
+`SUPERVISOR_OP_TRANSFER_REVOKED` report, the rank-6 `cap_refcount` drop, and a reclaim gated on
+the ACK. **Unmap before ACK before reclaim** — a refcount that reaches zero without an ACK leaves
+the frame OUT of the allocator rather than handing it to the next allocation while a remote CPU
+may still translate it. All three ordinary rollback callsites dropped their broad fallback
+(6 → 3); `src/runtime.rs` now holds no production broad acquisition of any kind. A twin-kernel
+EQUIVALENCE test tears down a memory-backed cap that really owns an active transfer-mapping
+record — broad on one kernel, split on the other — and compares registry record, page mapping,
+all three refcounts, object liveness, cap slot and every transfer telemetry counter.
+
+*§7.* The D6 functional stack repair is split without being weakened: rank 1 for the current TID,
+ONE rank-2 acquisition for every live task's kernel stack BY VALUE, then a page-table walk with
+nothing held that takes rank 6 for each frame ALLOCATION alone and releases it before mapping —
+plus an exact rollback of any frame whose mapping failed, which the broad body leaked. Across the
+whole 60-line D6 cleanup family, in BOTH the `D6_SWITCH_PROOF=1` and `D6_SWITCH_A=1` profiles,
+base `d3032f8` and the split head differ in exactly one line: `D6_POST_CLEANUP_FIRST_TRAP_R14`, a
+kernel code pointer that moved because the code moved. `STACK_MAP_DONE tasks=4 roots=3 failures=0
+guard_pages=4`, `CLEANUP_DONE` and `D6_SWITCH_A_DONE` are byte-identical (3 → 2).
+
+*A defect found and fixed.* The CPL3 proof cell runs on every BSP trap until it latches, and it
+opened with a 20,000,000-iteration spin waiting for the residency edge — paid again on every trap
+whenever the edge never arrives, which is every x86 SMP profile whose AP does not run the
+`0xA9C6` stub. Measured on `qemu-x86_64-ap-cross-cpu-request-smoke`: base 3/3 green, the
+intermediate checkpoint 2/2 red, fixed 3/3 green. The edge is now read exactly once per
+invocation — the retry is the trap itself — and a hosted guard pins that, with the measurement in
+its doc comment.
+
+**The two survivors are the terminal broad dispatchers** (`trap_entry.rs` Phase-2 dispatch and its
+RISC-V counterpart), explicitly out of scope for this cohort. Direct-IpcCall production remains
+OFF (`ipccall_direct_production_enabled()` is `const false`).
+
+***U9 itself remains OPEN.*** U9-D3 closes the D3-fenced cohort, not U9. The broad
+`SpinLock<KernelState>` still has two production acquisition sites, and **U9 is not complete until
+those two terminal dispatchers are themselves retired.** Nothing in this record should be read as
+U9 being finished.
+
+**Live evidence, stated exactly.** The candidate was run against ~26 live profiles across three
+architectures. **Six are red, and all six are exact-base deferrals, not candidate regressions:**
+each was reproduced at base `d3032f8` with a *byte-identical failure signature* (same `[error]` /
+`[fail]` set after address normalization).
+
+| Red profile | Why it is not a candidate regression |
+|---|---|
+| `qemu-x86_64-core-smoke D6_SWITCH_PROOF=1` | REMOVE-FALLBACKS gate is unconditional while mode isolation forces `UNLOCK_GRADUATED=0`; identical `[error]` set at base |
+| `qemu-x86_64-core-smoke D6_SWITCH_A=1` | same script contradiction; identical `[error]` set at base |
+| `qemu-x86_64-server-dies-smoke` | identical `IPC_SERVER_DEATH_RECORD_LEAK` / `TIMEOUT_WON` failure at base |
+| `qemu-aarch64-exit-current-task-smoke` | identical failure signature at base |
+| `qemu-aarch64-server-dies-smoke` | identical failure signature at base |
+| `qemu-shared-region-direct-aarch64-smoke` | identical failure signature at base |
+| `qemu-riscv64-server-dies-smoke` | identical failure signature at base |
+
+**Neither D6 profile is claimed globally green.** What IS claimed for them is narrower and is what
+§7 needed: across the whole 60-line D6 cleanup marker family, in both profiles, base and candidate
+differ in exactly one line — a kernel code pointer that moved because the code moved — with
+`[ok]` counts equal (32/32 and 31/31) and `[error]` sets identical. The profiles' own end-to-end
+verdicts remain `result=fail` for the pre-existing reason above.
+
+`doc/KERNEL_UNLOCKING.md` § U9-D3.
+
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
 `finalize_split_handled_syscall` broad reacquisition, already retired by Stage 199D; that
 function holds no broad acquisition today. Earlier "U8 is next" pointers are removed.
@@ -395,9 +482,9 @@ function holds no broad acquisition today. Earlier "U8 is next" pointers are rem
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **6** |
+| Production `SharedKernel::with_cpu` callsites | **2** |
 | Production broad `SharedKernel::with` callsites | **0** |
-| **Total production broad-lock acquisition sites** | **6** |
+| **Total production broad-lock acquisition sites** | **2** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **Direct NR6/NR7:** x86_64 (live) + AArch64 (structural, proof-gated) via `offlock_authoritative_dispatch_enabled()`; RISC-V not admitted. **Blocking IpcRecv / IpcSend (U4):** queue-advancing dispatch is authoritative outside the broad lock on **all three** architectures via the canonical `queue_advancing_dispatch_enabled()`. `d6_genuine_enabled()` itself remains compile-time x86_64-only — U4 widened the queue-ADVANCING question only, never the queue-neutral D6 slice. |
@@ -2280,7 +2367,8 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **6** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` has **2** production acquisition sites (§0) — the two
+   terminal broad dispatchers, out of scope for every unlocking pass.
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there
