@@ -2376,6 +2376,148 @@ resume only when it is tied to a numbered unlocking directive **and** a specific
 retirement. Waiter-semantics work that retires no callsite does not move the one measurable
 definition in §0.1, and must not be scheduled ahead of U3 on its own.
 
+## U9-D3 — THE D3 FENCE IS DISCHARGED, AND SPENT: CENSUS 6 → 2
+
+**CENSUS 6 → 2 (2 / 0 / 2)** (`with_cpu` 2, `with_broad` 0, acquisitions 2; the 3 raw
+`state_lock` method definitions in `runtime.rs` are separate bookkeeping and are NOT the third
+census field). The two survivors are exactly the terminal broad dispatchers — the canonical
+Phase-2 trap dispatch in `src/arch/trap_entry.rs` and its RISC-V counterpart in
+`src/arch/riscv64/trap.rs`. **`src/runtime.rs` holds no production broad acquisition of any
+kind.** Direct-IpcCall production remains OFF.
+
+U9-F and U9/203C both stopped at the same wall, and named it precisely: `AI_AGENT_RULES` §14.4
+forbids adding `with_vm_split_mut` / `with_memory_split_mut` "without the lock-free
+`await_tlb_shootdown_ack` design and multi-CPU smoke". U9-D3 built that design, proved it live,
+and then spent it on both cohorts it was blocking.
+
+### §2/§3 — one producer, two privilege levels
+
+The `0xA9C6` proof-private AP convention used to set `ap_syscall_reentry_ok` and park in ring 0
+unconditionally, so CPU 1 had no durable ring-3 residency and a CPL3-origin ACK was unreachable.
+It is now **return-once / park-second**: the first invocation publishes the flag and `sysretq`s to
+the exact next ring-3 instruction; the second parks. The public userspace syscall ABI is
+untouched — the changed convention is proof-private, which §1 permitted and the public ABI, which
+it did not, is not involved.
+
+Vector `0xF1` became the **SOLE** target-side invalidation and generation-matched ACK producer.
+The trampoline's sched-idle mailbox service block — which read `tlb_req_gen`, invalidated, and
+published `tlb_ack_gen` — is DELETED rather than left as a second producer racing the handler.
+The handler reads its saved `CS` at an offset that is CPL-invariant **in the current entry
+shape**: a long-mode interrupt gate with no error code always pushes SS:RSP:RFLAGS:CS:RIP,
+including same-privilege, so saved `CS` sits at `[rsp+32]` after its three pushes regardless of
+the interrupted privilege level. (The general claim that "identical complete interrupt frames are
+always pushed at CPL0 and CPL3" is false and is not what this rests on.) The origin is recorded by
+extending the EXISTING `X86_TLB_SHOOTDOWN_*` marker text with `origin=kernel|user` — no new marker
+family, no new syscall number, no new workload binary, no new script.
+
+### §4 — the live proof
+
+Three consecutive runs of `scripts/qemu-x86_64-ap-saved-return-smoke.sh`, identical every time:
+
+```
+kernel_acks=2  user_acks=1  user_cell_ok=1  user_origin_unproven=0  seal_ok=1
+X86_TLB_SHOOTDOWN_ACK cpu=1 gen=3 origin=user
+X86_TLB_SHOOTDOWN_DONE result=ok context=user_origin targets=0x2 attempt=0
+```
+
+**Vector `0xF1` earns real generation-matched ACKs from both CPL0 and CPL3.** Serial output is
+never used as synchronization: the BSP polls the per-CPU residency flag and the mailbox
+generation, and the markers only report what those already settled.
+
+### §5 — production split unmap drives the real coordinator
+
+`SharedKernel::unmap_range_two_phase_split` now completes a REAL shootdown per page: remove the
+PTE under rank 5, release it, `complete_unmap_shootdown_split` with **nothing held**, then reclaim
+under rank 6 — and only when every target acknowledged. The target mask comes from
+`live_cpu_bitmap_for_asid_split` (online, not wake-only, currently running a task bound to that
+ASID), **not** `online_wake_only_ap_bitmap`, which is the complement set and would target CPUs
+that cannot hold the mapping while missing the one that does.
+
+It is deliberately NOT `KernelState::request_live_asid_shootdown`: that helper impersonates the
+requester onto each target (`set_current_cpu`), drains the targets' mailboxes from the requester,
+and calls `yield_current` — all of which §5 forbids, and all of which are impossible here because
+nothing holds a lock to yield under.
+
+### §6 — the memory-backed cohort joins the split revocation (6 → 3)
+
+`split_revoke_class_admitted` now admits `MemoryObject`/`DmaRegion`. The composition does not
+avoid obligations (4) and (5); it **performs** them, in the broad function's exact order:
+
+* `revoke_active_transfer_mappings_for_cap_split` — the registry scan, the two-phase unmap with
+  real D3 completion, the record clear, both telemetry counters, the
+  `SUPERVISOR_OP_TRANSFER_REVOKED` report (enqueue and waiter-take under ONE rank-3 acquisition,
+  wake only after it is released), and the existing `YARM_TRANSFER_REVOKE` marker;
+* `memory_obligations_split` — `cap_refcount--` then the guarded reclaim, both rank 6, for the
+  root and for every descendant.
+
+**Unmap before ACK before reclaim.** The reclaim is gated on the shootdown having completed; the
+refcount drop is not. A refcount that reaches zero without an ACK therefore leaves the frame OUT
+of the allocator rather than handing it to the next allocation while a remote CPU may still
+translate it — the fail-safe direction.
+
+All three ordinary rollback callsites dropped their broad `with_cpu` fallback. At those sites the
+cap was minted in the same syscall and never handed to userspace, so no delegation link and no
+registry record can name it (`CapId` carries a generation, and both `revoke` and `delete_if_leaf`
+bump it as they clear a slot), which makes the two capacity refusals unreachable; the one
+reachable refusal, `Unresolvable`, is exactly the input for which the broad path also did nothing.
+A capacity refusal, should a future change make one reachable, emits the EXISTING
+`CAP_CNODE_ROLLBACK_LEAK` marker rather than failing silently.
+
+The evidence is equivalence, not restatement: a twin-kernel test tears down a memory-backed cap
+that really owns an active transfer-mapping record — broad on one kernel, split on the other —
+and compares registry record, page mapping, all three refcounts, object liveness, cap slot and
+every transfer telemetry counter.
+
+`Reply` is still routed to U9-C's `rollback_reply_cap_split`; it is a routing decision, not a
+refusal to serve.
+
+### §7 — the D6 functional tail (3 → 2)
+
+`post_switch_restore_broad_tail` is retired. The cleanup it guarded is preserved WHOLE as
+`post_switch_d6_cleanup_split`, and `d6_ensure_post_cleanup_task_stacks_mapped_split` performs
+the functional repair with at most one domain lock held at a time and **none across a page-table
+write**: lock-free active root, rank 1 for the current TID, ONE rank-2 acquisition that copies
+every live task's `(tid, stack_base, stack_top)` BY VALUE into the same bounded
+`D6_PROOF_MAX_TASKS` array, then the walk — taking rank 6 for each frame ALLOCATION alone and
+releasing it before mapping. A frame whose mapping failed was never reachable from any address
+space, so it goes back to the allocator instead of being lost as the broad body lost it; no
+shootdown is owed for it, because no page table ever referred to it.
+
+**Exact-base comparison, both D6 profiles.** Across the whole 60-line D6 cleanup marker family, in
+`D6_SWITCH_PROOF=1` and `D6_SWITCH_A=1` alike, base `d3032f8` and the split head differ in exactly
+one line — `D6_POST_CLEANUP_FIRST_TRAP_R14`, a kernel code pointer that moved because the code
+moved. `D6_POST_CLEANUP_STACK_MAP_DONE tasks=4 roots=3 failures=0 guard_pages=4`,
+`D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE` and `D6_SWITCH_A_DONE` are byte-identical, and the
+`[ok]` counts match (32/32 and 31/31).
+
+The RISC-V in-lock restore that shared the tail went with it, and nothing reachable was removed:
+`maybe_switch_kernel_context` gates the stash on `!cfg!(target_arch = "riscv64")`, so
+`DISPATCH_SWITCH_PLAN_STASH` is never populated there and `has_plan()` — the drain's entry
+condition — is never true. All three arch arms of the FOUNDATION
+`post_switch_restore_arch_thread_state` remain defined.
+
+### A defect this pass introduced, found, and fixed
+
+The §4 CPL3 proof cell runs on every BSP trap until it latches, and it opened with an
+`AP_READY_POLL_ITERS` (20,000,000) spin waiting for the residency edge. That wait is paid AGAIN on
+every subsequent trap for as long as the edge never arrives — and it never arrives on any profile
+whose AP workload does not run the `0xA9C6` stub at all, which is every x86 SMP profile except the
+saved-return proof the cell was developed against. The BSP made no forward progress; the client
+task never issued its NR6 inside the boot timeout.
+
+Measured on `scripts/qemu-x86_64-ap-cross-cpu-request-smoke.sh`: base `d3032f8` **3/3 green**, the
+intermediate §5 checkpoint **2/2 red**, after the fix **3/3 green**. The residency edge is now
+read EXACTLY ONCE per invocation — the retry is the trap itself, which was always the design — and
+a hosted guard pins that property with the measurement in its doc comment. The bounded ACK wait
+that legitimately exists is untouched: it lives in `smp_tlb_shootdown_cpus`, runs only after the
+edge is observed, and at most 8 times.
+
+This is recorded here rather than quietly fixed because the profile that exposed it was not in the
+set the intermediate checkpoints were verified against, and the lesson is the general one: a hook
+that fires on every trap must cost O(1) when its precondition is absent.
+
+---
+
 **Safety fact that U1, U2 and every U3 increment so far preserved, and the rest of U3 must preserve.** `ipccall_direct_production_enabled()`
 (`src/kernel/boot/mod.rs:3222`) returns `false` on **every** architecture (Stage
 199D-WA1-GATE). Ordinary NR 6 / NR 7 traffic is admitted to the off-lock direct path on no
