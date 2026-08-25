@@ -222,6 +222,11 @@ pub(crate) enum QueueAdvanceRefusal {
     NoTrapDrainer,
     /// More than one CPU is dispatching. The lock-drop window is only accepted single-online.
     MultiCpu,
+    /// U9-QA §1: the caller's trap CPU is not the scheduler's authoritative dispatch CPU. Raised
+    /// here, before any mutation, so the identical Stage 199D-WA3A-R2-SEAL (item D) authentication
+    /// the commit's selection step performs can never be the thing that fails AFTER the caller has
+    /// published its terminal transition.
+    CpuNotAuthoritative,
     /// A plan is already stashed for this CPU; a second would be lost.
     StashOccupied,
     /// The outgoing task is not this CPU's current task, or has no TCB — fail closed rather than
@@ -4244,14 +4249,23 @@ impl crate::runtime::SharedKernel {
         {
             return Err(QueueAdvanceRefusal::NoTrapDrainer);
         }
-        // The SAME predicate `KernelState::dispatching_cpu_count` computes, read under rank 1.
-        let dispatching = self.with_scheduler_split_mut(|sched| {
+        // The SAME predicate `KernelState::dispatching_cpu_count` computes, read under rank 1 —
+        // together with the authoritative dispatch CPU, in ONE acquisition.
+        let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
             let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
             let online = s.online_cpu_bitmap();
-            (online & !s.wake_only_bitmap()).count_ones() as usize
+            (
+                (online & !s.wake_only_bitmap()).count_ones() as usize,
+                sched.current_cpu,
+            )
         });
         if dispatching > 1 {
             return Err(QueueAdvanceRefusal::MultiCpu);
+        }
+        // U9-QA §1: pre-check the authentication the commit's selection step will perform. The
+        // commit cannot refuse, so this must fail HERE — before the caller blocks anything.
+        if dispatch_cpu != cpu {
+            return Err(QueueAdvanceRefusal::CpuNotAuthoritative);
         }
         if unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() } {
             return Err(QueueAdvanceRefusal::StashOccupied);
@@ -4284,17 +4298,43 @@ impl crate::runtime::SharedKernel {
     /// `admitted` is the candidate [`Self::queue_advance_admit_split`] returned under the same
     /// uninterrupted trap. Phases are monotonic and never nested:
     ///
-    /// 1. **rank 1** — `dispatch_next_selection_on(cpu)`, the SAME selection primitive the broad
+    /// 1. **rank 1** — `SharedKernel::queue_advance_select_step_split`, the ONE authoritative
+    ///    selection step (U9-QA §1), which calls the SAME `dispatch_next_selection_on` the broad
     ///    path calls. Because the caller has already cleared the current slot, this takes the
     ///    `current is None` branch and DEQUEUES the admitted candidate.
     /// 2. **rank 2** — the incoming ASID.
-    /// 3. **LOCK-FREE** — address-space activation for the incoming task.
-    /// 4. **rank 2** — the switch plan, through the single shared builder.
+    /// 3. **rank 2** — the switch plan, through the single shared builder. The LAST fallible step,
+    ///    taken before any lock-free side effect so a failure has nothing arch-visible to undo.
+    /// 4. **LOCK-FREE** — address-space activation for the incoming task.
     /// 5. **LOCK-FREE** — stash the plan for the arch apply.
     ///
     /// `Idle` selection yields `TerminalIdle`; a `ContinuedCurrent` selection means the caller did
     /// not actually clear the current slot and yields `ResumeSame` with nothing stashed. Neither is
     /// a refusal — nothing was dequeued in either case.
+    ///
+    /// ## The SMP wake race (U9-QA §1)
+    ///
+    /// Admission and this commit take rank 1 separately, so a wake — on this CPU or on a wake-only
+    /// AP rerouting an enqueue onto this CPU's queue — can land between them. Every way that can
+    /// resolve ends in a valid outcome, and none of them is a refusal after publication:
+    ///
+    /// * **the wake enqueues an ordinary task** — the dequeue selects the FIFO/priority winner,
+    ///   which may or may not be the peeked candidate; either way exactly one task is dequeued and
+    ///   the rest stay queued. No duplicate enqueue: the wake enqueued once, the dequeue removed
+    ///   one.
+    /// * **the wake enqueues a HIGHER-priority task** — it displaces the peeked candidate at the
+    ///   head. The dequeue honours it; `admitted` was a proof, not a prediction, and the
+    ///   superseding is logged, not asserted on.
+    /// * **the wake enqueues into a queue admission found EMPTY** — the unconditional selection in
+    ///   step (1) sees it, so the CPU switches instead of idling. This is why there is no
+    ///   `admitted == None` short circuit: that would be a lost wake.
+    /// * **the wake targets the OUTGOING task itself** — the caller has already published it
+    ///   blocked, so the wake makes it runnable and enqueues it like any other task. It is then an
+    ///   ordinary dequeue candidate; it is never resumed through the stale frame this trap is
+    ///   returning through, because the plan build derives the outgoing side from its TCB.
+    /// * **the superseding task is not resumable** — step (3) refuses, and the dequeue is undone
+    ///   with its exact inverse. The queue and the current slot are left exactly as the wake left
+    ///   them, and this CPU idles; nothing stale is switched to.
     pub(crate) fn queue_advance_commit_split(
         &self,
         cpu: CpuId,
@@ -4302,49 +4342,86 @@ impl crate::runtime::SharedKernel {
         admitted: Option<u64>,
     ) -> QueueAdvanceOutcome {
         use crate::kernel::scheduler::DispatchSelection;
+        use crate::runtime::CpuDispatch;
         let cpu_idx = cpu.0 as usize;
-        let Some(admitted) = admitted else {
-            return QueueAdvanceOutcome::TerminalIdle;
+        // (1) rank 1: the ONE authoritative selection step (U9-QA §1) — the same one the FutexWait
+        // retirement drain reaches the run queue through. It authenticates the CPU and calls the
+        // same `Scheduler::dispatch_next_selection_on` the broad path calls.
+        //
+        // U9-QA §1 (SMP WAKE RACE): the selection is run UNCONDITIONALLY, including when admission
+        // found no candidate. Admission's peek and this dequeue are two separate rank-1
+        // acquisitions, so a wake may enqueue between them; short-circuiting on `admitted == None`
+        // would idle a CPU that had just become runnable — a lost wake. Deciding from the
+        // authoritative dequeue instead means a task enqueued in that window is simply selected.
+        let dispatch = self.queue_advance_select_step_split(cpu, "queue_advance_commit_split");
+        let incoming = match dispatch {
+            // Admission already authenticated this CPU under the single-dispatcher gate, so a
+            // mismatch here is unreachable. It is still matched explicitly, and it dequeued
+            // NOTHING — so the truthful outcome is an idle CPU, never a fabricated switch.
+            CpuDispatch::RefusedCpuMismatch { .. } => return QueueAdvanceOutcome::TerminalIdle,
+            CpuDispatch::Selected { selection, .. } => match selection {
+                DispatchSelection::Dequeued { tid } => tid.0,
+                // The caller did not clear the current slot, so nothing was dequeued.
+                DispatchSelection::ContinuedCurrent { .. } => {
+                    return QueueAdvanceOutcome::ResumeSame;
+                }
+                DispatchSelection::Idle => return QueueAdvanceOutcome::TerminalIdle,
+            },
         };
-        // (1) rank 1: the SAME selection primitive the broad path calls.
-        let selection = self.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu)
-        });
-        let incoming = match selection {
-            DispatchSelection::Dequeued { tid } => tid.0,
-            // The caller did not clear the current slot, so nothing was dequeued.
-            DispatchSelection::ContinuedCurrent { .. } => return QueueAdvanceOutcome::ResumeSame,
-            DispatchSelection::Idle => return QueueAdvanceOutcome::TerminalIdle,
-        };
-        debug_assert_eq!(
-            incoming, admitted,
-            "the dequeued task must be the admitted candidate"
-        );
+        // U9-QA §1 (SMP WAKE RACE): `admitted` is the admission PROOF — that a resumable candidate
+        // existed and the four stash conditions held — never a prediction of the winner.
+        // `peek_highest` scans High → Normal → Low, so a wake that enqueues a higher-priority task
+        // in the window legitimately displaces the peeked candidate. The authoritative dequeue is
+        // the decision; the disagreement is recorded and the dequeued task is honoured. It is NOT
+        // an error, so it is not asserted on: the resumability of whatever was actually dequeued is
+        // re-established below, before anything irreversible happens.
+        if admitted != Some(incoming) {
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROP_ADMITTED_SUPERSEDED cpu={} admitted={} dequeued={}",
+                cpu.0,
+                admitted.unwrap_or(u64::MAX),
+                incoming
+            );
+        }
         // (2) rank 2: the incoming ASID.
         let incoming_asid = self.task_asid_opt_split_read(incoming);
-        // (3) Lock-free: activate the incoming address space — the same two free functions
+        // (3) rank 2: the switch plan, through the SINGLE shared builder.
+        //
+        // This is the LAST step that can fail, and it is deliberately taken BEFORE the lock-free
+        // address-space activation so a failure leaves no arch-visible side effect to undo. It is
+        // also where the dequeued task's resumability is re-established: the builder refuses an
+        // uninitialized incoming kernel context, which is exactly the check admission ran against
+        // the peeked candidate. When the two agree the check is a formality; when a wake superseded
+        // the candidate it is the thing that keeps the advance sound.
+        let plan = self.with_task_tcbs_split_mut(|tcbs| {
+            build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming)
+        });
+        let Ok(Some(plan)) = plan else {
+            // Fail closed WITH AN EXACT UNDO. The dequeue made `incoming` current; leaving it there
+            // while this CPU idles would strand a runnable task behind a `current` slot nothing
+            // will resume. `preempt_reenqueue_only_on` is the existing exact inverse of the
+            // dequeue — it re-enqueues `current` and clears the slot — so the run queue and the
+            // current slot are restored to what they were before step (1). The outgoing task
+            // remains correctly blocked and will be woken by its own waker. Nothing is stashed, no
+            // address space was activated, and no plan was published.
+            let restored = self.with_scheduler_split_mut(|sched| {
+                crate::kernel::boot::kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu)
+                    == Some(crate::kernel::ipc::ThreadId(incoming))
+            });
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROP_DEFERRED reason=plan_unavailable outgoing={} incoming={} dequeue_undone={}",
+                outgoing_tid,
+                incoming,
+                u8::from(restored)
+            );
+            return QueueAdvanceOutcome::TerminalIdle;
+        };
+        // (4) Lock-free: activate the incoming address space — the same two free functions
         // `Hal::switch_address_space` calls, which `dispatch_next_task` uses at this exact point.
         if let Some(asid) = incoming_asid {
             crate::arch::hal_adapters::switch_address_space(asid);
             crate::arch::hal::note_address_space_activated(cpu, asid);
         }
-        // (4) rank 2: the switch plan, through the SINGLE shared builder. Admission already proved
-        // the incoming kernel context is initialized, so `Ok(None)` here can only mean the outgoing
-        // and incoming resolved to the same slot — which the caller's block made impossible.
-        let plan = self.with_task_tcbs_split_mut(|tcbs| {
-            build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming)
-        });
-        let Ok(Some(plan)) = plan else {
-            // Fail closed: the incoming task stays current and runnable-selected, and this CPU
-            // idles rather than switching to a task whose plan we could not build. The outgoing
-            // task remains correctly blocked and will be woken by its own waker.
-            crate::yarm_log!(
-                "D6_GLOBAL_LOCK_DROP_DEFERRED reason=plan_unavailable outgoing={} incoming={}",
-                outgoing_tid,
-                incoming
-            );
-            return QueueAdvanceOutcome::TerminalIdle;
-        };
         // (5) Lock-free: publish the plan for the arch apply. This is the point of no return.
         unsafe {
             crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan);

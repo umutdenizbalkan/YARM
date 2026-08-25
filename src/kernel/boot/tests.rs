@@ -119332,19 +119332,22 @@ mod stage199d_wa3a_transition_barriers {
             runtime.contains("fn d6_genuine_mark_running_via_task_seam(\n        &self,\n        dispatch: CpuDispatch,\n    ) -> DispatchMarkOutcome"),
             "the mark seam must take the CPU-bound dispatch, not a (selection, cpu) pair"
         );
-        for seam in [
-            "d6_genuine_local_dispatch_step_mut",
-            "d2_recv_dispatch_step_mut",
-            "d2_send_dispatch_step_mut",
-            "futex_wait_dispatch_step_mut",
-            "yield_dispatch_step_mut",
-        ] {
+        // A seam satisfies the property one of two ways: it authenticates inline before its own
+        // dequeue, or it performs NO dequeue of its own and delegates to the one authoritative
+        // selection step, which authenticates before ITS dequeue. U9-QA §1 moved
+        // `futex_wait_dispatch_step_mut` onto the second shape so that it and the U9-QA
+        // transaction share a single selection implementation; the property is unchanged, and
+        // for a delegating seam it becomes unavoidable rather than merely repeated.
+        let scope_of = |seam: &str| -> &str {
             let body = runtime
                 .split(&alloc::format!("fn {seam}("))
                 .nth(1)
                 .unwrap_or_else(|| panic!("{seam}"));
             let end = body.find("\n    /// ").unwrap_or(body.len());
-            let scoped = &body[..end];
+            &body[..end]
+        };
+        let authenticates_before_dequeue = |seam: &str| {
+            let scoped = scope_of(seam);
             let guard = scoped
                 .find("if dispatch_cpu != cpu {")
                 .unwrap_or_else(|| panic!("{seam} must authenticate the CPU"));
@@ -119355,6 +119358,25 @@ mod stage199d_wa3a_transition_barriers {
                 guard < mutate,
                 "{seam} must authenticate the CPU BEFORE it dequeues"
             );
+        };
+        // The one authoritative selection step (U9-QA §1) authenticates before it dequeues.
+        authenticates_before_dequeue("queue_advance_select_step_split");
+        for seam in [
+            "d6_genuine_local_dispatch_step_mut",
+            "d2_recv_dispatch_step_mut",
+            "d2_send_dispatch_step_mut",
+            "futex_wait_dispatch_step_mut",
+            "yield_dispatch_step_mut",
+        ] {
+            let scoped = scope_of(seam);
+            if scoped.contains("self.queue_advance_select_step_split(") {
+                assert!(
+                    !scoped.contains("dispatch_next_selection_on("),
+                    "{seam} delegates selection, so it must not also dequeue itself"
+                );
+                continue;
+            }
+            authenticates_before_dequeue(seam);
         }
     }
 
@@ -139309,6 +139331,361 @@ mod u9d3_split_unmap_drives_real_d3 {
         assert!(
             sched_end < asid_at,
             "rank 1 is released before rank 2 is entered"
+        );
+    }
+}
+
+// ── U9-QA §1: ONE QUEUE-ADVANCE OWNER ─────────────────────────────────────────────────────────
+//
+// The off-lock queue advance has exactly two consumers — the FutexWait retirement drain and the
+// U9-QA transaction — and they must reach the run queue through ONE implementation. Before §1 each
+// opened its own rank-1 scheduler seam, authenticated the trap CPU itself and called
+// `dispatch_next_selection_on` itself; the primitive was shared but the step around it was not,
+// which is precisely the surface a second selection policy grows on. These cases assert the single
+// owner directly, in source, so the duplication cannot come back.
+#[cfg(test)]
+mod u9qa_one_queue_advance_owner {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::boot::exec_state::QueueAdvanceOutcome;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskClass;
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const EXEC: &str = include_str!("exec_state.rs");
+
+    /// A function body, bounded by the start of the next doc-commented item at the same depth.
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let after = src
+            .split(signature)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing: {signature}"));
+        let end = after.find("\n    /// ").unwrap_or(after.len());
+        &after[..end]
+    }
+
+    /// The shared step exists, takes rank 1 exactly once, and names its caller in the refusal
+    /// marker so a live `DISPATCH_STEP_REFUSED_CPU_MISMATCH` stays attributable to a site.
+    #[test]
+    fn the_shared_step_takes_rank_one_once_and_is_site_attributed() {
+        let step = body_of(RUNTIME, "pub(crate) fn queue_advance_select_step_split(");
+        assert_eq!(
+            step.matches("with_scheduler_split_mut").count(),
+            1,
+            "the shared selection step must take rank 1 exactly once"
+        );
+        assert!(
+            step.contains(
+                "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}"
+            ) && step.contains("site,"),
+            "the refusal marker must carry the CALLER's site, not a hard-coded one"
+        );
+        assert!(
+            step.contains("dispatch_next_selection_on(dispatch_cpu)"),
+            "the shared step must call the authoritative scheduler selection primitive"
+        );
+    }
+
+    /// The shared step emits NO success marker. The two consumers own different telemetry
+    /// families and a shared step must not fabricate either of them.
+    #[test]
+    fn the_shared_step_owns_no_success_telemetry() {
+        let step = body_of(RUNTIME, "pub(crate) fn queue_advance_select_step_split(");
+        for marker in [
+            "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK",
+            "D6_GLOBAL_LOCK_DROP_PLAN_READY",
+        ] {
+            assert!(
+                !step.contains(marker),
+                "the shared step must not emit `{marker}` — its consumers own that family"
+            );
+        }
+    }
+
+    /// Both consumers delegate: neither performs a dequeue of its own.
+    #[test]
+    fn both_consumers_delegate_and_neither_dequeues_itself() {
+        let futex = body_of(RUNTIME, "pub(crate) fn futex_wait_dispatch_step_mut(");
+        assert!(
+            futex.contains(
+                "self.queue_advance_select_step_split(cpu, \"futex_wait_dispatch_step_mut\")"
+            ),
+            "the FutexWait retirement drain must delegate selection to the shared step"
+        );
+        assert!(
+            !futex.contains("dispatch_next_selection_on(")
+                && !futex.contains("with_scheduler_split_mut"),
+            "the FutexWait seam must contain NO independent dequeue or scheduler acquisition"
+        );
+        let commit = body_of(EXEC, "pub(crate) fn queue_advance_commit_split(");
+        assert!(
+            commit.contains(
+                "self.queue_advance_select_step_split(cpu, \"queue_advance_commit_split\")"
+            ),
+            "the U9-QA commit must delegate selection to the same shared step"
+        );
+        assert!(
+            !commit.contains("dispatch_next_selection_on("),
+            "the U9-QA commit must contain NO independent dequeue"
+        );
+        // Its only other rank-1 use is the EXACT inverse of a dequeue on the fail-closed path —
+        // an undo, not a selection.
+        assert_eq!(
+            commit.matches("with_scheduler_split_mut").count(),
+            1,
+            "the commit's only other rank-1 acquisition is the dequeue undo"
+        );
+        assert!(
+            commit.contains("preempt_reenqueue_only_on(cpu)"),
+            "and that acquisition must be the existing exact inverse of the dequeue"
+        );
+    }
+
+    /// The FutexWait seam keeps its OWN telemetry — a retirement must stay legible in a live log
+    /// by its own marker family — but only on a genuine selection. A refusal dequeued nothing and
+    /// must never be reported as a dequeue.
+    #[test]
+    fn futex_telemetry_is_retained_but_gated_on_a_genuine_selection() {
+        let futex = body_of(RUNTIME, "pub(crate) fn futex_wait_dispatch_step_mut(");
+        let gate = futex
+            .find("if matches!(dispatch, CpuDispatch::Selected { .. })")
+            .expect("the marker must be gated on a genuine selection");
+        let marker = futex
+            .find("QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK")
+            .expect("the class marker must be retained");
+        assert!(
+            gate < marker,
+            "the dequeue marker must sit INSIDE the genuine-selection gate"
+        );
+    }
+
+    /// The commit cannot refuse, so the CPU authentication the shared step performs must already
+    /// have been checked by admission — before the caller published its terminal transition.
+    #[test]
+    fn admission_pre_checks_the_authentication_the_commit_cannot_refuse_on() {
+        let admit = body_of(EXEC, "pub(crate) fn queue_advance_admit_split(");
+        assert!(
+            admit.contains("if dispatch_cpu != cpu {")
+                && admit.contains("QueueAdvanceRefusal::CpuNotAuthoritative"),
+            "admission must pre-check the dispatch-CPU authentication"
+        );
+        // And the commit still handles it explicitly rather than by a wildcard, mapping it to the
+        // only truthful outcome for a step that dequeued nothing.
+        let commit = body_of(EXEC, "pub(crate) fn queue_advance_commit_split(");
+        let refused = commit
+            .find("CpuDispatch::RefusedCpuMismatch { .. } =>")
+            .expect("the commit must match the refusal explicitly");
+        let tail = &commit[refused..];
+        assert!(
+            tail.starts_with(
+                "CpuDispatch::RefusedCpuMismatch { .. } => return QueueAdvanceOutcome::TerminalIdle,"
+            ),
+            "a step that dequeued nothing must yield TerminalIdle, never a fabricated switch"
+        );
+    }
+
+    /// The commit runs the authoritative selection UNCONDITIONALLY. Short-circuiting on an empty
+    /// admission would idle a CPU that a wake had just made runnable in the admit→commit window.
+    #[test]
+    fn the_commit_has_no_admitted_none_short_circuit() {
+        let commit = body_of(EXEC, "pub(crate) fn queue_advance_commit_split(");
+        let select = commit
+            .find("self.queue_advance_select_step_split(")
+            .expect("the commit must select");
+        assert!(
+            !commit[..select].contains("let Some(admitted) = admitted else"),
+            "a lost wake: the selection must not be skipped when admission found no candidate"
+        );
+        assert!(
+            commit.contains("if admitted != Some(incoming) {"),
+            "a superseded candidate must be reconciled explicitly"
+        );
+        assert!(
+            !commit.contains("debug_assert_eq!(\n            incoming, admitted"),
+            "a concurrent higher-priority wake legitimately supersedes the candidate — it must \
+             not be asserted away"
+        );
+    }
+
+    /// The last fallible step precedes every lock-free side effect, so a refusal has nothing
+    /// arch-visible to undo — and the dequeue it does have to undo uses the exact inverse.
+    #[test]
+    fn the_plan_build_precedes_the_activation_and_undoes_its_dequeue() {
+        let commit = body_of(EXEC, "pub(crate) fn queue_advance_commit_split(");
+        let plan = commit
+            .find("build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming)")
+            .expect("the plan build");
+        let activate = commit
+            .find("crate::arch::hal_adapters::switch_address_space(asid)")
+            .expect("the activation");
+        let stash = commit
+            .find("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan)")
+            .expect("the stash");
+        assert!(
+            plan < activate && activate < stash,
+            "plan build (fallible) must precede activation, which must precede the stash"
+        );
+        let refusal = commit
+            .find("reason=plan_unavailable")
+            .expect("the fail-closed path");
+        let undo = commit
+            .find("preempt_reenqueue_only_on(cpu)")
+            .expect("the exact dequeue inverse");
+        assert!(
+            undo < refusal,
+            "the dequeue must be undone BEFORE the refusal is reported, so the report is truthful"
+        );
+    }
+
+    /// Register `tid` with an INITIALIZED kernel context, so the switch-plan builder accepts it.
+    fn resumable(state: &mut crate::kernel::boot::KernelState, tid: u64) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == tid {
+                    tcb.kernel_context.initialized = true;
+                }
+            }
+        });
+    }
+
+    /// EMPIRICAL: a task enqueued after an EMPTY admission is still selected AND switched to — the
+    /// lost-wake shape the unconditional selection exists to prevent.
+    #[test]
+    fn a_wake_after_an_empty_admission_is_not_lost() {
+        use crate::runtime::SharedKernel;
+        unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[0].take() };
+        let mut state = Bootstrap::init().expect("init");
+        state.set_current_cpu(CpuId(0)).expect("cpu");
+        resumable(&mut state, 90100);
+        resumable(&mut state, 90101);
+        // The outgoing task is current, then blocked — exactly what a FutexWait publication does.
+        state.enqueue_on_cpu(CpuId(0), 90100).expect("enq outgoing");
+        state.dispatch_next_task().expect("make outgoing current");
+        assert_eq!(state.current_tid_on_cpu(CpuId(0)), Some(90100));
+        let _ = state.block_current_cpu();
+        let shared = SharedKernel::new(state);
+
+        // Admission's peek would find nothing: the run queue is empty at this instant.
+        assert_eq!(
+            shared.with(|k| k.runnable_count_on_cpu(CpuId(0))),
+            0,
+            "fixture: the queue is empty when admission peeks"
+        );
+        // The wake lands in the admit -> commit window.
+        shared.with(|k| k.enqueue_on_cpu(CpuId(0), 90101).expect("wake enqueue"));
+        // The commit is handed the EMPTY admission and must still select the woken task.
+        let outcome = shared.queue_advance_commit_split(CpuId(0), 90100, None);
+        assert!(
+            matches!(
+                outcome,
+                QueueAdvanceOutcome::Switch {
+                    outgoing_tid: 90100,
+                    incoming_tid: 90101,
+                    ..
+                }
+            ),
+            "the woken task must be switched to, not idled past: {outcome:?}"
+        );
+        assert_eq!(
+            shared.with(|k| k.current_tid_on_cpu(CpuId(0))),
+            Some(90101),
+            "the woken task is the one the authoritative dequeue selected"
+        );
+        assert!(
+            unsafe {
+                crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[0]
+                    .take()
+                    .is_some()
+            },
+            "and its plan was stashed for the arch apply"
+        );
+    }
+
+    /// EMPIRICAL: when the dequeued task cannot be planned, the dequeue is UNDONE exactly — the
+    /// task goes back on the run queue and the current slot is cleared, so nothing is stranded.
+    #[test]
+    fn an_unplannable_dequeue_is_undone_exactly() {
+        use crate::runtime::SharedKernel;
+        unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[0].take() };
+        let mut state = Bootstrap::init().expect("init");
+        state.set_current_cpu(CpuId(0)).expect("cpu");
+        resumable(&mut state, 90200);
+        // The incoming is registered but NEVER initialized: the plan builder must refuse it.
+        state
+            .register_task_with_class(90201, TaskClass::App)
+            .expect("reg");
+        state.enqueue_on_cpu(CpuId(0), 90200).expect("enq outgoing");
+        state.dispatch_next_task().expect("make outgoing current");
+        let _ = state.block_current_cpu();
+        state.enqueue_on_cpu(CpuId(0), 90201).expect("enq incoming");
+        let queued_before = state.runnable_count_on_cpu(CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        let outcome = shared.queue_advance_commit_split(CpuId(0), 90200, Some(90201));
+        assert_eq!(
+            outcome,
+            QueueAdvanceOutcome::TerminalIdle,
+            "an unplannable incoming settles as idle"
+        );
+        assert_eq!(
+            shared.with(|k| k.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "the dequeue was undone: the task is back on the run queue"
+        );
+        assert_eq!(
+            shared.with(|k| k.current_tid_on_cpu(CpuId(0))),
+            None,
+            "and the current slot is clear, so nothing is stranded behind it"
+        );
+        assert!(
+            !unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[0].has_plan() },
+            "nothing was stashed"
+        );
+    }
+
+    /// EMPIRICAL: the shared step refuses a non-authoritative CPU without touching the run queue,
+    /// and the same step on the authoritative CPU dequeues exactly one task.
+    #[test]
+    fn the_shared_step_refuses_a_foreign_cpu_without_mutating() {
+        use crate::runtime::{CpuDispatch, SharedKernel};
+        let mut state = Bootstrap::init().expect("init");
+        state.set_current_cpu(CpuId(0)).expect("cpu");
+        state
+            .register_task_with_class(90001, TaskClass::App)
+            .expect("reg");
+        state.enqueue_on_cpu(CpuId(0), 90001).expect("enq");
+        let runnable_before = state.runnable_count_on_cpu(CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        let refused = shared.queue_advance_select_step_split(CpuId(3), "test");
+        assert!(
+            matches!(
+                refused,
+                CpuDispatch::RefusedCpuMismatch {
+                    requested: CpuId(3),
+                    authoritative: CpuId(0)
+                }
+            ),
+            "a foreign CPU must be refused with both identities reported"
+        );
+        assert_eq!(
+            shared.with(|k| k.runnable_count_on_cpu(CpuId(0))),
+            runnable_before,
+            "a refusal must leave the run queue untouched"
+        );
+
+        let selected = shared.queue_advance_select_step_split(CpuId(0), "test");
+        assert_eq!(
+            selected.tid().map(|t| t.0),
+            Some(90001),
+            "the authoritative CPU dequeues the runnable task"
+        );
+        assert_eq!(
+            shared.with(|k| k.runnable_count_on_cpu(CpuId(0))),
+            runnable_before - 1,
+            "exactly one task left the run queue"
         );
     }
 }
