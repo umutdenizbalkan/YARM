@@ -1573,15 +1573,45 @@ yarm_x86_lstar_entry:
     // and adds one compare+branch to the proven baseline.
     //
     // On a match we do NOT descend into the shared kernel dispatch (that would
-    // run the whole global-lock kernel on the AP without the lock). Instead we
-    // prove per-CPU LSTAR entry executed ON THIS CPU by setting the per-CPU
-    // ap_syscall_reentry_ok flag (gs:[168], kernel .bss addressable under the
-    // task CR3) and parking. The BSP polls the flag and emits the marker. RAX
-    // and the serial scratch registers are safe to clobber here — the probe
-    // path never returns to userspace.
+    // run the whole global-lock kernel on the AP without the lock).
+    //
+    // U9-D3 — TWO-PHASE HANDSHAKE. This path used to set gs:[168] and park
+    // unconditionally, so CPU 1 had no durable ring-3 residency and a CPL3-origin
+    // shootdown ACK was unreachable. It is now return-once / park-second:
+    //
+    //   first  0xA9C6 (gs:[168] == 0): publish gs:[168] = 1 and SYSRETQ back to the
+    //                                  exact next ring-3 instruction;
+    //   second 0xA9C6 (gs:[168] == 1): the existing permanent ring-0 park.
+    //
+    // The 0 -> 1 edge is what tells the BSP that CPU 1 is RESIDENT IN RING 3.
+    //
+    // This is proof-private, NOT public syscall ABI: real YARM syscall numbers are
+    // 0..32, so 0xA9C6 (43462) can never be a production (BSP) syscall, and no
+    // public dispatch arm is added or changed by either phase.
+    //
+    // REGISTER DISCIPLINE on the returning phase: not one GPR is written. The
+    // discriminator and the publish are both gs-relative memory operands, and
+    // SYSCALL already placed the user's return RIP in RCX and the user's RFLAGS in
+    // R11 — exactly what SYSRETQ consumes. RAX still holds 0xA9C6 on return, and
+    // every other GPR (including RSP, which was never switched to the kernel stack)
+    // is the user's authentic value. Interrupts are masked here by IA32_FMASK, and
+    // the only memory this phase touches is the per-CPU record, which is mapped in
+    // every task root — so no fault can take the still-user RSP.
+    //
+    // SYSRETQ is correct here because `configure_syscall_msrs_for_self` programs
+    // STAR[63:48] = USER_CODE_SELECTOR - 16, so SYSRETQ loads exactly the ring-3
+    // CS/SS pair (0x23/0x1b) the iretq return path builds by hand.
+    //
+    // The parking phase keeps its serial breadcrumb; the returning phase emits
+    // nothing, because serial output is not synchronization and a port write would
+    // clobber user DX/AL.
     cmp rax, 0xA9C6
     jne 2f
-    mov dword ptr gs:[168], 1        // ap_syscall_reentry_ok = 1 (persistent)
+    cmp dword ptr gs:[168], 0
+    jne 4f                           // already returned once -> permanent park
+    mov dword ptr gs:[168], 1        // ap_syscall_reentry_ok = 1 (ring-3 resident)
+    sysretq                          // -> exact next ring-3 instruction
+4:
     mov dx, 0x3f8
     mov al, 0x52                     // 'R' — AP ring3 SYSCALL re-entry observed
     out dx, al

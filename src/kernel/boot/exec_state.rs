@@ -54,6 +54,128 @@ const DEBUG_YIELD_LOG: bool = false;
 const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 static DISPATCH_CONTEXT_LOAD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
+// U9-D3 — the AP TLB-proof variant of the seal stub. Two-phase `0xA9C6` with a bounded
+// ring-3 RDTSC dwell between the phases, so CPU 1 is DEMONSTRABLY resident in ring 3
+// under its own user CR3 while the BSP drives a real shootdown at it. That residency is
+// the thing the tree could not previously produce: the old stub's single `0xA9C6` parked
+// in ring 0 immediately, so no CPL3-origin ACK was reachable.
+//
+//   xor eax, eax        ; RAX = 0  (SYSCALL_YIELD_NR — normal range)
+//   syscall             ; → normal global-lock dispatch (handle_yield), returns
+//   mov r12..r15, <canaries>
+//   mov eax, 0xA9C6     ; phase 1
+//   syscall             ; → LSTAR magic fast path: publish gs:[168]=1, SYSRETQ back
+//   <bounded RDTSC dwell — no syscall, no memory access, no privileged insn>
+//   cmp r12..r15, <canaries> ; any mismatch → diverge to `fail`, never reaching phase 2
+//   mov eax, 0xA9C6     ; phase 2
+//   syscall             ; → LSTAR magic fast path: park (existing behaviour)
+//   jmp .
+// fail:
+//   jmp .
+//
+// The canary compare is the LIVE context-preservation proof: reaching the phase-2 park at
+// all (observable as gs:[168] plus the existing 'R' serial breadcrumb) is only possible if
+// every callee-saved GPR survived the 0xF1 interrupt that fired during the dwell. A
+// corrupted context diverges to `fail` and the BSP's bounded poll reports a timeout
+// instead of a false pass.
+//
+// The dwell keeps its deadline in RCX and uses RAX/RDX as RDTSC's own clobbers, so no
+// canary register is touched by the dwell itself. It always terminates: the loop exits as
+// soon as the 64-bit TSC reaches a deadline computed once, up-front.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_CANARY_R12: u32 = 0x0111_1111;
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_CANARY_R13: u32 = 0x0222_2222;
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_CANARY_R14: u32 = 0x0333_3333;
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_CANARY_R15: u32 = 0x0444_4444;
+// ~134M TSC cycles. Long enough for the BSP to observe the `0 -> 1` edge and drive
+// bounded serialized shootdowns under QEMU, short enough to stay a bounded smoke step.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const AP_DWELL_TSC_DELTA: u32 = 0x0800_0000;
+#[rustfmt::skip]
+    pub(crate) const AP_PROBE_STUB: [u8; 119] = [
+        //   0: xor eax, eax  (RAX = 0 = Yield)
+        0x31, 0xC0,
+        //   2: syscall
+        0x0F, 0x05,
+        //   4: mov r12, AP_CANARY_R12
+        0x49, 0xC7, 0xC4, 0x11, 0x11, 0x11, 0x01,
+        //  11: mov r13, AP_CANARY_R13
+        0x49, 0xC7, 0xC5, 0x22, 0x22, 0x22, 0x02,
+        //  18: mov r14, AP_CANARY_R14
+        0x49, 0xC7, 0xC6, 0x33, 0x33, 0x33, 0x03,
+        //  25: mov r15, AP_CANARY_R15
+        0x49, 0xC7, 0xC7, 0x44, 0x44, 0x44, 0x04,
+        //  32: mov eax, 0xA9C6          (phase 1)
+        0xB8, 0xC6, 0xA9, 0x00, 0x00,
+        //  37: syscall                  -> returns to offset 39
+        0x0F, 0x05,
+        //  39: rdtsc
+        0x0F, 0x31,
+        //  41: shl rdx, 32
+        0x48, 0xC1, 0xE2, 0x20,
+        //  45: or  rax, rdx             (RAX = full TSC now)
+        0x48, 0x09, 0xD0,
+        //  48: mov rcx, rax
+        0x48, 0x89, 0xC1,
+        //  51: add rcx, AP_DWELL_TSC_DELTA   (RCX = deadline)
+        0x48, 0x81, 0xC1, 0x00, 0x00, 0x00, 0x08,
+        //  58: rdtsc                    <- dwell loop head
+        0x0F, 0x31,
+        //  60: shl rdx, 32
+        0x48, 0xC1, 0xE2, 0x20,
+        //  64: or  rax, rdx
+        0x48, 0x09, 0xD0,
+        //  67: cmp rax, rcx
+        0x48, 0x39, 0xC8,
+        //  70: jb  58                   (rel8 = 58 - 72 = -14)
+        0x72, 0xF2,
+        //  72: cmp r12, AP_CANARY_R12
+        0x49, 0x81, 0xFC, 0x11, 0x11, 0x11, 0x01,
+        //  79: jne fail                 (rel8 = 117 - 81 = 36)
+        0x75, 0x24,
+        //  81: cmp r13, AP_CANARY_R13
+        0x49, 0x81, 0xFD, 0x22, 0x22, 0x22, 0x02,
+        //  88: jne fail                 (rel8 = 117 - 90 = 27)
+        0x75, 0x1B,
+        //  90: cmp r14, AP_CANARY_R14
+        0x49, 0x81, 0xFE, 0x33, 0x33, 0x33, 0x03,
+        //  97: jne fail                 (rel8 = 117 - 99 = 18)
+        0x75, 0x12,
+        //  99: cmp r15, AP_CANARY_R15
+        0x49, 0x81, 0xFF, 0x44, 0x44, 0x44, 0x04,
+        // 106: jne fail                 (rel8 = 117 - 108 = 9)
+        0x75, 0x09,
+        // 108: mov eax, 0xA9C6          (phase 2)
+        0xB8, 0xC6, 0xA9, 0x00, 0x00,
+        // 113: syscall                  -> parks in ring 0
+        0x0F, 0x05,
+        // 115: jmp .                    (unreachable: phase 2 never returns)
+        0xEB, 0xFE,
+        // 117: fail: jmp .              (canary mismatch — never reaches phase 2)
+        0xEB, 0xFE,
+    ];
+// The canary immediates and the dwell delta are encoded little-endian in the stub above;
+// pin them so an edit to either constant cannot silently disagree with the machine code.
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_CANARY_R12.to_le_bytes()[3] == 0x01);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_CANARY_R13.to_le_bytes()[3] == 0x02);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_CANARY_R14.to_le_bytes()[3] == 0x03);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_CANARY_R15.to_le_bytes()[3] == 0x04);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AP_DWELL_TSC_DELTA.to_le_bytes()[3] == 0x08);
+
+/// U9-D3: the two-phase AP probe stub, for the focused tests that decode it.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn ap_probe_stub_bytes() -> &'static [u8] {
+    &AP_PROBE_STUB
+}
+
 impl KernelState {
     fn page_flags_from_elf_pflags(p_flags: u32) -> Result<PageFlags, KernelError> {
         let mut read = (p_flags & PF_R) != 0;
@@ -1484,19 +1606,6 @@ impl KernelState {
     ) -> Result<(u64, u64, u64), KernelError> {
         const PROBE_CODE_VA: u64 = 0x0000_0000_2000_0000;
         const PROBE_STACK_VA: u64 = 0x0000_0000_2001_0000;
-        // Seal stub (normal syscall FIRST, magic park SECOND):
-        //   xor eax, eax        ; RAX = 0  (SYSCALL_YIELD_NR — normal range)
-        //   syscall             ; → normal global-lock dispatch (handle_yield), returns
-        //   mov eax, 0xA9C6     ; magic park number (early diagnostic only)
-        //   syscall             ; → LSTAR magic fast path: set flag + hlt (parks)
-        //   jmp .
-        const PROBE_STUB: [u8; 13] = [
-            0x31, 0xC0, // xor eax, eax  (RAX = 0 = Yield)
-            0x0F, 0x05, // syscall
-            0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6
-            0x0F, 0x05, // syscall
-            0xEB, 0xFE, // jmp .
-        ];
         // Stage 199A2D2C1/C2A: when the x86_64 SMP cross-CPU request oracle is armed, the AP proof
         // task runs an ORDINARY userspace stub that (a) emits X86_AP_GENERIC_USER_ENTRY, (b) runs a
         // real Yield syscall, and (c) — reached ONLY through the saved-frame return path — emits
@@ -1535,7 +1644,7 @@ impl KernelState {
             0x0F, 0x05, // syscall  (DebugLog RESUMED)
             0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6  (park)
             0x0F, 0x05, // syscall
-            0xEB, 0xFE, // jmp .
+            0x0F, 0x05, // jmp .
         ];
         // Stage 199A2D2C2B1: when the recv-v2-server sub-selector is armed the SMP AP workload is a
         // REAL IPC server instead of the C2A Yield proof. Its stub (a) emits the userspace marker
@@ -1602,8 +1711,8 @@ impl KernelState {
             0x10, 0x00, 0x04, 0x20, 0x8B, 0x07, 0x85, 0xC0, 0x0F, 0x84, 0x2B, 0x00, 0x00, 0x00,
             0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00,
             0x00, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x05, 0x02, 0x20, 0xBE,
-            0x75, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB,
-            0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x04, 0x02, 0x20, 0xBE, 0x2F, 0x00,
+            0x75, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0x0F,
+            0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x04, 0x02, 0x20, 0xBE, 0x2F, 0x00,
             0x00, 0x00, 0x0F, 0x05, 0xEB, 0xE4,
         ];
         // Stage 199A2D2C2C: the REVERSE-direction server stub. Prefix identical to RECV_V2_SERVER_STUB_
@@ -1744,7 +1853,7 @@ impl KernelState {
             0x00, 0x00, 0x0F, 0x05, 0x85, 0xC9, 0x74, 0x10, 0x83, 0xF9, 0x07, 0x75, 0x25, 0x83,
             0xFB, 0x40, 0x73, 0x20, 0x31, 0xC0, 0x0F, 0x05, 0xEB, 0xCE, 0xB8, 0x0F, 0x00, 0x00,
             0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x37, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8,
-            0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF,
+            0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF,
             0x00, 0x01, 0x02, 0x20, 0xBE, 0x26, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xE4,
         ];
         const CLIENT_STUB_SEND_CAP_PATCH_OFFSET: usize = 10;
@@ -1781,10 +1890,10 @@ impl KernelState {
             0x8B, 0x07, 0x85, 0xC0, 0x74, 0x2B, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x02,
             0x02, 0x20, 0xBE, 0x2A, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00,
             0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6,
-            0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00,
+            0xA9, 0x00, 0x00, 0x0F, 0x05, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00,
             0x04, 0x02, 0x20, 0xBE, 0x2E, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F,
             0x00, 0x00, 0x00, 0xBF, 0x00, 0x01, 0x02, 0x20, 0xBE, 0x26, 0x00, 0x00, 0x00, 0x0F,
-            0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
+            0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0x0F, 0x05,
         ];
         const CLIENT_C2C_SEND_CAP_PATCH_OFFSET: usize = 10;
         // Same tie for the reverse-direction client: its NR6 send uses the framed wire length.
@@ -1935,7 +2044,7 @@ impl KernelState {
                     AP_SAVED_RESUMED_MARKER,
                 )?;
             } else {
-                self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB)?;
+                self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &AP_PROBE_STUB)?;
             }
             // Stack page: user + read + write (sequential single-AP use).
             let stack_phys = self.alloc_user_data_frame()?;

@@ -455,9 +455,38 @@ pub fn ap_dispatch_stage(cpu: CpuId) -> u32 {
 
 /// Stage 189C6: BSP reads the LSTAR AP-probe re-entry flag for `cpu` (1 = the
 /// dispatched AP user task's probe `syscall` re-entered per-CPU LSTAR on this CPU).
+///
+/// U9-D3: this flag is now the FIRST HALF of the two-phase `0xA9C6` handshake, not just a
+/// one-shot probe latch. `0` means "no `0xA9C6` seen yet on this CPU since the last reset", `1`
+/// means "the first `0xA9C6` was serviced and the AP was returned to ring 3". The BSP polls the
+/// `0 -> 1` edge to learn that CPU 1 is RESIDENT IN RING 3 — the observable that a CPL3-origin
+/// shootdown ACK needs and that nothing in the tree previously published.
 pub fn ap_syscall_reentry_ok(cpu: CpuId) -> u32 {
     let base = record_base(cpu) as *const PerCpuRecord;
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).ap_syscall_reentry_ok)) }
+}
+
+/// U9-D3: BSP clears the two-phase `0xA9C6` handshake flag for `cpu` before dispatching a
+/// workload task to it.
+///
+/// **This writer did not exist before U9-D3, and its absence was load-bearing.** The flag had
+/// exactly ONE writer in the whole tree — the LSTAR magic asm, storing `1` — and the source
+/// called it "(persistent)": nothing ever cleared it. That was harmless while the magic path
+/// only ever parked, because the flag was write-once-then-observe. It is NOT harmless now: the
+/// AP workload registers `count` tasks that run SEQUENTIALLY through the same stub, so without a
+/// reset every task after the first would find the flag already `1`, take the park arm on its
+/// FIRST `0xA9C6`, and never return to ring 3.
+///
+/// Field-granular `write_volatile`, matching `set_ap_dispatch_request`: it must never clobber the
+/// AP-owned `tlb_ack_gen` / `ap_dispatch_stage` neighbours.
+///
+/// Ordering: the BSP must clear this BEFORE it makes the task dispatchable, so the `0 -> 1` edge
+/// it later observes can only have been published by THAT task's first `0xA9C6`.
+pub fn clear_ap_syscall_reentry_ok(cpu: CpuId) {
+    let base = record_base(cpu) as *mut PerCpuRecord;
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*base).ap_syscall_reentry_ok), 0);
+    }
 }
 
 #[cfg(test)]

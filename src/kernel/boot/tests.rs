@@ -60688,11 +60688,40 @@ mod stage189d_seal {
     // probe. The magic (0xA9C6) syscall is present ONLY as the trailing park.
     #[test]
     fn seal_probe_uses_real_yield_not_magic_for_success() {
+        // U9-D3: re-derived onto the two-phase stub. The contract is unchanged and now
+        // STRONGER — the success path is still a real `Yield` (NR 0) issued BEFORE any magic
+        // syscall, and the magic is still only the trailing park — but the magic is now a
+        // return-once/park-second pair, so this pins the ORDER against the decoded bytes rather
+        // than against a comment string that a reformat can break.
+        let stub = crate::kernel::boot::exec_state::ap_probe_stub_bytes();
+        const YIELD: [u8; 4] = [0x31, 0xC0, 0x0F, 0x05]; // xor eax,eax ; syscall
+        const MAGIC: [u8; 5] = [0xB8, 0xC6, 0xA9, 0x00, 0x00]; // mov eax, 0xA9C6
+        let yield_at = stub
+            .windows(YIELD.len())
+            .position(|w| w == YIELD)
+            .expect("the probe stub must issue a real Yield (NR 0)");
+        let magic: alloc::vec::Vec<usize> = stub
+            .windows(MAGIC.len())
+            .enumerate()
+            .filter(|(_, w)| *w == MAGIC)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            magic.len(),
+            2,
+            "the magic syscall is a two-phase pair: one returning phase, one parking phase"
+        );
         assert!(
-            EXEC_SRC.contains("0x31, 0xC0, // xor eax, eax  (RAX = 0 = Yield)")
-                && EXEC_SRC.contains("0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6"),
+            yield_at < magic[0],
             "the probe stub must issue Yield (NR 0) first, then the magic park second"
         );
+        for m in &magic {
+            assert_eq!(
+                &stub[m + 5..m + 7],
+                &[0x0F, 0x05],
+                "each magic phase is `mov eax,0xA9C6` immediately followed by `syscall`"
+            );
+        }
         // The seal completion is driven by the NORMAL syscall dispatch hook, not the
         // magic fast path. The magic fast path only sets the re-entry flag + parks.
         assert!(
@@ -137519,5 +137548,377 @@ mod u9_production_post_switch_restore {
         let propagate = drain.find("restore_result?;").expect("the error lane");
         assert!(restore < tail, "the restore still runs first");
         assert!(tail < propagate, "the cleanup still runs before the error");
+    }
+}
+
+/// U9-D3 §2 — the two-phase `0xA9C6` handshake.
+///
+/// The magic AP syscall used to set `ap_syscall_reentry_ok` and park in ring 0 unconditionally,
+/// so CPU 1 had no durable ring-3 residency and a CPL3-origin TLB shootdown ACK was unreachable.
+/// It is now return-once / park-second, and the `0 -> 1` edge on that flag is the observable the
+/// BSP polls to learn CPU 1 is executing in ring 3.
+///
+/// The handshake itself is assembly, so these cases pin it against the DECODED stub bytes and the
+/// asm source rather than by executing it; the executable proof is the live §4 cell.
+#[cfg(test)]
+mod u9d3_two_phase_a9c6 {
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+
+    const MAGIC: [u8; 5] = [0xB8, 0xC6, 0xA9, 0x00, 0x00];
+    const SYSCALL: [u8; 2] = [0x0F, 0x05];
+
+    /// The magic fast path, bounded to its own arm of the LSTAR entry.
+    fn magic_arm() -> &'static str {
+        let start = DESC_SRC
+            .find("cmp rax, 0xA9C6")
+            .expect("the magic compare opens the fast path");
+        let end = DESC_SRC[start..]
+            .find("\n2:")
+            .map(|o| start + o)
+            .expect("the fast path ends at the ordinary-syscall label");
+        &DESC_SRC[start..end]
+    }
+
+    fn magic_sites(stub: &[u8]) -> alloc::vec::Vec<usize> {
+        stub.windows(MAGIC.len())
+            .enumerate()
+            .filter(|(_, w)| *w == MAGIC)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    // ── the handshake itself ──────────────────────────────────────────────────────────────
+
+    /// FIRST invocation returns: the arm discriminates on the flag being `0`, publishes `1`, and
+    /// leaves through `SYSRETQ` — not `hlt`.
+    #[test]
+    fn u9d3_first_invocation_publishes_the_flag_and_returns_to_ring3() {
+        let arm = magic_arm();
+        let discriminate = arm
+            .find("cmp dword ptr gs:[168], 0")
+            .expect("the returning phase is selected by the flag being 0");
+        let publish = arm
+            .find("mov dword ptr gs:[168], 1")
+            .expect("the returning phase publishes the ring-3 residency edge");
+        let ret = arm
+            .find("sysretq")
+            .expect("the returning phase leaves through SYSRETQ");
+        assert!(
+            discriminate < publish && publish < ret,
+            "order must be: discriminate -> publish -> return"
+        );
+        // The publish must happen BEFORE the return, or the BSP could observe ring-3 residency
+        // that has not been established yet.
+        assert!(
+            arm[..ret].contains("mov dword ptr gs:[168], 1"),
+            "the flag is published before control leaves for ring 3"
+        );
+    }
+
+    /// SECOND invocation parks: the existing permanent ring-0 park is retained verbatim, reached
+    /// only when the flag is already `1`.
+    #[test]
+    fn u9d3_second_invocation_retains_the_permanent_park() {
+        let arm = magic_arm();
+        let branch = arm
+            .find("jne 4f")
+            .expect("a non-zero flag branches to the park arm");
+        let park = arm.find("4:").expect("the park arm label");
+        assert!(branch < park, "the branch precedes its target");
+        let tail = &arm[park..];
+        assert!(tail.contains("hlt"), "the park arm still halts permanently");
+        assert!(
+            tail.contains("out dx, al"),
+            "the park arm keeps its existing serial breadcrumb"
+        );
+        assert!(
+            !tail.contains("sysretq"),
+            "the park arm must never return to ring 3"
+        );
+    }
+
+    /// Context preservation: the RETURNING phase writes no GPR at all. Both the discriminator and
+    /// the publish are gs-relative memory operands, and SYSCALL already staged RCX/R11 for
+    /// SYSRETQ. The serial write (which clobbers DX/AL) is confined to the parking arm.
+    #[test]
+    fn u9d3_returning_phase_touches_no_general_purpose_register() {
+        let arm = magic_arm();
+        let ret = arm.find("sysretq").expect("sysretq");
+        let returning = &arm[..ret];
+        for clobber in [
+            "mov dx,", "mov al,", "out dx", "push", "pop", "mov rax", "mov rcx",
+        ] {
+            assert!(
+                !returning.contains(clobber),
+                "the returning phase must not contain `{clobber}` — it would corrupt user context"
+            );
+        }
+        // Both memory operands are gs-relative, so no register is used to address them either.
+        assert_eq!(
+            returning.matches("gs:[168]").count(),
+            2,
+            "exactly the discriminator read and the publish write, both gs-relative"
+        );
+    }
+
+    // ── the flag: reset and transition ────────────────────────────────────────────────────
+
+    /// The flag now has a RESET writer, which it did not have before U9-D3, and the BSP clears it
+    /// before the workload becomes dispatchable — otherwise the second and later tasks would park
+    /// on their first `0xA9C6`.
+    #[test]
+    fn u9d3_flag_has_a_reset_writer_used_before_dispatch() {
+        assert!(
+            PERCPU_SRC.contains("pub fn clear_ap_syscall_reentry_ok(cpu: CpuId)"),
+            "the reset writer must exist"
+        );
+        let body = PERCPU_SRC
+            .split("pub fn clear_ap_syscall_reentry_ok(cpu: CpuId) {")
+            .nth(1)
+            .expect("its body")
+            .split("\n}")
+            .next()
+            .expect("bounded");
+        assert!(
+            body.contains("write_volatile") && body.contains("ap_syscall_reentry_ok"),
+            "field-granular volatile write, so it cannot clobber the AP-owned neighbours"
+        );
+        assert!(body.contains(", 0)"), "it writes 0");
+        // Ordering at the dispatch site: clear BEFORE the request is armed.
+        let clear = SMP_SRC
+            .find("clear_ap_syscall_reentry_ok(cpu);")
+            .expect("the dispatch site clears the flag");
+        let arm_req = SMP_SRC[clear..]
+            .find("set_ap_dispatch_request(cpu, 1);")
+            .expect("the dispatch request is armed after the clear");
+        assert!(
+            arm_req > 0,
+            "clear precedes arming, so the 0->1 edge is this workload's"
+        );
+    }
+
+    /// The magic asm remains the ONLY writer that sets the flag to 1, so the edge the BSP polls
+    /// can only be published by a real ring-3 `0xA9C6`.
+    #[test]
+    fn u9d3_only_the_magic_asm_sets_the_flag() {
+        assert_eq!(
+            DESC_SRC.matches("mov dword ptr gs:[168], 1").count(),
+            1,
+            "exactly one setter, in the magic fast path"
+        );
+        assert_eq!(
+            PERCPU_SRC.matches("ap_syscall_reentry_ok), 1)").count(),
+            0,
+            "no Rust-side setter may fabricate the residency edge"
+        );
+    }
+
+    // ── the stubs ─────────────────────────────────────────────────────────────────────────
+
+    /// The TLB-proof variant is two-phase with EXACTLY ONE bounded dwell between the phases, and
+    /// the dwell is deadline-driven (RDTSC), contains no syscall, and always terminates.
+    #[test]
+    fn u9d3_tlb_proof_stub_has_exactly_one_bounded_rdtsc_dwell() {
+        let stub = crate::kernel::boot::exec_state::ap_probe_stub_bytes();
+        let sites = magic_sites(stub);
+        assert_eq!(sites.len(), 2, "two-phase");
+        let (p1, p2) = (sites[0], sites[1]);
+        let between = &stub[p1 + 7..p2];
+
+        // Exactly one RDTSC-deadline dwell: one setup and one loop head.
+        assert_eq!(
+            between.windows(2).filter(|w| *w == [0x0F, 0x31]).count(),
+            2,
+            "exactly one dwell: one RDTSC to take the deadline, one in the loop"
+        );
+        // Deadline, not an iteration count: the loop compares against a value computed by ADD.
+        assert!(
+            between.windows(3).any(|w| w == [0x48, 0x81, 0xC1]),
+            "the deadline is `add rcx, imm32` over a sampled TSC, not a spin counter"
+        );
+        assert!(
+            between.windows(3).any(|w| w == [0x48, 0x39, 0xC8]),
+            "the loop compares the live TSC against that deadline"
+        );
+        // It always terminates: the only backward branch is the deadline test.
+        let back: alloc::vec::Vec<usize> = between
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0] == 0x72 && w[1] >= 0x80)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            back.len(),
+            1,
+            "exactly one backward branch — the deadline test"
+        );
+        // No syscall and no privileged instruction inside the dwell.
+        assert!(
+            !between.windows(2).any(|w| *w == SYSCALL),
+            "the dwell must contain no syscall"
+        );
+        for privileged in [[0x0F, 0x01], [0x0F, 0x06], [0x0F, 0x30]] {
+            assert!(
+                !between.windows(2).any(|w| *w == privileged),
+                "the dwell must contain no privileged instruction"
+            );
+        }
+    }
+
+    /// The dwell preserves the canaries, and the stub PROVES it: a mismatch diverges away from
+    /// phase 2, so reaching the park at all is the live context-preservation evidence.
+    #[test]
+    fn u9d3_tlb_proof_stub_gates_phase_two_on_intact_canaries() {
+        let stub = crate::kernel::boot::exec_state::ap_probe_stub_bytes();
+        let sites = magic_sites(stub);
+        let (p1, p2) = (sites[0], sites[1]);
+        let between = &stub[p1 + 7..p2];
+        // Four callee-saved canaries are set before phase 1 and compared before phase 2.
+        for reg in [0xFCu8, 0xFD, 0xFE, 0xFF] {
+            assert!(
+                stub[..p1].windows(3).any(|w| w == [0x49, 0xC7, reg - 0x38]),
+                "canary register 0x{reg:02X} must be seeded before phase 1"
+            );
+            assert!(
+                between.windows(3).any(|w| w == [0x49, 0x81, reg]),
+                "canary register 0x{reg:02X} must be compared before phase 2"
+            );
+        }
+        assert_eq!(
+            between.windows(2).filter(|w| w[0] == 0x75).count(),
+            4,
+            "each canary mismatch diverges away from phase 2"
+        );
+    }
+
+    /// Every stub that uses the magic syscall reaches a PARKING phase. This is not cosmetic:
+    /// with return-once semantics a lone `0xA9C6` RETURNS into whatever byte follows it, so a
+    /// stub left at one phase would spin in ring 3 (`jmp .`) instead of parking in ring 0.
+    ///
+    /// The invariant pinned here is exactly that hazard: no magic site may be immediately
+    /// followed by `jmp .`, and every stub containing a magic site must issue at least two
+    /// `syscall`s from the first magic load onwards — either an adjacent magic pair, a bare
+    /// `syscall` reusing the RAX the returning phase preserves, or (the TLB variant) a second
+    /// magic load after the dwell.
+    #[test]
+    fn u9d3_every_magic_stub_reaches_a_parking_phase() {
+        const JMP_SELF: [u8; 2] = [0xEB, 0xFE];
+        let mut checked = 0usize;
+        for (idx, bytes) in u9d3_all_stub_byte_arrays().into_iter().enumerate() {
+            let sites = magic_sites(&bytes);
+            if sites.is_empty() {
+                continue;
+            }
+            checked += 1;
+            for (k, &s) in sites.iter().enumerate() {
+                assert_eq!(
+                    &bytes[s + 5..s + 7],
+                    &SYSCALL,
+                    "stub #{idx}: each magic load is immediately followed by `syscall`"
+                );
+                // The LAST magic site is the parking phase; `jmp .` after it is the correct
+                // unreachable net, because the park never returns. Any EARLIER site followed by
+                // `jmp .` is the real hazard: it would return into a ring-3 spin.
+                if k + 1 < sites.len() {
+                    assert_ne!(
+                        &bytes[s + 7..s + 9],
+                        &JMP_SELF,
+                        "stub #{idx}: magic site at {s} returns straight into a ring-3 spin — it \
+                         needs a parking phase after it"
+                    );
+                }
+            }
+            if sites.len() == 1 {
+                // A single magic load only parks if a BARE `syscall` follows it, reusing the RAX
+                // the returning phase preserves. Anything else returns into ring 3.
+                assert_eq!(
+                    &bytes[sites[0] + 7..sites[0] + 9],
+                    &SYSCALL,
+                    "stub #{idx}: lone magic load must be followed by a bare parking `syscall`"
+                );
+            }
+            let after_first = &bytes[sites[0]..];
+            let syscalls = after_first.windows(2).filter(|w| *w == SYSCALL).count();
+            assert!(
+                syscalls >= 2,
+                "stub #{idx}: only {syscalls} syscall(s) from the first magic load — the parking \
+                 phase is missing"
+            );
+        }
+        assert!(checked >= 5, "all magic stubs are covered, found {checked}");
+    }
+
+    /// No public syscall dispatch arm was added. `0xA9C6` is 43462 — far outside the real
+    /// 0..=32 syscall numbers — and it is still handled entirely by the pre-dispatch compare.
+    #[test]
+    fn u9d3_no_public_syscall_dispatch_arm_was_added() {
+        assert_eq!(
+            DESC_SRC.matches("cmp rax, 0xA9C6").count(),
+            1,
+            "one magic compare, ahead of the ordinary dispatch"
+        );
+        let arm = magic_arm();
+        assert!(
+            !arm.contains("call ") && !arm.contains("dispatch"),
+            "the magic arm must not descend into the shared kernel dispatch"
+        );
+        assert!(
+            0xA9C6u32 > 32,
+            "the magic number is outside the public syscall range"
+        );
+        // The ordinary path is still reached only by the `jne`, unchanged.
+        assert!(
+            DESC_SRC.contains("cmp rax, 0xA9C6\n    jne 2f"),
+            "a non-magic RAX still falls straight through to the ordinary SYSCALL entry"
+        );
+    }
+
+    /// Helper: every `[u8; N]` stub literal in `exec_state.rs`, decoded (comments stripped).
+    fn u9d3_all_stub_byte_arrays() -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        let mut out = alloc::vec::Vec::new();
+        let mut rest = EXEC_SRC;
+        while let Some(i) = rest.find("const ") {
+            rest = &rest[i + 6..];
+            let Some(colon) = rest.find(':') else { break };
+            let Some(open) = rest.find("= [") else { break };
+            if !rest[colon..open].contains("[u8;") {
+                continue;
+            }
+            let Some(close) = rest[open..]
+                .find("\n    ];")
+                .or_else(|| rest[open..].find("\n];"))
+            else {
+                continue;
+            };
+            let body = &rest[open + 3..open + close];
+            let mut bytes = alloc::vec::Vec::new();
+            let mut k = 0usize;
+            let b = body.as_bytes();
+            while k < body.len() {
+                if body[k..].starts_with("//") {
+                    k = body[k..]
+                        .find('\n')
+                        .map(|o| k + o + 1)
+                        .unwrap_or(body.len());
+                    continue;
+                }
+                if body[k..].starts_with("0x") && k + 4 <= body.len() {
+                    if let Ok(v) = u8::from_str_radix(&body[k + 2..k + 4], 16) {
+                        let ends = k + 4 >= body.len() || !b[k + 4].is_ascii_alphanumeric();
+                        if ends {
+                            bytes.push(v);
+                            k += 4;
+                            continue;
+                        }
+                    }
+                }
+                k += 1;
+            }
+            out.push(bytes);
+        }
+        out
     }
 }

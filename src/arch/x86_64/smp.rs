@@ -2935,6 +2935,12 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     // markers fire from the AP's syscall as it enters the global-lock dispatch.
     set_ap_seal_probe_active(cpu, true);
     super::percpu::set_ap_dispatch_stage(cpu, 0);
+    // U9-D3: clear the two-phase `0xA9C6` handshake flag BEFORE the task becomes dispatchable, so
+    // the `0 -> 1` edge the BSP later polls can only have been published by THIS workload's first
+    // `0xA9C6`. Nothing cleared this flag before U9-D3 — it was a write-once probe latch — and
+    // without the clear every task after the first would take the park arm on its first `0xA9C6`
+    // and never reach ring 3 again.
+    super::percpu::clear_ap_syscall_reentry_ok(cpu);
     super::percpu::set_ap_dispatch_request(cpu, 1);
     crate::yarm_log!(
         "X86_AP_LIVE_DISPATCH_ARMED cpu={} tid={} cr3=0x{:x} entry=0x{:x} stack=0x{:x} rsp0=0x{:x}",
