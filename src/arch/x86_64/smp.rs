@@ -1824,17 +1824,18 @@ pub fn ap_tlb_shootdown_user_origin_proof() {
         return;
     }
     let cpu = CpuId(1);
-    // The ring-3 residency edge. Bounded: if the AP has not reached its dwell yet, return WITHOUT
-    // latching so a later trap retries. Serial output is never used as synchronization.
-    let mut resident = false;
-    for _ in 0..AP_READY_POLL_ITERS {
-        if super::percpu::ap_syscall_reentry_ok(cpu) != 0 {
-            resident = true;
-            break;
-        }
-        cpu_relax();
-    }
-    if !resident {
+    // The ring-3 residency edge, read EXACTLY ONCE. If the AP has not reached its dwell yet this
+    // returns WITHOUT latching, so a later trap retries. Serial output is never used as
+    // synchronization.
+    //
+    // This must not spin. This hook runs on EVERY BSP trap until it latches, so the retry is the
+    // trap itself; an `AP_READY_POLL_ITERS` (20_000_000) wait here would be paid again on every
+    // subsequent trap for as long as the edge never arrives — and it never arrives on any profile
+    // whose AP workload does not run the two-phase `0xA9C6` stub at all, which is every x86 SMP
+    // profile except the saved-return proof. Measured: with the spin in place the BSP made no
+    // forward progress on `qemu-x86_64-ap-cross-cpu-request-smoke` (the client task never issued
+    // its NR6 within the boot timeout) while the same profile is green without it.
+    if super::percpu::ap_syscall_reentry_ok(cpu) == 0 {
         return;
     }
     if AP_TLB_USER_ORIGIN_DONE.swap(true, Ordering::AcqRel) {

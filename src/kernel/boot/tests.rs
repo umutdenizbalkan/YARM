@@ -139011,6 +139011,61 @@ mod u9d3_f1_sole_ack_producer {
             );
         }
     }
+    /// **The residency edge is read ONCE, never spun on.**
+    ///
+    /// `ap_tlb_shootdown_user_origin_proof` runs on EVERY BSP trap until it latches, so the retry
+    /// is the trap itself. A bounded wait inside the hook is therefore paid AGAIN on every
+    /// subsequent trap for as long as the edge never arrives — and it never arrives on any profile
+    /// whose AP workload does not run the two-phase `0xA9C6` stub at all, which is every x86 SMP
+    /// profile except the saved-return proof.
+    ///
+    /// This was a real, measured livelock: with an `AP_READY_POLL_ITERS` (20_000_000) spin here,
+    /// the BSP made no forward progress on `qemu-x86_64-ap-cross-cpu-request-smoke` — the client
+    /// task never issued its NR6 within the boot timeout — while the same profile is green with a
+    /// single read. The guard exists so the spin cannot be reintroduced as an "obviously bounded"
+    /// wait.
+    #[test]
+    fn u9d3_the_residency_edge_is_polled_once_per_trap_not_spun_on() {
+        let body = {
+            let start = SMP
+                .find("pub fn ap_tlb_shootdown_user_origin_proof() {")
+                .expect("the CPL3 proof cell");
+            let tail = &SMP[start..];
+            let end = tail.find("\n}\n").expect("it closes");
+            code(&tail[..end])
+        };
+        let residency = body
+            .find("ap_syscall_reentry_ok(cpu)")
+            .expect("the residency edge is read");
+        // Exactly one read, and it is a plain early-return test — not a loop condition.
+        assert_eq!(
+            body.matches("ap_syscall_reentry_ok(").count(),
+            1,
+            "the residency edge must be read exactly once per invocation"
+        );
+        assert!(
+            body.contains("if super::percpu::ap_syscall_reentry_ok(cpu) == 0 {"),
+            "…as a single early-return check"
+        );
+        // No bounded-wait loop may precede or enclose it.
+        let before = &body[..residency];
+        for spin in ["AP_READY_POLL_ITERS", "cpu_relax()", "for _ in 0.."] {
+            assert!(
+                !before.contains(spin),
+                "no `{spin}` may run before the residency read — this hook fires on every BSP trap"
+            );
+        }
+        // The bounded ACK wait that legitimately exists lives inside `smp_tlb_shootdown_cpus`,
+        // which runs only AFTER the edge is observed, and at most 8 times.
+        assert!(
+            body.contains("for attempt in 0..8u32 {") && body.contains("smp_tlb_shootdown_cpus("),
+            "the bounded, serialized attempt loop runs only after residency is observed"
+        );
+        assert!(
+            !body.contains("AP_READY_POLL_ITERS"),
+            "the cell itself must contain no unbounded-cost poll"
+        );
+    }
 }
 
 /// U9-D3 §5 — the production split unmap drives the REAL shootdown coordinator.
