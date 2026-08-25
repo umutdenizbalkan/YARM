@@ -327,6 +327,202 @@ fn post_switch_d6_cleanup_split(
     }
 }
 
+/// U9-QA — the Stage 117 switch-plan stash DRAIN, extracted verbatim so it has exactly one
+/// implementation and two callers.
+///
+/// It was inline in `handle_trap_entry_shared`, reachable only after the broad `with_cpu`
+/// returned. U9-QA gives it a second caller: a PRE-LOCK route that published its own terminal
+/// transition and stashed a plan through `SharedKernel::queue_advance_commit_split` must drive
+/// the same apply, and must not enter the terminal broad dispatcher to do it.
+///
+/// Nothing about the apply changed. It still takes the plan, performs the arch switch with no
+/// lock held, runs the U9/203C off-lock incoming restore on x86_64 and AArch64, and runs the
+/// U9-D3 §7 split D6 cleanup when a proof/D6-SWITCH-A run has just completed.
+fn drain_switch_plan_stash(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    mut frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        // SAFETY: single CPU, interrupts disabled, no concurrent accessor.
+        let plan = unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take() };
+        if let Some(plan) = plan {
+            // Stage 166 (D6-SWITCH-A): tag this as a real production unlocked
+            // switch when driven by `yarm.d6_switch_a=1` (proof knob off).
+            #[cfg(target_arch = "x86_64")]
+            let d6_switch_a_mode = crate::kernel::boot::d6_switch_a_enabled()
+                && !crate::kernel::boot::d6_controlled_switch_proof_enabled();
+            #[cfg(not(target_arch = "x86_64"))]
+            let d6_switch_a_mode = false;
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
+            if d6_switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_LOCK_DROPPED outgoing={} incoming={}",
+                    plan.outgoing_tid,
+                    plan.incoming_tid
+                );
+            }
+            crate::yarm_log!(
+                "D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
+            if d6_switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_SWITCH_ENTER outgoing={} incoming={}",
+                    plan.outgoing_tid,
+                    plan.incoming_tid
+                );
+            }
+            // Stage 118 Part D: detect first-resume path (x86_64 only).
+            // If the incoming frame's RIP points to the trampoline, stash a
+            // FirstResumeContext so the trampoline can switch back after
+            // calling post_switch_restore_arch_thread_state.
+            #[cfg(target_arch = "x86_64")]
+            {
+                unsafe extern "C" {
+                    fn yarm_kernel_thread_switch_trampoline() -> !;
+                }
+                let trampoline_ip = yarm_kernel_thread_switch_trampoline as *const () as usize;
+                // SAFETY: incoming_frame_ptr is stable (KernelState::tcbs fixed array).
+                let incoming_ip = unsafe { (*plan.incoming_frame_ptr).instruction_ptr() };
+                if incoming_ip == trampoline_ip {
+                    let ctx = crate::kernel::boot::FirstResumeContext {
+                        cpu_id: cpu,
+                        incoming_tid: plan.incoming_tid,
+                        outgoing_frame_ptr: plan.outgoing_frame_ptr as *const _,
+                        incoming_frame_ptr: plan.incoming_frame_ptr,
+                        outgoing_stack_top: plan.outgoing_stack_top,
+                    };
+                    // SAFETY: single CPU, interrupts disabled.
+                    unsafe {
+                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].store(ctx);
+                    }
+                }
+            }
+            // SAFETY: pointers derived from stable KernelState::tcbs storage under
+            // task_state_lock; valid because KernelState is alive for the program
+            // lifetime, the array is fixed-size (no reallocation), and the system is
+            // single-CPU with interrupts disabled (no concurrent modification).
+            // The dereferences are non-aliasing: outgoing and incoming indices were
+            // verified distinct in `maybe_switch_kernel_context`.
+            unsafe {
+                crate::arch::selected_isa::context_switch::switch_frames(
+                    &mut *plan.outgoing_frame_ptr,
+                    &*plan.incoming_frame_ptr,
+                    plan.incoming_stack_top,
+                );
+            }
+            // POINT 2: execution resumes here when the outgoing task is switched
+            // back in (either by the normal scheduler or by the first-resume
+            // trampoline switching back after post_switch_restore).
+            crate::yarm_log!(
+                "D6_SWITCH_FRAMES_RETURNED_UNLOCKED outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
+            if d6_switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_RETURNED outgoing={} incoming={}",
+                    plan.outgoing_tid,
+                    plan.incoming_tid
+                );
+            }
+            // Stage 139: hardware CR3 snapshot at POINT 2, before proof cleanup
+            // restores the correct address space.  The proof path does not touch
+            // CR3 in switch_frames or the trampoline, so this captures any
+            // divergence introduced by the proof's lock-drop switch.
+            #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+            {
+                let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+                crate::yarm_log!("D6_PROOF_CR3_AFTER_SWITCH_BACK cr3=0x{:016x}", hw_cr3);
+            }
+            let is_proof_done =
+                if crate::kernel::boot::d6_controlled_switch_proof_take_pending_done() {
+                    crate::kernel::boot::d6_controlled_switch_proof_mark_done();
+                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DONE");
+                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN");
+                    // Dispatch stash was consumed by take() above — re-verify empty.
+                    let dispatch_clear = unsafe {
+                        !crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan()
+                    };
+                    // First-resume stash was consumed by the trampoline — verify empty.
+                    let resume_clear = unsafe {
+                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx]
+                            .take()
+                            .is_none()
+                    };
+                    if dispatch_clear && resume_clear {
+                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STASH_CLEAR_OK");
+                    }
+                    // PENDING_DONE was swapped to false by take_pending_done; verify.
+                    let pending_clear =
+                        !crate::kernel::boot::D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE
+                            .load(core::sync::atomic::Ordering::Acquire);
+                    // GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE was cleared before the stash drain.
+                    let trap_path_clear = cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+                        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                    if pending_clear && trap_path_clear {
+                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STATE_CLEAR_OK");
+                    }
+                    true
+                } else {
+                    false
+                };
+            // U9 (canonical 203C): restore the incoming task's arch thread state (populate its
+            // trap frame with its user-mode register context) with NO broad lock re-acquired.
+            //
+            // Reached on x86_64 and AArch64 — the only architectures whose stash gate can
+            // populate `DISPATCH_SWITCH_PLAN_STASH` at all, since that gate (`exec_state.rs`)
+            // opens with `!cfg!(target_arch = "riscv64") && …`. This drain is therefore
+            // statically unreachable on RISC-V, which keeps its verbatim in-lock restore inside
+            // the tail below rather than an unproven split.
+            #[cfg(not(target_arch = "riscv64"))]
+            let restore_result =
+                post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut());
+            #[cfg(target_arch = "riscv64")]
+            let restore_result: Result<(), TrapHandleError> = Ok(());
+
+            // U9-D3 §7: the D6 cleanup overlay is the ONLY remaining consumer here, and it no
+            // longer touches the broad lock — this site holds NO broad acquisition at all. An
+            // ordinary production switch skips it entirely (`is_proof_done` is false).
+            //
+            // The `|| cfg!(target_arch = "riscv64")` arm went with the tail. It existed to run
+            // RISC-V's in-lock restore, and that arm was already statically unreachable: the stash
+            // gate in `maybe_switch_kernel_context` opens with `!cfg!(target_arch = "riscv64")`,
+            // so `has_plan()` — this block's entry condition — is never true on RISC-V. Removing
+            // an unreachable branch weakens nothing; the FOUNDATION restore stays defined.
+            //
+            // Order is preserved: the restore ran first and its result is propagated last, so the
+            // overlay still observes exactly the state it did before, and a restore error still
+            // surfaces only after the cleanup has run.
+            if is_proof_done {
+                post_switch_d6_cleanup_split(shared, cpu, d6_switch_a_mode);
+            }
+            restore_result?;
+            // Stage 132: arm the first post-cleanup trap diagnostic.
+            if is_proof_done {
+                let cpu_idx_set = cpu.0 as usize;
+                if cpu_idx_set < crate::kernel::scheduler::MAX_CPUS {
+                    crate::kernel::boot::D6_POST_CLEANUP_DIAG_PENDING[cpu_idx_set]
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    // Stage 133: arm the pre-lock #PF register diagnostic.
+                    #[cfg(target_arch = "x86_64")]
+                    crate::kernel::boot::D6_PRE_LOCK_PF_DIAG_PENDING[cpu_idx_set]
+                        .store(true, core::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn handle_trap_entry_shared(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
@@ -1725,183 +1921,7 @@ pub fn handle_trap_entry_shared(
     // task's kernel stack. All local variables below (`frame`, `shared`, `cpu`)
     // are now the INCOMING task's versions, which were on its own kernel stack
     // when it was last suspended at this exact code location.
-    let cpu_idx = cpu.0 as usize;
-    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
-        // SAFETY: single CPU, interrupts disabled, no concurrent accessor.
-        let plan = unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take() };
-        if let Some(plan) = plan {
-            // Stage 166 (D6-SWITCH-A): tag this as a real production unlocked
-            // switch when driven by `yarm.d6_switch_a=1` (proof knob off).
-            #[cfg(target_arch = "x86_64")]
-            let d6_switch_a_mode = crate::kernel::boot::d6_switch_a_enabled()
-                && !crate::kernel::boot::d6_controlled_switch_proof_enabled();
-            #[cfg(not(target_arch = "x86_64"))]
-            let d6_switch_a_mode = false;
-            crate::yarm_log!(
-                "D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing={} incoming={}",
-                plan.outgoing_tid,
-                plan.incoming_tid
-            );
-            if d6_switch_a_mode {
-                crate::yarm_log!(
-                    "D6_SWITCH_A_LOCK_DROPPED outgoing={} incoming={}",
-                    plan.outgoing_tid,
-                    plan.incoming_tid
-                );
-            }
-            crate::yarm_log!(
-                "D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing={} incoming={}",
-                plan.outgoing_tid,
-                plan.incoming_tid
-            );
-            if d6_switch_a_mode {
-                crate::yarm_log!(
-                    "D6_SWITCH_A_SWITCH_ENTER outgoing={} incoming={}",
-                    plan.outgoing_tid,
-                    plan.incoming_tid
-                );
-            }
-            // Stage 118 Part D: detect first-resume path (x86_64 only).
-            // If the incoming frame's RIP points to the trampoline, stash a
-            // FirstResumeContext so the trampoline can switch back after
-            // calling post_switch_restore_arch_thread_state.
-            #[cfg(target_arch = "x86_64")]
-            {
-                unsafe extern "C" {
-                    fn yarm_kernel_thread_switch_trampoline() -> !;
-                }
-                let trampoline_ip = yarm_kernel_thread_switch_trampoline as *const () as usize;
-                // SAFETY: incoming_frame_ptr is stable (KernelState::tcbs fixed array).
-                let incoming_ip = unsafe { (*plan.incoming_frame_ptr).instruction_ptr() };
-                if incoming_ip == trampoline_ip {
-                    let ctx = crate::kernel::boot::FirstResumeContext {
-                        cpu_id: cpu,
-                        incoming_tid: plan.incoming_tid,
-                        outgoing_frame_ptr: plan.outgoing_frame_ptr as *const _,
-                        incoming_frame_ptr: plan.incoming_frame_ptr,
-                        outgoing_stack_top: plan.outgoing_stack_top,
-                    };
-                    // SAFETY: single CPU, interrupts disabled.
-                    unsafe {
-                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].store(ctx);
-                    }
-                }
-            }
-            // SAFETY: pointers derived from stable KernelState::tcbs storage under
-            // task_state_lock; valid because KernelState is alive for the program
-            // lifetime, the array is fixed-size (no reallocation), and the system is
-            // single-CPU with interrupts disabled (no concurrent modification).
-            // The dereferences are non-aliasing: outgoing and incoming indices were
-            // verified distinct in `maybe_switch_kernel_context`.
-            unsafe {
-                crate::arch::selected_isa::context_switch::switch_frames(
-                    &mut *plan.outgoing_frame_ptr,
-                    &*plan.incoming_frame_ptr,
-                    plan.incoming_stack_top,
-                );
-            }
-            // POINT 2: execution resumes here when the outgoing task is switched
-            // back in (either by the normal scheduler or by the first-resume
-            // trampoline switching back after post_switch_restore).
-            crate::yarm_log!(
-                "D6_SWITCH_FRAMES_RETURNED_UNLOCKED outgoing={} incoming={}",
-                plan.outgoing_tid,
-                plan.incoming_tid
-            );
-            if d6_switch_a_mode {
-                crate::yarm_log!(
-                    "D6_SWITCH_A_RETURNED outgoing={} incoming={}",
-                    plan.outgoing_tid,
-                    plan.incoming_tid
-                );
-            }
-            // Stage 139: hardware CR3 snapshot at POINT 2, before proof cleanup
-            // restores the correct address space.  The proof path does not touch
-            // CR3 in switch_frames or the trampoline, so this captures any
-            // divergence introduced by the proof's lock-drop switch.
-            #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
-            {
-                let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
-                crate::yarm_log!("D6_PROOF_CR3_AFTER_SWITCH_BACK cr3=0x{:016x}", hw_cr3);
-            }
-            let is_proof_done =
-                if crate::kernel::boot::d6_controlled_switch_proof_take_pending_done() {
-                    crate::kernel::boot::d6_controlled_switch_proof_mark_done();
-                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DONE");
-                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN");
-                    // Dispatch stash was consumed by take() above — re-verify empty.
-                    let dispatch_clear = unsafe {
-                        !crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan()
-                    };
-                    // First-resume stash was consumed by the trampoline — verify empty.
-                    let resume_clear = unsafe {
-                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx]
-                            .take()
-                            .is_none()
-                    };
-                    if dispatch_clear && resume_clear {
-                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STASH_CLEAR_OK");
-                    }
-                    // PENDING_DONE was swapped to false by take_pending_done; verify.
-                    let pending_clear =
-                        !crate::kernel::boot::D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE
-                            .load(core::sync::atomic::Ordering::Acquire);
-                    // GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE was cleared before the stash drain.
-                    let trap_path_clear = cpu_idx >= crate::kernel::scheduler::MAX_CPUS
-                        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-                            .load(core::sync::atomic::Ordering::Relaxed);
-                    if pending_clear && trap_path_clear {
-                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STATE_CLEAR_OK");
-                    }
-                    true
-                } else {
-                    false
-                };
-            // U9 (canonical 203C): restore the incoming task's arch thread state (populate its
-            // trap frame with its user-mode register context) with NO broad lock re-acquired.
-            //
-            // Reached on x86_64 and AArch64 — the only architectures whose stash gate can
-            // populate `DISPATCH_SWITCH_PLAN_STASH` at all, since that gate (`exec_state.rs`)
-            // opens with `!cfg!(target_arch = "riscv64") && …`. This drain is therefore
-            // statically unreachable on RISC-V, which keeps its verbatim in-lock restore inside
-            // the tail below rather than an unproven split.
-            #[cfg(not(target_arch = "riscv64"))]
-            let restore_result =
-                post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut());
-            #[cfg(target_arch = "riscv64")]
-            let restore_result: Result<(), TrapHandleError> = Ok(());
-
-            // U9-D3 §7: the D6 cleanup overlay is the ONLY remaining consumer here, and it no
-            // longer touches the broad lock — this site holds NO broad acquisition at all. An
-            // ordinary production switch skips it entirely (`is_proof_done` is false).
-            //
-            // The `|| cfg!(target_arch = "riscv64")` arm went with the tail. It existed to run
-            // RISC-V's in-lock restore, and that arm was already statically unreachable: the stash
-            // gate in `maybe_switch_kernel_context` opens with `!cfg!(target_arch = "riscv64")`,
-            // so `has_plan()` — this block's entry condition — is never true on RISC-V. Removing
-            // an unreachable branch weakens nothing; the FOUNDATION restore stays defined.
-            //
-            // Order is preserved: the restore ran first and its result is propagated last, so the
-            // overlay still observes exactly the state it did before, and a restore error still
-            // surfaces only after the cleanup has run.
-            if is_proof_done {
-                post_switch_d6_cleanup_split(shared, cpu, d6_switch_a_mode);
-            }
-            restore_result?;
-            // Stage 132: arm the first post-cleanup trap diagnostic.
-            if is_proof_done {
-                let cpu_idx_set = cpu.0 as usize;
-                if cpu_idx_set < crate::kernel::scheduler::MAX_CPUS {
-                    crate::kernel::boot::D6_POST_CLEANUP_DIAG_PENDING[cpu_idx_set]
-                        .store(true, core::sync::atomic::Ordering::Release);
-                    // Stage 133: arm the pre-lock #PF register diagnostic.
-                    #[cfg(target_arch = "x86_64")]
-                    crate::kernel::boot::D6_PRE_LOCK_PF_DIAG_PENDING[cpu_idx_set]
-                        .store(true, core::sync::atomic::Ordering::Release);
-                }
-            }
-        }
-    }
+    drain_switch_plan_stash(shared, cpu, frame.as_deref_mut())?;
 
     // U7 (canonical 199E) — THE PRODUCTION IPC-TIMEOUT ENTRY, x86_64 + AArch64 cell.
     //

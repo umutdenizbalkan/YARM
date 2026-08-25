@@ -36831,8 +36831,15 @@ mod stage130_d6_proof_cleanup {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
+        // Whitespace-insensitive: rustfmt re-indents this call when the enclosing block moves.
+        let flat: alloc::string::String = code
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
         assert!(
-            code.contains("if is_proof_done {\n                post_switch_d6_cleanup_split(shared, cpu, d6_switch_a_mode);"),
+            flat.contains(
+                "if is_proof_done { post_switch_d6_cleanup_split(shared, cpu, d6_switch_a_mode);"
+            ),
             "the cleanup is still gated on the proof having completed, and nothing else calls it"
         );
         assert_eq!(
@@ -98411,7 +98418,10 @@ mod stage200d0b3_x86_exit_corrected {
             "shared.drain_dispatch_post_work(cpu, ",
             "shared.run_due_ipc_timeout_work(cpu);",
             "shared.drain_server_death_post_work(cpu)",
-            "DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()",
+            // U9-QA: the switch-plan drain is now the extracted `drain_switch_plan_stash`,
+            // called at exactly the position its inline block occupied. The ordering this
+            // guard asserts is unchanged; only the text at that position is.
+            "drain_switch_plan_stash(shared, cpu, ",
         ] {
             let at = entry
                 .find(drain)
@@ -99261,7 +99271,10 @@ mod stage200d0c1_aarch64_exit_prep {
             "shared.drain_server_death_post_work(cpu)",
             "shared.run_due_ipc_timeout_work(cpu);",
             "super::aarch64::trap::enter_post_lock_idle(cpu);",
-            "DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()",
+            // U9-QA: the switch-plan drain is now the extracted `drain_switch_plan_stash`,
+            // called at exactly the position its inline block occupied. The ordering this
+            // guard asserts is unchanged; only the text at that position is.
+            "drain_switch_plan_stash(shared, cpu, ",
         ] {
             let at = entry
                 .find(drain)
