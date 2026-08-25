@@ -1396,7 +1396,19 @@ pub fn handle_trap_entry_shared(
                 crate::kernel::boot::maybe_log_futex_wait_retired();
             } else {
                 // Nothing else runnable ⇒ idle (same as the D2 recv idle branch).
+                //
+                // U9-QA §4: this is the x86_64 TERMINAL-IDLE settlement, and it settles by
+                // RETURNING. The outgoing waiter is `Blocked(Futex)` and `current` is clear, so
+                // the raw trap tail's `exiting_tid is None` landing takes this CPU into
+                // `idle_halt_loop()` with the depth clear and attestation epilogue intact. No
+                // frame is restored here and nothing diverges — see
+                // `settle_post_lock_terminal_idle`.
                 crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                crate::arch::x86_64::trap::settle_post_lock_terminal_idle(
+                    cpu,
+                    outgoing.unwrap_or(u64::MAX),
+                    "futex_wait",
+                );
                 crate::yarm_log!("FUTEX_WAIT_SPLIT_DISPATCH_OK cpu={} incoming=idle", cpu.0);
                 crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_DONE result=ok");
                 crate::yarm_log!("FUTEX_WAIT_SPLIT_DONE result=blocked");

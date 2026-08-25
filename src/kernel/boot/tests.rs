@@ -139335,6 +139335,115 @@ mod u9d3_split_unmap_drives_real_d3 {
     }
 }
 
+// ── U9-QA §4: THE x86_64 POST-LOCK TERMINAL-IDLE LANDING ──────────────────────────────────────
+//
+// A drain that settles `TerminalIdle` has cleared `current` and restored no frame, so the CPU
+// must land somewhere that does not return to userspace. On AArch64 that landing is an explicit
+// divergence. On x86_64 it already exists one level out, in the raw trap tail: after the shared
+// entry returns, the tail reads the exiting TID and, on `None`/idle with no revalidated owner,
+// clears the trap depth, runs the exit attestation epilogue and enters `idle_halt_loop()`.
+//
+// That makes RETURNING the correct x86_64 settlement and diverging the wrong one — a divergence
+// would skip the depth clear and the attestation. These cases hold the tail to that contract, so
+// the thing the drains depend on cannot be silently removed, and hold the settlement to being an
+// attestation rather than a second idle policy.
+#[cfg(test)]
+mod u9qa_x86_terminal_idle_landing {
+    const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
+    const DESC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+
+    /// The raw trap tail still lands terminal idle: exiting TID absent/idle, no revalidated
+    /// owner, then the depth clear, the attestation epilogue and the wake-capable idle.
+    #[test]
+    fn x86_terminal_idle_landing_is_the_raw_trap_tail() {
+        let landing = DESC
+            .split("if matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none() {")
+            .nth(1)
+            .expect("the raw trap tail must still test for an absent/idle exiting task");
+        let end = landing.find("\n        }").unwrap_or(landing.len());
+        let landing = &landing[..end];
+        for needle in [
+            "SCHED_ENTER_IDLE_HLT",
+            "TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release)",
+            "maybe_attest_exit_common_epilogue(cpu, \"idle\")",
+            "idle_halt_loop()",
+        ] {
+            assert!(
+                landing.contains(needle),
+                "the x86_64 terminal-idle landing must still `{needle}` — a post-lock drain \
+                 settles TerminalIdle by returning INTO this tail"
+            );
+        }
+    }
+
+    /// The idle primitive is the wake-capable one, so a settled CPU can be woken by an IRQ
+    /// rather than being parked forever.
+    #[test]
+    fn the_landing_idles_wake_capably() {
+        let body = DESC
+            .split("pub(crate) fn idle_halt_loop() -> ! {")
+            .nth(1)
+            .expect("idle_halt_loop must exist");
+        let end = body.find("\n}").unwrap_or(body.len());
+        assert!(
+            body[..end].contains("\"sti\", \"hlt\""),
+            "the terminal-idle landing must be interruptible (sti; hlt), not a masked halt"
+        );
+    }
+
+    /// The x86_64 settlement is an ATTESTATION, not a divergence: it returns, and it does not
+    /// introduce a second idle policy.
+    #[test]
+    fn the_x86_settlement_returns_instead_of_diverging() {
+        let sig = "pub(crate) fn settle_post_lock_terminal_idle(cpu: CpuId, outgoing_tid: u64, class: &'static str)";
+        assert!(
+            X86_TRAP.contains(&alloc::format!("{sig} {{")),
+            "the settlement must return unit, never `-> !`"
+        );
+        let body = X86_TRAP.split(sig).nth(1).expect("its body");
+        let end = body.find("\n}").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("X86_POST_LOCK_TERMINAL_IDLE"),
+            "the settlement must attest which class idled"
+        );
+        // Call syntax, not bare names: the attestation TEXT names the primitive the tail uses
+        // (`primitive=idle_halt_loop`), which is the point — it must not CALL it.
+        for banned in ["idle_halt_loop()", "halt_forever()", "loop {", "asm!"] {
+            assert!(
+                !body.contains(banned),
+                "the settlement must not idle itself (`{banned}`) — the raw trap tail owns that"
+            );
+        }
+    }
+
+    /// The FutexWait drain's idle branch uses the settlement, restores no frame, and does not
+    /// diverge — so the CPU reaches the tail's landing.
+    #[test]
+    fn the_futex_drain_idle_branch_settles_through_it() {
+        let branch = TRAP_ENTRY
+            .split("// Nothing else runnable ⇒ idle (same as the D2 recv idle branch).")
+            .nth(1)
+            .expect("the x86 FutexWait idle branch");
+        let end = branch.find("\n        } else {").unwrap_or(branch.len());
+        let branch = &branch[..end];
+        assert!(
+            branch.contains("settle_post_lock_terminal_idle("),
+            "the idle branch must attest through the named settlement"
+        );
+        for banned in [
+            "x86_post_lock_resume_marked_incoming(",
+            "enter_post_lock_dispatch_fatal(",
+        ] {
+            assert!(
+                !branch.contains(banned),
+                "the idle branch must restore nothing and diverge nowhere: found `{banned}`"
+            );
+        }
+    }
+}
+
 // ── U9-QA §1: ONE QUEUE-ADVANCE OWNER ─────────────────────────────────────────────────────────
 //
 // The off-lock queue advance has exactly two consumers — the FutexWait retirement drain and the
