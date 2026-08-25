@@ -7503,6 +7503,87 @@ impl SharedKernel {
         });
     }
 
+    /// U9-D3 §5 — the shootdown target set for `asid`, computed with NO broad lock.
+    ///
+    /// The same predicate `KernelState::live_cpu_bitmap_for_asid` applies — online, NOT wake-only,
+    /// and currently running a task bound to `asid` — but reached through the rank-1 scheduler and
+    /// rank-2 task seams instead of the broad guard. Wake-only APs are excluded because they run
+    /// no dispatcher and never load a user CR3, so they can hold no translation for a user ASID.
+    ///
+    /// This is deliberately NOT `online_wake_only_ap_bitmap`: that is the complement set (idle APs)
+    /// and would target CPUs that cannot possibly hold the mapping while missing the one that does.
+    pub(crate) fn live_cpu_bitmap_for_asid_split(&self, asid: crate::kernel::vm::Asid) -> u64 {
+        // rank 1: topology + per-CPU current TID, one acquisition.
+        let (online, wake_only, current) = self.with_scheduler_split_mut(|sched| {
+            let s = kernel_ref(&sched.scheduler);
+            let online = s.online_cpu_bitmap();
+            let wake_only = s.wake_only_bitmap();
+            let mut current = [None; crate::arch::platform_constants::MAX_CPUS];
+            for (cpu, slot) in current.iter_mut().enumerate() {
+                *slot = s.current_tid_on(CpuId(cpu as u8)).map(|t| t.0);
+            }
+            (online, wake_only, current)
+        });
+        // rank 1 released. rank 2: resolve each candidate's ASID.
+        let candidates = online & !wake_only;
+        let mut bitmap = 0u64;
+        for (cpu, tid) in current.iter().enumerate() {
+            let bit = 1u64 << cpu;
+            if candidates & bit == 0 {
+                continue;
+            }
+            let Some(tid) = tid else { continue };
+            if self.task_asid_for_tid_split_read(*tid) == asid.0 as u64 {
+                bitmap |= bit;
+            }
+        }
+        bitmap
+    }
+
+    /// U9-D3 §5 — complete the REAL TLB shootdown for one just-unmapped page, with NO domain or
+    /// broad lock held. Returns `true` only when every target acknowledged.
+    ///
+    /// Order: local invalidation on the requester, then the remote request published through the
+    /// generation-matched coordinator, which waits for each target's own 0xF1 handler to publish
+    /// `ack_gen == req_gen`. The caller reclaims ONLY on `true` — that is the
+    /// unmap-before-ACK-before-reclaim rule, and a timeout deliberately leaves the frame
+    /// unavailable for reuse rather than recycling memory a remote CPU may still translate.
+    ///
+    /// Deliberately NOT `KernelState::request_live_asid_shootdown`: that helper impersonates the
+    /// requester onto each target (`set_current_cpu`), drains the targets' mailboxes from the
+    /// requester, and calls `yield_current` — all of which §5 forbids, and all of which are
+    /// impossible here because nothing holds a lock to yield under.
+    pub(crate) fn complete_unmap_shootdown_split(
+        &self,
+        asid: crate::kernel::vm::Asid,
+        virt: crate::kernel::vm::VirtAddr,
+    ) -> bool {
+        // The requester's OWN translation is retired locally; a CPU never IPIs itself.
+        #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) virt.0, options(nostack, preserves_flags));
+        }
+        let requester = self.with_scheduler_split_mut(|sched| sched.current_cpu);
+        let targets = self.live_cpu_bitmap_for_asid_split(asid) & !(1u64 << requester.0);
+        if targets == 0 {
+            // Zero remote targets: the local invalidation above is the whole shootdown, and it
+            // has already happened. Correct, and not a silent skip.
+            return true;
+        }
+        let want = targets.count_ones() as usize;
+        #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
+        {
+            crate::arch::x86_64::smp::smp_tlb_shootdown_cpus(targets, virt.0) == want
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev"))))]
+        {
+            // No cross-CPU coordinator on this build; a non-empty remote target set therefore
+            // cannot be acknowledged, and must NOT be reported as completed.
+            let _ = want;
+            false
+        }
+    }
+
     /// rank 5 → TLB (no lock) → rank 6: two-phase unmap of the EXACT mapped prefix. Zero-length is a
     /// no-op. Each page: remove the PTE under the VM lock, produce the owned removed-mapping "plan",
     /// release the VM lock, complete the required TLB shootdown with NO lock held, then reclaim under
@@ -7533,14 +7614,32 @@ impl SharedKernel {
                 self.with_memory_split_mut(|m| {
                     KernelState::note_mapping_removed_locked(m, mapping.phys)
                 });
-                // Phase B: TLB shootdown wait — NO domain lock held. Hosted single-CPU has an empty
-                // target bitmap, so no cross-CPU wait is needed here; the ordering (strictly after
-                // the VM lock released, strictly before the reclaim below) is preserved regardless.
-                // Phase C (rank 6): reclaim the frame — only AFTER shootdown. Guarded (a still-pinned
-                // or still-cap-referenced object is not freed), so a rollback prefix-unmap is a no-op.
-                self.with_memory_split_mut(|m| {
-                    KernelState::reclaim_memory_object_for_phys_locked(m, mapping.phys)
-                });
+                // Phase B: the REAL TLB shootdown — NO domain lock held. U9-D3 replaces the
+                // comment that used to stand here with the generation-matched coordinator: local
+                // invalidation, then a published remote request that each target's own 0xF1
+                // handler invalidates and acknowledges by generation. The VM lock is already
+                // released and the memory lock is not yet taken, so nothing is held while waiting.
+                let shootdown_ok = self.complete_unmap_shootdown_split(asid, VirtAddr(va as u64));
+                // Phase C (rank 6): reclaim the frame — only AFTER a COMPLETED shootdown. Guarded
+                // (a still-pinned or still-cap-referenced object is not freed), so a rollback
+                // prefix-unmap is a no-op. A timeout skips the reclaim entirely: the frame stays
+                // unavailable for reuse rather than being recycled while a remote CPU may still
+                // hold a translation for it.
+                if shootdown_ok {
+                    self.with_memory_split_mut(|m| {
+                        KernelState::reclaim_memory_object_for_phys_locked(m, mapping.phys)
+                    });
+                } else {
+                    // The EXISTING X86_TLB_SHOOTDOWN_FAIL text, spelled literally because the
+                    // `tlb_shootdown` marker module is x86-only while this seam is arch-neutral.
+                    // No new marker family.
+                    crate::yarm_log!(
+                        "X86_TLB_SHOOTDOWN_FAIL reason=unmap_ack_incomplete asid={} va=0x{:x} phys=0x{:x}",
+                        asid.0,
+                        va,
+                        mapping.phys.0
+                    );
+                }
             }
             va = va.saturating_add(PAGE_SIZE);
         }

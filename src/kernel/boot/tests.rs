@@ -138272,3 +138272,189 @@ mod u9d3_f1_sole_ack_producer {
         }
     }
 }
+
+/// U9-D3 §5 — the production split unmap drives the REAL shootdown coordinator.
+///
+/// `unmap_range_two_phase_split`'s Phase B used to be a comment: it asserted the ordering
+/// (VM lock released, memory lock not yet taken) but performed no shootdown, on the grounds that
+/// hosted single-CPU has an empty target bitmap. That is no longer sufficient, because U9-D3
+/// makes a real remote ACK reachable — so Phase B now publishes a generation-matched request and
+/// waits for it with no lock held, and the reclaim is conditional on that completing.
+#[cfg(test)]
+mod u9d3_split_unmap_drives_real_d3 {
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const MEMORY: &str = include_str!("memory_state.rs");
+
+    fn code(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn fn_body(src: &str, sig: &str) -> alloc::string::String {
+        let after = src.split(sig).nth(1).unwrap_or_else(|| panic!("`{sig}`"));
+        let open = after.find('{').expect("body");
+        let mut depth = 0usize;
+        let mut end = after.len();
+        for (i, c) in after.char_indices().skip(open) {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        code(&after[open..end])
+    }
+
+    /// Phase order is unmap -> (release) -> shootdown -> reclaim, and the reclaim is GATED on the
+    /// shootdown having completed.
+    #[test]
+    fn u9d3_unmap_before_ack_before_reclaim() {
+        let b = fn_body(
+            RUNTIME,
+            "pub(crate) fn unmap_range_two_phase_split(\n        &self,\n        asid: crate::kernel::vm::Asid,\n        base: usize,\n        len: usize,\n    )",
+        );
+        let unmap = b.find("unmap_page(VirtAddr(va as u64))").expect("Phase A");
+        let shoot = b
+            .find("complete_unmap_shootdown_split(asid, VirtAddr(va as u64))")
+            .expect("Phase B");
+        let reclaim = b
+            .find("reclaim_memory_object_for_phys_locked")
+            .expect("Phase C");
+        assert!(unmap < shoot, "the PTE is removed before the shootdown");
+        assert!(
+            shoot < reclaim,
+            "the shootdown completes before the reclaim"
+        );
+        assert!(
+            b.contains("if shootdown_ok {"),
+            "the reclaim is gated on the shootdown having completed"
+        );
+    }
+
+    /// A failed / timed-out shootdown forbids reclaim and reuse: the frame is retained.
+    #[test]
+    fn u9d3_timeout_retains_the_frame() {
+        let b = fn_body(
+            RUNTIME,
+            "pub(crate) fn unmap_range_two_phase_split(\n        &self,\n        asid: crate::kernel::vm::Asid,\n        base: usize,\n        len: usize,\n    )",
+        );
+        let gate = b.find("if shootdown_ok {").expect("the gate");
+        let els = b[gate..].find("} else {").expect("the failure arm");
+        let arm = &b[gate + els..];
+        assert!(
+            !arm.contains("reclaim_memory_object_for_phys_locked"),
+            "a failed shootdown must not reclaim"
+        );
+        assert!(
+            arm.contains("unmap_ack_incomplete"),
+            "and it must say so on the existing FAIL marker"
+        );
+    }
+
+    /// The zero-remote-target path stays correct: the local invalidation IS the whole shootdown,
+    /// and it is reported as completed rather than silently skipped.
+    #[test]
+    fn u9d3_zero_target_path_is_correct_not_skipped() {
+        let b = fn_body(RUNTIME, "pub(crate) fn complete_unmap_shootdown_split(");
+        let local = b.find("invlpg").expect("local invalidation");
+        let targets = b
+            .find("live_cpu_bitmap_for_asid_split(asid)")
+            .expect("targets");
+        let zero = b.find("if targets == 0 {").expect("the zero-target arm");
+        assert!(
+            local < targets,
+            "the requester invalidates locally first, always"
+        );
+        assert!(targets < zero, "the target set is computed before the test");
+        let arm_end = b[zero..].find('}').expect("arm end");
+        assert!(
+            b[zero..zero + arm_end].contains("return true"),
+            "zero remote targets is a COMPLETED shootdown, not a skip"
+        );
+    }
+
+    /// The target mask comes from the live-ASID predicate, never the wake-only complement.
+    #[test]
+    fn u9d3_target_mask_is_the_live_asid_set() {
+        let b = fn_body(RUNTIME, "pub(crate) fn complete_unmap_shootdown_split(");
+        assert!(
+            b.contains("live_cpu_bitmap_for_asid_split(asid)"),
+            "targets come from the live-ASID predicate"
+        );
+        assert!(
+            !b.contains("online_wake_only_ap_bitmap"),
+            "the wake-only complement would target CPUs that cannot hold the mapping"
+        );
+        assert!(
+            b.contains("& !(1u64 << requester.0)"),
+            "a CPU never IPIs itself; its own translation is retired locally"
+        );
+        // The split predicate applies the same online & !wake_only & asid-matches rule.
+        let p = fn_body(RUNTIME, "pub(crate) fn live_cpu_bitmap_for_asid_split(");
+        assert!(p.contains("online & !wake_only"), "same candidate set");
+        assert!(
+            p.contains("task_asid_for_tid_split_read"),
+            "same per-CPU ASID resolution, through the rank-2 seam"
+        );
+    }
+
+    /// None of the banned broad-path behaviours appear: no lock held while waiting, no requester
+    /// impersonation, no `current_cpu` rebinding, no requester-side mailbox drain, no yield.
+    #[test]
+    fn u9d3_shootdown_wait_holds_nothing_and_impersonates_nobody() {
+        let b = fn_body(RUNTIME, "pub(crate) fn complete_unmap_shootdown_split(");
+        for banned in [
+            "set_current_cpu",
+            "process_cross_cpu_work_for_cpu",
+            "yield_current",
+            "submit_cross_cpu_work",
+            "with_cpu(",
+            "with_vm_user_spaces_split_mut",
+            "with_memory_split_mut",
+            "with_ipc_split_mut",
+        ] {
+            assert!(
+                !b.contains(banned),
+                "the shootdown wait must not contain `{banned}`"
+            );
+        }
+        // The retired broad helper still exists for the legacy path and still does all of those —
+        // which is exactly why the split path does not reuse it.
+        let legacy = fn_body(MEMORY, "fn request_live_asid_shootdown(");
+        assert!(
+            legacy.contains("set_current_cpu") && legacy.contains("yield_current"),
+            "fixture check: the legacy helper really is the impersonating one"
+        );
+    }
+
+    /// The rank-1 phase is released before the rank-2 resolution: the predicate takes ONE
+    /// scheduler acquisition, copies out by value, then resolves ASIDs through the task seam.
+    #[test]
+    fn u9d3_target_predicate_is_rank_ordered_and_released() {
+        let b = fn_body(RUNTIME, "pub(crate) fn live_cpu_bitmap_for_asid_split(");
+        assert_eq!(
+            b.matches("with_scheduler_split_mut").count(),
+            1,
+            "ONE rank-1 acquisition"
+        );
+        let sched_end = b.find("});").expect("the rank-1 closure closes");
+        let asid_at = b
+            .find("task_asid_for_tid_split_read")
+            .expect("the rank-2 resolution");
+        assert!(
+            sched_end < asid_at,
+            "rank 1 is released before rank 2 is entered"
+        );
+    }
+}
