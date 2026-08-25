@@ -60068,18 +60068,35 @@ mod stage183_ap_idle_admit {
                 && PERCPU_SRC.contains("fn tlb_ack_gen("),
             "the per-CPU TLB shootdown mailbox + BSP helpers must exist"
         );
+        // U9-D3: the AP-side mailbox service MOVED — from the sched-idle loop, where it could
+        // only ever run while the AP idled in ring 0, into the vector-0xF1 handler, which runs at
+        // whatever CPL the IPI interrupts. The steps are the same steps; the guard follows them
+        // to their new home and additionally pins that the idle loop no longer duplicates them.
+        const DESC_SRC_TLB: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
         for a in [
-            "mov r10d, dword ptr gs:[128]", // tlb_req_gen
-            "mov r11d, dword ptr gs:[132]", // tlb_ack_gen
-            "mov rax, qword ptr gs:[136]",  // tlb_req_va
-            "invlpg [rax]",
-            "mov dword ptr gs:[132], r10d", // ACK: ack_gen = req_gen
+            "mov ecx, dword ptr gs:[{tlb_req_gen_off}]",
+            "cmp ecx, dword ptr gs:[{tlb_ack_gen_off}]",
+            "mov rdx, qword ptr gs:[{tlb_req_va_off}]",
+            "invlpg [rdx]",
+            "mov dword ptr gs:[{tlb_ack_gen_off}], ecx",
         ] {
             assert!(
-                TRAMP_SRC.contains(a),
-                "AP TLB-mailbox service step must exist: {a}"
+                DESC_SRC_TLB.contains(a),
+                "AP TLB-mailbox service step must exist in the 0xF1 handler: {a}"
             );
         }
+        // Comment-stripped: the trampoline's prose still DESCRIBES the retired design (and the
+        // U9-D3 note that replaced it), so a raw substring search would match documentation
+        // rather than code.
+        let tramp_code: alloc::string::String = TRAMP_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !tramp_code.contains("mov dword ptr gs:[132],") && !tramp_code.contains("invlpg"),
+            "the sched-idle loop must no longer invalidate or ACK — 0xF1 is the sole producer"
+        );
         // The BSP driver sends + waits for a REAL ack, timing out (not hanging) on
         // failure. Stage 189A: the standard marker vocabulary is owned by the
         // `tlb_shootdown` coordinator; the driver emits it via the MARK_* constants
@@ -60150,10 +60167,20 @@ mod stage183_ap_idle_admit {
     // against a future "self-ack" regression.
     #[test]
     fn stage189a_bsp_never_writes_ap_tlb_ack() {
-        // The ONLY ack_gen writer is the AP's own asm store.
+        // The ONLY ack_gen writer is the AP's own asm store — U9-D3 moved it into the 0xF1
+        // handler and made it unique, so this is now a COUNT, not just a presence check.
+        const DESC_SRC_ACK: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
         assert!(
-            TRAMP_SRC.contains("mov dword ptr gs:[132], r10d"),
-            "the AP asm must publish its own ack (gs:[132] = req_gen)"
+            DESC_SRC_ACK.contains("mov dword ptr gs:[{tlb_ack_gen_off}], ecx"),
+            "the AP asm must publish its own ack (tlb_ack_gen = req_gen) from the 0xF1 handler"
+        );
+        assert_eq!(
+            DESC_SRC_ACK
+                .matches("mov dword ptr gs:[{tlb_ack_gen_off}], ecx")
+                .count()
+                + TRAMP_SRC.matches("mov dword ptr gs:[132],").count(),
+            1,
+            "exactly ONE ACK producer may exist in the tree"
         );
         // The BSP driver must observe the AP-owned ack via the READ accessor only,
         // and must contain no store to the mailbox ack slot (`gs:[132]`).
@@ -60802,10 +60829,41 @@ mod stage189d_seal {
             ),
             "the live dispatcher must not poll under the global lock for the AP's syscall"
         );
-        // The old under-lock re-entry poll (`ap_syscall_reentry_ok` spin) must be gone.
+        // The old UNDER-LOCK re-entry poll must be gone. U9-D3 re-derives this from "nowhere in
+        // the file" to "nowhere in the under-lock dispatcher", because U9-D3 legitimately polls
+        // that same flag from `ap_tlb_shootdown_user_origin_proof` — which the x86 trap epilogue
+        // calls only AFTER `dispatch_trap_entry_with_shared_kernel` has returned and the broad
+        // lock is released. The hazard the case owns is the LOCK, not the poll.
+        let under_lock = SMP_SRC
+            .split("fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {")
+            .nth(1)
+            .expect("the under-lock AP dispatcher")
+            .split("\n}\n")
+            .next()
+            .expect("bounded");
+        // Ban the READER specifically. The under-lock dispatcher legitimately CLEARS the flag
+        // (`percpu::clear_ap_syscall_reentry_ok`) before arming the workload — that is a write,
+        // it never waits for the AP, and it is what makes the later `0 -> 1` edge unambiguous.
         assert!(
-            !SMP_SRC.contains("if super::percpu::ap_syscall_reentry_ok(cpu) != 0 {"),
+            !under_lock.contains("percpu::ap_syscall_reentry_ok("),
             "the under-lock reentry poll must be removed (it would deadlock the AP's syscall)"
+        );
+        assert!(
+            under_lock.contains("percpu::clear_ap_syscall_reentry_ok(cpu);"),
+            "the dispatcher must still CLEAR the flag before arming, so the edge is this \
+             workload's own"
+        );
+        // And the off-lock cell must be reached only from the post-lock epilogue.
+        const DESC_EPI: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        let call = DESC_EPI
+            .find("ap_tlb_shootdown_user_origin_proof();")
+            .expect("the off-lock user-origin cell is called from the epilogue");
+        let dispatch = DESC_EPI
+            .find("dispatch_trap_entry_with_shared_kernel(")
+            .expect("the broad dispatch");
+        assert!(
+            dispatch < call,
+            "the user-origin cell must run AFTER the broad dispatch returns"
         );
     }
 }
@@ -87647,7 +87705,15 @@ mod stage199a2d2c2b1_guards {
     #[test]
     fn prior_seals_and_yield_stub_intact() {
         // The Yield saved-frame proof stub is still present (recv-v2 server does not replace it).
-        assert!(EXEC.contains("const PROBE_STUB_SMP: [u8; 64]"));
+        // U9-D3 grew it — the bounded ring-3 dwell lives between its two `0xA9C6` phases — so this
+        // pins the stub's IDENTITY and its saved-frame structure rather than a byte count that a
+        // legitimate extension changes. Bytes 0..55 (up to and including the post-resume
+        // DebugLog) are unchanged, which is what keeps the continuation RIP at PROBE_CODE_VA + 38.
+        assert!(EXEC.contains("const PROBE_STUB_SMP: [u8;"));
+        assert!(
+            EXEC.contains("the post-Yield continuation RIP = PROBE_CODE_VA + 38"),
+            "the saved-frame continuation contract must still be documented at the stub"
+        );
         let c1 = include_str!("../../../scripts/qemu-x86_64-ap-generic-return-smoke.sh");
         assert!(c1.contains("STAGE_199_X86_AP_GENERIC_RETURN_SEAL"));
         let c2a = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
@@ -137920,5 +137986,289 @@ mod u9d3_two_phase_a9c6 {
             out.push(bytes);
         }
         out
+    }
+}
+
+/// U9-D3 §3 — vector 0xF1 as the SOLE target-side invalidation and ACK producer.
+///
+/// Before U9-D3 the only invalidation + `tlb_ack_gen` write in the tree lived in the AP's
+/// sched-idle loop, which could only run while that AP was halted in ring 0. The 0xF1 stub merely
+/// counted the wake and EOI'd. That is why no CPL3-origin ACK existed: the one producer was
+/// structurally unable to run at CPL3.
+///
+/// The handler is assembly, so these cases pin its contract against the asm source; the
+/// executable proof is the live §4 cell, which observes both `origin=kernel` and `origin=user`.
+#[cfg(test)]
+mod u9d3_f1_sole_ack_producer {
+    const DESC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const TRAMP: &str = include_str!("../../arch/x86_64/smp_trampoline.rs");
+    const PERCPU: &str = include_str!("../../arch/x86_64/percpu.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+
+    /// The 0xF1 handler body.
+    fn handler() -> &'static str {
+        let start = DESC
+            .find("yarm_ap_remote_wake_stub:")
+            .expect("the 0xF1 stub");
+        let end = DESC[start..]
+            .find("\n    .align 16")
+            .map(|o| start + o)
+            .expect("the next stub");
+        &DESC[start..end]
+    }
+
+    fn code(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// Origin comes from the SAVED CS, at the fixed long-mode offset, read before the frame can
+    /// be modified. In long mode an interrupt ALWAYS pushes SS:RSP — even same-privilege — so CS
+    /// sits at a CPL-invariant offset; after the handler's three pushes that is `[rsp + 32]`.
+    /// Nothing assumes the CPL0 and CPL3 frames are otherwise identical.
+    #[test]
+    fn u9d3_origin_is_extracted_from_the_saved_cs_before_any_frame_write() {
+        let h = handler();
+        let pushes = h.find("push rdx").expect("the third push");
+        let read = h
+            .find("mov rax, qword ptr [rsp + 32]")
+            .expect("the saved-CS read at the CPL-invariant offset");
+        assert!(
+            pushes < read,
+            "the read is taken after the pushes it accounts for"
+        );
+        // RPL -> {KERNEL=1, USER=2}, branch-free.
+        let and = h.find("and eax, 3").expect("RPL mask");
+        let shr = h.find("shr eax, 1").expect("RPL fold");
+        let inc = h.find("inc eax").expect("origin encode");
+        assert!(
+            read < and && and < shr && shr < inc,
+            "origin is derived in order"
+        );
+        // Nothing writes the interrupt frame before the CS is read.
+        assert!(
+            !h[..read].contains("[rsp +") || !h[..read].contains("mov qword ptr [rsp"),
+            "no frame write may precede the saved-CS read"
+        );
+    }
+
+    /// Every register the handler touches is saved and restored, and the return is `iretq` to the
+    /// exact interrupted context.
+    #[test]
+    fn u9d3_handler_preserves_every_register_it_touches() {
+        let h = code(handler());
+        for (push, pop) in [
+            ("push rax", "pop rax"),
+            ("push rcx", "pop rcx"),
+            ("push rdx", "pop rdx"),
+        ] {
+            assert_eq!(h.matches(push).count(), 1, "{push} exactly once");
+            assert_eq!(h.matches(pop).count(), 1, "{pop} exactly once");
+            assert!(h.find(push) < h.find(pop), "{push} precedes {pop}");
+        }
+        // The only registers named are the three that are saved.
+        for forbidden in [
+            "rbx", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        ] {
+            assert!(
+                !h.contains(forbidden),
+                "the handler must not touch {forbidden} — it is not saved"
+            );
+        }
+        assert!(h.trim_end().ends_with("iretq"), "returns via iretq");
+    }
+
+    /// Invalidation happens BEFORE the origin, and the origin BEFORE the ACK. An observer that
+    /// sees `ack_gen == want` therefore knows the invalidation ran and the origin belongs to that
+    /// generation (x86-TSO orders the stores).
+    #[test]
+    fn u9d3_invalidation_precedes_origin_which_precedes_the_ack() {
+        let h = code(handler());
+        let invlpg = h.find("invlpg [rdx]").expect("single-page invalidation");
+        let flush = h.find("mov cr3, rdx").expect("full-flush convention");
+        let origin = h
+            .find("mov dword ptr gs:[{tlb_ack_origin_off}], eax")
+            .expect("origin publish");
+        let ack = h
+            .find("mov dword ptr gs:[{tlb_ack_gen_off}], ecx")
+            .expect("ack publish");
+        assert!(
+            invlpg < origin && flush < origin,
+            "invalidate before recording origin"
+        );
+        assert!(origin < ack, "record origin before publishing the ACK");
+    }
+
+    /// The ACK carries the EXACT generation that was read, and the request read is coherent:
+    /// generation first, then VA — mirroring the BSP's write order (VA, then generation).
+    #[test]
+    fn u9d3_ack_publishes_the_exact_generation_read() {
+        let h = code(handler());
+        let gen_at = h
+            .find("mov ecx, dword ptr gs:[{tlb_req_gen_off}]")
+            .expect("generation read into ecx");
+        let va = h
+            .find("mov rdx, qword ptr gs:[{tlb_req_va_off}]")
+            .expect("VA read");
+        assert!(gen_at < va, "generation is read before the VA");
+        // The ACK stores that same ecx — never a recomputed or re-read value.
+        assert!(
+            h.contains("mov dword ptr gs:[{tlb_ack_gen_off}], ecx"),
+            "the ACK publishes the generation actually serviced"
+        );
+        assert_eq!(
+            h.matches("gs:[{tlb_req_gen_off}]").count(),
+            1,
+            "the generation is read exactly once, so the ACK cannot outrun the request it read"
+        );
+    }
+
+    /// A spurious or duplicate IPI (`req_gen == ack_gen`) does the wake accounting, EOIs and
+    /// returns — producing no invalidation, no origin and no ACK.
+    #[test]
+    fn u9d3_spurious_and_duplicate_requests_produce_no_ack() {
+        let h = code(handler());
+        let cmp = h
+            .find("cmp ecx, dword ptr gs:[{tlb_ack_gen_off}]")
+            .expect("the already-serviced test");
+        let skip = h.find("je 91f").expect("the skip branch");
+        let label = h.find("\n91:").expect("the skip target");
+        let origin = h
+            .find("mov dword ptr gs:[{tlb_ack_origin_off}], eax")
+            .unwrap();
+        let ack = h.find("mov dword ptr gs:[{tlb_ack_gen_off}], ecx").unwrap();
+        assert!(cmp < skip, "compare then branch");
+        assert!(
+            origin < label && ack < label,
+            "the skip jumps PAST both publishes"
+        );
+        // The EOI is after the label, so it still happens on the skip path.
+        let eoi = h.find("mov dword ptr [rax], 0").expect("EOI store");
+        assert!(label < eoi, "a skipped request still EOIs");
+    }
+
+    /// A stale origin cannot be paired with a newer ACK: the requester retires the origin to
+    /// NONE before the new request becomes visible, and the handler republishes it before the ACK.
+    #[test]
+    fn u9d3_stale_origin_cannot_satisfy_a_new_generation() {
+        let body = PERCPU
+            .split("pub fn tlb_request_shootdown(cpu: CpuId, va: u64) -> u32 {")
+            .nth(1)
+            .expect("the request helper")
+            .split("\n}")
+            .next()
+            .expect("bounded");
+        let clear = body
+            .find("TLB_ACK_ORIGIN_NONE")
+            .expect("the origin is retired");
+        let va = body.find("tlb_req_va)").expect("VA write");
+        let gen_at = body.find("tlb_req_gen), next)").expect("generation bump");
+        assert!(
+            clear < va && va < gen_at,
+            "retire origin -> write VA -> publish generation"
+        );
+    }
+
+    /// EXACTLY ONE ACK producer, and EXACTLY ONE EOI per entry.
+    #[test]
+    fn u9d3_one_ack_producer_and_one_eoi() {
+        let h = code(handler());
+        assert_eq!(
+            h.matches("mov dword ptr gs:[{tlb_ack_gen_off}], ecx")
+                .count(),
+            1,
+            "one ACK store in the handler"
+        );
+        assert_eq!(
+            h.matches("mov dword ptr [rax], 0").count(),
+            1,
+            "one EOI store"
+        );
+        assert_eq!(
+            h.matches("movabs rax, {lapic_eoi}").count(),
+            1,
+            "one EOI address load"
+        );
+        // And nowhere else in the tree.
+        let tramp = code(TRAMP);
+        assert!(
+            !tramp.contains("gs:[132]") && !tramp.contains("invlpg"),
+            "the sched-idle loop is no longer a producer"
+        );
+        assert!(
+            !SMP.contains("gs:[132],"),
+            "the BSP driver never writes an AP's ack"
+        );
+    }
+
+    /// The old idle-loop service is gone, and its removal is documented where it lived.
+    #[test]
+    fn u9d3_old_idle_loop_invlpg_and_ack_are_absent() {
+        let tramp = code(TRAMP);
+        for gone in [
+            "mov r10d, dword ptr gs:[128]",
+            "mov r11d, dword ptr gs:[132]",
+            "mov rax, qword ptr gs:[136]",
+            "mov dword ptr gs:[132], r10d",
+        ] {
+            assert!(
+                !tramp.contains(gone),
+                "the retired sched-idle mailbox step must be gone: {gone}"
+            );
+        }
+        assert!(
+            TRAMP.contains("U9-D3: the sched-idle loop no longer services the TLB shootdown"),
+            "its removal must be recorded where it lived"
+        );
+    }
+
+    /// The handler takes no lock, no Rust dispatcher, no scheduler policy and no mailbox
+    /// impersonation — it is pure per-CPU asm.
+    #[test]
+    fn u9d3_handler_holds_no_lock_and_runs_no_policy() {
+        let h = code(handler());
+        for forbidden in [
+            "call",
+            "with_cpu",
+            "current_cpu",
+            "yield",
+            "lock",
+            "dispatch",
+        ] {
+            assert!(
+                !h.to_lowercase().contains(forbidden),
+                "the 0xF1 handler must not contain `{forbidden}`"
+            );
+        }
+        // Every memory operand it touches is gs-relative (its own per-CPU record), the frame, or
+        // the LAPIC EOI register.
+        assert!(h.contains("gs:["), "per-CPU state is reached gs-relatively");
+    }
+
+    /// The origin field is audit evidence, not policy: nothing branches on it in the kernel.
+    #[test]
+    fn u9d3_origin_is_evidence_not_policy() {
+        // Read only for reporting.
+        assert!(
+            SMP.contains("let origin = super::percpu::tlb_ack_origin(cpu);"),
+            "the driver reads the origin"
+        );
+        assert!(
+            SMP.contains("origin={}"),
+            "and reports it on the EXISTING marker, not a new family"
+        );
+        // No scheduling or placement decision keys off it.
+        for policy in ["if origin ==", "match origin"] {
+            assert!(
+                !SMP.contains(policy)
+                    || SMP.contains("origin == super::percpu::TLB_ACK_ORIGIN_USER"),
+                "the only permitted test is the proof cell's own acceptance check"
+            );
+        }
     }
 }

@@ -581,9 +581,11 @@ pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch 
 //                                                         iretq); interrupts masked again
 //   'q'   AP_STAGE_SCHED_IDLE (30)        'z'/loop        183.5 scheduler-owned interruptible idle
 //                                                         (current=idle tid 0; sti;hlt; wake-capable).
-//                                                         183.6: each wake also services the TLB
-//                                                         shootdown mailbox (gs:[128/132/136] —
-//                                                         invlpg/CR3-reload then ack_gen=req_gen).
+//                                                         U9-D3: the mailbox is NO LONGER serviced
+//                                                         here — vector 0xF1 itself invalidates and
+//                                                         publishes the generation-matched ACK, so a
+//                                                         shootdown is acknowledged at whatever CPL
+//                                                         the IPI interrupts, not only at idle.
 //   'z'   AP_STAGE_SCHED_WAKE_REENTER (31) 'q'            remote wake (vector 0xF1) observed;
 //                                                         wake_reenter_out++ then back to idle
 //   (note: 'c' AP_STAGE_CR4_SYNCED (25) runs between 'k' and the gs: canary —
@@ -969,25 +971,14 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "sti",
         "hlt",
         "cli",
-        // --- Stage 183.6: service the cross-CPU TLB shootdown mailbox (idempotent;
-        // acts only when the BSP bumped tlb_req_gen). A real remote ACK: the AP
-        // executes the invalidation locally then advances tlb_ack_gen. No lock, no
-        // KernelState — single-writer-per-direction record fields via gs:.
-        "mov r10d, dword ptr gs:[128]", // tlb_req_gen
-        "mov r11d, dword ptr gs:[132]", // tlb_ack_gen
-        "cmp r10d, r11d",
-        "je 76f",                      // no pending shootdown
-        "mov rax, qword ptr gs:[136]", // tlb_req_va
-        "test rax, rax",
-        "jz 77f",       // va == 0 -> full (non-global) flush
-        "invlpg [rax]", // single-page invalidation
-        "jmp 78f",
-        "77:",
-        "mov rax, cr3",
-        "mov cr3, rax", // reload CR3: flush non-global TLB entries
-        "78:",
-        "mov dword ptr gs:[132], r10d", // tlb_ack_gen = req_gen (ACK published)
-        "76:",
+        // --- U9-D3: the sched-idle loop no longer services the TLB shootdown mailbox.
+        // It used to run its own `invlpg` + `tlb_ack_gen` write here, which made it a
+        // SECOND ACK producer and — worse — the ONLY one, since it could only ever run
+        // while this AP was idling in ring 0. Vector 0xF1 now performs the invalidation
+        // and the generation-matched ACK itself, so a shootdown is acknowledged whether
+        // it interrupts this idle loop (origin=kernel) or a live ring-3 task
+        // (origin=user). Deleting the block here is what makes "one ACK producer" true
+        // rather than merely intended; the wake still arrives through 0xF1 as before.
         // Stage 189C6 LIVE AP user-dispatch hook. Inert unless the BSP set this AP's
         // per-CPU ap_dispatch_request (gs:[160]) AND CR4 is synced (env flag
         // gs:[88] & 32 — SSE enabled, required to run the compiled-Rust dispatcher).

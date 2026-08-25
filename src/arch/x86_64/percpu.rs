@@ -94,6 +94,18 @@ pub const SYSCALL_SCRATCH_RSP_OFFSET: usize = 152;
 pub const AP_DISPATCH_REQUEST_OFFSET: usize = 160;
 pub const AP_DISPATCH_STAGE_OFFSET: usize = 164;
 pub const AP_SYSCALL_REENTRY_OK_OFFSET: usize = 168;
+/// U9-D3: the vector-0xF1 handler records, per shootdown request, WHERE the interrupt it
+/// serviced came from — `TLB_ACK_ORIGIN_KERNEL` when the saved CS had RPL 0 (kernel/idle) and
+/// `TLB_ACK_ORIGIN_USER` when it had RPL 3 (ring 3). This is AUDIT EVIDENCE, not scheduling
+/// policy: nothing reads it to make a decision, and it exists so the D3 proof can state which
+/// privilege level actually acknowledged, instead of assuming.
+pub const TLB_ACK_ORIGIN_OFFSET: usize = 172;
+/// No ACK has been recorded for the current request generation.
+pub const TLB_ACK_ORIGIN_NONE: u32 = 0;
+/// The 0xF1 that produced the ACK interrupted CPL0 (kernel idle / kernel code).
+pub const TLB_ACK_ORIGIN_KERNEL: u32 = 1;
+/// The 0xF1 that produced the ACK interrupted CPL3 (a live ring-3 task).
+pub const TLB_ACK_ORIGIN_USER: u32 = 2;
 
 /// Fixed per-CPU record layout, owned by the BSP and indexed by logical
 /// CPU id. Field offsets are stable and tested.
@@ -132,8 +144,9 @@ pub const AP_SYSCALL_REENTRY_OK_OFFSET: usize = 168;
 /// - `160`: ap_dispatch_request u32 (Stage 189C6: BSP: 1 = run live AP dispatcher)
 /// - `164`: ap_dispatch_stage   u32 (Stage 189C6: AP: live-dispatch progress)
 /// - `168`: ap_syscall_reentry_ok u32 (Stage 189C6: LSTAR probe: 1 = AP re-entry)
+/// - `172`: tlb_ack_origin  u32 (U9-D3, AP via gs:: 0 none / 1 kernel / 2 user)
 ///
-/// Explicit-field bytes = 172; struct stride = 192 (64-byte aligned).
+/// Explicit-field bytes = 176; struct stride = 192 (64-byte aligned).
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct PerCpuRecord {
@@ -170,6 +183,7 @@ pub struct PerCpuRecord {
     pub ap_dispatch_request: u32,
     pub ap_dispatch_stage: u32,
     pub ap_syscall_reentry_ok: u32,
+    pub tlb_ack_origin: u32,
 }
 
 impl PerCpuRecord {
@@ -210,6 +224,7 @@ impl PerCpuRecord {
             ap_dispatch_request: 0,
             ap_dispatch_stage: 0,
             ap_syscall_reentry_ok: 0,
+            tlb_ack_origin: 0,
         }
     }
 }
@@ -238,6 +253,7 @@ const _: () = {
     assert!(
         core::mem::offset_of!(PerCpuRecord, ap_syscall_reentry_ok) == AP_SYSCALL_REENTRY_OK_OFFSET
     );
+    assert!(core::mem::offset_of!(PerCpuRecord, tlb_ack_origin) == TLB_ACK_ORIGIN_OFFSET);
     assert!(core::mem::size_of::<PerCpuRecord>() == 192);
 };
 
@@ -302,6 +318,7 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             ap_dispatch_request: 0,
             ap_dispatch_stage: 0,
             ap_syscall_reentry_ok: 0,
+            tlb_ack_origin: 0,
         };
         core::ptr::write_volatile(base, record);
     }
@@ -410,6 +427,14 @@ pub fn tlb_request_shootdown(cpu: CpuId, va: u64) -> u32 {
     unsafe {
         let cur_gen = core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_req_gen));
         let next = cur_gen.wrapping_add(1);
+        // U9-D3: retire the PREVIOUS request's origin before this request becomes visible, so a
+        // stale origin can never be paired with a newer ACK. The handler republishes it, and it
+        // republishes it BEFORE `tlb_ack_gen` — so an observer that sees `ack_gen == next` is
+        // guaranteed (x86-TSO store ordering) to see the origin recorded for `next`.
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*base).tlb_ack_origin),
+            TLB_ACK_ORIGIN_NONE,
+        );
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*base).tlb_req_va), va);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*base).tlb_req_gen), next);
         next
@@ -420,6 +445,25 @@ pub fn tlb_request_shootdown(cpu: CpuId, va: u64) -> u32 {
 pub fn tlb_ack_gen(cpu: CpuId) -> u32 {
     let base = record_base(cpu) as *const PerCpuRecord;
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_ack_gen)) }
+}
+
+/// U9-D3: BSP reads the privilege level the acknowledging 0xF1 interrupted.
+///
+/// Only meaningful once `tlb_ack_gen(cpu)` has reached the generation of interest: the handler
+/// writes this BEFORE it publishes the ACK, and `tlb_request_shootdown` clears it to
+/// [`TLB_ACK_ORIGIN_NONE`] before the next request becomes visible.
+pub fn tlb_ack_origin(cpu: CpuId) -> u32 {
+    let base = record_base(cpu) as *const PerCpuRecord;
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_ack_origin)) }
+}
+
+/// U9-D3: name the origin for a marker field.
+pub fn tlb_ack_origin_str(origin: u32) -> &'static str {
+    match origin {
+        TLB_ACK_ORIGIN_KERNEL => "kernel",
+        TLB_ACK_ORIGIN_USER => "user",
+        _ => "none",
+    }
 }
 
 /// Stage 189C6: BSP posts (or clears) the LIVE AP user-dispatch request for `cpu`.
