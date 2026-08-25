@@ -4000,6 +4000,7 @@ classification table's):
 | `exec_state.rs` | `spawn_user_task_from_image`, `dispatch_next_task`, `yield_current` ×2, `yield_current_to` ×2 | 6 |
 | `scheduler_state.rs` | `apply_cross_cpu_wake_task` | 1 |
 | `fault_state.rs` | `fault_current_task_with_fault` | 1 |
+| `capability_lifecycle_state.rs` | `wake_destroyed_notification_waiter_split` | 1 |
 
 **Layer 2 — logical origins**, i.e. every direct production caller of each helper writer:
 
@@ -4013,6 +4014,22 @@ classification table's):
 | `apply_cross_cpu_wake_task` | `apply_cross_cpu_work` (the `WorkItem::WakeTask` drain) | 1 |
 | `rt_commit_receiver_runnable` | `complete_reply_timeout_over`, `complete_server_death_over` | 2 |
 | `drain_recv_timeout_post_work` | `run_due_ipc_timeout_work` (the single production timeout entry) | 1 |
+
+> **U9-F — the notification waiter wake, split out.** `revoke_capability_in_cnode`'s sixth
+> obligation (notification destroy + waiter wake) is one of the four that U9-F proved independent
+> of the D3 fence. `wake_destroyed_notification_waiter_split` is its off-broad-lock form: rank 1
+> reads the CPU `ensure_driver_affinity` would pin to, rank 2 applies the Blocked-only transition
+> plus that driver pin, and rank 1 enqueues — three disjoint acquisitions, never nested. It is the
+> same wake owner as its in-lock mirror `wake_destroyed_notification_waiter`, with the identical
+> gate, and it writes only after the rank-3 `destroy_notification_split` has already snapshotted
+> AND cleared the waiter slot, so at most one wake per destruction. Its one direct production
+> caller is `revoke_capability_no_vm_split`, reached from the three ordinary recv-boundary
+> rollback sites when the class is admitted. **No wake origin was added or removed; one moved off
+> the broad lock**, and the broad writer remains for every refused class. The split writer lives
+> in the same file as the broad revocation it mirrors — U9-F created no seam file — and it is
+> **hosted-proven only**, which is sound because nothing in production creates, binds or mints a
+> Notification capability; a source guard fails with an explicit admission message if that ever
+> changes.
 
 > **U3 (canonical 203C) — blocked-waiter Phase-C completions.** The three `runtime.rs` Phase-C
 > completions (`execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`,

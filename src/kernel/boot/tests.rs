@@ -116360,6 +116360,16 @@ mod stage199d_wa2a_ownership_boundary {
         // are the live commit and the failed-spawn baseline restore. `task.rs` gains the
         // non-live reservation constructor (1 -> 2).
         const PINNED: &[(&str, usize)] = &[
+            // U9-F: one write in the EXISTING revocation owner (no seam file was created).
+            // `wake_destroyed_notification_waiter_split` performs `Blocked(_) -> Runnable`
+            // for the waiter parked on a notification destroyed by a capability revoke. It
+            // is a WAKE owner of exactly the same class as the in-lock writer it mirrors
+            // (`KernelState::wake_destroyed_notification_waiter`, ipc_state.rs), with the
+            // identical Blocked-only gate: a Dead/Exited/Runnable/Running/Faulted task is
+            // never resurrected or double-enqueued. It writes only after the rank-3
+            // `destroy_notification_split` has already snapshotted AND cleared the waiter
+            // slot, so the wake can fire at most once per destruction.
+            ("src/kernel/boot/capability_lifecycle_state.rs", 1),
             ("src/kernel/boot/exec_state.rs", 4),
             ("src/kernel/boot/ipc_state.rs", 9),
             ("src/kernel/boot/restart_state.rs", 4),
@@ -116408,10 +116418,11 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            36,
-            "33 raw writes (U6 added `commit_blocking_send_split`; U7 added \
-             `drain_send_timeout_post_work`), the WA3A barrier's single write, and the WA3B \
-             barrier's two"
+            37,
+            "34 raw writes (U6 added `commit_blocking_send_split`; U7 added \
+             `drain_send_timeout_post_work`; U9-F added \
+             `wake_destroyed_notification_waiter_split`), the WA3A barrier's single write, and \
+             the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -135447,16 +135458,27 @@ mod u9c_reply_cap_ordered_transaction {
         let reply_arm = body
             .find("if let Some((reply_index, reply_generation)) = pending.reply_record")
             .expect("the Reply class must be selected by its RECORD identity");
+        // U9-F: the non-Reply arm is `else if !<split offer>` — the broad rollback runs exactly
+        // when the split composition refused, never instead of it.
         let else_arm = body[reply_arm..]
-            .find("} else {")
-            .expect("every other class must have an else arm");
+            .find("} else if !shared.rollback_materialized_recv_cap_no_vm_split(")
+            .expect(
+                "every other class must be offered to the U9-F split composition, negated so the \
+                 broad path runs on refusal",
+            );
+        let tail = &body[reply_arm + else_arm..];
         assert!(
-            body[reply_arm + else_arm..].contains("kernel.rollback_materialized_recv_cap("),
-            "non-Reply objects must still take the unchanged broad rollback"
+            tail.contains("kernel.rollback_materialized_recv_cap("),
+            "non-Reply objects must still reach the unchanged broad rollback"
         );
         assert!(
-            body[reply_arm + else_arm..].contains("shared.with_cpu(cpu, |kernel|"),
+            tail.contains("shared.with_cpu(cpu, |kernel|"),
             "…including its broad acquisition, which remains counted in the census"
+        );
+        assert!(
+            tail.find("rollback_materialized_recv_cap_no_vm_split(")
+                < tail.find("shared.with_cpu(cpu, |kernel|"),
+            "the split is OFFERED first; the broad acquisition is the fallback, not the reverse"
         );
     }
 
@@ -135609,6 +135631,1105 @@ mod u9c_reply_cap_ordered_transaction {
         assert!(
             REPLY_SPLIT.contains("Stage 188D"),
             "the rank-3 reply seams remain where 188D put them"
+        );
+    }
+}
+
+/// U9-F — THE PHASED SPLIT OF `revoke_capability_in_cnode`, AND ITS CLASS ADMISSION.
+///
+/// `revoke_capability_in_cnode` owes six obligations under one broad acquisition. Two of them —
+/// active-transfer-mapping unmap (TLB shootdown) and memory-object refcount drop + frame reclaim —
+/// are the D3 fence. U9-F splits the other four (cross-CNode descendant revocation,
+/// delegation-link removal, the recursive in-cspace revoke, and notification destruction +
+/// waiter wake) into separately rank-ordered phases, and admits only the classes for which the
+/// two fenced obligations are provably vacuous.
+///
+/// The tests below are in three halves. The behavioural half proves the split path produces the
+/// SAME observable end state as the broad path it stands in for. The structural half pins the
+/// properties that make the admission sound — above all that the memory-backed cohort is REFUSED
+/// rather than served, that no seam file or marker family exists, and that every refusal happens
+/// before the first mutation. The third pins that Notification is production-UNREACHABLE at this
+/// revision, which is what makes hosted-only Notification evidence acceptable.
+mod u9f_split_capability_revocation {
+    use super::*;
+    use crate::kernel::boot::capability_lifecycle_state::{
+        SplitRevokeRefusal, split_revoke_class_admitted,
+    };
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const LIFECYCLE: &str = include_str!("capability_lifecycle_state.rs");
+
+    /// U9-F introduces NO seam file: the phased composition lives in the existing revocation
+    /// owner, `capability_lifecycle_state.rs`, below this banner. The guards below scope
+    /// themselves to that region so "the composition reaches no VM seam" keeps meaning the
+    /// composition, not the whole file (whose broad `revoke_capability_in_cnode` reaches plenty).
+    const U9F_BANNER: &str = "// \u{2500}\u{2500} U9-F: the phased, rank-ordered split of";
+
+    fn revoke_split_region() -> &'static str {
+        let at = LIFECYCLE
+            .find(U9F_BANNER)
+            .expect("the U9-F section banner must be present in the revocation owner");
+        &LIFECYCLE[at..]
+    }
+
+    /// Production source only, comment-stripped — the same shape the census guard counts.
+    fn code_of(src: &str) -> alloc::string::String {
+        let cutoff = src.find("\n#[cfg(test)]\nmod tests {").unwrap_or(src.len());
+        src[..cutoff]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of<'a>(src: &'a str, open: &str, close: &str) -> &'a str {
+        let after = src
+            .split(open)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing `{open}`"));
+        let end = after
+            .find(close)
+            .unwrap_or_else(|| panic!("missing terminator after `{open}`"));
+        &after[..end]
+    }
+
+    // ── (1) BEHAVIOUR: the split path reproduces the broad end state ────────────────────────
+
+    /// A Notification cap: the split destroys the object and bumps the generation, exactly as
+    /// `stage22_notification_cap_revoke_destroys_object` proves the broad path does.
+    #[test]
+    fn u9f_split_revoke_of_a_notification_cap_destroys_the_object() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (notif_idx, notif_cap, tid, gen_before) = k.with(|state| {
+            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            let tid = state.current_tid().expect("current tid");
+            let g = state.with_ipc_state(|ipc| ipc.notification_generations[idx]);
+            (idx, cap, tid, g)
+        });
+
+        let object = k
+            .revoke_capability_no_vm_split(tid, notif_cap)
+            .expect("a Notification cap is admitted by the split composition");
+        assert!(matches!(object, CapObject::Notification { .. }));
+
+        k.with(|state| {
+            assert!(
+                state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_none()),
+                "the notification object is destroyed by the split path"
+            );
+            assert_ne!(
+                state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]),
+                gen_before,
+                "and its generation is bumped, invalidating live caps"
+            );
+            assert!(
+                state
+                    .current_task_cnode()
+                    .and_then(|cnode| state.capability_for_cnode_local(cnode, notif_cap))
+                    .is_none(),
+                "the cnode slot is cleared"
+            );
+        });
+    }
+
+    /// The IRQ-route teardown obligation survives the split.
+    #[test]
+    fn u9f_split_revoke_tears_down_the_irq_route() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (notif_idx, notif_cap, tid) = k.with(|state| {
+            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            state.bind_irq_notification(20, cap).expect("bind");
+            let tid = state.current_tid().expect("current tid");
+            (idx, cap, tid)
+        });
+        k.with(|state| {
+            assert_eq!(
+                state.with_ipc_state(|ipc| ipc.irq_routes[20]),
+                Some(notif_idx),
+                "route registered before revoke"
+            );
+        });
+
+        k.revoke_capability_no_vm_split(tid, notif_cap)
+            .expect("admitted");
+
+        k.with(|state| {
+            assert_eq!(
+                state.with_ipc_state(|ipc| ipc.irq_routes[20]),
+                None,
+                "the IRQ route is torn down by the split path"
+            );
+        });
+    }
+
+    /// The waiter-wake obligation — the half that leaves rank 3 for rank 2 then rank 1 — survives
+    /// the split, with the same Blocked-only gate.
+    #[test]
+    fn u9f_split_revoke_clears_and_wakes_the_notification_waiter() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (notif_idx, notif_cap, tid) = k.with(|state| {
+            state.register_task(2901).expect("task");
+            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            stage21_block_on_notification(state, 2901);
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[idx] = Some(ThreadId(2901));
+            });
+            let tid = state.current_tid().expect("current tid");
+            (idx, cap, tid)
+        });
+        k.with(|state| {
+            assert_eq!(state.notification_waiter_count(notif_idx), 1);
+            assert!(state.task_is_blocked(2901));
+        });
+
+        k.revoke_capability_no_vm_split(tid, notif_cap)
+            .expect("admitted");
+
+        k.with(|state| {
+            assert_eq!(
+                state.notification_waiter_count(notif_idx),
+                0,
+                "the waiter slot is cleared by the split path"
+            );
+            assert!(
+                state.task_is_runnable(2901),
+                "and the Blocked waiter is woken to Runnable outside every lock"
+            );
+        });
+    }
+
+    /// A task that is NOT blocked is never resurrected or double-enqueued — the same gate the
+    /// broad `wake_destroyed_notification_waiter` applies.
+    #[test]
+    fn u9f_split_revoke_never_resurrects_a_dead_waiter() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (notif_idx, notif_cap, tid) = k.with(|state| {
+            state.register_task(2902).expect("task");
+            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[idx] = Some(ThreadId(2902));
+            });
+            state
+                .with_tcbs_mut(|tcbs| {
+                    tcbs.iter_mut()
+                        .flatten()
+                        .find(|t| t.tid.0 == 2902)
+                        .expect("tcb")
+                        .status = TaskStatus::Dead;
+                    Ok::<_, KernelError>(())
+                })
+                .expect("mark dead");
+            let tid = state.current_tid().expect("current tid");
+            (idx, cap, tid)
+        });
+
+        k.revoke_capability_no_vm_split(tid, notif_cap)
+            .expect("admitted");
+
+        k.with(|state| {
+            assert_eq!(
+                state.notification_waiter_count(notif_idx),
+                0,
+                "slot cleared"
+            );
+            assert_eq!(
+                state.task_status(2902),
+                Some(TaskStatus::Dead),
+                "a non-Blocked waiter is left exactly where it was"
+            );
+        });
+    }
+
+    /// The waiter wake mirrors `enqueue_task` in FULL, including `ensure_driver_affinity`: an
+    /// unpinned Driver-class waiter is pinned to the current CPU before placement. Reusing the
+    /// existing `enqueue_reply_timeout_wake_split` seam would have silently dropped that pin, and
+    /// a driver parked on an IRQ notification is exactly the task this matters for.
+    #[test]
+    fn u9f_split_revoke_pins_an_unpinned_driver_waiter_before_enqueue() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (notif_cap, tid) = k.with(|state| {
+            state
+                .register_task_with_class(2903, TaskClass::Driver)
+                .expect("driver task");
+            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            stage21_block_on_notification(state, 2903);
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[idx] = Some(ThreadId(2903));
+            });
+            (cap, state.current_tid().expect("current tid"))
+        });
+        k.with(|state| {
+            assert_eq!(
+                state.with_tcbs(|t| t
+                    .iter()
+                    .flatten()
+                    .find(|x| x.tid.0 == 2903)
+                    .and_then(|x| x.cpu_affinity)),
+                None,
+                "the driver starts unpinned"
+            );
+        });
+
+        k.revoke_capability_no_vm_split(tid, notif_cap)
+            .expect("admitted");
+
+        k.with(|state| {
+            assert!(state.task_is_runnable(2903), "the driver waiter is woken");
+            assert_eq!(
+                state.with_tcbs(|t| t
+                    .iter()
+                    .flatten()
+                    .find(|x| x.tid.0 == 2903)
+                    .and_then(|x| x.cpu_affinity)),
+                Some(state.current_cpu()),
+                "and pinned to the current CPU, exactly as `enqueue_task` would have"
+            );
+        });
+    }
+
+    /// An Endpoint cap — the class the EXISTING live rollback profile actually transfers — is
+    /// admitted, and the cnode slot is cleared.
+    #[test]
+    fn u9f_split_revoke_of_an_endpoint_cap_clears_the_slot() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (send_cap, tid) = k.with(|state| {
+            let (_eid, send_cap, _recv) = state
+                .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+                .expect("endpoint");
+            (send_cap, state.current_tid().expect("current tid"))
+        });
+
+        let object = k
+            .revoke_capability_no_vm_split(tid, send_cap)
+            .expect("an Endpoint cap is admitted");
+        assert!(matches!(object, CapObject::Endpoint { .. }));
+
+        k.with(|state| {
+            assert!(
+                state
+                    .current_task_cnode()
+                    .and_then(|cnode| state.capability_for_cnode_local(cnode, send_cap))
+                    .is_none(),
+                "the endpoint cap slot is cleared by the split path"
+            );
+        });
+    }
+
+    /// The delegation-link removal obligation survives the split: a link naming the revoked cap
+    /// is cleared, and an unrelated link is left alone.
+    #[test]
+    fn u9f_split_revoke_removes_only_the_links_naming_the_cap() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (send_cap, other_cap, tid) = k.with(|state| {
+            let (_e1, send_cap, _r1) = state
+                .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+                .expect("endpoint");
+            let (_e2, other_cap, _r2) = state
+                .create_endpoint_with_mode(2, EndpointMode::Synchronous)
+                .expect("endpoint 2");
+            let tid = state.current_tid().expect("current tid");
+            state
+                .record_delegated_capability_link(tid, send_cap, 4242, CapId(0x9001))
+                .expect("link");
+            state
+                .record_delegated_capability_link(tid, other_cap, 4242, CapId(0x9002))
+                .expect("unrelated link");
+            (send_cap, other_cap, tid)
+        });
+
+        k.revoke_capability_no_vm_split(tid, send_cap)
+            .expect("admitted");
+
+        k.with(|state| {
+            let links = state.with_capability_state(|c| c.delegated_capability_links.clone());
+            assert!(
+                !links
+                    .iter()
+                    .flatten()
+                    .any(|l| l.source_cap == send_cap && l.dest_cap == CapId(0x9001)),
+                "the link naming the revoked cap is removed"
+            );
+            assert!(
+                links
+                    .iter()
+                    .flatten()
+                    .any(|l| l.source_cap == other_cap && l.dest_cap == CapId(0x9002)),
+                "an unrelated link is untouched"
+            );
+        });
+    }
+
+    /// Slot + generation reuse: after the split revokes a cap, the cspace slot may be re-minted,
+    /// and the NEW cap must carry a different `CapId`. That is the fact the whole
+    /// active-transfer-mapping aliasing argument rests on, so it is pinned behaviourally and not
+    /// only in prose.
+    #[test]
+    fn u9f_a_reused_slot_never_reproduces_the_revoked_capid() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (first, tid) = k.with(|state| {
+            let (_e, send, _r) = state
+                .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+                .expect("endpoint");
+            (send, state.current_tid().expect("tid"))
+        });
+        k.revoke_capability_no_vm_split(tid, first)
+            .expect("admitted");
+        let second = k.with(|state| {
+            let (_e, send, _r) = state
+                .create_endpoint_with_mode(2, EndpointMode::Synchronous)
+                .expect("endpoint 2");
+            send
+        });
+        assert_ne!(
+            first, second,
+            "a re-minted slot must not reproduce the revoked CapId"
+        );
+        assert_eq!(
+            first.index(),
+            second.index(),
+            "the test is only meaningful if the slot was actually reused"
+        );
+        assert_ne!(
+            first.generation(),
+            second.generation(),
+            "the slot generation is what makes the two CapIds distinct"
+        );
+    }
+
+    /// Repeated rollback of the same cap is harmless: the second attempt finds nothing to resolve
+    /// and refuses BEFORE mutating, so a double rollback can never destroy a successor object.
+    #[test]
+    fn u9f_a_repeated_rollback_refuses_instead_of_destroying_a_successor() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (notif_idx, notif_cap, tid) = k.with(|state| {
+            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            (idx, cap, state.current_tid().expect("tid"))
+        });
+        assert!(k.rollback_materialized_recv_cap_no_vm_split(tid, notif_cap));
+        let gen_after_first =
+            k.with(|state| state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]));
+
+        // A successor object now occupies the same notification slot.
+        let (successor_idx, _successor_cap) = k.with(|state| {
+            let (idx, cap, _recv) = state.create_notification(4).expect("successor notif");
+            (idx, cap)
+        });
+        assert_eq!(successor_idx, notif_idx, "the slot was reused");
+
+        // The stale cap rolls back a second time — and must not touch the successor.
+        assert!(
+            !k.rollback_materialized_recv_cap_no_vm_split(tid, notif_cap),
+            "the second rollback is refused, not performed"
+        );
+        k.with(|state| {
+            assert!(
+                state.with_ipc_state(|ipc| ipc.notifications[successor_idx].is_some()),
+                "the successor notification object survives the repeated rollback"
+            );
+            assert_eq!(
+                state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]),
+                gen_after_first + 1,
+                "exactly one further generation bump — the successor's creation, not a destroy"
+            );
+        });
+    }
+
+    /// A replacement task that reuses the waiter's TID must not be woken in its place. The waiter
+    /// is snapshotted and cleared under rank 3; the rank-2 wake then applies the Blocked-only gate
+    /// to whatever now holds that TID, so a fresh Runnable replacement is left alone.
+    #[test]
+    fn u9f_a_replacement_task_under_a_reused_tid_is_not_woken() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (notif_idx, notif_cap, tid) = k.with(|state| {
+            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            // The waiter slot names TID 2904, but the live task under that TID is Runnable —
+            // exactly the shape a death-and-replacement leaves behind.
+            state.register_task(2904).expect("replacement task");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[idx] = Some(ThreadId(2904));
+            });
+            (idx, cap, state.current_tid().expect("tid"))
+        });
+        let before = k.with(|state| state.task_status(2904));
+        assert!(
+            !matches!(before, Some(TaskStatus::Blocked(_))),
+            "the replacement is not blocked"
+        );
+
+        k.revoke_capability_no_vm_split(tid, notif_cap)
+            .expect("admitted");
+
+        k.with(|state| {
+            assert_eq!(
+                state.task_status(2904),
+                before,
+                "a replacement under the reused TID is left exactly as it was"
+            );
+            assert_eq!(
+                state.notification_waiter_count(notif_idx),
+                0,
+                "the stale waiter slot is still cleared"
+            );
+        });
+    }
+
+    /// Exactly one wake per destruction: the waiter slot is TAKEN under the SAME rank-3
+    /// acquisition that clears the object, so a repeated rollback finds nothing and the task is
+    /// enqueued once, not twice.
+    #[test]
+    fn u9f_the_waiter_is_woken_and_enqueued_exactly_once() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (notif_idx, notif_cap, tid) = k.with(|state| {
+            state.register_task(2905).expect("task");
+            let (idx, cap, _recv) = state.create_notification(4).expect("notif");
+            stage21_block_on_notification(state, 2905);
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[idx] = Some(ThreadId(2905));
+            });
+            (idx, cap, state.current_tid().expect("tid"))
+        });
+
+        k.revoke_capability_no_vm_split(tid, notif_cap)
+            .expect("admitted");
+        let queued_once = k.with(|state| state.runnable_count_on_cpu(CpuId(0)));
+        k.with(|state| {
+            assert!(state.task_is_runnable(2905));
+            assert_eq!(
+                state.with_ipc_state(|ipc| ipc.notification_waiters[notif_idx]),
+                None,
+                "the waiter slot was TAKEN, so no second extraction is possible"
+            );
+        });
+
+        // A repeated rollback of the same, now-stale cap must wake nothing more.
+        assert!(
+            !k.rollback_materialized_recv_cap_no_vm_split(tid, notif_cap),
+            "the repeat is refused"
+        );
+        k.with(|state| {
+            assert_eq!(
+                state.runnable_count_on_cpu(CpuId(0)),
+                queued_once,
+                "no second enqueue"
+            );
+            assert!(state.task_is_runnable(2905));
+        });
+    }
+
+    // ── (2) BEHAVIOUR: the fenced classes are REFUSED, not served ───────────────────────────
+
+    /// The class gate is the load-bearing one: a memory-backed object owes an
+    /// active-transfer-mapping unmap and a frame reclaim that this composition does not perform,
+    /// so it is refused rather than half-torn-down.
+    #[test]
+    fn u9f_memory_backed_classes_are_refused_by_the_class_gate() {
+        for object in [
+            CapObject::MemoryObject { id: 7 },
+            CapObject::DmaRegion {
+                id: 7,
+                offset: 0,
+                len: 4096,
+            },
+        ] {
+            assert_eq!(
+                split_revoke_class_admitted(object),
+                Err(SplitRevokeRefusal::MemoryBacked),
+                "{object:?} owes VM shootdown and memory reclaim; it must be refused"
+            );
+        }
+        assert_eq!(
+            split_revoke_class_admitted(CapObject::Reply {
+                index: 0,
+                generation: 1
+            }),
+            Err(SplitRevokeRefusal::ReplyObject),
+            "Reply teardown belongs to the U9-C reply transaction, not to this one"
+        );
+        for admitted in [
+            CapObject::Endpoint {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Notification {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Kernel,
+        ] {
+            assert_eq!(
+                split_revoke_class_admitted(admitted),
+                Ok(()),
+                "{admitted:?} owes neither obligation"
+            );
+        }
+    }
+
+    /// A refused cap is left COMPLETELY untouched — nothing is half-revoked before the refusal.
+    #[test]
+    fn a_refused_cap_is_left_completely_intact() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (mem_cap, tid) = k.with(|state| {
+            let (_id, cap) = state
+                .create_memory_object(PhysAddr(0x40_0000))
+                .expect("memory object");
+            (cap, state.current_tid().expect("current tid"))
+        });
+
+        assert_eq!(
+            k.revoke_capability_no_vm_split(tid, mem_cap),
+            Err(SplitRevokeRefusal::MemoryBacked),
+            "a memory-backed cap is refused to the broad path"
+        );
+
+        k.with(|state| {
+            assert!(
+                state
+                    .current_task_cnode()
+                    .and_then(|cnode| state.capability_for_cnode_local(cnode, mem_cap))
+                    .is_some(),
+                "the refused cap must still be live — the refusal precedes every mutation"
+            );
+        });
+    }
+
+    /// An unresolvable cap is a refusal, not a partial teardown.
+    #[test]
+    fn an_absent_cap_is_refused_not_partially_torn_down() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let tid = k.with(|state| state.current_tid().expect("current tid"));
+        assert_eq!(
+            k.revoke_capability_no_vm_split(tid, CapId(0xDEAD_BEEF)),
+            Err(SplitRevokeRefusal::Unresolvable)
+        );
+        assert_eq!(
+            k.revoke_capability_no_vm_split(999_999, CapId(0)),
+            Err(SplitRevokeRefusal::Unresolvable),
+            "an unknown task is refused before anything is resolved"
+        );
+    }
+
+    /// The production entry point reports refusal as `false`, which is precisely the signal the
+    /// three callsites use to run the unchanged broad rollback.
+    #[test]
+    fn the_production_entry_point_reports_refusal_as_false() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (mem_cap, notif_cap, tid) = k.with(|state| {
+            let (_id, mem_cap) = state
+                .create_memory_object(PhysAddr(0x40_1000))
+                .expect("memory object");
+            let (_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+            (mem_cap, notif_cap, state.current_tid().expect("tid"))
+        });
+        assert!(
+            !k.rollback_materialized_recv_cap_no_vm_split(tid, mem_cap),
+            "memory-backed => false => the caller takes the broad path"
+        );
+        assert!(
+            k.rollback_materialized_recv_cap_no_vm_split(tid, notif_cap),
+            "an admitted class => true => the teardown already completed off-lock"
+        );
+    }
+
+    // ── (3) STRUCTURE: what makes the admission sound ───────────────────────────────────────
+
+    /// CENSUS-DELTA 0. U9-F retires no acquisition; all three ordinary rollback callsites and
+    /// their broad fallbacks remain exactly where they were.
+    #[test]
+    fn u9f_retires_no_broad_acquisition() {
+        let code = code_of(RUNTIME);
+        assert_eq!(
+            code.matches(".with_cpu(").count(),
+            3,
+            "runtime.rs still holds exactly the three ordinary rollback acquisitions"
+        );
+        assert_eq!(
+            code.matches("kernel.rollback_materialized_recv_cap(")
+                .count(),
+            3,
+            "every broad fallback remains reachable"
+        );
+        assert_eq!(
+            code.matches("self.rollback_materialized_recv_cap_no_vm_split(")
+                .count()
+                + code
+                    .matches("shared.rollback_materialized_recv_cap_no_vm_split(")
+                    .count(),
+            3,
+            "and all three are offered to the split composition first"
+        );
+    }
+
+    /// Every callsite is `split-first, broad-on-refusal` — never split-INSTEAD-of-broad. A future
+    /// pass that deletes a fallback because "the split handles it" would silently drop TLB
+    /// shootdowns and frame reclaim for the memory-backed cohort.
+    #[test]
+    fn every_callsite_falls_back_to_the_unchanged_broad_rollback() {
+        let code = code_of(RUNTIME);
+        for offer in [
+            "shared.rollback_materialized_recv_cap_no_vm_split(",
+            "self.rollback_materialized_recv_cap_no_vm_split(",
+        ] {
+            for (idx, _) in code.match_indices(offer) {
+                let window = &code[idx..core::cmp::min(idx + 600, code.len())];
+                assert!(
+                    window.contains("kernel.rollback_materialized_recv_cap("),
+                    "the offer at `{offer}` must be followed by the broad fallback"
+                );
+                assert!(
+                    window.contains("with_cpu(cpu, |kernel|"),
+                    "…including its broad acquisition"
+                );
+            }
+            assert!(
+                code.matches(offer).count() == 0 || code.contains(&alloc::format!("!{offer}")),
+                "the offer is negated — the broad path runs exactly when the split refused"
+            );
+        }
+    }
+
+    /// The broad teardown body is untouched: every obligation it owes is still there.
+    #[test]
+    fn the_broad_teardown_body_retains_every_obligation() {
+        let body = body_of(
+            LIFECYCLE,
+            "pub(crate) fn revoke_capability_in_cnode(",
+            "\n    /// Stage 181C",
+        );
+        for effect in [
+            "collect_delegated_descendants",
+            "revoke_capability_direct_in_process_cnode",
+            "remove_delegation_links_for",
+            "revoke_active_transfer_mappings_for_cap",
+            "adjust_memory_object_cap_refcount",
+            "reclaim_memory_object_if_unreferenced",
+            "destroy_notification_for_revoked_cap",
+        ] {
+            assert!(
+                body.contains(effect),
+                "the broad teardown must retain `{effect}`"
+            );
+        }
+    }
+
+    /// The split composition reaches NO VM and NO memory seam. This is the D3 fence expressed as
+    /// a property of the source, not of a comment.
+    #[test]
+    fn the_split_composition_reaches_no_vm_or_memory_seam() {
+        let code = code_of(revoke_split_region());
+        for forbidden in [
+            "with_vm_split_mut",
+            "with_memory_split_mut",
+            "unmap_range_two_phase",
+            "unmap_page_phase1",
+            "execute_tlb_shootdown_wait_plan",
+            "request_live_asid_shootdown",
+            "reclaim_memory_object_if_unreferenced",
+            "adjust_memory_object_cap_refcount",
+            "free_frame",
+            "with_cpu(",
+            "self.with(|",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the split composition must not reach `{forbidden}`"
+            );
+        }
+    }
+
+    /// Every refusal is raised in the PREFLIGHT, which makes no mutation. The commit phases
+    /// contain exactly one refusal — the first-mutation guard.
+    #[test]
+    fn refusals_are_raised_before_the_first_mutation() {
+        let plan = body_of(
+            revoke_split_region(),
+            "pub(crate) fn plan_revoke_capability_no_vm_split(",
+            "\n    // \u{2500}\u{2500} U9-F commit",
+        );
+        for phase in [
+            "task_cnode_split",
+            "resolved_capability_split",
+            "split_revoke_class_admitted",
+            "collect_admitted_descendants_split",
+            "collect_delegation_link_removals_split",
+            "refuse_on_active_transfer_mapping_split",
+        ] {
+            assert!(plan.contains(phase), "the preflight must run `{phase}`");
+        }
+        for mutation in [
+            "cspace_revoke_split",
+            "cspace_read_then_revoke_split",
+            "clear_delegation_links_split",
+            "destroy_notification_split",
+            "wake_destroyed_notification_waiter_split",
+        ] {
+            assert!(
+                !plan.contains(mutation),
+                "the preflight must not perform `{mutation}`"
+            );
+        }
+        let commit = body_of(
+            revoke_split_region(),
+            "pub(crate) fn revoke_capability_no_vm_split(",
+            "\n    /// U9-F production entry point",
+        );
+        assert_eq!(
+            commit.matches("Err(SplitRevokeRefusal::").count(),
+            1,
+            "the commit phases raise exactly one refusal — the root-revoke guard, which fires \
+             before any state has changed"
+        );
+    }
+
+    /// The commit performs the four split obligations in the SAME order the broad path does:
+    /// root revoke, then each descendant complete (revoke then notification), then link removal,
+    /// then the root's notification.
+    #[test]
+    fn the_commit_preserves_the_broad_interleave() {
+        let commit = body_of(
+            revoke_split_region(),
+            "pub(crate) fn revoke_capability_no_vm_split(",
+            "\n    /// U9-F production entry point",
+        );
+        let order = [
+            "cspace_revoke_split(plan.cnode, plan.root.cap)",
+            "cspace_read_then_revoke_split(cnode, descendant.cap)",
+            "clear_delegation_links_split(",
+            "destroy_notification_for_revoked_object_split(plan.root_object)",
+        ];
+        let mut last = 0usize;
+        for needle in order {
+            let at = commit
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` must be present"));
+            assert!(at > last, "`{needle}` is out of order");
+            last = at;
+        }
+    }
+
+    /// The fail-closed transfer-mapping preflight exists and is a REFUSAL, not a skip. The proof
+    /// that it can never fire lives in the section docs; this pins that the code does not rely on
+    /// that proof being restated correctly by a later reader.
+    #[test]
+    fn the_transfer_mapping_preflight_refuses_rather_than_skips() {
+        let body = body_of(
+            revoke_split_region(),
+            "fn refuse_on_active_transfer_mapping_split(",
+            "\n    /// Build the complete plan",
+        );
+        assert!(
+            body.contains("ipc.active_transfer_mappings"),
+            "the registry itself must be scanned"
+        );
+        assert_eq!(
+            body.matches("Err(SplitRevokeRefusal::ActiveMappingPresent)")
+                .count(),
+            2,
+            "both the overflow and the match arm must refuse"
+        );
+        assert!(
+            !body.contains("unmap"),
+            "the preflight refuses; it never attempts the unmap it is fencing"
+        );
+    }
+
+    /// No two locks are ever held at once: no split seam opens a domain inside another domain's
+    /// closure. Each `with_*_split` call in the composition is its own top-level acquisition.
+    #[test]
+    fn no_split_seam_is_nested_inside_another() {
+        // The extent of the seam's closure, by real paren balance from the opening `(` — not by a
+        // guessed terminator, which would silently widen the window past the closure and make this
+        // guard mean something other than what it says.
+        fn closure_extent(code: &str, open_at: usize) -> &str {
+            let start = open_at
+                + code[open_at..]
+                    .find('(')
+                    .expect("the seam call's opening paren");
+            let mut depth = 0i32;
+            for (offset, ch) in code[start..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &code[start..start + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced seam call at byte {open_at}");
+        }
+
+        let code = code_of(revoke_split_region());
+        let mut checked = 0usize;
+        for (seam, forbidden, what) in [
+            (
+                "self.with_capability_state_split_mut(|",
+                &[
+                    "with_ipc_split_mut(",
+                    "with_task_tcbs_split_mut(",
+                    "with_scheduler_split_mut(",
+                    "process_id_split_read(",
+                ][..],
+                "rank-4 capability",
+            ),
+            (
+                "self.with_ipc_split_mut(|",
+                &[
+                    "with_capability_state_split_mut(",
+                    "with_task_tcbs_split_mut(",
+                    "process_id_split_read(",
+                ][..],
+                "rank-3 IPC",
+            ),
+            (
+                "self.with_task_tcbs_split_mut(|",
+                &[
+                    "with_capability_state_split_mut(",
+                    "with_ipc_split_mut(",
+                    "with_scheduler_split_mut(",
+                ][..],
+                "rank-2 task",
+            ),
+        ] {
+            for (idx, _) in code.match_indices(seam) {
+                checked += 1;
+                let window = closure_extent(&code, idx);
+                for inner in forbidden {
+                    assert!(
+                        !window.contains(inner),
+                        "no `{inner}` may appear inside a held {what} seam"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked >= 6,
+            "the composition's seam acquisitions must all be inspected, found {checked}"
+        );
+    }
+
+    /// The wake is keyed by the waiter identity the rank-3 snapshot returned, never by a bare TID
+    /// the caller invented.
+    #[test]
+    fn u9f_the_wake_is_snapshot_keyed_and_never_bare_tid() {
+        let code = code_of(revoke_split_region());
+        let destroy = body_of(
+            revoke_split_region(),
+            "fn destroy_notification_split(",
+            "\n    /// rank 1",
+        );
+        assert!(
+            destroy.contains("ipc.notification_waiters[index].take()"),
+            "the waiter is TAKEN under rank 3 — snapshot and clear in one acquisition"
+        );
+        let wake = body_of(
+            revoke_split_region(),
+            "fn destroy_notification_for_revoked_object_split(",
+            "\n    // \u{2500}\u{2500} U9-F preflight",
+        );
+        assert!(
+            wake.contains("if let Some(waiter_tid) = self.destroy_notification_split(index)"),
+            "the wake consumes the snapshot's identity, not a caller-supplied TID"
+        );
+        for forbidden in ["current_tid", "task_cnode_split(0)", "ThreadId(0)"] {
+            assert!(
+                !code.contains(forbidden),
+                "the composition must not reach `{forbidden}`"
+            );
+        }
+    }
+
+    /// U9-F introduces NO new seam file and NO new marker family. Both were deviations in an
+    /// earlier candidate and both are now structural invariants: the composition lives in the
+    /// existing revocation owner, and its live evidence is the EXISTING
+    /// `IPC_RECV_MATERIALIZE_ROLLBACK` text, byte-identical on the split and broad routes.
+    #[test]
+    fn u9f_adds_no_seam_file_and_no_marker_family() {
+        for (rel, src) in super::stage199d_wa2a_ownership_boundary::production_sources() {
+            assert!(
+                !rel.ends_with("cap_revoke_rank_split.rs"),
+                "the U9-F seam file must not exist; the composition belongs to the revocation owner"
+            );
+            let code = code_of(&src);
+            assert!(
+                !code.contains("U9F_SPLIT_REVOKE"),
+                "{rel} carries a U9F_SPLIT_REVOKE marker family"
+            );
+            assert!(
+                !code.contains("kind=transfer_split"),
+                "{rel} carries a new `kind=` variant of an existing marker family"
+            );
+            assert!(
+                !code.contains("mod cap_revoke_rank_split"),
+                "{rel} declares a U9-F seam module"
+            );
+        }
+        // The composition and the broad rollback emit the SAME marker text, so the log cannot be
+        // used to tell the routes apart — which is why the source guards above are the proof.
+        let split = code_of(revoke_split_region());
+        let broad = code_of(include_str!("transfer_state.rs"));
+        let marker = r#"IPC_RECV_MATERIALIZE_ROLLBACK kind=transfer receiver_tid={} cap={} ok={}"#;
+        assert!(
+            split.contains(marker),
+            "the split entry point must emit the existing marker verbatim"
+        );
+        assert!(
+            broad.contains(marker),
+            "…which is exactly the text the broad transfer arm emits"
+        );
+    }
+
+    /// The relocated composition sits inside the file that OWNS `revoke_capability_in_cnode`, so
+    /// the split and the broad path it mirrors cannot drift apart across files.
+    #[test]
+    fn the_composition_lives_with_the_broad_revocation_it_mirrors() {
+        assert!(
+            LIFECYCLE.contains("pub(crate) fn revoke_capability_in_cnode("),
+            "the owner must still define the broad revocation"
+        );
+        for item in [
+            "pub(crate) fn revoke_capability_no_vm_split(",
+            "pub(crate) fn plan_revoke_capability_no_vm_split(",
+            "pub(crate) fn rollback_materialized_recv_cap_no_vm_split(",
+            "fn wake_destroyed_notification_waiter_split(",
+            "fn destroy_notification_split(",
+        ] {
+            assert_eq!(
+                code_of(LIFECYCLE).matches(item).count(),
+                1,
+                "`{item}` must have exactly one definition, in the revocation owner"
+            );
+        }
+    }
+
+    /// The proof that a Notification can never carry an active transfer mapping rests on every
+    /// registration callsite being object-gated. This pins the count of production registration
+    /// sites, so a NEW one cannot be added without this test failing and the proof being redone.
+    #[test]
+    fn every_transfer_mapping_registration_site_is_still_accounted_for() {
+        let sites = [
+            (
+                include_str!("../syscall/ipc.rs"),
+                "register_active_transfer_mapping(",
+                1usize,
+            ),
+            (
+                include_str!("../syscall/recv_shared_v3.rs"),
+                "register_active_transfer_mapping(",
+                1,
+            ),
+            (
+                include_str!("shared_region_txn.rs"),
+                "register_active_transfer_mapping(",
+                1,
+            ),
+            (RUNTIME, "register_active_transfer_mapping_locked(", 1),
+        ];
+        for (src, needle, expected) in sites {
+            assert_eq!(
+                code_of(src).matches(needle).count(),
+                expected,
+                "the number of `{needle}` production callsites changed; the U9-F admission proof \
+                 must be re-derived before this test is updated"
+            );
+        }
+    }
+
+    // ── (4) THE ADMISSION CONDITION: Notification is production-UNREACHABLE here ────────────
+
+    /// **This is the guard that makes hosted-only Notification evidence acceptable.**
+    ///
+    /// U9-F's Notification semantics — object destruction, IRQ-route teardown, exact waiter
+    /// extraction, the Blocked-only wake gate, driver affinity, exactly-one enqueue — are proven
+    /// by the hosted tests above and are NOT live-proven. That is sound only while no production
+    /// build can reach them, which is the case at this revision: nothing in production creates,
+    /// binds or mints a Notification capability, so the behaviour cannot run in a QEMU boot.
+    ///
+    /// If any of these counts moves, the guard fails and the accompanying message states what a
+    /// future change must supply before it is accepted.
+    #[test]
+    fn notification_is_production_unreachable_so_hosted_proof_suffices() {
+        const ADMISSION: &str = "\n\nU9-F ADMISSION CONDITION. Notification teardown is \
+             hosted-proven only, which is sound solely because no production path can reach it. \
+             This guard just detected production Notification reachability. Before accepting that \
+             change, it must ALSO supply, on an EXISTING profile: a live Notification \
+             rollback/destruction/wake seal; exact waiter identity; exactly-one destruction and \
+             exactly-one wake; and driver-affinity preservation. Do not weaken this guard instead.";
+
+        let mut create_callers = 0usize;
+        let mut bind_callers = 0usize;
+        let mut syscall_mints = 0usize;
+        let mut startup_mints = 0usize;
+        for (rel, src) in super::stage199d_wa2a_ownership_boundary::production_sources() {
+            // `production_sources` already strips each file's `#[cfg(test)] mod tests` tail, so
+            // test-only callers are excluded by construction. The hosted simulation harness
+            // (`posix_compat`) is a separate crate under `crates/` and is not scanned here; it
+            // builds its own `Bootstrap::init()` and is driven only by `tests/kernel_scenarios.rs`,
+            // so it is not a production path either.
+            let code = code_of(&src);
+            // The definitions themselves are not callers.
+            let defines_create = code.contains("pub fn create_notification(")
+                || code.contains("pub(crate) fn create_notification(");
+            let defines_bind = code.contains("pub fn bind_irq_notification(")
+                || code.contains("pub(crate) fn bind_irq_notification(");
+            let c = code.matches("create_notification(").count() - usize::from(defines_create);
+            let b = code.matches("bind_irq_notification(").count() - usize::from(defines_bind);
+            create_callers += c;
+            bind_callers += b;
+            if rel.starts_with("src/kernel/syscall") {
+                syscall_mints += code.matches("create_notification(").count();
+            }
+            // A startup-cap provisioning path that MINTS a Notification would have to name the
+            // object class at a mint. `StartupCapRequirement::IrqNotification` is a declared
+            // requirement, not a mint, and carries no `Capability::new(CapObject::Notification`.
+            startup_mints += code
+                .matches("Capability::new(CapObject::Notification")
+                .count();
+        }
+
+        assert_eq!(
+            create_callers, 0,
+            "`create_notification` gained {create_callers} production caller(s).{ADMISSION}"
+        );
+        assert_eq!(
+            bind_callers, 0,
+            "`bind_irq_notification` gained {bind_callers} production caller(s).{ADMISSION}"
+        );
+        assert_eq!(
+            syscall_mints, 0,
+            "a syscall now creates a Notification.{ADMISSION}"
+        );
+        assert_eq!(
+            startup_mints, 0,
+            "a production path now mints a Notification capability.{ADMISSION}"
+        );
+    }
+
+    /// `StartupCapRequirement::IrqNotification` is a *declared requirement* in the driver
+    /// manager's policy model — it is not itself a mint, and does not make Notification
+    /// production-reachable. Pinned separately so the distinction cannot be lost.
+    #[test]
+    fn the_irq_notification_startup_requirement_is_a_declaration_not_a_mint() {
+        const DM: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/driver_manager/service.rs"
+        );
+        assert!(
+            DM.contains("IrqNotification"),
+            "the declared requirement should still exist"
+        );
+        assert!(
+            !DM.contains("create_notification("),
+            "the driver manager must not create a Notification object"
+        );
+        assert!(
+            !DM.contains("bind_irq_notification("),
+            "…nor bind one to an IRQ line"
+        );
+        assert!(
+            !DM.contains("CapObject::Notification"),
+            "…nor name the object class at a mint"
         );
     }
 }

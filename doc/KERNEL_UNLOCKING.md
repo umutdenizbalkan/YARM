@@ -981,6 +981,179 @@ retires the Phase-A site (7 -> 6). The three rollback sites need an off-lock
 capability-revoke-with-object-teardown transaction and are **D3-gated**, so they cannot be
 retired ahead of the D3 `await_tlb_shootdown_ack` design.
 
+## U9-F (canonical 200B) — SPLITTING THE CAPABILITY-REVOKE TEARDOWN, CLASS BY CLASS
+
+**CENSUS-DELTA 0. `runtime.rs` stays at 3. Callsites deleted: 0. Broad fallbacks retained: 3.
+New seam files: 0. New marker families: 0.**
+
+U9-C retired the reply-cap Phase-A acquisition and recorded that the three ordinary
+`rollback_materialized_recv_cap` callers remain D3-fenced. U9-F does not retire them either. It
+answers the prior question: **which of the obligations that fence actually depends on the D3
+shootdown, and which only travelled with it.**
+
+### The six obligations, separated
+
+`revoke_capability_in_cnode` performs six things under one broad acquisition:
+
+| # | obligation | rank | D3? |
+|---|---|---|---|
+| 1 | cross-CNode descendant revocation | 4 | no |
+| 2 | delegation-link removal | 4 | no |
+| 3 | the recursive in-cspace `revoke` | 4 | no |
+| 4 | active-transfer-mapping unmap + TLB shootdown | 5/6 | **yes** |
+| 5 | memory-object refcount drop + frame reclaim | 6 | **yes** |
+| 6 | notification destroy + waiter wake | 3, then 2 → 1 | no |
+
+Only (4) and (5) are the fence. `SharedKernel::revoke_capability_no_vm_split` performs (1), (2),
+(3) and (6) as separately rank-ordered phases — no two locks held at once — and **admits only the
+classes for which (4) and (5) are provably vacuous**. Everything else is refused to the unchanged
+broad path.
+
+**No seam file was created.** The composition lives in
+`src/kernel/boot/capability_lifecycle_state.rs`, the existing owner of
+`revoke_capability_in_cnode` — the very function it splits — so the split and the broad path it
+mirrors cannot drift apart across files.
+
+### Why Notification is not D3-dependent — the hard stop, resolved
+
+(5) is direct: `adjust_memory_object_cap_refcount` and `reclaim_memory_object_if_unreferenced`
+both open with `MemoryObject { id } | DmaRegion { id, .. } => id, _ => return`.
+
+(4) could **not** be settled from the enum. `ActiveTransferMapping` (`defs.rs`) is
+`{ owner_tid, transfer_cap, base, len }` — **no object identity, no generation** — and
+`revoke_active_transfer_mappings_for_cap` matches on the bare `CapId`. So the question is whether
+a record keyed by a Notification's CapId can exist. Three source facts close it:
+
+1. **Every** production `register_active_transfer_mapping{,_locked}` callsite is object-gated to
+   `MemoryObject`/`DmaRegion` *before* it can register — `syscall/ipc.rs` behind
+   `resolve_memory_object_phys` (`WrongObject` for any other class), `syscall/recv_shared_v3.rs`
+   behind its `DmaRegion`/`MemoryObject` match arm, and `shared_region_txn.rs` (plus its
+   `SharedKernel` twin `sr_register_active_mapping_split`) behind `shared_region_phase_a`, which
+   admits only `MemoryObject | DmaRegion` into the snapshot the minted cap comes from.
+2. **A stale record cannot alias a later cap.** `CapId` is `(generation << 16) | index`, and both
+   `CapabilitySpace::revoke` and `delete_if_leaf` bump the slot generation as they clear it, so a
+   re-minted slot never reproduces a retired `CapId` value.
+3. **A record cannot outlive its process into a recycled TID.** Process teardown purges the
+   registry for the pid (`purge_active_transfer_mappings_for_pid`, and the noalloc reap's inline
+   equivalent) before the cnode walk.
+
+So a Notification owes neither fenced obligation, and neither does any class except
+`MemoryObject` and `DmaRegion`. `Reply` is refused too — not because it is fenced, but because its
+teardown is the U9-C reply transaction, which owns it.
+
+**The proof is not load-bearing at runtime.** A fail-closed rank-3 preflight scans the registry
+for the root and every descendant and refuses if it ever finds a match. That branch is unreachable
+by the argument above; it exists so the argument, and not this code, is the thing that has to stay
+true. A focused test also pins the *count* of registration callsites, so a new one cannot be added
+without the proof being re-derived.
+
+### Refusal is always safe
+
+Every refusal is raised in the preflight, which makes **no mutation**: identity resolution and the
+root class gate, then the bounded delegated closure with every member class-gated, then the exact
+link-removal set, then the transfer-mapping check. Only after all four does the commit run, and it
+follows the broad interleave exactly — root revoke, then each descendant complete (revoke, then its
+notification destroy + wake), then link removal, then the root's notification destroy + wake.
+
+The composition is allocation-free: the delegated closure and the link-removal set are bounded
+stack arrays, and an overflow is a refusal, not a growth. This preserves the Stage 181C property
+that a leaf cap-delete warms no PT-pool slab pages — `collect_delegated_descendants` and
+`remove_delegation_links_for` both `Box`-clone a 2048/4096-entry snapshot, and neither is called.
+
+### Production routing — split first, broad on refusal
+
+All three ordinary rollback callsites (`complete_recv_boundary_user_copy`,
+`complete_recv_boundary_ordinary_cap`, `execute_blocked_waiter_ordinary_cap_delivery`) now read:
+
+```rust
+} else if !shared.rollback_materialized_recv_cap_no_vm_split(tid, cap) {
+    let _ = shared.with_cpu(cpu, |kernel| { kernel.rollback_materialized_recv_cap(..) });
+}
+```
+
+The split is **offered**, never substituted. On refusal the unchanged broad rollback runs with its
+full effects intact. **CENSUS-DELTA 0 is the point, not a shortfall**: the memory-backed cohort
+still needs the D3 lock-free `await_tlb_shootdown_ack` design, and deleting a fallback now would
+silently drop TLB shootdowns and frame reclaim.
+
+### What is live-proven, and what is not
+
+**No new marker family was introduced, and none is needed.** The split entry point emits the
+EXISTING `IPC_RECV_MATERIALIZE_ROLLBACK kind=transfer receiver_tid=… cap=… ok=…` text verbatim —
+byte-identical to what `rollback_materialized_recv_cap`'s transfer arm emits — so the live log is
+the same on both routes and cannot be used to tell them apart. That is deliberate: **route
+ownership is proven by source-recomputed guards**, not by telemetry, in a CENSUS-DELTA 0 change
+where new telemetry would have to be deleted by the very commit that retires a callsite.
+
+**Endpoint — live-proven.** The existing rollback profile `YARM_IPC_RECV_PROOF_ROLLBACK=1`, whose
+workload transfers the loopback **Endpoint SEND cap** and drives it into the queued-split
+undersized writeback, reaches the first callsite. Three consecutive x86_64 runs with freshly
+rebuilt artifacts pass, with the rollback marker and `IPC_RECV_V2_ROLLBACK_OK
+site=queued_split_undersize reply=false` present, zero fatal/leak lines and zero `U9F_` marker
+leakage. Because
+`Endpoint` is an admitted class and the offer precedes the fallback, that rollback runs through the
+split composition; the guards, not the log, are what establish it.
+
+**Notification — hosted-proven only, and mechanically production-unreachable.** Notification
+destruction, IRQ-route teardown, exact waiter extraction, the Blocked-only wake gate,
+driver-affinity preservation, exactly-one enqueue, replacement-under-reused-TID and repeated
+rollback are covered by focused hosted tests against the same `SharedKernel` the live kernel runs.
+They are **not** live-proven, and the Endpoint result above must not be read as standing in for
+them.
+
+That is sound at this revision because **nothing in production can create, bind or mint a
+Notification capability.** `create_notification` has zero production callers — every callsite is
+in `src/kernel/boot/tests.rs`, in `runtime.rs`'s own `#[cfg(test)]` module, or in `posix_compat`'s
+hosted simulation harness, which builds its own `Bootstrap::init()` and is driven only by
+`tests/kernel_scenarios.rs`. `bind_irq_notification` likewise has zero production callers, and no
+syscall creates a Notification. `StartupCapRequirement::IrqNotification` in the driver manager is a
+**declared requirement, not a mint** — pinned separately. The behaviour therefore cannot run in any
+production build.
+
+**Live Notification proof is a future admission condition, not current work, because no production
+Notification capability exists.** The guard
+`notification_is_production_unreachable_so_hosted_proof_suffices` recomputes all of those counts
+from production source and fails with an explicit message if any of them moves, stating that the
+change must additionally supply, on an existing profile: a live Notification
+rollback/destruction/wake seal, exact waiter identity, exactly-one destruction and exactly-one
+wake, and driver-affinity preservation.
+
+**Cross-architecture.** RISC-V carries only the profile's own explicit deferral — its split-recv
+falls back to `legacy_full_path`, so the rollback happens inside the broad `KernelState` and never
+reaches this callsite; no stronger claim is made. AArch64's rollback proof does not emit its
+sequence marker (`have_seq=0 have_kern=0`), and the reason is visible directly in that run's log:
+it contains **zero** `IPC_RECV_PROOF_ROLLBACK_SEND_BEGIN`, **zero**
+`IPC_RECV_MATERIALIZE_ROLLBACK` and **zero** `IPC_RECV_V2_ROLLBACK_OK` — no rollback of any kind
+occurred, so **no U9-F code executed on that architecture at all** and the failure cannot
+originate here. It is a pre-existing AArch64 workload-startup issue. Its shared-region cell is
+likewise unreachable by U9-F, whose class gate refuses `MemoryObject`/`DmaRegion` outright, so
+every shared-region capability still takes the unchanged broad D3 route. (An earlier session
+observed identical signatures on freshly built base `fbe1229` artifacts; that comparison was not
+re-run in this one, so the statements above rest on the zero-rollback evidence and the class gate
+rather than on a base run.) Neither architecture is claimed as live Notification proof.
+
+
+### Re-derived guards
+
+Two pre-existing guards broke and each was re-derived onto its now-stronger contract rather than
+weakened. `only_reply_is_diverted_and_ordinary_rollback_keeps_every_effect` now pins the
+three-way shape and, crucially, the **order** — the split is offered before the broad acquisition,
+which is what makes "fallback" mean what it says.
+`every_production_task_status_assignment_site_is_enumerated` gains one site:
+`wake_destroyed_notification_waiter_split` is a WAKE owner of exactly the class its in-lock mirror
+is, with the identical Blocked-only gate, writing only after rank 3 has already snapshotted and
+cleared the waiter slot — so the wake fires at most once per destruction.
+
+### Status
+
+**U9-F DELIVERED. Census 6 / 0 / 6 — unchanged, by design.** What changed is that four of the six
+teardown obligations are now proven independent of the D3 fence and run off the broad lock for
+every class that owes only them. `Reply` remains owned by U9-C; `MemoryObject`/`DmaRegion` remain
+on the broad D3-dependent route; all three broad rollback acquisitions remain counted. **U9 remains
+OPEN**, and no canonical stage is closed by this prerequisite. When `await_tlb_shootdown_ack`
+lands, the remaining work at those three callsites is obligations (4) and (5) for
+`MemoryObject`/`DmaRegion` alone.
+
 > **Correction — there is no U8 implementation left to do.** Earlier revisions of this doc and
 > of `doc/STATUS.md` ended with "U8 is next". Directive U8 was the AArch64
 > `finalize_split_handled_syscall` broad reacquisition, and Stage 199D already retired it: that

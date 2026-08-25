@@ -355,6 +355,36 @@ materializations, 1 reply-cap one-shot): no class changed route. **The three ord
 D3/capability-object-teardown fenced. Six survivors: two terminal dispatchers, the D6 restore,
 and those three.
 
+**U9-F — DELIVERED. CENSUS-DELTA 0 (6 / 0 / 6, by design).** U9-B recorded the rollback cohort as
+D3-gated as a whole. U9-F separates it: of the six obligations `revoke_capability_in_cnode` owes,
+only two — the active-transfer-mapping unmap + TLB shootdown, and the memory-object refcount drop
++ frame reclaim — actually depend on D3. The other four (cross-CNode descendant revocation,
+delegation-link removal, the recursive in-cspace revoke, and notification destroy + waiter wake)
+now run as separately rank-ordered phases in `SharedKernel::revoke_capability_no_vm_split`, with
+no two locks held at once. **No seam file and no marker family were added**: the composition lives
+in `capability_lifecycle_state.rs`, the existing owner of the broad function, and it emits the
+EXISTING `IPC_RECV_MATERIALIZE_ROLLBACK kind=transfer …` text verbatim, so the live log is
+identical on both routes and route ownership is proven by source-recomputed guards rather than by
+telemetry. All three rollback callsites offer the split first and fall back to the **unchanged**
+broad rollback on refusal, so no acquisition is retired and no obligation is dropped. `Reply`
+remains owned by U9-C; `MemoryObject`/`DmaRegion` remain on the broad D3-dependent route; all
+three broad rollback acquisitions remain counted. **Endpoint rollback is live-proven 3/3 on
+x86_64** via the existing `YARM_IPC_RECV_PROOF_ROLLBACK=1` profile. **Notification
+destruction/wake is hosted-proven only** — and mechanically **production-unreachable** at this
+revision: `create_notification` and `bind_irq_notification` have zero production callers, no
+syscall creates a Notification, and `StartupCapRequirement::IrqNotification` is a declared
+requirement rather than a mint. A source guard recomputes all of that and fails with an explicit
+admission message if reachability is ever introduced, requiring a live Notification seal with
+exact waiter identity, exactly-one destruction and wake, and driver-affinity preservation before
+acceptance. **Live Notification proof is a future admission condition, not current work, because
+no production Notification capability exists.** RISC-V carries only the profile's own explicit
+deferral. AArch64's rollback cell fails because its workload never starts — that run's log holds
+zero `IPC_RECV_PROOF_ROLLBACK_SEND_BEGIN`, zero `IPC_RECV_MATERIALIZE_ROLLBACK` and zero
+`IPC_RECV_V2_ROLLBACK_OK`, so no U9-F code executed there and the failure cannot originate here;
+its shared-region cell is likewise unreachable by U9-F, whose class gate refuses
+`MemoryObject`/`DmaRegion` outright. Both are recorded as pre-existing.
+`doc/KERNEL_UNLOCKING.md` § U9-F.
+
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
 `finalize_split_handled_syscall` broad reacquisition, already retired by Stage 199D; that
 function holds no broad acquisition today. Earlier "U8 is next" pointers are removed.

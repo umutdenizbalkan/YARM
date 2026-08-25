@@ -5092,12 +5092,16 @@ impl SharedKernel {
                 // teardown obligations, which is why this arm can be retired while the
                 // ordinary ones cannot.
                 //
-                // Every OTHER object class keeps the unchanged broad
-                // `rollback_materialized_recv_cap`, with its full effects intact: delegated
-                // descendant revocation, active-transfer-mapping unmap + TLB shootdown,
-                // memory refcount/reclaim, and notification destroy + wake. Nothing is
-                // narrowed, filtered or skipped here — that cohort remains D3-fenced and
-                // remains counted in the census.
+                // U9-F — every OTHER object class first offers the teardown to the phased
+                // split composition, which ACCEPTS only the classes that provably owe neither
+                // an active-transfer-mapping unmap (VM/TLB shootdown) nor a memory-object
+                // refcount drop + frame reclaim, and performs their COMPLETE teardown —
+                // cross-CNode descendant revocation, delegation-link removal, the recursive
+                // in-cspace revoke, and notification destroy + waiter wake — off the broad
+                // lock. On any refusal the unchanged broad `rollback_materialized_recv_cap`
+                // runs instead, with its full effects intact. Nothing is ever narrowed,
+                // filtered or skipped: the split either does all of it or none of it, so the
+                // memory-backed cohort stays D3-fenced and this callsite stays counted.
                 if let Some((reply_index, reply_generation)) = pending.reply_record {
                     let _ = shared.rollback_reply_cap_split(
                         pending.receiver_tid,
@@ -5105,7 +5109,10 @@ impl SharedKernel {
                         reply_index,
                         reply_generation,
                     );
-                } else {
+                } else if !shared.rollback_materialized_recv_cap_no_vm_split(
+                    pending.receiver_tid,
+                    crate::kernel::capabilities::CapId(cap_id),
+                ) {
                     let _ = shared.with_cpu(cpu, |kernel| {
                         kernel.rollback_materialized_recv_cap(
                             pending.receiver_tid,
@@ -5399,14 +5406,22 @@ impl SharedKernel {
         if crate::kernel::syscall::recv_boundary_encode_transfer_cap_ret(frame, Some(local_cap))
             .is_err()
         {
-            // Roll the just-minted cap back so nothing leaks, then fail.
-            let _ = self.with_cpu(cpu, |kernel| {
-                kernel.rollback_materialized_recv_cap(
-                    pending.receiver_tid,
-                    crate::kernel::capabilities::CapId(local_cap),
-                    false,
-                );
-            });
+            // Roll the just-minted cap back so nothing leaks, then fail. U9-F: offered to the
+            // phased split composition first (complete teardown off the broad lock for the
+            // classes that owe no VM shootdown and no memory reclaim); the unchanged broad
+            // rollback runs on refusal.
+            if !self.rollback_materialized_recv_cap_no_vm_split(
+                pending.receiver_tid,
+                crate::kernel::capabilities::CapId(local_cap),
+            ) {
+                let _ = self.with_cpu(cpu, |kernel| {
+                    kernel.rollback_materialized_recv_cap(
+                        pending.receiver_tid,
+                        crate::kernel::capabilities::CapId(local_cap),
+                        false,
+                    );
+                });
+            }
             return Err(TrapHandleError::Syscall(SyscallError::Internal));
         }
 
@@ -6194,9 +6209,14 @@ impl SharedKernel {
                 )
                 .is_ok();
         if !copy_ok {
-            let _ = self.with_cpu(cpu, |kernel| {
-                kernel.rollback_materialized_recv_cap(snap.waiter_tid, CapId(local_cap), false);
-            });
+            // U9-F: the phased split composition first (complete teardown off the broad lock for
+            // the classes that owe no VM shootdown and no memory reclaim); the unchanged broad
+            // rollback runs on refusal.
+            if !self.rollback_materialized_recv_cap_no_vm_split(snap.waiter_tid, CapId(local_cap)) {
+                let _ = self.with_cpu(cpu, |kernel| {
+                    kernel.rollback_materialized_recv_cap(snap.waiter_tid, CapId(local_cap), false);
+                });
+            }
             crate::yarm_log!(
                 "IPC_RECV_V2_ROLLBACK_OK site=blocked_ordinary_cap tid={} reply=false",
                 snap.waiter_tid
