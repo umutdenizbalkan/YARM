@@ -4202,43 +4202,40 @@ impl crate::runtime::SharedKernel {
         })
     }
 
-    /// U9-QA — the authoritative queue advance, with NO broad lock.
+    /// U9-QA — ADMISSION for one queue advance. Makes NO mutation, and is the ONLY place a
+    /// refusal can be raised.
     ///
-    /// `outgoing_tid` is the exact task the caller has already published as no longer runnable
-    /// (blocked, preempted or faulted). The caller owns that publication; this owns the advance.
+    /// The caller must run this BEFORE it publishes its terminal transition (block, preempt or
+    /// fault). Once that publication happens the advance must complete, so every reason it could
+    /// decline is checked here, while falling through to the unchanged terminal broad dispatcher is
+    /// still safe.
     ///
-    /// Phases, monotonic and never nested:
+    /// Checks, in order:
+    /// 1. lock-free — the four `can_stash_for_lock_drop` conditions (arch support, a trap drainer
+    ///    for this CPU, a single dispatching CPU, an empty stash);
+    /// 2. rank 1 — `peek_next_runnable_on(cpu)`, the NON-mutating candidate read (the run queue is
+    ///    unchanged; two calls return the same TID);
+    /// 3. rank 2 — the candidate must be RESUMABLE, i.e. its kernel context is initialized.
+    ///    A candidate that has never run takes the fresh/startup resume convention, which this
+    ///    transaction does not own, so it is refused here — before the caller has blocked anything
+    ///    and before the run queue has been touched.
     ///
-    /// 1. **Lock-free refusals.** Arch support, trap drainer present, single dispatching CPU, stash
-    ///    empty. All four are the same conditions `can_stash_for_lock_drop` tests, evaluated before
-    ///    any mutation, so a refusal is always safe to follow with the broad path.
-    /// 2. **rank 1** — `dispatch_next_selection_on(cpu)`, the SAME selection the broad path uses.
-    ///    Released before anything else. No task selected → `TerminalIdle`; the same task →
-    ///    `ResumeSame`.
-    /// 3. **rank 2** — the incoming ASID.
-    /// 4. **LOCK-FREE** — address-space activation for the incoming task.
-    /// 5. **rank 2** — the switch plan, through the shared builder. If the incoming task vanished
-    ///    or either kernel context is uninitialized this fails closed with nothing stashed.
-    /// 6. **LOCK-FREE** — stash the plan for the arch apply.
-    ///
-    /// After step 6 returns `Switch`, fallback is forbidden: the plan is stashed and the caller
-    /// must drive the drain.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn queue_advance_split(
+    /// `Ok(None)` means "no candidate": the advance will legitimately idle this CPU.
+    pub(crate) fn queue_advance_admit_split(
         &self,
         cpu: CpuId,
-        outgoing_tid: u64,
-    ) -> Result<QueueAdvanceOutcome, QueueAdvanceRefusal> {
+    ) -> Result<Option<u64>, QueueAdvanceRefusal> {
         let cpu_idx = cpu.0 as usize;
         if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
             return Err(QueueAdvanceRefusal::OutgoingIdentityStale);
         }
-        // (1) Lock-free refusals — the `can_stash_for_lock_drop` conditions, before any mutation.
+        // (1) Lock-free refusals — the `can_stash_for_lock_drop` conditions.
         //
-        // RISC-V is refused because the Stage 117 stash gate itself opens with
-        // `!cfg!(target_arch = "riscv64")`: that architecture has never had an off-lock drain, so a
-        // stashed plan would have no consumer. Refusing here keeps RISC-V on its unchanged
-        // in-lock switch rather than inventing a second one.
+        // RISC-V is refused by construction: the Stage 117 stash gate itself opens with
+        // `!cfg!(target_arch = "riscv64")`, and that architecture's drain leaves
+        // `restore_result = Ok(())` because it has no `post_switch_restore_*_split`. A stashed plan
+        // would switch tasks with nothing restoring the incoming context. Refusing keeps RISC-V on
+        // its unchanged in-lock switch rather than inventing a second, unproven one.
         if cfg!(target_arch = "riscv64") {
             return Err(QueueAdvanceRefusal::ArchUnsupported);
         }
@@ -4259,36 +4256,96 @@ impl crate::runtime::SharedKernel {
         if unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() } {
             return Err(QueueAdvanceRefusal::StashOccupied);
         }
-        // (2) rank 1: the SAME selection primitive the broad path calls, then released.
+        // (2) rank 1: the NON-mutating candidate peek. The run queue is not touched.
+        let Some(candidate) = self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler)
+                .peek_next_runnable_on(cpu)
+                .map(|t| t.0)
+        }) else {
+            return Ok(None);
+        };
+        // (3) rank 2: the candidate must be resumable by THIS convention.
+        let resumable = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == candidate)
+                .map(|t| t.kernel_context.initialized)
+                .unwrap_or(false)
+        });
+        if !resumable {
+            return Err(QueueAdvanceRefusal::IncomingUnavailable);
+        }
+        Ok(Some(candidate))
+    }
+
+    /// U9-QA — COMMIT the queue advance. Cannot refuse.
+    ///
+    /// `outgoing_tid` is the exact task the caller has already published as no longer runnable, and
+    /// `admitted` is the candidate [`Self::queue_advance_admit_split`] returned under the same
+    /// uninterrupted trap. Phases are monotonic and never nested:
+    ///
+    /// 1. **rank 1** — `dispatch_next_selection_on(cpu)`, the SAME selection primitive the broad
+    ///    path calls. Because the caller has already cleared the current slot, this takes the
+    ///    `current is None` branch and DEQUEUES the admitted candidate.
+    /// 2. **rank 2** — the incoming ASID.
+    /// 3. **LOCK-FREE** — address-space activation for the incoming task.
+    /// 4. **rank 2** — the switch plan, through the single shared builder.
+    /// 5. **LOCK-FREE** — stash the plan for the arch apply.
+    ///
+    /// `Idle` selection yields `TerminalIdle`; a `ContinuedCurrent` selection means the caller did
+    /// not actually clear the current slot and yields `ResumeSame` with nothing stashed. Neither is
+    /// a refusal — nothing was dequeued in either case.
+    pub(crate) fn queue_advance_commit_split(
+        &self,
+        cpu: CpuId,
+        outgoing_tid: u64,
+        admitted: Option<u64>,
+    ) -> QueueAdvanceOutcome {
+        use crate::kernel::scheduler::DispatchSelection;
+        let cpu_idx = cpu.0 as usize;
+        let Some(admitted) = admitted else {
+            return QueueAdvanceOutcome::TerminalIdle;
+        };
+        // (1) rank 1: the SAME selection primitive the broad path calls.
         let selection = self.with_scheduler_split_mut(|sched| {
             crate::kernel::boot::kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu)
         });
-        let Some(incoming) = selection.tid().map(|t| t.0) else {
-            return Ok(QueueAdvanceOutcome::TerminalIdle);
+        let incoming = match selection {
+            DispatchSelection::Dequeued { tid } => tid.0,
+            // The caller did not clear the current slot, so nothing was dequeued.
+            DispatchSelection::ContinuedCurrent { .. } => return QueueAdvanceOutcome::ResumeSame,
+            DispatchSelection::Idle => return QueueAdvanceOutcome::TerminalIdle,
         };
-        if incoming == outgoing_tid {
-            return Ok(QueueAdvanceOutcome::ResumeSame);
-        }
-        // (3) rank 2: the incoming ASID.
+        debug_assert_eq!(
+            incoming, admitted,
+            "the dequeued task must be the admitted candidate"
+        );
+        // (2) rank 2: the incoming ASID.
         let incoming_asid = self.task_asid_opt_split_read(incoming);
-        // (4) Lock-free: activate the incoming address space, exactly as `dispatch_next_task` does
-        // through `Hal::switch_address_space` — the same two free functions, no lock either way.
+        // (3) Lock-free: activate the incoming address space — the same two free functions
+        // `Hal::switch_address_space` calls, which `dispatch_next_task` uses at this exact point.
         if let Some(asid) = incoming_asid {
             crate::arch::hal_adapters::switch_address_space(asid);
             crate::arch::hal::note_address_space_activated(cpu, asid);
         }
-        // (5) rank 2: the switch plan, through the SINGLE shared builder.
+        // (4) rank 2: the switch plan, through the SINGLE shared builder. Admission already proved
+        // the incoming kernel context is initialized, so `Ok(None)` here can only mean the outgoing
+        // and incoming resolved to the same slot — which the caller's block made impossible.
         let plan = self.with_task_tcbs_split_mut(|tcbs| {
             build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming)
         });
-        let plan = match plan {
-            Ok(Some(plan)) => plan,
-            // Same slot or an uninitialized kernel context: the broad path treats this as "no
-            // switch required" and resumes. Nothing was stashed.
-            Ok(None) => return Ok(QueueAdvanceOutcome::ResumeSame),
-            Err(_) => return Err(QueueAdvanceRefusal::IncomingUnavailable),
+        let Ok(Some(plan)) = plan else {
+            // Fail closed: the incoming task stays current and runnable-selected, and this CPU
+            // idles rather than switching to a task whose plan we could not build. The outgoing
+            // task remains correctly blocked and will be woken by its own waker.
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROP_DEFERRED reason=plan_unavailable outgoing={} incoming={}",
+                outgoing_tid,
+                incoming
+            );
+            return QueueAdvanceOutcome::TerminalIdle;
         };
-        // (6) Lock-free: publish the plan for the arch apply. This is the point of no return.
+        // (5) Lock-free: publish the plan for the arch apply. This is the point of no return.
         unsafe {
             crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan);
         }
@@ -4297,10 +4354,10 @@ impl crate::runtime::SharedKernel {
             outgoing_tid,
             incoming
         );
-        Ok(QueueAdvanceOutcome::Switch {
+        QueueAdvanceOutcome::Switch {
             outgoing_tid,
             incoming_tid: incoming,
             incoming_asid,
-        })
+        }
     }
 }

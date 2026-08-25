@@ -11876,15 +11876,25 @@ fn stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker() {
         !broad_dispatch.contains("with_scheduler_split_mut("),
         "the BROAD dispatch entry point must not be relocated onto with_scheduler_split_mut"
     );
-    let qa = exec_src
-        .split("pub(crate) fn queue_advance_split")
+    let admit = exec_src
+        .split("pub(crate) fn queue_advance_admit_split")
         .nth(1)
-        .expect("the U9-QA transaction must exist");
-    let qa_body = qa.split("\n    }\n").next().expect("its body");
+        .expect("the U9-QA admission must exist")
+        .split("\n    }\n")
+        .next()
+        .expect("its body");
+    let commit = exec_src
+        .split("pub(crate) fn queue_advance_commit_split")
+        .nth(1)
+        .expect("the U9-QA commit must exist")
+        .split("\n    }\n")
+        .next()
+        .expect("its body");
     assert_eq!(
         exec_src.matches("with_scheduler_split_mut(").count(),
-        qa_body.matches("with_scheduler_split_mut(").count(),
-        "every with_scheduler_split_mut in exec_state.rs must be inside queue_advance_split"
+        admit.matches("with_scheduler_split_mut(").count()
+            + commit.matches("with_scheduler_split_mut(").count(),
+        "every with_scheduler_split_mut in exec_state.rs must be inside the U9-QA transaction"
     );
     assert!(
         sched_src.contains("relocating the dispatch entry point"),
