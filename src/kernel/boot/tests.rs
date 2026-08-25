@@ -11858,9 +11858,33 @@ fn stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker() {
         !sched_src.contains("with_scheduler_split_mut("),
         "with_scheduler_split_mut must not be called from scheduler_state.rs yet"
     );
+    // U9-QA re-derivation. The file-wide ban was a PROXY for the real claim: the BROAD dispatch
+    // entry point must not be relocated onto the seam. U9-QA added an off-lock queue-advance
+    // transaction ALONGSIDE it, for the frame-decodable trap boundaries this blocker text itself
+    // names as the acceptable shape — so the proxy is now false while the claim it stood for is
+    // still true. The claim is asserted directly instead, which is strictly stronger: the broad
+    // dispatch body is checked, and every occurrence in the file must be inside the named
+    // transaction.
+    let broad_dispatch = exec_src
+        .split("pub(crate) fn dispatch_next_task")
+        .nth(1)
+        .expect("the broad dispatch entry point must still exist")
+        .split("\n    pub")
+        .next()
+        .expect("bounded by the next item");
     assert!(
-        !exec_src.contains("with_scheduler_split_mut("),
-        "with_scheduler_split_mut must not be called from exec_state.rs yet"
+        !broad_dispatch.contains("with_scheduler_split_mut("),
+        "the BROAD dispatch entry point must not be relocated onto with_scheduler_split_mut"
+    );
+    let qa = exec_src
+        .split("pub(crate) fn queue_advance_split")
+        .nth(1)
+        .expect("the U9-QA transaction must exist");
+    let qa_body = qa.split("\n    }\n").next().expect("its body");
+    assert_eq!(
+        exec_src.matches("with_scheduler_split_mut(").count(),
+        qa_body.matches("with_scheduler_split_mut(").count(),
+        "every with_scheduler_split_mut in exec_state.rs must be inside queue_advance_split"
     );
     assert!(
         sched_src.contains("relocating the dispatch entry point"),
@@ -33539,13 +33563,25 @@ mod stage114_d3_vm_brk_shrink_live {
             1,
             "dispatch_next_task must still call local_dispatch_step_split exactly once"
         );
+        // U9-QA re-derivation, same reasoning as stage113 above: the Outcome-B claim is that the
+        // BROAD dispatch entry point was not relocated, and that remains true and is asserted
+        // directly. The blocker text stays accurate — the dispatch entry point still has ~50+ call
+        // sites fanning into it and is still NOT relocated; U9-QA instead added a separate
+        // transaction for the frame-decodable trap boundaries this very text names as the
+        // acceptable shape.
+        assert!(!sched_src.contains("with_scheduler_split_mut("));
+        let broad_dispatch = exec_src
+            .split("pub(crate) fn dispatch_next_task")
+            .nth(1)
+            .expect("the broad dispatch entry point must still exist")
+            .split("\n    pub")
+            .next()
+            .expect("bounded by the next item");
         assert!(
-            !sched_src.contains("with_scheduler_split_mut(")
-                && !exec_src.contains("with_scheduler_split_mut("),
-            "D6 must still not call with_scheduler_split_mut directly (Outcome B retained): the \
-             dispatch entry point has ~50+ call sites fanning into it (yield, block, exit, fault, \
-             many syscalls), not one frame-decodable trap boundary like VmBrk/IpcRecv, so there is \
-             no single call site to relocate ahead of with_cpu"
+            !broad_dispatch.contains("with_scheduler_split_mut("),
+            "D6 Outcome-B retained: the BROAD dispatch entry point has ~50+ call sites fanning \
+             into it (yield, block, exit, fault, many syscalls), not one frame-decodable trap \
+             boundary like VmBrk/IpcRecv, so it is still not relocated ahead of with_cpu"
         );
         assert!(
             sched_src.contains("relocating the dispatch entry point"),

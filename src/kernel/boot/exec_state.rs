@@ -176,6 +176,139 @@ pub(crate) fn ap_probe_stub_bytes() -> &'static [u8] {
     &AP_PROBE_STUB
 }
 
+/// U9-QA §2 — the SINGLE `DispatchSwitchPlan` builder.
+///
+/// Extracted verbatim from `maybe_switch_kernel_context`'s `with_tcbs_mut` closure so the broad
+/// path and the off-lock queue-advance transaction share ONE implementation. It is a free
+/// function over the TCB slice, which is exactly what both `KernelState::with_tcbs_mut` and
+/// `SharedKernel::with_task_tcbs_split_mut` hand their closures, so neither had to change shape
+/// and no selection or plan policy is duplicated.
+///
+/// `Ok(None)` means "no switch is required or possible" (same slot, or either kernel context
+/// uninitialized) — the caller resumes the interrupted task. Every `Err` is `TaskMissing`.
+/// U9-QA §2 — the typed outcome of one authoritative off-lock queue advance.
+///
+/// The transaction either performs the whole advance or refuses BEFORE its first mutation. There
+/// is no third state: once `Switch` is returned the outgoing task has been published as no longer
+/// current and the plan is stashed, so the caller MUST drive the arch apply and MUST NOT fall back
+/// to the terminal broad dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueAdvanceOutcome {
+    /// The scheduler re-selected the same task. The interrupted frame is preserved untouched and
+    /// the caller returns to it; nothing was mutated.
+    ResumeSame,
+    /// A different task was selected and the switch plan is STASHED for the arch apply. These are
+    /// the exact facts the apply needs; the incoming identity was selected authoritatively here,
+    /// never reconstructed afterwards.
+    Switch {
+        outgoing_tid: u64,
+        incoming_tid: u64,
+        incoming_asid: Option<crate::kernel::vm::Asid>,
+    },
+    /// No task is runnable on this CPU. The caller enters the architecture's existing idle path.
+    TerminalIdle,
+}
+
+/// Why the queue advance declined. EVERY variant is raised before the first mutation, so a refused
+/// caller may safely fall through to the unchanged terminal broad dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueAdvanceRefusal {
+    /// This architecture has no off-lock switch apply. The Stage 117 stash gate opens with
+    /// `!cfg!(target_arch = "riscv64")`, so RISC-V has never had an off-lock drain and the plan
+    /// would be stashed with nothing to consume it.
+    ArchUnsupported,
+    /// `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` is clear for this CPU: no drainer will consume a stashed
+    /// plan, exactly the condition `can_stash_for_lock_drop` tests.
+    NoTrapDrainer,
+    /// More than one CPU is dispatching. The lock-drop window is only accepted single-online.
+    MultiCpu,
+    /// A plan is already stashed for this CPU; a second would be lost.
+    StashOccupied,
+    /// The outgoing task is not this CPU's current task, or has no TCB — fail closed rather than
+    /// switch away from an identity we cannot confirm.
+    OutgoingIdentityStale,
+    /// The selected incoming task vanished, or either kernel context is uninitialized, between
+    /// selection and plan build. Fails closed with NOTHING mutated.
+    IncomingUnavailable,
+}
+
+pub(crate) fn build_dispatch_switch_plan_locked(
+    tcbs: &mut [Option<crate::kernel::task::ThreadControlBlock>],
+    outgoing_tid: u64,
+    incoming_tid: u64,
+) -> Result<Option<DispatchSwitchPlan>, KernelError> {
+    let outgoing_idx = tcbs
+        .iter()
+        .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == outgoing_tid))
+        .ok_or(KernelError::TaskMissing)?;
+    let incoming_idx = tcbs
+        .iter()
+        .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == incoming_tid))
+        .ok_or(KernelError::TaskMissing)?;
+
+    if outgoing_idx == incoming_idx {
+        return Ok(None);
+    }
+
+    // Split the TCB slice to get simultaneous mutable/shared refs.
+    let (outgoing_tcb, incoming_tcb) = if outgoing_idx < incoming_idx {
+        let (left, right) = tcbs.split_at_mut(incoming_idx);
+        (
+            left[outgoing_idx]
+                .as_mut()
+                .ok_or(KernelError::TaskMissing)?,
+            right[0].as_mut().ok_or(KernelError::TaskMissing)?,
+        )
+    } else {
+        let (left, right) = tcbs.split_at_mut(outgoing_idx);
+        (
+            right[0].as_mut().ok_or(KernelError::TaskMissing)?,
+            left[incoming_idx]
+                .as_mut()
+                .ok_or(KernelError::TaskMissing)?,
+        )
+    };
+
+    if !outgoing_tcb.kernel_context.initialized || !incoming_tcb.kernel_context.initialized {
+        return Ok(None);
+    }
+
+    let incoming_stack_top = incoming_tcb.kernel_context.stack_top.map(|top| top.0);
+
+    // Derive raw pointers from the live mutable/shared references.
+    // These pointers remain valid after `task_state_lock` is released:
+    //
+    // (1) `KernelState::tcbs` is `KernelStorage<[Option<TCB>; MAX_TASKS]>` —
+    //     a fixed-size inline array; no move or reallocation can occur
+    //     during the dispatch path.
+    // (2) On the Stage 116 fallback path: the outer global
+    //     `SpinLock<KernelState>` (held by `with_cpu`) guarantees
+    //     exclusive access to all of `KernelState`.
+    // (3) On the Stage 117 stash path: interrupts are disabled (hardware
+    //     trap entry on x86_64/aarch64) and the system is single-CPU, so
+    //     no concurrent modification of `KernelState` can occur between
+    //     the lock drop and `switch_frames`.
+    // (4) The outgoing task is currently executing on this CPU only;
+    //     its kernel frame cannot be modified by any other CPU.
+    // (5) The incoming task was selected for this CPU by
+    //     `local_dispatch_step_split`; the scheduler guarantees no other
+    //     CPU will attempt to run it simultaneously.
+    let outgoing_frame_ptr: *mut crate::kernel::task::ArchSwitchContext =
+        &mut outgoing_tcb.kernel_context.frame;
+    let incoming_frame_ptr: *mut crate::kernel::task::ArchSwitchContext =
+        &mut incoming_tcb.kernel_context.frame;
+    let outgoing_stack_top = outgoing_tcb.kernel_context.stack_top.map(|t| t.0);
+
+    Ok(Some(DispatchSwitchPlan {
+        outgoing_tid,
+        incoming_tid,
+        outgoing_frame_ptr,
+        incoming_frame_ptr,
+        incoming_stack_top,
+        outgoing_stack_top,
+    }))
+}
+
 impl KernelState {
     fn page_flags_from_elf_pflags(p_flags: u32) -> Result<PageFlags, KernelError> {
         let mut read = (p_flags & PF_R) != 0;
@@ -952,81 +1085,9 @@ impl KernelState {
         // (dropped by `local_dispatch_step_split`); task_state_lock (rank 2)
         // will be gone; only the outer global `SpinLock<KernelState>` from
         // `with_cpu` remains held on the x86_64/aarch64 path.
-        let plan =
-            self.with_tcbs_mut(|tcbs| -> Result<Option<DispatchSwitchPlan>, KernelError> {
-                let outgoing_idx = tcbs
-                    .iter()
-                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == outgoing_tid))
-                    .ok_or(KernelError::TaskMissing)?;
-                let incoming_idx = tcbs
-                    .iter()
-                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == incoming_tid))
-                    .ok_or(KernelError::TaskMissing)?;
-
-                if outgoing_idx == incoming_idx {
-                    return Ok(None);
-                }
-
-                // Split the TCB slice to get simultaneous mutable/shared refs.
-                let (outgoing_tcb, incoming_tcb) = if outgoing_idx < incoming_idx {
-                    let (left, right) = tcbs.split_at_mut(incoming_idx);
-                    (
-                        left[outgoing_idx]
-                            .as_mut()
-                            .ok_or(KernelError::TaskMissing)?,
-                        right[0].as_mut().ok_or(KernelError::TaskMissing)?,
-                    )
-                } else {
-                    let (left, right) = tcbs.split_at_mut(outgoing_idx);
-                    (
-                        right[0].as_mut().ok_or(KernelError::TaskMissing)?,
-                        left[incoming_idx]
-                            .as_mut()
-                            .ok_or(KernelError::TaskMissing)?,
-                    )
-                };
-
-                if !outgoing_tcb.kernel_context.initialized
-                    || !incoming_tcb.kernel_context.initialized
-                {
-                    return Ok(None);
-                }
-
-                let incoming_stack_top = incoming_tcb.kernel_context.stack_top.map(|top| top.0);
-
-                // Derive raw pointers from the live mutable/shared references.
-                // These pointers remain valid after `task_state_lock` is released:
-                //
-                // (1) `KernelState::tcbs` is `KernelStorage<[Option<TCB>; MAX_TASKS]>` —
-                //     a fixed-size inline array; no move or reallocation can occur
-                //     during the dispatch path.
-                // (2) On the Stage 116 fallback path: the outer global
-                //     `SpinLock<KernelState>` (held by `with_cpu`) guarantees
-                //     exclusive access to all of `KernelState`.
-                // (3) On the Stage 117 stash path: interrupts are disabled (hardware
-                //     trap entry on x86_64/aarch64) and the system is single-CPU, so
-                //     no concurrent modification of `KernelState` can occur between
-                //     the lock drop and `switch_frames`.
-                // (4) The outgoing task is currently executing on this CPU only;
-                //     its kernel frame cannot be modified by any other CPU.
-                // (5) The incoming task was selected for this CPU by
-                //     `local_dispatch_step_split`; the scheduler guarantees no other
-                //     CPU will attempt to run it simultaneously.
-                let outgoing_frame_ptr: *mut crate::kernel::task::ArchSwitchContext =
-                    &mut outgoing_tcb.kernel_context.frame;
-                let incoming_frame_ptr: *mut crate::kernel::task::ArchSwitchContext =
-                    &mut incoming_tcb.kernel_context.frame;
-                let outgoing_stack_top = outgoing_tcb.kernel_context.stack_top.map(|t| t.0);
-
-                Ok(Some(DispatchSwitchPlan {
-                    outgoing_tid,
-                    incoming_tid,
-                    outgoing_frame_ptr,
-                    incoming_frame_ptr,
-                    incoming_stack_top,
-                    outgoing_stack_top,
-                }))
-            })?;
+        let plan = self.with_tcbs_mut(|tcbs| {
+            build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming_tid)
+        })?;
         // task_state_lock (rank 2) is now released.
 
         let Some(plan) = plan else {
@@ -4086,5 +4147,160 @@ mod tests {
             .expect("spawn")
             .join()
             .expect("join");
+    }
+}
+
+// ── U9-QA — the authoritative off-lock queue-advancing dispatch ──────────────────────────────
+//
+// The broad queue-advancing switch is `KernelState::dispatch_next_task`, and every step it takes
+// is already reachable through a single-rank seam or a lock-free primitive:
+//
+// | step                       | owner     | rank / lock                                        |
+// |----------------------------|-----------|----------------------------------------------------|
+// | next-task selection        | scheduler | rank 1 — `dispatch_next_selection_on(cpu)`          |
+// | incoming ASID              | task      | rank 2 — `task_asid`                               |
+// | address-space activation   | HAL       | LOCK-FREE — `hal_adapters::switch_address_space`   |
+// |                            |           | + `note_address_space_activated` (per-CPU atomic)  |
+// | switch-plan build          | task      | rank 2 — `build_dispatch_switch_plan_locked`       |
+// | the switch itself          | arch      | NO LOCK — Stage 117 stash, drained by `trap_entry` |
+// | incoming context restore   | arch      | NO LOCK — U9/203C `post_switch_restore_*_split`    |
+// | terminal idle              | scheduler | rank 1 — the existing architecture idle path       |
+//
+// So the broad lock was never load-bearing for the advance; it was the ambient authority the steps
+// were written against. This transaction supplies that authority explicitly instead — the trap
+// `CpuId` and the exact outgoing identity — and takes each rank once, in monotonic order, with
+// nothing held across the HAL activation or the stash.
+//
+// It deliberately does NOT own selection policy: it calls the SAME
+// `Scheduler::dispatch_next_selection_on` the broad path calls, and the SAME
+// `build_dispatch_switch_plan_locked` extracted from `maybe_switch_kernel_context`. There is one
+// scheduler-selection implementation and one plan-build implementation in the tree.
+impl crate::runtime::SharedKernel {
+    /// U9-QA — capture the outgoing task's user context into its TCB, off the broad lock.
+    ///
+    /// The split twin of the `sync_current_thread_from_frame(trapframe)` that opens the broad
+    /// `handle_trap(Trap::Syscall, …)` arm. It MUST run before anything can select another task:
+    /// once the queue advance publishes the outgoing task as no longer current, the live trap frame
+    /// stops being that task's authoritative context.
+    ///
+    /// rank 2, one acquisition, keyed on the EXACT outgoing tid the caller authenticated — never an
+    /// ambient current-task lookup. Returns `false` if that tid has no TCB (fail closed).
+    pub(crate) fn capture_outgoing_user_context_split(
+        &self,
+        outgoing_tid: u64,
+        frame: &crate::kernel::trapframe::TrapFrame,
+    ) -> bool {
+        let captured = frame.capture_user_context();
+        self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == outgoing_tid) {
+                Some(tcb) => {
+                    tcb.user_context = captured;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// U9-QA — the authoritative queue advance, with NO broad lock.
+    ///
+    /// `outgoing_tid` is the exact task the caller has already published as no longer runnable
+    /// (blocked, preempted or faulted). The caller owns that publication; this owns the advance.
+    ///
+    /// Phases, monotonic and never nested:
+    ///
+    /// 1. **Lock-free refusals.** Arch support, trap drainer present, single dispatching CPU, stash
+    ///    empty. All four are the same conditions `can_stash_for_lock_drop` tests, evaluated before
+    ///    any mutation, so a refusal is always safe to follow with the broad path.
+    /// 2. **rank 1** — `dispatch_next_selection_on(cpu)`, the SAME selection the broad path uses.
+    ///    Released before anything else. No task selected → `TerminalIdle`; the same task →
+    ///    `ResumeSame`.
+    /// 3. **rank 2** — the incoming ASID.
+    /// 4. **LOCK-FREE** — address-space activation for the incoming task.
+    /// 5. **rank 2** — the switch plan, through the shared builder. If the incoming task vanished
+    ///    or either kernel context is uninitialized this fails closed with nothing stashed.
+    /// 6. **LOCK-FREE** — stash the plan for the arch apply.
+    ///
+    /// After step 6 returns `Switch`, fallback is forbidden: the plan is stashed and the caller
+    /// must drive the drain.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn queue_advance_split(
+        &self,
+        cpu: CpuId,
+        outgoing_tid: u64,
+    ) -> Result<QueueAdvanceOutcome, QueueAdvanceRefusal> {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+            return Err(QueueAdvanceRefusal::OutgoingIdentityStale);
+        }
+        // (1) Lock-free refusals — the `can_stash_for_lock_drop` conditions, before any mutation.
+        //
+        // RISC-V is refused because the Stage 117 stash gate itself opens with
+        // `!cfg!(target_arch = "riscv64")`: that architecture has never had an off-lock drain, so a
+        // stashed plan would have no consumer. Refusing here keeps RISC-V on its unchanged
+        // in-lock switch rather than inventing a second one.
+        if cfg!(target_arch = "riscv64") {
+            return Err(QueueAdvanceRefusal::ArchUnsupported);
+        }
+        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(QueueAdvanceRefusal::NoTrapDrainer);
+        }
+        // The SAME predicate `KernelState::dispatching_cpu_count` computes, read under rank 1.
+        let dispatching = self.with_scheduler_split_mut(|sched| {
+            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+            let online = s.online_cpu_bitmap();
+            (online & !s.wake_only_bitmap()).count_ones() as usize
+        });
+        if dispatching > 1 {
+            return Err(QueueAdvanceRefusal::MultiCpu);
+        }
+        if unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() } {
+            return Err(QueueAdvanceRefusal::StashOccupied);
+        }
+        // (2) rank 1: the SAME selection primitive the broad path calls, then released.
+        let selection = self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu)
+        });
+        let Some(incoming) = selection.tid().map(|t| t.0) else {
+            return Ok(QueueAdvanceOutcome::TerminalIdle);
+        };
+        if incoming == outgoing_tid {
+            return Ok(QueueAdvanceOutcome::ResumeSame);
+        }
+        // (3) rank 2: the incoming ASID.
+        let incoming_asid = self.task_asid_opt_split_read(incoming);
+        // (4) Lock-free: activate the incoming address space, exactly as `dispatch_next_task` does
+        // through `Hal::switch_address_space` — the same two free functions, no lock either way.
+        if let Some(asid) = incoming_asid {
+            crate::arch::hal_adapters::switch_address_space(asid);
+            crate::arch::hal::note_address_space_activated(cpu, asid);
+        }
+        // (5) rank 2: the switch plan, through the SINGLE shared builder.
+        let plan = self.with_task_tcbs_split_mut(|tcbs| {
+            build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming)
+        });
+        let plan = match plan {
+            Ok(Some(plan)) => plan,
+            // Same slot or an uninitialized kernel context: the broad path treats this as "no
+            // switch required" and resumes. Nothing was stashed.
+            Ok(None) => return Ok(QueueAdvanceOutcome::ResumeSame),
+            Err(_) => return Err(QueueAdvanceRefusal::IncomingUnavailable),
+        };
+        // (6) Lock-free: publish the plan for the arch apply. This is the point of no return.
+        unsafe {
+            crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan);
+        }
+        crate::yarm_log!(
+            "D6_GLOBAL_LOCK_DROP_PLAN_READY outgoing={} incoming={}",
+            outgoing_tid,
+            incoming
+        );
+        Ok(QueueAdvanceOutcome::Switch {
+            outgoing_tid,
+            incoming_tid: incoming,
+            incoming_asid,
+        })
     }
 }
