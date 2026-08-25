@@ -6630,6 +6630,33 @@ impl SharedKernel {
         self.with_fault_split_read(|faults| faults.supervisor_endpoint)
     }
 
+    /// U9-D3 §7 — rank 2, ONE acquisition: every live task's `(tid, stack_base, stack_top)`
+    /// copied BY VALUE, the split twin of the `with_tcbs` collection that opens
+    /// `KernelState::d6_ensure_post_cleanup_task_stacks_mapped`.
+    ///
+    /// Same bounded destination (`out.len()` is `D6_PROOF_MAX_TASKS` at the caller), same skip of
+    /// a task with no `stack_base`/`stack_top`, same silent stop once the array is full. Returns
+    /// the number of entries written. No TCB reference escapes the guard, so the caller's whole
+    /// page-table walk runs with rank 2 already released.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn d6_live_kernel_stacks_split(&self, out: &mut [(u64, usize, usize)]) -> usize {
+        let mut n = 0usize;
+        self.with_task_tcbs_split_mut(|tcbs| {
+            for tcb in tcbs.iter().flatten() {
+                let (Some(base), Some(top)) =
+                    (tcb.kernel_context.stack_base, tcb.kernel_context.stack_top)
+                else {
+                    continue;
+                };
+                if n < out.len() {
+                    out[n] = (tcb.tid.0, base.0 as usize, top.0 as usize);
+                    n += 1;
+                }
+            }
+        });
+        n
+    }
+
     pub fn task_asid_for_tid_split_read(&self, tid: u64) -> u64 {
         // Stage 4T+7 split-read: acquires task_state_lock (rank 2) only.
         // Does not acquire the outer SharedKernel lock. Does not mutate any state.
@@ -10745,13 +10772,13 @@ mod tests {
             1,
             "the authoritative transaction has ONE definition; U3 reuses it"
         );
-        // The two acquisitions that remain in the file are the canonical broad Phase-2 trap
-        // dispatch and the D6 proof cleanup tail, and neither was touched.
+        // U9-D3 §7 later retired the D6 proof cleanup tail too, so the ONE acquisition that
+        // remains in the file is the canonical broad Phase-2 trap dispatch — untouched here.
         let code = u3_code_lines(TRAP_ENTRY);
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            2,
-            "trap_entry.rs drops from 3 to 2 with_cpu callsites"
+            1,
+            "trap_entry.rs drops from 3 to 2 with this retirement, then to 1 with U9-D3 §7"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
         assert!(
@@ -10761,13 +10788,13 @@ mod tests {
             ),
             "the canonical broad Phase-2 trap dispatch is present and unchanged"
         );
-        // U9 (canonical 203C): the second acquisition kept its D3-fenced cleanup and LOST the
-        // production restore, which is now the off-lock split twin. The cleanup is what still
-        // makes the site broad, so it is the thing this assertion pins.
+        // U9 (canonical 203C) moved the production restore out of the second acquisition; U9-D3
+        // §7 then lifted the D3 fence and retired the acquisition itself. The CLEANUP is what this
+        // assertion pins, and it is preserved whole — only its lock shape changed.
         assert!(
-            code.contains("fn post_switch_restore_broad_tail(")
-                && code.contains("d6_ensure_post_cleanup_task_stacks_mapped"),
-            "the D6 cleanup tail and its D3-fenced stack repair are present and unchanged"
+            code.contains("fn post_switch_d6_cleanup_split(")
+                && code.contains("d6_ensure_post_cleanup_task_stacks_mapped_split"),
+            "the D6 cleanup and its stack repair are present, now off the broad lock"
         );
     }
 

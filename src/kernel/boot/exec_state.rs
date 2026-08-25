@@ -3795,12 +3795,95 @@ impl KernelState {
         }
     }
 
+    /// U9-D3 §7 — the broad-lock-free twin of [`Self::d6_emit_proof_cleanup_arch_markers`].
+    ///
+    /// Every effect is preserved, in the same order, reached through single-rank seams and
+    /// lock-free HAL primitives instead of a broad `&mut KernelState`:
+    ///
+    /// * `current_tid` — rank 1, read for the EXPLICIT `cpu` the drain is running on. That is the
+    ///   same value the broad form read, because `with_cpu(cpu, …)` bound `current_cpu` to `cpu`
+    ///   before the body ran, so its `self.current_tid()` was this CPU's current task.
+    /// * the active ASID — `arch::hal::active_address_space`, a per-CPU atomic. The broad form
+    ///   reached it via `self.hal.active_asid_on(..)`, which is that same function; no lock was
+    ///   ever involved.
+    /// * `task_asid` — rank 2.
+    /// * the CR3 force-restore — `hal_adapters::switch_address_space` plus
+    ///   `note_address_space_activated`, both free functions, exactly what `Hal::switch_address_space`
+    ///   does. It runs with NO lock held, which is where a CR3 write belongs.
+    ///
+    /// `d6_emit_proof_cleanup_arch_markers` is left unmodified as the foundation this mirrors.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_emit_proof_cleanup_arch_markers_split(
+        shared: &crate::runtime::SharedKernel,
+        cpu: CpuId,
+    ) {
+        let current_tid = shared.current_tid_split_read(cpu).unwrap_or(u64::MAX);
+        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK tid={}", current_tid);
+        let active_asid = crate::arch::hal::active_address_space(cpu).map_or(0, |asid| asid.0);
+        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CR3_OK asid={}", active_asid);
+        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_TSS_OK");
+        // Stage 139, unchanged: force-restore hardware CR3 to the current task's address space so
+        // subsequent ASID switches see a consistent starting state.
+        #[cfg(not(feature = "hosted-dev"))]
+        if let Some(task_asid) = shared.task_asid_opt_split_read(current_tid) {
+            let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+            crate::yarm_log!(
+                "D6_PROOF_CR3_CLEANUP_RESTORE hw_cr3=0x{:016x} task_asid={}",
+                hw_cr3,
+                task_asid.0
+            );
+            crate::arch::hal_adapters::switch_address_space(task_asid);
+            crate::arch::hal::note_address_space_activated(cpu, task_asid);
+            crate::yarm_log!("D6_PROOF_CR3_CLEANUP_OK");
+        }
+    }
+
+    /// U9-D3 §7 — the lock-free form of [`Self::d6_check_asid1_stack_page_mapped`].
+    ///
+    /// It takes no `self` because the broad form never used any: the body reads CR3 and walks the
+    /// page tables through the direct map, touching no kernel-state domain. Taking `&self` was the
+    /// only thing that made it look like it belonged inside the broad acquisition. Byte-identical
+    /// markers; the broad form is left unmodified as the foundation this mirrors.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_check_asid1_stack_page_mapped_split() {
+        const CHECK_PAGE: u64 = 0xffff_8000_0000_d000;
+        #[cfg(not(test))]
+        {
+            const VIRT_OFFSET: u64 = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
+            let pml4_phys = unsafe {
+                let mut cr3: u64;
+                core::arch::asm!(
+                    "mov {}, cr3",
+                    out(reg) cr3,
+                    options(nomem, preserves_flags)
+                );
+                cr3 & 0x000F_FFFF_FFFF_F000
+            };
+            crate::yarm_log!("D6_ASID1_PAGE_CHECK_CR3 phys=0x{:x}", pml4_phys);
+            let pte = unsafe { d6_x86_walk_4level(CHECK_PAGE, pml4_phys, VIRT_OFFSET) };
+            match pte {
+                Some(p) => crate::yarm_log!(
+                    "D6_ASID1_PAGE_CHECK_MAPPED present=yes pte=0x{:x} page=0x{:016x}",
+                    p,
+                    CHECK_PAGE
+                ),
+                None => crate::yarm_log!(
+                    "D6_ASID1_PAGE_CHECK_MAPPED present=no page=0x{:016x}",
+                    CHECK_PAGE
+                ),
+            }
+        }
+        #[cfg(test)]
+        let _ = CHECK_PAGE;
+    }
+
     /// Stage 133: software page-table walk to verify ASID 1 maps page 0xffff80000000d000.
     ///
     /// Reads the current CR3 (which at CLEANUP_DONE is TID1/ASID1's root) and walks
     /// the 4-level page table for the exact page that contained the observed
     /// CR2=0xffff80000000d9d8.  Emits D6_ASID1_PAGE_CHECK_* markers before CLEANUP_DONE.
     #[cfg(target_arch = "x86_64")]
+    #[allow(dead_code)]
     pub(crate) fn d6_check_asid1_stack_page_mapped(&self) {
         const CHECK_PAGE: u64 = 0xffff_8000_0000_d000;
         #[cfg(not(test))]

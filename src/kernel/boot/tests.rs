@@ -36741,47 +36741,59 @@ mod stage130_d6_proof_cleanup {
             .find("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN")
             .expect("Stage 130 CLEANUP_BEGIN marker");
         let end = TRAP_ENTRY_SRC[start..]
-            .find("post_switch_restore_broad_tail(")
+            .find("post_switch_d6_cleanup_split(")
             .map(|offset| start + offset)
-            .expect("the broad tail call that finishes the Stage 130 cleanup");
+            .expect("the cleanup call that finishes the Stage 130 block");
         &TRAP_ENTRY_SRC[start..end]
     }
 
-    /// U9 (canonical 203C): `CLEANUP_DONE` and the three arch-gated cleanup steps moved into
-    /// `post_switch_restore_broad_tail` together, and are still gated on `is_proof_done`.
-    /// Splitting them apart — emitting the marker outside the acquisition that performs the
-    /// repair — would let the smoke read DONE for a cleanup that never ran.
+    /// U9 (canonical 203C) put `CLEANUP_DONE` and the three arch-gated cleanup steps into ONE
+    /// function so the marker could not be emitted for a cleanup that never ran. U9-D3 §7 kept
+    /// exactly that property while retiring the broad acquisition: the same function is now
+    /// `post_switch_d6_cleanup_split`, it still owns all four, and it is still the only thing the
+    /// `is_proof_done` branch calls. What changed is the lock shape, not the grouping.
     #[test]
-    fn stage130_cleanup_done_is_emitted_by_the_retained_broad_tail() {
+    fn stage130_cleanup_done_is_emitted_by_the_one_cleanup_function() {
         let tail_start = TRAP_ENTRY_SRC
-            .find("fn post_switch_restore_broad_tail(")
-            .expect("the retained broad tail is a named function");
+            .find("fn post_switch_d6_cleanup_split(")
+            .expect("the cleanup is a named function");
         let tail_end = TRAP_ENTRY_SRC[tail_start..]
             .find("\npub fn handle_trap_entry_shared(")
             .map(|offset| tail_start + offset)
-            .expect("the tail ends before the shared trap entry");
+            .expect("it ends before the shared trap entry");
         let tail = &TRAP_ENTRY_SRC[tail_start..tail_end];
         assert!(
-            tail.contains(".with_cpu(cpu, |kernel| {"),
-            "the tail owns the acquisition"
-        );
-        assert!(
-            tail.contains("if is_proof_done {"),
-            "the cleanup is still gated on the proof having completed"
+            !tail.contains(".with_cpu("),
+            "the cleanup must own NO broad acquisition"
         );
         for step in [
-            "d6_emit_proof_cleanup_arch_markers",
-            "d6_check_asid1_stack_page_mapped",
-            "d6_ensure_post_cleanup_task_stacks_mapped",
+            "d6_emit_proof_cleanup_arch_markers_split",
+            "d6_check_asid1_stack_page_mapped_split",
+            "d6_ensure_post_cleanup_task_stacks_mapped_split",
             "D6_POST_CLEANUP_STACK_MAP_FAILED",
             "D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE",
             "D6_SWITCH_A_DONE",
         ] {
             assert!(
                 tail.contains(step),
-                "`{step}` must stay inside the acquisition that performs the cleanup"
+                "`{step}` must stay inside the one function that performs the cleanup"
             );
         }
+        // The gate itself is still `is_proof_done`, and it is still the sole caller.
+        let code: alloc::string::String = TRAP_ENTRY_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("if is_proof_done {\n                post_switch_d6_cleanup_split(shared, cpu, d6_switch_a_mode);"),
+            "the cleanup is still gated on the proof having completed, and nothing else calls it"
+        );
+        assert_eq!(
+            code.matches("post_switch_d6_cleanup_split(shared,").count(),
+            1,
+            "exactly one callsite"
+        );
     }
 
     // 1. Trampoline switch-back passes ctx.outgoing_stack_top — not None — so TSS
@@ -54839,10 +54851,12 @@ mod stage169_d2_send_genuine {
         // reacquisition onto `post_exit_replacement_restore_split`, and the AArch64 deferred
         // FutexWait no-incoming idle read onto the existing authoritative
         // `current_tid_authoritative`. Their classes and counters are untouched.
+        // U9-D3 §7: 2 -> 1. The D6 functional broad tail is retired (its D3 fence is lifted), so
+        // the ONE that remains here is the canonical terminal broad dispatcher.
         assert_eq!(
             src.matches(".with_cpu(").count(),
-            2,
-            "trap_entry.rs retains exactly two broad acquisitions"
+            1,
+            "trap_entry.rs retains exactly one broad acquisition — the terminal dispatcher"
         );
         assert!(
             src.contains("FUTEX_WAIT_DISPATCH_COUNT"),
@@ -99912,33 +99926,39 @@ mod stage200d0c1_aarch64_exit_prep {
         let code = code.join("\n");
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            2,
-            "trap_entry.rs is at 2 with_cpu callsites: this retirement took it 4 -> 3, and the \
-             U3 AArch64 FutexWait no-incoming idle retirement then took it 3 -> 2"
+            1,
+            "trap_entry.rs is at 1 with_cpu callsite: this retirement took it 4 -> 3, the U3 \
+             AArch64 FutexWait no-incoming idle retirement took it 3 -> 2, and U9-D3 §7 retired \
+             the D6 functional broad tail to take it 2 -> 1"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
     }
 
-    /// U3-3b. The D6 controlled-switch proof acquisition is EXCLUDED and byte-for-byte unchanged.
+    /// U3-3b. The D6 controlled-switch proof cleanup is preserved WHOLE, and its retirement was
+    /// earned rather than declared.
     ///
-    /// Its body does more than restore: it also runs the D6 proof cleanup, whose
-    /// `d6_ensure_post_cleanup_task_stacks_mapped` maps kernel stack pages into the active root
-    /// and into every live task root. That is cross-address-space page-table mutation, D3-fenced
-    /// by `AI_AGENT_RULES` §14.4, with no split form — so splitting the site into a narrow
-    /// restore plus a broad cleanup would leave a broad drain behind at census delta 0.
+    /// U3 excluded this site because the cleanup's `d6_ensure_post_cleanup_task_stacks_mapped`
+    /// maps kernel stack pages into the active root and into every live task root — a
+    /// cross-address-space page-table mutation that allocates rank-6 frames, D3-fenced by
+    /// `AI_AGENT_RULES` §14.4, with no split form at the time. Splitting the site then would have
+    /// left a broad drain behind at census delta 0.
+    ///
+    /// U9-D3 lifted that fence (0xF1 is the sole generation-matched ACK producer, proven live from
+    /// CPL0 and CPL3) and §7 then built the split form. This guard therefore now pins the two
+    /// things that matter: the acquisition is gone, and NOT ONE cleanup effect went with it.
     #[test]
-    fn u3_d6_proof_acquisition_is_excluded_and_unchanged() {
-        // U9 (canonical 203C): the exclusion still holds, and for exactly the reason recorded
-        // above — but it is now the ONLY thing left in the acquisition. The production restore
-        // moved out to the split twin, so an ordinary switch on x86_64 or AArch64 no longer enters
-        // this at all; the cleanup is what keeps the site broad, unchanged and D3-fenced.
+    fn u3_d6_proof_cleanup_is_preserved_whole_and_its_acquisition_is_retired() {
         assert!(
-            TRAP_ENTRY_SRC.contains("fn post_switch_restore_broad_tail("),
-            "the D6 cleanup keeps its own named broad acquisition"
+            !TRAP_ENTRY_SRC.contains("fn post_switch_restore_broad_tail("),
+            "the D6 broad tail is retired"
         );
         assert!(
-            TRAP_ENTRY_SRC.contains("if is_proof_done || cfg!(target_arch = \"riscv64\") {"),
-            "and it is entered only by the cleanup, or by the unreachable RISC-V restore"
+            TRAP_ENTRY_SRC.contains("fn post_switch_d6_cleanup_split("),
+            "…replaced by the named, lock-free cleanup"
+        );
+        assert!(
+            !TRAP_ENTRY_SRC.contains("if is_proof_done || cfg!(target_arch = \"riscv64\") {"),
+            "the RISC-V arm went with the tail; the drain is statically unreachable there"
         );
         for retained in [
             "d6_emit_proof_cleanup_arch_markers",
@@ -99948,17 +99968,26 @@ mod stage200d0c1_aarch64_exit_prep {
         ] {
             assert!(
                 TRAP_ENTRY_SRC.contains(retained),
-                "the D6 proof cleanup `{retained}` is untouched"
+                "the D6 proof cleanup `{retained}` is preserved"
             );
         }
-        // No split form of the cleanup was invented to justify a partial retirement.
+        // The broad body is KEPT as the foundation the split form is equivalent to — it was not
+        // rewritten in place, and the split is a second definition beside it, not a replacement
+        // that could drift silently.
         const THREAD_STATE_SRC: &str = include_str!("../../kernel/boot/thread_state.rs");
         assert_eq!(
             THREAD_STATE_SRC
-                .matches("fn d6_ensure_post_cleanup_task_stacks_mapped")
+                .matches("fn d6_ensure_post_cleanup_task_stacks_mapped(")
                 .count(),
             1,
-            "the D6 stack-mapping cleanup keeps its single broad-lock definition"
+            "the broad D6 stack-mapping cleanup keeps its single definition"
+        );
+        assert_eq!(
+            THREAD_STATE_SRC
+                .matches("fn d6_ensure_post_cleanup_task_stacks_mapped_split(")
+                .count(),
+            1,
+            "…and the split twin has exactly one definition, beside it"
         );
     }
 
@@ -122279,23 +122308,24 @@ mod u3_d6_first_resume_bind_transaction {
     }
 
     #[test]
-    fn u3_bind_real_d6_restore_acquisition_is_deliberately_retained() {
+    fn u3_bind_the_d6_site_is_untouched_by_this_cohort_and_is_now_lock_free() {
         let code = code_of(TRAP_ENTRY);
+        // U9-D3 §7: 2 -> 1. This cohort touched neither acquisition; the others were retired
+        // separately — by the U3 AArch64 exit-validation, exit replacement-restore and FutexWait
+        // no-incoming idle retirements, then by §7's split of the D6 functional tail. What remains
+        // is the canonical broad Phase-2 trap dispatch, a terminal dispatcher.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            2,
-            "trap_entry.rs holds two acquisitions — this cohort touches neither of them; the \
-             other three were retired separately by the U3 AArch64 exit-validation, exit \
-             replacement-restore and FutexWait no-incoming idle retirements. The two that \
-             remain are the canonical broad Phase-2 trap dispatch and this D6 proof restore"
+            1,
+            "trap_entry.rs holds one acquisition — the terminal dispatcher"
         );
-        // U9 (canonical 203C): the second acquisition is no longer a restore at all. The
-        // production restore left it for the split twin; what remains is the D6 cleanup, whose own
-        // D3 fence is why it stays broad. It is still NOT a no-op — it performs the cross-root
-        // stack repair — but it no longer needs the frame.
         assert!(
-            code.contains("fn post_switch_restore_broad_tail("),
-            "the retained acquisition is the named D6 cleanup tail"
+            !code.contains("fn post_switch_restore_broad_tail("),
+            "the D6 cleanup tail no longer holds an acquisition"
+        );
+        assert!(
+            code.contains("fn post_switch_d6_cleanup_split("),
+            "…it is the named, lock-free cleanup now"
         );
         assert!(
             code.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE"),
@@ -122305,7 +122335,7 @@ mod u3_d6_first_resume_bind_transaction {
             code.contains(
                 "post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut())"
             ),
-            "and the production restore that left it passes the live frame off-lock"
+            "and the production restore passes the live frame off-lock"
         );
     }
 }
@@ -137963,53 +137993,68 @@ mod u9_production_post_switch_restore {
         );
     }
 
-    // ── the retained acquisition, and the census ──────────────────────────────────────────
+    // ── the site's last acquisition, and the census ───────────────────────────────────────
 
-    /// The one broad acquisition left at this site is entered ONLY by the D6 cleanup or by the
-    /// statically-unreachable RISC-V restore. An ordinary production switch on x86_64 or AArch64
-    /// evaluates `is_proof_done == false` against a compile-time-false `cfg!` and acquires
-    /// nothing.
+    /// U9/203C left ONE broad acquisition at this site, entered only by the D6 cleanup or by the
+    /// statically-unreachable RISC-V restore. U9-D3 §7 retired it: the cleanup is split and the
+    /// unreachable RISC-V arm went with the tail. This guard pins the retirement AND the fact that
+    /// the unreachability argument is still true — it is what makes removing that arm sound.
     #[test]
-    fn u9_the_retained_acquisition_is_entered_only_by_d6_or_riscv() {
+    fn u9d3_the_last_acquisition_at_this_site_is_retired() {
         let code = code_of(TRAP_ENTRY);
         assert!(
-            code.contains("if is_proof_done || cfg!(target_arch = \"riscv64\") {"),
-            "the gate on the retained acquisition"
+            !code.contains("fn post_switch_restore_broad_tail("),
+            "the tail is gone"
         );
-        let tail = fn_body(TRAP_ENTRY, "fn post_switch_restore_broad_tail(");
+        assert!(
+            !code.contains("if is_proof_done || cfg!(target_arch = \"riscv64\") {"),
+            "…and so is the gate that entered it"
+        );
+        let cleanup = fn_body(TRAP_ENTRY, "fn post_switch_d6_cleanup_split(");
         assert_eq!(
-            tail.matches(".with_cpu(").count(),
-            1,
-            "the tail holds exactly one acquisition"
+            cleanup.matches(".with_cpu(").count(),
+            0,
+            "the split cleanup holds no acquisition"
         );
         assert!(
-            tail.contains("d6_ensure_post_cleanup_task_stacks_mapped"),
-            "the D3-fenced cleanup that keeps it broad is here"
+            cleanup.contains("d6_ensure_post_cleanup_task_stacks_mapped_split"),
+            "the once-D3-fenced cleanup is performed, through its split form"
         );
-        // The RISC-V arm is the only one that still restores in-lock, and it is the only arm whose
-        // stash gate can never fire — the two facts are stated together on purpose.
+        // The in-lock RISC-V restore was removed, not relocated — and the compile-time gate that
+        // made it unreachable is still there, which is why removing it weakened nothing.
         assert!(
-            tail.contains(
+            !code.contains(
                 "let result = post_switch_restore_arch_thread_state(kernel, cpu, frame);"
             ),
-            "only the unreachable RISC-V arm restores in-lock"
+            "no in-lock restore remains at this site"
         );
         assert!(
             code_of(EXEC_STATE)
                 .contains("!cfg!(target_arch = \"riscv64\") && self.online_cpu_count() <= 1"),
-            "and the gate that makes it unreachable is a compile-time `cfg!`"
+            "and the compile-time `cfg!` that makes the RISC-V drain unreachable is intact"
+        );
+        // The FOUNDATION the split twins are proven against is still defined on all three arches.
+        assert_eq!(
+            TRAP_ENTRY
+                .matches("pub(crate) fn post_switch_restore_arch_thread_state(")
+                .count(),
+            3,
+            "all three arch arms of the foundation remain"
         );
     }
 
-    /// CENSUS-DELTA 0 at this site: `trap_entry.rs` keeps exactly two broad acquisitions — the
-    /// canonical Phase-2 trap dispatch and the D6 cleanup tail. What changed is that an ordinary
-    /// switch no longer ENTERS the second one.
+    /// CENSUS-DELTA −1 at this site: `trap_entry.rs` now holds exactly ONE broad acquisition, the
+    /// canonical Phase-2 trap dispatch — a terminal dispatcher, out of scope for every pass.
     #[test]
-    fn u9_the_site_census_is_unchanged() {
+    fn u9d3_the_site_census_falls_to_the_terminal_dispatcher() {
         let code = code_of(TRAP_ENTRY);
-        assert_eq!(code.matches(".with_cpu(").count(), 2);
+        assert_eq!(code.matches(".with_cpu(").count(), 1);
         assert_eq!(code.matches(".with(|").count(), 0);
         assert_eq!(code.matches("state.lock()").count(), 0);
+        assert!(
+            code.contains("let inner_result = shared\n        .with_cpu(cpu, |kernel| {"),
+            "the survivor is the canonical broad Phase-2 trap dispatch, unchanged"
+        );
     }
 
     /// The callsite order is the retired order: restore first, cleanup second, and the restore's
@@ -138029,11 +138074,286 @@ mod u9_production_post_switch_restore {
             .find("post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut())")
             .expect("the split restore");
         let tail = drain
-            .find("post_switch_restore_broad_tail(")
-            .expect("the cleanup tail");
+            .find("post_switch_d6_cleanup_split(")
+            .expect("the split cleanup");
         let propagate = drain.find("restore_result?;").expect("the error lane");
         assert!(restore < tail, "the restore still runs first");
         assert!(tail < propagate, "the cleanup still runs before the error");
+    }
+}
+
+/// U9-D3 §7 — the FUNCTIONAL D6 cleanup leaves the broad lock.
+///
+/// `d6_ensure_post_cleanup_task_stacks_mapped` is a repair, not a diagnostic: it shares every live
+/// task's kernel-stack pages into the active root and into every task root, without which a
+/// post-cleanup trap faults on a supervisor stack write (Stage 165D/165F/165G). It was the last
+/// reason the Stage 117 switch-plan stash drain held a broad acquisition, and U3, U9/203C and the
+/// census guard all recorded the same blocker: it allocates rank-6 frames and maps them across
+/// address spaces, so a split form needs `with_memory_split_mut`, fenced by `AI_AGENT_RULES` §14.4
+/// until the lock-free ACK design landed. U9-D3 landed it.
+///
+/// The split body is `#[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]`,
+/// so it cannot be EXECUTED from a hosted test. These cases therefore prove what a hosted run
+/// can prove and no less: that the split body emits the SAME marker set as the broad body it
+/// mirrors (derived from both sources, not restated), that its phases are rank-ordered with
+/// nothing held across a page-table write, and that a frame whose mapping failed is returned
+/// rather than leaked. The executable evidence is the live x86_64 D6 profile, which hard-asserts
+/// `D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE` and `D6_SWITCH_A_DONE`.
+#[cfg(test)]
+mod u9d3_d6_cleanup_split {
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const THREAD_STATE: &str = include_str!("thread_state.rs");
+    const EXEC_STATE: &str = include_str!("exec_state.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        let cutoff = src.find("\n#[cfg(test)]\nmod tests {").unwrap_or(src.len());
+        src[..cutoff]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of `fn <name>` up to the next item at the same indentation.
+    fn fn_body(src: &str, name: &str) -> alloc::string::String {
+        let at = src
+            .find(name)
+            .unwrap_or_else(|| panic!("`{name}` must exist"));
+        let tail = &src[at..];
+        let end = tail
+            .find("\n    }\n")
+            .unwrap_or_else(|| panic!("`{name}` must close"));
+        code_of(&tail[..end])
+    }
+
+    /// Every `D6_*` marker literal in a body, in source order.
+    fn d6_markers(body: &str) -> alloc::vec::Vec<&str> {
+        let mut out = alloc::vec::Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find("\"D6_") {
+            let from = &rest[at + 1..];
+            let end = from.find('"').expect("a closed string literal");
+            out.push(&from[..end]);
+            rest = &from[end..];
+        }
+        out
+    }
+
+    /// **The load-bearing case.** The split repair emits exactly the broad repair's markers, in
+    /// exactly its order. Derived from both sources — a marker dropped, added or reordered in
+    /// either body fails here, so the smoke's `DONE`/`SKIP`/`FAILED` assertions keep meaning what
+    /// they meant.
+    #[test]
+    fn u9d3_the_split_repair_emits_the_broad_repairs_markers_in_order() {
+        let broad = fn_body(
+            THREAD_STATE,
+            "pub(crate) fn d6_ensure_post_cleanup_task_stacks_mapped(",
+        );
+        let split = fn_body(
+            THREAD_STATE,
+            "pub(crate) fn d6_ensure_post_cleanup_task_stacks_mapped_split(",
+        );
+        assert_eq!(
+            d6_markers(&split),
+            d6_markers(&broad),
+            "the split repair must emit the SAME D6 markers, in the same order, as the broad one"
+        );
+        assert!(
+            !d6_markers(&broad).is_empty(),
+            "…and the comparison must not be vacuous"
+        );
+        // The failure verdict is the same, so a caller cannot start treating a failed repair as a
+        // success.
+        assert!(
+            split.contains("if failures > 0 {")
+                && split.contains("return Err(KernelError::VmFull);"),
+            "the split repair keeps the broad `VmFull` verdict"
+        );
+    }
+
+    /// Rank order, and the property that actually makes the split safe: no domain lock is held
+    /// across a page-table write. The memory domain is entered ONLY by the two named rank-6
+    /// helpers, never inline in the walk.
+    #[test]
+    fn u9d3_no_lock_is_held_across_a_page_table_write() {
+        let split = fn_body(
+            THREAD_STATE,
+            "pub(crate) fn d6_ensure_post_cleanup_task_stacks_mapped_split(",
+        );
+        assert!(
+            split.contains("page_table::map_page("),
+            "the walk really does write page tables"
+        );
+        for held in [
+            "with_memory_split_mut",
+            "with_vm_user_spaces_split_mut",
+            "with_task_tcbs_split_mut",
+            "with_scheduler_split_mut",
+            ".with_cpu(",
+            "self.with(|",
+        ] {
+            assert!(
+                !split.contains(held),
+                "the walk must not open `{held}` itself — the rank-6 helpers own that, and they \
+                 return before any mapping"
+            );
+        }
+        // Phase order: lock-free active ASID -> rank 1 current TID -> rank 2 stacks by value ->
+        // per-task owner ASIDs -> the walk.
+        let order = [
+            "crate::arch::hal::active_address_space(cpu)",
+            "shared.current_tid_split_read(cpu)",
+            "shared.d6_live_kernel_stacks_split(&mut stacks)",
+            "shared.task_asid_opt_split_read(stacks[i].0)",
+            "page_table::resolve_page(",
+        ];
+        let mut last = 0usize;
+        for needle in order {
+            let at = split
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` must be present"));
+            assert!(at > last, "`{needle}` is out of phase order");
+            last = at;
+        }
+        // The rank-2 collection is ONE acquisition and copies by value; nothing borrows a TCB.
+        let collect = fn_body(
+            include_str!("../../runtime.rs"),
+            "pub(crate) fn d6_live_kernel_stacks_split(",
+        );
+        assert_eq!(
+            collect.matches("with_task_tcbs_split_mut").count(),
+            1,
+            "ONE rank-2 acquisition"
+        );
+        assert!(
+            collect.contains("out[n] = (tcb.tid.0, base.0 as usize, top.0 as usize);"),
+            "…and the payload leaves it by value"
+        );
+    }
+
+    /// Exact rollback of unused frames: every allocation whose mapping fails hands the frame back.
+    /// The broad body leaked such a frame, so this is strictly tighter — and it is only sound
+    /// because the mapping FAILED, which is why the helper says so in its own name.
+    #[test]
+    fn u9d3_a_frame_whose_mapping_failed_is_returned_not_leaked() {
+        let split = fn_body(
+            THREAD_STATE,
+            "pub(crate) fn d6_ensure_post_cleanup_task_stacks_mapped_split(",
+        );
+        let allocs = split
+            .matches("KernelState::alloc_user_data_frame_split(shared)")
+            .count();
+        let frees = split
+            .matches("KernelState::free_unmapped_user_data_frame_split(shared, p);")
+            .count();
+        assert_eq!(
+            allocs, 2,
+            "the owner and no-owner source arms each allocate"
+        );
+        assert_eq!(
+            frees, allocs,
+            "every allocation arm must return its frame when the mapping fails"
+        );
+        // Each free sits on the map_page Err arm, and each is followed by the same `failed` verdict
+        // the broad body produced — the observable outcome is unchanged.
+        for (idx, _) in split.match_indices("KernelState::free_unmapped_user_data_frame_split(") {
+            let before = &split[idx.saturating_sub(200)..idx];
+            assert!(
+                before.contains("Err(_) => {"),
+                "the return must be on the mapping's Err arm"
+            );
+            let after = &split[idx..core::cmp::min(idx + 120, split.len())];
+            assert!(
+                after.contains("source = \"failed\";"),
+                "…and the marker verdict must stay `failed`"
+            );
+        }
+        // No shootdown is owed, and none is attempted: the frame was never in a page table.
+        for forbidden in [
+            "complete_unmap_shootdown_split",
+            "smp_tlb_shootdown_cpus",
+            "invlpg",
+        ] {
+            assert!(
+                !split.contains(forbidden),
+                "the repair only ADDS mappings; it owes no shootdown (`{forbidden}`)"
+            );
+        }
+    }
+
+    /// The two marker/diagnostic steps are split too, and neither lost an effect. The ASID-1 page
+    /// check took `&self` while using no kernel state at all, which is what made it look like it
+    /// belonged inside the acquisition.
+    #[test]
+    fn u9d3_the_marker_steps_are_split_and_keep_every_effect() {
+        let broad = fn_body(
+            EXEC_STATE,
+            "pub(crate) fn d6_emit_proof_cleanup_arch_markers(",
+        );
+        let split = fn_body(
+            EXEC_STATE,
+            "pub(crate) fn d6_emit_proof_cleanup_arch_markers_split(",
+        );
+        assert_eq!(
+            d6_markers(&split),
+            d6_markers(&broad),
+            "the split marker step must emit the same D6 markers in the same order"
+        );
+        // The CR3 force-restore is preserved, through the same two free functions
+        // `Hal::switch_address_space` itself calls.
+        assert!(
+            split.contains("crate::arch::hal_adapters::switch_address_space(task_asid)")
+                && split.contains("crate::arch::hal::note_address_space_activated(cpu, task_asid)"),
+            "the Stage 139 CR3 force-restore is preserved, off-lock"
+        );
+        for held in ["with_memory_split_mut", ".with_cpu(", "self.with(|"] {
+            assert!(
+                !split.contains(held),
+                "no broad or memory acquisition: `{held}`"
+            );
+        }
+
+        let check_broad = fn_body(
+            EXEC_STATE,
+            "pub(crate) fn d6_check_asid1_stack_page_mapped(&self)",
+        );
+        let check_split = fn_body(
+            EXEC_STATE,
+            "pub(crate) fn d6_check_asid1_stack_page_mapped_split()",
+        );
+        assert_eq!(
+            d6_markers(&check_split),
+            d6_markers(&check_broad),
+            "the ASID-1 page check must emit the same markers"
+        );
+        assert!(
+            !check_split.contains("self."),
+            "…and it takes no `self`, because the broad form never used any"
+        );
+    }
+
+    /// CENSUS-DELTA −1. The site's acquisition is deleted, not relocated: `trap_entry.rs` keeps
+    /// only the terminal broad dispatcher, and nothing gained a broad acquisition to compensate.
+    #[test]
+    fn u9d3_the_cleanup_retirement_relocates_no_acquisition() {
+        assert_eq!(code_of(TRAP_ENTRY).matches(".with_cpu(").count(), 1);
+        for (name, src) in [
+            ("thread_state.rs", THREAD_STATE),
+            ("exec_state.rs", EXEC_STATE),
+            ("runtime.rs", include_str!("../../runtime.rs")),
+        ] {
+            let code = code_of(src);
+            assert_eq!(
+                code.matches(".with_cpu(").count(),
+                0,
+                "{name} must not have gained a broad acquisition"
+            );
+            assert_eq!(
+                code.matches("self.with(|").count(),
+                0,
+                "{name} must not have gained a broad `with` either"
+            );
+        }
     }
 }
 
