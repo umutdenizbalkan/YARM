@@ -855,90 +855,112 @@ impl KernelState {
 // 6. **notification destruction + waiter wake** — `destroy_notification` (rank 3) then
 //    `wake_destroyed_notification_waiter` (rank 2 → rank 1).
 //
-// Obligations (4) and (5) are the D3 fence. This section splits (1), (2), (3) and (6) into
-// separately rank-ordered phases and admits ONLY the object classes for which (4) and (5) are
-// provably vacuous, so nothing here can reach VM shootdown or memory reclaim. It lives in this
-// file — the owner of the broad function it mirrors — so the two cannot drift apart, and it
-// introduces no seam file and no marker family.
+// Obligations (4) and (5) used to be the D3 fence: until U9-D3 there was no lock-free way to
+// complete a cross-CPU TLB shootdown, so the composition admitted only the object classes for
+// which (4) and (5) are provably vacuous and left the memory-backed cohort to the broad path.
 //
-// # Why (4) and (5) are vacuous for the admitted classes — from source, not from the enum
+// # U9-D3 §6: (4) and (5) are now PERFORMED, not avoided
 //
-// (5) is direct: `adjust_memory_object_cap_refcount` (`memory_lifecycle_state.rs`) and
-// `reclaim_memory_object_if_unreferenced` (same file) both open with
-// `CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => id, _ => return`.
+// `AI_AGENT_RULES` §14.4 fenced `with_vm_split_mut` / `with_memory_split_mut` here "without the
+// lock-free `await_tlb_shootdown_ack` design and multi-CPU smoke". That design is delivered:
+// vector 0xF1 is the sole target-side invalidation and generation-matched ACK producer, earning
+// real ACKs from CPL0 and CPL3, and `SharedKernel::unmap_range_two_phase_split` drives it through
+// `complete_unmap_shootdown_split` with NO domain lock held. So this composition now covers EVERY
+// class the broad function covers except `Reply`, and it performs all six obligations:
 //
-// (4) is indirect, because `ActiveTransferMapping` (`defs.rs`) carries `{ owner_tid,
-// transfer_cap, base, len }` — **no object identity and no generation** — and
-// `revoke_active_transfer_mappings_for_cap` matches on the bare `CapId`. So the class alone does
-// not settle it; the registration and aliasing paths do:
+// * (4) `revoke_active_transfer_mappings_for_cap_split` — the registry scan, the real two-phase
+//   unmap with a REAL D3 completion, the record clear, both telemetry counters, the supervisor
+//   `SUPERVISOR_OP_TRANSFER_REVOKED` report, and the `YARM_TRANSFER_REVOKE` marker, in the broad
+//   function's exact order;
+// * (5) `memory_obligations_split` — `adjust_memory_object_cap_refcount_locked(-1)` then
+//   `reclaim_memory_object_if_unreferenced_locked`, both rank 6.
 //
-// * **Every** production `register_active_transfer_mapping{,_locked}` callsite is object-gated to
-//   `MemoryObject`/`DmaRegion` before it can register:
-//   - `syscall/ipc.rs` (recv-v2 `OPCODE_SHARED_MEM`) registers only after
-//     `map_shared_region_into_receiver` → `map_user_page_in_asid_with_caps` →
-//     `resolve_memory_object_phys`, which returns `WrongObject` for every other class;
-//   - `syscall/recv_shared_v3.rs` registers only after its `DmaRegion`/`MemoryObject` match arm
-//     produced `Some`; any other class takes the rollback-and-return arm first;
-//   - `shared_region_txn.rs` (`ctx_register_active_mapping`, and its `SharedKernel` twin
-//     `sr_register_active_mapping_split`) registers `txn.minted_cap`, minted from
-//     `txn.snapshot.object`, and `shared_region_phase_a` admits only
-//     `MemoryObject | DmaRegion` into that snapshot.
-// * A **stale** record cannot alias a later cap: `CapId` is `(generation << 16) | index`, and both
-//   `CapabilitySpace::revoke` and `delete_if_leaf` bump the slot generation as they clear it, so a
-//   re-minted slot never reproduces a retired `CapId` value.
-// * A record cannot outlive its owning process into a recycled TID: process teardown purges the
+// **Unmap before ACK before reclaim.** The frame is reclaimed only after every target CPU has
+// published `ack_gen == req_gen` for it. A shootdown that does not complete leaves the frame
+// UNAVAILABLE for reuse: `unmap_range_two_phase_split` skips its per-page reclaim, and this
+// composition skips the object-level reclaim too, so a refcount that reached zero without an ACK
+// never returns a frame to the allocator that a remote CPU may still translate. That is strictly
+// safer than leaking it back.
+//
+// `Reply` stays out on purpose: its teardown is the reply-registry transaction
+// (`fast_revoke_reply_cap_in_cnode` + `clear_reply_cap_waiter_cap`) owned by U9-C's
+// `rollback_reply_cap_split`, not a cnode revoke at all.
+//
+// # Why the callsites need no broad fallback
+//
+// The three ordinary rollback callsites revoke a cap minted moments earlier in the SAME syscall
+// and never handed to userspace. Nothing can have delegated it, and nothing can have mapped it:
+//
+// * a `delegated_capability_links` entry naming it cannot exist, because the only way to create
+//   one is a delegation of a cap userspace holds;
+// * a **stale** link or registry record cannot alias it either: `CapId` is
+//   `(generation << 16) | index`, and both `CapabilitySpace::revoke` and `delete_if_leaf` bump the
+//   slot generation as they clear it, so a re-minted slot never reproduces a retired `CapId`;
+// * a record cannot outlive its owning process into a recycled TID — process teardown purges the
 //   registry for the pid (`cnode_state.rs`, `purge_active_transfer_mappings_for_pid`, and the
 //   noalloc reap's inline equivalent).
 //
-// The composition still runs a **fail-closed** rank-3 preflight over the registry (Phase P4) and
-// refuses rather than proceeding if a record ever names an admitted cap. That branch is
-// unreachable by the proof above; it exists so the proof, not this code, is the thing that has to
-// stay true.
+// So at those callsites the delegated closure is EMPTY and the link-removal set is EMPTY, which
+// makes `DescendantOverflow` and `LinkOverflow` — the only two capacity refusals — unreachable.
+// The single reachable refusal there is `Unresolvable` (the slot is already gone), and the broad
+// `rollback_materialized_recv_cap` does exactly nothing in that case: it reads `None` from
+// `capability_for_cnode_local` and returns `false`. The broad fallback was therefore load-bearing
+// only for the memory-backed cohort, which this section now serves — so U9-D3 §6 deletes all
+// three broad acquisitions.
+//
+// Capacity refusals remain fail-closed rather than silent: the entry point emits the EXISTING
+// `CAP_CNODE_ROLLBACK_LEAK` marker — the same text the broad path emits when it cannot clear a
+// slot — so a future change that makes the closure non-empty is loud, not quiet.
 //
 // # Refusal is always safe
 //
-// Every refusal is raised BEFORE the first mutation, and every caller falls back to the unchanged
-// broad `rollback_materialized_recv_cap`. This composition therefore never narrows, filters or
-// skips an obligation: it either performs the complete teardown off the broad lock, or performs
-// nothing.
+// Every refusal is raised BEFORE the first mutation. This composition therefore never narrows,
+// filters or skips an obligation: it either performs the complete teardown off the broad lock, or
+// performs nothing.
 
 /// Bounded delegated-descendant closure. The rollback sites this serves revoke a cap that was
 /// minted moments earlier in the same syscall and never handed to userspace, so the closure is
-/// empty there; a larger closure refuses to the broad path rather than growing an allocation on
-/// the kernel stack (and rather than warming PT-pool slab pages — see Stage 181C).
+/// empty there; a larger closure refuses rather than growing an allocation on the kernel stack
+/// (and rather than warming PT-pool slab pages — see Stage 181C).
 pub(crate) const SPLIT_REVOKE_MAX_DESCENDANTS: usize = 16;
 
 /// Bounded per-node numeric `source_cap` candidates and bounded link-removal candidates.
 pub(crate) const SPLIT_REVOKE_MAX_LINK_HITS: usize = 32;
 
-/// Why the split composition declined a cap. Every variant means "the caller must use the
-/// unchanged broad path"; none of them is an error the caller should surface.
+/// Why the split composition declined a cap. Every variant is raised BEFORE the first mutation,
+/// so a refused cap is left exactly as it was; none of them is an error the caller should surface.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SplitRevokeRefusal {
-    /// `MemoryObject`/`DmaRegion`: teardown owes an active-transfer-mapping unmap + TLB shootdown
-    /// and a memory refcount drop + frame reclaim. D3-fenced.
-    MemoryBacked,
     /// `Reply`: teardown is the reply-registry transaction (`fast_revoke_reply_cap_in_cnode` +
-    /// `clear_reply_cap_waiter_cap`), owned by `rollback_reply_cap_split`, not by this one.
+    /// `clear_reply_cap_waiter_cap`), owned by U9-C's `rollback_reply_cap_split`, not by this one.
+    /// This is a ROUTING refusal, not a capacity one — the object is served, elsewhere.
     ReplyObject,
-    /// The task, its process cnode, or the cap slot could not be resolved.
+    /// The task, its process cnode, or the cap slot could not be resolved. Equivalent to what the
+    /// broad `rollback_materialized_recv_cap` does for the same input: nothing.
     Unresolvable,
-    /// More delegated descendants than the bounded closure holds.
+    /// More delegated descendants than the bounded closure holds. Unreachable at the three
+    /// production rollback callsites (see the section docs above); fail-closed if it ever fires.
     DescendantOverflow,
-    /// More delegation-link candidates than the bounded removal set holds.
+    /// More delegation-link candidates than the bounded removal set holds. Unreachable at the
+    /// three production rollback callsites; fail-closed if it ever fires.
     LinkOverflow,
-    /// An active transfer-mapping record names the root or a descendant. Unreachable for the
-    /// admitted classes (see the section docs above); fail-closed defence in depth.
-    ActiveMappingPresent,
 }
 
-/// The class gate. `Ok` iff this object owes NEITHER an active-transfer-mapping unmap (VM / TLB
-/// shootdown) NOR a memory-object refcount drop / frame reclaim, per the section docs above.
+impl SplitRevokeRefusal {
+    /// A CAPACITY refusal means the bounded working set could not hold this cap's closure, so the
+    /// teardown did not run and nothing else will run it. `Unresolvable` (already gone) and
+    /// `ReplyObject` (served by the U9-C transaction) are not capacity refusals.
+    pub(crate) fn is_capacity(self) -> bool {
+        matches!(self, Self::DescendantOverflow | Self::LinkOverflow)
+    }
+}
+
+/// The class gate. U9-D3 §6 admits every class the broad `revoke_capability_in_cnode` serves,
+/// including the memory-backed cohort — this composition now PERFORMS the active-transfer-mapping
+/// unmap (with a real, lock-free D3 completion) and the memory refcount drop + reclaim rather than
+/// avoiding them. Only `Reply` is routed elsewhere, to the U9-C reply transaction.
 pub(crate) fn split_revoke_class_admitted(object: CapObject) -> Result<(), SplitRevokeRefusal> {
     match object {
-        CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {
-            Err(SplitRevokeRefusal::MemoryBacked)
-        }
         CapObject::Reply { .. } => Err(SplitRevokeRefusal::ReplyObject),
         _ => Ok(()),
     }
@@ -1364,55 +1386,149 @@ impl crate::runtime::SharedKernel {
         Ok(())
     }
 
-    /// Preflight P4: the fail-closed active-transfer-mapping check. Unreachable for the admitted
-    /// classes (see the section docs above) — if it ever fires, the composition refuses to the
-    /// broad path rather than dropping obligation (4).
-    fn refuse_on_active_transfer_mapping_split(
+    // ── U9-D3 §6 obligations (4) and (5), off the broad lock ────────────────────────────────
+
+    /// rank 3 → (rank 2) → rank 1: the split twin of
+    /// `KernelState::report_transfer_revoke_to_supervisor`, itself
+    /// `send_message_to_endpoint_and_wake` specialised to `SUPERVISOR_OP_TRANSFER_REVOKED`.
+    ///
+    /// The lock ordering is the one that function's own doc comment mandates and is preserved
+    /// exactly: the message is enqueued under the IPC lock (rank 3) so it is visible before the
+    /// lock is released, the waiter is TAKEN under that same rank-3 acquisition, and the wake —
+    /// which reaches rank 2 then rank 1 — happens only after rank 3 is dropped.
+    ///
+    /// An absent supervisor endpoint is a silent `Ok(())`, exactly as in the broad form.
+    fn report_transfer_revoke_to_supervisor_split(
         &self,
-        plan: &SplitRevokePlan,
-    ) -> Result<(), SplitRevokeRefusal> {
-        let mut caps = [None::<CapId>; SPLIT_REVOKE_MAX_DESCENDANTS + 1];
-        caps[0] = Some(plan.root.cap);
-        let mut cap_len = 1usize;
-        for node in plan.descendant_slice().iter().flatten() {
-            caps[cap_len] = Some(node.cap);
-            cap_len += 1;
-        }
-        let mut hits = [None::<(u64, CapId)>; SPLIT_REVOKE_MAX_LINK_HITS];
-        let mut n = 0usize;
-        let overflow = self.with_ipc_split_mut(|ipc| {
-            for mapping in ipc.active_transfer_mappings.iter().flatten() {
-                if !caps[..cap_len]
-                    .iter()
-                    .flatten()
-                    .any(|cap| *cap == mapping.transfer_cap)
-                {
-                    continue;
-                }
-                if n >= hits.len() {
-                    return true;
-                }
-                hits[n] = Some((mapping.owner_tid.0, mapping.transfer_cap));
-                n += 1;
-            }
-            false
-        });
-        if overflow {
-            return Err(SplitRevokeRefusal::ActiveMappingPresent);
-        }
-        for (owner_tid, transfer_cap) in hits.iter().flatten().copied() {
-            let mapping_pid = self.process_id_split_read(owner_tid).unwrap_or(owner_tid);
-            let names_root = mapping_pid == plan.root.pid && transfer_cap == plan.root.cap;
-            let names_descendant = plan
-                .descendant_slice()
-                .iter()
-                .flatten()
-                .any(|node| node.pid == mapping_pid && node.cap == transfer_cap);
-            if names_root || names_descendant {
-                return Err(SplitRevokeRefusal::ActiveMappingPresent);
-            }
+        owner_pid: u64,
+        cap: u64,
+        base: u64,
+        len: u64,
+    ) -> Result<(), KernelError> {
+        use yarm_ipc_abi::supervisor_abi::{
+            SUPERVISOR_OP_TRANSFER_REVOKED, encode_transfer_revoked_event,
+        };
+        let Some(endpoint_idx) = self.supervisor_endpoint_split() else {
+            return Ok(());
+        };
+        let msg = crate::kernel::ipc::Message::with_header(
+            0,
+            SUPERVISOR_OP_TRANSFER_REVOKED,
+            0,
+            None,
+            &encode_transfer_revoked_event(owner_pid, cap, base, len),
+        )
+        .map_err(|_| KernelError::WrongObject)?;
+        // rank 3: enqueue, then take the waiter in the SAME acquisition.
+        let waiter = self.with_ipc_split_mut(|ipc| {
+            let Some(ep_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
+            else {
+                return Err(KernelError::WrongObject);
+            };
+            kernel_mut(ep_storage)
+                .send(msg)
+                .map_err(|_| KernelError::EndpointQueueFull)?;
+            Ok(ipc.take_endpoint_waiter(endpoint_idx))
+        })?;
+        // rank 3 released. rank 2 → rank 1: the wake, keyed by the waiter identity rank 3 returned.
+        if let Some(waiter) = waiter {
+            crate::yarm_log!("SCHED_WAKE tid={}", waiter.tid.0);
+            let cpu = self.current_cpu_split_read();
+            let _ = self.wake_tid_to_runnable_split(cpu, waiter.tid);
         }
         Ok(())
+    }
+
+    /// U9-D3 §6 — obligation (4), off the broad lock: the split twin of
+    /// `KernelState::revoke_active_transfer_mappings_for_cap`.
+    ///
+    /// Same registry scan over `MAX_TRANSFER_ENVELOPES`, same `(pid, cap)` match, same per-record
+    /// order — two-phase unmap, clear the slot, `note_shared_mem_released`,
+    /// `note_transfer_record_revoked`, supervisor report, `YARM_TRANSFER_REVOKE` — with each step
+    /// taken through its own single-rank seam and no two locks ever held at once.
+    ///
+    /// The unmap is the REAL one: `unmap_range_two_phase_split` removes each PTE under rank 5,
+    /// releases it, completes a generation-matched cross-CPU shootdown with NOTHING held, and only
+    /// then reclaims under rank 6. Returns `false` if any page's shootdown did not complete, which
+    /// tells the caller to skip the object-level reclaim as well — the frame stays unavailable for
+    /// reuse rather than being recycled while a remote CPU may still translate it.
+    ///
+    /// Like the broad form, the per-page reclaim inside the unmap is a no-op here because
+    /// `cap_refcount` is still 1: the caller drops it AFTER this returns.
+    fn revoke_active_transfer_mappings_for_cap_split(&self, owner_pid: u64, cap: CapId) -> bool {
+        let mut all_acked = true;
+        for idx in 0..MAX_TRANSFER_ENVELOPES {
+            // rank 3: one record.
+            let mapping = self.with_ipc_split_mut(|ipc| ipc.active_transfer_mappings[idx]);
+            let Some(mapping) = mapping else {
+                continue;
+            };
+            // rank 3 released. rank 2: confirm the owning process.
+            let mapping_pid = self
+                .process_id_split_read(mapping.owner_tid.0)
+                .unwrap_or(mapping.owner_tid.0);
+            if mapping_pid != owner_pid || mapping.transfer_cap != cap {
+                continue;
+            }
+            // rank 2: the owner's address space — `None` skips the unmap, exactly as the broad
+            // form's `if let Some(asid) = self.task_asid(..)` does.
+            if let Some(asid) = self.task_asid_opt_split_read(mapping.owner_tid.0) {
+                all_acked &=
+                    self.unmap_range_two_phase_split(asid, mapping.base.0 as usize, mapping.len);
+            }
+            // rank 3: retire the record, then both telemetry counters (same subsystem, one seam
+            // each — the broad form takes `with_ipc_state_mut` three times here too).
+            self.with_ipc_split_mut(|ipc| ipc.active_transfer_mappings[idx] = None);
+            self.with_ipc_split_mut(|ipc| {
+                ipc.telemetry.transfer_release_calls =
+                    ipc.telemetry.transfer_release_calls.saturating_add(1);
+                ipc.telemetry.shared_mem_bytes_released = ipc
+                    .telemetry
+                    .shared_mem_bytes_released
+                    .saturating_add(mapping.len as u64);
+            });
+            self.with_ipc_split_mut(|ipc| {
+                ipc.telemetry.transfer_records_revoked =
+                    ipc.telemetry.transfer_records_revoked.saturating_add(1);
+            });
+            let _ = self.report_transfer_revoke_to_supervisor_split(
+                owner_pid,
+                cap.0,
+                mapping.base.0,
+                mapping.len as u64,
+            );
+            crate::yarm_log!(
+                "YARM_TRANSFER_REVOKE owner_pid={} cap={} base=0x{:x} len={}",
+                owner_pid,
+                cap.0,
+                mapping.base.0,
+                mapping.len
+            );
+        }
+        all_acked
+    }
+
+    /// U9-D3 §6 — obligations (4) and (5) for ONE revoked node, in the broad function's exact
+    /// order: active-transfer-mapping revocation, then `cap_refcount--`, then the guarded reclaim.
+    ///
+    /// **Reclaim only after ACK.** The reclaim is skipped when the unmap's shootdown did not
+    /// complete, so a `cap_refcount` that reached zero without an acknowledgement leaves the frame
+    /// out of the allocator instead of handing it to the next allocation while a remote CPU may
+    /// still hold a translation. The refcount drop itself is NOT skipped — the capability really
+    /// is gone, and under-counting it would let a later drop free the frame early.
+    ///
+    /// A non-memory-backed object takes the `_ => return` arm inside both rank-6 helpers, so this
+    /// is exactly the no-op the broad path is for `Endpoint`, `Notification` and `Kernel`.
+    fn memory_obligations_split(&self, pid: u64, cap: CapId, object: CapObject) {
+        let acked = self.revoke_active_transfer_mappings_for_cap_split(pid, cap);
+        self.with_memory_split_mut(|memory| {
+            KernelState::adjust_memory_object_cap_refcount_locked(memory, object, -1)
+        });
+        if acked {
+            self.with_memory_split_mut(|memory| {
+                KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object)
+            });
+        }
     }
 
     /// Build the complete plan, or refuse. Makes NO mutation on any path.
@@ -1447,8 +1563,6 @@ impl crate::runtime::SharedKernel {
         self.collect_admitted_descendants_split(root, &mut plan)?;
         // P3: the exact link-removal set.
         self.collect_delegation_link_removals_split(&mut plan)?;
-        // P4: fail-closed transfer-mapping check.
-        self.refuse_on_active_transfer_mapping_split(&plan)?;
         Ok(plan)
     }
 
@@ -1458,18 +1572,20 @@ impl crate::runtime::SharedKernel {
     /// the broad `revoke_capability_in_cnode` performs it:
     ///
     /// 1. rank 4: revoke the root (the recursive in-cspace derivation revoke, unchanged);
-    /// 2. per descendant: rank 4 read-then-revoke in its own process cnode, then rank 3
-    ///    notification destroy, then rank 2 → rank 1 waiter wake — the same interleave
-    ///    `revoke_capability_direct_in_process_cnode` produces;
+    /// 2. per descendant: rank 4 read-then-revoke in its own process cnode, then its
+    ///    active-transfer-mapping revocation + memory refcount/reclaim, then rank 3 notification
+    ///    destroy, then rank 2 → rank 1 waiter wake — the same interleave
+    ///    `revoke_capability_direct_in_process_cnode` produces, in the same order;
     /// 3. rank 4: clear the delegation links naming the root or a descendant;
-    /// 4. rank 3 then rank 2 → rank 1: the root's notification destroy + waiter wake.
+    /// 4. the root's active-transfer-mapping revocation + memory refcount/reclaim;
+    /// 5. rank 3 then rank 2 → rank 1: the root's notification destroy + waiter wake.
     ///
-    /// Obligations (4) and (5) are absent because the admitted classes owe neither — proven in the
-    /// section docs above and re-checked fail-closed in the preflight. No two locks are ever held
-    /// at once.
+    /// U9-D3 §6 added steps (2b) and (4): obligations (4) and (5) are now PERFORMED, with a real
+    /// lock-free D3 completion, rather than being avoided by a class gate. No two locks are ever
+    /// held at once, and nothing is held while a shootdown is awaited.
     ///
-    /// `Ok(())` means the teardown completed; every `Err` is a refusal raised before any mutation,
-    /// and the caller must run the unchanged broad path instead.
+    /// `Ok(object)` means the teardown completed; every `Err` is a refusal raised before any
+    /// mutation, so a refused cap is left exactly as it was.
     pub(crate) fn revoke_capability_no_vm_split(
         &self,
         receiver_tid: u64,
@@ -1477,22 +1593,32 @@ impl crate::runtime::SharedKernel {
     ) -> Result<CapObject, SplitRevokeRefusal> {
         let plan = self.plan_revoke_capability_no_vm_split(receiver_tid, cap)?;
         // (1) rank 4: the root revoke. This is the first mutation; if the slot vanished between
-        // the preflight and here, nothing has changed yet and the caller falls back cleanly.
+        // the preflight and here, nothing has changed yet and the refusal is still clean.
         if self.cspace_revoke_split(plan.cnode, plan.root.cap).is_err() {
             return Err(SplitRevokeRefusal::Unresolvable);
         }
-        // (2) descendants, each complete before the next — the broad interleave.
+        // (2) descendants, each complete before the next — the broad interleave, including the
+        // per-descendant mapping revocation and memory obligations that
+        // `revoke_capability_direct_in_process_cnode` performs between the revoke and the
+        // notification destroy.
         for descendant in plan.descendant_slice().iter().flatten().copied() {
             let object = self
                 .process_cnode_for_pid_split(descendant.pid)
                 .and_then(|cnode| self.cspace_read_then_revoke_split(cnode, descendant.cap));
+            // The broad form revokes the descendant's transfer mappings whether or not its slot
+            // still held a capability, and performs the memory obligations only when it did.
             if let Some(object) = object {
+                self.memory_obligations_split(descendant.pid, descendant.cap, object);
                 self.destroy_notification_for_revoked_object_split(object);
+            } else {
+                self.revoke_active_transfer_mappings_for_cap_split(descendant.pid, descendant.cap);
             }
         }
         // (3) rank 4: delegation-link removal.
         self.clear_delegation_links_split(&plan.link_removals[..plan.link_removal_len]);
-        // (4) rank 3 then rank 2 → rank 1: the root's notification obligation.
+        // (4) the root's obligations (4) and (5), in the broad order: mappings, refcount, reclaim.
+        self.memory_obligations_split(plan.root.pid, plan.root.cap, plan.root_object);
+        // (5) rank 3 then rank 2 → rank 1: the root's notification obligation.
         self.destroy_notification_for_revoked_object_split(plan.root_object);
         Ok(plan.root_object)
     }
@@ -1500,20 +1626,35 @@ impl crate::runtime::SharedKernel {
     /// U9-F production entry point for the ordinary (non-`Reply`) recv-boundary rollback cohort:
     /// the split twin of `KernelState::rollback_materialized_recv_cap`'s transfer arm.
     ///
-    /// Returns `true` iff the complete teardown ran off the broad lock. `false` means the class or
-    /// the shape was refused and the caller MUST run the unchanged broad
-    /// `rollback_materialized_recv_cap`, whose effects stay fully intact.
+    /// Returns `true` iff the complete teardown ran off the broad lock.
+    ///
+    /// U9-D3 §6 retired the broad fallback at all three callsites, because the composition now
+    /// serves every class those sites can produce. What `false` means is therefore narrower than
+    /// it was, and each case is accounted for:
+    ///
+    /// * `Unresolvable` — the slot is already gone. The broad
+    ///   `rollback_materialized_recv_cap` did exactly nothing for this input too (its
+    ///   `capability_for_cnode_local` read is `None` and it returns `false`), so there is nothing
+    ///   left undone and nothing to log.
+    /// * `ReplyObject` — routed to U9-C's `rollback_reply_cap_split`, which owns the reply-registry
+    ///   transaction. Not reachable from these three sites, which carry ordinary objects.
+    /// * a CAPACITY refusal — unreachable at these sites (the section docs prove the closure is
+    ///   empty for a cap minted in the same syscall and never delegated), and fail-closed if a
+    ///   future change ever makes it reachable: it emits the EXISTING `CAP_CNODE_ROLLBACK_LEAK`
+    ///   marker, the same text the broad path emits when it cannot clear a slot.
     pub(crate) fn rollback_materialized_recv_cap_no_vm_split(
         &self,
         receiver_tid: u64,
         materialized_cap: CapId,
     ) -> bool {
-        if self
-            .revoke_capability_no_vm_split(receiver_tid, materialized_cap)
-            .is_err()
-        {
-            // Refused: emit NOTHING. The broad `rollback_materialized_recv_cap` the caller runs
-            // next emits this path's marker itself, so a refusal must not double-log it.
+        if let Err(refusal) = self.revoke_capability_no_vm_split(receiver_tid, materialized_cap) {
+            if refusal.is_capacity() {
+                crate::yarm_log!(
+                    "CAP_CNODE_ROLLBACK_LEAK tid={} slot={} kind=transfer",
+                    receiver_tid,
+                    materialized_cap.0
+                );
+            }
             return false;
         }
         // Byte-identical to the marker `rollback_materialized_recv_cap`'s transfer arm emits, so

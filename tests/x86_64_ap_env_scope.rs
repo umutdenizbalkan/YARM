@@ -406,20 +406,54 @@ fn early_ap_breadcrumb_ladder_still_uses_com1() {
     }
 }
 
-/// The AP dispatch and TLB-shootdown regions are untouched by this repair.
+/// The AP dispatch region is untouched by this repair.
+///
+/// U9-D3 §3 moved the TLB-shootdown half out of this file entirely: vector 0xF1's handler
+/// (`descriptor_tables.rs`) became the SOLE target-side invalidation and generation-matched ACK
+/// producer, so the trampoline's sched-idle mailbox service block — which read `tlb_req_gen`
+/// (gs:[128]), invalidated, and published `tlb_ack_gen` (gs:[132]) — was deleted rather than left
+/// as a second producer racing the handler. This guard therefore pins BOTH halves of that fact:
+/// the dispatch anchors still stand here, and the shootdown anchors now stand only in the handler.
 #[test]
-fn ap_dispatch_and_shootdown_regions_are_unchanged() {
+fn ap_dispatch_region_is_unchanged_and_shootdown_moved_to_the_sole_producer() {
     for anchor in [
         "\"call yarm_x86_ap_user_dispatch_entry\"",
-        "\"mov eax, dword ptr gs:[160]\"",  // ap_dispatch_request
-        "\"mov r10d, dword ptr gs:[128]\"", // tlb_req_gen
-        "\"mov dword ptr gs:[132], r10d\"", // tlb_ack_gen published
-        "\"invlpg [rax]\"",
+        "\"mov eax, dword ptr gs:[160]\"", // ap_dispatch_request
         "\"mov r8d, dword ptr gs:[108]\"", // remote_wake_count
     ] {
         assert!(
             TRAMPOLINE.contains(anchor),
             "must remain unchanged: {anchor}"
+        );
+    }
+    // Comment-aware: the retired design is still DESCRIBED in prose here, and prose must not be
+    // mistaken for a live second producer.
+    let code: String = TRAMPOLINE
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for retired in [
+        "mov r10d, dword ptr gs:[128]",
+        "mov dword ptr gs:[132], r10d",
+        "invlpg",
+    ] {
+        assert!(
+            !code.contains(retired),
+            "the trampoline must not service the TLB mailbox any more (`{retired}`); 0xF1 is the \
+             sole producer"
+        );
+    }
+    const IDT: &str = include_str!("../src/arch/x86_64/descriptor_tables.rs");
+    let idt_code: String = IDT
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for moved in ["invlpg [rdx]", "tlb_req_gen_off", "tlb_ack_gen_off"] {
+        assert!(
+            idt_code.contains(moved),
+            "the 0xF1 handler must own the shootdown work now: `{moved}`"
         );
     }
 }

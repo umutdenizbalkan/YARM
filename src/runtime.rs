@@ -3411,8 +3411,12 @@ impl SharedKernel {
     /// sender wake (through [`Self::apply_split_sender_wake_plan_split`]), and renamed it from
     /// `wake_blocked_waiter_split` to name the operation rather than the first caller: it is the
     /// single split form of `wake_tid_to_runnable`, and there is exactly one body.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn wake_tid_to_runnable_split(
+    ///
+    /// U9-D3 (§6) gave it a third production caller — the split
+    /// `report_transfer_revoke_to_supervisor_split` endpoint wake, which is the exact split twin
+    /// of `wake_waiter_for_endpoint`'s `wake_tid_to_runnable`. It is `pub(crate)` for that caller;
+    /// there is still exactly one body.
+    pub(crate) fn wake_tid_to_runnable_split(
         &self,
         cpu: CpuId,
         tid: crate::kernel::ipc::ThreadId,
@@ -5210,27 +5214,29 @@ impl SharedKernel {
         };
         use crate::kernel::syscall::SyscallError;
 
-        // Phase C helper: §58 cap rollback under a brief global re-entry. The
+        // Phase C helper: §58 cap rollback, now entirely off the broad lock. The
         // seam copy has already completed (or failed) — no seam call happens
         // inside this closure.
         let rollback_cap = |shared: &Self, frame: &mut TrapFrame| {
             if let Some(cap_id) = pending.materialized_cap {
                 // U9-C — REPLY caps roll back through the exact ordered transaction, off the
                 // broad lock: rank 4 validate-the-same-object-and-generation + revoke, then
-                // rank 3 clear that record's alias. A Reply object owes none of the ordinary
-                // teardown obligations, which is why this arm can be retired while the
-                // ordinary ones cannot.
+                // rank 3 clear that record's alias. A Reply object's teardown is the
+                // reply-registry transaction, not a cnode revoke, which is why it is routed
+                // here rather than through the ordinary composition.
                 //
-                // U9-F — every OTHER object class first offers the teardown to the phased
-                // split composition, which ACCEPTS only the classes that provably owe neither
-                // an active-transfer-mapping unmap (VM/TLB shootdown) nor a memory-object
-                // refcount drop + frame reclaim, and performs their COMPLETE teardown —
-                // cross-CNode descendant revocation, delegation-link removal, the recursive
-                // in-cspace revoke, and notification destroy + waiter wake — off the broad
-                // lock. On any refusal the unchanged broad `rollback_materialized_recv_cap`
-                // runs instead, with its full effects intact. Nothing is ever narrowed,
-                // filtered or skipped: the split either does all of it or none of it, so the
-                // memory-backed cohort stays D3-fenced and this callsite stays counted.
+                // U9-D3 §6 — every OTHER object class goes to the phased split composition,
+                // which now serves the memory-backed cohort too: it performs the COMPLETE
+                // teardown — cross-CNode descendant revocation, delegation-link removal, the
+                // recursive in-cspace revoke, the active-transfer-mapping unmap with a REAL
+                // generation-matched TLB shootdown, the memory refcount drop, the
+                // reclaim-only-after-ACK, and notification destroy + waiter wake — with no
+                // broad lock and nothing held while a shootdown is awaited.
+                //
+                // The broad `with_cpu` fallback that used to stand here is RETIRED. It was
+                // load-bearing only for the memory-backed cohort; the only refusal this site
+                // can still produce is `Unresolvable`, for which the broad path did nothing
+                // either. Nothing is narrowed, filtered or skipped.
                 if let Some((reply_index, reply_generation)) = pending.reply_record {
                     let _ = shared.rollback_reply_cap_split(
                         pending.receiver_tid,
@@ -5238,17 +5244,11 @@ impl SharedKernel {
                         reply_index,
                         reply_generation,
                     );
-                } else if !shared.rollback_materialized_recv_cap_no_vm_split(
-                    pending.receiver_tid,
-                    crate::kernel::capabilities::CapId(cap_id),
-                ) {
-                    let _ = shared.with_cpu(cpu, |kernel| {
-                        kernel.rollback_materialized_recv_cap(
-                            pending.receiver_tid,
-                            crate::kernel::capabilities::CapId(cap_id),
-                            pending.is_reply_cap,
-                        );
-                    });
+                } else {
+                    let _ = shared.rollback_materialized_recv_cap_no_vm_split(
+                        pending.receiver_tid,
+                        crate::kernel::capabilities::CapId(cap_id),
+                    );
                 }
                 crate::kernel::syscall::recv_boundary_clear_transfer_cap_ret(frame);
                 true
@@ -5535,22 +5535,15 @@ impl SharedKernel {
         if crate::kernel::syscall::recv_boundary_encode_transfer_cap_ret(frame, Some(local_cap))
             .is_err()
         {
-            // Roll the just-minted cap back so nothing leaks, then fail. U9-F: offered to the
-            // phased split composition first (complete teardown off the broad lock for the
-            // classes that owe no VM shootdown and no memory reclaim); the unchanged broad
-            // rollback runs on refusal.
-            if !self.rollback_materialized_recv_cap_no_vm_split(
+            // Roll the just-minted cap back so nothing leaks, then fail. U9-D3 §6: the phased
+            // split composition performs the COMPLETE teardown off the broad lock for every class
+            // this site can produce — including the memory-backed cohort, whose
+            // active-transfer-mapping unmap now completes a real generation-matched TLB shootdown
+            // before any frame is reclaimed. The broad `with_cpu` fallback is retired.
+            let _ = self.rollback_materialized_recv_cap_no_vm_split(
                 pending.receiver_tid,
                 crate::kernel::capabilities::CapId(local_cap),
-            ) {
-                let _ = self.with_cpu(cpu, |kernel| {
-                    kernel.rollback_materialized_recv_cap(
-                        pending.receiver_tid,
-                        crate::kernel::capabilities::CapId(local_cap),
-                        false,
-                    );
-                });
-            }
+            );
             return Err(TrapHandleError::Syscall(SyscallError::Internal));
         }
 
@@ -6338,14 +6331,12 @@ impl SharedKernel {
                 )
                 .is_ok();
         if !copy_ok {
-            // U9-F: the phased split composition first (complete teardown off the broad lock for
-            // the classes that owe no VM shootdown and no memory reclaim); the unchanged broad
-            // rollback runs on refusal.
-            if !self.rollback_materialized_recv_cap_no_vm_split(snap.waiter_tid, CapId(local_cap)) {
-                let _ = self.with_cpu(cpu, |kernel| {
-                    kernel.rollback_materialized_recv_cap(snap.waiter_tid, CapId(local_cap), false);
-                });
-            }
+            // U9-D3 §6: the phased split composition performs the COMPLETE teardown off the broad
+            // lock for every class this site can produce — including the memory-backed cohort,
+            // whose active-transfer-mapping unmap now completes a real generation-matched TLB
+            // shootdown before any frame is reclaimed. The broad `with_cpu` fallback is retired.
+            let _ =
+                self.rollback_materialized_recv_cap_no_vm_split(snap.waiter_tid, CapId(local_cap));
             crate::yarm_log!(
                 "IPC_RECV_V2_ROLLBACK_OK site=blocked_ordinary_cap tid={} reply=false",
                 snap.waiter_tid
@@ -6618,6 +6609,26 @@ impl SharedKernel {
     // unchanged: it goes through `control_plane_set_process_cnode_slots_split_mut`. The
     // `KernelState` method of the same name (`kernel/boot/fault_state.rs`) is untouched;
     // the tests now reach it through `SharedKernel::with` in the test module below.
+
+    /// U9-D3 §6 — rank 2: the EXACT `Option<Asid>` the broad `KernelState::task_asid` returns.
+    ///
+    /// [`Self::task_asid_for_tid_split_read`] flattens "no task / no ASID" to `0`, which is
+    /// indistinguishable from the kernel ASID. The active-transfer-mapping revocation must skip
+    /// the unmap when the owner has no address space — exactly as the broad
+    /// `revoke_active_transfer_mappings_for_cap` does with its `if let Some(asid)` — so it needs
+    /// the distinction, not the flattened value.
+    pub(crate) fn task_asid_opt_split_read(&self, tid: u64) -> Option<crate::kernel::vm::Asid> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter().flatten().find(|tcb| tcb.tid.0 == tid)?.asid
+        })
+    }
+
+    /// U9-D3 §6 — the supervisor endpoint index, read through the fault seam only. The split twin
+    /// of the `with_fault_state(|faults| faults.supervisor_endpoint)` read that opens
+    /// `KernelState::report_transfer_revoke_to_supervisor`.
+    pub(crate) fn supervisor_endpoint_split(&self) -> Option<usize> {
+        self.with_fault_split_read(|faults| faults.supervisor_endpoint)
+    }
 
     pub fn task_asid_for_tid_split_read(&self, tid: u64) -> u64 {
         // Stage 4T+7 split-read: acquires task_state_lock (rank 2) only.
@@ -7590,16 +7601,22 @@ impl SharedKernel {
     /// the memory lock — never reclaiming before shootdown. Repeat calls are no-ops (pages already
     /// gone). On hosted single-CPU the shootdown target bitmap is 0 (no cross-CPU wait); during a
     /// shared-region rollback the object stays pinned, so the reclaim is a guarded no-op there.
+    ///
+    /// Returns `true` iff every page that was actually removed also completed its shootdown. A
+    /// `false` return means at least one frame was deliberately left unreclaimed, and the CALLER's
+    /// own reclaim obligation (if it has one) must be skipped for the same reason — see
+    /// [`Self::complete_unmap_shootdown_split`].
     pub(crate) fn unmap_range_two_phase_split(
         &self,
         asid: crate::kernel::vm::Asid,
         base: usize,
         len: usize,
-    ) {
+    ) -> bool {
         use crate::kernel::vm::{PAGE_SIZE, VirtAddr};
         if len == 0 {
-            return;
+            return true;
         }
+        let mut all_acked = true;
         let end = base.saturating_add(len);
         let mut va = base;
         while va < end {
@@ -7630,6 +7647,7 @@ impl SharedKernel {
                         KernelState::reclaim_memory_object_for_phys_locked(m, mapping.phys)
                     });
                 } else {
+                    all_acked = false;
                     // The EXISTING X86_TLB_SHOOTDOWN_FAIL text, spelled literally because the
                     // `tlb_shootdown` marker module is x86-only while this seam is arch-neutral.
                     // No new marker family.
@@ -7643,6 +7661,7 @@ impl SharedKernel {
             }
             va = va.saturating_add(PAGE_SIZE);
         }
+        all_acked
     }
 
     /// rank 2 → rank 1 (non-nested): wake a blocked receiver exactly once. Phase 1 (task lock) reads
@@ -9922,7 +9941,10 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
         self.0.sr_release_pin_split(object)
     }
     fn ctx_unmap_prefix(&mut self, asid: crate::kernel::vm::Asid, base: usize, len: usize) {
-        self.0.unmap_range_two_phase_split(asid, base, len)
+        // The shootdown-completion flag is discarded here on purpose: this is the shared-region
+        // ROLLBACK prefix-unmap, where the object stays pinned, so both the per-page reclaim and
+        // any object-level reclaim are guarded no-ops regardless of the ACK outcome.
+        let _ = self.0.unmap_range_two_phase_split(asid, base, len);
     }
     fn ctx_remove_active_mapping(&mut self, tid: u64, cap: CapId) -> bool {
         self.0.sr_remove_active_mapping_split(tid, cap)

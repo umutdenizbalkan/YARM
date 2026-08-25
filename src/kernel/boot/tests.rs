@@ -49393,18 +49393,17 @@ mod stage188a_dispatch_return_delivery_channel {
                 "executor must not touch IPC (`{forbidden}`)"
             );
         }
-        // The only with_cpu re-entry (Phase C) must call no seam.
-        let phase_c = code
-            .split("self.with_cpu(cpu, |kernel| {")
-            .nth(1)
-            .and_then(|r| r.split("});").next())
-            .expect("Phase C with_cpu closure");
-        for seam in ["copy_to_user_split", "materialize_received", "_split_mut"] {
-            assert!(
-                !phase_c.contains(seam),
-                "the Phase-C with_cpu closure must call no seam (`{seam}`)"
-            );
-        }
+        // U9-D3 §6: the Phase-C `with_cpu` re-entry this used to inspect was the ordinary cap
+        // rollback, and it is RETIRED — the executor now has no broad re-entry at all, which is a
+        // strictly stronger statement than "the one re-entry calls no seam". Re-derived onto that.
+        assert!(
+            !code.contains("self.with_cpu(") && !code.contains("self.with(|"),
+            "the executor must hold no broad acquisition of any kind"
+        );
+        assert!(
+            code.contains("rollback_materialized_recv_cap_no_vm_split("),
+            "…and its Phase-C rollback must go to the phased split composition"
+        );
     }
 
     // The drain runs AFTER with_cpu in the trap entry (post-boundary execution
@@ -63612,9 +63611,11 @@ mod stage193c_ipc_send_ordinary_cap {
     // the FAIL marker — the existing 188C ordinary-cap executor rollback, now surfaced.
     #[test]
     fn executor_rolls_back_on_copy_fault() {
+        // U9-D3 §6: the rollback is unchanged in effect but no longer broad — it goes to the
+        // phased split composition, which now serves the memory-backed cohort too.
         assert!(
             RUNTIME_SRC.contains(
-                "rollback_materialized_recv_cap(snap.waiter_tid, CapId(local_cap), false)"
+                "rollback_materialized_recv_cap_no_vm_split(snap.waiter_tid, CapId(local_cap))"
             ) && RUNTIME_SRC.contains("IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL reason=user_copy"),
             "a user-copy fault must roll the minted cap back and emit the cap FAIL marker"
         );
@@ -123525,15 +123526,17 @@ mod u3_owner_revalidation_transaction {
 
     #[test]
     fn the_out_of_scope_broad_acquisitions_are_untouched() {
-        // The rollback family stopped at the previous increment, and the D6 restore/cleanup
-        // acquisition, must all still be broad — this increment converted none of them.
+        // This increment converted none of the rollback family. U9-D3 §6 later retired their
+        // broad acquisitions onto the phased split composition, so what this guard pins is the
+        // callsite COUNT — still three, still the same three operations — not their lock shape.
         let code = code_of(RUNTIME);
         assert!(
-            code.contains("rollback_materialized_recv_cap("),
-            "the queued-recv capability rollback stays exactly as it was"
+            code.contains("rollback_materialized_recv_cap_no_vm_split("),
+            "the queued-recv capability rollback stays exactly as it was, off the broad lock"
         );
         assert_eq!(
-            code.matches("rollback_materialized_recv_cap(").count(),
+            code.matches("rollback_materialized_recv_cap_no_vm_split(")
+                .count(),
             3,
             "all three legacy rollback call sites remain"
         );
@@ -123931,20 +123934,21 @@ mod u3_recv_copy_fault_completion {
             !body.contains("self.with(|") && !body.contains("|kernel| {\n                        crate::kernel::syscall::recv_boundary_record_user_fault"),
             "no broad `with`, no fallback"
         );
-        // EXACTLY one `with_cpu` survives in the method: the dependency-blocked capability
-        // rollback. Not zero (that would mean the rollback was touched), not two.
+        // At this increment exactly one `with_cpu` survived in the method — the then
+        // dependency-blocked capability rollback. U9-D3 §6 lifted that dependency (real
+        // generation-matched D3 completion) and retired it too, so the method now holds ZERO
+        // broad acquisitions and the rollback runs through the phased split composition. The
+        // rollback itself is still here: the guard's point is that it was never dropped.
         assert_eq!(
             body.matches(".with_cpu(").count(),
-            1,
-            "only the capability-rollback re-entry may remain"
+            0,
+            "no broad re-entry may remain in the method"
         );
-        let remaining = body
-            .split(".with_cpu(")
-            .nth(1)
-            .expect("the surviving acquisition");
-        assert!(
-            remaining.contains("rollback_materialized_recv_cap("),
-            "the surviving acquisition must be the capability rollback, unchanged"
+        assert_eq!(
+            body.matches("rollback_materialized_recv_cap_no_vm_split(")
+                .count(),
+            1,
+            "the capability rollback is still performed, through the split composition"
         );
         // The shared transaction is used by BOTH arms.
         assert_eq!(
@@ -123988,17 +123992,20 @@ mod u3_recv_copy_fault_completion {
 
     #[test]
     fn the_dependency_blocked_and_deferred_acquisitions_all_remain() {
+        // U9-D3 §6 lifted the D3 dependency and retired these three broad acquisitions; the three
+        // rollback OPERATIONS remain, unnarrowed, on the phased split composition.
         let code = code_of(RUNTIME);
         assert_eq!(
-            code.matches("rollback_materialized_recv_cap(").count(),
+            code.matches("rollback_materialized_recv_cap_no_vm_split(")
+                .count(),
             3,
-            "all three dependency-blocked capability-rollback callsites remain"
+            "all three capability-rollback callsites remain"
         );
-        // The deferred ordinary-cap sender-wake acquisition is untouched.
+        // The deferred ordinary-cap sender wake is still performed, now through its split form.
         let ordinary = body_of("fn complete_recv_boundary_ordinary_cap");
         assert!(
-            ordinary.contains(".with_cpu("),
-            "the ordinary-cap acquisition set is not part of this increment"
+            ordinary.contains("apply_split_sender_wake_plan_split(cpu, wake_tid)"),
+            "the ordinary-cap sender wake is not part of this increment"
         );
     }
 
@@ -124430,16 +124437,19 @@ mod u3_riscv_terminal_idle_snapshot {
 
     #[test]
     fn the_out_of_scope_runtime_acquisitions_are_unchanged() {
+        // Re-derived for U9-D3 §6, which retired the three broad rollback acquisitions: what is
+        // pinned is that this drain touched none of those callsites, not their lock shape.
         let code = code_of(RUNTIME);
         assert_eq!(
-            code.matches("rollback_materialized_recv_cap(").count(),
+            code.matches("rollback_materialized_recv_cap_no_vm_split(")
+                .count(),
             3,
-            "the dependency-blocked capability-rollback callsites are untouched"
+            "the capability-rollback callsites are untouched by this drain"
         );
         let ordinary = body_of(RUNTIME, "fn complete_recv_boundary_ordinary_cap");
         assert!(
-            ordinary.contains(".with_cpu("),
-            "the deferred ordinary-cap sender-wake acquisition remains"
+            ordinary.contains("apply_split_sender_wake_plan_split(cpu, wake_tid)"),
+            "the deferred ordinary-cap sender wake remains"
         );
     }
 
@@ -124899,17 +124909,19 @@ mod u3_ordinary_cap_sender_wake {
             1,
             "the target calls the split composition exactly once"
         );
-        // EXACTLY one `with_cpu` remains in the method: the encode-failure capability rollback,
-        // which is dependency-blocked and out of scope.
+        // At this increment exactly one `with_cpu` remained — the encode-failure capability
+        // rollback, then dependency-blocked. U9-D3 §6 retired it too, so the method now holds ZERO
+        // broad acquisitions while still performing that rollback through the split composition.
         assert_eq!(
             body.matches(".with_cpu(").count(),
-            1,
-            "only the encode-failure capability rollback may remain"
+            0,
+            "no broad acquisition may remain in the method"
         );
-        let remaining = body.split(".with_cpu(").nth(1).expect("the survivor");
-        assert!(
-            remaining.contains("rollback_materialized_recv_cap("),
-            "the survivor must be the capability rollback, unchanged"
+        assert_eq!(
+            body.matches("rollback_materialized_recv_cap_no_vm_split(")
+                .count(),
+            1,
+            "the encode-failure rollback is still performed, through the split composition"
         );
         // materialize < encode < wake < writeback.
         let mint = body
@@ -125002,10 +125014,13 @@ mod u3_ordinary_cap_sender_wake {
     #[test]
     fn the_out_of_scope_acquisitions_all_remain() {
         let code = code_of(RUNTIME);
+        // U9-D3 §6 retired their broad acquisitions; the three rollback callsites themselves
+        // remain, unnarrowed, on the phased split composition.
         assert_eq!(
-            code.matches("rollback_materialized_recv_cap(").count(),
+            code.matches("rollback_materialized_recv_cap_no_vm_split(")
+                .count(),
             3,
-            "the three dependency-blocked capability-rollback callsites remain"
+            "the three capability-rollback callsites remain"
         );
         // The queued-receive Phase-A broad acquisition.
         assert!(
@@ -135398,10 +135413,13 @@ mod u9c_reply_cap_ordered_transaction {
     #[test]
     fn the_phase_a_broad_acquisition_is_gone() {
         let code = code_of(RUNTIME);
+        // U9-C left three (the ordinary rollback acquisitions); U9-D3 §6 retired those too, so
+        // runtime.rs now holds NO production broad acquisition of any kind. The point of this
+        // guard is unchanged: the census moved by deletion, never by relaxation.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            3,
-            "runtime.rs holds exactly the three ordinary rollback acquisitions"
+            0,
+            "runtime.rs holds no production `with_cpu` acquisition"
         );
         assert_eq!(
             code.matches(".with(|").count(),
@@ -135609,10 +135627,15 @@ mod u9c_reply_cap_ordered_transaction {
 
     // ── (4) SEPARATION — the ordinary classes are untouched. This is the load-bearing one. ──
 
-    /// Only the Reply class is diverted. Every other object keeps the unchanged broad rollback,
-    /// with its full teardown effects. Narrowing this would be the "reply-only approximation"
-    /// the U9-B stop explicitly forbade, and it would silently drop TLB shootdowns and memory
-    /// reclaim for MemoryObject/DmaRegion/Notification transfers.
+    /// Only the Reply class is diverted, and every other object still gets the COMPLETE ordinary
+    /// teardown. Narrowing this would be the "reply-only approximation" the U9-B stop explicitly
+    /// forbade, and it would silently drop TLB shootdowns and memory reclaim for
+    /// MemoryObject/DmaRegion/Notification transfers.
+    ///
+    /// U9-D3 §6 re-derived the second half: the ordinary arm no longer falls back to a broad
+    /// acquisition, because the phased split composition now performs those very obligations —
+    /// the active-transfer-mapping unmap with a real generation-matched shootdown, the memory
+    /// refcount drop, and a reclaim that happens only after every target acknowledged.
     #[test]
     fn only_reply_is_diverted_and_ordinary_rollback_keeps_every_effect() {
         let body = body_of(
@@ -135623,28 +135646,29 @@ mod u9c_reply_cap_ordered_transaction {
         let reply_arm = body
             .find("if let Some((reply_index, reply_generation)) = pending.reply_record")
             .expect("the Reply class must be selected by its RECORD identity");
-        // U9-F: the non-Reply arm is `else if !<split offer>` — the broad rollback runs exactly
-        // when the split composition refused, never instead of it.
         let else_arm = body[reply_arm..]
-            .find("} else if !shared.rollback_materialized_recv_cap_no_vm_split(")
-            .expect(
-                "every other class must be offered to the U9-F split composition, negated so the \
-                 broad path runs on refusal",
-            );
+            .find("} else {\n                    let _ = shared.rollback_materialized_recv_cap_no_vm_split(")
+            .expect("every other class must go to the phased split composition, unconditionally");
         let tail = &body[reply_arm + else_arm..];
         assert!(
-            tail.contains("kernel.rollback_materialized_recv_cap("),
-            "non-Reply objects must still reach the unchanged broad rollback"
+            !tail.contains("kernel.rollback_materialized_recv_cap(")
+                && !tail.contains("shared.with_cpu(cpu, |kernel|"),
+            "the broad fallback is retired — the composition performs the whole teardown"
         );
-        assert!(
-            tail.contains("shared.with_cpu(cpu, |kernel|"),
-            "…including its broad acquisition, which remains counted in the census"
-        );
-        assert!(
-            tail.find("rollback_materialized_recv_cap_no_vm_split(")
-                < tail.find("shared.with_cpu(cpu, |kernel|"),
-            "the split is OFFERED first; the broad acquisition is the fallback, not the reverse"
-        );
+        // …and the composition really does owe and perform the memory-backed obligations.
+        let split = code_of(include_str!("capability_lifecycle_state.rs"));
+        for effect in [
+            "fn revoke_active_transfer_mappings_for_cap_split(",
+            "unmap_range_two_phase_split(",
+            "adjust_memory_object_cap_refcount_locked(",
+            "reclaim_memory_object_if_unreferenced_locked(",
+            "report_transfer_revoke_to_supervisor_split(",
+        ] {
+            assert!(
+                split.contains(effect),
+                "the ordinary teardown must still perform `{effect}`"
+            );
+        }
     }
 
     /// The ordinary teardown body is untouched: every effect the U9-B stop enumerated is still
@@ -135673,15 +135697,17 @@ mod u9c_reply_cap_ordered_transaction {
         }
     }
 
-    /// The three ordinary rollback callsites all remain — the census says 6, not 3.
+    /// The three ordinary rollback callsites all remain. U9-C retired none of them; U9-D3 §6
+    /// later moved all three off the broad lock without removing a single callsite, taking the
+    /// census 6 -> 3.
     #[test]
     fn all_three_ordinary_rollback_callsites_remain() {
         let code = code_of(RUNTIME);
         assert_eq!(
-            code.matches("kernel.rollback_materialized_recv_cap(")
+            code.matches("rollback_materialized_recv_cap_no_vm_split(")
                 .count(),
             3,
-            "all three broad rollback callers must remain; U9-C retires none of them"
+            "all three ordinary rollback callers must remain; U9-C retires none of them"
         );
     }
 
@@ -135800,19 +135826,26 @@ mod u9c_reply_cap_ordered_transaction {
     }
 }
 
-/// U9-F — THE PHASED SPLIT OF `revoke_capability_in_cnode`, AND ITS CLASS ADMISSION.
+/// U9-F / U9-D3 §6 — THE PHASED SPLIT OF `revoke_capability_in_cnode`, AND ITS CLASS ADMISSION.
 ///
 /// `revoke_capability_in_cnode` owes six obligations under one broad acquisition. Two of them —
 /// active-transfer-mapping unmap (TLB shootdown) and memory-object refcount drop + frame reclaim —
-/// are the D3 fence. U9-F splits the other four (cross-CNode descendant revocation,
+/// were the D3 fence. U9-F split the other four (cross-CNode descendant revocation,
 /// delegation-link removal, the recursive in-cspace revoke, and notification destruction +
-/// waiter wake) into separately rank-ordered phases, and admits only the classes for which the
-/// two fenced obligations are provably vacuous.
+/// waiter wake) and admitted only the classes for which the two fenced obligations were provably
+/// vacuous.
+///
+/// **U9-D3 §6 lifted the fence.** Vector 0xF1 is now the sole target-side invalidation and
+/// generation-matched ACK producer, earning real ACKs from CPL0 and CPL3, so
+/// `unmap_range_two_phase_split` completes a real cross-CPU shootdown with nothing held. The
+/// composition therefore PERFORMS all six obligations and serves the memory-backed cohort too;
+/// only `Reply` is routed away, to the U9-C transaction. All three ordinary rollback callsites
+/// dropped their broad fallback with it — census 6 -> 3.
 ///
 /// The tests below are in three halves. The behavioural half proves the split path produces the
-/// SAME observable end state as the broad path it stands in for. The structural half pins the
-/// properties that make the admission sound — above all that the memory-backed cohort is REFUSED
-/// rather than served, that no seam file or marker family exists, and that every refusal happens
+/// SAME observable end state as the broad path it replaces — for the memory-backed cohort that is
+/// a twin-kernel equivalence, not a restatement. The structural half pins the properties that make
+/// the admission sound — that no seam file or marker family exists, and that every refusal happens
 /// before the first mutation. The third pins that Notification is production-UNREACHABLE at this
 /// revision, which is what makes hosted-only Notification evidence acceptable.
 mod u9f_split_capability_revocation {
@@ -136284,11 +136317,12 @@ mod u9f_split_capability_revocation {
 
     // ── (2) BEHAVIOUR: the fenced classes are REFUSED, not served ───────────────────────────
 
-    /// The class gate is the load-bearing one: a memory-backed object owes an
-    /// active-transfer-mapping unmap and a frame reclaim that this composition does not perform,
-    /// so it is refused rather than half-torn-down.
+    /// U9-D3 §6 inverted this guard. The D3 fence is lifted, so the class gate now ADMITS the
+    /// memory-backed cohort — the composition performs the active-transfer-mapping unmap and the
+    /// memory refcount/reclaim rather than avoiding them. `Reply` is the only routed-away class,
+    /// and it is routed, not dropped: U9-C's `rollback_reply_cap_split` owns it.
     #[test]
-    fn u9f_memory_backed_classes_are_refused_by_the_class_gate() {
+    fn u9d3_memory_backed_classes_are_admitted_by_the_class_gate() {
         for object in [
             CapObject::MemoryObject { id: 7 },
             CapObject::DmaRegion {
@@ -136299,8 +136333,8 @@ mod u9f_split_capability_revocation {
         ] {
             assert_eq!(
                 split_revoke_class_admitted(object),
-                Err(SplitRevokeRefusal::MemoryBacked),
-                "{object:?} owes VM shootdown and memory reclaim; it must be refused"
+                Ok(()),
+                "{object:?} is served by the composition now that D3 completion is real"
             );
         }
         assert_eq!(
@@ -136311,6 +136345,23 @@ mod u9f_split_capability_revocation {
             Err(SplitRevokeRefusal::ReplyObject),
             "Reply teardown belongs to the U9-C reply transaction, not to this one"
         );
+        assert!(
+            !SplitRevokeRefusal::ReplyObject.is_capacity(),
+            "routing a Reply elsewhere is not a capacity failure"
+        );
+        assert!(
+            !SplitRevokeRefusal::Unresolvable.is_capacity(),
+            "an already-gone slot is not a capacity failure"
+        );
+        for capacity in [
+            SplitRevokeRefusal::DescendantOverflow,
+            SplitRevokeRefusal::LinkOverflow,
+        ] {
+            assert!(
+                capacity.is_capacity(),
+                "{capacity:?} means the teardown did not run and nothing else will run it"
+            );
+        }
         for admitted in [
             CapObject::Endpoint {
                 index: 0,
@@ -136325,26 +136376,35 @@ mod u9f_split_capability_revocation {
             assert_eq!(
                 split_revoke_class_admitted(admitted),
                 Ok(()),
-                "{admitted:?} owes neither obligation"
+                "{admitted:?} was already admitted and stays admitted"
             );
         }
     }
 
-    /// A refused cap is left COMPLETELY untouched — nothing is half-revoked before the refusal.
+    /// A memory-backed cap is now TORN DOWN by the composition, and its object obligations are
+    /// really performed: `cap_refcount` drops and the unreferenced object is reclaimed. On hosted
+    /// there are no remote CPUs, so the shootdown target set is empty and the reclaim is reached.
     #[test]
-    fn a_refused_cap_is_left_completely_intact() {
+    fn u9d3_a_memory_backed_cap_is_completely_torn_down_off_lock() {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
-        let (mem_cap, tid) = k.with(|state| {
-            let (_id, cap) = state
+        let (mem_id, mem_cap, tid) = k.with(|state| {
+            let (id, cap) = state
                 .create_memory_object(PhysAddr(0x40_0000))
                 .expect("memory object");
-            (cap, state.current_tid().expect("current tid"))
+            (id, cap, state.current_tid().expect("current tid"))
+        });
+        k.with(|state| {
+            assert_eq!(
+                state.memory_object_refcounts_by_id(mem_id).map(|r| r.0),
+                Some(1),
+                "the fresh object is held by exactly the one cap"
+            );
         });
 
         assert_eq!(
             k.revoke_capability_no_vm_split(tid, mem_cap),
-            Err(SplitRevokeRefusal::MemoryBacked),
-            "a memory-backed cap is refused to the broad path"
+            Ok(CapObject::MemoryObject { id: mem_id }),
+            "the memory-backed cap is served, not refused"
         );
 
         k.with(|state| {
@@ -136352,6 +136412,193 @@ mod u9f_split_capability_revocation {
                 state
                     .current_task_cnode()
                     .and_then(|cnode| state.capability_for_cnode_local(cnode, mem_cap))
+                    .is_none(),
+                "the cap slot is cleared"
+            );
+            assert_eq!(
+                state.memory_object_refcounts_by_id(mem_id),
+                None,
+                "cap_refcount reached zero and the object was reclaimed — obligation (5) ran"
+            );
+        });
+    }
+
+    /// The load-bearing §6 proof: a memory-backed cap **with a live active transfer mapping** is
+    /// torn down by the split composition to the SAME observable end state the broad
+    /// `revoke_capability_in_cnode` produces, run on a twin kernel built identically.
+    ///
+    /// This is equivalence, not restatement: registry record, page mapping, all three memory
+    /// refcounts, object liveness, the cap slot and every transfer telemetry counter are compared
+    /// between the two kernels. Obligation (4) — the one the D3 fence used to make unreachable —
+    /// is exercised for real here, because the record genuinely names the cap being revoked.
+    #[test]
+    fn u9d3_memory_backed_teardown_with_a_live_mapping_matches_the_broad_path() {
+        use crate::kernel::vm::CachePolicy;
+
+        /// `(kernel, tid, task-local cap, memory-object id, asid)`, with a mapped page and an
+        /// active transfer-mapping record naming that exact cap.
+        fn fixture() -> (SharedKernel, u64, CapId, u64, crate::kernel::vm::Asid) {
+            let k = SharedKernel::new(Bootstrap::init().expect("init"));
+            let (cap1, mem_id, asid1) = k.with(|state| {
+                state.register_task(1).expect("task1");
+                let (asid1, _map_cap) = state.create_user_address_space().expect("asid1");
+                state.bind_task_asid(1, asid1).expect("bind1");
+                let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+                let cap1 = state
+                    .grant_capability_task_to_task(0, mem_cap, 1)
+                    .expect("grant mem");
+                state.enqueue_current_cpu(1).expect("enqueue");
+                state.yield_current().expect("switch to task1");
+                state
+                    .map_user_page_in_asid_with_caps(
+                        asid1,
+                        cap1,
+                        VirtAddr(0xA000),
+                        PageFlags {
+                            read: true,
+                            write: true,
+                            execute: false,
+                            user: true,
+                            cache_policy: CachePolicy::WriteBack,
+                        },
+                    )
+                    .expect("map");
+                state
+                    .register_active_transfer_mapping(
+                        ThreadId(1),
+                        cap1,
+                        VirtAddr(0xA000),
+                        PAGE_SIZE,
+                    )
+                    .expect("register mapping");
+                state.note_shared_mem_mapped(PAGE_SIZE);
+                (cap1, mem_id, asid1)
+            });
+            (k, 1u64, cap1, mem_id, asid1)
+        }
+
+        /// Everything the teardown can be observed to change.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Observed {
+            record_present: bool,
+            page_mapped: bool,
+            refcounts: Option<(u32, u32, u32)>,
+            cap_live: bool,
+            release_calls: u64,
+            bytes_released: u64,
+            records_revoked: u64,
+        }
+
+        fn observe(k: &SharedKernel, tid: u64, cap: CapId, mem_id: u64, asid: Asid) -> Observed {
+            k.with(|state| {
+                let t = state.ipc_path_telemetry();
+                Observed {
+                    // `remove_active_transfer_mapping` reports whether a record existed; if the
+                    // teardown left one behind this both detects it and clears it, so a leaked
+                    // record cannot silently pass twice.
+                    record_present: state.remove_active_transfer_mapping(ThreadId(tid), cap),
+                    page_mapped: state
+                        .user_spaces
+                        .get(asid)
+                        .is_some_and(|a| a.resolve(VirtAddr(0xA000)).is_some()),
+                    refcounts: state.memory_object_refcounts_by_id(mem_id),
+                    cap_live: state
+                        .task_cnode(tid)
+                        .and_then(|cnode| state.capability_for_cnode_local(cnode, cap))
+                        .is_some(),
+                    release_calls: t.transfer_release_calls,
+                    bytes_released: t.shared_mem_bytes_released,
+                    records_revoked: t.transfer_records_revoked,
+                }
+            })
+        }
+
+        // Broad twin: the retired body, run on its own kernel.
+        let (broad_k, tid, broad_cap, broad_mem, broad_asid) = fixture();
+        broad_k.with(|state| {
+            let cnode = state.task_cnode(tid).expect("task1 cnode");
+            state
+                .revoke_capability_in_cnode(cnode, broad_cap)
+                .expect("broad teardown");
+        });
+        let broad = observe(&broad_k, tid, broad_cap, broad_mem, broad_asid);
+
+        // Split: the production composition, off the broad lock.
+        let (split_k, _, split_cap, split_mem, split_asid) = fixture();
+        assert_eq!(
+            split_k.revoke_capability_no_vm_split(tid, split_cap),
+            Ok(CapObject::MemoryObject { id: split_mem }),
+            "the memory-backed cap with a live mapping is served, not refused"
+        );
+        let split = observe(&split_k, tid, split_cap, split_mem, split_asid);
+
+        assert_eq!(
+            split, broad,
+            "the split teardown must reach the SAME observable state as the broad one"
+        );
+        // …and that shared state is the one the teardown is FOR — not "both did nothing".
+        assert!(
+            !split.record_present,
+            "obligation (4) ran: the registry record naming the cap is gone"
+        );
+        assert!(
+            !split.page_mapped,
+            "obligation (4) ran: the page really was unmapped"
+        );
+        assert!(
+            !split.cap_live,
+            "obligation (3) ran: the cap slot is cleared"
+        );
+        assert_eq!(
+            split.bytes_released, PAGE_SIZE as u64,
+            "the release telemetry counted the exact mapping length"
+        );
+        assert_eq!(split.records_revoked, 1, "exactly one record was revoked");
+        assert_eq!(
+            split.refcounts.map(|r| r.0),
+            Some(1),
+            "obligation (5) ran: cap_refcount dropped from 2 to 1 (task0 still holds one), so \
+             the object is correctly NOT reclaimed"
+        );
+    }
+
+    /// A refused cap is left COMPLETELY untouched — nothing is half-revoked before the refusal.
+    /// `Reply` is the reachable routing refusal, and it must not disturb the slot the U9-C
+    /// transaction is about to act on.
+    #[test]
+    fn a_refused_cap_is_left_completely_intact() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|state| {
+            state.register_task(2951).expect("task");
+        });
+        let (reply_cap, tid) = k.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let cap = state
+                .mint_capability_in_cnode(
+                    cnode,
+                    Capability::new(
+                        CapObject::Reply {
+                            index: 0,
+                            generation: 1,
+                        },
+                        CapRights::SEND.union(CapRights::RECEIVE),
+                    ),
+                )
+                .expect("reply cap");
+            (cap, state.current_tid().expect("current tid"))
+        });
+
+        assert_eq!(
+            k.revoke_capability_no_vm_split(tid, reply_cap),
+            Err(SplitRevokeRefusal::ReplyObject),
+            "a Reply cap is routed to the U9-C transaction, not torn down here"
+        );
+
+        k.with(|state| {
+            assert!(
+                state
+                    .current_task_cnode()
+                    .and_then(|cnode| state.capability_for_cnode_local(cnode, reply_cap))
                     .is_some(),
                 "the refused cap must still be live — the refusal precedes every mutation"
             );
@@ -136374,10 +136621,12 @@ mod u9f_split_capability_revocation {
         );
     }
 
-    /// The production entry point reports refusal as `false`, which is precisely the signal the
-    /// three callsites use to run the unchanged broad rollback.
+    /// The production entry point now reports `true` for BOTH cohorts — the memory-backed one
+    /// included — because there is no broad fallback left for a `false` to select. A stale cap is
+    /// the one reachable `false`, and it is the exact input for which the retired broad
+    /// `rollback_materialized_recv_cap` also did nothing.
     #[test]
-    fn the_production_entry_point_reports_refusal_as_false() {
+    fn the_production_entry_point_serves_both_cohorts() {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let (mem_cap, notif_cap, tid) = k.with(|state| {
             let (_id, mem_cap) = state
@@ -136387,32 +136636,42 @@ mod u9f_split_capability_revocation {
             (mem_cap, notif_cap, state.current_tid().expect("tid"))
         });
         assert!(
-            !k.rollback_materialized_recv_cap_no_vm_split(tid, mem_cap),
-            "memory-backed => false => the caller takes the broad path"
+            k.rollback_materialized_recv_cap_no_vm_split(tid, mem_cap),
+            "memory-backed => served off-lock, with the real D3 completion"
         );
         assert!(
             k.rollback_materialized_recv_cap_no_vm_split(tid, notif_cap),
-            "an admitted class => true => the teardown already completed off-lock"
+            "an already-admitted class => still served off-lock"
+        );
+        assert!(
+            !k.rollback_materialized_recv_cap_no_vm_split(tid, mem_cap),
+            "the repeat finds nothing: `Unresolvable`, for which the broad path did nothing either"
         );
     }
 
     // ── (3) STRUCTURE: what makes the admission sound ───────────────────────────────────────
 
-    /// CENSUS-DELTA 0. U9-F retires no acquisition; all three ordinary rollback callsites and
-    /// their broad fallbacks remain exactly where they were.
+    /// CENSUS-DELTA −3. U9-D3 §6 retires all three ordinary rollback acquisitions: `runtime.rs`
+    /// now holds NO production broad acquisition of any kind, and every callsite goes to the
+    /// composition unconditionally.
     #[test]
-    fn u9f_retires_no_broad_acquisition() {
+    fn u9d3_retires_all_three_broad_rollback_acquisitions() {
         let code = code_of(RUNTIME);
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            3,
-            "runtime.rs still holds exactly the three ordinary rollback acquisitions"
+            0,
+            "runtime.rs must hold no production `with_cpu` acquisition"
+        );
+        assert_eq!(
+            code.matches("self.with(|").count(),
+            0,
+            "…and no production broad `with` either"
         );
         assert_eq!(
             code.matches("kernel.rollback_materialized_recv_cap(")
                 .count(),
-            3,
-            "every broad fallback remains reachable"
+            0,
+            "no broad fallback remains"
         );
         assert_eq!(
             code.matches("self.rollback_materialized_recv_cap_no_vm_split(")
@@ -136421,36 +136680,43 @@ mod u9f_split_capability_revocation {
                     .matches("shared.rollback_materialized_recv_cap_no_vm_split(")
                     .count(),
             3,
-            "and all three are offered to the split composition first"
+            "and all three sites go to the split composition"
         );
     }
 
-    /// Every callsite is `split-first, broad-on-refusal` — never split-INSTEAD-of-broad. A future
-    /// pass that deletes a fallback because "the split handles it" would silently drop TLB
-    /// shootdowns and frame reclaim for the memory-backed cohort.
+    /// Every callsite calls the composition UNCONDITIONALLY — never guarded by a negation that a
+    /// now-absent fallback would have serviced. A guarded call with no `else` would silently drop
+    /// the teardown on refusal instead of surfacing it.
     #[test]
-    fn every_callsite_falls_back_to_the_unchanged_broad_rollback() {
+    fn no_callsite_guards_the_composition_on_a_missing_fallback() {
         let code = code_of(RUNTIME);
+        let mut sites = 0usize;
         for offer in [
             "shared.rollback_materialized_recv_cap_no_vm_split(",
             "self.rollback_materialized_recv_cap_no_vm_split(",
         ] {
             for (idx, _) in code.match_indices(offer) {
-                let window = &code[idx..core::cmp::min(idx + 600, code.len())];
+                sites += 1;
+                // Whitespace-insensitive: rustfmt may wrap between `let _ =` and the call.
+                let before: alloc::string::String = code[idx.saturating_sub(48)..idx]
+                    .split_whitespace()
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join(" ");
                 assert!(
-                    window.contains("kernel.rollback_materialized_recv_cap("),
-                    "the offer at `{offer}` must be followed by the broad fallback"
-                );
-                assert!(
-                    window.contains("with_cpu(cpu, |kernel|"),
-                    "…including its broad acquisition"
+                    before.ends_with("let _ ="),
+                    "the call at `{offer}` must be an unconditional `let _ =`, not a branch \
+                     condition — found `{before}`"
                 );
             }
             assert!(
-                code.matches(offer).count() == 0 || code.contains(&alloc::format!("!{offer}")),
-                "the offer is negated — the broad path runs exactly when the split refused"
+                !code.contains(&alloc::format!("!{offer}")),
+                "no site may negate the offer: there is no broad path left to select"
             );
         }
+        assert_eq!(
+            sites, 3,
+            "all three ordinary rollback sites must be covered"
+        );
     }
 
     /// The broad teardown body is untouched: every obligation it owes is still there.
@@ -136477,29 +136743,92 @@ mod u9f_split_capability_revocation {
         }
     }
 
-    /// The split composition reaches NO VM and NO memory seam. This is the D3 fence expressed as
-    /// a property of the source, not of a comment.
+    /// U9-D3 §6 inverted this guard too. The composition now REACHES the VM and memory seams — via
+    /// the D3-complete `unmap_range_two_phase_split` and the rank-6 `_locked` refcount/reclaim
+    /// siblings — and must still reach nothing broad, and none of the impersonating shootdown
+    /// machinery §5 forbids.
     #[test]
-    fn the_split_composition_reaches_no_vm_or_memory_seam() {
+    fn the_split_composition_reaches_the_d3_complete_seam_and_nothing_broad() {
         let code = code_of(revoke_split_region());
+        for required in [
+            "unmap_range_two_phase_split(",
+            "with_memory_split_mut(",
+            "adjust_memory_object_cap_refcount_locked(",
+            "reclaim_memory_object_if_unreferenced_locked(",
+        ] {
+            assert!(
+                code.contains(required),
+                "the composition must perform obligations (4)/(5) through `{required}`"
+            );
+        }
         for forbidden in [
-            "with_vm_split_mut",
-            "with_memory_split_mut",
-            "unmap_range_two_phase",
-            "unmap_page_phase1",
-            "execute_tlb_shootdown_wait_plan",
-            "request_live_asid_shootdown",
-            "reclaim_memory_object_if_unreferenced",
-            "adjust_memory_object_cap_refcount",
-            "free_frame",
+            // Broad acquisitions of any shape.
             "with_cpu(",
             "self.with(|",
+            // The retired requester-impersonating shootdown machinery (§5).
+            "execute_tlb_shootdown_wait_plan",
+            "request_live_asid_shootdown",
+            "set_current_cpu",
+            "yield_current",
+            "online_wake_only_ap_bitmap",
+            // The broad `&mut KernelState` twins of the obligations it now performs itself.
+            "self.reclaim_memory_object_if_unreferenced(",
+            "self.adjust_memory_object_cap_refcount(",
+            "revoke_active_transfer_mappings_for_cap(&mut",
         ] {
             assert!(
                 !code.contains(forbidden),
                 "the split composition must not reach `{forbidden}`"
             );
         }
+    }
+
+    /// **Unmap before ACK before reclaim.** The object-level reclaim is gated on the unmap's
+    /// shootdown having completed, so a `cap_refcount` that reaches zero without an ACK leaves the
+    /// frame out of the allocator rather than handing it to the next allocation while a remote CPU
+    /// may still translate it. The refcount drop itself is NOT gated — the capability really is
+    /// gone.
+    #[test]
+    fn u9d3_the_reclaim_is_gated_on_the_ack_but_the_refcount_drop_is_not() {
+        let body = body_of(
+            revoke_split_region(),
+            "fn memory_obligations_split(",
+            "\n    /// Build the complete plan",
+        );
+        let unmap = body
+            .find("let acked = self.revoke_active_transfer_mappings_for_cap_split(")
+            .expect("the mapping revocation runs first and yields the ACK verdict");
+        let refcount = body
+            .find("adjust_memory_object_cap_refcount_locked(memory, object, -1)")
+            .expect("the refcount drop must be present");
+        let gate = body
+            .find("if acked {")
+            .expect("the reclaim must be ACK-gated");
+        let reclaim = body
+            .find("reclaim_memory_object_if_unreferenced_locked(memory, object)")
+            .expect("the reclaim must be present");
+        assert!(
+            unmap < refcount && refcount < gate && gate < reclaim,
+            "order must be: unmap (with ACK verdict) -> refcount drop -> ACK gate -> reclaim"
+        );
+        assert!(
+            !body[..refcount].contains("if acked"),
+            "the refcount drop must NOT be inside the ACK gate"
+        );
+        // The unmap seam it drives is the one that reclaims per page only after a completed
+        // shootdown, and that reports the verdict this gate consumes.
+        let seam = body_of(
+            RUNTIME,
+            "pub(crate) fn unmap_range_two_phase_split(",
+            "\n    /// rank 2 \u{2192} rank 1 (non-nested)",
+        );
+        assert!(
+            seam.contains("let shootdown_ok = self.complete_unmap_shootdown_split(")
+                && seam.contains("if shootdown_ok {")
+                && seam.contains("all_acked = false;")
+                && seam.contains("all_acked\n"),
+            "the seam must complete a real shootdown per page and report whether all completed"
+        );
     }
 
     /// Every refusal is raised in the PREFLIGHT, which makes no mutation. The commit phases
@@ -136517,7 +136846,6 @@ mod u9f_split_capability_revocation {
             "split_revoke_class_admitted",
             "collect_admitted_descendants_split",
             "collect_delegation_link_removals_split",
-            "refuse_on_active_transfer_mapping_split",
         ] {
             assert!(plan.contains(phase), "the preflight must run `{phase}`");
         }
@@ -136527,6 +136855,11 @@ mod u9f_split_capability_revocation {
             "clear_delegation_links_split",
             "destroy_notification_split",
             "wake_destroyed_notification_waiter_split",
+            // U9-D3 §6: the obligations the composition now PERFORMS are commit work, and the
+            // preflight must still make no mutation.
+            "memory_obligations_split",
+            "revoke_active_transfer_mappings_for_cap_split",
+            "unmap_range_two_phase_split",
         ] {
             assert!(
                 !plan.contains(mutation),
@@ -136546,9 +136879,10 @@ mod u9f_split_capability_revocation {
         );
     }
 
-    /// The commit performs the four split obligations in the SAME order the broad path does:
-    /// root revoke, then each descendant complete (revoke then notification), then link removal,
-    /// then the root's notification.
+    /// The commit performs all six split obligations in the SAME order the broad path does: root
+    /// revoke; then each descendant complete (revoke, its mapping/memory obligations, its
+    /// notification — the order `revoke_capability_direct_in_process_cnode` uses); then link
+    /// removal; then the ROOT's mapping/memory obligations; then the root's notification.
     #[test]
     fn the_commit_preserves_the_broad_interleave() {
         let commit = body_of(
@@ -136559,7 +136893,10 @@ mod u9f_split_capability_revocation {
         let order = [
             "cspace_revoke_split(plan.cnode, plan.root.cap)",
             "cspace_read_then_revoke_split(cnode, descendant.cap)",
+            "memory_obligations_split(descendant.pid, descendant.cap, object)",
+            "destroy_notification_for_revoked_object_split(object)",
             "clear_delegation_links_split(",
+            "memory_obligations_split(plan.root.pid, plan.root.cap, plan.root_object)",
             "destroy_notification_for_revoked_object_split(plan.root_object)",
         ];
         let mut last = 0usize;
@@ -136570,31 +136907,114 @@ mod u9f_split_capability_revocation {
             assert!(at > last, "`{needle}` is out of order");
             last = at;
         }
+        // The broad `revoke_capability_direct_in_process_cnode` revokes a descendant's transfer
+        // mappings whether or not its slot still held a capability. Dropping that on the empty-slot
+        // arm would leak a mapping the broad path unmaps.
+        assert!(
+            commit.contains(
+                "} else {\n                self.revoke_active_transfer_mappings_for_cap_split(descendant.pid, descendant.cap);"
+            ),
+            "an empty descendant slot must still have its transfer mappings revoked"
+        );
     }
 
-    /// The fail-closed transfer-mapping preflight exists and is a REFUSAL, not a skip. The proof
-    /// that it can never fire lives in the section docs; this pins that the code does not rely on
-    /// that proof being restated correctly by a later reader.
+    /// U9-D3 §6 — obligation (4) is PERFORMED, in the broad function's exact per-record order, and
+    /// the unmap it performs is the real D3-completing one. The preflight refusal it replaced is
+    /// gone; a scan that silently skipped a record would drop the shootdown the broad path does.
     #[test]
-    fn the_transfer_mapping_preflight_refuses_rather_than_skips() {
+    fn the_transfer_mapping_revocation_performs_the_broad_sequence() {
         let body = body_of(
             revoke_split_region(),
-            "fn refuse_on_active_transfer_mapping_split(",
-            "\n    /// Build the complete plan",
+            "fn revoke_active_transfer_mappings_for_cap_split(",
+            "\n    /// U9-D3 \u{a7}6 \u{2014} obligations (4) and (5) for ONE revoked node",
         );
         assert!(
-            body.contains("ipc.active_transfer_mappings"),
-            "the registry itself must be scanned"
+            body.contains("for idx in 0..MAX_TRANSFER_ENVELOPES")
+                && body.contains("ipc.active_transfer_mappings[idx]"),
+            "the whole registry must be scanned, exactly as the broad form scans it"
         );
-        assert_eq!(
-            body.matches("Err(SplitRevokeRefusal::ActiveMappingPresent)")
-                .count(),
-            2,
-            "both the overflow and the match arm must refuse"
+        let order = [
+            "self.task_asid_opt_split_read(mapping.owner_tid.0)",
+            "self.unmap_range_two_phase_split(",
+            "ipc.active_transfer_mappings[idx] = None",
+            "ipc.telemetry.shared_mem_bytes_released",
+            "ipc.telemetry.transfer_records_revoked",
+            "self.report_transfer_revoke_to_supervisor_split(",
+            "YARM_TRANSFER_REVOKE owner_pid={} cap={} base=0x{:x} len={}",
+        ];
+        let mut last = 0usize;
+        for needle in order {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` must be present"));
+            assert!(
+                at > last,
+                "`{needle}` is out of order versus the broad form"
+            );
+            last = at;
+        }
+        // The verdict is ANDed across every record, so one unacknowledged page suppresses the
+        // caller's reclaim for the whole object.
+        let flat: alloc::string::String = body
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("all_acked &= self.unmap_range_two_phase_split("),
+            "the ACK verdict must accumulate across records, not be overwritten by the last one"
+        );
+        // The exact broad text, so the live log is identical on both routes.
+        let broad = body_of(
+            LIFECYCLE,
+            "fn revoke_active_transfer_mappings_for_cap(",
+            "\n    /// Find the CapId in the current task's cnode",
+        );
+        for shared_effect in [
+            "ipc.active_transfer_mappings[idx] = None",
+            "YARM_TRANSFER_REVOKE owner_pid={} cap={} base=0x{:x} len={}",
+        ] {
+            assert!(
+                broad.contains(shared_effect),
+                "the broad form must still perform `{shared_effect}` — the split mirrors it"
+            );
+        }
+    }
+
+    /// The supervisor report is the split twin of `send_message_to_endpoint_and_wake`, and it
+    /// preserves that function's mandated ordering: enqueue and take the waiter under rank 3, wake
+    /// only after rank 3 is released.
+    #[test]
+    fn the_supervisor_report_enqueues_under_rank_three_and_wakes_after() {
+        let body = body_of(
+            revoke_split_region(),
+            "fn report_transfer_revoke_to_supervisor_split(",
+            "\n    /// U9-D3 \u{a7}6 \u{2014} obligation (4)",
+        );
+        let seam = body
+            .find("self.with_ipc_split_mut(|ipc| {")
+            .expect("the rank-3 acquisition");
+        let send = body.find(".send(msg)").expect("the enqueue");
+        let take = body
+            .find("ipc.take_endpoint_waiter(endpoint_idx)")
+            .expect("the waiter is TAKEN in the same acquisition");
+        let wake = body
+            .find("self.wake_tid_to_runnable_split(cpu, waiter.tid)")
+            .expect("the wake");
+        assert!(
+            seam < send && send < take && take < wake,
+            "enqueue then take under rank 3, then wake after releasing it"
         );
         assert!(
-            !body.contains("unmap"),
-            "the preflight refuses; it never attempts the unmap it is fencing"
+            body[..take].matches("with_ipc_split_mut").count() == 1,
+            "the enqueue and the take must share ONE rank-3 acquisition"
+        );
+        assert!(
+            !body[wake..].contains("with_ipc_split_mut"),
+            "no rank-3 acquisition may be held across the wake"
+        );
+        assert!(
+            body.contains("let Some(endpoint_idx) = self.supervisor_endpoint_split() else"),
+            "an absent supervisor endpoint is a silent Ok(()), exactly as in the broad form"
         );
     }
 
