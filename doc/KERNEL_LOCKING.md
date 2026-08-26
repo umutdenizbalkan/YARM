@@ -14209,12 +14209,21 @@ before the switch, so there is nothing for a resume boundary to consume for that
 
 * **Timer entry — WIP-9 was selection-owner unification rather than timer retirement.**
   `TimerInterrupt` entry REMAINS BROAD: the tick, the IPC timeout collector and ten diagnostic
-  hooks still run inside the broad arm. Two blockers: `process_ipc_timeout_deadlines` has no split twin (~210 lines
-  across ranks 2/3/1), and five of the ten hooks have no other call site, so returning early for
-  a non-preempting tick would silently stop them running. Claim/ack and re-arm are *not*
-  blockers — `hal_adapters` already exposes them lock-free. **No timer-preemption dequeue was
-  witnessed live**: `YIELD_DISPATCH_DEQUEUE_OK` is 0 in all three core smokes, so no
-  timer-preemption live claim is made.
+  hooks still run inside the broad arm. Five of the ten hooks have no other call site, so
+  returning early for a non-preempting tick would silently stop them running. Claim/ack and
+  re-arm are *not* blockers — `hal_adapters` already exposes them lock-free. **No
+  timer-preemption dequeue was witnessed live**: `YIELD_DISPATCH_DEQUEUE_OK` is 0 in all three
+  core smokes, so no timer-preemption live claim is made.
+
+  **CORRECTION, recorded by U9-TM.** This bullet originally named a second blocker: that
+  `process_ipc_timeout_deadlines` had "no split twin (~210 lines across ranks 2/3/1)". **That
+  claim was false.** The function owns zero timeout classes. Its body begins with an
+  unconditional `continue;` above an `#[allow(unreachable_code)]`, because U7 and canonical 199E
+  had already retired all three IPC timeout classes off-lock to `run_due_ipc_timeout_work` ->
+  `collect_due_ipc_timeout_work` -> `drain_{reply,send,recv}_timeout_post_work`, driven post-lock
+  from both trap wrappers. The surviving body is a preserved unreachable no-op, not live work.
+  The original claim was made from the signature and header comment without reading the body;
+  the correct reading is recorded here so no later increment re-derives the phantom blocker.
 * **`Unknown` user exception.** No live witness on any architecture. Not delivered.
 * **Terminal user PageFault.** A live witness exists (AArch64 core smoke: user read at `0x0`,
   `PAGE_FAULT_UNHANDLED` -> fault report -> replacement). It is still NOT routed: terminality
@@ -14231,4 +14240,98 @@ before the switch, so there is nothing for a resume boundary to consume for that
 inheritance; recoverable demand/COW PageFault VM decomposition; timer-timeout decomposition;
 Spawn/Fork/Exit; RPi5; WA3C2; and direct-IpcCall production. No stage status changes merely
 because this prerequisite was delivered — U9-QA is CENSUS-DELTA 0, so the canonical stage
+arithmetic is unchanged.
+
+### U9-TM — the default off-lock TimerInterrupt checkpoint. PARTIAL. CENSUS-DELTA 0.
+
+**U9-TM — CENSUS-DELTA 0 prerequisite.** U9-TM's objective was to remove `TimerInterrupt` as a
+reason either terminal dispatcher remains reachable. It reaches a **default-configuration
+checkpoint**, not that objective: with all five timer-only proof knobs off — the default
+production configuration — a non-preempting `TimerInterrupt` executes its tick and the production
+timeout work entirely off-lock, with exact timer completion. Two residual classes still enter the
+unchanged broad timer arm, so the census stays **2 / 0 / 2** and only the two terminal
+dispatchers remain counted.
+
+**The timeout collector was already retired — the blocker was phantom.**
+`process_ipc_timeout_deadlines` owns **zero** timeout classes. Its body opens with an
+unconditional `continue;` above an `#[allow(unreachable_code)]`: U7 and canonical 199E had
+already moved all three IPC timeout classes off-lock to `run_due_ipc_timeout_work` ->
+`collect_due_ipc_timeout_work` -> `drain_{reply,send,recv}_timeout_post_work`, driven post-lock
+from both trap wrappers. The surviving body is a preserved unreachable no-op. No second collector
+was written and no settled timeout semantics were reimplemented; the off-lock pipeline is
+delegated to as-is. The earlier "~210 lines across ranks 2/3/1" blocker recorded under U9-QA was
+a misreading of the signature and header comment without the body, and is corrected above.
+
+**The five timer-only proof hooks are NOT relocated. This is a temporary proof-mode fallback.**
+By explicit decision, this increment relocates none of them. Instead `timer_proof_hooks_armed()`
+pins all five knob terms — `cap_cnode_enabled`, `fault_delivery_enabled`,
+`spawn_lifecycle_enabled`, `global_state_enabled`, `smp_ready_enabled` — and their exact
+negations. If **any** knob is armed, the split timer route refuses **before claim, tick or any
+other mutation** and the unchanged broad timer arm runs, attributed on the wire as
+`TIMER_SPLIT_REFUSED cpu=<n> reason=proof_hooks_armed`. A source-discovering guard fails the
+hosted suite if a sixth timer-only hook is added without extending the gate, so a new hook
+cannot silently bypass the refusal. **All five proof profiles are marker-identical to the U9-QA
+base `6a21e07`** (cap_cnode 20/232, fault_delivery 13/13, spawn_lifecycle 11/82, global_state
+10/13, smp_ready 28/29 — `diff` clean on every one), so the fallback is exact rather than
+approximate. Relocating the hooks remains open work; until it lands, this is proof-mode
+fallback, not TimerInterrupt retirement.
+
+**The rank-1 split tick.** `Timer::would_preempt_next()` is a pure predicate
+(`ticks_remaining == 1`) that mutates nothing.
+`SharedKernel::scheduler_tick_if_no_switch_split_mut(cpu)` takes rank 1 alone, asks the predicate
+**before** `tick_and_check()`, and returns `None` without having ticked when the next tick would
+preempt. A `debug_assert` pins that the taken branch never observes `should_preempt`.
+
+**One indivisible timer completion.** For a committed tick the split route owns the tick, IRQ
+acknowledgement and the re-arm together, in that order — the rank-1 tick, then
+`acknowledge_interrupt`, then `program_timer_deadline` with the same deadline constant the broad
+arm passes — and attests `TIMER_SPLIT_TICK_OK cpu=<n> tick=<t> preempt=0 rearm=1`. Both calls are
+the same free functions `Hal::acknowledge_interrupt` and `Hal::program_timer_deadline` delegate
+to. On RISC-V the single SBI `set_timer` both clears the pending condition and programs the next
+deadline: it IS the completion, and there is no separate end-of-interrupt. The broad arm never
+re-executes any of the three for a committed tick.
+
+**`PostWorkCommitted` — a fourth disposition, and why it was required.** `Complete(..)` would have
+skipped the post-lock drain, and `QueueAdvanceCommitted` carries publication semantics a
+non-preempting tick does not have. So the pre-lock split seam now answers with four meanings —
+`NotHandled`, `Complete(..)`, `QueueAdvanceCommitted`, `PostWorkCommitted`. Under
+`PostWorkCommitted` the broad dispatcher is skipped but control falls through to the single
+existing drain, so production timeout work still runs. **The branch discriminator is the typed
+disposition — never a nonempty stash.** Both bridges gate on
+`queue_advance_committed || post_work_committed`; the shared bridge attributes the skip as
+`QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=<n> reason=timer_post_work_committed`, while the RISC-V
+bridge emits that marker only for the publication case, so its timer skip carries no marker of
+its own — which is why the RISC-V row below records no broad-skip count. `TrapPathWindow` remains
+the single owner of the trap-path-active window on both bridges.
+
+**Live evidence — head of `wip/u9-timer-entry`.**
+
+| Profile | Split ticks | Broad skipped | Refused (proof) | Refused (would-preempt) | Broad `SCHED_TICK` |
+|---|---|---|---|---|---|
+| x86_64 core | 73 | 73 | 0 | 0 | 0 |
+| aarch64 core | 3 | 3 | 0 | 0 | 0 |
+| riscv64 core | 1370 | — | 0 | 117 | 4 |
+
+Each of the five knob profiles shows 71–74 proof refusals, 0 split ticks and the broad arm
+running.
+
+**NOT retired, and why.**
+
+* **Preempting ticks remain broad — no live evidence exists.** Zero `preempt=1` across 77
+  recorded profiles: no existing profile witnesses timer preemption. Rather than manufacture a
+  workload, selector or marker to produce one, a would-preempt tick is refused **atomically
+  before mutation** and takes the unchanged broad route
+  (`TIMER_SPLIT_REFUSED cpu=<n> reason=would_preempt`). RISC-V records 117 such refusals, so the
+  refusing branch is itself live-exercised even though the preempting tick is not retired.
+* **Proof-knob ticks remain broad**, per the decision above.
+
+**`TimerInterrupt` is therefore NOT fully retired** while either fallback remains, and neither
+terminal acquisition loses a reason to exist: the runtime census is unchanged at **2 / 0 / 2**.
+***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`).
+
+**Still deferred, unchanged by this prerequisite:** futex requeue, `WAIT_BITSET` and priority
+inheritance; recoverable demand/COW PageFault VM decomposition; timer-timeout decomposition;
+Spawn/Fork/Exit; RPi5; WA3C2; and direct-IpcCall production. No stage status changes merely
+because this prerequisite was delivered — U9-TM is CENSUS-DELTA 0, so the canonical stage
 arithmetic is unchanged.
