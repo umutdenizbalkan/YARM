@@ -961,6 +961,68 @@ pub(crate) enum BlockingSendProducerOutcome {
     PublicationPending,
 }
 
+/// U9-RX2 — THE one recv-waiter publication policy: an atomic queue-recheck and
+/// last-receiver-wins publish, performed entirely inside a caller-supplied rank-3 (IPC)
+/// critical section.
+///
+/// Both forms call this and neither re-derives it: the broad
+/// [`KernelState::publish_recv_waiter_live`] runs it under `with_ipc_state_mut`, and the
+/// off-lock `SharedKernel::publish_recv_waiter_split` runs the identical body under
+/// `with_ipc_split_mut`. Last-receiver-wins replacement is PRESERVED deliberately — whether YARM
+/// should keep replacement at all is WA3C2's question, and this must not answer it by accident.
+pub(crate) fn publish_recv_waiter_locked(
+    ipc: &mut IpcSubsystem,
+    endpoint_idx: usize,
+    record: EndpointWaiterRecord,
+    recv_cap: CapId,
+) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
+    use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
+    let receiver = record.receiver;
+    let receiver_tid = receiver.tid;
+
+    if endpoint_idx >= ipc.endpoints.len() {
+        return PublishWaiterOutcome::InvalidEndpoint;
+    }
+    let endpoint = match ipc.endpoints[endpoint_idx].as_ref() {
+        Some(e) => e,
+        None => return PublishWaiterOutcome::InvalidEndpoint,
+    };
+    if endpoint.queued() > 0 {
+        return PublishWaiterOutcome::QueueNonEmpty;
+    }
+    // Stage 199D-WA3C1: store the COMPLETE generation-bearing RECORD. Canonical
+    // last-receiver-wins is PRESERVED on purpose — the relay, direct-request,
+    // direct-reply and reply-timeout paths each have their own replacement/rollback
+    // contract built on it. Whether YARM should keep replacement at all is WA3C2's
+    // question; this increment must not answer it by accident.
+    if let Some(displaced) = ipc.set_endpoint_waiter(endpoint_idx, record) {
+        crate::yarm_log!(
+            "D2_RECV_WAITER_DISPLACED endpoint={} old_tid={} old_wait_gen={} new_tid={} new_wait_gen={}",
+            endpoint_idx,
+            displaced.tid().0,
+            displaced.wait_generation,
+            receiver_tid.0,
+            record.wait_generation
+        );
+    }
+    crate::yarm_log!(
+        "D2_RECV_WAITER_PUBLISH endpoint={} tid={} asid={} recv_cap={}",
+        endpoint_idx,
+        receiver_tid.0,
+        receiver.asid.0,
+        recv_cap.0
+    );
+    // Stage 193B: if this is the send-plain oracle loopback E1, push a
+    // deterministic "receiver blocked" signal into the coordination
+    // endpoint E2 WITHIN this same `ipc_state_lock` section (atomic with
+    // the waiter publish) so init plain-sends only after the receiver is
+    // provably a waiter — no enqueue race. Strict no-op off the sub-knob.
+    if let Some(e2_idx) = super::proof_send_plain_oracle_coordination_target(endpoint_idx) {
+        super::proof_send_plain_oracle_push_coordination_locked(ipc, e2_idx, receiver_tid.0);
+    }
+    PublishWaiterOutcome::Published
+}
+
 impl KernelState {
     fn wake_tid_to_runnable(&mut self, tid: ThreadId) -> Result<(), KernelError> {
         let old_status = self.task_status(tid.0).ok_or(KernelError::TaskMissing)?;
@@ -6802,54 +6864,11 @@ impl KernelState {
         recv_cap: CapId,
     ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
         use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
-        let receiver = record.receiver;
-        let receiver_tid = receiver.tid;
+        // U9-RX2: the POLICY (atomic queue-recheck + last-receiver-wins publish) lives in the
+        // one owner below, so the off-lock twin runs the identical body through its own rank-3
+        // seam rather than re-deriving it. This form contributes only the broad acquisition.
         let outcome = self.with_ipc_state_mut(|ipc| {
-            if endpoint_idx >= ipc.endpoints.len() {
-                return PublishWaiterOutcome::InvalidEndpoint;
-            }
-            let endpoint = match ipc.endpoints[endpoint_idx].as_ref() {
-                Some(e) => e,
-                None => return PublishWaiterOutcome::InvalidEndpoint,
-            };
-            if endpoint.queued() > 0 {
-                return PublishWaiterOutcome::QueueNonEmpty;
-            }
-            // Stage 199D-WA3C1: store the COMPLETE generation-bearing RECORD. Canonical
-            // last-receiver-wins is PRESERVED on purpose — the relay, direct-request,
-            // direct-reply and reply-timeout paths each have their own replacement/rollback
-            // contract built on it. Whether YARM should keep replacement at all is WA3C2's
-            // question; this increment must not answer it by accident.
-            if let Some(displaced) = ipc.set_endpoint_waiter(endpoint_idx, record) {
-                crate::yarm_log!(
-                    "D2_RECV_WAITER_DISPLACED endpoint={} old_tid={} old_wait_gen={} new_tid={} new_wait_gen={}",
-                    endpoint_idx,
-                    displaced.tid().0,
-                    displaced.wait_generation,
-                    receiver_tid.0,
-                    record.wait_generation
-                );
-            }
-            crate::yarm_log!(
-                "D2_RECV_WAITER_PUBLISH endpoint={} tid={} asid={} recv_cap={}",
-                endpoint_idx,
-                receiver_tid.0,
-                receiver.asid.0,
-                recv_cap.0
-            );
-            // Stage 193B: if this is the send-plain oracle loopback E1, push a
-            // deterministic "receiver blocked" signal into the coordination
-            // endpoint E2 WITHIN this same `ipc_state_lock` section (atomic with
-            // the waiter publish) so init plain-sends only after the receiver is
-            // provably a waiter — no enqueue race. Strict no-op off the sub-knob.
-            if let Some(e2_idx) = super::proof_send_plain_oracle_coordination_target(endpoint_idx) {
-                super::proof_send_plain_oracle_push_coordination_locked(
-                    ipc,
-                    e2_idx,
-                    receiver_tid.0,
-                );
-            }
-            PublishWaiterOutcome::Published
+            publish_recv_waiter_locked(ipc, endpoint_idx, record, recv_cap)
         });
         if matches!(outcome, PublishWaiterOutcome::Published) {
             self.note_d2_recv_waiter_publish();

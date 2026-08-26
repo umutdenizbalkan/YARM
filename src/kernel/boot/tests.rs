@@ -63258,17 +63258,38 @@ mod stage193b_ipc_send_plain_oracle {
                 && MOD_SRC.contains("fn proof_send_plain_oracle_push_coordination_locked("),
             "the coordination target + push helpers must exist"
         );
-        // The push lives INSIDE publish_recv_waiter_live's with_ipc_state_mut closure,
-        // right after the endpoint_waiters write (atomic with the waiter publish).
+        // U9-RX2 re-derivation: the publish POLICY was extracted into the single owner
+        // `publish_recv_waiter_locked`, which both the broad `publish_recv_waiter_live` and the
+        // off-lock twin run. The semantic claim is unchanged and is asserted where the policy now
+        // lives: the receiver-blocked signal is still pushed inside the SAME rank-3 critical
+        // section as the waiter publish, right after the `endpoint_waiters` write.
         let publish = IPC_STATE_SRC
-            .split_once("fn publish_recv_waiter_live(")
-            .and_then(|(_, rest)| rest.split_once("fn "))
+            .split_once("fn publish_recv_waiter_locked(")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
             .map(|(body, _)| body)
             .unwrap_or("");
         assert!(
             publish.contains("proof_send_plain_oracle_coordination_target(endpoint_idx)")
                 && publish.contains("proof_send_plain_oracle_push_coordination_locked("),
-            "the receiver-blocked signal must be pushed inside publish_recv_waiter_live"
+            "the receiver-blocked signal must be pushed inside the one publish policy owner"
+        );
+        // The push is atomic with the publish: it follows the waiter write in the same body.
+        let write_at = publish
+            .find("set_endpoint_waiter(endpoint_idx, record)")
+            .expect("the waiter write");
+        let push_at = publish
+            .find("proof_send_plain_oracle_coordination_target(endpoint_idx)")
+            .expect("the coordination push");
+        assert!(write_at < push_at, "the push must follow the waiter write");
+        // And the broad form delegates rather than re-deriving the policy.
+        let live = IPC_STATE_SRC
+            .split_once("fn publish_recv_waiter_live(")
+            .and_then(|(_, rest)| rest.split_once("\n    }"))
+            .map(|(body, _)| body)
+            .unwrap_or("");
+        assert!(
+            live.contains("publish_recv_waiter_locked(ipc, endpoint_idx, record, recv_cap)"),
+            "the broad form must delegate to the one policy owner"
         );
     }
 
@@ -142648,5 +142669,151 @@ mod u9ft4_route {
         }
         assert!(ARM_SMOKE.contains("u9ft4_require_one"));
         assert!(ARM_SMOKE.contains("u9ft4_require_zero"));
+    }
+}
+
+/// U9-RX — the blocked-receive writeback twin, and the two arms' status.
+///
+/// NOTE: these guards were written during the U9-RX cohort but were lost before that commit by a
+/// `git checkout HEAD -- src/` run during its clippy comparison, while they were still
+/// uncommitted. `d2f27dc` therefore shipped the U9-RX documentation without them. They are
+/// restored here, unchanged in substance.
+mod u9rx_blocked_recv {
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const POST_WORK_SRC: &str = include_str!("../dispatch_post_work.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    fn executor(name: &str) -> &'static str {
+        let i = RUNTIME_SRC
+            .find(&alloc::format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} missing"));
+        let rest = &RUNTIME_SRC[i..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|j| j + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    fn code_of(body: &str) -> alloc::string::String {
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// THE TWIN EXISTS, in four cap classes.
+    #[test]
+    fn the_blocked_waiter_twin_exists_in_four_classes() {
+        for variant in [
+            "BlockedWaiterPlainDelivery",
+            "BlockedWaiterOrdinaryCapDelivery",
+            "BlockedWaiterReplyCapDelivery",
+            "BlockedWaiterSharedRegionDelivery",
+        ] {
+            assert!(
+                POST_WORK_SRC.contains(variant),
+                "class `{variant}` must exist"
+            );
+        }
+    }
+
+    /// The user copy runs OFF the broad lock, through the VM/memory split seam.
+    #[test]
+    fn the_user_copy_is_lock_free() {
+        for name in [
+            "execute_blocked_waiter_ordinary_cap_delivery",
+            "execute_blocked_waiter_reply_cap_delivery",
+        ] {
+            let code = code_of(executor(name));
+            assert!(
+                code.contains("copy_to_user_split("),
+                "{name} must use the split seam"
+            );
+            assert!(
+                !code.contains("self.with_cpu("),
+                "{name} takes no broad acquisition"
+            );
+        }
+    }
+
+    /// Each class rolls back through its OWN off-lock owner.
+    #[test]
+    fn failure_rolls_the_cap_back_off_lock() {
+        for (name, owner) in [
+            (
+                "execute_blocked_waiter_ordinary_cap_delivery",
+                "rollback_materialized_recv_cap_no_vm_split(",
+            ),
+            (
+                "execute_blocked_waiter_reply_cap_delivery",
+                "rollback_minted_cap_split(",
+            ),
+        ] {
+            let code = code_of(executor(name));
+            assert!(
+                code.contains(owner),
+                "{name} must roll back through `{owner}`"
+            );
+            assert!(
+                !code.contains("self.with_cpu("),
+                "{name} must not re-enter the broad lock"
+            );
+        }
+    }
+
+    /// The completion/wake half has ONE owner, documented 3 -> 2 -> 1.
+    #[test]
+    fn completion_and_wake_have_one_owner() {
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("pub(crate) fn complete_blocked_waiter_delivery_split(")
+                .count(),
+            1
+        );
+    }
+
+    /// The broad form is retained and never called off-lock.
+    #[test]
+    fn the_broad_form_is_untouched_and_not_called_off_lock() {
+        assert!(SYSCALL_SRC.contains("pub(crate) fn complete_blocked_recv_for_waiter("));
+        assert!(
+            !RUNTIME_SRC.contains("complete_blocked_recv_for_waiter("),
+            "no off-lock path may call the broad blocked-recv completion"
+        );
+    }
+
+    /// ARM A remains broad: no live profile witnesses a fault report reaching a blocked waiter.
+    #[test]
+    fn arm_a_fault_waiter_delivery_remains_broad() {
+        assert!(
+            FAULT_SRC.contains("complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)"),
+            "the fault path's waiter arm must still use the broad completion"
+        );
+        assert!(
+            !FAULT_SRC.contains("BlockedWaiterPlainDelivery"),
+            "the fault waiter arm must not be routed without a live witness"
+        );
+        assert!(SPLIT_SRC.contains("A::WaiterPresent { .. } => \"waiter_present\""));
+    }
+
+    /// U9-RX introduced no new surface.
+    #[test]
+    fn u9rx_introduced_no_new_surface() {
+        for invented in [
+            "BlockedWaiterFaultDelivery",
+            "SYSCALL_IPC_RECV_SPLIT_NR",
+            "U9RX_",
+        ] {
+            assert!(
+                !POST_WORK_SRC.contains(invented)
+                    && !RUNTIME_SRC.contains(invented)
+                    && !SPLIT_SRC.contains(invented),
+                "no new surface: `{invented}`"
+            );
+        }
     }
 }
