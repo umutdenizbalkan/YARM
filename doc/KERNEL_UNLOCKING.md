@@ -11995,3 +11995,65 @@ terminal transition" remains false in source — neither was "repaired" during d
 census remains **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall production remains OFF
 (`ipccall_direct_production_enabled()` is `const false`). U9-FT2 is CENSUS-DELTA 0, so the
 canonical stage arithmetic is unchanged.
+
+### U9-FT3 — buffered fault-report emission and the terminal transition. PARTIAL / FOUNDATION. CENSUS-DELTA 0.
+
+**U9-FT3 — CENSUS-DELTA 0 prerequisite.** Delivered: the buffered-only split fault-report emitter
+and the split terminal task transition. The AArch64 route was **built, wired, live-tested and then
+REVERTED** — the live witness exposed a real defect, recorded below. **No fault route is wired**;
+the census stays **2 / 0 / 2** and the timer proof blockers remain **five**.
+
+**The buffered-only contract.** `admit_buffered_fault_report_shared` yields `BufferedEligible`,
+`WaiterPresent`, `BufferFull`, `EndpointStale` or `NoRoute`; only the first may proceed split.
+The waiter check is deliberately **conservative**: any present waiter declines, without consulting
+`is_task_recv_v2_blocked`. The broad emitter takes its direct-delivery branch only when a waiter is
+*both* present *and* recv-v2 blocked, so declining on mere presence declines a strict superset —
+always safe, because the fault simply returns to the unchanged broad emitter, which then makes the
+finer distinction itself.
+
+**The waiter race is closed.** A waiter can arrive between preflight and commit, so
+`commit_buffered_fault_report_shared` revalidates generation, waiter absence **and** capacity under
+the **same rank-3 acquisition that enqueues**, with nothing between the last check and the send. A
+waiter arriving after preflight can therefore neither receive a buffered report nor be skipped: the
+commit refuses before publishing, and broad fallback stays legal because nothing was published.
+The payload is encoded outside the lock by the same `SupervisorFaultReportWire::encode` the broad
+emitter uses — identical 17-byte wire. `woke` is always false, which is a **valid** outcome here,
+not a degraded one.
+
+**The terminal transition** mirrors the broad ordering step for step: validate the victim and the
+exact `{tid, asid}` at rank 2 *before* the irreversible scheduler mutation, capture the outgoing
+context, admit the advance, clear `current` at rank 1, verify the scheduler removed the task that
+was validated, apply `FaultRunningCurrent` once, then advance through the **U9-QA owner** — no
+second selection policy is created. Non-atomicity is **preserved, not repaired**: a refusal leaves
+the already-published report published, exactly as the broad path does.
+
+**`block_current_on_cpu_split` lost its `x86_64` cfg gate.** Its body is architecture-neutral — it
+validates the CPU and runs the scheduler's own `block_current_on(cpu)` under rank 1. The gate
+reflected where the U3 caller happened to live, not where the transaction is sound.
+
+**THE LIVE DEFECT that stopped the wiring.** With the AArch64 route wired, the live witness
+published correctly — exactly one report, `endpoint=3 generation=1 queued=1 woke=0`, no duplicate —
+and the transition reported `TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1`. But it
+committed with **`replacement=None`**, and the trap then **returned to the faulting instruction**:
+`PAGE_FAULT_ENTRY tid=18446744073709551615 addr=0x0 access=Read rip=0x40307c` recurred with no
+current task, failing as `AARCH64_TRAP_DISPATCH_RESULT err=Syscall(Internal)`. Two coupled causes:
+
+1. **Ordering.** `queue_advance_admit_split` was called while the faulting task was still
+   `current` and `queue_advance_commit_split` after `current` was cleared. That is not the
+   ordering the U9-QA transaction was built for, and it selected nothing.
+2. **The resume half is missing.** `QueueAdvanceCommitted` alone does not put the incoming task on
+   the CPU. `ExactTokenResume` requires a post-lock drain keyed to a published deferral — the kind
+   FutexWait publishes. The terminal route publishes none, so even a correct `Switch` would not be
+   applied.
+
+**The AArch64 core smoke exits 0 in spite of this.** Its fatal patterns did not catch a resumed
+faulting PC on a fault-delivery route. Any future attempt must assert the witness chain
+positively — replacement selected, replacement reaching EL0, and `PAGE_FAULT_ENTRY` occurring
+exactly once — rather than relying on the smoke's exit status.
+
+**Unchanged.** Waiter delivery remains broad pending a split blocked-receive write-back; x86_64 COW
+remains unwired and broad; demand paging remains blocked on a live witness and exact map-failure
+rollback; the fault-delivery timer proof hook remains broad, so the timer proof blockers remain
+**five**. The census remains **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall production
+remains OFF (`ipccall_direct_production_enabled()` is `const false`). U9-FT3 is CENSUS-DELTA 0, so
+the canonical stage arithmetic is unchanged.

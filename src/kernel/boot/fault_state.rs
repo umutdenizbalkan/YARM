@@ -53,6 +53,89 @@ pub(crate) struct PageFaultFacts {
     pub demand_region: bool,
 }
 
+/// U9-FT3 §3 — the outcome of the split terminal task transition.
+///
+/// Reached only AFTER a buffered report has been published (or after policy determined none was
+/// required). Every refusal here is fail-closed: the report stays published, exactly as the broad
+/// path leaves it, and there is NO broad fallback — re-entering the broad emitter would publish a
+/// second report.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalFaultTransition {
+    /// The faulting task is blocked and `Faulted`, and the queue advance is committed.
+    Committed {
+        faulted_tid: u64,
+        replacement: Option<u64>,
+    },
+    /// The task or its ASID moved before the transition began. Nothing was mutated by this
+    /// transition; the already-published report is retained, matching current semantics.
+    RefusedIdentityChanged,
+    /// The task-transition barrier rejected the victim before the scheduler mutation.
+    RefusedTransitionRejected,
+    /// The scheduler removed a different task than the one validated.
+    RefusedVictimChanged,
+}
+
+/// U9-FT3 §1 — the buffered fault-report admission verdict.
+///
+/// Produced by a read-only preflight. ONLY [`Self::BufferedEligible`] may proceed on the split
+/// route; every other verdict is a pre-mutation refusal that leaves the unchanged broad path to
+/// handle the fault exactly as it does today.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BufferedFaultAdmission {
+    BufferedEligible {
+        endpoint_idx: usize,
+        generation: u64,
+        queued_before: usize,
+        via_fault_handler: bool,
+    },
+    /// A receiver is waiting on the endpoint. The broad emitter would deliver DIRECTLY to it via
+    /// `complete_blocked_recv_for_waiter`, which has no split twin — so this stays broad.
+    WaiterPresent {
+        endpoint_idx: usize,
+    },
+    BufferFull {
+        endpoint_idx: usize,
+    },
+    /// The route named an endpoint slot that no longer exists, or whose generation moved.
+    EndpointStale {
+        endpoint_idx: usize,
+    },
+    /// Neither a fault-handler nor a supervisor endpoint is registered — the existing
+    /// `TASK_FAULT_NO_SUPERVISOR_ROUTE` case.
+    NoRoute,
+}
+
+/// U9-FT3 §2 — the outcome of the rank-3 buffered commit.
+///
+/// Every `Refused*` variant is raised BEFORE the enqueue, so broad fallback remains legal.
+/// `Buffered` means the report is published and there is no way back.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BufferedFaultCommit {
+    /// Published. `woke` is ALWAYS false on this path: buffered publication wakes nobody, and
+    /// that is a valid outcome, not a degraded one.
+    Buffered {
+        endpoint_idx: usize,
+        generation: u64,
+        queued_after: usize,
+        woke: bool,
+    },
+    /// A waiter arrived between preflight and commit. Refused before enqueue.
+    RefusedWaiterArrived {
+        endpoint_idx: usize,
+    },
+    RefusedBufferFull {
+        endpoint_idx: usize,
+    },
+    RefusedEndpointStale {
+        endpoint_idx: usize,
+    },
+    /// The report payload could not be built — the existing `reason=message` case.
+    RefusedMessageBuild,
+}
+
 /// U9-FT2 §3 — THE one effective-fault-policy rule.
 ///
 /// The task's `fault_policy_override` wins if set, otherwise the kernel default. Both

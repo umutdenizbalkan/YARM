@@ -142005,3 +142005,377 @@ mod u9ft2_policy_twin {
         );
     }
 }
+
+/// U9-FT3 §6 — the buffered-only split report path.
+mod u9ft3_buffered {
+    use crate::kernel::boot::{SUPERVISOR_FAULT_REPORT_WIRE_LEN, SupervisorFaultReportWire};
+    use crate::kernel::trap::FaultAccess;
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    fn admit_body() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn admit_buffered_fault_report_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the admission preflight")
+    }
+
+    fn commit_body() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn commit_buffered_fault_report_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n\n").next())
+            .expect("the buffered commit")
+    }
+
+    /// ONLY BufferedEligible may proceed. Every other admission verdict exists and is distinct.
+    #[test]
+    fn only_buffered_eligible_can_proceed() {
+        let a = admit_body();
+        for verdict in [
+            "A::BufferedEligible",
+            "A::WaiterPresent",
+            "A::BufferFull",
+            "A::EndpointStale",
+            "A::NoRoute",
+        ] {
+            assert!(a.contains(verdict), "admission must classify `{verdict}`");
+        }
+        // The preflight mutates nothing.
+        for mutator in [
+            "send(",
+            "get_mut(",
+            "push(",
+            "take_endpoint_waiter",
+            "wake_",
+        ] {
+            assert!(
+                !a.contains(mutator),
+                "the preflight must not mutate: `{mutator}`"
+            );
+        }
+    }
+
+    /// THE waiter race: the commit revalidates waiter absence under the SAME rank-3 acquisition
+    /// that enqueues, so a waiter arriving after the preflight can never be skipped.
+    #[test]
+    fn the_commit_revalidates_waiter_absence_before_enqueue() {
+        let c = commit_body();
+        let acquire = c
+            .find("self.with_ipc_split_mut(")
+            .expect("the rank-3 commit");
+        let waiter = c[acquire..]
+            .find("ipc.endpoint_waiter_present(endpoint_idx)")
+            .expect("waiter revalidation");
+        let enqueue = c[acquire..]
+            .find("endpoint.send(msg)")
+            .expect("the enqueue");
+        assert!(
+            waiter < enqueue,
+            "waiter absence must be revalidated BEFORE the enqueue, in the same acquisition"
+        );
+        // Generation and capacity are revalidated in the same acquisition too.
+        let gen_check = c[acquire..]
+            .find("generation != expected_generation")
+            .expect("generation revalidation");
+        let cap = c[acquire..]
+            .find("endpoint.queued() >= endpoint.capacity()")
+            .expect("capacity revalidation");
+        assert!(gen_check < enqueue && cap < enqueue);
+        // Exactly ONE enqueue.
+        assert_eq!(
+            c.matches("endpoint.send(").count(),
+            1,
+            "exactly one enqueue"
+        );
+    }
+
+    /// The split emitter can never deliver to a waiter: it cannot call blocked-receive
+    /// completion, cannot wake, and cannot write back to a receiver.
+    #[test]
+    fn the_split_emitter_cannot_deliver_to_a_waiter() {
+        let c = commit_body();
+        for forbidden in [
+            "complete_blocked_recv_for_waiter",
+            "complete_blocked_waiter_delivery_split",
+            "apply_split_receiver_wake_plan",
+            "wake_tid_to_runnable",
+            "take_endpoint_waiter",
+            "ipc_clear_plain_receiver_waiter_only",
+            "wake_waiter_for_endpoint",
+        ] {
+            assert!(
+                !c.contains(forbidden),
+                "the buffered emitter must never call `{forbidden}`"
+            );
+        }
+    }
+
+    /// `woke` is always false on this path, and the marker says `woke=0`.
+    #[test]
+    fn buffered_publication_never_wakes() {
+        let c = commit_body();
+        assert!(
+            c.contains("woke: false"),
+            "the commit must report woke: false"
+        );
+        assert!(!c.contains("woke: true"));
+        assert!(
+            c.contains("queued={} woke=0"),
+            "the ENQUEUE_OK marker must print woke=0"
+        );
+    }
+
+    /// The report bytes are produced by the SAME encoder the broad emitter uses, and the wire
+    /// layout is unchanged: 17 bytes, tid | addr | access.
+    #[test]
+    fn the_report_bytes_are_identical_to_the_broad_path() {
+        assert_eq!(SUPERVISOR_FAULT_REPORT_WIRE_LEN, 17);
+        let w = SupervisorFaultReportWire {
+            faulting_tid: 1,
+            fault_addr: 0,
+            access: FaultAccess::Read,
+        }
+        .encode();
+        assert_eq!(w.len(), 17);
+        assert_eq!(&w[..8], &1u64.to_le_bytes());
+        assert_eq!(&w[8..16], &0u64.to_le_bytes());
+        assert_eq!(w[16], 0, "Read encodes as 0");
+        // Write and Execute discriminants are unchanged.
+        assert_eq!(
+            SupervisorFaultReportWire {
+                faulting_tid: 0,
+                fault_addr: 0,
+                access: FaultAccess::Write
+            }
+            .encode()[16],
+            1
+        );
+        assert_eq!(
+            SupervisorFaultReportWire {
+                faulting_tid: 0,
+                fault_addr: 0,
+                access: FaultAccess::Execute
+            }
+            .encode()[16],
+            2
+        );
+        // The encoder has one definition, and the split commit calls it.
+        assert_eq!(
+            FAULT_SRC
+                .matches("pub(crate) fn encode(self) -> [u8; SUPERVISOR_FAULT_REPORT_WIRE_LEN]")
+                .count(),
+            1
+        );
+        assert!(commit_body().contains("SupervisorFaultReportWire {"));
+    }
+
+    /// The payload is encoded OUTSIDE the lock — no user copy or message build under rank 3.
+    #[test]
+    fn the_payload_is_encoded_outside_the_lock() {
+        let c = commit_body();
+        let encode = c.find(".encode();").expect("encode");
+        let acquire = c.find("self.with_ipc_split_mut(").expect("rank 3");
+        assert!(
+            encode < acquire,
+            "the payload must be encoded before the rank-3 acquisition"
+        );
+    }
+
+    /// Every refusal is raised BEFORE the enqueue, so broad fallback stays legal; after the
+    /// enqueue there is no refusal path at all.
+    #[test]
+    fn every_refusal_precedes_the_enqueue() {
+        let c = commit_body();
+        let enqueue = c.find("endpoint.send(msg)").expect("the enqueue");
+        for refusal in [
+            "C::RefusedEndpointStale",
+            "C::RefusedWaiterArrived",
+            "C::RefusedBufferFull",
+        ] {
+            let first = c
+                .find(refusal)
+                .unwrap_or_else(|| panic!("{refusal} missing"));
+            assert!(
+                first < enqueue,
+                "`{refusal}` must be reachable before the enqueue"
+            );
+        }
+        // Inside the rank-3 closure, once the enqueue SUCCEEDS the only outcome is Buffered.
+        // (The trailing `match outcome` that emits markers names the refusal variants too, but
+        // it only reports an already-decided outcome; scope the claim to the closure.)
+        let closure = c
+            .split("self.with_ipc_split_mut(|ipc| {")
+            .nth(1)
+            .and_then(|s| s.split("\n        });").next())
+            .expect("the rank-3 closure");
+        let send_at = closure.find("endpoint.send(msg)").expect("the enqueue");
+        let tail = &closure[send_at..];
+        // The `send` error arm is the LAST pre-publication refusal; everything after the
+        // successful branch must be the Buffered construction only.
+        let buffered_at = tail.find("C::Buffered").expect("buffered outcome");
+        assert!(
+            !tail[buffered_at..].contains("C::Refused"),
+            "no refusal may follow a successful enqueue: {}",
+            &tail[buffered_at..]
+        );
+    }
+
+    /// The buffered path takes no broad acquisition.
+    #[test]
+    fn the_buffered_path_takes_no_broad_lock() {
+        assert!(!admit_body().contains("with_cpu("));
+        assert!(!commit_body().contains("with_cpu("));
+    }
+}
+
+/// U9-FT3 §3/§6 — the split terminal task transition.
+mod u9ft3_transition {
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    fn body() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn commit_terminal_fault_transition_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// U9-FT3 §1").next())
+            .expect("the terminal transition")
+    }
+
+    /// The victim is validated at rank 2 BEFORE the irreversible scheduler mutation, exactly as
+    /// the broad path does — a check after `block_current` would be a check after commit.
+    #[test]
+    fn the_victim_is_validated_before_the_scheduler_mutation() {
+        let b = body();
+        let validate = b
+            .find("task_transition_would_be_accepted")
+            .expect("the barrier");
+        let block = b
+            .find("self.block_current_on_cpu_split(cpu)")
+            .expect("rank 1");
+        assert!(
+            validate < block,
+            "validation must precede clearing `current`"
+        );
+        // The exact incarnation is revalidated too.
+        let asid = b.find("t.asid != Some(asid)").expect("asid revalidation");
+        assert!(asid < block);
+    }
+
+    /// The outgoing context is captured BEFORE anything can schedule.
+    #[test]
+    fn the_outgoing_context_is_captured_before_scheduling() {
+        let b = body();
+        let capture = b
+            .find("self.capture_outgoing_user_context_split(tid, frame)")
+            .expect("capture");
+        let block = b
+            .find("self.block_current_on_cpu_split(cpu)")
+            .expect("rank 1");
+        let commit = b.find("self.queue_advance_commit_split(").expect("advance");
+        assert!(capture < block && capture < commit);
+    }
+
+    /// The status write happens exactly ONCE, through the existing transition owner.
+    #[test]
+    fn the_status_write_happens_exactly_once() {
+        let b = body();
+        assert_eq!(
+            b.matches("apply_task_transition(").count(),
+            1,
+            "exactly one status write"
+        );
+        assert!(b.contains("TaskTransition::FaultRunningCurrent"));
+    }
+
+    /// The queue advance uses the U9-QA owner — no second selection policy is created.
+    #[test]
+    fn the_advance_uses_the_u9qa_selection_owner() {
+        let b = body();
+        assert!(b.contains("self.queue_advance_admit_split("));
+        assert!(b.contains("self.queue_advance_commit_split("));
+        for forbidden in [
+            "dispatch_next_task",
+            "dispatch_next_selection_on",
+            "local_dispatch_step_split_selection",
+            "dispatch_next_on",
+        ] {
+            assert!(
+                !b.contains(forbidden),
+                "the transition must not create a second selection policy: `{forbidden}`"
+            );
+        }
+    }
+
+    /// Admission precedes the irreversible scheduler mutation, so a refused advance still leaves
+    /// the task current.
+    #[test]
+    fn admission_precedes_the_irreversible_mutation() {
+        let b = body();
+        let admit = b.find("self.queue_advance_admit_split(").expect("admit");
+        let block = b
+            .find("self.block_current_on_cpu_split(cpu)")
+            .expect("rank 1");
+        assert!(admit < block);
+    }
+
+    /// There is NO broad fallback anywhere in the transition — re-entering the broad emitter
+    /// after a published report would publish a second one.
+    #[test]
+    fn there_is_no_broad_fallback_after_publication() {
+        let b = body();
+        assert!(!b.contains("with_cpu("), "no broad acquisition");
+        assert!(
+            !b.contains("emit_fault_report"),
+            "the transition must never re-enter report emission"
+        );
+    }
+
+    /// Non-atomicity is preserved: no rollback of a committed report is introduced, because the
+    /// broad path performs none.
+    #[test]
+    fn no_report_rollback_is_introduced() {
+        let b = body();
+        for rollback in [
+            "recv(",
+            "unsend",
+            "dequeue_report",
+            "retract",
+            "rollback_report",
+        ] {
+            assert!(
+                !b.contains(rollback),
+                "the transition must not roll back a published report: `{rollback}`"
+            );
+        }
+        // And every refusal variant is fail-closed, documented as retaining the report.
+        assert!(FAULT_SRC.contains("the already-published report is retained"));
+    }
+
+    /// Every refusal is typed and attributed on the wire.
+    #[test]
+    fn every_refusal_is_typed_and_attributed() {
+        let b = body();
+        for refusal in [
+            "T::RefusedIdentityChanged",
+            "T::RefusedTransitionRejected",
+            "T::RefusedVictimChanged",
+        ] {
+            assert!(b.contains(refusal), "must pin `{refusal}`");
+        }
+        assert!(b.contains("TERMINAL_FAULT_SPLIT_REFUSED"));
+        assert!(b.contains("TERMINAL_FAULT_SPLIT_COMMITTED"));
+    }
+
+    /// The scheduler must remove the task we validated; anything else is refused.
+    #[test]
+    fn the_removed_victim_is_verified() {
+        let b = body();
+        assert!(b.contains("if removed != Some(tid)"));
+        let check = b.find("if removed != Some(tid)").expect("victim check");
+        let apply = b.find("apply_task_transition(").expect("status write");
+        assert!(check < apply, "verify the victim before writing its status");
+    }
+}

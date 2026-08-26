@@ -3761,7 +3761,11 @@ impl SharedKernel {
     /// waiter, wake or barrier logic here. The removed TID is returned verbatim, `Some(0)`
     /// included, and `None` when the CPU has no current task. The guard is released when this
     /// returns, before the caller's `printk_emit_sync`.
-    #[cfg(target_arch = "x86_64")]
+    /// U9-FT3 §3: the `x86_64` cfg gate was removed. The body is architecture-NEUTRAL — it
+    /// validates the CPU and runs the scheduler's own `block_current_on(cpu)` under rank 1, and
+    /// touches nothing architecture-specific. The gate reflected where the U3 caller happened to
+    /// live, not where the transaction is sound, and the AArch64 terminal-fault transition needs
+    /// the same rank-1 step.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn block_current_on_cpu_split(
         &self,
@@ -4129,6 +4133,323 @@ impl SharedKernel {
     /// # Validation status
     /// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — called by
     ///   `try_split_vm_brk_shrink_into_frame` once per unmapped page.
+    /// U9-FT3 §3 — the split terminal task transition.
+    ///
+    /// Runs AFTER the buffered report is published (or after policy determined none was
+    /// required), and mirrors the broad `fault_current_task_with_fault` ordering step for step:
+    /// validate the victim at rank 2 BEFORE the irreversible scheduler mutation, capture the
+    /// outgoing context, clear `current` at rank 1, verify the scheduler removed the task we
+    /// validated, then apply `FaultRunningCurrent` at rank 2 and advance the queue.
+    ///
+    /// NON-ATOMICITY IS PRESERVED, NOT REPAIRED. If this refuses, the already-published report
+    /// stays published — exactly what the broad path does, since its emitter swallows failures
+    /// and its transition can refuse independently. No rollback of a committed report is
+    /// introduced, because the broad path performs none.
+    ///
+    /// FAIL-CLOSED. After the report is published there is no broad fallback: re-entering the
+    /// broad emitter would publish a SECOND report. Every refusal here leaves the task alive and
+    /// the trap returning through the existing path, and is attributed on the wire.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn commit_terminal_fault_transition_shared(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+        frame: &crate::kernel::trapframe::TrapFrame,
+    ) -> crate::kernel::boot::TerminalFaultTransition {
+        use crate::kernel::boot::TerminalFaultTransition as T;
+        // (1) Revalidate the EXACT incarnation at rank 2, and run the same transition barrier the
+        // broad path runs BEFORE the scheduler mutation — a check placed after `block_current`
+        // would be a check after an irreversible commit.
+        let validated = self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(t) = tcbs.iter().flatten().find(|t| t.tid.0 == tid) else {
+                return Err(T::RefusedIdentityChanged);
+            };
+            if t.asid != Some(asid) {
+                return Err(T::RefusedIdentityChanged);
+            }
+            if crate::kernel::task_transition::task_transition_would_be_accepted(
+                tcbs,
+                tid,
+                None,
+                crate::kernel::task_transition::TaskTransition::FaultRunningCurrent,
+            )
+            .is_err()
+            {
+                return Err(T::RefusedTransitionRejected);
+            }
+            Ok(())
+        });
+        if let Err(refusal) = validated {
+            crate::yarm_log!(
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=validate reason={:?}",
+                cpu.0,
+                tid,
+                refusal
+            );
+            return refusal;
+        }
+        // (2) Capture the outgoing user context BEFORE anything can schedule.
+        let captured = self.capture_outgoing_user_context_split(tid, frame);
+        // (3) Admit the queue advance before the irreversible scheduler mutation, so a refusal
+        // still leaves the task current.
+        let admitted = match self.queue_advance_admit_split(
+            cpu,
+            crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+        ) {
+            Ok(a) => a,
+            Err(refusal) => {
+                crate::yarm_log!(
+                    "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=admit reason={:?}",
+                    cpu.0,
+                    tid,
+                    refusal
+                );
+                return T::RefusedTransitionRejected;
+            }
+        };
+        // (4) rank 1 — clear `current`. Irreversible from here.
+        let removed = match self.block_current_on_cpu_split(cpu) {
+            Ok(r) => r,
+            Err(_) => return T::RefusedVictimChanged,
+        };
+        if removed != Some(tid) {
+            crate::yarm_log!(
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=block reason=victim_changed observed={:?}",
+                cpu.0,
+                tid,
+                removed
+            );
+            return T::RefusedVictimChanged;
+        }
+        // (5) rank 2 — the status write, exactly once, through the same transition owner.
+        let applied = self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::task_transition::apply_task_transition(
+                tcbs,
+                tid,
+                None,
+                crate::kernel::task_transition::TaskTransition::FaultRunningCurrent,
+            )
+            .is_ok()
+        });
+        if !applied {
+            crate::yarm_log!(
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=apply reason=transition_rejected",
+                cpu.0,
+                tid
+            );
+            return T::RefusedTransitionRejected;
+        }
+        // (6) The U9-QA selection owner performs the advance — no second selection policy.
+        let outcome = self.queue_advance_commit_split(cpu, tid, admitted);
+        let replacement = match outcome {
+            crate::kernel::boot::QueueAdvanceOutcome::Switch { incoming_tid, .. } => {
+                Some(incoming_tid)
+            }
+            // `ResumeSame` cannot occur here: the faulting task was just removed from `current`
+            // and marked `Faulted`, so it is not re-selectable. `TerminalIdle` means nothing is
+            // runnable and the architecture's existing idle path is entered.
+            crate::kernel::boot::QueueAdvanceOutcome::ResumeSame
+            | crate::kernel::boot::QueueAdvanceOutcome::TerminalIdle => None,
+        };
+        crate::yarm_log!(
+            "TERMINAL_FAULT_SPLIT_COMMITTED cpu={} tid={} captured={} replacement={:?}",
+            cpu.0,
+            tid,
+            u8::from(captured),
+            replacement
+        );
+        T::Committed {
+            faulted_tid: tid,
+            replacement,
+        }
+    }
+
+    /// U9-FT3 §1 — the read-only buffered fault-report admission preflight.
+    ///
+    /// Classifies whether this fault's report can be published on the BUFFERED path off-lock.
+    /// Only `BufferedEligible` may proceed; every other verdict leaves the unchanged broad path
+    /// to handle the fault exactly as it does today.
+    ///
+    /// The waiter check is deliberately AUTHORITATIVE and conservative: any present waiter
+    /// yields `WaiterPresent`, without consulting `is_task_recv_v2_blocked`. The broad emitter
+    /// takes its direct-delivery branch only when a waiter is BOTH present and recv-v2 blocked,
+    /// so refusing on mere presence refuses a superset — always safe, since the refusal simply
+    /// routes the fault back to the unchanged broad emitter which then makes the finer decision.
+    ///
+    /// Ranks: the caller's rank-2 policy facts are already released before this rank-3 snapshot
+    /// is taken; this function acquires IPC (rank 3) alone and mutates nothing.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn admit_buffered_fault_report_shared(
+        &self,
+        snapshot: &crate::kernel::boot::TerminalFaultPolicySnapshot,
+    ) -> crate::kernel::boot::BufferedFaultAdmission {
+        use crate::kernel::boot::BufferedFaultAdmission as A;
+        let Some(target) = snapshot.target else {
+            return A::NoRoute;
+        };
+        let endpoint_idx = target.endpoint_idx;
+        self.with_ipc_split_mut(|ipc| {
+            // Exact generation: a slot that vanished or whose generation moved is stale.
+            let Some(&generation) = ipc.endpoint_generations.get(endpoint_idx) else {
+                return A::EndpointStale { endpoint_idx };
+            };
+            if generation != target.generation {
+                return A::EndpointStale { endpoint_idx };
+            }
+            let Some(Some(storage)) = ipc.endpoints.get(endpoint_idx) else {
+                return A::EndpointStale { endpoint_idx };
+            };
+            let endpoint = crate::kernel::boot::kernel_ref(storage);
+            // Authoritative waiter presence — see the conservatism note above.
+            if ipc.endpoint_waiter_present(endpoint_idx) {
+                return A::WaiterPresent { endpoint_idx };
+            }
+            let queued_before = endpoint.queued();
+            if queued_before >= endpoint.capacity() {
+                return A::BufferFull { endpoint_idx };
+            }
+            A::BufferedEligible {
+                endpoint_idx,
+                generation,
+                queued_before,
+                via_fault_handler: target.via_fault_handler,
+            }
+        })
+    }
+
+    /// U9-FT3 §2 — the rank-3 buffered commit.
+    ///
+    /// REVALIDATES generation, waiter absence and capacity under the SAME acquisition that
+    /// enqueues, so a waiter arriving after the preflight can never receive a buffered report and
+    /// can never be skipped. Every refusal is raised BEFORE the enqueue, so broad fallback stays
+    /// legal; once the enqueue happens there is no way back.
+    ///
+    /// It cannot wake anyone and cannot write back to a receiver: `woke` is always false, which
+    /// is a VALID outcome on this path, not a degraded one. The payload is built by the same
+    /// `SupervisorFaultReportWire::encode` the broad emitter uses, so the bytes are identical.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn commit_buffered_fault_report_shared(
+        &self,
+        faulted_tid: u64,
+        fault: crate::kernel::trap::FaultInfo,
+        endpoint_idx: usize,
+        expected_generation: u64,
+        via_fault_handler: bool,
+    ) -> crate::kernel::boot::BufferedFaultCommit {
+        use crate::kernel::boot::BufferedFaultCommit as C;
+        let target = if via_fault_handler {
+            "fault-handler"
+        } else {
+            "supervisor"
+        };
+        // Encode OUTSIDE any lock — the same encoder, the same bytes.
+        let payload = crate::kernel::boot::SupervisorFaultReportWire {
+            faulting_tid: faulted_tid,
+            fault_addr: fault.addr.0,
+            access: fault.access,
+        }
+        .encode();
+        let Ok(msg) = crate::kernel::ipc::Message::new(0, &payload) else {
+            crate::yarm_log!("TASK_FAULT_REPORT_FAIL tid={} reason=message", faulted_tid);
+            return C::RefusedMessageBuild;
+        };
+        crate::yarm_log!(
+            "TASK_FAULT_REPORT_SENDER tid={} sender_tid=0 opcode={} len={}",
+            faulted_tid,
+            msg.opcode,
+            msg.len
+        );
+        // ONE rank-3 acquisition: revalidate, then enqueue. Nothing between them.
+        let outcome = self.with_ipc_split_mut(|ipc| {
+            let Some(&generation) = ipc.endpoint_generations.get(endpoint_idx) else {
+                return C::RefusedEndpointStale { endpoint_idx };
+            };
+            if generation != expected_generation {
+                return C::RefusedEndpointStale { endpoint_idx };
+            }
+            // A waiter that arrived since the preflight belongs to the broad emitter's direct
+            // path. Refuse BEFORE publishing anything.
+            if ipc.endpoint_waiter_present(endpoint_idx) {
+                return C::RefusedWaiterArrived { endpoint_idx };
+            }
+            let Some(Some(storage)) = ipc.endpoints.get_mut(endpoint_idx) else {
+                return C::RefusedEndpointStale { endpoint_idx };
+            };
+            let endpoint = crate::kernel::boot::kernel_mut(storage);
+            if endpoint.queued() >= endpoint.capacity() {
+                return C::RefusedBufferFull { endpoint_idx };
+            }
+            crate::yarm_log!(
+                "TASK_FAULT_REPORT_ENQUEUE_BEGIN tid={} endpoint={} generation={}",
+                faulted_tid,
+                endpoint_idx,
+                generation
+            );
+            // The single enqueue. `send` refusing here would mean the capacity check above
+            // disagreed with the queue itself; map it to the same typed refusal, still
+            // pre-publication.
+            if endpoint.send(msg).is_err() {
+                return C::RefusedBufferFull { endpoint_idx };
+            }
+            let queued_after = endpoint.queued();
+            C::Buffered {
+                endpoint_idx,
+                generation,
+                queued_after,
+                woke: false,
+            }
+        });
+        match outcome {
+            C::Buffered {
+                endpoint_idx,
+                generation,
+                queued_after,
+                ..
+            } => {
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_QUEUE_STATE_AFTER endpoint={} waiters=0 queued={}",
+                    endpoint_idx,
+                    queued_after
+                );
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_ENQUEUE_OK tid={} endpoint={} queued={} woke=0",
+                    faulted_tid,
+                    endpoint_idx,
+                    queued_after
+                );
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_SENT tid={} target={}",
+                    faulted_tid,
+                    target
+                );
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_SENT tid={} target={} endpoint={} generation={}",
+                    faulted_tid,
+                    target,
+                    endpoint_idx,
+                    generation
+                );
+            }
+            C::RefusedWaiterArrived { endpoint_idx }
+            | C::RefusedBufferFull { endpoint_idx }
+            | C::RefusedEndpointStale { endpoint_idx } => {
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_SPLIT_REFUSED tid={} endpoint={} reason={}",
+                    faulted_tid,
+                    endpoint_idx,
+                    match outcome {
+                        C::RefusedWaiterArrived { .. } => "waiter_arrived",
+                        C::RefusedBufferFull { .. } => "buffer_full",
+                        _ => "endpoint_stale",
+                    }
+                );
+            }
+            C::RefusedMessageBuild => {}
+        }
+        outcome
+    }
+
     /// U9-FT2 §3 — the OFF-LOCK terminal FaultPolicy snapshot twin.
     ///
     /// The caller supplies the EXACT `{tid, asid}` it classified against; this refuses if either

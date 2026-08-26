@@ -17,7 +17,7 @@ mod exec_state;
 // U9-QA §1: the queue-advance apply convention is named by callers outside this module (the
 // pre-lock split route), so it is re-exported alongside the transaction it parameterises.
 #[cfg_attr(feature = "hosted-dev", allow(unused_imports))]
-pub(crate) use exec_state::QueueAdvanceApply;
+pub(crate) use exec_state::{QueueAdvanceApply, QueueAdvanceOutcome};
 mod fault_endpoint_state;
 mod fault_state;
 // U9-FT2 §2: the ONE PageFault classification evaluator and its named fact types are
@@ -26,10 +26,11 @@ mod fault_state;
 // re-deriving the policy against the split seams.
 #[cfg_attr(feature = "hosted-dev", allow(unused_imports))]
 pub(crate) use fault_state::{
-    FaultReportTarget, PageFaultClass, PageFaultFacts, TerminalFaultPolicyRefusal,
-    TerminalFaultPolicySnapshot, evaluate_cow_marked, evaluate_demand_backed_region,
-    evaluate_fault_policy, evaluate_fault_report_route, evaluate_page_fault_class,
-    page_fault_addr_is_kernel_space,
+    BufferedFaultAdmission, BufferedFaultCommit, FaultReportTarget, PageFaultClass, PageFaultFacts,
+    SUPERVISOR_FAULT_REPORT_WIRE_LEN, SupervisorFaultReportWire, TerminalFaultPolicyRefusal,
+    TerminalFaultPolicySnapshot, TerminalFaultTransition, evaluate_cow_marked,
+    evaluate_demand_backed_region, evaluate_fault_policy, evaluate_fault_report_route,
+    evaluate_page_fault_class, page_fault_addr_is_kernel_space,
 };
 mod ipc_state;
 // Stage 200C2B: the reply-timeout completion transaction abstraction + single generic
