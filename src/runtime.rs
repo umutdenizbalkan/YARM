@@ -4129,6 +4129,95 @@ impl SharedKernel {
     /// # Validation status
     /// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — called by
     ///   `try_split_vm_brk_shrink_into_frame` once per unmapped page.
+    /// U9-FT2 §3 — the OFF-LOCK terminal FaultPolicy snapshot twin.
+    ///
+    /// The caller supplies the EXACT `{tid, asid}` it classified against; this refuses if either
+    /// coordinate no longer matches, so a snapshot can never describe a departed incarnation.
+    /// There is no ambient current-task read: the tid is a parameter, and the CPU is one too
+    /// because the current-task check needs it — but the POLICY itself does not depend on the
+    /// CPU, exactly as in the broad form.
+    ///
+    /// Ranks: scheduler (1) for the explicit-CPU current task, task (2) for
+    /// `{asid, status, override}`, fault (8) for the default policy and route, IPC (3) for the
+    /// endpoint generation and queue state. Each is taken and released separately; none nests.
+    ///
+    /// ONE POLICY EVALUATOR: the override-then-default rule and the route rule are
+    /// `evaluate_fault_policy` and `evaluate_fault_report_route`, the same owners the broad
+    /// `KernelState::read_terminal_fault_policy_split` delegates to.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn read_terminal_fault_policy_shared(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Result<
+        crate::kernel::boot::TerminalFaultPolicySnapshot,
+        crate::kernel::boot::TerminalFaultPolicyRefusal,
+    > {
+        use crate::kernel::boot as fs;
+        // Rank 1 — the current task on the EXPLICIT cpu, matching the broad form's use of
+        // `current_tid()` to decide whose policy applies.
+        let Some(current) = self.current_tid_split_read(cpu) else {
+            return Err(fs::TerminalFaultPolicyRefusal::NoCurrentTask);
+        };
+        if current != tid {
+            return Err(fs::TerminalFaultPolicyRefusal::NotCurrentTask);
+        }
+        // Rank 2 — identity, status and the policy override, in ONE task acquisition.
+        let Some((found_asid, status, task_override)) = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| (t.asid, t.status, t.fault_policy_override))
+        }) else {
+            return Err(fs::TerminalFaultPolicyRefusal::TaskNotFound);
+        };
+        // EXACT ASID revalidation against the coordinate the caller classified with.
+        if found_asid != Some(asid) {
+            return Err(fs::TerminalFaultPolicyRefusal::NotCurrentTask);
+        }
+        // Rank 8 — the kernel default policy and the endpoint route, from the fault owner.
+        let (kernel_default, route) = self.with_fault_split_mut(|faults| {
+            (
+                faults.fault_policy,
+                crate::kernel::boot::evaluate_fault_report_route(
+                    faults.fault_handler_endpoint,
+                    faults.supervisor_endpoint,
+                ),
+            )
+        });
+        // THE one policy rule, shared with the broad form.
+        let policy = crate::kernel::boot::evaluate_fault_policy(task_override, kernel_default);
+        // Rank 3 — the endpoint's REAL generation and queue state. A route naming a slot that no
+        // longer exists yields `None`: the stale-supervisor case the emitter refuses to publish
+        // into. No generation is fabricated.
+        let target = route.and_then(|(endpoint_idx, via_fault_handler)| {
+            self.with_ipc_split_mut(|ipc| {
+                let generation = *ipc.endpoint_generations.get(endpoint_idx)?;
+                let queued_before = ipc
+                    .endpoints
+                    .get(endpoint_idx)?
+                    .as_ref()
+                    .map(|ep| crate::kernel::boot::kernel_ref(ep).queued())?;
+                let waiters_before = usize::from(ipc.endpoint_waiter_present(endpoint_idx));
+                Some(fs::FaultReportTarget {
+                    endpoint_idx,
+                    generation,
+                    via_fault_handler,
+                    waiters_before,
+                    queued_before,
+                })
+            })
+        });
+        Ok(fs::TerminalFaultPolicySnapshot {
+            tid,
+            asid: found_asid,
+            status,
+            policy,
+            target,
+        })
+    }
+
     /// U9-FT2 §2 — the OFF-LOCK PageFault classification twin.
     ///
     /// The broad `KernelState::classify_page_fault_split` cannot be called from pre-lock code:

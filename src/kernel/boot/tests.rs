@@ -141812,3 +141812,196 @@ mod u9ft2_one_evaluator {
         assert!(!evaluate_demand_backed_region(None, None, 0x1000));
     }
 }
+
+/// U9-FT2 §3/§9 — one terminal-policy evaluator, shared by the broad and off-lock forms.
+mod u9ft2_policy_twin {
+    use crate::kernel::boot::{evaluate_fault_policy, evaluate_fault_report_route};
+    use crate::kernel::task::FaultPolicy;
+
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const ENDPOINT_SRC: &str = include_str!("fault_endpoint_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn shared_body() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn read_terminal_fault_policy_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the shared policy twin")
+    }
+
+    /// ONE policy rule. Both forms delegate; neither re-derives override-then-default.
+    #[test]
+    fn one_policy_rule_owner() {
+        assert_eq!(
+            FAULT_SRC
+                .matches("pub(crate) fn evaluate_fault_policy(")
+                .count(),
+            1
+        );
+        assert!(ENDPOINT_SRC.contains("evaluate_fault_policy(task_override, kernel_default)"));
+        assert!(shared_body().contains("evaluate_fault_policy(task_override, kernel_default)"));
+        // The broad owner no longer inlines `.unwrap_or(` over the override.
+        let broad = ENDPOINT_SRC
+            .split("pub(crate) fn effective_fault_policy_for(&self, tid: u64) -> FaultPolicy {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("broad policy read");
+        assert!(
+            !broad.contains(".unwrap_or(self.with_fault_state"),
+            "the rule must live in the owner, not the fact-gatherer"
+        );
+    }
+
+    /// ONE route rule. Both the broad snapshot and the twin delegate to it.
+    #[test]
+    fn one_route_rule_owner() {
+        assert_eq!(
+            FAULT_SRC
+                .matches("pub(crate) fn evaluate_fault_report_route(")
+                .count(),
+            1
+        );
+        assert!(FAULT_SRC.contains("evaluate_fault_report_route(faults.fault_handler_endpoint"));
+        assert!(shared_body().contains("evaluate_fault_report_route("));
+    }
+
+    /// The rules themselves, exercised directly over every variant.
+    #[test]
+    fn the_policy_and_route_rules_are_correct() {
+        // Override wins when present; default otherwise.
+        assert_eq!(
+            evaluate_fault_policy(Some(FaultPolicy::NotifyAndContinue), FaultPolicy::KillTask),
+            FaultPolicy::NotifyAndContinue
+        );
+        assert_eq!(
+            evaluate_fault_policy(Some(FaultPolicy::KillTask), FaultPolicy::NotifyAndContinue),
+            FaultPolicy::KillTask
+        );
+        assert_eq!(
+            evaluate_fault_policy(None, FaultPolicy::KillTask),
+            FaultPolicy::KillTask
+        );
+        assert_eq!(
+            evaluate_fault_policy(None, FaultPolicy::NotifyAndContinue),
+            FaultPolicy::NotifyAndContinue
+        );
+        // Fault-handler is preferred; supervisor is the fallback; neither is "no route".
+        assert_eq!(
+            evaluate_fault_report_route(Some(7), Some(3)),
+            Some((7, true))
+        );
+        assert_eq!(evaluate_fault_report_route(None, Some(3)), Some((3, false)));
+        assert_eq!(evaluate_fault_report_route(Some(7), None), Some((7, true)));
+        assert_eq!(evaluate_fault_report_route(None, None), None);
+    }
+
+    /// The twin refuses on every stale-identity case BEFORE reading policy or route.
+    #[test]
+    fn the_twin_refuses_stale_identity_before_reading_policy() {
+        let b = shared_body();
+        for refusal in [
+            "TerminalFaultPolicyRefusal::NoCurrentTask",
+            "TerminalFaultPolicyRefusal::NotCurrentTask",
+            "TerminalFaultPolicyRefusal::TaskNotFound",
+        ] {
+            assert!(b.contains(refusal), "must pin `{refusal}`");
+        }
+        // ASID mismatch is refused explicitly, against the coordinate the caller classified with.
+        assert!(
+            b.contains("if found_asid != Some(asid)"),
+            "the twin must revalidate the exact ASID"
+        );
+        let last_refusal = b.rfind("TerminalFaultPolicyRefusal::").expect("refusal");
+        let policy_read = b.find("with_fault_split_mut").expect("the rank-8 read");
+        assert!(
+            last_refusal < policy_read,
+            "every identity refusal must precede the policy/route read"
+        );
+    }
+
+    /// The twin takes an explicit CpuId for the current-task check, never an ambient read, and
+    /// the POLICY still does not depend on the CPU.
+    #[test]
+    fn the_twin_is_explicit_cpu_with_cpu_independent_policy() {
+        let b = shared_body();
+        assert!(b.contains("self.current_tid_split_read(cpu)"));
+        assert!(!b.contains("current_cpu()"), "no ambient current-CPU read");
+        // `cpu` is used only for the current-task lookup, never passed to the policy rule.
+        assert!(
+            b.contains("evaluate_fault_policy(task_override, kernel_default)"),
+            "the policy rule takes no CPU"
+        );
+    }
+
+    /// No generation is fabricated: the endpoint generation is read from the IPC owner.
+    #[test]
+    fn the_twin_fabricates_no_generation() {
+        let b = shared_body();
+        assert!(b.contains("ipc.endpoint_generations.get(endpoint_idx)"));
+        for invented in [
+            "generation: 0",
+            "wrapping_add",
+            "task_generation",
+            "incarnation",
+        ] {
+            assert!(
+                !b.contains(invented),
+                "no fabricated generation: `{invented}`"
+            );
+        }
+    }
+
+    /// The twin mutates nothing and takes no broad acquisition, despite using `_split_mut` seams
+    /// (which are the only accessors the split architecture provides).
+    #[test]
+    fn the_twin_mutates_nothing_and_takes_no_broad_lock() {
+        let b = shared_body();
+        assert!(!b.contains("with_cpu("), "no broad acquisition");
+        for mutator in [
+            "push(",
+            "insert(",
+            "remove(",
+            "= true",
+            "= false",
+            "take_endpoint_waiter",
+            "send(",
+            "wake_",
+            "dispatch_",
+        ] {
+            assert!(
+                !b.contains(mutator),
+                "the policy read must not mutate: `{mutator}`"
+            );
+        }
+    }
+
+    /// Rank discipline: four sequential acquisitions, none nested inside another.
+    #[test]
+    fn the_twin_takes_no_nested_acquisition() {
+        let b = shared_body();
+        let task = b.find("self.with_task_tcbs_split_mut(").expect("rank 2");
+        let fault = b.find("self.with_fault_split_mut(").expect("rank 8");
+        let ipc = b.find("self.with_ipc_split_mut(").expect("rank 3");
+        assert!(task < fault && fault < ipc);
+        let task_closure = b
+            .split("self.with_task_tcbs_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("}) else").next())
+            .expect("task closure");
+        assert!(
+            !task_closure.contains("with_fault_split_mut")
+                && !task_closure.contains("with_ipc_split_mut"),
+            "the rank-2 read must not enclose a higher-rank acquisition"
+        );
+        let fault_closure = b
+            .split("self.with_fault_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("});").next())
+            .expect("fault closure");
+        assert!(
+            !fault_closure.contains("with_ipc_split_mut"),
+            "the rank-8 read must not enclose the rank-3 acquisition"
+        );
+    }
+}

@@ -53,6 +53,34 @@ pub(crate) struct PageFaultFacts {
     pub demand_region: bool,
 }
 
+/// U9-FT2 §3 — THE one effective-fault-policy rule.
+///
+/// The task's `fault_policy_override` wins if set, otherwise the kernel default. Both
+/// `KernelState::effective_fault_policy_for` and the off-lock
+/// `SharedKernel::read_terminal_fault_policy_shared` delegate here, so the rule exists once.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn evaluate_fault_policy(
+    task_override: Option<FaultPolicy>,
+    kernel_default: FaultPolicy,
+) -> FaultPolicy {
+    task_override.unwrap_or(kernel_default)
+}
+
+/// U9-FT2 §3 — THE one fault-report route rule.
+///
+/// Exactly what `emit_fault_report_for_fault` resolves: the fault-handler endpoint if one is
+/// registered, otherwise the supervisor endpoint. Returns `(endpoint_idx, via_fault_handler)`;
+/// `None` is the `TASK_FAULT_NO_SUPERVISOR_ROUTE` case.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn evaluate_fault_report_route(
+    fault_handler_endpoint: Option<usize>,
+    supervisor_endpoint: Option<usize>,
+) -> Option<(usize, bool)> {
+    fault_handler_endpoint
+        .map(|idx| (idx, true))
+        .or_else(|| supervisor_endpoint.map(|idx| (idx, false)))
+}
+
 /// U9-FT2 §2 — THE one demand-backed-region policy, as a pure function of gathered facts.
 ///
 /// `KernelState::fault_addr_in_demand_backed_region` and the off-lock twin both delegate here, so
@@ -452,10 +480,7 @@ impl KernelState {
         // Rank 8 — the endpoint route, resolved exactly as the existing emitter resolves it:
         // fault-handler first, then supervisor.
         let route = self.with_fault_state(|faults| {
-            faults
-                .fault_handler_endpoint
-                .map(|idx| (idx, true))
-                .or_else(|| faults.supervisor_endpoint.map(|idx| (idx, false)))
+            evaluate_fault_report_route(faults.fault_handler_endpoint, faults.supervisor_endpoint)
         });
         // Rank 3 — the endpoint's REAL generation and queue state. A route that names an
         // endpoint slot which no longer exists yields `None`, exactly the stale-supervisor case
