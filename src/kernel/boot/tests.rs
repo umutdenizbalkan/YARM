@@ -141056,3 +141056,238 @@ mod u9tm_proof_gate {
         }
     }
 }
+
+/// U9-PF §1 — the pure Phase-A classification and the authorized routing matrix.
+mod u9pf_classification {
+    use crate::kernel::boot::fault_state::{PageFaultClass, PageFaultRoute, page_fault_route_for};
+
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    fn classifier_body() -> &'static str {
+        FAULT_SRC
+            .split("pub(crate) fn classify_page_fault_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the Phase-A classifier")
+    }
+
+    /// The classifier takes `&self`. A `&mut self` receiver would make PTE, task, capability and
+    /// refcount mutation expressible; `&self` makes it a compile error.
+    #[test]
+    fn the_classifier_is_read_only_by_type() {
+        let head = FAULT_SRC
+            .split("pub(crate) fn classify_page_fault_split(")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .expect("signature");
+        assert!(
+            head.contains("&self,") && !head.contains("&mut self"),
+            "the Phase-A classifier must take &self, not &mut self: {head}"
+        );
+    }
+
+    /// It must not allocate, map, revoke or otherwise mutate, even through an interior-mutability
+    /// seam. Pin the absence of every mutating owner by name.
+    #[test]
+    fn the_classifier_calls_no_mutating_owner() {
+        let body = classifier_body();
+        for forbidden in [
+            "alloc_anonymous_memory_object",
+            "map_user_page",
+            "revoke_capability_in_cnode",
+            "clear_cow_page",
+            "copy_frame_contents_for_cow",
+            "invalidate_page",
+            "flush_tlb_local_full",
+            "repair_user_path_intermediates",
+            "_mut(",
+            "fault_current_task",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the pure classifier must not reference `{forbidden}`"
+            );
+        }
+    }
+
+    /// It consults exactly the two PURE verdict predicates the broad arm consults.
+    #[test]
+    fn the_classifier_consults_the_two_pure_predicates() {
+        let body = classifier_body();
+        assert!(body.contains("self.is_cow_page(asid, page)"));
+        assert!(body.contains("self.fault_addr_in_demand_backed_region(tid, page.0)"));
+        // Both are &self in their own definitions — the property this extraction rests on.
+        assert!(FAULT_SRC.contains("fn fault_addr_in_demand_backed_region(&self,"));
+    }
+
+    /// COW is tested BEFORE demand and ONLY for writes, mirroring the broad arm's order. If the
+    /// two orders diverged, the split and broad routes could classify one fault differently.
+    #[test]
+    fn cow_is_screened_before_demand_and_only_for_writes() {
+        let body = classifier_body();
+        let cow_at = body.find("PageFaultClass::CowCandidate").expect("cow arm");
+        let demand_at = body
+            .find("PageFaultClass::DemandCandidate")
+            .expect("demand arm");
+        assert!(
+            cow_at < demand_at,
+            "COW must be screened before demand, as the broad arm does"
+        );
+        let cow_guard = &body[..cow_at];
+        assert!(
+            cow_guard.contains("matches!(fault.access, FaultAccess::Write) && cow_marked"),
+            "the COW arm must be gated on a WRITE access and the COW mark"
+        );
+    }
+
+    /// The kernel/fallback boundary is exactly the one current policy already uses, and no
+    /// privilege-origin bit is invented (FaultInfo carries none).
+    #[test]
+    fn the_kernel_boundary_is_the_existing_one() {
+        let body = classifier_body();
+        assert!(body.contains("page.0 >= crate::kernel::vm::KERNEL_SPACE_BASE"));
+        assert!(body.contains("let Some(tid) = self.current_tid()"));
+        assert!(body.contains("let Some(asid) = self.task_asid(tid)"));
+        // Check CODE, not prose: the body's own comments legitimately discuss the absent
+        // privilege bit, so strip comment lines before looking for an invented identifier.
+        let code: alloc::string::String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for invented in ["is_user_origin", "privilege", "from_user", "user_mode_bit"] {
+            assert!(
+                !code.contains(invented),
+                "no privilege-origin bit may be invented: `{invented}`"
+            );
+        }
+    }
+
+    /// THE ROUTING MATRIX, pinned exhaustively for all three ports.
+    #[test]
+    fn the_routing_matrix_is_exactly_the_witnessed_subset() {
+        use PageFaultClass::*;
+        use PageFaultRoute::*;
+        let classes = [
+            CowCandidate,
+            DemandCandidate,
+            TerminallyUnhandled,
+            KernelOrAbsentTask,
+        ];
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            for class in classes {
+                let got = page_fault_route_for(arch, class);
+                let want = match (arch, class) {
+                    ("x86_64", CowCandidate) => SplitCow,
+                    ("aarch64", TerminallyUnhandled) => SplitTerminal,
+                    _ => Broad,
+                };
+                assert_eq!(got, want, "route drifted for arch={arch} class={class:?}");
+            }
+        }
+    }
+
+    /// EVERY demand candidate stays broad on EVERY architecture — the class has zero live
+    /// witnesses, so U9-PF routes none of it. This is the guard that must fail if a later
+    /// increment routes demand without first providing a witness.
+    #[test]
+    fn every_demand_candidate_stays_broad() {
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert_eq!(
+                page_fault_route_for(arch, PageFaultClass::DemandCandidate),
+                PageFaultRoute::Broad,
+                "demand must stay broad on {arch}: the class has no live witness"
+            );
+        }
+    }
+
+    /// The two split routes are claimed for exactly ONE architecture each, never widened to an
+    /// architecture whose witness does not exist.
+    #[test]
+    fn neither_split_route_is_claimed_beyond_its_witness() {
+        assert_eq!(
+            page_fault_route_for("aarch64", PageFaultClass::CowCandidate),
+            PageFaultRoute::Broad,
+            "AArch64 has no COW witness"
+        );
+        assert_eq!(
+            page_fault_route_for("riscv64", PageFaultClass::CowCandidate),
+            PageFaultRoute::Broad,
+            "RISC-V has no COW witness"
+        );
+        assert_eq!(
+            page_fault_route_for("x86_64", PageFaultClass::TerminallyUnhandled),
+            PageFaultRoute::Broad,
+            "x86_64 has no terminal PageFault witness"
+        );
+        assert_eq!(
+            page_fault_route_for("riscv64", PageFaultClass::TerminallyUnhandled),
+            PageFaultRoute::Broad,
+            "RISC-V has no terminal PageFault witness"
+        );
+    }
+}
+
+/// U9-PF §7 — the demand-page blocker, pinned as an UNRESOLVED prerequisite.
+mod u9pf_demand_blocker {
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    fn demand_body() -> &'static str {
+        FAULT_SRC
+            .split("pub(crate) fn try_handle_demand_page_fault(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the demand handler")
+    }
+
+    /// The demand handler still mints a capability and then maps, with the map failure
+    /// propagating by `?`. There is NO revoke on that path, so a map failure leaks the freshly
+    /// minted MemoryObject cap.
+    ///
+    /// This test does NOT freeze the leak as desired behaviour. It records an unresolved
+    /// prerequisite: a future demand-page increment must repair this rollback AND provide a live
+    /// witness before any demand route may be retired. If the rollback is repaired, this test
+    /// SHOULD fail and be replaced by a positive rollback assertion.
+    #[test]
+    fn demand_map_failure_rollback_is_an_unresolved_prerequisite() {
+        let body = demand_body();
+        let alloc_at = body
+            .find("self.alloc_anonymous_memory_object()?")
+            .expect("the demand allocation");
+        let map_at = body
+            .find("self.map_user_page_in_asid_with_caps(")
+            .expect("the demand mapping");
+        assert!(alloc_at < map_at, "allocation precedes mapping");
+        let between_and_after = &body[alloc_at..];
+        assert!(
+            !between_and_after.contains("revoke"),
+            "UNRESOLVED PREREQUISITE RESOLVED: the demand map-failure path now revokes. \
+             Replace this guard with a positive rollback assertion and re-derive the \
+             demand-page blocker record in the owner documents."
+        );
+    }
+
+    /// The three COW revoke obligations are all still present and accounted for. None may be
+    /// silently dropped by a later edit.
+    #[test]
+    fn all_three_cow_revoke_obligations_remain() {
+        const MEM_SRC: &str = include_str!("memory_state.rs");
+        let cow = MEM_SRC
+            .split("pub(crate) fn try_handle_cow_fault(")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub fn map_user_page(").next())
+            .expect("the COW handler");
+        assert_eq!(
+            cow.matches("revoke_capability_in_cnode(cnode, new_mem_cap)")
+                .count(),
+            3,
+            "all three COW revoke obligations (resolve_phys, copy_frame, remap) must remain"
+        );
+        for reason in ["reason=resolve_phys", "reason=copy_frame", "reason=remap"] {
+            assert!(
+                cow.contains(reason),
+                "the COW rollback attribution `{reason}` must remain"
+            );
+        }
+    }
+}
