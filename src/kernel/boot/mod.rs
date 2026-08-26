@@ -14,6 +14,9 @@ mod defs;
 mod delegation_state;
 mod driver_state;
 mod exec_state;
+// U9-QA §1: the queue-advance apply convention is named by callers outside this module (the
+// pre-lock split route), so it is re-exported alongside the transaction it parameterises.
+pub(crate) use exec_state::QueueAdvanceApply;
 mod fault_endpoint_state;
 mod fault_state;
 mod ipc_state;

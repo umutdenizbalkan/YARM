@@ -537,17 +537,21 @@ fn drain_switch_plan_stash(
 /// drains. Rather than duplicate the clear at each, this type owns it: `settle` clears exactly
 /// once and `Drop` calls `settle`, so every RETURNING path is covered without a written clear.
 ///
+/// U9-QA §2 (RISC-V): the RISC-V wrapper `handle_riscv_trap_entry_shared` owns the same window
+/// for the same reason and uses this same type, so there is ONE flag lifecycle in the tree rather
+/// than one per bridge.
+///
 /// `Drop` cannot cover a DIVERGING path — the drains' idle and fatal landings never return, so
 /// they never unwind. That is why `settle` is also called explicitly at the single point after
 /// the broad dispatcher and before the drains: by the time any divergence is reachable, the
 /// window is already closed, and the later `Drop` is a no-op.
-struct TrapPathWindow {
+pub(crate) struct TrapPathWindow {
     cpu_idx: usize,
     settled: core::cell::Cell<bool>,
 }
 
 impl TrapPathWindow {
-    fn establish(cpu: CpuId) -> Self {
+    pub(crate) fn establish(cpu: CpuId) -> Self {
         let cpu_idx = cpu.0 as usize;
         if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
             crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
@@ -561,7 +565,7 @@ impl TrapPathWindow {
 
     /// Close the window. Idempotent by construction, so an explicit call before a divergence
     /// and the `Drop` that follows a return together still clear it exactly once.
-    fn settle(&self) {
+    pub(crate) fn settle(&self) {
         if self.settled.replace(true) {
             return;
         }

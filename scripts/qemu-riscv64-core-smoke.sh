@@ -701,18 +701,30 @@ if (( QEMU_SMP >= 2 )); then
   fi
 fi
 
-# Stage 196C: the RISC-V split dispatcher may service DebugLog (NR 15) and FutexWake
-# (NR 10) ONLY. Any `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is neither 15
-# nor 10 means another class was wrongly retired off the global lock. Compare total vs
-# allowed (nr=15 + nr=10) counts.
+# Stage 196C + U9-QA §2: the RISC-V split dispatcher may service DebugLog (NR 15), FutexWake
+# (NR 10) and FutexWait (NR 9) ONLY. NR 15 and NR 10 are NON-SWITCHING and return early; NR 9 is
+# the one SWITCHING class — it publishes its block pre-lock and settles through the existing
+# Stage 196E drain, which is why its lines read `result=queue_advance_committed` rather than
+# `result=ok`. Any `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is none of the three
+# means another class was wrongly retired off the global lock.
 riscv_split_total=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=" "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr15=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr10=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=10 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr9=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_total=${riscv_split_total:-0}
 riscv_split_nr15=${riscv_split_nr15:-0}
 riscv_split_nr10=${riscv_split_nr10:-0}
-if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 )); then
-  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog/non-FutexWake syscall (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10})"
+riscv_split_nr9=${riscv_split_nr9:-0}
+# Every NR 9 line must be a committed queue advance — never an early return, which for a
+# switching class would mean returning through the parked caller's own frame.
+riscv_split_nr9_committed=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 .*result=queue_advance_committed" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr9_committed=${riscv_split_nr9_committed:-0}
+if (( riscv_split_nr9 != riscv_split_nr9_committed )); then
+  echo "[fail] RISC-V FutexWait split did not commit a queue advance (nr9=${riscv_split_nr9} committed=${riscv_split_nr9_committed})"
+  failures=$((failures + 1))
+fi
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 )); then
+  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog/FutexWake/FutexWait syscall (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9})"
   failures=$((failures + 1))
 fi
 
@@ -816,11 +828,21 @@ fi
 # in userspace + wakes A via split FutexWake (count 1), A resumes once. NO Yield/NR27 marker appears.
 if [[ "$FUTEX_WAIT_ORACLE" == "1" ]]; then
   FUTEX_WAIT_PATTERNS=(
-    "RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"
-    "RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0 tid="
-    "RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid="
-    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0 outgoing="
-    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu=0"
+    # U9-QA §2: FutexWait now publishes its block PRE-LOCK, so the five in-lock attestations this
+    # list used to require are deliberately absent — §3 of the directive requires exactly that
+    # ("no in-lock FutexWait production marker"). Each is replaced by its pre-lock counterpart,
+    # and the set is strictly stronger: the broad dispatcher is SKIPPED entirely rather than
+    # bypassed from inside the handler it already entered.
+    #   RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON        -> FUTEX_WAIT_SPLIT_BEGIN
+    #   RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN     -> QUEUE_ADVANCING_DISPATCH_DEFERRED
+    #   RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK-> FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK
+    #   RISCV_FUTEX_WAIT_HANDLER_BYPASS_{BEGIN,DONE} -> result=queue_advance_committed
+    #                                                 + QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED
+    "FUTEX_WAIT_SPLIT_BEGIN"
+    "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid="
+    "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid="
+    "result=queue_advance_committed outgoing="
+    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed"
     "RISCV_FUTEX_WAIT_DISPATCH_DRAIN_BEGIN cpu=0"
     "RISCV_FUTEX_WAIT_DISPATCH_LOCK_DROPPED_OK cpu=0"
     "RISCV_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid="
@@ -865,11 +887,21 @@ fi
 # RISC-V idle loop entered. The blocked caller stays Blocked and current stays None.
 if [[ "$FUTEX_WAIT_IDLE_ORACLE" == "1" ]]; then
   FUTEX_WAIT_IDLE_PATTERNS=(
-    "RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"
-    "RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0 tid="
-    "RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid="
-    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0 outgoing="
-    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu=0"
+    # U9-QA §2: FutexWait now publishes its block PRE-LOCK, so the five in-lock attestations this
+    # list used to require are deliberately absent — §3 of the directive requires exactly that
+    # ("no in-lock FutexWait production marker"). Each is replaced by its pre-lock counterpart,
+    # and the set is strictly stronger: the broad dispatcher is SKIPPED entirely rather than
+    # bypassed from inside the handler it already entered.
+    #   RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON        -> FUTEX_WAIT_SPLIT_BEGIN
+    #   RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN     -> QUEUE_ADVANCING_DISPATCH_DEFERRED
+    #   RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK-> FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK
+    #   RISCV_FUTEX_WAIT_HANDLER_BYPASS_{BEGIN,DONE} -> result=queue_advance_committed
+    #                                                 + QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED
+    "FUTEX_WAIT_SPLIT_BEGIN"
+    "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid="
+    "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid="
+    "result=queue_advance_committed outgoing="
+    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed"
     "RISCV_FUTEX_WAIT_DISPATCH_DRAIN_BEGIN cpu=0"
     "RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=0"
     "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu=0"

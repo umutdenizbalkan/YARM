@@ -344,7 +344,13 @@ fn try_split_futex_wait_into_frame(
         );
         return D::NotHandled;
     }
-    if let Err(refusal) = shared.queue_advance_admit_split(cpu) {
+    // The FutexWait drains apply through the EXACT-TOKEN resume on all three architectures — they
+    // stash nothing and switch no kernel context — so admission is asked that convention's
+    // preconditions, not the stash's.
+    if let Err(refusal) = shared.queue_advance_admit_split(
+        cpu,
+        crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+    ) {
         crate::yarm_log!(
             "FUTEX_WAIT_SPLIT_REFUSED tid={} reason={:?} cpu={}",
             tid,

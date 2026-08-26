@@ -209,6 +209,28 @@ pub(crate) enum QueueAdvanceOutcome {
     TerminalIdle,
 }
 
+/// U9-QA §1 — HOW a consumer will apply the advance it is admitted for.
+///
+/// The transaction owns ONE selection policy, but the architectures have two established ways of
+/// putting the selected task on the CPU, and they have different preconditions. Admission asked
+/// only the first one's questions, which made it refuse RISC-V outright — for a reason that is
+/// true of the stash and false of the resume RISC-V actually uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueAdvanceApply {
+    /// The Stage 117 switch-plan stash, drained by `trap_entry::drain_switch_plan_stash`, which
+    /// performs `switch_frames` between two KERNEL contexts. The stash gate itself opens with
+    /// `!cfg!(target_arch = "riscv64")`, so this convention is x86_64/AArch64 only.
+    StashedKernelSwitch,
+    /// The EXACT-TOKEN post-lock resume that the FutexWait, Yield and D2 drains already perform on
+    /// all three architectures: the incoming task's address space is activated and its saved USER
+    /// context is applied directly to the live trap frame. No stash, no `switch_frames`, and no
+    /// kernel-context switch — so none of the stash's preconditions apply to it.
+    ///
+    /// x86_64 `x86_post_lock_resume_marked_incoming`, AArch64
+    /// `direct_dispatch_resume_incoming_core`, RISC-V `direct_dispatch_resume_incoming`.
+    ExactTokenResume,
+}
+
 /// Why the queue advance declined. EVERY variant is raised before the first mutation, so a refused
 /// caller may safely fall through to the unchanged terminal broad dispatcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4225,23 +4247,35 @@ impl crate::runtime::SharedKernel {
     ///    transaction does not own, so it is refused here — before the caller has blocked anything
     ///    and before the run queue has been touched.
     ///
+    /// `apply` names the convention the CALLER will use to put the selected task on the CPU, so
+    /// that the two stash-specific refusals are asked only of a caller that will actually stash.
+    ///
     /// `Ok(None)` means "no candidate": the advance will legitimately idle this CPU.
     pub(crate) fn queue_advance_admit_split(
         &self,
         cpu: CpuId,
+        apply: QueueAdvanceApply,
     ) -> Result<Option<u64>, QueueAdvanceRefusal> {
         let cpu_idx = cpu.0 as usize;
         if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
             return Err(QueueAdvanceRefusal::OutgoingIdentityStale);
         }
-        // (1) Lock-free refusals — the `can_stash_for_lock_drop` conditions.
+        // (1) Lock-free refusals.
         //
-        // RISC-V is refused by construction: the Stage 117 stash gate itself opens with
-        // `!cfg!(target_arch = "riscv64")`, and that architecture's drain leaves
-        // `restore_result = Ok(())` because it has no `post_switch_restore_*_split`. A stashed plan
-        // would switch tasks with nothing restoring the incoming context. Refusing keeps RISC-V on
-        // its unchanged in-lock switch rather than inventing a second, unproven one.
-        if cfg!(target_arch = "riscv64") {
+        // The two STASH-SPECIFIC ones are scoped to the stash convention (see
+        // [`QueueAdvanceApply`]). RISC-V is refused for `StashedKernelSwitch` by construction: the
+        // Stage 117 stash gate itself opens with `!cfg!(target_arch = "riscv64")`, and that
+        // architecture's `drain_switch_plan_stash` has no `post_switch_restore_*_split` arm, so a
+        // stashed plan would switch kernel contexts with nothing restoring the incoming one.
+        //
+        // That reason says nothing about `ExactTokenResume`, which stashes nothing and switches no
+        // kernel context — it activates the incoming address space and applies that task's saved
+        // USER context to the live trap frame. RISC-V has performed exactly that, live, since Stage
+        // 196E: `direct_dispatch_resume_incoming` is its gather+apply owner and its FutexWait drain
+        // already drives it. Refusing that convention on this architecture was refusing a capability
+        // it demonstrably has.
+        if matches!(apply, QueueAdvanceApply::StashedKernelSwitch) && cfg!(target_arch = "riscv64")
+        {
             return Err(QueueAdvanceRefusal::ArchUnsupported);
         }
         if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
@@ -4267,7 +4301,11 @@ impl crate::runtime::SharedKernel {
         if dispatch_cpu != cpu {
             return Err(QueueAdvanceRefusal::CpuNotAuthoritative);
         }
-        if unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() } {
+        // Stash-specific: an `ExactTokenResume` publishes no plan, so an occupied stash is not its
+        // precondition. It is still checked for the stash convention, where a second plan is lost.
+        if matches!(apply, QueueAdvanceApply::StashedKernelSwitch)
+            && unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() }
+        {
             return Err(QueueAdvanceRefusal::StashOccupied);
         }
         // (2) rank 1: the NON-mutating candidate peek. The run queue is not touched.
@@ -4278,13 +4316,46 @@ impl crate::runtime::SharedKernel {
         }) else {
             return Ok(None);
         };
-        // (3) rank 2: the candidate must be resumable by THIS convention.
+        // (3) rank 2: the candidate must be resumable BY THE CONVENTION THE CALLER WILL USE.
+        //
+        // This is the question admission exists to ask, and the two conventions answer it
+        // differently — the screen exists so that no refusal can happen after the dequeue, and the
+        // set of tasks each apply can actually serve is not the same.
+        //
+        // * `StashedKernelSwitch` needs `kernel_context.initialized`, which is exactly what
+        //   `build_dispatch_switch_plan_locked` requires before it will produce a plan.
+        //
+        // * `ExactTokenResume` needs whatever its architecture's resume owner accepts, and that
+        //   genuinely differs:
+        //
+        //   - x86_64/AArch64: `x86_post_lock_resume_marked_incoming` refuses `X86ResumeRefusal::
+        //     Context` for an incarnation with no restorable saved context, and a task that has
+        //     never run takes the FIRST-RESUME TRAMPOLINE — which is the stash path, not this one.
+        //     So the same `kernel_context.initialized` screen applies, and screening here is what
+        //     keeps that post-dequeue (fatal) refusal unreachable.
+        //   - riscv64: its resume owner activates SATP and applies the saved user context, and its
+        //     bridge write-back then selects among ALL FOUR conventions — including fresh/startup,
+        //     which it serves from the argument mirror. A never-run task is therefore genuinely
+        //     resumable there, and screening it out refused a live-capable advance. Measured: the
+        //     first RISC-V FutexWait of a core-smoke boot was refused `IncomingUnavailable` for
+        //     incoming tid 2, and the in-lock path then switched to that very task successfully
+        //     through the startup convention (`SATP_OK` → `FRAME_OK` → `SRET_ARMED` →
+        //     `RISCV_STARTUP_ARGS tid=2`). What that architecture requires is a resolvable ASID,
+        //     which is what its `direct_dispatch_activate_asid_split` would otherwise refuse on.
         let resumable = self.with_task_tcbs_split_mut(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .find(|t| t.tid.0 == candidate)
-                .map(|t| t.kernel_context.initialized)
-                .unwrap_or(false)
+            let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == candidate) else {
+                return false;
+            };
+            match apply {
+                QueueAdvanceApply::StashedKernelSwitch => tcb.kernel_context.initialized,
+                QueueAdvanceApply::ExactTokenResume => {
+                    if cfg!(target_arch = "riscv64") {
+                        tcb.asid.is_some()
+                    } else {
+                        tcb.kernel_context.initialized
+                    }
+                }
+            }
         });
         if !resumable {
             return Err(QueueAdvanceRefusal::IncomingUnavailable);

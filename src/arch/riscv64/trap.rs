@@ -679,6 +679,19 @@ pub fn handle_riscv_trap_entry_shared(
     let cpu_idx = cpu.0 as usize;
     let is_syscall = matches!(decode_trap_context(context), TrapEvent::Syscall);
 
+    // U9-QA §2: open the trap-path-active window BEFORE the pre-lock split dispatch, not just
+    // around the broad phase. FutexWait's pre-lock route asks `queue_advance_admit_split` whether
+    // a drainer will run, and until the window is open the truthful answer here was "no" — so the
+    // route was refused `NoTrapDrainer` on this architecture regardless of anything else.
+    //
+    // `TrapPathWindow` is the SAME owner the shared x86_64/AArch64 entry uses: one flag lifecycle
+    // in the tree, not one per bridge. Its `Drop` closes the window on every path that RETURNS —
+    // including the split block's early returns below, which previously left the flag untouched
+    // because it had not yet been set — and the explicit `settle` before the post-lock drains
+    // closes it ahead of the diverging idle/fatal landings, which never unwind.
+    let trap_path = crate::arch::trap_entry::TrapPathWindow::establish(cpu);
+    let mut queue_advance_committed = false;
+
     // ── Phase 1: pre-lock split dispatch — DebugLog (NR 15) ONLY ──
     // Stage 196B/196C: RISC-V enables exactly TWO split-dispatch retirement classes,
     // DebugLog (NR 15) and FutexWake (NR 10). The RISC-V trap bridge has ALREADY
@@ -715,9 +728,17 @@ pub fn handle_riscv_trap_entry_shared(
     let is_ipc_direct = (nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
         || nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)
         && crate::kernel::boot::ipccall_direct_admission_enabled();
+    // U9-QA §2: FutexWait (NR 9) joins the RISC-V split classifier. It is the one SWITCHING class
+    // admitted here, and it is admitted because this architecture has the apply convention it
+    // needs: `direct_dispatch_resume_incoming` — SATP activation with the `sfence.vma` inside
+    // `write_satp`, the exact saved user context applied to the live frame, the exact parked
+    // completion consumed — which the Stage 196E FutexWait drain below already drives, live, off
+    // the broad lock. What was missing was never the restore; it was that admission asked the
+    // STASH convention's preconditions of a caller that stashes nothing.
     let split_eligible = is_syscall
         && (nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+            || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -735,23 +756,40 @@ pub fn handle_riscv_trap_entry_shared(
         }
         let disposition =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame);
-        // U9-QA §2: RISC-V admits DebugLog, FutexWake and (gated) NR6/NR7 only — all
-        // NON-SWITCHING. FutexWait's NR never reaches the dispatcher from here, so
-        // `QueueAdvanceCommitted` is unreachable on this bridge. It is matched explicitly
-        // anyway, and FAILS LOUDLY rather than being folded into the fall-through: this
-        // architecture has no off-lock switch apply yet, so a committed publication here would
-        // leave a blocked caller with nothing to settle it. If NR 9 is ever admitted above
-        // before that apply exists, this is the line that says so.
+        // U9-QA §2: the COMMITTED disposition. The pre-lock route published `Blocked(Futex)` and
+        // cleared `current`, so this trap may neither enter the broad dispatcher (which would
+        // re-execute FutexWait against an already-blocked task and advance the queue a second
+        // time) nor `sret` through the parked caller's own frame.
+        //
+        // It falls through instead, to the SAME Stage 196E FutexWait drain that has settled the
+        // in-lock deferral since it landed. That drain consumes the one existing deferral, runs the
+        // one authoritative selection step, and applies the exact-token resume — so `Switch`
+        // becomes `ReturnToIncoming`, a declined selection becomes `ReturnToCurrent`, and an empty
+        // run queue becomes the unchanged RISC-V S-mode WFI idle settlement. No RISC-V-specific
+        // scheduler, no second stash and no second drain is introduced.
+        //
+        // The outgoing user context is captured HERE, before the drain overwrites the live frame
+        // with the incoming task's, and keyed on the identity the deferral itself carries.
         if matches!(
             disposition,
             crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted
         ) {
+            let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+            let captured = outgoing
+                .map(|t| shared.capture_outgoing_user_context_split(t, frame))
+                .unwrap_or(false);
             crate::yarm_log!(
-                "RISCV_SPLIT_QUEUE_ADVANCE_UNSUPPORTED nr={} cpu={} reason=no_off_lock_switch_apply",
+                "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu={} result=queue_advance_committed outgoing={} captured={}",
                 nr,
+                cpu.0,
+                outgoing.unwrap_or(u64::MAX),
+                u8::from(captured)
+            );
+            crate::yarm_log!(
+                "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=publication_committed",
                 cpu.0
             );
-            return Err(TrapHandleError::MissingTrapFrame);
+            queue_advance_committed = true;
         }
         if let crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) =
             disposition
@@ -829,13 +867,10 @@ pub fn handle_riscv_trap_entry_shared(
         crate::yarm_log!("RISCV_SHARED_TRAP_ENTRY_BEGIN cpu={}", cpu.0);
     }
 
-    // ── Phase 2: own the active flag, then run the canonical handler in-lock ──
-    // Set the flag BEFORE the broad-lock phase so the blocked-waiter producers
-    // see a real drainer will run (deferred-snapshot path), and clear it AFTER.
-    if cpu_idx < MAX_CPUS {
-        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .store(true, Ordering::Relaxed);
-    }
+    // ── Phase 2: run the canonical handler in-lock ──
+    // The active flag was set by `TrapPathWindow::establish` above — earlier than this point, so
+    // the pre-lock split route sees it too — and the blocked-waiter producers still observe a real
+    // drainer will run (deferred-snapshot path). The window is closed after the broad phase, below.
     if log_structural {
         crate::yarm_log!("RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET cpu={}", cpu.0);
     }
@@ -845,44 +880,52 @@ pub fn handle_riscv_trap_entry_shared(
         && crate::kernel::boot::riscv_post_lock_foundation_oracle_enabled()
         && !RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG.load(Ordering::Acquire);
 
-    let inner_result = shared
-        .with_cpu(cpu, |kernel| {
-            // Foundation oracle PUBLISH — during the broad-lock phase, stash a
-            // one-shot post-work token (the requester tid, +1 biased). This is a
-            // pure atomic write: it mutates NO scheduler / capability / user / task
-            // state and copies no user data. It only records "a post-lock drain is
-            // owed for this tid".
-            if oracle_arm && cpu_idx < MAX_CPUS {
-                let tid = kernel.current_tid().unwrap_or(0);
-                RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]
-                    .store(tid.wrapping_add(1), Ordering::Release);
-                crate::yarm_log!(
-                    "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu={} tid={}",
-                    cpu.0,
-                    tid
-                );
-            }
-            // Reborrow so `frame` stays available for the Stage 196D post-lock switch drain
-            // (which restores the INCOMING task's frame after the broad guard drops).
-            handle_trap_entry_with_fault_bookkeeping_mode(
-                kernel,
-                cpu,
-                context,
-                Some(&mut *frame),
-                FaultBookkeepingMode::RecordInHandleTrapEvent,
-            )
-        })
-        .map_err(|err| TrapHandleError::Syscall(err.into()));
+    // U9-QA §2: the broad dispatcher is entered ONLY when nothing was published. After a
+    // committed publication the caller is already `Blocked(Futex)` and current on no CPU, so the
+    // canonical handler would re-execute FutexWait against it and `dispatch_next_task` would
+    // advance the queue a second time for one publication. The gate is the DISPOSITION, never an
+    // inspection of any stash.
+    let inner_result = if queue_advance_committed {
+        Ok(Ok(()))
+    } else {
+        shared
+            .with_cpu(cpu, |kernel| {
+                // Foundation oracle PUBLISH — during the broad-lock phase, stash a
+                // one-shot post-work token (the requester tid, +1 biased). This is a
+                // pure atomic write: it mutates NO scheduler / capability / user / task
+                // state and copies no user data. It only records "a post-lock drain is
+                // owed for this tid".
+                if oracle_arm && cpu_idx < MAX_CPUS {
+                    let tid = kernel.current_tid().unwrap_or(0);
+                    RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]
+                        .store(tid.wrapping_add(1), Ordering::Release);
+                    crate::yarm_log!(
+                        "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu={} tid={}",
+                        cpu.0,
+                        tid
+                    );
+                }
+                // Reborrow so `frame` stays available for the Stage 196D post-lock switch drain
+                // (which restores the INCOMING task's frame after the broad guard drops).
+                handle_trap_entry_with_fault_bookkeeping_mode(
+                    kernel,
+                    cpu,
+                    context,
+                    Some(&mut *frame),
+                    FaultBookkeepingMode::RecordInHandleTrapEvent,
+                )
+            })
+            .map_err(|err| TrapHandleError::Syscall(err.into()))
+    };
 
     if log_structural {
         crate::yarm_log!("RISCV_GLOBAL_LOCK_PHASE_DONE cpu={}", cpu.0);
     }
-    // Clear the flag now that the broad borrow has dropped; the drain below
-    // completes any stashed blocked-waiter delivery.
-    if cpu_idx < MAX_CPUS {
-        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .store(false, Ordering::Relaxed);
-    }
+    // Close the window now that the broad borrow has dropped; the drains below complete any
+    // stashed blocked-waiter delivery and the committed FutexWait advance. This is the SINGLE
+    // explicit settlement, placed here because the drains contain diverging idle/fatal landings
+    // that never unwind — every other exit returns and is closed by `TrapPathWindow::drop`.
+    trap_path.settle();
     if log_structural {
         crate::yarm_log!("RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR cpu={}", cpu.0);
     }

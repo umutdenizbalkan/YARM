@@ -72414,12 +72414,21 @@ mod stage194_cross_arch_portability_audit {
     // The prior force-false (which existed only because RISC-V had no drainer) is retired.
     #[test]
     fn riscv_trap_entry_forces_active_flag_inactive() {
-        // The shared wrapper owns the flag lifecycle (true in-lock, cleared post-lock).
+        // The shared wrapper owns the flag lifecycle. U9-QA §2 moved the raw stores into the ONE
+        // settlement owner (`trap_entry::TrapPathWindow`) so there is a single flag lifecycle in
+        // the tree rather than one per bridge — and so the window opens EARLY enough for the
+        // pre-lock split route to be admitted. The claim is unchanged: this wrapper establishes it
+        // and settles it, and nothing else on this bridge writes the flag.
         assert!(
             RISCV_TRAP_SRC.contains("pub fn handle_riscv_trap_entry_shared(")
-                && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
-                && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)"),
+                && RISCV_TRAP_SRC.contains("TrapPathWindow::establish(cpu)")
+                && RISCV_TRAP_SRC.contains("trap_path.settle();"),
             "RISC-V shared wrapper must own the active flag (set true in-lock, cleared post-lock)"
+        );
+        assert!(
+            !RISCV_TRAP_SRC
+                .contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]\n            .store("),
+            "the wrapper must not write the flag directly — the owner does"
         );
         // The canonical handler no longer force-clears the flag (force-false retired).
         assert!(
@@ -72709,10 +72718,11 @@ mod stage195a_aarch64_debuglog_live {
     // (set true before the bounded broad-lock phase, cleared after) with a real post-lock drain.
     #[test]
     fn riscv_still_force_clears_active_flag() {
+        // U9-QA §2: ownership is now expressed through `TrapPathWindow` — same claim, one owner.
         assert!(
             RISCV_TRAP_SRC.contains("pub fn handle_riscv_trap_entry_shared(")
-                && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
-                && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)")
+                && RISCV_TRAP_SRC.contains("TrapPathWindow::establish(cpu)")
+                && RISCV_TRAP_SRC.contains("trap_path.settle();")
                 && RISCV_TRAP_SRC.contains("shared.drain_dispatch_post_work(cpu, "),
             "RISC-V shared wrapper must own the active flag with a real post-lock drain"
         );
@@ -73888,10 +73898,21 @@ mod stage196a_riscv_shared_trap_foundation {
     // RISC-V force-false is retired (owned by the wrapper now).
     #[test]
     fn active_flag_owned_by_wrapper_force_false_retired() {
+        // U9-QA §2: the wrapper still owns the window, through the single `TrapPathWindow` owner,
+        // and it now opens BEFORE the pre-lock split dispatch rather than only around the broad
+        // phase — which is what lets the pre-lock FutexWait route be admitted at all. The ordering
+        // claim is asserted directly: establish precedes the broad phase, settle follows it.
+        let establish = RISCV_TRAP_SRC
+            .find("TrapPathWindow::establish(cpu)")
+            .expect("the wrapper must establish the window");
+        let broad = RISCV_TRAP_SRC
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("the broad phase");
+        let settle = RISCV_TRAP_SRC
+            .find("trap_path.settle();")
+            .expect("the wrapper must settle the window");
         assert!(
-            RISCV_TRAP_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
-                && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
-                && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)"),
+            establish < broad && broad < settle,
             "wrapper must set the active flag true before the broad phase and clear it after"
         );
         // The canonical handler must NOT force-clear the flag anymore (the old force-false
@@ -74038,11 +74059,19 @@ mod stage196a_riscv_shared_trap_foundation {
             !RISCV_SMOKE.contains("'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake'"),
             "smoke must NOT forbid class=FutexWake (retired in 196C)"
         );
-        // Smoke must require the split-dispatch marker + the DebugLog/FutexWake-only guard.
+        // Smoke must require the split-dispatch marker + the membership guard. U9-QA §2 widened
+        // that membership to include FutexWait (NR 9) as the one SWITCHING class, and added the
+        // stronger companion check that every NR 9 line COMMITTED a queue advance rather than
+        // returning early — which for a switching class would mean returning through the parked
+        // caller's own frame.
         assert!(
             RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15")
-                && RISCV_SMOKE.contains("non-DebugLog/non-FutexWake syscall"),
-            "smoke must assert DebugLog+FutexWake-only split dispatch"
+                && RISCV_SMOKE.contains("non-DebugLog/FutexWake/FutexWait syscall"),
+            "smoke must assert DebugLog+FutexWake+FutexWait-only split dispatch"
+        );
+        assert!(
+            RISCV_SMOKE.contains("RISC-V FutexWait split did not commit a queue advance"),
+            "smoke must assert every NR 9 split line committed a queue advance"
         );
     }
 
@@ -74114,12 +74143,10 @@ mod stage196b_riscv_debuglog_split {
                 && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR"),
             "the wrapper must gate split dispatch on NR 15 + NR 10"
         );
-        // No queue-advancing / blocking class NR appears as a split gate in the wrapper.
-        for other in [
-            "SYSCALL_FUTEX_WAIT_NR",
-            "SYSCALL_YIELD_NR",
-            "SYSCALL_INITRAMFS_READ_CHUNK_NR",
-        ] {
+        // No queue-advancing / blocking class NR appears as a split gate in the wrapper, EXCEPT
+        // FutexWait, which U9-QA §2 admits as the one switching class (it settles through the
+        // existing Stage 196E drain rather than early-returning).
+        for other in ["SYSCALL_YIELD_NR", "SYSCALL_INITRAMFS_READ_CHUNK_NR"] {
             assert!(
                 !RISCV_TRAP_SRC.contains(other),
                 "wrapper must not gate split dispatch on {other}"
@@ -74170,12 +74197,14 @@ mod stage196b_riscv_debuglog_split {
         let gate = RISCV_TRAP_SRC
             .find("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
             .expect("gate");
+        // U9-QA §2 moved the flag write into `TrapPathWindow`, so the broad-lock phase is located
+        // by the acquisition itself — which is what the claim was always about.
         let active_set = RISCV_TRAP_SRC
-            .find(".store(true, Ordering::Relaxed)")
-            .expect("active-set");
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("the broad-lock phase");
         assert!(
             gate < active_set,
-            "the NR-15 split gate must run BEFORE the active flag is set (early return skips it)"
+            "the NR-15 split gate must run BEFORE the broad-lock phase (early return skips it)"
         );
         assert!(
             RISCV_TRAP_SRC[gate..active_set]
@@ -74279,9 +74308,11 @@ mod stage196c_riscv_futex_wake_split {
                 && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR"),
             "wrapper must gate split dispatch on NR 15 + NR 10"
         );
+        // U9-QA §2: NR 9 joined the gate as the one SWITCHING class; NR 15 + NR 10 remain the
+        // non-switching pair this case is about.
         assert!(
-            !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR"),
-            "FutexWait (NR 9) must stay global-lock-only (not in the RISC-V split gate)"
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR"),
+            "FutexWait (NR 9) is admitted as the one switching RISC-V split class"
         );
     }
 
@@ -74741,13 +74772,20 @@ mod stage196e_riscv_futex_wait_retirement {
                 && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR"),
             "the pre-lock split gate must stay NR 15 + NR 10"
         );
+        // U9-QA §2: NR 9 IS now in the gate. The reason it was excluded — "RISC-V has no off-lock
+        // switch apply" — was never true of the convention FutexWait uses: its Stage 196E drain has
+        // driven `direct_dispatch_resume_incoming` (SATP activate + exact saved user context +
+        // exact parked completion) off the broad lock since that stage landed. What blocked it was
+        // that admission asked the STASH convention's preconditions.
         assert!(
-            !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR"),
-            "FutexWait (NR 9) must NOT be in the RISC-V pre-lock split gate"
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR"),
+            "FutexWait (NR 9) is admitted through the RISC-V pre-lock split gate"
         );
+        // It is still NOT on the NON-SWITCHING whitelist — that list's contract is that everything
+        // on it may be early-returned, which is exactly what a switching class may not do.
         assert!(
             !SPLIT_SRC.contains("Syscall::FutexWait => Some"),
-            "FutexWait must not be handled by try_split_dispatch_into_frame"
+            "FutexWait must not join the early-returnable non-switching whitelist"
         );
     }
 
@@ -75610,12 +75648,15 @@ mod stage197_first_cohort_seal {
     #[test]
     fn prelock_split_membership() {
         // The RISC-V wrapper's pre-lock gate is DebugLog + FutexWake only.
+        // U9-QA §2: DebugLog + FutexWake remain the NON-SWITCHING members; FutexWait is admitted
+        // as the one SWITCHING member, which settles through the drains instead of early-returning.
+        // Yield is still excluded — it has no pre-lock route.
         assert!(
             RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
                 && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR")
-                && !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR")
                 && !RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_YIELD_NR"),
-            "the pre-lock split gate must be DebugLog + FutexWake only"
+            "the pre-lock split gate is DebugLog + FutexWake + FutexWait"
         );
         // FutexWait publishes Blocked; Yield re-enqueues Runnable.
         assert!(
@@ -76275,7 +76316,7 @@ mod stage197b_riscv_typed_idle_outcome {
             .nth(1)
             .expect("wrapper fn");
         let prelock = fn_body
-            .split("Phase 2: own the active flag")
+            .split("Phase 2: run the canonical handler in-lock")
             .next()
             .unwrap();
         assert!(
@@ -111345,8 +111386,8 @@ mod stage199d_riscv_production_readiness_audit {
             .expect("the handled early return")
             + split_at;
         let phase2 = body
-            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
-            .expect("the phase-2 flag");
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("the phase-2 broad-lock acquisition");
         assert!(
             first_return < phase2,
             "the handled split path must return BEFORE the broad-lock phase is entered"
@@ -112044,7 +112085,7 @@ mod stage199d_riscv_narrow_trap_snapshots {
             .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
             .expect("the handled early return");
         let phase2 = wrapper
-            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+            .find(".with_cpu(cpu, |kernel| {")
             .expect("the broad-lock phase");
         assert!(
             handled < phase2,
@@ -112452,10 +112493,12 @@ mod stage199d_riscv_canonical_admission {
         let at = w
             .find("let split_eligible = is_syscall")
             .expect("the whitelist");
-        let whitelist = &w[at..at + 320];
+        let whitelist = &w[at..at + 420];
         for nr in [
             "SYSCALL_DEBUG_LOG_NR",
             "SYSCALL_FUTEX_WAKE_NR",
+            // U9-QA §2: the one SWITCHING member.
+            "SYSCALL_FUTEX_WAIT_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -112466,8 +112509,8 @@ mod stage199d_riscv_canonical_admission {
         // Nothing else was added to the whitelist.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            2,
-            "exactly two literal NRs plus the gated direct-IPC term"
+            3,
+            "exactly three literal NRs plus the gated direct-IPC term"
         );
         // The arch-tagged NR6/NR7 markers are emitted by the kernel drain, not by this gate.
         assert!(
@@ -112504,7 +112547,7 @@ mod stage199d_riscv_canonical_admission {
             .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
             .expect("handled return");
         let phase2 = w
-            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+            .find(".with_cpu(cpu, |kernel| {")
             .expect("broad-lock phase");
         assert!(
             handled < phase2,
@@ -139433,6 +139476,183 @@ mod u9d3_split_unmap_drives_real_d3 {
     }
 }
 
+// ── U9-QA §1: THE APPLY CONVENTION, AND WHY RISC-V WAS REFUSED ────────────────────────────────
+//
+// The transaction owns ONE selection policy, but the architectures have two established ways of
+// putting the selected task on the CPU:
+//
+//   * `StashedKernelSwitch` — the Stage 117 plan stash, drained by `drain_switch_plan_stash`,
+//     which `switch_frames` between two KERNEL contexts. Its gate opens with
+//     `!cfg!(target_arch = "riscv64")`, so it is x86_64/AArch64 only.
+//   * `ExactTokenResume` — what the FutexWait, Yield and D2 drains actually do on ALL THREE
+//     architectures: activate the incoming address space, apply that task's saved USER context to
+//     the live trap frame. No stash, no kernel-context switch.
+//
+// Admission asked only the first one's questions, which refused RISC-V outright for a reason that
+// is true of the stash and false of the resume RISC-V has driven live since Stage 196E. These
+// cases pin the distinction so the refusal cannot silently widen again.
+#[cfg(test)]
+mod u9qa_apply_convention {
+    const EXEC: &str = include_str!("exec_state.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    fn admit_body() -> &'static str {
+        EXEC.split("pub(crate) fn queue_advance_admit_split")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the admission body")
+    }
+
+    /// Both conventions exist and admission takes one.
+    #[test]
+    fn admission_is_parameterised_by_the_apply_convention() {
+        for v in ["StashedKernelSwitch,", "ExactTokenResume,"] {
+            assert!(EXEC.contains(v), "the apply convention must carry `{v}`");
+        }
+        assert!(
+            EXEC.contains("apply: QueueAdvanceApply,"),
+            "admission must be told which convention the caller will use"
+        );
+    }
+
+    /// The two STASH-SPECIFIC refusals are asked only of a stashing caller. This is the whole
+    /// finding: `ArchUnsupported` was refusing RISC-V a capability it demonstrably has.
+    #[test]
+    fn the_stash_refusals_are_scoped_to_the_stash_convention() {
+        let body = admit_body();
+        for (refusal, needle) in [
+            (
+                "QueueAdvanceRefusal::ArchUnsupported",
+                "matches!(apply, QueueAdvanceApply::StashedKernelSwitch) && cfg!(target_arch = \"riscv64\")",
+            ),
+            (
+                "QueueAdvanceRefusal::StashOccupied",
+                "matches!(apply, QueueAdvanceApply::StashedKernelSwitch)",
+            ),
+        ] {
+            let at = body.find(refusal).unwrap_or_else(|| panic!("{refusal}"));
+            let guard = body[..at]
+                .rfind("matches!(apply, QueueAdvanceApply::StashedKernelSwitch)")
+                .unwrap_or_else(|| panic!("{refusal} must be scoped to the stash convention"));
+            assert!(
+                guard < at,
+                "{refusal} must be raised only for a stashing caller"
+            );
+            assert!(body.contains(needle), "{refusal} scoping must be explicit");
+        }
+    }
+
+    /// The resumability screen asks what the CALLER'S convention can actually serve, because the
+    /// two conventions serve different sets of tasks — and getting that wrong is refusable only
+    /// BEFORE the dequeue.
+    #[test]
+    fn resumability_is_screened_per_convention_before_the_dequeue() {
+        let body = admit_body();
+        // The stash convention requires exactly what the plan builder requires.
+        assert!(
+            body.contains("QueueAdvanceApply::StashedKernelSwitch => tcb.kernel_context.initialized"),
+            "the stash convention must screen on what build_dispatch_switch_plan_locked requires"
+        );
+        // The exact-token convention differs by architecture, because its resume owners do:
+        // x86_64/AArch64 refuse an incarnation with no restorable context (a never-run task takes
+        // the first-resume trampoline, which is the STASH path), while the RISC-V write-back
+        // serves the fresh/startup convention from the argument mirror and needs only a
+        // resolvable ASID — the thing its `direct_dispatch_activate_asid_split` refuses on.
+        let exact = body
+            .split("QueueAdvanceApply::ExactTokenResume => {")
+            .nth(1)
+            .and_then(|s| s.split("\n                }").next())
+            .expect("the exact-token arm");
+        assert!(
+            exact.contains("cfg!(target_arch = \"riscv64\")")
+                && exact.contains("tcb.asid.is_some()")
+                && exact.contains("tcb.kernel_context.initialized"),
+            "the exact-token screen must match what each architecture's resume owner accepts"
+        );
+        // Whatever the screen, a failure is a refusal raised BEFORE anything is dequeued.
+        let screen = body
+            .find("let resumable = self.with_task_tcbs_split_mut")
+            .expect("the screen");
+        let refusal = body
+            .find("QueueAdvanceRefusal::IncomingUnavailable")
+            .expect("its refusal");
+        assert!(
+            screen < refusal,
+            "a non-resumable candidate is refused before anything is dequeued"
+        );
+    }
+
+    /// The FutexWait route names the convention it actually uses.
+    #[test]
+    fn the_futex_route_admits_as_an_exact_token_resume() {
+        assert!(
+            SPLIT.contains("QueueAdvanceApply::ExactTokenResume"),
+            "the FutexWait pre-lock route stashes nothing, so it admits as an exact-token resume"
+        );
+        assert!(
+            !SPLIT.contains("QueueAdvanceApply::StashedKernelSwitch"),
+            "it must not claim the stash convention it does not use"
+        );
+    }
+
+    /// RISC-V's exact-token gather+apply owner is the one that already existed, unduplicated:
+    /// one SATP activation, one context apply, one completion consumer.
+    #[test]
+    fn riscv_reuses_its_existing_gather_and_apply_owner() {
+        let owner = RISCV_TRAP
+            .split("fn direct_dispatch_resume_incoming(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the RISC-V exact-token resume owner");
+        for step in [
+            "direct_dispatch_activate_asid_split(token)",
+            "direct_dispatch_restore_context_split(token)",
+            "frame.apply_user_context(context)",
+        ] {
+            assert!(owner.contains(step), "the owner must perform `{step}`");
+        }
+        // ONE definition — U9-QA added no second RISC-V restore.
+        assert_eq!(
+            RISCV_TRAP
+                .matches("fn direct_dispatch_resume_incoming(")
+                .count(),
+            1,
+            "there must be exactly one RISC-V exact-token resume owner"
+        );
+        // And it consumes NO async-preemption tag: canonical 199E-R2 measured that a second
+        // consumer spends the tag before the write-back that actually chooses the ABI lanes can
+        // see it (407 published, 407 consumed at the wrong seam, 0 of 187 switching write-backs
+        // authorized). The bridge write-back is the ONE consumer.
+        assert!(
+            !owner.contains("take_async_preempt_for_incoming_split")
+                && !owner.contains("classify_and_take_async_resume"),
+            "the restore must not become a second async-tag consumer"
+        );
+    }
+
+    /// The async-resume authorization has exactly ONE consumer on RISC-V, at the write-back.
+    #[test]
+    fn the_async_tag_has_exactly_one_riscv_consumer() {
+        const BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+        let takes = BOOT
+            .matches("take_async_preempt_for_incoming_split(")
+            .count();
+        assert_eq!(
+            takes, 2,
+            "the two RISC-V write-back boundaries (bridge and S-mode-idle dispatch), and nothing \
+             else, may consume the authorization"
+        );
+        assert!(
+            RISCV_TRAP
+                .matches("take_async_preempt_for_incoming_split(")
+                .count()
+                == 0,
+            "the trap wrapper and its drains must consume no async tag"
+        );
+    }
+}
+
 // ── U9-QA §2: THE THREE-WAY PRE-LOCK DISPOSITION ──────────────────────────────────────────────
 //
 // The pre-lock split seam used to answer with two meanings, and the trap entry acted on that: a
@@ -139534,7 +139754,7 @@ mod u9qa_split_dispatch_disposition {
             .nth(1)
             .expect("the FutexWait route");
         let admit = route
-            .find("shared.queue_advance_admit_split(cpu)")
+            .find("shared.queue_advance_admit_split(")
             .expect("admission");
         let reserve = route
             .find("futex_wait_dispatch_try_defer(cpu_idx, tid)")
@@ -139720,33 +139940,62 @@ mod u9qa_split_dispatch_disposition {
         }
     }
 
-    /// RISC-V has no off-lock switch apply yet, so a committed publication there would strand a
-    /// blocked caller. Its bridge matches the variant explicitly and fails loudly.
+    /// U9-QA §2: RISC-V now SETTLES a committed publication rather than refusing it. WIP-6 made
+    /// its bridge fail loudly because that architecture was thought to have no off-lock switch
+    /// apply; it has had one since Stage 196E. This case pins the settlement instead: NR 9 is
+    /// admitted, the committed disposition captures the outgoing context and skips the broad
+    /// dispatcher, and no second drain or stash appears.
     #[test]
-    fn riscv_refuses_a_committed_publication_loudly() {
-        assert!(
-            RISCV_TRAP.contains("SplitDispatchDisposition::QueueAdvanceCommitted"),
-            "the RISC-V bridge must match the committed disposition explicitly"
-        );
-        let arm = RISCV_TRAP
-            .split("RISCV_SPLIT_QUEUE_ADVANCE_UNSUPPORTED")
-            .nth(1)
-            .expect("the loud refusal");
-        assert!(
-            arm.split("\n        }")
-                .next()
-                .is_some_and(|a| a.contains("return Err(")),
-            "it must fail loudly, not fold into the fall-through"
-        );
-        // FutexWait's NR is still not admitted there.
+    fn riscv_settles_a_committed_publication_through_its_existing_drain() {
+        // NR 9 is admitted through the gate.
         let gate = RISCV_TRAP
             .split("let split_eligible = is_syscall")
             .nth(1)
             .and_then(|s| s.split(';').next())
             .expect("the RISC-V eligibility gate");
         assert!(
-            !gate.contains("SYSCALL_FUTEX_WAIT_NR"),
-            "RISC-V must not admit FutexWait before its off-lock switch apply exists"
+            gate.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "RISC-V must admit FutexWait now that its exact-token resume is reachable"
+        );
+        // The committed arm captures the outgoing context and skips the broad dispatcher — and it
+        // does NOT return, so the trap falls through to the existing drains.
+        let arm = RISCV_TRAP
+            .split("SplitDispatchDisposition::QueueAdvanceCommitted\n        ) {")
+            .nth(1)
+            .and_then(|s| s.split("\n        }").next())
+            .expect("the committed arm");
+        assert!(
+            arm.contains("capture_outgoing_user_context_split(t, frame)"),
+            "the outgoing context must be captured before the drain overwrites the frame"
+        );
+        assert!(
+            arm.contains("QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED")
+                && arm.contains("queue_advance_committed = true;"),
+            "the committed arm must skip the broad dispatcher"
+        );
+        assert!(
+            !arm.contains("return "),
+            "the committed arm must fall through to the drains, never return early"
+        );
+        // The broad phase is gated on the disposition, never on a stash inspection.
+        let gate_at = RISCV_TRAP
+            .find("if queue_advance_committed {")
+            .expect("the broad-dispatch gate");
+        let call = RISCV_TRAP
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("the broad dispatch");
+        assert!(gate_at < call, "the gate must precede the acquisition");
+        assert!(
+            !RISCV_TRAP[gate_at..call].contains("DISPATCH_SWITCH_PLAN_STASH"),
+            "a stale or unrelated stash must not alter RISC-V dispatch control flow"
+        );
+        // No second drain: the Stage 196E FutexWait drain remains the only one, entered once.
+        assert_eq!(
+            RISCV_TRAP
+                .matches("shared.futex_wait_dispatch_step_mut(cpu)")
+                .count(),
+            1,
+            "the one existing RISC-V FutexWait drain settles it"
         );
     }
 }
