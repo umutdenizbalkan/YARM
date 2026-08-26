@@ -33772,21 +33772,31 @@ mod stage115_d2_d6_seam_analysis {
 
     #[test]
     fn stage115_d2_blocking_recv_orchestrator_still_calls_with_cpu() {
-        // D2's `block_current_on_receive_with_deadline` is called from inside
-        // `with_cpu` (in exec_state.rs handle_ipc_recv / handle_recv_shared).
-        // Verify the call is NOT prefixed by a pre-with_cpu interceptor in
-        // syscall_split.rs (i.e., the D2 IpcRecvKernelTask path only handles
-        // the queued-plain case, not the blocking case).
+        // RE-DERIVED BY U9-RX3, and narrowed rather than weakened.
+        //
+        // What this asserted was two claims wearing one assertion: that the BROAD orchestrator
+        // `block_current_on_receive_with_deadline` is never called from `syscall_split.rs`, and —
+        // by implication — that no pre-lock blocking-recv route exists at all. U9-RX3 wired such
+        // a route, so the second claim is retired and is not restated here.
+        //
+        // The first is unchanged and still load-bearing: that orchestrator takes
+        // `&mut KernelState`, and calling it from a pre-lock route would alias the same backing
+        // storage the split seams project raw pointers into. Comments are stripped before the
+        // check because the route's own documentation names the orchestrator when explaining why
+        // it does NOT call it — an explanation must never be mistaken for a call site.
         let src = include_str!("../syscall_split.rs");
-        // The fast path in syscall_split handles IpcRecvKernelTask NR 2 only
-        // for the already-queued case. The blocking path is NOT in syscall_split.
+        let code = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
         assert!(
-            src.contains("try_split_ipc_recv_queued_plain_into_frame"),
+            code.contains("try_split_ipc_recv_queued_plain_into_frame"),
             "queued-plain fast path must still exist in syscall_split"
         );
         assert!(
-            !src.contains("block_current_on_receive_with_deadline"),
-            "blocking recv orchestrator must NOT be called from syscall_split (still inside with_cpu)"
+            !code.contains("block_current_on_receive_with_deadline"),
+            "the broad blocking-recv orchestrator must NOT be called from syscall_split"
         );
     }
 
@@ -33844,20 +33854,49 @@ mod stage115_d2_d6_seam_analysis {
 
     #[test]
     fn stage115_d2_task_seam_not_called_from_d2_blocking_path() {
-        // The D2 blocking recv path does not call `with_task_tcbs_split_mut`
-        // from syscall_split.rs (it's not wired there for blocking recv).
+        // RE-DERIVED BY U9-RX3. The premise this guarded — "blocking recv is not wired pre-lock"
+        // — is exactly what U9-RX3 changed, so restating it would be false. What replaces it is
+        // the invariant that made the wiring admissible in the first place: the pre-lock route
+        // reaches the task domain ONLY through `SharedKernel` twins, never through a
+        // `&mut KernelState` method, because off-lock code can never hold a whole-`KernelState`
+        // reference. That is the property "not wired here" used to guarantee for free.
         let split_src = include_str!("../syscall_split.rs");
+        let code = split_src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for broad_owner in [
+            "block_current_on_receive_with_deadline",
+            "recv_block_phase_a_scheduler",
+            "recv_block_phase_b_task",
+            "recv_block_phase_c_ipc_publish",
+            "recv_block_unwind_race(",
+        ] {
+            assert!(
+                !code.contains(broad_owner),
+                "syscall_split must not call the broad `{broad_owner}` — it takes &mut KernelState"
+            );
+        }
         assert!(
-            !split_src.contains("block_current_on_receive_with_deadline"),
-            "syscall_split must not wire D2 blocking recv (would be a live caller outside with_cpu)"
+            code.contains("recv_block_phase_a_split(")
+                && code.contains("recv_block_phase_b_split(")
+                && code.contains("recv_block_phase_c_split(")
+                && code.contains("recv_block_unwind_race_split("),
+            "the pre-lock blocking recv must drive the SharedKernel twins"
         );
     }
 
     #[test]
     fn stage115_d2_race_unwind_marker_is_zero() {
-        // D2_PUBLISH_RACE_UNWIND must remain 0 (no race unwind ever fired in
-        // smoke). This guards against accidental introduction of a race path.
         // The marker lives in ipc_state.rs where Phase C does its publish.
+        //
+        // U9-RX3 NOTE: the parenthetical "no race unwind ever fired in smoke" was true because
+        // the branch was unreachable under the serialized broad lock. The pre-lock route makes it
+        // genuinely reachable, and the count stays 0 in every recorded profile only because no
+        // sender has yet won that window — not because it cannot. The forced interleaving is
+        // proven by `runtime::tests::u9rx3_forced_publish_race_unwinds_the_block_completely`.
+        // This guard's own assertion is unchanged: the marker must still exist.
         let ipc_src = include_str!("ipc_state.rs");
         assert!(
             ipc_src.contains("D2_PUBLISH_RACE_UNWIND"),
@@ -116789,7 +116828,23 @@ mod stage199d_wa2a_ownership_boundary {
             // the broad lock — and it writes only after the exact `{tid, asid,
             // send_generation}` claim, in the same acquisition that parks the `TimedOut`
             // completion, so the completion is always visible before the wake.
-            ("src/runtime.rs", 9),
+            //
+            // U9-RX3: 9 -> 11. Two writers, an exact BLOCK/UNWIND pair, both split forms of
+            // existing in-lock writers in the same phase decomposition:
+            //
+            // - `recv_block_phase_b_split` writes `Running -> Blocked(EndpointReceive)`, the
+            //   split form of `KernelState::recv_block_phase_b_task`. It is a BLOCK owner: it
+            //   can only move a task OUT of runnability, and it does so in the SAME rank-2
+            //   acquisition that mints the fresh wait generation and stores the blocked-recv
+            //   writeback state, so a task cannot be Blocked for a receive whose generation was
+            //   never advanced or whose payload/meta pointers do not yet exist.
+            // - `recv_block_unwind_race_split` writes `Blocked -> Runnable`, the split form of
+            //   the reversal `KernelState::recv_block_unwind_race` performs. It is the EXACT
+            //   inverse of the writer above and runs only on the `QueueNonEmpty` race, before
+            //   any waiter was published. The wait generation is deliberately NOT rolled back —
+            //   generations only advance, and a rollback would let a stale record compare equal
+            //   to a newer one.
+            ("src/runtime.rs", 11),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -116811,11 +116866,12 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            37,
-            "34 raw writes (U6 added `commit_blocking_send_split`; U7 added \
+            39,
+            "36 raw writes (U6 added `commit_blocking_send_split`; U7 added \
              `drain_send_timeout_post_work`; U9-F added \
-             `wake_destroyed_notification_waiter_split`), the WA3A barrier's single write, and \
-             the WA3B barrier's two"
+             `wake_destroyed_notification_waiter_split`; U9-RX3 added the exact BLOCK/UNWIND \
+             pair `recv_block_phase_b_split` and `recv_block_unwind_race_split`), the WA3A \
+             barrier's single write, and the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -117302,6 +117358,26 @@ mod stage199d_wa2b_wake_owner_census {
             Verdict::Can,
         ),
         ("src/runtime.rs", "futex_wake_split_mut", 1, Verdict::Cannot),
+        // U9-RX3: the BLOCK half of the split receive-block pair. It moves a task INTO
+        // `Blocked(EndpointReceive)` in the same rank-2 acquisition that mints the fresh wait
+        // generation and stores the blocked-recv writeback state, so it is never a transition
+        // OUT of Blocked and cannot act on an already-blocked receiver.
+        (
+            "src/runtime.rs",
+            "recv_block_phase_b_split",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        // U9-RX3: the UNWIND half — the exact inverse of the writer above, taken only on the
+        // `QueueNonEmpty` race before any waiter was published. It acts on a
+        // `Blocked(EndpointReceive)` task, so it carries the same verdict as the in-lock
+        // reversal it mirrors (`recv_block_unwind_race`).
+        (
+            "src/runtime.rs",
+            "recv_block_unwind_race_split",
+            1,
+            Verdict::Can,
+        ),
         ("src/runtime.rs", "sr_wake_receiver_split", 1, Verdict::Can),
         (
             "src/runtime.rs",
@@ -117744,6 +117820,23 @@ mod stage199d_wa2b_wake_owner_census {
             "if !matches!(old_status, TaskStatus::Runnable) {",
             "}",
         ),
+        // U9-RX3: the split receive-block BLOCK/UNWIND pair.
+        (
+            "src/runtime.rs",
+            "recv_block_phase_b_split",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))",
+            "tcb.blocked_recv_generation = next;",
+            "tcb.ipc_timeout_deadline = deadline;",
+        ),
+        (
+            "src/runtime.rs",
+            "recv_block_unwind_race_split",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "tcb.ipc_timeout_fired = false;",
+            "true",
+        ),
         (
             "src/runtime.rs",
             "futex_wake_split_mut",
@@ -117882,7 +117975,7 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            33,
+            35,
             "33 raw writes: U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
              split form of \
@@ -117958,7 +118051,7 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            42,
+            44,
             "37 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
              `commit_blocking_send_split`, U3 (203C)'s `wake_tid_to_runnable_split`, and U7 \
              (199E)'s `drain_send_timeout_post_work`"
@@ -117973,8 +118066,9 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            42,
-            "33 raw writes + 8 transition-barriered sites + 1 reservation-barriered site"
+            44,
+            "35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair) + 8 transition-barriered \
+             sites + 1 reservation-barriered site"
         );
     }
 
@@ -118273,7 +118367,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            42,
+            44,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -118290,9 +118384,16 @@ mod stage199d_wa2b_wake_owner_census {
         // rank-2 claim refuses every status but `Blocked(EndpointSend(_))` before mutating
         // anything, so it can never act on a `Blocked(EndpointReceive)` task — CANNOT moves
         // 16 → 17 and nothing else moves.
+        // U9-RX3 adds exactly TWO rows, one to each of two classes, and nothing else moves.
+        // `recv_block_unwind_race_split` joins CAN (14 → 15): it writes
+        // `Blocked(EndpointReceive) -> Runnable`, the split form of the reversal
+        // `recv_block_unwind_race` performs, so it is the same class as the in-lock writer it
+        // mirrors. `recv_block_phase_b_split` joins INTO-BLOCKED (8 → 9): it only ever moves a
+        // task INTO `Blocked(EndpointReceive)`, in the same rank-2 acquisition that mints the
+        // fresh wait generation, so it is never a transition out.
         assert_eq!(
             (can, cannot, into_blocked, fresh, non_production),
-            (14, 17, 8, 2, 1)
+            (15, 17, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -118553,7 +118654,7 @@ mod stage199d_wa2b_wake_owner_census {
         // A. writer sites and logical origins are two explicit layers, and every helper's
         // direct callers are named (not a transitive caller standing in for the real one).
         assert!(
-            matrix.contains("Layer 1 — the 22 CAN status-assignment sites")
+            matrix.contains("Layer 1 — the 23 CAN status-assignment sites")
                 && matrix.contains("Layer 2 — logical origins"),
             "the matrix must separate writer sites from logical origins"
         );
@@ -142813,6 +142914,238 @@ mod u9rx_blocked_recv {
                     && !RUNTIME_SRC.contains(invented)
                     && !SPLIT_SRC.contains(invented),
                 "no new surface: `{invented}`"
+            );
+        }
+    }
+}
+
+/// U9-RX3 §9 — the structural guards for the pre-lock blocking-`IpcRecv` route.
+///
+/// The route's safety is entirely a property of its ORDER: what may still decline, what has
+/// already mutated, and which single deferral carries the outgoing identity to the drain. Each
+/// guard below pins one of those, derived from the source it guards rather than restated.
+mod u9rx3_route {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    /// The route body, comments stripped — every guard here asks about CODE, so an explanatory
+    /// comment that happens to name a symbol must never satisfy or trip one.
+    fn route_code() -> alloc::string::String {
+        let i = SPLIT_SRC
+            .find("fn try_split_blocking_ipc_recv_into_frame(\n    shared: &SharedKernel,")
+            .expect("the U9-RX3 route must exist");
+        let rest = &SPLIT_SRC[i..];
+        let end = rest
+            .find("\n#[cfg(feature = \"hosted-dev\")]")
+            .expect("the route is followed by its hosted stub");
+        rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// THE ORDER IS THE PROOF. The deferral is reserved before the first phase, and the three
+    /// phases run in rank order 1 → 2 → 3. Any other arrangement either publishes a waiter with
+    /// no reserved drain (the U9-FT3 defect) or publishes it before the TCB is `Blocked` (the
+    /// racing-sender hazard the broad entry's comment names).
+    #[test]
+    fn the_reservation_precedes_the_phases_and_the_phases_run_in_rank_order() {
+        let code = route_code();
+        let at = |needle: &str| {
+            code.find(needle)
+                .unwrap_or_else(|| panic!("the route must call `{needle}`"))
+        };
+        let defer = at("d2_recv_dispatch_try_defer(");
+        let a = at("recv_block_phase_a_split(");
+        let b = at("recv_block_phase_b_split(");
+        let c = at("recv_block_phase_c_split(");
+        assert!(
+            defer < a && a < b && b < c,
+            "order must be reserve({defer}) -> A({a}) -> B({b}) -> C({c})"
+        );
+    }
+
+    /// EVERY post-reservation decline releases the reservation. A reservation left armed on a
+    /// path that publishes nothing strands the CPU: the drain would re-verify an outgoing task
+    /// that is not blocked, decline, and clear it having advanced nothing.
+    #[test]
+    fn every_decline_after_the_reservation_clears_it() {
+        let code = route_code();
+        let after = &code[code
+            .find("d2_recv_dispatch_try_defer(")
+            .expect("the reservation")..];
+        // Four fallbacks sit at or after the reservation call: the reservation FAILING (nothing
+        // was reserved, so it correctly clears nothing), and then phase A, phase B and the race
+        // branch — each of which holds a reservation and must release it. A fifth clear belongs
+        // to the defensive publish arm, which settles as `Complete` rather than falling back.
+        let clears = after.matches("d2_recv_dispatch_clear(").count();
+        assert_eq!(
+            clears, 4,
+            "phase A, phase B, the race branch and the defensive publish branch must each clear \
+             the reservation"
+        );
+        assert_eq!(
+            after.matches("D::NotHandled").count(),
+            4,
+            "the only fallbacks at or after the reservation are: reservation failed, phase A, \
+             phase B, and the race branch"
+        );
+    }
+
+    /// `QueueAdvanceCommitted` is minted ONCE, and only past the publish.
+    #[test]
+    fn the_committed_outcome_is_minted_once_and_only_after_the_publish() {
+        let code = route_code();
+        assert_eq!(
+            code.matches("D::QueueAdvanceCommitted").count(),
+            1,
+            "the committed outcome has exactly one mint site"
+        );
+        assert!(
+            code.find("recv_block_phase_c_split(").expect("phase C")
+                < code.find("D::QueueAdvanceCommitted").expect("the mint"),
+            "nothing may claim a committed queue advance before the waiter is published"
+        );
+    }
+
+    /// THE RACE BRANCH RUNS THE INVERSE. `QueueNonEmpty` must reach `recv_block_unwind_race_split`
+    /// — the branch exists precisely because the block cannot be left standing.
+    #[test]
+    fn the_queue_non_empty_branch_runs_the_unwind() {
+        let code = route_code();
+        let arm = code
+            .find("PublishWaiterOutcome::QueueNonEmpty =>")
+            .expect("the race arm must be matched explicitly");
+        let tail = &code[arm..];
+        let stop = tail.find("\n        _ =>").unwrap_or(tail.len());
+        assert!(
+            tail[..stop].contains("recv_block_unwind_race_split("),
+            "the race arm must run the inverse before it falls back"
+        );
+    }
+
+    /// NO SECOND DRAIN. The route publishes into the deferral the blocking-recv class already
+    /// owns; it may not introduce a deferral family of its own, and it may not borrow another
+    /// class's.
+    #[test]
+    fn the_route_reuses_the_existing_blocking_recv_deferral_only() {
+        let code = route_code();
+        for foreign in [
+            "futex_wait_dispatch_try_defer",
+            "yield_dispatch_try_defer",
+            "d2_send_dispatch_try_defer",
+            "DISPATCH_SWITCH_PLAN_STASH",
+        ] {
+            assert!(
+                !code.contains(foreign),
+                "the route must not touch `{foreign}` — it has one deferral, the D2-recv one"
+            );
+        }
+        assert!(
+            code.contains("d2_recv_dispatch_try_defer(")
+                && code.contains("d2_recv_dispatch_is_deferred("),
+            "the route both checks and reserves the existing D2-recv deferral"
+        );
+    }
+
+    /// THE WOULD-BLOCK READ IS CONSERVATIVE. A wrong `true` blocks a receiver that had a message,
+    /// which is a hang; all five structural conditions must be present in the one acquisition.
+    #[test]
+    fn the_would_block_read_checks_all_five_conditions() {
+        let i = RUNTIME_SRC
+            .find("pub(crate) fn recv_would_block_split_read(")
+            .expect("the would-block read must exist");
+        let rest = &RUNTIME_SRC[i..];
+        let body = &rest[..rest.find("\n    /// U9-C").expect("its successor")];
+        for needle in [
+            "endpoint_generations",
+            "EndpointMode::Buffered",
+            "queued() != 0",
+            "endpoint_sender_waiters",
+            "endpoint_waiter_present",
+        ] {
+            assert!(
+                body.contains(needle),
+                "the would-block read must test `{needle}`"
+            );
+        }
+        assert_eq!(
+            body.matches("with_ipc_split_mut(").count(),
+            1,
+            "all five conditions must be read in ONE rank-3 acquisition, never two"
+        );
+    }
+
+    /// THE ROUTE IS TRIED BEFORE THE NON-SWITCHING WHITELIST. That whitelist's contract is that
+    /// every class on it may be early-returned through the caller's own frame; a blocking receive
+    /// may not, for the same reason FutexWait may not.
+    #[test]
+    fn the_switching_classes_are_dispatched_before_the_non_switching_ones() {
+        let i = SPLIT_SRC
+            .find("pub(crate) fn try_split_dispatch_into_frame(")
+            .expect("the pre-lock dispatcher");
+        let rest = &SPLIT_SRC[i..];
+        let body = &rest[..rest.find("\n}\n").expect("its body")];
+        let futex = body
+            .find("try_split_futex_wait_into_frame(")
+            .expect("FutexWait is dispatched");
+        let recv = body
+            .find("try_split_blocking_ipc_recv_into_frame(")
+            .expect("the blocking recv is dispatched");
+        let nonswitching = body
+            .find("try_split_dispatch_nonswitching_into_frame(")
+            .expect("the non-switching dispatcher");
+        assert!(
+            futex < nonswitching && recv < nonswitching,
+            "both switching classes must be tried before the non-switching whitelist"
+        );
+    }
+
+    /// AARCH64 IS NOT ADMITTED, AND THE REASON IS RECORDED. `pre_split_import_syscall_abi` is the
+    /// gate: without NR 2 in it the frame carries `nr = 0` there and every recv class falls back.
+    /// The exclusion is deliberate — importing NR 2 also reaches the queued-plain split recv,
+    /// whose writeback loses the reply cap — so it is pinned together with the finding, and a
+    /// future increment that fixes the writeback has to delete the note to admit the class.
+    #[test]
+    fn aarch64_does_not_import_the_recv_abi_and_says_why() {
+        let i = TRAP_ENTRY_SRC
+            .find("fn pre_split_import_syscall_abi(frame: &mut TrapFrame)")
+            .expect("the AArch64 ABI import gate must exist");
+        let rest = &TRAP_ENTRY_SRC[i..];
+        let body = &rest[..rest.find("\n}\n").expect("its body")];
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("SYSCALL_IPC_RECV_NR"),
+            "NR 2 must not be imported unconditionally on AArch64"
+        );
+        assert!(
+            body.contains("PM_RECV_DECODE_FAIL"),
+            "the recorded reason for the exclusion must stay with the gate"
+        );
+    }
+
+    /// NO NEW SURFACE. The route adds no syscall, no ABI lane, no cap slot and no marker family
+    /// beyond its own attributed refusals.
+    #[test]
+    fn the_route_invents_no_new_surface() {
+        let code = route_code();
+        for invented in [
+            "Syscall::IpcRecvBlocking",
+            "SYSCALL_IPC_RECV_BLOCK_NR",
+            "mint_capability",
+            "copy_to_current_user",
+            "with_cpu(",
+            "with_broad(",
+        ] {
+            assert!(
+                !code.contains(invented),
+                "the route must not reach for `{invented}`"
             );
         }
     }

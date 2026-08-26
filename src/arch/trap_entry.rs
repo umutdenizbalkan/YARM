@@ -2486,6 +2486,23 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // exact parked completion), and its Stage 195E drain has driven it live for that class
         // since it landed.
         || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+        // U9-RX3 §3 — IpcRecv (NR 2) is DELIBERATELY NOT admitted here, and the reason is a live
+        // finding, not caution.
+        //
+        // The blocking-recv pre-lock route below is architecture-neutral, and admitting NR 2 does
+        // make it fire correctly on AArch64: measured, the block publishes, the deferral is
+        // reserved and the existing D2-recv drain resumes the replacement cleanly. But the import
+        // is not selective — it makes NR 2 visible to the WHOLE pre-lock dispatcher, and the
+        // queued-plain split recv (Stage 32B) is reached first. On AArch64 that route then
+        // services PM's receive and PM answers `PM_RECV_DECODE_FAIL opcode=0
+        // reply_cap=4294967295`: the split writeback delivers the message without its reply cap,
+        // so PM never replies, and the caller (tid 2) is left blocked on endpoint 5 for the rest
+        // of the boot. The same `PM_RECV_DECODE_FAIL` is already visible on x86_64, where that
+        // route has always been live — so this is a PRE-EXISTING defect in the queued-plain split
+        // writeback that the import would newly impose on a second architecture.
+        //
+        // Fixing that writeback is its own increment with its own proof. Until it lands, AArch64
+        // keeps `nr = 0` for NR 2 and every recv class falls back byte-identically.
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

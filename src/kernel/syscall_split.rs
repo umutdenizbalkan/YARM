@@ -490,10 +490,337 @@ pub(crate) fn try_split_dispatch_into_frame(
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
+    // U9-RX3 §3 — the SECOND switching class. It is tried before the non-switching dispatcher for
+    // the same reason FutexWait is: the NR-only whitelist's contract is that every class on it may
+    // be early-returned through the caller's own frame, and a blocking receive may not.
+    //
+    // It runs AFTER the non-blocking queued-plain recv would have, in the sense that matters:
+    // this route admits ONLY the state in which that one declines (an empty buffered endpoint with
+    // no waiters), so the two never contend for the same trap.
+    match try_split_blocking_ipc_recv_into_frame(shared, cpu, frame) {
+        SplitDispatchDisposition::NotHandled => {}
+        handled => return handled,
+    }
     match try_split_dispatch_nonswitching_into_frame(shared, cpu, frame) {
         None => SplitDispatchDisposition::NotHandled,
         Some(result) => SplitDispatchDisposition::Complete(result),
     }
+}
+
+/// U9-RX3 §3 — service a BLOCKING `IpcRecv` (NR 2) off the broad lock.
+///
+/// This is the migration of the existing block-and-publish sequence onto the four SharedKernel
+/// phase twins, reusing the deferral/drain topology the broad entry already publishes into. It
+/// creates no drain, no syscall, no ABI lane and no marker family beyond its own attributed
+/// refusals.
+///
+/// ## The ordering is forced by source, not chosen
+///
+/// `block_current_on_receive_with_deadline` runs scheduler(1) → task(2) → ipc(3), and the comment
+/// above it says why the publish may not be hoisted ahead of the block: a sender that observes a
+/// published waiter must also observe a `Blocked` TCB, or it will attempt direct delivery to a
+/// task that is still `Running`. So the recheck-loses race (`QueueNonEmpty`) cannot be made
+/// mutation-free, and this route must be able to UNDO the rank-1 block. That inverse is
+/// `SharedKernel::recv_block_unwind_race_split`, and its existence is what makes this route
+/// possible at all.
+///
+/// ## Steps, ordered so the last decline precedes the first mutation
+///
+/// 1. **NR + architecture** — `IpcRecv` only, and only where a live witness exists.
+/// 2. **Publication gates** — the broad blocked-recv arm calls three `maybe_publish_*_ack` hooks
+///    that take `&mut KernelState`. They are strict no-ops in the default configuration; when any
+///    is armed this route refuses so the unchanged broad arm runs them exactly as before.
+/// 3. **ABI** — decoded through the SAME canonical `RecvRequest` builder the broad entry uses.
+///    Only a `recv-v2` request is admitted: it is the shape whose `BlockedRecvState` the four
+///    `DispatchPostWork::BlockedWaiter*Delivery` classes complete by writeback. A legacy request
+///    saves no state and is completed differently; it keeps the broad path.
+/// 4. **Capability** — resolved off-lock through the existing task(2) → capability(4) split read.
+/// 5. **Would-block** — the conservative rank-3 structural read. The broad entry answers this by
+///    attempting the take; a pre-lock route cannot, because the attempt is the mutation.
+/// 6. **Admission** — `queue_advance_admit_split`, plus this class's own precondition that no
+///    same-class deferral is outstanding. Every refusal lands here, while fallback is still safe.
+/// 7. **Reserve the deferral** — before any publication, so a reservation failure stays
+///    pre-mutation. Holding it is what guarantees the drain applies an incoming context.
+/// 8. **Phase A / B / C** — the three twins, in rank order. `QueueNonEmpty` runs the exact
+///    inverse and falls back; the broad path then services the message that arrived.
+/// 9. **`QueueAdvanceCommitted`** — the existing D2-recv drain consumes the one deferral,
+///    re-verifies `Blocked(EndpointReceive)`, selects and resumes.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_blocking_ipc_recv_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    use crate::kernel::capabilities::{CapId, CapObject};
+    use crate::kernel::recv_core::{RecvMetaTarget, RecvRequest};
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
+        SYSCALL_ARG_PTR,
+    };
+    use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+    use SplitDispatchDisposition as D;
+
+    // (1) NR, then architecture. The body is architecture-neutral; the gate names the two that
+    // have the drain this route publishes into. In practice only x86_64 REACHES it today —
+    // AArch64 keeps `nr = 0` for NR 2 (see `pre_split_import_syscall_abi`, where the reason is
+    // recorded), so the decode below declines there. RISC-V is excluded for want of a live
+    // witness, not for a structural reason: its D2-recv drain is the same shape.
+    if !matches!(Syscall::decode(frame.syscall_num()), Ok(Syscall::IpcRecv)) {
+        return D::NotHandled;
+    }
+    if !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+        return D::NotHandled;
+    }
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return D::NotHandled;
+    }
+    // (2) The publication gates the broad blocked-recv arm owns.
+    if cfg!(feature = "shared-region-direct-oracle")
+        || crate::kernel::boot::ipccall_direct_publication_enabled()
+    {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=ack_publication_armed",
+            cpu.0
+        );
+        return D::NotHandled;
+    }
+    let Some(tid) = shared.current_tid_authoritative(cpu) else {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=no_current_task",
+            cpu.0
+        );
+        return D::NotHandled;
+    };
+    // (3) ABI, through the canonical builder. `is_kernel_task` is the same question
+    // `current_task_has_user_asid` asks, read through the rank-2 seam.
+    let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let is_kernel_task = shared.task_asid_opt_split_read(tid).is_none();
+    let request = RecvRequest::from_legacy_ipc_recv(
+        tid,
+        cap,
+        frame.arg(SYSCALL_ARG_PTR),
+        frame.arg(SYSCALL_ARG_LEN),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+        is_kernel_task,
+    );
+    let RecvMetaTarget::V2 {
+        ptr: meta_user_ptr,
+        len: meta_user_len,
+    } = request.meta_target
+    else {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=not_recv_v2",
+            cpu.0,
+            tid
+        );
+        return D::NotHandled;
+    };
+    // (4) Capability: task(2) pid read → capability(4) resolve, both off the broad lock. Every
+    // refusal here has a canonical error the broad handler produces, so fall back and let it.
+    let Ok(snapshot) = shared.resolve_endpoint_recv_cap_split_read(tid, cap) else {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=cap_resolve",
+            cpu.0,
+            tid
+        );
+        return D::NotHandled;
+    };
+    let CapObject::Endpoint {
+        index: endpoint_idx,
+        generation,
+    } = snapshot.endpoint
+    else {
+        return D::NotHandled;
+    };
+    // (5) Would-block, under one rank-3 acquisition.
+    if !shared.recv_would_block_split_read(endpoint_idx, generation) {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} endpoint={} reason=would_not_block",
+            cpu.0,
+            tid,
+            endpoint_idx
+        );
+        return D::NotHandled;
+    }
+    // (6) ADMISSION — the last point at which falling back is safe.
+    if crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx) {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=already_deferred",
+            cpu.0,
+            tid
+        );
+        return D::NotHandled;
+    }
+    if let Err(refusal) = shared.queue_advance_admit_split(
+        cpu,
+        crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+    ) {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason={:?}",
+            cpu.0,
+            tid,
+            refusal
+        );
+        return D::NotHandled;
+    }
+    // The markers the broad entry emits before it blocks, in the broad entry's order — this route
+    // intercepts before the arm that would have printed them, and the stream an observer sees must
+    // not change because the owner did.
+    crate::yarm_log!("IPC_RECV_ENTER tid={} cap={}", tid, cap.0);
+    crate::yarm_log!(
+        "YARM_RECV_CORE_ADAPTER kind=legacy_full_path is_kernel_task={}",
+        is_kernel_task
+    );
+    crate::yarm_log!(
+        "IPC_RECV_AFTER_CAP_OK tid={} cap={} endpoint={:?}",
+        tid,
+        cap.0,
+        snapshot.endpoint
+    );
+    if tid == 2 && shared.fault_or_supervisor_endpoint_split_read(endpoint_idx) {
+        crate::yarm_log!(
+            "SUPERVISOR_FAULT_RECV_CAP cap={} endpoint={} generation={}",
+            cap.0,
+            endpoint_idx,
+            generation
+        );
+    }
+    // (7) Reserve the deferral BEFORE any publication.
+    if !crate::kernel::boot::d2_recv_dispatch_try_defer(cpu_idx, tid) {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=defer_unavailable",
+            cpu.0,
+            tid
+        );
+        return D::NotHandled;
+    }
+    // (8) Phase A — scheduler rank 1. A victim mismatch unwinds its own single step inside the
+    // twin, so this is still pre-mutation from the route's point of view.
+    let Some(receiver_asid) = shared.recv_block_phase_a_split(cpu, tid) else {
+        crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=phase_a",
+            cpu.0,
+            tid
+        );
+        return D::NotHandled;
+    };
+    // Phase B — task rank 2. `deadline` is `None`: NR 2 carries no timeout, which is also what
+    // keeps the reply-deadline and oracle arming the broad arm performs strict no-ops.
+    let state = BlockedRecvState {
+        recv_cap: cap,
+        payload_user_ptr: frame.arg(SYSCALL_ARG_PTR),
+        payload_user_len: frame.arg(SYSCALL_ARG_LEN),
+        meta_user_ptr,
+        meta_user_len,
+        recv_abi: RecvAbiVariant::RecvV2,
+    };
+    let Some(wait_generation) = shared.recv_block_phase_b_split(tid, cap, None, state) else {
+        // The task half refused before it wrote anything; undo Phase A's block and fall back.
+        let _ = shared.recv_block_unwind_race_split(cpu, tid);
+        crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=phase_b",
+            cpu.0,
+            tid
+        );
+        return D::NotHandled;
+    };
+    // `IPC_RECV_BLOCKED_STATE_SAVE` is NOT emitted here: `recv_block_phase_b_split` is the owner
+    // of that write and already prints it, so printing it again would double the marker.
+    // Phase C — ipc rank 3. The atomic recheck-and-publish, through the ONE policy owner both
+    // routes share.
+    let outcome = shared.recv_block_phase_c_split(
+        endpoint_idx,
+        crate::kernel::boot::EndpointWaiterRecord::new(
+            crate::kernel::boot::ReceiverWaiterIdentity::new(
+                crate::kernel::ipc::ThreadId(tid),
+                receiver_asid,
+            ),
+            wait_generation,
+        ),
+        cap,
+    );
+    match outcome {
+        crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published => {}
+        // THE RACE. A sender enqueued between step (5) and this publish. Reverse ranks 2 and 1
+        // exactly, release the reservation, and let the broad path service the message. This is
+        // the branch the serialized broad entry documents as unreachable and this route makes
+        // reachable — it is why the unwind twin had to exist first.
+        crate::kernel::recv_waiter_split::PublishWaiterOutcome::QueueNonEmpty => {
+            let unwound = shared.recv_block_unwind_race_split(cpu, tid);
+            crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+            if !unwound {
+                // The inverse could not complete. Falling back would re-execute the syscall on a
+                // task the scheduler no longer holds as current, so fail closed instead.
+                crate::yarm_log!(
+                    "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=unwind",
+                    cpu.0,
+                    tid
+                );
+                return D::Complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                )));
+            }
+            crate::yarm_log!(
+                "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} endpoint={} reason=queue_non_empty",
+                cpu.0,
+                tid,
+                endpoint_idx
+            );
+            return D::NotHandled;
+        }
+        // The live publish policy preserves last-receiver-wins and never returns
+        // `ReceiverAlreadyWaiting`, and step (5) validated the index and generation under the
+        // same rank-3 lock, so `InvalidEndpoint` is defensively unreachable.
+        _ => {
+            let unwound = shared.recv_block_unwind_race_split(cpu, tid);
+            crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=publish unwound={}",
+                cpu.0,
+                tid,
+                u8::from(unwound)
+            );
+            return D::Complete(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::WrongObject,
+            )));
+        }
+    }
+    crate::yarm_log!(
+        "IPC_RECV_BLOCK_REGISTER endpoint={} tid={}",
+        endpoint_idx,
+        tid
+    );
+    crate::yarm_log!(
+        "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=blocking_recv_switch_required tid={} cpu={}",
+        tid,
+        cpu_idx
+    );
+    // (9) The syscall's own result, into the outgoing frame before the switch — the exact
+    // `WouldBlock` the broad arm returns for a receive that parked. A delivering sender overwrites
+    // it through `complete_blocked_recv_for_waiter`; it is what the caller observes only if it is
+    // resumed without a delivery.
+    frame.set_err(crate::kernel::syscall::SyscallError::WouldBlock.code());
+    crate::yarm_log!(
+        "IPC_RECV_BLOCK_SPLIT_DONE cpu={} tid={} endpoint={} wait_gen={} result=blocked",
+        cpu.0,
+        tid,
+        endpoint_idx,
+        wait_generation
+    );
+    D::QueueAdvanceCommitted
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_blocking_ipc_recv_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
 }
 
 /// U9-TM §2 — service a NON-PREEMPTING `TimerInterrupt` off the broad lock.

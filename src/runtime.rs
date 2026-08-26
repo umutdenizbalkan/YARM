@@ -3838,7 +3838,11 @@ impl SharedKernel {
     /// a write of CPU 0 over CPU 0, because the consumer returns immediately unless `cpu.0 == 0`
     /// and the broad Phase-2 trap guard already bound the same value.) No broad fallback, no
     /// drain, no retry.
-    #[cfg(target_arch = "x86_64")]
+    /// U9-RX3: the `x86_64` cfg gate was removed. The body is architecture-NEUTRAL — it calls
+    /// the scheduler's own `on_preempt_prefer_on(cpu, tid)` under rank 1 and touches nothing
+    /// architecture-specific. The gate reflected where the U3 caller happened to live, not where
+    /// the transaction is sound, and the receive-block unwind needs the same rank-1 step to
+    /// re-establish the unwound receiver as current.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn on_preempt_prefer_on_cpu_split(
         &self,
@@ -4253,6 +4257,158 @@ impl SharedKernel {
             tid
         );
         T::Committed { faulted_tid: tid }
+    }
+
+    /// U9-RX3 — Phase A twin (scheduler, rank 1): remove the receiver from `current`.
+    ///
+    /// Mirrors `KernelState::recv_block_phase_a_scheduler`. Returns the EXACT blocked tid and its
+    /// captured ASID as an opaque token half; the caller never reconstructs either.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn recv_block_phase_a_split(
+        &self,
+        cpu: CpuId,
+        expected_tid: u64,
+    ) -> Option<crate::kernel::vm::Asid> {
+        let removed = self.block_current_on_cpu_split(cpu).ok().flatten()?;
+        if removed != expected_tid {
+            // A different task was current than the one this route classified. Nothing else has
+            // been touched, so the caller unwinds this single step and declines.
+            crate::yarm_log!(
+                "D2_RECV_SPLIT_REFUSED cpu={} phase=a reason=victim_changed expected={} removed={}",
+                cpu.0,
+                expected_tid,
+                removed
+            );
+            let _ = self.on_preempt_prefer_on_cpu_split(cpu, removed);
+            return None;
+        }
+        crate::yarm_log!("SCHED_BLOCK tid={}", removed);
+        Some(
+            self.task_asid_opt_split_read(removed)
+                .unwrap_or(crate::kernel::vm::Asid(0)),
+        )
+    }
+
+    /// U9-RX3 — Phase B twin (task, rank 2): mint the FRESH wait generation, mark the receiver
+    /// `Blocked(EndpointReceive)`, stage the deadline, and store the blocked-recv writeback state
+    /// — all in ONE acquisition.
+    ///
+    /// The `BlockedRecvState` is stored HERE, before the waiter is published, so a sender that
+    /// finds the waiter can never complete a receiver whose payload/meta pointers do not yet
+    /// exist. Checked generation advancement fails closed exactly as the broad phase does.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn recv_block_phase_b_split(
+        &self,
+        tid: u64,
+        recv_cap: crate::kernel::capabilities::CapId,
+        deadline: Option<u64>,
+        state: crate::kernel::task::BlockedRecvState,
+    ) -> Option<u64> {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let wait_gen = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
+            let next = tcb.blocked_recv_generation.checked_add(1)?;
+            tcb.blocked_recv_generation = next;
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            tcb.ipc_timeout_deadline = deadline;
+            tcb.ipc_timeout_fired = false;
+            tcb.blocked_recv_state = Some(state);
+            Some(next)
+        })?;
+        crate::yarm_log!(
+            "D2_RECV_WAITER_TASK_BLOCKED tid={} wait_gen={}",
+            tid,
+            wait_gen
+        );
+        crate::yarm_log!(
+            "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={}",
+            tid,
+            recv_cap.0,
+            state.payload_user_ptr,
+            state.payload_user_len,
+            state.meta_user_ptr,
+            state.meta_user_len
+        );
+        Some(wait_gen)
+    }
+
+    /// U9-RX3 — Phase C twin (IPC, rank 3): the atomic queue-recheck and waiter publish, through
+    /// the ONE policy owner `publish_recv_waiter_locked` that the broad form also runs.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn recv_block_phase_c_split(
+        &self,
+        endpoint_idx: usize,
+        record: crate::kernel::boot::EndpointWaiterRecord,
+        recv_cap: crate::kernel::capabilities::CapId,
+    ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
+        let outcome = self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::publish_recv_waiter_locked(ipc, endpoint_idx, record, recv_cap)
+        });
+        if matches!(
+            outcome,
+            crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
+        ) {
+            crate::yarm_log!("D2_RECV_WAITER_PUBLISHED tid={}", record.receiver.tid.0);
+        }
+        outcome
+    }
+
+    /// U9-RX3 — the EXACT inverse of Phase B then Phase A, for the `QueueNonEmpty` race.
+    ///
+    /// Reverses in strict reverse order: clear the blocked-recv writeback state and restore the
+    /// task to `Runnable` (rank 2), then re-establish it as `current` on the SAME cpu (rank 1).
+    /// The wait generation is deliberately NOT rolled back — generations only ever advance, and a
+    /// rollback would let a stale record compare equal to a newer one.
+    ///
+    /// Returns `true` only when the receiver is provably `current` again. A `false` return means
+    /// the caller must fail closed rather than resume a task that is still Blocked.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn recv_block_unwind_race_split(&self, cpu: CpuId, tid: u64) -> bool {
+        use crate::kernel::task::TaskStatus;
+        crate::yarm_log!("D2_PUBLISH_RACE_UNWIND endpoint=split tid={}", tid);
+        crate::yarm_log!("D2_RECV_WAITER_RACE_UNWIND tid={}", tid);
+        // Rank 2 — the exact inverse of Phase B's task half.
+        let cleared = self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                Some(tcb) => {
+                    tcb.blocked_recv_state = None;
+                    tcb.ipc_timeout_deadline = None;
+                    tcb.ipc_timeout_fired = false;
+                    tcb.status = TaskStatus::Runnable;
+                    true
+                }
+                None => false,
+            }
+        });
+        if !cleared {
+            crate::yarm_log!(
+                "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=b reason=task_missing",
+                tid
+            );
+            return false;
+        }
+        // Rank 1 — the exact inverse of Phase A: re-enqueue and make current again.
+        if self
+            .wake_tid_to_runnable_split(cpu, crate::kernel::ipc::ThreadId(tid))
+            .is_err()
+        {
+            crate::yarm_log!("D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=wake", tid);
+            return false;
+        }
+        match self.on_preempt_prefer_on_cpu_split(cpu, tid) {
+            Some(now) if now == tid => {
+                crate::yarm_log!("D2_RECV_SPLIT_UNWIND_OK cpu={} tid={}", cpu.0, tid);
+                true
+            }
+            other => {
+                crate::yarm_log!(
+                    "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=not_current observed={:?}",
+                    tid,
+                    other
+                );
+                false
+            }
+        }
     }
 
     /// U9-FT3 §1 — the read-only buffered fault-report admission preflight.
@@ -4699,6 +4855,53 @@ impl SharedKernel {
     ) -> crate::kernel::boot::IpcEndpointRecvResult {
         self.with_ipc_split_mut(|ipc| {
             crate::kernel::boot::ipc_try_recv_queued_plain_endpoint_only_locked(ipc, endpoint_idx)
+        })
+    }
+
+    /// U9-RX3 §2 — the rank-3 read that decides, off the broad lock, that an `IpcRecv` on this
+    /// endpoint WOULD BLOCK.
+    ///
+    /// The broad entry answers the same question by *attempting* the take
+    /// (`ipc_recv_endpoint_take`) and observing `None`. That is not available to a pre-lock
+    /// route: the attempt itself is the mutation. So this asks the conservative structural
+    /// question instead, in ONE rank-3 acquisition, and answers `true` only for the state in
+    /// which the broad take is provably a no-op:
+    ///
+    /// * the capability's generation still names this endpoint (the liveness check the broad
+    ///   `resolve_endpoint_index` performs);
+    /// * the endpoint is `Buffered` — the only mode this route services;
+    /// * its queue is empty, so there is nothing to dequeue;
+    /// * NO sender waiter is parked, so the two-phase refill has nothing to hand over;
+    /// * and NO receive waiter is already published, so this caller is not displacing one.
+    ///
+    /// Any other shape returns `false` and the unchanged broad path runs. Being conservative
+    /// here is free — a wrong `true` would block a receiver that had a message waiting, which is
+    /// a hang; a wrong `false` is one fallback.
+    pub(crate) fn recv_would_block_split_read(&self, endpoint_idx: usize, generation: u64) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            if endpoint_idx >= ipc.endpoints.len() {
+                return false;
+            }
+            if ipc.endpoint_generations.get(endpoint_idx).copied() != Some(generation) {
+                return false;
+            }
+            let Some(storage) = ipc.endpoints[endpoint_idx].as_ref() else {
+                return false;
+            };
+            let endpoint = crate::kernel::boot::kernel_ref(storage);
+            if endpoint.mode() != crate::kernel::ipc::EndpointMode::Buffered {
+                return false;
+            }
+            if endpoint.queued() != 0 {
+                return false;
+            }
+            if ipc.endpoint_sender_waiters[endpoint_idx]
+                .iter()
+                .any(Option::is_some)
+            {
+                return false;
+            }
+            !ipc.endpoint_waiter_present(endpoint_idx)
         })
     }
 
@@ -7245,6 +7448,20 @@ impl SharedKernel {
     /// `KernelState::report_transfer_revoke_to_supervisor`.
     pub(crate) fn supervisor_endpoint_split(&self) -> Option<usize> {
         self.with_fault_split_read(|faults| faults.supervisor_endpoint)
+    }
+
+    /// U9-RX3 §3 — the exact predicate `log_supervisor_fault_recv_cap_if_applicable` evaluates,
+    /// read through the fault seam alone (rank 8).
+    ///
+    /// The marker that predicate guards is emitted on every live boot, and the pre-lock blocking
+    /// receive intercepts before the broad arm that prints it. Reproducing the condition rather
+    /// than dropping the marker is what keeps the observable stream the same when the owner
+    /// changes.
+    pub(crate) fn fault_or_supervisor_endpoint_split_read(&self, endpoint_idx: usize) -> bool {
+        self.with_fault_split_read(|faults| {
+            faults.fault_handler_endpoint == Some(endpoint_idx)
+                || faults.supervisor_endpoint == Some(endpoint_idx)
+        })
     }
 
     /// U9-D3 §7 — rank 2, ONE acquisition: every live task's `(tid, stack_base, stack_top)`
@@ -10663,6 +10880,152 @@ mod tests {
 
         assert_eq!(kernel.current_tid_split_read(CpuId(0)), Some(42));
         assert_eq!(kernel.current_tid_split_read(CpuId(7)), None);
+    }
+
+    /// U9-RX3 §9 — the FORCED `QueueNonEmpty` race, driven entirely through the split twins.
+    ///
+    /// The broad entry documents this branch as unreachable: Phases A/B/C run inside one
+    /// `&mut KernelState` borrow, so no sender can interleave. The pre-lock route makes it
+    /// genuinely reachable, and it is the only branch that must UNDO a rank-1 block. This test
+    /// forces the interleaving by hand and asserts the whole inverse:
+    ///
+    /// * the publish observes the raced enqueue and publishes NOTHING;
+    /// * the unwind reports success;
+    /// * the receiver is `Runnable` again, current on its CPU, with its blocked-recv state,
+    ///   deadline and timeout flag all cleared;
+    /// * no waiter is left behind, and the raced message is still queued for the fallback.
+    ///
+    /// A regression here is a hang, not a wrong value, which is why it is asserted positively
+    /// rather than by the absence of a marker.
+    #[test]
+    fn u9rx3_forced_publish_race_unwinds_the_block_completely() {
+        use crate::kernel::boot::{EndpointWaiterRecord, ReceiverWaiterIdentity};
+        use crate::kernel::ipc::{Message, ThreadId};
+        use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskStatus};
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let (endpoint_idx, generation, recv_cap, sender_send_cap) = kernel.with(|state| {
+            state.register_task(1).expect("sender task");
+            state.enqueue_current_cpu(1).expect("queue sender");
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            let object = state
+                .current_task_capability(recv_cap)
+                .expect("recv cap")
+                .object;
+            let crate::kernel::capabilities::CapObject::Endpoint { index, generation } = object
+            else {
+                panic!("recv cap must name an endpoint")
+            };
+            let sender_send_cap = state
+                .grant_capability_task_to_task(0, send_cap, 1)
+                .expect("dup send cap to the sender");
+            (index, generation, recv_cap, sender_send_cap)
+        });
+
+        // Before anything is blocked the endpoint is empty, so the route's would-block read
+        // admits it. This is the precondition the race then invalidates.
+        assert!(
+            kernel.recv_would_block_split_read(endpoint_idx, generation),
+            "an empty buffered endpoint with no waiters must read as would-block"
+        );
+
+        // Phase A (rank 1) — the receiver (tid 0) is removed from `current`.
+        let receiver_asid = kernel
+            .recv_block_phase_a_split(cpu, 0)
+            .expect("phase A must block the receiver it was given");
+        // Phase B (rank 2) — marked `Blocked(EndpointReceive)` with a fresh generation.
+        let wait_generation = kernel
+            .recv_block_phase_b_split(
+                0,
+                recv_cap,
+                None,
+                BlockedRecvState {
+                    recv_cap,
+                    payload_user_ptr: 0x1000,
+                    payload_user_len: 128,
+                    meta_user_ptr: 0x2000,
+                    meta_user_len: 40,
+                    recv_abi: RecvAbiVariant::RecvV2,
+                },
+            )
+            .expect("phase B must mint a generation");
+        assert_eq!(wait_generation, 1);
+
+        // THE RACE — a sender enqueues after the block and before the publish.
+        kernel.with(|state| {
+            state.dispatch_next_task().expect("dispatch to the sender");
+            assert_eq!(state.current_tid(), Some(1));
+            let msg = Message::new(1, b"raced").expect("msg");
+            state.ipc_send(sender_send_cap, msg).expect("racing send");
+        });
+        assert!(
+            !kernel.recv_would_block_split_read(endpoint_idx, generation),
+            "the raced enqueue must make the endpoint no longer would-block"
+        );
+
+        // Phase C (rank 3) — the atomic recheck loses, exactly as the route expects.
+        let outcome = kernel.recv_block_phase_c_split(
+            endpoint_idx,
+            EndpointWaiterRecord::new(
+                ReceiverWaiterIdentity::new(ThreadId(0), receiver_asid),
+                wait_generation,
+            ),
+            recv_cap,
+        );
+        assert_eq!(
+            outcome,
+            PublishWaiterOutcome::QueueNonEmpty,
+            "the publish must detect the raced enqueue"
+        );
+
+        // THE INVERSE.
+        assert!(
+            kernel.recv_block_unwind_race_split(cpu, 0),
+            "the unwind must complete"
+        );
+        kernel.with(|state| {
+            assert_eq!(
+                state.task_status(0),
+                Some(TaskStatus::Runnable),
+                "the receiver must be Runnable again, not left Blocked"
+            );
+            assert_eq!(
+                state.current_tid_on_cpu(cpu),
+                Some(0),
+                "the receiver must be current again so the broad fallback can re-run its syscall"
+            );
+            state.with_tcb_mut(0, |tcb| {
+                assert!(
+                    tcb.blocked_recv_state.is_none(),
+                    "phase B's blocked-recv state must be cleared"
+                );
+                assert!(
+                    tcb.ipc_timeout_deadline.is_none(),
+                    "deadline must be cleared"
+                );
+                assert!(!tcb.ipc_timeout_fired, "timeout flag must be cleared");
+            });
+            assert_eq!(
+                state.endpoint_waiter_tid(
+                    state
+                        .current_task_capability(recv_cap)
+                        .expect("recv cap")
+                        .object
+                ),
+                None,
+                "no waiter may be left published on the race branch"
+            );
+            assert_eq!(
+                state
+                    .ipc_recv(recv_cap)
+                    .expect("recv")
+                    .map(|m| m.as_slice().to_vec()),
+                Some(b"raced".to_vec()),
+                "the raced message must still be there for the fallback to take"
+            );
+        });
     }
 
     #[test]
