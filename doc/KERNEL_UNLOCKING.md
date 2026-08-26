@@ -12436,3 +12436,127 @@ creation, Spawn/Fork/Exit, the futex features and RPi5 are untouched. The census
 **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall production remains OFF
 (`ipccall_direct_production_enabled()` is `const false`). U9-RX4 is CENSUS-DELTA 0, so the canonical
 stage arithmetic is unchanged.
+
+### U9-COW2 — the restored COW witness, and the routed x86_64 private-copy recovery. CENSUS-DELTA 0.
+
+**U9-COW2 — the witness was restored first, the broad handler was qualified against it, and only
+then was the route wired.** The census stays **2 / 0 / 2**.
+
+**CORRECTION — earlier sections claim a live COW witness that had ceased to exist.** U9-PF
+recorded "2 × `path=private_copy`" under `VM_COW=1` at base `adcf229`, and every increment since
+repeated that the witness was "intact". Measured at `11d6ba4` with fresh matched artifacts and
+`VM_COW=1`: `VM_COW_FORK_BEGIN=0`, `VM_COW_FAULT_BEGIN=0`, `VM_COW_DONE=0`,
+`PAGE_FAULT_HANDLED_COW=0`, `PAGE_FAULT_ENTRY=0` — **zero page faults of any class**. Statements
+that `11d6ba4` supplied a COW witness were false, and the routing matrix's `SplitCow` row rested
+on evidence that had lapsed. This section supersedes them; the earlier text is left in place as
+the historical record of what was believed at the time.
+
+**WHY IT LAPSED — unreachability, not removal.** The only shipped caller of Fork (NR 12) is
+`run_ipc_recv_proof_sender_wake`, dispatched roughly 640 lines into init's service chain. On
+x86_64 init blocks first at `INIT_SPAWN_V5_REPLY_RECV_BEGIN`, waiting on PM's reply to its
+SpawnV5 request, and the system quiesces with only the supervisor runnable. Fork is therefore
+never invoked, no page is ever COW-cloned, and no COW fault can occur. The core smoke tolerates
+that state as a `[warn] service entry warnings` condition rather than a failure.
+
+**AND WHY NOBODY NOTICED.** Every assertion in the Stage-172 `VM_COW` block was guarded by
+`if log_has_pattern "VM_COW_FAULT_BEGIN"`. A boot producing zero forks and zero COW faults passed
+the *identical* gate as one producing a correct witness. The profile was not weakly verified — it
+was verified vacuously, and it exited 0 throughout.
+
+**THE WITNESS, RESTORED WHERE IT CAN ACTUALLY RUN.** `run_vm_cow_fork_witness_early` sits beside
+`dispatch_aarch64_unlocking_oracle_early`, which was itself relocated ahead of the SpawnV5 chain
+for precisely this reason — "they were never reached and their live acceptance evidence could not
+be produced". It is gated on startup slot 13, the sender-wake selector `VM_COW=1` turns on, and
+is a strict no-op otherwise: no fork, no writes, not one extra syscall on an ordinary boot.
+
+It seeds one page-aligned page of init's own BSS (making it resident and writable *before* the
+clone write-protects it — a never-faulted lazy page would take a DEMAND fault, not a COW one),
+calls the existing `fork_raw()`, has parent and child write **distinct values to the same virtual
+address**, verifies isolation from userspace, and exits the child through the existing NR 16.
+**No new script, syscall, ABI lane, marker family or userspace binary**: it reuses
+`IPC_RECV_PROOF_SENDER_WAKE_FORK_*` and `FORK_PROOF_*`. Nothing in fork, ELF, scheduler, VM,
+capability or syscall semantics is altered to make it pass.
+
+**THE GATE IS NOW MANDATORY.** With the selector on, the smoke FAILS on zero fork transactions,
+zero COW faults, zero `path=private_copy`, disagreeing `BEGIN`/`DONE`/`HANDLED` counts, or a
+missing userspace isolation check. Conditionality survives only on the selector itself.
+
+**BROAD-PATH QUALIFICATION FIRST — three consecutive runs, unchanged handler.** Identical every
+time: exactly one fork transaction (`FORK_BEGIN` = `FORK_DONE` = 1); `FAULT_BEGIN` = `DONE` =
+`HANDLED_COW` = 4, all four `path=private_copy`; ASID 1 (parent, tid 1) and ASID 5 (child, tid
+10000), at `0x464000` and the stack; parent wrote `0xa1`, child `0xc2`, at the **same** VA, each
+observing only its own; zero unhandled, panic, double fault, `VM_COW_FAIL`, refcount underflow,
+writable-shared alias, stale cap or capability exhaustion. The witness executes the production
+Fork syscall from a real userspace process and is recovered by ordinary broad PageFault handling —
+nothing kernel-synthetic. The recovery is the historical shape plus the stack page.
+
+**THE OBSERVED BROAD ORDER became the audit reference**, rather than the attempt's own description
+of itself: `FAULT_BEGIN` → `PHASE_METADATA writable=0` → `PHASE_FRAME_ALLOC new_pa` →
+`PHASE_PT_UPDATE` → `VM_TLB_LOCAL_FLUSH` → `VM_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live` →
+`VM_TLB_SHOOTDOWN_PREP_DONE` → `PHASE_TLB_FLUSH` → `VM_COW_DONE path=private_copy` →
+`PAGE_FAULT_HANDLED_COW`.
+
+**THE TRANSACTION.** `cow_recover_private_copy_split` revalidates the cnode, that the mapping is
+still present and still NOT writable, that the page is still COW-marked, and that `{cpu, tid,
+asid}` is still the incarnation that was classified — all before the first mutation, so every
+`Refused*` outcome is safe to hand back to the broad arm. Then: one frame (rank 6) → the object
+slot through `create_memory_object_slot_locked` (rank 6) → the cap through
+`mint_capability_with_memory_ref_split` into the **exact faulting task's** cnode (rank 6 then 4)
+→ the broad path's rights-and-object resolution against that exact task → the page copy with no
+lock held → `map_page`, whose arch backend writes the PTE and then invalidates locally, so
+replacement precedes invalidation by construction → the refcount transition and COW-mark clear in
+ONE rank-6 acquisition → the generation-matched shootdown with **no domain lock held** → and the
+old frame's reclaim **only after the acknowledgement**. No two domain locks are held at once.
+
+**ONE OWNER PER EFFECT.** The rank-6 object-slot policy — capacity screen, id allocation, slot
+install, the three initial refcounts — and the per-kind rights rule are each stated once and
+driven by BOTH creators. A private-copy COW frame created with different starting refcounts than
+every other anonymous object is the kind of divergence that surfaces later as a leak rather than
+as a failure.
+
+**FAIL-CLOSED IS NOT DECLINE.** The outcome is deliberately three-way. `Refused*` mutated nothing
+and may fall back. `FailedClosed*` allocated a frame, so it may NOT — the broad arm would allocate
+a second one for a fault it never saw declined — and it carries the EXACT `KernelError` the broad
+arm produces at that same step, so the trap the caller finally reports is the one it would have
+reported anyway. All five post-allocation failure arms run one shared inverse.
+
+**ROUTED, x86_64 ONLY.** Admission goes through the existing pure classifier and routing matrix:
+an x86_64 user WRITE fault classified `CowCandidate` on a present, non-writable page. The
+`already_writable` arm — a bare mark clear, with zero live witnesses — stays broad. Demand and
+terminal PageFault are untouched, AArch64 and RISC-V are unchanged, and no shipped profile
+produces a COW private-copy witness on either.
+
+**LIVE, FIVE CONSECUTIVE FRESH BOOTS.** Identical every run: 1 fork; 4 faults; 4
+`path=private_copy`; 4 `PAGE_FAULT_HANDLED_COW`; **4 `VM_COW_SPLIT_COMMITTED`, all `acked=1`**; 4
+`QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED reason=cow_recovered`; 0 refusals; 0 fail-closed; isolation
+OK for both roles. Across all five: **0 `PF_PROOF_COW_HANDLE_OK`** — the broad handler's own
+success marker, meaning zero broad COW recovery for the routed faults — and 0 unhandled, panic,
+double fault, `VM_COW_FAIL`, refcount underflow, writable-shared alias, shootdown failure, stale
+cap or unacknowledged shootdown. Parent and child share `old_pa` per VA and each receives a
+distinct `new_pa`: the private copy, observed.
+
+**THE BROAD-VERSUS-SPLIT MARKER DELTA, and every difference explained.** `FAULT_BEGIN`,
+`VM_COW_DONE path=private_copy`, `PAGE_FAULT_HANDLED_COW` and the isolation checks are UNCHANGED
+at 4/4/4/2. Three markers move, all of them expected: `PF_PROOF_COW_HANDLE_OK` 4 → 0 and
+`VM_TLB_SHOOTDOWN_PREP_DONE` 4 → 0, because the broad handler no longer runs for these faults;
+`VM_TLB_SHOOTDOWN_DEFERRED` 5 → 1, because the four COW deferrals are replaced by real
+acknowledged shootdowns and the one survivor belongs to an unrelated unmap. Two appear:
+`VM_COW_SPLIT_COMMITTED` and `reason=cow_recovered`, 0 → 4 each.
+
+**Two guards re-derived, neither weakened.** `both_bridges_skip_the_broad_arm_on_post_work` now
+ENUMERATES every legal broad-skip arm per bridge instead of counting to two: a recovered COW fault
+is a third legal reason and is neither of the others — it publishes no deferral, so it is not a
+queue advance, and owes no architecture tail work, so it is not post-work — so it carries its own
+`cow_recovered` reason, and the guard additionally pins that RISC-V must NOT carry it. The smoke's
+shootdown gate keeps its claim and widens what satisfies it: a local flush must still account for
+the remote shootdown, but the broad owner accounts by DEFERRING and the split owner by PERFORMING
+it, and requiring the deferral marker specifically would fail the owner doing the stronger thing.
+
+**Unchanged.** Demand PageFault stays broad and unchanged, and the guard recording its missing
+live witness and its map-failure rollback prerequisite is intact. Terminal-fault routing is
+untouched and the U9-FT4 AArch64 witness still passes. AArch64 and RISC-V take no COW route.
+Blocking IpcRecv, fault-report delivery, WA3C2, endpoint creation, Spawn/Fork, the futex features
+and RPi5 are untouched. **The census remains 2 / 0 / 2** — both terminal acquisition sites remain
+reachable by their residual classes, so neither is retired. ***U9 remains OPEN*** and
+direct-IpcCall production remains OFF (`ipccall_direct_production_enabled()` is `const false`).
+U9-COW2 is CENSUS-DELTA 0, so the canonical stage arithmetic is unchanged.

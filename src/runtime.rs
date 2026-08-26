@@ -4778,6 +4778,295 @@ impl SharedKernel {
         Ok((fs::evaluate_page_fault_class(facts), Some(facts)))
     }
 
+    /// U9-COW1 §3 — the owner-local private-copy COW recovery transaction.
+    ///
+    /// This reproduces `KernelState::try_handle_cow_fault`'s `path=private_copy` arm effect for
+    /// effect, in the same order, through narrow owner phases. It is not a second COW policy: the
+    /// verdict comes from the ONE evaluator both forms share (`evaluate_page_fault_class`, via
+    /// `classify_page_fault_shared`), the refcount and COW-mark rules come from the ONE set of
+    /// `*_locked` memory owners the broad path's `&mut self` wrappers restate, the mint/rollback
+    /// pair is the production `mint_capability_with_memory_ref_split` /
+    /// `rollback_minted_cap_split`, and the mapping replacement goes through the SAME
+    /// `AddressSpace::map_page` whose arch backend writes the PTE and then invalidates locally.
+    ///
+    /// ## Order, and why each step sits where it does
+    ///
+    /// 1-3. **Revalidate everything fallible, before touching anything.** The classification
+    ///      happened in separate acquisitions, so the cnode, the mapping and the COW mark are all
+    ///      re-read here and the incarnation is re-checked. This is the last point at which
+    ///      falling back to the broad dispatcher is safe, and every `Refused*` outcome is reached
+    ///      from here.
+    /// 4.   **Allocate.** Frame (rank 6) → object slot (rank 6, through the shared
+    ///      `create_memory_object_slot_locked`) → cap (rank 4, into the EXACT faulting task's
+    ///      cnode). The broad path mints into `current_task_cnode()`; using `facts.tid` is the
+    ///      same cnode on this path and is authoritative rather than ambient. **First mutation.**
+    /// 5.   **Resolve.** The broad path's `resolve_memory_object_phys` check, against the exact
+    ///      task. It cannot legitimately disagree with the address we just allocated, and if it
+    ///      does the transaction fails closed rather than mapping an unverified frame.
+    /// 6.   **Copy**, with no lock held — the destination is not reachable by anything yet.
+    /// 7.   **Replace the mapping** (rank 5). `map_page` writes the PTE and the arch backend
+    ///      issues the local invalidation immediately after, so PTE replacement precedes
+    ///      invalidation by construction rather than by a separate call this could forget.
+    /// 8.   **Refcounts and the COW mark** (rank 6): the old frame loses a map reference, the new
+    ///      frame gains one, and the page stops being COW. Exactly what
+    ///      `map_user_page_in_asid_raw` does after a replacement, minus the reclaim.
+    /// 9.   **Shootdown**, with NO domain lock held (AI_AGENT_RULES §14.4). The old translation
+    ///      was read-only and is now stale on any remote CPU still running this ASID.
+    /// 10.  **Reclaim the old frame — ONLY after the acknowledgement.** In the witnessed COW case
+    ///      the old frame is still shared and the guarded reclaim is a no-op; when it is not, an
+    ///      unacknowledged shootdown leaves it unreclaimed rather than recycling memory a remote
+    ///      CPU may still translate. That is the fail-safe direction §14.4 requires.
+    ///
+    /// No two domain locks are ever held at once: every phase acquires and releases its own.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) fn cow_recover_private_copy_split(
+        &self,
+        facts: crate::kernel::boot::PageFaultFacts,
+    ) -> crate::kernel::boot::CowRecovery {
+        use crate::kernel::boot::{CowRecovery as R, KernelState as KS};
+        use crate::kernel::capabilities::{CapObject, Capability};
+        use crate::kernel::vm::{Mapping, PhysAddr};
+
+        let asid = facts.asid;
+        let page = facts.page;
+
+        // (1) rank 2 + rank 4 — the EXACT faulting task's cnode.
+        let Some(cnode) = self.task_cnode_split(facts.tid) else {
+            return R::RefusedNoCnode;
+        };
+        // (2) rank 5 — the mapping, re-read. It must still be present and still NOT writable:
+        // a writable mapping is the broad path's `already_writable` arm, which this route does
+        // not admit, and an absent one is a different fault entirely.
+        let Some(old_mapping) = self.with_vm_user_spaces_split_mut(|spaces| {
+            spaces.get(asid).and_then(|space| space.resolve(page))
+        }) else {
+            return R::RefusedMappingChanged;
+        };
+        if old_mapping.flags.write {
+            return R::RefusedMappingChanged;
+        }
+        // (3) rank 6 — still COW-marked, and rank 1/2 — still the same incarnation.
+        let still_cow = self.with_memory_split_mut(|memory| {
+            memory
+                .cow_pages
+                .get(&asid.0)
+                .is_some_and(|set| set.contains(&page.0))
+        });
+        if !still_cow {
+            return R::RefusedMappingChanged;
+        }
+        if self.current_tid_split_read(facts.cpu) != Some(facts.tid) {
+            return R::RefusedIdentityChanged;
+        }
+        if self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == facts.tid)
+                .map(|t| t.asid)
+        }) != Some(Some(asid))
+        {
+            return R::RefusedIdentityChanged;
+        }
+
+        // ── FIRST MUTATION. Broad fallback is forbidden from here on. ───────────────────────
+        // (4a) rank 6 — one frame.
+        let Some(new_phys_raw) = self.with_memory_split_mut(|memory| {
+            crate::kernel::boot::kernel_mut(&mut memory.frame_allocator)
+                .alloc_contiguous(1)
+                .ok()
+        }) else {
+            return R::RefusedAllocation;
+        };
+        let new_phys = PhysAddr(new_phys_raw);
+        // (4b) rank 6 — the object slot, through the owner the broad creator also drives.
+        let max_objects = self.runtime_capacity_config_split_read().max_memory_objects;
+        let object_id = match self.with_memory_split_mut(|memory| {
+            KS::create_memory_object_slot_locked(
+                memory,
+                new_phys,
+                crate::kernel::vm::PAGE_SIZE,
+                crate::kernel::boot::MemoryObjectKind::Anonymous,
+                max_objects,
+            )
+        }) {
+            Ok(id) => id,
+            Err(_) => {
+                // The object slot is what would have owned the frame; without it nothing does,
+                // so the frame is returned here rather than being tracked by an absent owner.
+                self.with_memory_split_mut(|memory| {
+                    let _ = crate::kernel::boot::kernel_mut(&mut memory.frame_allocator)
+                        .free_frame(new_phys.0);
+                });
+                return R::RefusedAllocation;
+            }
+        };
+        let object = CapObject::MemoryObject { id: object_id };
+        // (4c) rank 6 then rank 4 — the cap, with the rights rule the broad creator uses.
+        let Ok(new_mem_cap) = self.mint_capability_with_memory_ref_split(
+            cnode,
+            Capability::new(
+                object,
+                KS::memory_object_rights_for_kind(crate::kernel::boot::MemoryObjectKind::Anonymous),
+            ),
+        ) else {
+            // The mint rolled back its own refcount bump; the object still holds the frame, so
+            // release both together through the same reclaim rule.
+            self.with_memory_split_mut(|memory| {
+                KS::reclaim_memory_object_for_phys_locked(memory, new_phys)
+            });
+            return R::RefusedAllocation;
+        };
+        // From here every failure runs this exact inverse: revoke the slot, drop the mint's
+        // refcount, and free the frame once the object is unreferenced.
+        let rollback = |shared: &Self| {
+            shared.rollback_minted_cap_split(cnode, new_mem_cap, object);
+            shared.with_memory_split_mut(|memory| {
+                KS::reclaim_memory_object_for_phys_locked(memory, new_phys)
+            });
+        };
+
+        // (5) The broad path's rights + object resolution, against the exact task.
+        match self.resolve_memory_object_phys_for_task_split(
+            facts.tid,
+            new_mem_cap,
+            crate::kernel::vm::PageFlags::USER_RW,
+        ) {
+            Ok(p) if p == new_phys => {}
+            Ok(_) => {
+                rollback(self);
+                return R::FailedClosedResolve(KernelError::MemoryObjectMissing);
+            }
+            Err(e) => {
+                rollback(self);
+                return R::FailedClosedResolve(e);
+            }
+        }
+
+        // (6) The page copy. No lock is held: nothing can reach the destination yet.
+        if let Err(e) = self.copy_cow_frame_contents_split(old_mapping.phys, new_phys) {
+            rollback(self);
+            return R::FailedClosedCopy(e);
+        }
+
+        // (7) rank 5 — replace the mapping with the private writable copy. Permissions are the
+        // ORIGINAL flags with `write` set, exactly as the broad path derives them: nothing else
+        // is widened, so an executable or shared-region invariant cannot be relaxed here.
+        let mut flags = old_mapping.flags;
+        flags.write = true;
+        let replaced = self.with_vm_user_spaces_split_mut(|spaces| {
+            spaces.get_mut(asid).map(|space| {
+                space.map_page(
+                    page,
+                    Mapping {
+                        phys: new_phys,
+                        flags,
+                    },
+                )
+            })
+        });
+        let old_entry = match replaced {
+            Some(Ok(old)) => old,
+            Some(Err(e)) => {
+                rollback(self);
+                return R::FailedClosedRemap(KernelError::Vm(e));
+            }
+            None => {
+                rollback(self);
+                return R::FailedClosedRemap(KernelError::Vm(
+                    crate::kernel::vm::VmError::InvalidAsid,
+                ));
+            }
+        };
+
+        // (8) rank 6 — the refcount transition and the COW-mark clear, in ONE acquisition.
+        let old_phys = old_entry.map(|m| m.phys).unwrap_or(old_mapping.phys);
+        self.with_memory_split_mut(|memory| {
+            if old_entry.is_some() {
+                KS::note_mapping_removed_locked(memory, old_phys);
+            }
+            KS::clear_cow_page_locked(memory, asid, page);
+            KS::note_mapping_inserted_locked(memory, new_phys);
+        });
+
+        // (9) The shootdown, with NO domain lock held.
+        let shootdown_acked = self.complete_unmap_shootdown_split(asid, page);
+
+        // (10) rank 6 — reclaim the OLD frame, only after the acknowledgement. Guarded, so the
+        // ordinary COW case (the frame is still mapped elsewhere) is a no-op.
+        if old_entry.is_some() && shootdown_acked {
+            self.with_memory_split_mut(|memory| {
+                KS::reclaim_memory_object_for_phys_locked(memory, old_phys)
+            });
+        }
+
+        R::Committed {
+            old_phys,
+            new_phys,
+            shootdown_acked,
+        }
+    }
+
+    /// U9-COW1 §3 — the page copy, off every domain lock.
+    ///
+    /// The same direct-map `copy_nonoverlapping` `KernelState::copy_frame_contents_for_cow`
+    /// performs on a freestanding target. It is a separate method only because the broad form
+    /// takes `&mut self` for its hosted branch; the freestanding body is the identical two
+    /// direct-map translations and one page-sized copy.
+    #[cfg(not(feature = "hosted-dev"))]
+    fn copy_cow_frame_contents_split(
+        &self,
+        old_phys: crate::kernel::vm::PhysAddr,
+        new_phys: crate::kernel::vm::PhysAddr,
+    ) -> Result<(), KernelError> {
+        let src =
+            KernelState::phys_to_direct_map_ptr(old_phys.0).ok_or(KernelError::UserMemoryFault)?;
+        let dst =
+            KernelState::phys_to_direct_map_ptr(new_phys.0).ok_or(KernelError::UserMemoryFault)?;
+        // SAFETY: both addresses are page-aligned frames the direct map covers; `new_phys` was
+        // just allocated and is reachable by nothing else, so the regions cannot overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src as *const u8, dst, crate::kernel::vm::PAGE_SIZE);
+        }
+        Ok(())
+    }
+
+    /// U9-COW1 §3 — `KernelState::resolve_memory_object_phys` bound to an EXACT task rather than
+    /// the ambient current one, through the task(2) → capability(4) → memory(6) split reads.
+    ///
+    /// Same three checks in the same order: the cap must resolve in that task's cspace to a
+    /// memory-backed object, it must carry the rights the requested flags demand, and the object
+    /// must still exist.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) fn resolve_memory_object_phys_for_task_split(
+        &self,
+        tid: u64,
+        mem_cap: CapId,
+        flags: crate::kernel::vm::PageFlags,
+    ) -> Result<crate::kernel::vm::PhysAddr, KernelError> {
+        use crate::kernel::capabilities::{CapObject, CapRights};
+        // The existing exact-task resolver: task(2) → cnode → capability(4). No ambient read.
+        let capability = self.resolve_capability_for_task_split(tid, mem_cap)?;
+        let id = match capability.object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return Err(KernelError::WrongObject),
+        };
+        if flags.read && !capability.has_right(CapRights::READ) {
+            return Err(KernelError::MissingRight);
+        }
+        if flags.write && !capability.has_right(CapRights::WRITE) {
+            return Err(KernelError::MissingRight);
+        }
+        self.with_memory_split_mut(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.phys)
+                .ok_or(KernelError::MemoryObjectMissing)
+        })
+    }
+
     pub(crate) fn with_vm_user_spaces_split_mut<R>(
         &self,
         f: impl FnOnce(&mut crate::kernel::vm::AddressSpaceManager) -> R,

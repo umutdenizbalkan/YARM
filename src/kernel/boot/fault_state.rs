@@ -53,6 +53,92 @@ pub(crate) struct PageFaultFacts {
     pub demand_region: bool,
 }
 
+/// U9-COW1 §3 — the outcome of the owner-local private-copy COW recovery.
+///
+/// The split is deliberately three-way, not two-way, because "declined" and "failed" have
+/// different rights here. Everything named `Refused*` happened BEFORE the first mutation and may
+/// fall through to the unchanged broad dispatcher, which will re-derive the same facts and do
+/// whatever it would have done. Everything named `FailedClosed*` happened AFTER a frame was
+/// allocated: the allocation has been rolled back exactly, but the broad path must NOT run,
+/// because it would allocate a second frame for a fault it never saw declined.
+///
+/// `Committed` carries both physical addresses so the caller can attest the transition it just
+/// performed rather than re-reading state that may already have moved on.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CowRecovery {
+    /// The private copy is mapped writable, the refcounts are transitioned, the stale translation
+    /// is retired, and the faulting task may resume at the same instruction.
+    Committed {
+        old_phys: crate::kernel::vm::PhysAddr,
+        new_phys: crate::kernel::vm::PhysAddr,
+        /// Whether the old frame's shootdown was acknowledged by every target. `false` means the
+        /// old frame was deliberately left unreclaimed — never that the mapping is incomplete.
+        shootdown_acked: bool,
+    },
+    /// Pre-mutation: the faulting incarnation is no longer the one that was classified.
+    RefusedIdentityChanged,
+    /// Pre-mutation: the mapping is gone, already writable, or no longer COW-marked. Another
+    /// owner serviced this page between classification and here.
+    RefusedMappingChanged,
+    /// Pre-mutation: the faulting task has no resolvable CNode, so a cap cannot be minted for it.
+    RefusedNoCnode,
+    /// Pre-mutation: no frame, no object slot, or no cnode slot. Nothing was left allocated.
+    RefusedAllocation,
+    /// Post-allocation: the freshly minted cap did not resolve to the frame it was minted for.
+    /// The allocation is rolled back.
+    ///
+    /// Each `FailedClosed*` carries the EXACT `KernelError` the broad arm produces at the same
+    /// step, so the trap the caller finally reports is the one it would have reported anyway —
+    /// the owner changed, the user-visible error did not.
+    FailedClosedResolve(crate::kernel::boot::KernelError),
+    /// Post-allocation: the page copy failed. The allocation is rolled back.
+    FailedClosedCopy(crate::kernel::boot::KernelError),
+    /// Post-allocation: the mapping replacement failed. The allocation is rolled back and the
+    /// original mapping is untouched — `map_page` either replaced the entry or it did not.
+    FailedClosedRemap(crate::kernel::boot::KernelError),
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl CowRecovery {
+    /// True only for the outcomes that mutated nothing and may therefore reach the broad arm.
+    pub(crate) fn may_fall_back_to_broad(self) -> bool {
+        matches!(
+            self,
+            Self::RefusedIdentityChanged
+                | Self::RefusedMappingChanged
+                | Self::RefusedNoCnode
+                | Self::RefusedAllocation
+        )
+    }
+
+    /// The refusal/failure reason as the marker text, so no call site invents its own spelling.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Committed { .. } => "committed",
+            Self::RefusedIdentityChanged => "identity_changed",
+            Self::RefusedMappingChanged => "mapping_changed",
+            Self::RefusedNoCnode => "no_cnode",
+            Self::RefusedAllocation => "allocation",
+            Self::FailedClosedResolve(_) => "resolve_phys",
+            Self::FailedClosedCopy(_) => "copy_frame",
+            Self::FailedClosedRemap(_) => "remap",
+        }
+    }
+
+    /// The error a post-allocation failure carries. `None` for every outcome that is not one —
+    /// a committed recovery has no error, and a pre-mutation refusal hands the fault to the broad
+    /// arm, which produces its own.
+    pub(crate) fn kernel_error(self) -> Option<crate::kernel::boot::KernelError> {
+        match self {
+            Self::FailedClosedResolve(e)
+            | Self::FailedClosedCopy(e)
+            | Self::FailedClosedRemap(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// U9-FT3 §3 — the outcome of the split terminal task transition.
 ///
 /// Reached only AFTER a buffered report has been published (or after policy determined none was

@@ -1249,28 +1249,102 @@ if [[ "$VM_COW" == "1" ]]; then
     echo "[error] VM-COW: VM_COW_ENABLED missing (knob not applied)"
     vm_cow_fail=1
   fi
-  # If a COW write fault occurred, its full phase sequence must complete.
-  if log_has_pattern "VM_COW_FAULT_BEGIN"; then
-    echo "[info] VM-COW: COW write fault observed — checking phase sequence"
-    for m in "VM_COW_PHASE_METADATA" "VM_COW_PHASE_TLB_FLUSH" "VM_COW_DONE"; do
-      if log_has_pattern "$m"; then
-        echo "[ok] VM-COW phase marker present: $m"
-      else
-        echo "[error] VM-COW: COW fault occurred but phase marker missing: $m"
-        vm_cow_fail=1
-      fi
-    done
+  # U9-COW2: THE WITNESS IS MANDATORY, not conditional.
+  #
+  # Every check below used to be guarded by `if log_has_pattern "VM_COW_FAULT_BEGIN"`, so a boot
+  # that produced ZERO fork attempts and ZERO COW faults passed the identical gate as one that
+  # produced a correct witness — and that is exactly what happened: the only shipped Fork caller
+  # sits past a SpawnV5 chain init never completes, so `VM_COW=1` was silently vacuous. With the
+  # selector on, the witness must OCCUR; conditionality now lives only in the `VM_COW == 1`
+  # test above, which is the selector itself.
+  vm_cow_forks="$(log_count_pattern 'VM_COW_FORK_BEGIN')"
+  vm_cow_faults="$(log_count_pattern 'VM_COW_FAULT_BEGIN')"
+  vm_cow_dones="$(log_count_pattern 'VM_COW_DONE')"
+  vm_cow_handled="$(log_count_pattern 'PAGE_FAULT_HANDLED_COW')"
+  # Counted on VM_COW_DONE specifically: `path=private_copy` also appears on the proof-gated
+  # PF_PROOF_COW_HANDLE_OK line, so a bare substring count double-reports every recovery. The
+  # gate outcome is the same either way; the NUMBER has to be right because the split-route
+  # comparison comes back to it.
+  vm_cow_private="$(tr '\r' '\n' <"$LOGFILE" | rg -a -c -- 'VM_COW_DONE .*path=private_copy' || true)"
+  vm_cow_private="${vm_cow_private:-0}"
+  if [[ "$vm_cow_forks" -lt 1 ]]; then
+    echo "[error] VM-COW: selector on but ZERO fork transactions (VM_COW_FORK_BEGIN=$vm_cow_forks)"
+    vm_cow_fail=1
+  else
+    echo "[ok] VM-COW: fork transactions observed: $vm_cow_forks"
   fi
-  # If a fork COW clone occurred, it must reach DONE (or a clean ROLLBACK_OK).
-  if log_has_pattern "VM_COW_FORK_BEGIN" \
+  if [[ "$vm_cow_forks" -ge 1 ]] \
      && ! log_has_pattern "VM_COW_FORK_DONE" \
      && ! log_has_pattern "VM_COW_FORK_ROLLBACK_OK"; then
     echo "[error] VM-COW: fork COW clone began but neither DONE nor ROLLBACK_OK observed"
     vm_cow_fail=1
   fi
-  # TLB-shootdown prep markers must accompany a COW/unmap that changed a mapping.
-  if log_has_pattern "VM_TLB_LOCAL_FLUSH" && ! log_has_pattern "VM_TLB_SHOOTDOWN_DEFERRED"; then
-    echo "[error] VM-COW: local TLB flush without shootdown-deferred prep marker"
+  if [[ "$vm_cow_faults" -lt 1 ]]; then
+    echo "[error] VM-COW: selector on but ZERO COW write faults (VM_COW_FAULT_BEGIN=$vm_cow_faults)"
+    vm_cow_fail=1
+  else
+    echo "[ok] VM-COW: COW write faults observed: $vm_cow_faults"
+  fi
+  if [[ "$vm_cow_private" -lt 1 ]]; then
+    echo "[error] VM-COW: no genuine path=private_copy recovery (the routed class)"
+    vm_cow_fail=1
+  else
+    echo "[ok] VM-COW: private_copy recoveries: $vm_cow_private"
+  fi
+  # The three counts must AGREE: a fault that begins must complete and must be reported handled.
+  if [[ "$vm_cow_faults" != "$vm_cow_dones" || "$vm_cow_faults" != "$vm_cow_handled" ]]; then
+    echo "[error] VM-COW: counts disagree — BEGIN=$vm_cow_faults DONE=$vm_cow_dones HANDLED=$vm_cow_handled"
+    vm_cow_fail=1
+  else
+    echo "[ok] VM-COW: BEGIN/DONE/HANDLED all agree at $vm_cow_faults"
+  fi
+  # The phase sequence is now required unconditionally, because a fault is now required.
+  for m in "VM_COW_PHASE_METADATA" "VM_COW_PHASE_TLB_FLUSH" "VM_COW_DONE"; do
+    if log_has_pattern "$m"; then
+      echo "[ok] VM-COW phase marker present: $m"
+    else
+      echo "[error] VM-COW: COW fault occurred but phase marker missing: $m"
+      vm_cow_fail=1
+    fi
+  done
+  # The userspace half: a real Fork (NR 12) by a real process, and isolation checked BY
+  # USERSPACE. A kernel-synthetic call into the handler cannot produce these.
+  for req in \
+    "FORK_PROOF_COW_WITNESS_SEED" \
+    "IPC_RECV_PROOF_SENDER_WAKE_FORK_SYSCALL_RET" \
+    "FORK_PROOF_COW_WITNESS_ISOLATION_OK role=parent" \
+    "FORK_PROOF_COW_WITNESS_ISOLATION_OK role=child"; do
+    if log_has_pattern "$req"; then
+      echo "[ok] VM-COW witness: $req"
+    else
+      echo "[error] VM-COW: mandatory userspace witness marker missing: $req"
+      vm_cow_fail=1
+    fi
+  done
+  for forbidden in \
+    "FORK_PROOF_COW_WITNESS_ISOLATION_FAIL" \
+    "FORK_PROOF_COW_WITNESS_FORK_FAILED" \
+    "FORK_PROOF_COW_WITNESS_ABORT" \
+    "FORK_PROOF_COW_WITNESS_CHILD_EXIT_DECLINED"; do
+    if log_has_pattern "$forbidden"; then
+      echo "[error] VM-COW: witness failure marker present: $forbidden"
+      vm_cow_fail=1
+    fi
+  done
+  # A COW/unmap that changed a mapping must ACCOUNT for the remote shootdown — it may never
+  # flush locally and say nothing about the other CPUs.
+  #
+  # U9-COW2 re-derives this rather than dropping it. The claim is unchanged; what satisfies it
+  # is now two things instead of one, because there are now two owners. The broad handler
+  # accounts for the shootdown by DEFERRING it (`VM_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live`,
+  # a prep marker and nothing more). The split route accounts for it by PERFORMING it, through
+  # the generation-matched coordinator, and attests the result on
+  # `VM_COW_SPLIT_COMMITTED ... acked=`. Requiring the deferral marker specifically would fail
+  # the owner that does the stronger thing.
+  if log_has_pattern "VM_TLB_LOCAL_FLUSH" \
+     && ! log_has_pattern "VM_TLB_SHOOTDOWN_DEFERRED" \
+     && ! log_has_pattern "VM_COW_SPLIT_COMMITTED"; then
+    echo "[error] VM-COW: local TLB flush with the remote shootdown neither deferred nor performed"
     vm_cow_fail=1
   fi
   # Hard failure markers (must never appear).
