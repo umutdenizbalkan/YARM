@@ -691,6 +691,29 @@ pub fn handle_riscv_trap_entry_shared(
     // closes it ahead of the diverging idle/fatal landings, which never unwind.
     let trap_path = crate::arch::trap_entry::TrapPathWindow::establish(cpu);
     let mut queue_advance_committed = false;
+    // U9-TM §2: the pre-lock TIMER route, refusing before any claim, tick or mutation when a
+    // proof knob is armed or when this tick would preempt.
+    let mut post_work_committed = false;
+    {
+        let is_timer = matches!(decode_trap_context(context), TrapEvent::TimerInterrupt);
+        match crate::kernel::syscall_split::try_split_timer_dispatch(shared, cpu, is_timer) {
+            crate::kernel::syscall_split::SplitDispatchDisposition::PostWorkCommitted => {
+                post_work_committed = true;
+            }
+            crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
+            other => {
+                crate::yarm_log!(
+                    "TIMER_SPLIT_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                    cpu.0,
+                    other
+                );
+                debug_assert!(
+                    false,
+                    "the timer route yields NotHandled or PostWorkCommitted"
+                );
+            }
+        }
+    }
 
     // ── Phase 1: pre-lock split dispatch — DebugLog (NR 15) ONLY ──
     // Stage 196B/196C: RISC-V enables exactly TWO split-dispatch retirement classes,
@@ -885,7 +908,7 @@ pub fn handle_riscv_trap_entry_shared(
     // canonical handler would re-execute FutexWait against it and `dispatch_next_task` would
     // advance the queue a second time for one publication. The gate is the DISPOSITION, never an
     // inspection of any stash.
-    let inner_result = if queue_advance_committed {
+    let inner_result = if queue_advance_committed || post_work_committed {
         Ok(Ok(()))
     } else {
         shared

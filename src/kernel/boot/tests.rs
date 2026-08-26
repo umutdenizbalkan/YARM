@@ -140153,8 +140153,9 @@ mod u9qa_split_dispatch_disposition {
             "the committed arm must fall through to the drains, never return early"
         );
         // The broad phase is gated on the disposition, never on a stash inspection.
+        // U9-TM §2 added the post-work term to the same gate; the claim it carries is unchanged.
         let gate_at = RISCV_TRAP
-            .find("if queue_advance_committed {")
+            .find("if queue_advance_committed || post_work_committed {")
             .expect("the broad-dispatch gate");
         let call = RISCV_TRAP
             .find(".with_cpu(cpu, |kernel| {")
@@ -140650,5 +140651,408 @@ mod u9qa_one_queue_advance_owner {
             runnable_before - 1,
             "exactly one task left the run queue"
         );
+    }
+}
+
+// ── U9-TM §1/§4: THE TIMER ENTRY, RE-DERIVED ─────────────────────────────────────────────────
+//
+// Two facts about the broad timer arm are load-bearing for U9-TM and neither was pinned before.
+//
+// FIRST: `process_ipc_timeout_deadlines` owns NO timeout class. U7 (canonical 199E) retired all
+// three — reply-receive, blocking-send, and finally the ordinary receive deadline — to the
+// off-lock pipeline (`run_due_ipc_timeout_work` -> `collect_due_ipc_timeout_work` ->
+// `drain_{reply,send,recv}_timeout_post_work`), which runs post-lock in every port's trap
+// wrapper. What is left in the broad scan is an unconditional `continue` above a preserved,
+// unreachable body. It is a NO-OP, so the timer entry has no timeout dependency to split.
+//
+// SECOND: the tick POLICY was never duplicated. `SchedulerTimer::tick_and_check` has one
+// definition; the broad arm's `&mut KernelState` was only ever the means of reaching
+// `sched.timer`. `scheduler_tick_split_mut` reaches the same field through the rank-1 seam.
+#[cfg(test)]
+mod u9tm_timer_entry {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::{SchedulerTickOutcome, SharedKernel};
+
+    const IPC: &str = include_str!("ipc_state.rs");
+    const SCHED_TIMER: &str = include_str!("../scheduler_timer.rs");
+    const SCHED_STATE: &str = include_str!("scheduler_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    /// STRUCTURAL: the broad scan short-circuits unconditionally before its preserved body, and
+    /// the body below is marked unreachable. This is what makes the function a no-op.
+    #[test]
+    fn the_broad_timeout_scan_owns_no_class() {
+        let body = IPC
+            .split("pub(crate) fn process_ipc_timeout_deadlines(")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub(crate) fn ").next())
+            .expect("the broad timeout scan");
+        let stop = body
+            .find("\n                    continue;\n                    #[allow(unreachable_code)]")
+            .expect("the unconditional short-circuit above the preserved body");
+        // Every earlier exit in the scan loop is also a `continue`, so no `tcb` can reach the
+        // selection arms. Nothing between the loop head and the short-circuit may collect.
+        let head = body
+            .find("for tcb in tcbs.iter_mut().flatten()")
+            .expect("the scan loop");
+        let prelude = &body[head..stop];
+        assert!(
+            !prelude.contains("expired[n] = Some("),
+            "no entry may be collected before the unconditional short-circuit"
+        );
+        let flat = body
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("this scan owns // NO timeout class at all"),
+            "the retired-class statement must remain in the source it describes"
+        );
+    }
+
+    /// The off-lock pipeline that owns all three classes exists and is driven post-lock from
+    /// BOTH trap wrappers. If either call site disappeared, the classes would have no owner.
+    #[test]
+    fn the_off_lock_timeout_pipeline_owns_all_three_classes() {
+        for f in [
+            "fn collect_due_ipc_timeout_work(",
+            "fn drain_reply_timeout_post_work(",
+            "fn drain_send_timeout_post_work(",
+            "fn drain_recv_timeout_post_work(",
+            "fn run_due_ipc_timeout_work(",
+        ] {
+            assert!(
+                RUNTIME.contains(f),
+                "the off-lock pipeline must provide `{f}`"
+            );
+        }
+        let shared = include_str!("../../arch/trap_entry.rs");
+        let riscv = include_str!("../../arch/riscv64/trap.rs");
+        assert!(
+            shared.contains("shared.run_due_ipc_timeout_work(cpu);"),
+            "the shared trap wrapper must drive the off-lock timeout pipeline"
+        );
+        assert!(
+            riscv.contains("shared.run_due_ipc_timeout_work(cpu);"),
+            "the RISC-V trap wrapper must drive the off-lock timeout pipeline"
+        );
+    }
+
+    /// EMPIRICAL: the broad scan collects nothing and reports nothing, for any tick.
+    #[test]
+    fn the_broad_timeout_scan_is_a_no_op() {
+        let mut state = Bootstrap::init().expect("init");
+        for now in [0u64, 1, 7, u64::MAX] {
+            let expired = state
+                .process_ipc_timeout_deadlines(now)
+                .expect("the scan must not error");
+            assert_eq!(
+                expired, 0,
+                "the broad scan must collect nothing at now={now}"
+            );
+        }
+    }
+
+    /// The tick policy has exactly ONE implementation, and both the broad arm and the rank-1
+    /// owner call it.
+    #[test]
+    fn the_tick_policy_has_one_implementation() {
+        assert_eq!(
+            SCHED_TIMER
+                .matches("pub fn tick_and_check(&mut self) -> (Tick, bool)")
+                .count(),
+            1,
+            "one tick policy"
+        );
+        assert!(
+            SCHED_STATE.contains("sched.timer.tick_and_check()"),
+            "the broad arm reaches the one policy"
+        );
+        let owner = RUNTIME
+            .split("pub(crate) fn scheduler_tick_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the rank-1 tick owner");
+        assert!(
+            owner.contains("sched.timer.tick_and_check()"),
+            "the rank-1 owner reaches the SAME policy — it does not restate it"
+        );
+        assert_eq!(
+            owner.matches("with_scheduler_split_mut").count(),
+            1,
+            "one rank-1 acquisition"
+        );
+        // It always ticks: no refusal may skip the increment.
+        assert!(
+            !owner.contains("return SchedulerTickOutcome::")
+                || !owner.contains("dispatch_cpu != cpu"),
+            "the tick owner must not gate the increment on a CPU check"
+        );
+    }
+
+    /// EMPIRICAL: the rank-1 owner produces the same increment and the same preemption predicate
+    /// the broad path would, tick for tick, across a whole quantum.
+    #[test]
+    fn the_split_tick_matches_the_broad_tick_across_a_quantum() {
+        // A short quantum, installed through the established test seam on BOTH kernels, so the
+        // window provably crosses a boundary. The production quantum is 50_000_000 ticks on this
+        // host, which would make a no-switch-only comparison the only feasible one.
+        const Q: u64 = 4;
+        let mut broad = Bootstrap::init().expect("init");
+        broad.set_timer_for_test(crate::kernel::scheduler_timer::Timer::new(Q));
+        let mut reference = alloc::vec::Vec::new();
+        let steps = (Q as usize) * 2 + 1;
+        for _ in 0..steps {
+            let (t, p) = broad.tick_scheduler_timer();
+            reference.push((t.0, p));
+        }
+        // Split run from an identical fresh kernel with the identical quantum.
+        let mut split_state = Bootstrap::init().expect("init");
+        split_state.set_timer_for_test(crate::kernel::scheduler_timer::Timer::new(Q));
+        let shared = SharedKernel::new(split_state);
+        let mut observed = alloc::vec::Vec::new();
+        for _ in 0..steps {
+            observed.push(match shared.scheduler_tick_split_mut(CpuId(0)) {
+                SchedulerTickOutcome::NoSwitch { tick, cpu } => {
+                    assert_eq!(cpu, CpuId(0), "the outcome carries the caller's CPU");
+                    (tick, false)
+                }
+                SchedulerTickOutcome::Preempt { tick, cpu } => {
+                    assert_eq!(cpu, CpuId(0), "the outcome carries the caller's CPU");
+                    (tick, true)
+                }
+            });
+        }
+        assert_eq!(
+            observed, reference,
+            "the rank-1 tick must match the broad tick increment and preemption predicate exactly"
+        );
+        assert!(
+            reference.iter().any(|(_, p)| *p),
+            "fixture check: the window must actually cross a quantum boundary"
+        );
+    }
+}
+
+// ── U9-TM §1/§2/§3: THE PROOF-MODE GATE AND THE DEFAULT TIMER ROUTE ───────────────────────────
+//
+// U9-TM does NOT retire TimerInterrupt. It routes the default configuration off-lock and keeps
+// two explicit fallbacks, both taken before anything is claimed, ticked or mutated. These cases
+// pin the gate's exhaustiveness, the fail-before-mutation ordering, and the fact that a
+// non-preempting tick uses its own disposition rather than borrowing a queue-advance one.
+#[cfg(test)]
+mod u9tm_proof_gate {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const FAULT: &str = include_str!("fault_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TIMER: &str = include_str!("../scheduler_timer.rs");
+
+    fn gate_body() -> &'static str {
+        MOD_SRC
+            .split("pub(crate) fn timer_proof_hooks_armed() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the proof-mode gate")
+    }
+
+    /// The gate is built from the five EXISTING knob predicates — no new flag, no new selector.
+    #[test]
+    fn the_gate_is_built_from_existing_knobs_only() {
+        let g = gate_body();
+        for k in [
+            "cap_cnode_enabled()",
+            "fault_delivery_enabled()",
+            "spawn_lifecycle_enabled()",
+            "global_state_enabled()",
+            "smp_ready_enabled()",
+        ] {
+            assert!(
+                g.contains(k),
+                "the gate must consult the existing knob `{k}`"
+            );
+        }
+        assert_eq!(g.matches("||").count(), 4, "exactly five terms, disjoined");
+        assert!(
+            !g.contains("static ") && !g.contains("AtomicBool"),
+            "the gate must introduce no new flag of its own"
+        );
+    }
+
+    /// EXHAUSTIVENESS: every hook whose ONLY call site is the broad timer arm must appear in the
+    /// gate. Adding a sixth timer-only hook without extending the gate fails here — which is the
+    /// whole point, since such a hook would be silently skipped by the split route.
+    #[test]
+    fn the_gate_covers_every_timer_only_hook() {
+        let arm = FAULT
+            .split("Trap::TimerInterrupt => {")
+            .nth(1)
+            .and_then(|s| s.split("\n            Trap::").next())
+            .expect("the broad timer arm");
+        let g = gate_body();
+        let mut timer_only = alloc::vec::Vec::new();
+        for line in arm.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("self.maybe_run_") else {
+                continue;
+            };
+            let Some(name) = rest.split("()").next() else {
+                continue;
+            };
+            let call = alloc::format!("self.maybe_run_{name}()");
+            if FAULT.matches(call.as_str()).count() == 1 {
+                timer_only.push(alloc::string::String::from(name));
+            }
+        }
+        assert_eq!(
+            timer_only.len(),
+            5,
+            "expected exactly five timer-only hooks, found {timer_only:?}"
+        );
+        for name in &timer_only {
+            // Each hook's knob predicate shares its stem: `maybe_run_X_proof`/`_audit` -> `X_enabled`.
+            let stem = name.trim_end_matches("_proof").trim_end_matches("_audit");
+            assert!(
+                g.contains(&alloc::format!("{stem}_enabled()")),
+                "timer-only hook `maybe_run_{name}` has no term in the proof-mode gate"
+            );
+        }
+    }
+
+    /// FAIL BEFORE MUTATION: both refusals precede the claim, the tick and the re-arm.
+    #[test]
+    fn both_refusals_precede_every_mutation() {
+        let route = SPLIT
+            .split("fn try_split_timer_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the timer route");
+        let gate = route
+            .find("timer_proof_hooks_armed()")
+            .expect("the proof-mode refusal");
+        let preempt = route
+            .find("scheduler_tick_if_no_switch_split_mut(cpu)")
+            .expect("the would-preempt refusal");
+        let claim = route
+            .find("acknowledge_interrupt(cpu, 0)")
+            .expect("the claim");
+        let rearm = route.find("program_timer_deadline(").expect("the re-arm");
+        assert!(
+            gate < preempt && preempt < claim && claim < rearm,
+            "order must be: proof gate -> would-preempt -> claim -> re-arm"
+        );
+        // The proof-mode refusal happens before the tick seam is even consulted.
+        assert!(
+            route[..gate].find("scheduler_tick").is_none(),
+            "nothing may tick before the proof-mode gate is evaluated"
+        );
+    }
+
+    /// The would-preempt refusal is ATOMIC with the tick: one acquisition, and the declining
+    /// path increments nothing.
+    #[test]
+    fn the_would_preempt_refusal_increments_nothing() {
+        let seam = RUNTIME
+            .split("pub(crate) fn scheduler_tick_if_no_switch_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the no-switch tick seam");
+        assert_eq!(
+            seam.matches("with_scheduler_split_mut").count(),
+            1,
+            "the lookahead and the tick must share ONE acquisition"
+        );
+        let look = seam.find("would_preempt_next()").expect("the lookahead");
+        let tick = seam.find("tick_and_check()").expect("the tick");
+        assert!(look < tick, "the lookahead must precede the tick");
+        let refusal = seam.find("return None;").expect("the refusal");
+        assert!(
+            refusal < tick,
+            "the refusal must return BEFORE the tick, having incremented nothing"
+        );
+        // And it delegates rather than restating the quantum arithmetic.
+        assert!(
+            !seam.contains("quantum_ticks"),
+            "the seam must not restate the quantum calculation"
+        );
+        let la = TIMER
+            .split("pub fn would_preempt_next(&self) -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the lookahead body");
+        assert!(
+            la.contains("self.ticks_remaining == 1") && !la.contains("quantum_ticks"),
+            "the lookahead reads remaining budget only"
+        );
+    }
+
+    /// A non-preempting tick uses its OWN disposition. Borrowing `Complete` would skip the
+    /// production timeout pipeline; borrowing `QueueAdvanceCommitted` would send a tick that
+    /// changed no scheduler state into the queue-advance drains.
+    #[test]
+    fn a_non_preempting_tick_uses_its_own_disposition() {
+        assert!(
+            SPLIT.contains("PostWorkCommitted,"),
+            "the fourth disposition must exist"
+        );
+        let route = SPLIT
+            .split("fn try_split_timer_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the timer route");
+        assert!(
+            route.contains("D::PostWorkCommitted"),
+            "the timer route must settle as PostWorkCommitted"
+        );
+        for wrong in ["D::Complete", "D::QueueAdvanceCommitted"] {
+            assert!(
+                !route.contains(wrong),
+                "a non-preempting tick must not borrow `{wrong}`"
+            );
+        }
+        // It performs no queue selection and publishes no transition.
+        for banned in [
+            "queue_advance_select_step_split",
+            "queue_advance_commit_split",
+            "yield_dispatch_try_defer",
+            "dispatch_next_selection_on",
+        ] {
+            assert!(
+                !route.contains(banned),
+                "a non-preempting tick must not `{banned}`"
+            );
+        }
+    }
+
+    /// Both trap bridges skip the broad arm for the committed post-work outcome, and the gate is
+    /// the disposition — never a stash inspection.
+    #[test]
+    fn both_bridges_skip_the_broad_arm_on_post_work() {
+        for (name, src) in [
+            ("shared", include_str!("../../arch/trap_entry.rs")),
+            ("riscv", include_str!("../../arch/riscv64/trap.rs")),
+        ] {
+            assert!(
+                src.contains("if queue_advance_committed || post_work_committed {"),
+                "{name} bridge must skip the broad arm on either committed disposition"
+            );
+            assert_eq!(
+                src.matches("post_work_committed = true;").count(),
+                1,
+                "{name} bridge: exactly one place may declare post-work committed"
+            );
+            let gate = src
+                .find("if queue_advance_committed || post_work_committed {")
+                .expect("the gate");
+            let call = src
+                .find(".with_cpu(cpu, |kernel| {")
+                .expect("the broad acquisition");
+            assert!(gate < call, "{name}: the gate must precede the acquisition");
+            assert!(
+                !src[gate..call].contains("DISPATCH_SWITCH_PLAN_STASH"),
+                "{name}: a stash must never decide dispatch control flow"
+            );
+        }
     }
 }

@@ -456,6 +456,22 @@ impl BlockingSendCommitOutcome {
 /// re-enqueue on, and clear `current` of, the wrong core. Binding the CPU to the selection at
 /// the point of mutation removes that possibility structurally: `d6_genuine_mark_running_via_task_seam`
 /// takes no `cpu` argument at all, so there is nothing for a caller to get wrong.
+/// U9-TM §4 — what one scheduler tick decided, as two exact meanings.
+///
+/// The broad timer arm expressed this as a bare `(Tick, bool)` and immediately branched on the
+/// bool. Naming the two outcomes is what stops a caller publishing a preemption for a tick that
+/// still has quantum budget — the one mistake that would put a task on the run queue that the
+/// scheduler never asked to preempt.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchedulerTickOutcome {
+    /// The quantum still has budget. No preemption may be published for this tick.
+    NoSwitch { cpu: CpuId, tick: u64 },
+    /// The quantum expired. The EXISTING Stage 192B publication applies; this outcome authorises
+    /// it and nothing else.
+    Preempt { cpu: CpuId, tick: u64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CpuDispatch {
     /// The requested CPU **was** the authoritative dispatch CPU; `selection` is what it did.
@@ -1910,6 +1926,67 @@ impl SharedKernel {
                     )
                 })
                 .unwrap_or(false)
+        })
+    }
+
+    /// U9-TM §4 — the rank-1 owner of the SCHEDULER TICK, off the broad lock.
+    ///
+    /// The tick POLICY was never duplicated: `SchedulerTimer::tick_and_check` has one definition
+    /// and both the broad `KernelState::tick_scheduler_timer` and this seam call it. What the
+    /// broad path additionally held was the broad `&mut KernelState` needed to reach
+    /// `sched.timer` at all. This reaches the same field through the rank-1 scheduler seam
+    /// instead — one acquisition, released before anything else runs.
+    ///
+    /// It ALWAYS ticks, exactly as the broad arm does. `cpu` is carried for attribution and for
+    /// the typed outcome, NOT as a refusal gate: a tick that could be skipped would change the
+    /// tick increment, and the authoritative-CPU question belongs to a caller's admission, before
+    /// it decides to tick at all.
+    ///
+    /// The returned outcome is typed so a caller cannot mistake "the quantum still has budget"
+    /// for "the quantum expired": a `NoSwitch` tick must not publish a preemption, and a
+    /// `Preempt` tick uses the EXISTING Stage 192B publication and the U9-QA selection owner —
+    /// this seam introduces no requeue or dequeue path of its own.
+    pub(crate) fn scheduler_tick_split_mut(&self, cpu: CpuId) -> SchedulerTickOutcome {
+        let (tick, should_preempt) =
+            self.with_scheduler_split_mut(|sched| sched.timer.tick_and_check());
+        if should_preempt {
+            SchedulerTickOutcome::Preempt { cpu, tick: tick.0 }
+        } else {
+            SchedulerTickOutcome::NoSwitch { cpu, tick: tick.0 }
+        }
+    }
+
+    /// U9-TM §4 — tick ONLY if this tick would not preempt, atomically.
+    ///
+    /// No existing profile witnesses a timer-driven preemption: across 77 recorded profiles on
+    /// all three architectures, `YARM_SCHED_TICK ... preempt=1` occurs zero times and no
+    /// `YIELD_DISPATCH_DEQUEUE_OK` is ever produced by a timer. So the preempting branch of a
+    /// split timer route cannot be live-proven, and shipping it unproven is not acceptable.
+    ///
+    /// This is the honest alternative. The lookahead and the tick happen inside ONE rank-1
+    /// acquisition, so the answer cannot go stale between them:
+    ///
+    /// * would preempt -> `None`, with NOTHING incremented and nothing mutated. The caller falls
+    ///   through to the unchanged broad arm, which ticks and preempts exactly as it always has.
+    /// * would not preempt -> the normal tick runs and `NoSwitch` is returned.
+    ///
+    /// It delegates to the SAME `SchedulerTimer` policy as [`Self::scheduler_tick_split_mut`] —
+    /// `would_preempt_next` reads the remaining budget and `tick_and_check` performs the tick.
+    /// The quantum calculation is not restated here.
+    pub(crate) fn scheduler_tick_if_no_switch_split_mut(
+        &self,
+        cpu: CpuId,
+    ) -> Option<SchedulerTickOutcome> {
+        self.with_scheduler_split_mut(|sched| {
+            if sched.timer.would_preempt_next() {
+                return None;
+            }
+            let (tick, should_preempt) = sched.timer.tick_and_check();
+            debug_assert!(
+                !should_preempt,
+                "the lookahead and the tick are one acquisition; they cannot disagree"
+            );
+            Some(SchedulerTickOutcome::NoSwitch { cpu, tick: tick.0 })
         })
     }
 

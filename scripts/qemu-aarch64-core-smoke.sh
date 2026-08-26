@@ -528,7 +528,12 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     exit 0
   fi
 
-  if ! check_required_patterns "$LOGFILE" \
+  # U9-TM §2: with the proof knobs off the pre-lock split route owns the timer and attests
+  # claim+tick+re-arm as one `TIMER_SPLIT_TICK_OK` line, so the three broad-arm markers
+  # legitimately do not appear. Either attestation satisfies the progression claim.
+  if rg -a -q "TIMER_SPLIT_TICK_OK" "$LOGFILE" 2>/dev/null; then
+    :
+  elif ! check_required_patterns "$LOGFILE" \
       "YARM_TIMER_IRQ_DELIVERED" \
       "YARM_TIMER_EOI_DONE" \
       "YARM_SCHED_TICK"; then
