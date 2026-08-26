@@ -141291,3 +141291,207 @@ mod u9pf_demand_blocker {
         }
     }
 }
+
+/// U9-FT §2/§8 — the owner-local terminal-fault policy read.
+mod u9ft_policy_read {
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const ENDPOINT_SRC: &str = include_str!("fault_endpoint_state.rs");
+
+    fn reader_body() -> &'static str {
+        FAULT_SRC
+            .split("pub(crate) fn read_terminal_fault_policy_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the policy reader")
+    }
+
+    fn code_of(body: &str) -> alloc::string::String {
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The reader takes `&self`, so IPC/scheduler/VM mutation is not expressible.
+    #[test]
+    fn the_policy_read_is_read_only_by_type() {
+        let head = FAULT_SRC
+            .split("pub(crate) fn read_terminal_fault_policy_split(")
+            .nth(1)
+            .and_then(|s| s.split("->").next())
+            .expect("signature");
+        assert!(
+            head.contains("&self,") && !head.contains("&mut self"),
+            "the policy read must take &self: {head}"
+        );
+    }
+
+    /// ONE FaultPolicy implementation: the reader delegates to the SAME
+    /// `effective_fault_policy_for` the broad terminal path consults, and does not re-derive the
+    /// override-then-default rule itself.
+    #[test]
+    fn there_is_exactly_one_fault_policy_implementation() {
+        let code = code_of(reader_body());
+        assert!(
+            code.contains("self.effective_fault_policy_for(tid)"),
+            "the split read must delegate to the existing policy owner"
+        );
+        assert!(
+            !code.contains("fault_policy_override"),
+            "the split read must NOT re-derive the override rule; that is the owner's job"
+        );
+        // The broad terminal path reads the same owner.
+        assert!(
+            FAULT_SRC.contains(
+                "self.effective_fault_policy_for(running_tid) == FaultPolicy::NotifyAndContinue"
+            ),
+            "the broad path must still consult the same policy owner"
+        );
+        // And that owner is defined exactly once.
+        assert_eq!(
+            ENDPOINT_SRC
+                .matches("pub(crate) fn effective_fault_policy_for(&self, tid: u64) -> FaultPolicy")
+                .count(),
+            1,
+            "effective_fault_policy_for must have exactly one definition"
+        );
+    }
+
+    /// The endpoint route is resolved exactly as the existing emitter resolves it: fault-handler
+    /// endpoint first, supervisor endpoint second.
+    #[test]
+    fn the_route_matches_the_existing_emitter_order() {
+        let code = code_of(reader_body());
+        let fh = code
+            .find("fault_handler_endpoint")
+            .expect("fault-handler arm");
+        let sup = code.find("supervisor_endpoint").expect("supervisor arm");
+        assert!(fh < sup, "fault-handler must be preferred over supervisor");
+        // The broad emitter resolves in the same order.
+        let emitter = FAULT_SRC
+            .split("fn emit_fault_report_for_fault(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the emitter");
+        let efh = emitter.find("fault_handler_endpoint").expect("emitter fh");
+        let esup = emitter.find("supervisor_endpoint").expect("emitter sup");
+        assert!(efh < esup, "the emitter's order must be unchanged");
+    }
+
+    /// No generation is fabricated. The ONLY generation in the snapshot is the endpoint's, read
+    /// from the IPC owner — there is no task-incarnation counter in source to carry.
+    #[test]
+    fn no_generation_is_fabricated() {
+        let code = code_of(reader_body());
+        assert!(
+            code.contains("self.endpoint_fault_report_stats(endpoint_idx)"),
+            "the endpoint generation must come from the IPC owner"
+        );
+        for invented in [
+            "generation: 0",
+            "generation + 1",
+            "wrapping_add",
+            "task_generation",
+            "incarnation",
+        ] {
+            assert!(
+                !code.contains(invented),
+                "no generation may be fabricated: `{invented}`"
+            );
+        }
+    }
+
+    /// Stale or missing identity is a TYPED refusal raised before anything else happens.
+    #[test]
+    fn stale_identity_is_a_typed_refusal_before_mutation() {
+        let code = code_of(reader_body());
+        let no_current = code
+            .find("TerminalFaultPolicyRefusal::NoCurrentTask")
+            .expect("no-current refusal");
+        let not_current = code
+            .find("TerminalFaultPolicyRefusal::NotCurrentTask")
+            .expect("stale refusal");
+        let first_read = code.find("self.with_tcbs(").expect("the rank-2 read");
+        assert!(
+            no_current < first_read && not_current < first_read,
+            "both identity refusals must precede the first domain acquisition"
+        );
+        assert!(
+            code.contains("TerminalFaultPolicyRefusal::TaskNotFound"),
+            "a missing TCB must also be typed"
+        );
+    }
+
+    /// The snapshot is a NAMED struct, not a positional tuple, and carries only the facts the
+    /// terminal settlement needs.
+    #[test]
+    fn the_snapshot_is_named_and_minimal() {
+        let s = FAULT_SRC
+            .split("pub(crate) struct TerminalFaultPolicySnapshot {")
+            .nth(1)
+            .and_then(|x| x.split('}').next())
+            .expect("the snapshot struct");
+        for field in ["tid:", "asid:", "status:", "policy:", "target:"] {
+            assert!(s.contains(field), "snapshot must carry `{field}`");
+        }
+        assert_eq!(
+            s.matches("pub ").count(),
+            5,
+            "the snapshot must carry exactly these five facts and no more: {s}"
+        );
+    }
+
+    /// No CpuId is threaded through, because terminal fault policy does not depend on the CPU in
+    /// source. Pinning this stops a later edit from implying a dependence that does not exist.
+    #[test]
+    fn the_policy_read_takes_no_cpu_because_policy_is_cpu_independent() {
+        let head = FAULT_SRC
+            .split("pub(crate) fn read_terminal_fault_policy_split(")
+            .nth(1)
+            .and_then(|s| s.split("->").next())
+            .expect("signature");
+        assert!(!head.contains("CpuId"), "policy is CPU-independent: {head}");
+        // And no ambient current_cpu read inside.
+        assert!(
+            !code_of(reader_body()).contains("current_cpu()"),
+            "no ambient current_cpu read"
+        );
+    }
+
+    /// Rank discipline: the acquisitions are sequential and ascending-or-independent, and the
+    /// reader never nests a lower rank inside a higher one.
+    #[test]
+    fn the_reader_takes_no_reverse_rank_nesting() {
+        let code = code_of(reader_body());
+        let tcbs = code.find("self.with_tcbs(").expect("rank 2");
+        let fault = code.find("self.with_fault_state(").expect("rank 8");
+        let ipc = code
+            .find("self.endpoint_fault_report_stats(")
+            .expect("rank 3");
+        // Each is a separate top-level statement; none encloses another.
+        assert!(tcbs < fault, "task read precedes the fault read");
+        assert!(fault < ipc, "fault read precedes the endpoint read");
+        let tcbs_stmt = &code[tcbs..fault];
+        assert!(
+            !tcbs_stmt.contains("with_fault_state")
+                && !tcbs_stmt.contains("endpoint_fault_report_stats"),
+            "the rank-2 read must not enclose a higher-rank acquisition"
+        );
+    }
+
+    /// `terminates_task` reflects the EXISTING policy branch exactly: KillTask terminates,
+    /// NotifyAndContinue does not.
+    #[test]
+    fn terminates_task_mirrors_the_existing_policy_branch() {
+        use crate::kernel::task::FaultPolicy;
+        let mk = |policy| crate::kernel::boot::fault_state::TerminalFaultPolicySnapshot {
+            tid: 1,
+            asid: None,
+            status: crate::kernel::task::TaskStatus::Running,
+            policy,
+            target: None,
+        };
+        assert!(mk(FaultPolicy::KillTask).terminates_task());
+        assert!(!mk(FaultPolicy::NotifyAndContinue).terminates_task());
+    }
+}
