@@ -4189,6 +4189,163 @@ fn run_aarch64_yield_lone_task_oracle(init_tid: u64) {
     );
 }
 
+/// U9-COW2 — one ordinary private writable page, in init's own BSS.
+///
+/// Page-aligned and page-sized so a fork's COW clone marks exactly this page and a write to it
+/// faults exactly once per address space. It is ordinary anonymous writable memory — no shared
+/// region, no capability, no new ABI — which is precisely the class `try_handle_cow_fault`'s
+/// `path=private_copy` arm exists to service.
+#[cfg(not(feature = "hosted-dev"))]
+#[repr(C, align(4096))]
+struct VmCowWitnessPage([u8; 4096]);
+
+#[cfg(not(feature = "hosted-dev"))]
+static mut VM_COW_WITNESS_PAGE: VmCowWitnessPage = VmCowWitnessPage([0u8; 4096]);
+
+/// U9-COW2 §1 — the genuine userspace Fork + private-copy COW witness.
+///
+/// Selector-gated on startup slot 13 (`service_extra_cap_0`), which the kernel provisions ONLY
+/// under the sender-wake sub-knob that `VM_COW=1` turns on. A normal boot leaves it `None` and
+/// this is a strict no-op — no fork, no writes, not one extra syscall.
+///
+/// ## What it does, and why each step is needed
+///
+/// 1. Write a seed byte to the page BEFORE forking. This makes the page resident and writable in
+///    the parent, so the fork has something to write-protect: a never-faulted lazy page would be
+///    cloned as absent and would take a DEMAND fault, not a COW fault.
+/// 2. `fork_raw()` — the existing NR 12 wrapper, the existing return-lane decode, the existing
+///    `IPC_RECV_PROOF_SENDER_WAKE_FORK_*` markers. No new syscall and no new marker family.
+/// 3. Parent and child each write a DISTINCT value to the SAME virtual address. Both writes hit
+///    a page the clone left read-only and COW-marked, so each takes one write fault that
+///    `try_handle_cow_fault` services as `path=private_copy` — two faults, in two ASIDs, which
+///    is the historical witness shape.
+/// 4. Each side reads the address back and reports what it sees. Isolation is verified FROM
+///    USERSPACE: if the copy were not private, one side would observe the other's value.
+/// 5. The child exits through the existing NR 16; the parent returns and continues into the
+///    unchanged service chain. Neither leaks a task nor rejoins the other's flow.
+#[cfg(not(feature = "hosted-dev"))]
+fn run_vm_cow_fork_witness_early(ctx: &yarm_user_rt::runtime::StartupContext) {
+    // Slot 13 is the sender-wake selector. With it unset this returns immediately.
+    if ctx.service_extra_cap_0.is_none() {
+        return;
+    }
+    const PARENT_VALUE: u8 = 0xA1;
+    const CHILD_VALUE: u8 = 0xC2;
+    const SEED_VALUE: u8 = 0x5A;
+
+    // The one address both processes will write. Taken once, so parent and child provably use
+    // the SAME virtual address rather than two that merely look alike in a log.
+    // SAFETY: taking the address only. init is single-threaded here, and after the fork each
+    // address space holds its own private incarnation of this page.
+    let page_addr = unsafe { &raw mut VM_COW_WITNESS_PAGE.0[0] };
+
+    // (1) Seed: make the page resident and writable BEFORE the clone write-protects it.
+    // SAFETY: `VM_COW_WITNESS_PAGE` is this process's own BSS; nothing else references it, and
+    // after the fork each address space has its own incarnation of it.
+    unsafe { page_addr.write_volatile(SEED_VALUE) };
+    let seeded = unsafe { page_addr.read_volatile() };
+    yarm_user_rt::user_log!(
+        "FORK_PROOF_COW_WITNESS_SEED tid={} va=0x{:x} value=0x{:x}",
+        ctx.task_id,
+        page_addr as usize,
+        seeded
+    );
+    if seeded != SEED_VALUE {
+        yarm_user_rt::user_log!("FORK_PROOF_COW_WITNESS_ABORT reason=seed_readback");
+        return;
+    }
+
+    // (2) The existing Fork ABI, with the existing non-lossy return-lane decode.
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_SYSCALL_BEGIN smoke=0");
+    // SAFETY: the existing proof-only raw fork. The child inherits init's COW address space and
+    // exits below without returning into init's flow.
+    let fr = unsafe { yarm_user_rt::syscall::fork_raw() };
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_SENDER_WAKE_FORK_SYSCALL_RET ret0={} ret1={} ret2={} err={} arch={}",
+        fr.ret0,
+        fr.ret1,
+        fr.ret2,
+        fr.err,
+        fr.arch
+    );
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_SENDER_WAKE_FORK_DECODE code={} meaning={}",
+        fr.err,
+        fork_err_meaning(fr.err)
+    );
+
+    if fr.ret0 == 0 && fr.err != 0 && fr.err < 0x100 {
+        // A genuine fork failure. Report the exact code and do NOT proceed: a witness that
+        // silently skipped its own fork is the vacuous gate this increment exists to remove.
+        yarm_user_rt::user_log!(
+            "FORK_PROOF_COW_WITNESS_FORK_FAILED code={} meaning={}",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        return;
+    }
+
+    // (3)+(4) Both roles write the SAME address and read it back.
+    if fr.ret0 != 0 {
+        // ── PARENT ──
+        yarm_user_rt::user_log!(
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw={} role=parent",
+            fr.ret0
+        );
+        // SAFETY: as above — the parent's own copy of its own BSS page.
+        unsafe { page_addr.write_volatile(PARENT_VALUE) };
+        let observed = unsafe { page_addr.read_volatile() };
+        yarm_user_rt::user_log!(
+            "FORK_PROOF_COW_WITNESS_WRITE role=parent tid={} child={} va=0x{:x} wrote=0x{:x} observed=0x{:x}",
+            ctx.task_id,
+            fr.ret0,
+            page_addr as usize,
+            PARENT_VALUE,
+            observed
+        );
+        if observed == PARENT_VALUE {
+            yarm_user_rt::user_log!("FORK_PROOF_COW_WITNESS_ISOLATION_OK role=parent");
+        } else {
+            yarm_user_rt::user_log!(
+                "FORK_PROOF_COW_WITNESS_ISOLATION_FAIL role=parent observed=0x{:x}",
+                observed
+            );
+        }
+        yarm_user_rt::user_log!("FORK_PROOF_COW_WITNESS_DONE role=parent");
+        // The parent RETURNS: init continues into the unchanged service chain below.
+        return;
+    }
+
+    // ── CHILD ──
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw=0 role=child");
+    // SAFETY: the child's own private incarnation of the same BSS page.
+    unsafe { page_addr.write_volatile(CHILD_VALUE) };
+    let observed = unsafe { page_addr.read_volatile() };
+    yarm_user_rt::user_log!(
+        "FORK_PROOF_COW_WITNESS_WRITE role=child va=0x{:x} wrote=0x{:x} observed=0x{:x}",
+        page_addr as usize,
+        CHILD_VALUE,
+        observed
+    );
+    if observed == CHILD_VALUE {
+        yarm_user_rt::user_log!("FORK_PROOF_COW_WITNESS_ISOLATION_OK role=child");
+    } else {
+        yarm_user_rt::user_log!(
+            "FORK_PROOF_COW_WITNESS_ISOLATION_FAIL role=child observed=0x{:x}",
+            observed
+        );
+    }
+    yarm_user_rt::user_log!("FORK_PROOF_COW_WITNESS_DONE role=child");
+    // (5) Terminate through the existing NR 16. The child must NOT fall through into init's
+    // service chain — it would become a second init and spawn every service twice.
+    // SAFETY: no pointer arguments; this does not return on success.
+    let _ = unsafe { yarm_user_rt::syscall::exit_current_task() };
+    yarm_user_rt::user_log!("FORK_PROOF_COW_WITNESS_CHILD_EXIT_DECLINED");
+    loop {
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("INIT_RUN_ENTER");
     // Stage 196B: this second userspace DebugLog executes ONLY if the preceding
@@ -4218,6 +4375,18 @@ pub fn run() {
     // With slot 5 unset this is a no-op and the ordinary service chain runs unchanged.
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     dispatch_aarch64_unlocking_oracle_early(&ctx);
+
+    // U9-COW2: the COW witness runs HERE, for exactly the reason the AArch64 oracles above
+    // moved here. The sender-wake proof workload — the only shipped code that calls Fork
+    // (NR 12) — is dispatched ~640 lines below, AFTER the whole SpawnV5/VFS/blkcache chain.
+    // On x86_64 init never gets that far: it blocks at `INIT_SPAWN_V5_REPLY_RECV_BEGIN`
+    // waiting on PM's reply and the system quiesces with only the supervisor runnable, so
+    // Fork is never invoked, no page is ever COW-cloned, and `VM_COW=1` produced ZERO COW
+    // faults — the witness the routing matrix was written against. Nothing was removed; the
+    // workload simply became unreachable. This branch needs no spawned service, exactly like
+    // the oracles above: it drives one fork and two writes through the startup context alone.
+    #[cfg(not(feature = "hosted-dev"))]
+    run_vm_cow_fork_witness_early(&ctx);
 
     // --- Spawn initramfs_srv (image_id=4) ---
     yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
