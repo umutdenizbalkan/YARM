@@ -310,20 +310,43 @@ fn try_split_futex_wait_into_frame(
         return D::NotHandled;
     }
     // (1) ABI, identical to `handle_futex_wait`.
+    //
+    // Every decline from here on is ATTRIBUTED. These were silent, and that cost a diagnosis:
+    // AArch64 imported `nr=9` into the frame and still never took this route, with no marker to
+    // say which check declined it. A refusal that cannot be seen in a live log cannot be
+    // distinguished from a route that was never reached.
     let addr = frame.arg(SYSCALL_ARG_CAP);
     let (Ok(expected), Ok(observed)) = (
         u32::try_from(frame.arg(SYSCALL_ARG_PTR)),
         u32::try_from(frame.arg(SYSCALL_ARG_LEN)),
     ) else {
-        return D::NotHandled; // legacy: InvalidArgs, produced by the broad handler
+        // legacy: InvalidArgs, produced by the broad handler
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid=0 reason=arg_decode cpu={}",
+            cpu.0
+        );
+        return D::NotHandled;
     };
     let Some(tid) = shared.current_tid_authoritative(cpu) else {
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid=0 reason=no_current_task cpu={}",
+            cpu.0
+        );
         return D::NotHandled;
     };
     // (2) Phase A: the off-lock value check.
     let Some(would_block) = shared.futex_wait_would_block_split_read(tid, addr, expected, observed)
     else {
-        return D::NotHandled; // legacy: WrongObject / UserMemoryFault
+        // legacy: WrongObject / UserMemoryFault
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason=value_check addr={} expected={} observed={} cpu={}",
+            tid,
+            addr,
+            expected,
+            observed,
+            cpu.0
+        );
+        return D::NotHandled;
     };
     // (3) The non-blocking outcome: no transition, no switch, no drain.
     if !would_block {

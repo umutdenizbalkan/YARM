@@ -72617,12 +72617,18 @@ mod stage195a_aarch64_debuglog_live {
             body.contains("REG_X8"),
             "the import gate must peek the raw syscall number from x8"
         );
-        // Must NEVER de-gate the queue-advancing FutexWait on AArch64 (it BLOCKS the caller and
-        // needs the deferred drain body). FutexWake (NR 10) IS enabled as of Stage 195C — that
-        // selectivity is pinned in the stage195c module.
+        // U9-QA §2: FutexWait (NR 9) IS now imported. The reason it was held back — "it BLOCKS
+        // the caller and needs the deferred drain body" — is exactly what the pre-lock route now
+        // does: it publishes the block and settles through that SAME Stage 195E drain, which is
+        // why the import is the one lever that had to move. The selectivity claim this case owns
+        // is unchanged: the import is a whitelist, not a blanket import.
         assert!(
-            !body.contains("SYSCALL_FUTEX_WAIT_NR"),
-            "AArch64 must not enable the queue-advancing FutexWait"
+            body.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "AArch64 imports FutexWait (NR 9) — the one switching pre-lock class"
+        );
+        assert!(
+            !body.contains("SYSCALL_YIELD_NR"),
+            "the import must stay a whitelist: Yield has no pre-lock route"
         );
     }
 
@@ -72803,10 +72809,15 @@ mod stage195c_aarch64_futex_wake_live {
             import.contains("SYSCALL_FUTEX_WAKE_NR"),
             "the AArch64 ABI gate must include FutexWake (NR 10) as of Stage 195C"
         );
-        // But NEVER the queue-advancing FutexWait/Yield.
+        // U9-QA §2 admitted FutexWait as the one SWITCHING class; Yield still has no pre-lock
+        // route and must stay out.
         assert!(
-            !import.contains("SYSCALL_FUTEX_WAIT_NR") && !import.contains("SYSCALL_YIELD_NR"),
-            "the AArch64 gate must NOT enable queue-advancing FutexWait/Yield"
+            import.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "the AArch64 gate admits FutexWait (NR 9) as of U9-QA §2"
+        );
+        assert!(
+            !import.contains("SYSCALL_YIELD_NR"),
+            "the AArch64 gate must NOT enable queue-advancing Yield"
         );
     }
 
@@ -139551,7 +139562,9 @@ mod u9qa_apply_convention {
         let body = admit_body();
         // The stash convention requires exactly what the plan builder requires.
         assert!(
-            body.contains("QueueAdvanceApply::StashedKernelSwitch => tcb.kernel_context.initialized"),
+            body.contains(
+                "QueueAdvanceApply::StashedKernelSwitch => tcb.kernel_context.initialized"
+            ),
             "the stash convention must screen on what build_dispatch_switch_plan_locked requires"
         );
         // The exact-token convention differs by architecture, because its resume owners do:
@@ -139565,7 +139578,7 @@ mod u9qa_apply_convention {
             .and_then(|s| s.split("\n                }").next())
             .expect("the exact-token arm");
         assert!(
-            exact.contains("cfg!(target_arch = \"riscv64\")")
+            exact.contains("cfg!(target_arch = \"x86_64\")")
                 && exact.contains("tcb.asid.is_some()")
                 && exact.contains("tcb.kernel_context.initialized"),
             "the exact-token screen must match what each architecture's resume owner accepts"

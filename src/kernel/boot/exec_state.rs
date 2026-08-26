@@ -4328,20 +4328,23 @@ impl crate::runtime::SharedKernel {
         // * `ExactTokenResume` needs whatever its architecture's resume owner accepts, and that
         //   genuinely differs:
         //
-        //   - x86_64/AArch64: `x86_post_lock_resume_marked_incoming` refuses `X86ResumeRefusal::
-        //     Context` for an incarnation with no restorable saved context, and a task that has
-        //     never run takes the FIRST-RESUME TRAMPOLINE — which is the stash path, not this one.
-        //     So the same `kernel_context.initialized` screen applies, and screening here is what
+        //   - x86_64: `x86_post_lock_resume_marked_incoming` refuses `X86ResumeRefusal::Context`
+        //     for an incarnation with no restorable saved context, and a task that has never run
+        //     takes the FIRST-RESUME TRAMPOLINE — which is the stash path, not this one. So
+        //     `kernel_context.initialized` is the right screen there, and screening here is what
         //     keeps that post-dequeue (fatal) refusal unreachable.
-        //   - riscv64: its resume owner activates SATP and applies the saved user context, and its
-        //     bridge write-back then selects among ALL FOUR conventions — including fresh/startup,
-        //     which it serves from the argument mirror. A never-run task is therefore genuinely
-        //     resumable there, and screening it out refused a live-capable advance. Measured: the
-        //     first RISC-V FutexWait of a core-smoke boot was refused `IncomingUnavailable` for
-        //     incoming tid 2, and the in-lock path then switched to that very task successfully
-        //     through the startup convention (`SATP_OK` → `FRAME_OK` → `SRET_ARMED` →
-        //     `RISCV_STARTUP_ARGS tid=2`). What that architecture requires is a resolvable ASID,
-        //     which is what its `direct_dispatch_activate_asid_split` would otherwise refuse on.
+        //   - AArch64 and riscv64: their resume owners activate the incoming address space and
+        //     apply that task's saved user context, and their write-backs then serve the
+        //     fresh/startup convention from the argument mirror. A never-run task is genuinely
+        //     resumable on both, and screening it out refused a live-capable advance.
+        //
+        //     BOTH were measured, not assumed. RISC-V: the first FutexWait of a core-smoke boot
+        //     was refused `IncomingUnavailable` for incoming tid 2, and the in-lock path then
+        //     switched to that very task through the startup convention (`SATP_OK` → `FRAME_OK`
+        //     → `SRET_ARMED` → `RISCV_STARTUP_ARGS tid=2`). AArch64: its FutexWait oracle refused
+        //     three times for the same reason while its in-lock drain switched all three
+        //     successfully (`TTBR0_OK` → `FRAME_OK`). What both require is a resolvable ASID,
+        //     which is what `direct_dispatch_activate_asid_split` would otherwise refuse on.
         let resumable = self.with_task_tcbs_split_mut(|tcbs| {
             let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == candidate) else {
                 return false;
@@ -4349,10 +4352,10 @@ impl crate::runtime::SharedKernel {
             match apply {
                 QueueAdvanceApply::StashedKernelSwitch => tcb.kernel_context.initialized,
                 QueueAdvanceApply::ExactTokenResume => {
-                    if cfg!(target_arch = "riscv64") {
-                        tcb.asid.is_some()
-                    } else {
+                    if cfg!(target_arch = "x86_64") {
                         tcb.kernel_context.initialized
+                    } else {
+                        tcb.asid.is_some()
                     }
                 }
             }

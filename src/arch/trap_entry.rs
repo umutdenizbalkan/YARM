@@ -2390,6 +2390,15 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
     let raw_nr = frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8);
     if raw_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+        // U9-QA §2: FutexWait (NR 9) — the one SWITCHING pre-lock class. Without its ABI in the
+        // frame the split dispatcher sees `nr = 0` and declines, which is why AArch64 kept taking
+        // the in-lock deferral while x86_64 and RISC-V had moved to the pre-lock route. This is
+        // the AArch64 counterpart of the RISC-V `split_eligible` gate, and it admits NR 9 for the
+        // same reason: this architecture has the apply convention FutexWait needs
+        // (`direct_dispatch_resume_incoming_core` — TTBR0/ASID activation, exact EL0 context,
+        // exact parked completion), and its Stage 195E drain has driven it live for that class
+        // since it landed.
+        || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply
