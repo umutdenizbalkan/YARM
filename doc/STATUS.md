@@ -1130,6 +1130,61 @@ census remains **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall productio
 (`ipccall_direct_production_enabled()` is `const false`). U9-RX is CENSUS-DELTA 0, so the canonical
 stage arithmetic is unchanged.
 
+### U9-RX2 — the recv-waiter publish policy, and the blocking-entry blocker. FOUNDATION. CENSUS-DELTA 0.
+
+**U9-RX2 — CENSUS-DELTA 0 prerequisite.** Delivered: the restoration of the U9-RX guards, and the
+extraction of the single recv-waiter publish policy both forms now share. **The blocking IpcRecv
+entry is NOT routed** — the derivation identified a forced ordering constraint whose unwind has no
+off-lock owner. The census stays **2 / 0 / 2**.
+
+**CORRECTION — the U9-RX guards were lost before their commit.** During U9-RX the clippy
+comparison ran `git checkout -q d0d0a1e -- src/` and then `git checkout -q HEAD -- src/` while the
+eight new guards were still uncommitted; `HEAD` was the branch tip, which did not yet contain them,
+so the restore silently reverted them. `d2f27dc` therefore shipped the U9-RX **documentation
+without its guards**, and the claim that the twin "is now pinned by guard" was false as delivered.
+The documentation findings are unaffected — they were derived by reading source and remain true.
+The guards are restored, and the work is now committed before any base-comparison checkout.
+
+**ONE recv-waiter publish policy.** `publish_recv_waiter_locked(ipc, endpoint_idx, record,
+recv_cap)` owns the atomic queue-recheck and last-receiver-wins publish, performed entirely inside
+a caller-supplied rank-3 critical section. `KernelState::publish_recv_waiter_live` delegates to it
+and contributes only the broad acquisition; an off-lock twin can run the identical body through
+`with_ipc_split_mut` without re-deriving anything. Last-receiver-wins replacement is preserved
+deliberately, `D2_RECV_WAITER_DISPLACED` included — whether YARM should keep replacement is WA3C2's
+question. The Stage 193B send-plain oracle coordination push stays inside the same rank-3 section,
+immediately after the `endpoint_waiters` write, so it remains atomic with the publish.
+
+**THE BLOCKER — the blocking entry needs an off-lock unwind that does not exist.** The canonical
+blocking sequence is already decomposed into three named phases with an unwind:
+`recv_block_phase_a_scheduler` (rank 1, block current), `recv_block_phase_b_task` (rank 2, mark
+`Blocked(EndpointReceive)`), `recv_block_phase_c_ipc_publish` (rank 3, atomic recheck + publish),
+and `recv_block_unwind_race` for the `QueueNonEmpty` branch. A standing guard,
+`stage111_d2_seam_helper_only_fence_not_live_wired_from_d2_path`, fences these as helper-only
+because "D-NEXT-1 PR-A landed the phase-split refactor but deferred the genuine
+bypass-the-global-lock wiring".
+
+That ordering is **forced, not incidental**: the task must be `Blocked` before the waiter becomes
+visible, or a racing sender can find a published waiter that is still `Running` and attempt direct
+delivery to it. The publish therefore cannot be moved ahead of the block to make the
+`QueueNonEmpty` branch mutation-free — so the split route must be able to **undo the rank-1 block**
+when the recheck finds a message. All four phases are `&mut KernelState` methods, and no off-lock
+counterpart of `recv_block_unwind_race` exists. Building the route without one would risk leaving a
+receiver `Blocked` with no waiter — a hang, on a path the x86_64 core profile exercises 114 times
+per boot.
+
+**What the next increment needs, in order:** a `SharedKernel` twin of each of the three phases
+(the rank-1 and rank-2 halves have existing seams — `block_current_on_cpu_split` and
+`with_task_tcbs_split_mut`; the rank-3 half now has its policy owner), an off-lock
+`recv_block_unwind_race` twin, and only then the admit → reserve-deferral → publish →
+`QueueAdvanceCommitted` route on the U9-FT4 model. The four-class completion transaction remains
+the sole completion/writeback owner and needs nothing further.
+
+**Unchanged.** Blocking IpcRecv stays broad on all three architectures; fault-report waiter
+delivery stays broad for want of any live witness; COW and demand are untouched; the U9-FT4 AArch64
+terminal route is intact. The census remains **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall
+production remains OFF (`ipccall_direct_production_enabled()` is `const false`). U9-RX2 is
+CENSUS-DELTA 0, so the canonical stage arithmetic is unchanged.
+
 `doc/KERNEL_UNLOCKING.md` § U9-D3.
 
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64
