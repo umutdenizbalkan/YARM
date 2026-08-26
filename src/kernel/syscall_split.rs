@@ -561,10 +561,10 @@ fn try_split_blocking_ipc_recv_into_frame(
     use SplitDispatchDisposition as D;
 
     // (1) NR, then architecture. The body is architecture-neutral; the gate names the two that
-    // have the drain this route publishes into. In practice only x86_64 REACHES it today —
-    // AArch64 keeps `nr = 0` for NR 2 (see `pre_split_import_syscall_abi`, where the reason is
-    // recorded), so the decode below declines there. RISC-V is excluded for want of a live
-    // witness, not for a structural reason: its D2-recv drain is the same shape.
+    // have the drain this route publishes into, and since U9-RX4 repaired the queued-plain
+    // writeback both of them actually REACH it — AArch64's NR 2 ABI import is no longer held
+    // back (see `pre_split_import_syscall_abi`). RISC-V is excluded for want of a live witness,
+    // not for a structural reason: its D2-recv drain is the same shape.
     if !matches!(Syscall::decode(frame.syscall_num()), Ok(Syscall::IpcRecv)) {
         return D::NotHandled;
     }

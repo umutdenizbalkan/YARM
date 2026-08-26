@@ -6081,7 +6081,15 @@ impl SharedKernel {
             RecvWritebackPlan::UserMemory { sender_tid, .. } => {
                 match execute_user_asid_plain_writeback_boundary(self, pending) {
                     RecvUserWritebackOutcome::Ok => {
-                        let payload_len = pending.msg.as_slice().len();
+                        // U9-RX4: the RECEIVER-VISIBLE length, i.e. the one the executor just
+                        // copied. Reporting the raw wire length would tell a receiver of a
+                        // framed cap-bearing message that two bytes more arrived than did.
+                        let payload_len =
+                            crate::kernel::syscall::ipc_recv_core::project_recv_delivery(
+                                &pending.msg,
+                            )
+                            .app_payload
+                            .len();
                         frame.set_ok(sender_tid, payload_len, frame.ret2());
                         crate::yarm_log!("IPC_RECV_BOUNDARY_USER_COPY_SEAM_OK kind=user_plain");
                         crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain");
@@ -6105,7 +6113,13 @@ impl SharedKernel {
             RecvWritebackPlan::UserMemoryV2 { .. } => {
                 match execute_user_asid_plain_v2_writeback_boundary(self, pending) {
                     RecvV2WritebackOutcome::Ok => {
-                        let payload_len = pending.msg.as_slice().len();
+                        // U9-RX4: same receiver-visible length as the copy and the meta.
+                        let payload_len =
+                            crate::kernel::syscall::ipc_recv_core::project_recv_delivery(
+                                &pending.msg,
+                            )
+                            .app_payload
+                            .len();
                         frame.set_ok(0, payload_len, frame.ret2());
                         crate::yarm_log!("IPC_RECV_BOUNDARY_USER_COPY_SEAM_OK kind=user_plain_v2");
                         crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain_v2");

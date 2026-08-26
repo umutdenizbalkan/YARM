@@ -5733,3 +5733,98 @@ four-class completion transaction remains the sole completion/writeback owner. T
 **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall production remains OFF
 (`ipccall_direct_production_enabled()` is `const false`). U9-RX3 is CENSUS-DELTA 0, so the canonical
 stage arithmetic is unchanged.
+
+### U9-RX4 — the reply-cap writeback repair, and AArch64 blocking IpcRecv. CENSUS-DELTA 0.
+
+**U9-RX4 — the AArch64 blocker U9-RX3 recorded is retired by fixing it, not by working around
+it.** Delivered: the repair of the Stage-32B queued-plain split receive, and the AArch64 NR 2 ABI
+import and U9-RX3 routing it was holding back. The census stays **2 / 0 / 2**.
+
+**THE BUG WAS TWO DIVERGENCES IN ONE WRITEBACK OWNER.** Both live on the queued-plain boundary
+executor, `execute_user_asid_plain_v2_writeback_boundary`, and both made a split receive deliver
+something a broad receive would not:
+
+1. **The reply cap was discarded.** Stage 193F surfaced an ORDINARY materialized cap in the
+   recv-v2 meta and deliberately kept hiding a REPLY cap; Stage 193G then froze that carve-out as
+   a contract, on the stated belief that "reply-cap meta visibility must not change". Phase A had
+   already minted the receiver-local cap and recorded its one-shot reply record — the writeback
+   simply wrote `NO_TRANSFER_CAP` with no flags over it. Userspace decoded
+   `IpcRecvMetaV2.reply_cap` as `u32::MAX`.
+2. **The receiver-visible framing was lost.** The broad receives open with
+   `project_recv_delivery`, described there as the "canonical receiver-visible projection (single
+   rule, shared with every other delivery path)": it strips the two-byte inline opcode prefix the
+   `ipc_send`/`ipc_call` helpers prepend, so the receiver observes the APPLICATION opcode. This
+   executor read `msg.opcode` and `msg.as_slice()` raw.
+
+**WHAT IT COST, LIVE.** The same message the broad path delivers as `opcode=12 len=8
+reply_cap=Some(65538)` arrived as `opcode=0 len=10 reply_cap=None`. PM answered
+`PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295`, never replied, and its caller — tid 2 — was
+left blocked on endpoint 5 for the whole boot; the minted reply cap sat orphaned in PM's cnode
+with no CapId ever exposed, which is the same orphaning 193F had fixed for ordinary caps. On
+x86_64 this had been visible in every core boot for as long as that route had been live. It is
+also exactly why U9-RX3 measured the AArch64 NR 2 import, saw the regression it would import, and
+reverted.
+
+**THE FIX IS TWO CALLS, TO OWNERS THE BROAD PATHS ALREADY USE.** `recv_meta_cap_projection` is
+new, pure, and lives beside the recv-v2 codec; it answers which cap id and which `recv_meta_flags`
+a receiver is told about. The two halves of that answer come from different places — the FLAGS are
+a property of the message, the CAP ID a property of the receiver's cnode — which is precisely why
+a writeback that special-cases a class gets it wrong. The broad blocked-waiter completion, which
+had always derived it correctly, now calls the same projection, so a divergence between what a
+broad and a split receive tell userspace is no longer expressible. `project_recv_delivery` already
+existed and is simply applied.
+
+**Nothing about the plain class changes.** Both projections are the IDENTITY for a plain message
+— the framing predicate is `opcode == OPCODE_INLINE && (FLAG_REPLY_CAP | FLAG_CAP_TRANSFER)`, and
+a plain message has no materialized cap — so that class copies exactly the bytes it copied before,
+from the same slice, with the same `NO_TRANSFER_CAP` and no flags. There is no ABI change and no
+layout change; the frozen 40-byte frame is untouched. `u32::MAX` survives if and only if there is
+genuinely no cap: userspace maps the id to `None` before it consults the flags, so a flag set with
+no cap still decodes to "no cap", which is what must happen when materialization declined. The
+frame's reported payload length is now the length that was actually copied. The ordinary-cap and
+shared-region paths are unchanged, and the rollback routing is untouched — reply caps still tear
+down through the exact ordered reply transaction, every other class through the phased split
+composition.
+
+**AARCH64 IS NOW ROUTED.** With the precondition met, `pre_split_import_syscall_abi` admits NR 2 —
+the same one-line admission NR 9 carries, for the same reason. The import is what makes NR 2
+visible to the pre-lock dispatcher; it admits nothing by itself, and what the class needs from the
+architecture it demonstrably has: the shared D2-recv drain has settled AArch64 blocking-recv
+resumes live since U4 widened it there.
+
+**THE MANDATORY AArch64 CHAIN, WITNESSED.** `PM_RECV_GOT_MSG opcode=12 len=8
+reply_cap=Some(65538)` → `PM_LIFECYCLE_QUERY_RECV tid=2` → `PM_LIFECYCLE_QUERY_REPLY tid=2
+found=1` → `IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=0 generation=1` → both one-shot sides
+fast-revoked exactly once (`ok=true`) → `IPC_REPLY_WAKE_CALLER tid=2`. The blocking route publishes
+and defers twice, the broad dispatcher is skipped, and the existing D2-recv drain resumes the
+replacement. **The U9-FT4 terminal-fault witness selects tid 2 again** — all eighteen assertions
+pass — because tid 2 is no longer stranded. Zero `reply_cap=4294967295`, zero `PM_RECV_DECODE_FAIL`,
+zero duplicate reply, zero rollback, zero fail-closed. x86_64 shows the identical chain.
+
+**RISC-V remains BROAD, and it is not a policy choice.** Its boot is healthy and PM decodes and
+replies there exactly as elsewhere, but it takes zero pre-lock NR 2 dispatches and publishes zero
+blocking-recv split blocks — there is no live witness of the route on that architecture to qualify
+it, so it keeps the unchanged broad entry.
+
+**Two guards re-derived, one of them inverted.** `reply_cap_meta_visibility_unchanged` asserted the
+defect verbatim — it required that the split writeback "keep hiding reply caps from the meta". It is
+not weakened but inverted to the true requirement, because the 193G conclusion it enforced was
+contradicted by live evidence rather than by argument: hiding the cap did not preserve a contract,
+it broke the one the receiver depends on. `recv_v2_writeback_encodes_materialized_cap` pinned the
+exact `match` 193F had written, whose guard encoded the same carve-out; it now states its claim
+over behaviour instead of over an implementation. The U9-RX3 guard that pinned the AArch64
+exclusion now pins the admission and the dependency that keeps it sound.
+
+**Both existing core smoke scripts gain a positive U9-RX4 block** — no new script and no new marker
+family. Asserting positively is not ceremony here: the defect was invisible to fatal-pattern
+matching for as long as it existed, and the smoke exited 0 throughout. The block is a real gate:
+run against the pre-fix log it fails five of its assertions, three required-once patterns at zero
+and two required-zero patterns at one.
+
+**Unchanged.** Blocking IpcRecv stays broad on RISC-V and on both routed architectures for every
+case the route declines. Fault-report waiter delivery stays broad; COW and demand are untouched;
+the U9-FT4 AArch64 terminal route is intact and re-verified. WA3C2's replacement question, endpoint
+creation, Spawn/Fork/Exit, the futex features and RPi5 are untouched. The census remains
+**2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`). U9-RX4 is CENSUS-DELTA 0, so the canonical
+stage arithmetic is unchanged.

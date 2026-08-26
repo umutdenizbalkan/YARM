@@ -536,13 +536,11 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
         return Err(SyscallError::InvalidArgs);
     }
-    let recv_meta_flags = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
-        SYSCALL_RECV_META_REPLY_CAP
-    } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0 {
-        SYSCALL_RECV_META_TRANSFERRED_CAP
-    } else {
-        0
-    };
+    // U9-RX4: the flag half of the ONE receiver-visible cap projection. It is computed here,
+    // before materialization, because it depends only on the message; the cap half is taken
+    // from the same projection below, once the materialized id exists. This was the
+    // derivation the queued-plain split boundary failed to match, and both now share it.
+    let (_, recv_meta_flags) = self::ipc_recv_core::recv_meta_cap_projection(msg.flags, None);
     // Stage 104 / D1: routed — supported transfer-cap messages go through the
     // phase-separated split engine; reply-cap and shared-region fall back to
     // the canonical materialize path inside the router.
@@ -563,7 +561,15 @@ pub(crate) fn complete_blocked_recv_for_waiter(
                 .unwrap_or(SYSCALL_NO_TRANSFER_CAP)
         );
     }
-    let cap_id = recv_local_transfer.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
+    // U9-RX4: the cap half of the same projection, against the id materialization produced.
+    // Asserting the flag half is unchanged is what keeps the two halves one decision rather
+    // than two reads of the same source that could later drift apart.
+    let (cap_id, projected_flags) =
+        self::ipc_recv_core::recv_meta_cap_projection(msg.flags, recv_local_transfer);
+    debug_assert_eq!(
+        projected_flags, recv_meta_flags,
+        "the projection's flag half cannot depend on the materialized cap"
+    );
     if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
         crate::yarm_log!(
             "IPC_RECV_BLOCKED_META_REPLY_CAP waiter_tid={} cap={}",
@@ -583,7 +589,7 @@ pub(crate) fn complete_blocked_recv_for_waiter(
         app_opcode,
         app_payload.len(),
         cap_id,
-        recv_meta_flags as u64,
+        recv_meta_flags,
         msg.sender_tid.0,
     );
     match kernel.copy_to_user(

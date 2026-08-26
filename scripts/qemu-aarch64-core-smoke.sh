@@ -364,6 +364,86 @@ if [[ "$u9ft4_fail" -eq 1 ]]; then
 fi
 echo "[ok] U9-FT4: AArch64 terminal PageFault route witness chain complete"
 
+# U9-RX4: the Stage-32B queued-plain split receive must deliver EXACTLY what the broad receive
+# delivers. Asserted POSITIVELY, because the defect this replaced was invisible to
+# fatal-pattern matching for as long as it existed: the smoke exited 0 while PM silently failed
+# to decode, never replied, and left its caller blocked for the rest of the boot.
+u9rx4_fail=0
+u9rx4_log="$(tr '\r' '\n' <"$LOGFILE")"
+u9rx4_count() {
+  local n
+  n="$(printf '%s\n' "$u9rx4_log" | rg -a -F -c -- "$1" || true)"
+  printf '%s' "${n:-0}"
+}
+u9rx4_require_one() {
+  local want_desc="$1" pat="$2" n
+  n="$(u9rx4_count "$pat")"
+  if [[ "$n" != "1" ]]; then
+    echo "[error] U9-RX4: $want_desc -- expected exactly 1, got ${n:-0}: $pat"
+    u9rx4_fail=1
+  else
+    echo "[ok] U9-RX4: $want_desc"
+  fi
+}
+u9rx4_require_min_one() {
+  local want_desc="$1" pat="$2" n
+  n="$(u9rx4_count "$pat")"
+  if [[ "$n" -lt 1 ]]; then
+    echo "[error] U9-RX4: $want_desc -- expected at least 1, got ${n:-0}: $pat"
+    u9rx4_fail=1
+  else
+    echo "[ok] U9-RX4: $want_desc (n=$n)"
+  fi
+}
+u9rx4_require_zero() {
+  local want_desc="$1" pat="$2" n
+  n="$(u9rx4_count "$pat")"
+  if [[ "$n" != "0" ]]; then
+    echo "[error] U9-RX4: $want_desc -- expected 0, got $n: $pat"
+    u9rx4_fail=1
+  else
+    echo "[ok] U9-RX4: $want_desc"
+  fi
+}
+# The receive itself: the EXACT one-shot reply cap the kernel minted, and the
+# receiver-visible framing (application opcode 12, 8 payload bytes) -- not the raw wire
+# opcode 0 with its two-byte inline prefix still attached.
+u9rx4_require_one "PM receives the exact minted reply cap with receiver-visible framing" \
+  'PM_RECV_GOT_MSG opcode=12 len=8 reply_cap=Some(65538)'
+u9rx4_require_one "the reply cap is materialized exactly once" \
+  'IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=65538'
+# PM can now decode and answer.
+u9rx4_require_one "PM decodes the lifecycle query" 'PM_LIFECYCLE_QUERY_RECV tid=2'
+u9rx4_require_one "PM replies successfully" 'PM_LIFECYCLE_QUERY_REPLY tid=2 found=1'
+u9rx4_require_one "the reply resolves against the live one-shot object" \
+  'IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=0 generation=1'
+# The one-shot is CONSUMED exactly once, on both sides, and the caller resumes once.
+u9rx4_require_one "the replier side of the one-shot is revoked once" \
+  'IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538'
+u9rx4_require_one "the caller side of the one-shot is revoked once" \
+  'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2'
+u9rx4_require_one "the blocked caller resumes exactly once" 'IPC_REPLY_WAKE_CALLER tid=2'
+# The defect's own signatures must be gone.
+u9rx4_require_zero "no reply cap is lost to the u32::MAX sentinel" 'reply_cap=4294967295'
+u9rx4_require_zero "PM never fails to decode" 'PM_RECV_DECODE_FAIL'
+u9rx4_require_zero "no writeback rollback on the witnessed path" 'IPC_RECV_V2_ROLLBACK_OK'
+u9rx4_require_zero "the reply cap is never used twice" 'IPC_REPLY_FAST_REVOKE_FAIL'
+u9rx4_require_zero "no cap materialization failure" 'IPC_RECV_CAP_MATERIALIZE_FAILED'
+# The U9-RX3 blocking-recv route runs here, on the deferral the class already owned.
+u9rx4_require_min_one "the blocking IpcRecv route publishes and defers" \
+  'IPC_RECV_BLOCK_SPLIT_DONE'
+u9rx4_require_min_one "the broad dispatcher is skipped for a published block" \
+  'QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed'
+u9rx4_require_min_one "the existing D2-recv drain resumes a replacement" \
+  'D2_RECV_GENUINE_DISPATCH_DONE result=switch'
+u9rx4_require_zero "no fail-closed settlement on the blocking route" \
+  'IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED'
+if [[ "$u9rx4_fail" -eq 1 ]]; then
+  echo "[error] U9-RX4 AArch64 reply-cap witness FAILED"
+  exit 1
+fi
+echo "[ok] U9-RX4: AArch64 queued-plain reply-cap + framing witness chain complete"
+
 BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_COMPLETE_FAILED|CapabilityFull|VM_FULL|YARM_FIRST_USER_FAIL|MemoryObjectMissing|ELF_MISSING|PrivilegeViolation|failed to bootstrap first user task|panic|InvalidCapability|WrongObject|StaleCapability|MissingRight|UserMemoryFault|PM_RECV_DECODE_FAIL|bad_len expected=16 got=8|CAP_LOOKUP tid=1 cap=0|empty-elf|Malformed|Syscall\\(Internal\\)|memory allocation of|DELEGATE_FAIL|delegation.*fail|IPC_REPLY_FAST_REVOKE_FAIL|PM_PANIC|INIT_PANIC|DEVFS_PANIC|VFS_PANIC|INITRAMFS_PANIC|INITRAMFS_CPIO_EMPTY|D2_PUBLISH_RACE_UNWIND'
 # XARCH-SRV-PARITY: the supervisor's lifecycle SELF-query (query PM for the
 # supervisor's own tid, before entering the event loop) returns WrongObject

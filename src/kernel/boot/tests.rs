@@ -64505,18 +64505,44 @@ mod stage193f_ipc_send_cap_enqueue {
         );
     }
 
-    // The receiver-later recv_v2 writeback now encodes an ORDINARY materialized
-    // receiver-local cap into the recv-v2 meta (so it is not orphaned) — proving the
-    // receiver gets a fresh cap. Reply caps retain the historical hidden behavior
-    // (`!snapshot.is_reply_cap` gate) and plain messages map to NO_TRANSFER_CAP.
+    // RE-DERIVED BY U9-RX4. What 193F actually needed to prove is that a materialized
+    // receiver-local cap is NOT orphaned — that the id reaches userspace instead of sitting
+    // in the receiver's cnode with nothing exposed. It proved that by pinning the exact
+    // `match` it had written, whose `!snapshot.is_reply_cap` guard also encoded the carve-out
+    // that left REPLY caps orphaned in precisely that way. Pinning an implementation rather
+    // than the claim is what let the defect become a contract.
+    //
+    // The claim survives, stated over behaviour: an ordinary cap-transfer message projects
+    // the materialized id with the TRANSFERRED_CAP flag, and a plain message projects
+    // NO_TRANSFER_CAP with no flags — byte-identically to before.
     #[test]
     fn recv_v2_writeback_encodes_materialized_cap() {
+        use crate::kernel::ipc::Message;
+        use crate::kernel::syscall::ipc_recv_core::recv_meta_cap_projection;
+        assert_eq!(
+            recv_meta_cap_projection(Message::FLAG_CAP_TRANSFER, Some(0xABCD)),
+            (
+                0xABCD,
+                crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64
+            ),
+            "an ordinary cap transfer must surface the materialized id, never orphan it"
+        );
+        assert_eq!(
+            recv_meta_cap_projection(Message::FLAG_CAP_TRANSFER_PLAIN, Some(0xABCD)),
+            (
+                0xABCD,
+                crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64
+            ),
+            "the plain cap-transfer flag is the same ordinary class"
+        );
+        assert_eq!(
+            recv_meta_cap_projection(0, None),
+            (Message::NO_TRANSFER_CAP, 0),
+            "a plain message keeps the historical constants exactly"
+        );
         assert!(
-            RECV_CORE_SRC.contains("match snapshot.materialized_cap {")
-                && RECV_CORE_SRC.contains("Some(cap) if !snapshot.is_reply_cap =>")
-                && RECV_CORE_SRC.contains("SYSCALL_RECV_META_TRANSFERRED_CAP as u64")
-                && RECV_CORE_SRC.contains("_ => (Message::NO_TRANSFER_CAP, 0),"),
-            "the queued-split recv-v2 writeback must encode an ordinary materialized cap (reply/plain → NO_TRANSFER_CAP)"
+            RECV_CORE_SRC.contains("recv_meta_cap_projection("),
+            "the queued-split recv-v2 writeback must reach the projection, not re-derive it"
         );
     }
 
@@ -64705,14 +64731,50 @@ mod stage193g_remaining_shapes_audit {
         }
     }
 
-    // The 193F reply-cap meta carve-out (`!snapshot.is_reply_cap`) must stay EXACTLY as-is:
-    // 193G proves reply-cap meta visibility must not change (supervisor/crash-restart).
+    // RETIRED AND REPLACED BY U9-RX4 — this guard asserted the defect.
+    //
+    // 193G concluded that reply-cap meta visibility "must not change (supervisor/crash-restart)"
+    // and froze the carve-out that hid a materialized reply cap from the recv-v2 meta. The
+    // conclusion was wrong, and the evidence is live rather than argued: a receiver taking a
+    // one-shot reply cap through this writeback decoded `IpcRecvMetaV2.reply_cap` as `u32::MAX`,
+    // answered `PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295`, and never replied — so its
+    // caller stayed blocked and the minted cap was orphaned. Hiding the cap did not preserve a
+    // contract; it broke the one the receiver actually depends on.
+    //
+    // The guard is not weakened, it is inverted to the true requirement: the split writeback
+    // must SURFACE the exact reply cap it materialized, tagged as a reply cap and never as an
+    // ordinary transfer, and must surface nothing when nothing was materialized.
     #[test]
     fn reply_cap_meta_visibility_unchanged() {
+        use crate::kernel::ipc::Message;
+        use crate::kernel::syscall::ipc_recv_core::recv_meta_cap_projection;
+        assert_eq!(
+            recv_meta_cap_projection(Message::FLAG_REPLY_CAP, Some(65538)),
+            (
+                65538,
+                crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64
+            ),
+            "a materialized reply cap must reach userspace with the REPLY_CAP flag"
+        );
+        assert_eq!(
+            recv_meta_cap_projection(
+                Message::FLAG_REPLY_CAP | Message::FLAG_CAP_TRANSFER,
+                Some(65538)
+            ),
+            (
+                65538,
+                crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64
+            ),
+            "a reply cap is never reported as an ordinary transfer"
+        );
+        assert_eq!(
+            recv_meta_cap_projection(Message::FLAG_REPLY_CAP, None).0,
+            Message::NO_TRANSFER_CAP,
+            "u32::MAX survives only when no cap was materialized"
+        );
         assert!(
-            RECV_CORE_SRC.contains("Some(cap) if !snapshot.is_reply_cap =>")
-                && RECV_CORE_SRC.contains("_ => (Message::NO_TRANSFER_CAP, 0),"),
-            "the split-path recv-v2 writeback must keep hiding reply caps from the meta"
+            !RECV_CORE_SRC.contains("Some(cap) if !snapshot.is_reply_cap =>"),
+            "the reply-cap carve-out must not come back"
         );
     }
 
@@ -143103,13 +143165,15 @@ mod u9rx3_route {
         );
     }
 
-    /// AARCH64 IS NOT ADMITTED, AND THE REASON IS RECORDED. `pre_split_import_syscall_abi` is the
-    /// gate: without NR 2 in it the frame carries `nr = 0` there and every recv class falls back.
-    /// The exclusion is deliberate — importing NR 2 also reaches the queued-plain split recv,
-    /// whose writeback loses the reply cap — so it is pinned together with the finding, and a
-    /// future increment that fixes the writeback has to delete the note to admit the class.
+    /// AARCH64 IS NOW ADMITTED — U9-RX4 met the precondition U9-RX3 was waiting on.
+    ///
+    /// This guard used to pin the EXCLUSION, together with the live finding that justified it:
+    /// importing NR 2 also reaches the queued-plain split recv, whose writeback dropped the
+    /// reply cap. U9-RX4 fixed that writeback in its one owner, so the exclusion is retired and
+    /// the guard now pins the admission and the dependency that makes it sound — if the
+    /// projection owner ever stops being called, this says why that matters here.
     #[test]
-    fn aarch64_does_not_import_the_recv_abi_and_says_why() {
+    fn aarch64_imports_the_recv_abi_now_that_the_writeback_is_repaired() {
         let i = TRAP_ENTRY_SRC
             .find("fn pre_split_import_syscall_abi(frame: &mut TrapFrame)")
             .expect("the AArch64 ABI import gate must exist");
@@ -143121,12 +143185,16 @@ mod u9rx3_route {
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
         assert!(
-            !code.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2 must not be imported unconditionally on AArch64"
+            code.contains("raw_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_NR"),
+            "NR 2 must be imported so the pre-lock recv classes are reachable on AArch64"
         );
+        // The admission is only sound while the queued-plain writeback still delivers what the
+        // broad receive delivers — both halves of it.
+        let recv_core = include_str!("../recv_core.rs");
         assert!(
-            body.contains("PM_RECV_DECODE_FAIL"),
-            "the recorded reason for the exclusion must stay with the gate"
+            recv_core.contains("recv_meta_cap_projection(")
+                && recv_core.contains("project_recv_delivery(msg)"),
+            "the AArch64 admission depends on the U9-RX4 writeback repair staying in place"
         );
     }
 
