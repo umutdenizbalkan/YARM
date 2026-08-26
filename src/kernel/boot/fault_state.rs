@@ -12,6 +12,82 @@ use crate::kernel::task::TaskStatus;
 use crate::kernel::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
 
+/// U9-PF §1 — the pure Phase-A PageFault class.
+///
+/// Produced by [`KernelState::classify_page_fault_split`] from read-only facts, before any
+/// mutation. The variants are exactly the outcomes the existing broad arm already distinguishes;
+/// no new user/kernel classification is introduced.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageFaultClass {
+    /// A WRITE fault on a page the memory owner marks copy-on-write. The broad arm attempts
+    /// `try_handle_cow_fault` first for exactly this case.
+    CowCandidate,
+    /// A fault `try_handle_demand_page_fault` would attempt. U9-PF routes NONE of these: the
+    /// class has zero live witnesses on all three architectures, so it stays broad.
+    DemandCandidate,
+    /// Neither recovery owner would claim it, so existing policy reaches `PAGE_FAULT_UNHANDLED`
+    /// and terminal settlement.
+    TerminallyUnhandled,
+    /// No current task, no user address space, or a kernel-space address — the boundary current
+    /// policy already treats as the kernel/fallback case.
+    KernelOrAbsentTask,
+}
+
+/// U9-PF §1 — the read-only facts a classification rests on, captured once under one VM
+/// snapshot so a later phase can revalidate against the exact same coordinates.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PageFaultFacts {
+    /// Explicit — never an ambient `current_cpu` read at a later phase.
+    pub cpu: crate::kernel::scheduler::CpuId,
+    pub tid: u64,
+    /// The incarnation discriminator. See `classify_page_fault_split` on why `{tid, asid}` is
+    /// the authoritative coordinate and no new generation field is invented.
+    pub asid: crate::kernel::vm::Asid,
+    pub page: crate::kernel::vm::VirtAddr,
+    pub access: FaultAccess,
+    pub mapping_present: bool,
+    pub mapping_writable: bool,
+    pub cow_marked: bool,
+    pub demand_region: bool,
+}
+
+/// U9-PF §1 — the authorized routing matrix, in ONE place.
+///
+/// A class is routed off the broad dispatcher only where an EXISTING live witness proves the
+/// route at base `adcf229`. Measured there: x86_64 witnesses COW `path=private_copy` twice
+/// (ASIDs 1 and 13) under the `VM_COW=1` profile; AArch64 witnesses the terminal user fault once
+/// (tid 1, read at `0x0`) in its core profile; the demand class witnesses ZERO faults on all
+/// three architectures. Everything else stays on the unchanged broad path, refused before any
+/// mutation.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageFaultRoute {
+    /// x86_64 COW candidate — the owner-local COW transaction.
+    SplitCow,
+    /// AArch64 terminal user fault — the owner-local terminal fault transaction.
+    SplitTerminal,
+    /// The unchanged broad path, entered before any mutation.
+    Broad,
+}
+
+/// The single evaluator of that matrix. Architecture is a parameter rather than a `cfg!` read so
+/// the matrix is exhaustively testable for all three ports from the hosted suite.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn page_fault_route_for(arch: &str, class: PageFaultClass) -> PageFaultRoute {
+    match (arch, class) {
+        // Live-witnessed at base: 2 x private_copy COW faults under VM_COW=1.
+        ("x86_64", PageFaultClass::CowCandidate) => PageFaultRoute::SplitCow,
+        // Live-witnessed at base: 1 x terminal user read at 0x0 in the core profile.
+        ("aarch64", PageFaultClass::TerminallyUnhandled) => PageFaultRoute::SplitTerminal,
+        // EVERY demand candidate stays broad, on every architecture: zero live witnesses.
+        (_, PageFaultClass::DemandCandidate) => PageFaultRoute::Broad,
+        // No other architecture/class pair has a witness.
+        _ => PageFaultRoute::Broad,
+    }
+}
+
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
 const DEMAND_STACK_GROWTH_WINDOW: u64 = 8 * 1024 * 1024;
 #[allow(dead_code)]
@@ -196,6 +272,79 @@ impl KernelState {
                 sw_demand
             );
         }
+    }
+
+    /// U9-PF §1 — the PURE Phase-A PageFault classification.
+    ///
+    /// Takes `&self`, so no mutation of PTE, task, capability or refcount state is structurally
+    /// expressible, and it allocates nothing. It reproduces the ORDER of the existing broad
+    /// `TrapEvent::PageFault` arm exactly — COW first and only for writes, then the demand
+    /// screen, then the terminal fall-through — so the split route and the broad route can never
+    /// disagree about which class a fault belongs to.
+    ///
+    /// Both verdict predicates it consults are themselves pure: `is_cow_page` reads
+    /// `memory.cow_pages`, and `fault_addr_in_demand_backed_region` reads the brk bounds and
+    /// `user_stack_top`. Every `Ok(false)` decline in both recovery handlers is reached before
+    /// that handler's first mutation, which is what makes this extraction sound.
+    ///
+    /// IDENTITY. There is no per-task incarnation counter on `ThreadControlBlock` — the only
+    /// generations it carries are per-purpose (`blocked_recv_generation`,
+    /// `blocked_send_generation`, `async_preempt_generation`, `reply_record_generation`). The
+    /// authoritative incarnation coordinate for a fault is therefore `{tid, asid}`, exactly as
+    /// both existing handlers use it: a reused numeric TID occupying a fresh address space
+    /// carries a different ASID. No new generation field is invented here.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn classify_page_fault_split(
+        &self,
+        cpu: crate::kernel::scheduler::CpuId,
+        fault: FaultInfo,
+    ) -> (PageFaultClass, Option<PageFaultFacts>) {
+        // The kernel/fallback boundary is exactly what current policy already treats as one:
+        // an absent current task, an absent user address space, or a kernel-space address.
+        // `FaultInfo` carries no privilege-origin bit and the broad arm performs no origin
+        // test, so none is invented here.
+        let Some(tid) = self.current_tid() else {
+            return (PageFaultClass::KernelOrAbsentTask, None);
+        };
+        let Some(asid) = self.task_asid(tid) else {
+            return (PageFaultClass::KernelOrAbsentTask, None);
+        };
+        let page = fault.addr.page_align_down();
+        if page.0 >= crate::kernel::vm::KERNEL_SPACE_BASE {
+            return (PageFaultClass::KernelOrAbsentTask, None);
+        }
+        let mapping = self.with_user_spaces(|s| s.get(asid).and_then(|a| a.resolve(page)));
+        let cow_marked = self.is_cow_page(asid, page);
+        let demand_region = self.fault_addr_in_demand_backed_region(tid, page.0);
+        let facts = PageFaultFacts {
+            cpu,
+            tid,
+            asid,
+            page,
+            access: fault.access,
+            mapping_present: mapping.is_some(),
+            mapping_writable: mapping.map(|m| m.flags.write).unwrap_or(false),
+            cow_marked,
+            demand_region,
+        };
+        // COW is attempted FIRST and ONLY for writes, mirroring the broad arm.
+        if matches!(fault.access, FaultAccess::Write) && cow_marked {
+            return (PageFaultClass::CowCandidate, Some(facts));
+        }
+        // The demand screen, mirroring `try_handle_demand_page_fault`'s pre-mutation checks:
+        // execute faults decline, the address must be demand-backed, and a PRESENT mapping only
+        // qualifies when it already satisfies the faulting access (a write fault on a present
+        // read-only page is a protection/COW fault, not a demand fault).
+        if !matches!(fault.access, FaultAccess::Execute) && demand_region {
+            let write_satisfied = !matches!(fault.access, FaultAccess::Write)
+                || mapping.map(|m| m.flags.write).unwrap_or(false);
+            if mapping.is_none() || write_satisfied {
+                return (PageFaultClass::DemandCandidate, Some(facts));
+            }
+        }
+        // Neither recovery owner would claim it, so existing policy reaches
+        // `PAGE_FAULT_UNHANDLED` and the terminal fault transaction.
+        (PageFaultClass::TerminallyUnhandled, Some(facts))
     }
 
     pub(crate) fn try_handle_demand_page_fault(
