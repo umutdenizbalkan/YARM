@@ -11929,3 +11929,69 @@ remains broad, so the timer proof blockers remain **five**. The census remains *
 ***U9 remains OPEN*** and direct-IpcCall production remains OFF
 (`ipccall_direct_production_enabled()` is `const false`). U9-FT is CENSUS-DELTA 0, so the
 canonical stage arithmetic is unchanged.
+
+### U9-FT2 — off-lock fault snapshots. PARTIAL / FOUNDATION. CENSUS-DELTA 0.
+
+**U9-FT2 — CENSUS-DELTA 0 prerequisite.** Delivered: the off-lock PageFault classification twin,
+the off-lock terminal FaultPolicy twin, and five extracted single-owner rules. This **resolves the
+structural blocker recorded at `fb30b74`** — classification and policy are now reachable from
+pre-lock `SharedKernel` code. **No fault route is wired**: no PageFault takes a split route, the
+census stays **2 / 0 / 2**, and the timer proof blockers remain **five**.
+
+**Five rules, five owners, both forms delegating.** Each rule is a pure free function that the
+broad and off-lock forms both call, which is what makes them mechanically equivalent rather than
+merely similar:
+
+| Owner | Rule |
+|---|---|
+| `evaluate_page_fault_class` | COW-for-write → demand screen → terminal fall-through |
+| `evaluate_demand_backed_region` | brk range, or the stack-growth window below `user_stack_top` |
+| `page_fault_addr_is_kernel_space` | the kernel/fallback boundary, checked before any VM read |
+| `evaluate_fault_policy` | task override wins, else the kernel default |
+| `evaluate_fault_report_route` | fault-handler endpoint preferred, supervisor as fallback |
+
+Guards assert that neither classification form names `CowCandidate`, `DemandCandidate` or
+`TerminallyUnhandled` in its own body, and that the broad gatherers no longer inline the demand
+window or the override-then-default rule. The evaluator is checked exhaustively over all **48**
+combinations of access × present × writable × COW × demand against an independently restated rule.
+
+**`SharedKernel::classify_page_fault_shared(cpu, fault)`.** Rank order, each acquisition taken and
+released separately and none nested: scheduler (1) for the explicit-CPU current task, task (2) for
+`{asid, user_stack_top}`, VM (5) for the mapping, memory (6) for the COW mark and brk bounds.
+Because the acquisitions are separate, **both identity coordinates are re-read at the end and
+compared**; a change is the typed refusal `SharedPageFaultRefusal::IdentityChanged`, raised before
+any classification is produced. The broad form needs no such check because it holds the broad lock
+throughout.
+
+**`SharedKernel::read_terminal_fault_policy_shared(cpu, tid, asid)`.** The caller supplies the
+exact `{tid, asid}` it classified against and the twin refuses if either moved. Ranks: scheduler
+(1), task (2) for `{asid, status, override}` in one acquisition, fault (8) for the default policy
+and route, IPC (3) for the endpoint generation and queue state. `CpuId` is a parameter only
+because the current-task check needs it — **the policy itself takes no CPU**, exactly as in the
+broad form. No generation is fabricated: the endpoint generation is read from the IPC owner, and
+`{tid, asid}` remains the task coordinate because `ThreadControlBlock` still has no incarnation
+counter.
+
+**THE NEXT EXACT BLOCKER — the direct-waiter report path.** The existing emitter has **two**
+delivery outcomes, and both must be preserved:
+
+* **Buffered** — no blocked waiter, so the report is enqueued and `woke=0`. This is what the live
+  AArch64 witness produces (`waiters=0`, `queued` 0 → 1, `woke=0`), and it is entirely valid.
+* **DeliveredToWaiter** — a blocked receiver exists, so the report is written back into the
+  waiter's buffer, the endpoint waiter is cleared and the waiter is woken.
+
+The buffered half is buildable off-lock today. The direct-waiter half is **not**: its message
+write-back is `complete_blocked_recv_for_waiter`, which takes `&mut KernelState` and has no split
+twin. `SharedKernel::complete_blocked_waiter_delivery_split` covers only the clear-and-wake half
+(ranks 3 → 2 → 1) and carries no message, and it has no production caller today. A split emitter
+must therefore either gain a write-back twin, or refuse the waiter case with a typed pre-publication
+refusal and leave it broad — the bounded option, parallel to how U9-TM handled would-preempt ticks.
+
+**Unchanged by this prerequisite.** x86_64 COW remains unwired and broad; AArch64 terminal
+PageFault remains broad; demand paging remains blocked on a live witness and exact map-failure
+rollback; the fault-delivery timer proof hook remains broad, so the timer proof blockers remain
+**five**. Report publication and the task transition remain non-atomic, and "no report without a
+terminal transition" remains false in source — neither was "repaired" during decomposition. The
+census remains **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`). U9-FT2 is CENSUS-DELTA 0, so the
+canonical stage arithmetic is unchanged.
