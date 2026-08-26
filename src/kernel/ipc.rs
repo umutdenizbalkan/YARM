@@ -156,6 +156,13 @@ impl Endpoint {
     pub fn queued(&self) -> usize {
         self.len
     }
+
+    /// U9-FT3 §1: the queue's configured depth, so a caller can classify "would be full"
+    /// BEFORE attempting a send. Read-only sibling of [`Self::queued`]; the authoritative
+    /// full check remains `send`'s own `len >= max_depth`.
+    pub fn capacity(&self) -> usize {
+        self.max_depth
+    }
 }
 
 #[cfg(test)]

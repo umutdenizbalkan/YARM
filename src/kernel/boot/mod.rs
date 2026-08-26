@@ -26,7 +26,8 @@ mod fault_state;
 // re-deriving the policy against the split seams.
 #[cfg_attr(feature = "hosted-dev", allow(unused_imports))]
 pub(crate) use fault_state::{
-    FaultReportTarget, PageFaultClass, PageFaultFacts, TerminalFaultPolicyRefusal,
+    BufferedFaultAdmission, BufferedFaultCommit, FaultReportTarget, PageFaultClass, PageFaultFacts,
+    SUPERVISOR_FAULT_REPORT_WIRE_LEN, SupervisorFaultReportWire, TerminalFaultPolicyRefusal,
     TerminalFaultPolicySnapshot, evaluate_cow_marked, evaluate_demand_backed_region,
     evaluate_fault_policy, evaluate_fault_report_route, evaluate_page_fault_class,
     page_fault_addr_is_kernel_space,
