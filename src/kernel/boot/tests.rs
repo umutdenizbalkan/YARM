@@ -140203,6 +140203,20 @@ mod u9qa_one_queue_advance_owner {
                 && !futex.contains("with_scheduler_split_mut"),
             "the FutexWait seam must contain NO independent dequeue or scheduler acquisition"
         );
+        // U9-QA §3: the TIMER's queue advance. A timer that expires a quantum reaches
+        // `yield_current`, which re-enqueues the caller, clears `current` and defers the dispatch
+        // to the trap-entry drain — so this seam IS the preemption-driven selection, on all three
+        // architectures. It selects through the same one owner.
+        let yld = body_of(RUNTIME, "pub(crate) fn yield_dispatch_step_mut(");
+        assert!(
+            yld.contains("self.queue_advance_select_step_split(cpu, \"yield_dispatch_step_mut\")"),
+            "the Yield/timer preemption drain must delegate selection to the shared step"
+        );
+        assert!(
+            !yld.contains("dispatch_next_selection_on(")
+                && !yld.contains("with_scheduler_split_mut"),
+            "the Yield/timer seam must contain NO independent dequeue or scheduler acquisition"
+        );
         let commit = body_of(EXEC, "pub(crate) fn queue_advance_commit_split(");
         assert!(
             commit.contains(

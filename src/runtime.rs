@@ -2050,43 +2050,33 @@ impl SharedKernel {
     /// Yield drain (the AArch64 arch restore runs in the drain's `with_cpu` re-acquire).
     /// Stage 196D: un-gated to RISC-V — the same rank-1 dequeue drives the RISC-V queue-switch
     /// foundation drain (the RISC-V SATP/sfence + frame restore run in its `with_cpu` re-acquire).
+    ///
+    /// U9-QA §3 (ONE QUEUE-ADVANCE OWNER): the seam acquisition, the CPU authentication and the
+    /// dequeue are no longer written here — they are DELEGATED to
+    /// [`Self::queue_advance_select_step_split`], the same one step the FutexWait retirement drain
+    /// and the U9-QA transaction use. This is the TIMER's queue advance: a timer that expires a
+    /// quantum reaches `yield_current`, which re-enqueues the caller, clears `current` and defers
+    /// the dispatch to the trap-entry drain — so this seam IS the preemption-driven selection, on
+    /// all three architectures. It now selects through the single authoritative policy, and what
+    /// remains here is only this class's telemetry.
     #[cfg(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
     pub(crate) fn yield_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
-        self.with_scheduler_split_mut(|sched| {
-            let dispatch_cpu = sched.current_cpu;
-            // Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's CPU against the
-            // authoritative dispatch CPU BEFORE any mutation. On mismatch nothing is dequeued.
-            if dispatch_cpu != cpu {
-                crate::yarm_log!(
-                    "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}",
-                    "yield_dispatch_step_mut",
-                    cpu.0,
-                    dispatch_cpu.0
-                );
-                return CpuDispatch::RefusedCpuMismatch {
-                    requested: cpu,
-                    authoritative: dispatch_cpu,
-                };
-            }
-            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
-            let selection =
-                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
-            let incoming = selection.tid().map(|t| t.0);
-            match incoming {
+        let dispatch = self.queue_advance_select_step_split(cpu, "yield_dispatch_step_mut");
+        // Telemetry only, and only for a genuine selection: a refusal already emitted its own
+        // marker inside the seam and dequeued nothing, so it must not be reported as a dequeue.
+        if matches!(dispatch, CpuDispatch::Selected { .. }) {
+            match dispatch.tid().map(|t| t.0) {
                 Some(tid) => {
                     crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid={}", cpu.0, tid)
                 }
                 None => crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid=idle", cpu.0),
             }
-            CpuDispatch::Selected {
-                cpu: dispatch_cpu,
-                selection,
-            }
-        })
+        }
+        dispatch
     }
 
     /// Stage 168B (D2-GENUINE-RECV): does the incoming task have an initialized
