@@ -286,6 +286,84 @@ if [[ "$CROSS_ARCH_D6" == "1" ]]; then
   echo "[ok] CROSS-ARCH-D6: AArch64 D6 restore-path audit diagnostics clean (live restore DEFERRED)"
 fi
 
+# U9-FT4: the AArch64 terminal PageFault route is now SPLIT. Assert the witness chain
+# POSITIVELY -- fatal-pattern absence is insufficient, and demonstrably so: the FT3 attempt
+# exited 0 while the faulting PC resumed. Every line below must hold exactly.
+u9ft4_fail=0
+u9ft4_log="$(tr '\r' '\n' <"$LOGFILE")"
+# `rg -c` prints nothing and exits non-zero when there are no matches, so normalise to 0.
+u9ft4_count() {
+  local n
+  n="$(printf '%s\n' "$u9ft4_log" | rg -a -F -c -- "$1" || true)"
+  printf '%s' "${n:-0}"
+}
+u9ft4_require_one() {
+  local want_desc="$1" pat="$2" n
+  n="$(u9ft4_count "$pat")"
+  if [[ "$n" != "1" ]]; then
+    echo "[error] U9-FT4: $want_desc -- expected exactly 1, got ${n:-0}: $pat"
+    u9ft4_fail=1
+  else
+    echo "[ok] U9-FT4: $want_desc"
+  fi
+}
+u9ft4_require_zero() {
+  local want_desc="$1" pat="$2" n
+  n="$(u9ft4_count "$pat")"
+  if [[ "$n" != "0" ]]; then
+    echo "[error] U9-FT4: $want_desc -- expected 0, got $n: $pat"
+    u9ft4_fail=1
+  else
+    echo "[ok] U9-FT4: $want_desc"
+  fi
+}
+# The faulting task, the exact fault facts, and exactly one of each.
+u9ft4_require_one "tid 1 read fault at 0x0 entered once" \
+  'PAGE_FAULT_ENTRY tid=1 addr=0x0 access=Read'
+u9ft4_require_one "the fault is reported unhandled exactly once" \
+  'PAGE_FAULT_UNHANDLED tid=1 addr=0x0 access=Read'
+# Buffered publication to endpoint 3, no wake.
+u9ft4_require_one "report targets endpoint 3 at its exact generation" \
+  'TASK_FAULT_REPORT_TARGET tid=1 endpoint=3 generation=1'
+u9ft4_require_one "report is BUFFERED exactly once with woke=0" \
+  'TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=3 queued=1 woke=0'
+# The terminal transition and the deferral, each exactly once.
+u9ft4_require_one "terminal task transition commits exactly once" \
+  'TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred'
+u9ft4_require_one "the queue-advance deferral is published exactly once" \
+  'QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid=1 cpu=0'
+# The broad dispatcher is SKIPPED -- the old in-lock route must not run.
+u9ft4_require_one "broad dispatcher skipped for the terminal fault" \
+  'QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=terminal_fault_committed'
+# The existing drain selects the replacement and applies its exact context.
+u9ft4_require_one "queue selection happens once and chooses tid 2" \
+  'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=2'
+u9ft4_require_one "replacement tid 2 is marked Running" \
+  'AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK tid=2'
+u9ft4_require_one "replacement tid 2 gets its exact address space" \
+  'AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid=2 asid=2'
+u9ft4_require_one "replacement tid 2 gets its exact EL0 frame" \
+  'AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid=2'
+u9ft4_require_one "the drain completes once" \
+  'AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok'
+# The faulting PC must NEVER resume: a second entry at the same rip, or a fault with no
+# current task, is exactly the FT3 defect.
+u9ft4_require_zero "the faulting PC never resumes (no ownerless re-fault)" \
+  'PAGE_FAULT_ENTRY tid=18446744073709551615'
+u9ft4_require_zero "no split refusal on the witnessed path" 'TERMINAL_FAULT_SPLIT_REFUSED'
+u9ft4_require_zero "no fail-closed settlement on the witnessed path" \
+  'TERMINAL_FAULT_SPLIT_FAILED_CLOSED'
+u9ft4_require_zero "the drain never idles instead of selecting" \
+  'AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING'
+# The OLD in-lock route must not run: the broad arm's own dispatch for this fault is gone.
+u9ft4_require_zero "the old in-lock terminal route does not run" \
+  'TERMINAL_FAULT_UNEXPECTED_DISPOSITION'
+if [[ "$u9ft4_fail" -eq 1 ]]; then
+  echo "[error] U9-FT4 AArch64 terminal-fault witness FAILED"
+  exit 1
+fi
+echo "[ok] U9-FT4: AArch64 terminal PageFault route witness chain complete"
+
 BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_COMPLETE_FAILED|CapabilityFull|VM_FULL|YARM_FIRST_USER_FAIL|MemoryObjectMissing|ELF_MISSING|PrivilegeViolation|failed to bootstrap first user task|panic|InvalidCapability|WrongObject|StaleCapability|MissingRight|UserMemoryFault|PM_RECV_DECODE_FAIL|bad_len expected=16 got=8|CAP_LOOKUP tid=1 cap=0|empty-elf|Malformed|Syscall\\(Internal\\)|memory allocation of|DELEGATE_FAIL|delegation.*fail|IPC_REPLY_FAST_REVOKE_FAIL|PM_PANIC|INIT_PANIC|DEVFS_PANIC|VFS_PANIC|INITRAMFS_PANIC|INITRAMFS_CPIO_EMPTY|D2_PUBLISH_RACE_UNWIND'
 # XARCH-SRV-PARITY: the supervisor's lifecycle SELF-query (query PM for the
 # supervisor's own tid, before entering the event loop) returns WrongObject

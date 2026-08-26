@@ -619,6 +619,51 @@ pub fn handle_trap_entry_shared(
     // exclusive with it — a timer interrupt carries no syscall NR — and it refuses BEFORE any
     // claim, tick or mutation when a proof knob is armed or when this tick would preempt, so a
     // refused trap reaches the unchanged broad arm having changed nothing.
+    // U9-FT4: the pre-lock AArch64 terminal PageFault route. It runs before the timer and
+    // syscall seams and is mutually exclusive with both. It refuses BEFORE any publication for
+    // every class, architecture or endpoint condition it does not admit, so a declined trap
+    // reaches the unchanged broad arm having changed nothing. When it commits it holds a
+    // RESERVED deferral, so the existing post-lock drain is guaranteed to apply an incoming
+    // context — `QueueAdvanceCommitted` without one is what FT3 got wrong.
+    {
+        let pf = match decode_trap_context(context) {
+            TrapEvent::PageFault(f) => Some(f),
+            _ => None,
+        };
+        if pf.is_some() {
+            match crate::kernel::syscall_split::try_split_terminal_page_fault_dispatch(
+                shared,
+                cpu,
+                pf,
+                frame.as_deref(),
+            ) {
+                SplitDispatchDisposition::NotHandled => {}
+                SplitDispatchDisposition::QueueAdvanceCommitted => {
+                    crate::yarm_log!(
+                        "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=terminal_fault_committed",
+                        cpu.0
+                    );
+                    queue_advance_committed = true;
+                }
+                SplitDispatchDisposition::Complete(_) => {
+                    // Fail-closed after publication: the report is out, so the broad emitter must
+                    // NOT run again. No deferral is held on this path.
+                    queue_advance_committed = true;
+                }
+                other => {
+                    crate::yarm_log!(
+                        "TERMINAL_FAULT_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(
+                        false,
+                        "the terminal PageFault route yields NotHandled, QueueAdvanceCommitted or Complete"
+                    );
+                }
+            }
+        }
+    }
     let mut post_work_committed = false;
     {
         let is_timer = matches!(decode_trap_context(context), TrapEvent::TimerInterrupt);
@@ -1594,8 +1639,15 @@ pub fn handle_trap_entry_shared(
             && crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
         if futex_wait_was_deferred {
             let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+            // U9-FT4: the drain admits TWO outgoing states and verifies each exactly — a
+            // FutexWait caller is `Blocked(Futex)`, a terminally faulted task is `Faulted`. Both
+            // mean the outgoing task is off the CPU and a queue advance is owed, so they share
+            // THIS drain rather than growing a second one. Neither predicate is loosened.
             let reverify_ok = outgoing
-                .map(|t| shared.futex_wait_reverify_blocked(t))
+                .map(|t| {
+                    shared.futex_wait_reverify_blocked(t)
+                        || shared.terminal_fault_reverify_faulted(t)
+                })
                 .unwrap_or(false);
             if reverify_ok {
                 if let Some(t) = outgoing {

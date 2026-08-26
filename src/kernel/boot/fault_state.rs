@@ -62,11 +62,10 @@ pub(crate) struct PageFaultFacts {
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalFaultTransition {
-    /// The faulting task is blocked and `Faulted`, and the queue advance is committed.
-    Committed {
-        faulted_tid: u64,
-        replacement: Option<u64>,
-    },
+    /// The faulting task is blocked and `Faulted`. The queue advance is NOT performed here:
+    /// the EXISTING post-lock drain owns selection and the incoming-context apply, exactly as it
+    /// does for FutexWait.
+    Committed { faulted_tid: u64 },
     /// The task or its ASID moved before the transition began. Nothing was mutated by this
     /// transition; the already-published report is retained, matching current semantics.
     RefusedIdentityChanged,
