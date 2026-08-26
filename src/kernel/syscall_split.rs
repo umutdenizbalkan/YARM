@@ -387,6 +387,202 @@ fn try_split_terminal_page_fault_into_frame(
     SplitDispatchDisposition::NotHandled
 }
 
+/// U9-COW1 §2 — service the witnessed x86_64 private-copy COW PageFault off the broad lock.
+///
+/// Admits ONE class and nothing else: an x86_64 user WRITE fault on a present, non-writable,
+/// COW-marked page belonging to the exact task the classifier saw. Everything else — a read
+/// fault, another architecture, a demand candidate, a terminal fault, an already-writable page
+/// (the broad `path=already_writable` arm, which has zero live witnesses) — declines here having
+/// touched nothing and reaches the unchanged broad dispatcher.
+///
+/// ## What the disposition means for this class
+///
+/// The broad arm's COW success is `return Ok(())`: no frame writeback, no scheduler change, no
+/// queue advance. The trap returns through the architecture epilogue and the faulting instruction
+/// re-executes against the now-writable private copy. That is exactly `Complete(Ok(()))`, and it
+/// is why this route publishes no deferral and needs no drain — there is nothing to drain.
+///
+/// ## Why a post-mutation failure is `Complete(Err(..))`, not `NotHandled`
+///
+/// After the transaction has allocated a frame, falling back would let the broad arm allocate a
+/// SECOND one for a fault it never saw declined. The recovery rolls its own allocation back
+/// exactly, and the trap then carries the same error the broad arm would have produced.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_cow_page_fault_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    fault: Option<crate::kernel::trap::FaultInfo>,
+) -> SplitDispatchDisposition {
+    use crate::kernel::boot::{CowRecovery as R, PageFaultRoute, page_fault_route_for};
+    use crate::kernel::trap::FaultAccess;
+    use SplitDispatchDisposition as D;
+
+    if !cfg!(target_arch = "x86_64") {
+        return D::NotHandled;
+    }
+    let Some(fault) = fault else {
+        return D::NotHandled;
+    };
+    // The broad arm attempts COW only for writes, before anything else. Same screen, same place.
+    if !matches!(fault.access, FaultAccess::Write) {
+        return D::NotHandled;
+    }
+    // (1) Classify off-lock, through the ONE evaluator the broad arm uses. A stale identity
+    // refuses here, before anything is decided.
+    let Ok((class, Some(facts))) = shared.classify_page_fault_shared(cpu, fault) else {
+        return D::NotHandled;
+    };
+    if !matches!(
+        page_fault_route_for("x86_64", class),
+        PageFaultRoute::SplitCow
+    ) {
+        return D::NotHandled;
+    }
+    // (2) This route owns the PRIVATE-COPY arm only. An already-writable COW page is the broad
+    // arm's other branch — a bare mark clear with no allocation, no copy and no witness — and it
+    // stays there rather than being reimplemented for a case nothing exercises.
+    if facts.mapping_writable || !facts.mapping_present {
+        return D::NotHandled;
+    }
+    // The marker the broad arm prints on entry, in the broad arm's position: this route
+    // intercepts before it, and the stream an observer sees must not change because the owner did.
+    crate::yarm_log!(
+        "PAGE_FAULT_ENTRY tid={} addr=0x{:x} access={:?} rip=0x{:x}",
+        facts.tid,
+        fault.addr.0,
+        fault.access,
+        0
+    );
+    if crate::kernel::boot::vm_cow_enabled() {
+        crate::yarm_log!(
+            "VM_COW_FAULT_BEGIN asid={} va=0x{:x}",
+            facts.asid.0,
+            facts.page.0
+        );
+    }
+    // (3) The transaction. Everything fallible is revalidated inside it before the first
+    // mutation, so a `Refused*` outcome is still safe to hand to the broad arm.
+    let outcome = shared.cow_recover_private_copy_split(facts);
+    match outcome {
+        R::Committed {
+            old_phys,
+            new_phys,
+            shootdown_acked,
+        } => {
+            if crate::kernel::boot::vm_cow_enabled() {
+                crate::yarm_log!(
+                    "VM_COW_PHASE_METADATA asid={} va=0x{:x} writable=0",
+                    facts.asid.0,
+                    facts.page.0
+                );
+                crate::yarm_log!(
+                    "VM_COW_PHASE_FRAME_ALLOC asid={} va=0x{:x} new_pa=0x{:x}",
+                    facts.asid.0,
+                    facts.page.0,
+                    new_phys.0
+                );
+                crate::yarm_log!(
+                    "VM_COW_PHASE_PT_UPDATE asid={} va=0x{:x}",
+                    facts.asid.0,
+                    facts.page.0
+                );
+                crate::yarm_log!(
+                    "VM_TLB_LOCAL_FLUSH asid={} va=0x{:x}",
+                    facts.asid.0,
+                    facts.page.0
+                );
+                crate::yarm_log!(
+                    "VM_COW_PHASE_TLB_FLUSH asid={} va=0x{:x}",
+                    facts.asid.0,
+                    facts.page.0
+                );
+                crate::yarm_log!(
+                    "VM_COW_DONE asid={} va=0x{:x} path=private_copy",
+                    facts.asid.0,
+                    facts.page.0
+                );
+            }
+            crate::yarm_log!(
+                "VM_COW_SPLIT_COMMITTED cpu={} tid={} asid={} va=0x{:x} old_pa=0x{:x} new_pa=0x{:x} acked={}",
+                cpu.0,
+                facts.tid,
+                facts.asid.0,
+                facts.page.0,
+                old_phys.0,
+                new_phys.0,
+                u8::from(shootdown_acked)
+            );
+            crate::yarm_log!("PAGE_FAULT_HANDLED_COW");
+            if crate::kernel::boot::fault_delivery_enabled() {
+                crate::yarm_log!("FAULT_DELIVERY_CLASSIFY_HANDLED kind=cow");
+            }
+            D::Complete(Ok(()))
+        }
+        other if other.may_fall_back_to_broad() => {
+            crate::yarm_log!(
+                "VM_COW_SPLIT_REFUSED cpu={} tid={} va=0x{:x} reason={}",
+                cpu.0,
+                facts.tid,
+                facts.page.0,
+                other.reason()
+            );
+            D::NotHandled
+        }
+        other => {
+            // Post-allocation failure. The allocation is rolled back; the broad arm must not
+            // run, so this carries the error the broad arm's own failure would have carried.
+            crate::yarm_log!(
+                "VM_COW_SPLIT_FAILED_CLOSED cpu={} tid={} va=0x{:x} reason={}",
+                cpu.0,
+                facts.tid,
+                facts.page.0,
+                other.reason()
+            );
+            if crate::kernel::boot::vm_cow_enabled() {
+                crate::yarm_log!(
+                    "VM_COW_FAIL reason={} asid={} va=0x{:x}",
+                    other.reason(),
+                    facts.asid.0,
+                    facts.page.0
+                );
+            }
+            // The EXACT error the broad arm produces at the same step, through the SAME
+            // `KernelError -> SyscallError` conversion its `map_err` chain uses.
+            D::Complete(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::from(
+                    other
+                        .kernel_error()
+                        .unwrap_or(crate::kernel::boot::KernelError::UserMemoryFault),
+                ),
+            )))
+        }
+    }
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_cow_page_fault_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _fault: Option<crate::kernel::trap::FaultInfo>,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
+}
+
+/// U9-COW1 — the bridge entry for the x86_64 private-copy COW PageFault route.
+///
+/// Tried BEFORE the terminal route, because that is the order the broad arm uses: COW first and
+/// only for writes, then the demand screen, then the terminal fall-through. The two are mutually
+/// exclusive by class anyway — `page_fault_route_for` maps `CowCandidate` to `SplitCow` and
+/// `TerminallyUnhandled` to `SplitTerminal`, never both — but preserving the order is what makes
+/// "split and broad cannot disagree about a fault" true for the sequencing as well as the verdict.
+pub(crate) fn try_split_cow_page_fault_dispatch(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    fault: Option<crate::kernel::trap::FaultInfo>,
+) -> SplitDispatchDisposition {
+    try_split_cow_page_fault_into_frame(shared, cpu, fault)
+}
+
 /// U9-FT4 — the bridge entry for the terminal PageFault route.
 pub(crate) fn try_split_terminal_page_fault_dispatch(
     shared: &SharedKernel,

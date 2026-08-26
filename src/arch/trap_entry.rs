@@ -615,6 +615,11 @@ pub fn handle_trap_entry_shared(
     // one: a terminal transition has been published, so this trap may neither enter the broad
     // dispatcher nor return through the outgoing frame — it falls through to the drains.
     let mut queue_advance_committed = false;
+    // U9-COW1: a recovered COW fault is NOT a queue advance and NOT post-work. It is a handled
+    // trap that changed no scheduler state, so it gets its own flag and its own skip reason —
+    // reusing either of the others would tell an observer something false about what happened.
+    let mut cow_recovered = false;
+    let mut cow_result: Option<Result<(), TrapHandleError>> = None;
     // U9-TM §2: the pre-lock TIMER route. It runs before the syscall seam and is mutually
     // exclusive with it — a timer interrupt carries no syscall NR — and it refuses BEFORE any
     // claim, tick or mutation when a proof knob is armed or when this tick would preempt, so a
@@ -630,7 +635,39 @@ pub fn handle_trap_entry_shared(
             TrapEvent::PageFault(f) => Some(f),
             _ => None,
         };
-        if pf.is_some() {
+        // U9-COW1: the pre-lock x86_64 private-copy COW route, tried FIRST because that is the
+        // order the broad arm uses (COW for writes, then demand, then terminal). It is
+        // NON-SWITCHING: a recovered COW fault changes no scheduler state and publishes no
+        // deferral, so it must skip the broad dispatcher WITHOUT claiming a queue advance —
+        // `cow_recovered` is its own reason, not a borrowed one.
+        if pf.is_some()
+            && !cow_recovered
+            && let disposition =
+                crate::kernel::syscall_split::try_split_cow_page_fault_dispatch(shared, cpu, pf)
+        {
+            match disposition {
+                SplitDispatchDisposition::NotHandled => {}
+                SplitDispatchDisposition::Complete(result) => {
+                    // Success or a rolled-back post-allocation failure: either way the broad COW
+                    // handler must not run again for this fault. The result is carried exactly as
+                    // the broad arm would have returned it.
+                    cow_recovered = true;
+                    cow_result = Some(result);
+                }
+                other => {
+                    crate::yarm_log!(
+                        "VM_COW_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(
+                        false,
+                        "the COW PageFault route yields NotHandled or Complete"
+                    );
+                }
+            }
+        }
+        if pf.is_some() && !cow_recovered {
             match crate::kernel::syscall_split::try_split_terminal_page_fault_dispatch(
                 shared,
                 cpu,
@@ -852,17 +889,22 @@ pub fn handle_trap_entry_shared(
     // a successful acquisition of nothing and a successful handler, so both `?` sites below stay
     // untouched.
     let inner_result: Result<Result<(), TrapHandleError>, TrapHandleError> =
-        if queue_advance_committed || post_work_committed {
+        if queue_advance_committed || post_work_committed || cow_recovered {
             crate::yarm_log!(
                 "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason={}",
                 cpu.0,
                 if queue_advance_committed {
                     "publication_committed"
-                } else {
+                } else if post_work_committed {
                     "timer_post_work_committed"
+                } else {
+                    "cow_recovered"
                 }
             );
-            Ok(Ok(()))
+            // U9-COW1: a recovered COW fault carries the SAME result the broad arm would have
+            // returned — `Ok(())` on success, the rolled-back failure's error otherwise — so the
+            // two `?` sites below behave identically whichever owner handled the fault.
+            Ok(cow_result.unwrap_or(Ok(())))
         } else {
             shared
                 .with_cpu(cpu, |kernel| {
