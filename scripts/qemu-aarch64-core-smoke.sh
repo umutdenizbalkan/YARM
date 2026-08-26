@@ -391,10 +391,11 @@ fi
 # set and the live-oracle proof, and forbid any drain failure or stale-state decline.
 if [[ -f "$LOGFILE" && "$FUTEX_WAIT_ORACLE" == "1" ]]; then
   if ! check_required_patterns "$LOGFILE" \
-      "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0" \
-      "AARCH64_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK" \
-      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0" \
-      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu=0" \
+      "FUTEX_WAIT_SPLIT_BEGIN" \
+      "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid=" \
+      "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid=" \
+      "result=queue_advance_committed outgoing=" \
+      "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed" \
       "AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK" \
       "AARCH64_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu=0" \
       "AARCH64_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu=0" \
@@ -404,12 +405,17 @@ if [[ -f "$LOGFILE" && "$FUTEX_WAIT_ORACLE" == "1" ]]; then
       "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok" \
       "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=FutexWait" \
       "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok" \
-      "AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok" \
       "AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok"; then
     echo "[error] aarch64 Stage 195E/195F FutexWait switch-oracle markers missing"
     exit 1
   fi
+  # U9-QA §2: FutexWait publishes its block PRE-LOCK, so the in-lock deferral must not appear at
+  # all — §3 of the directive requires "no in-lock FutexWait production marker". The five
+  # attestations this list used to require are replaced above by their pre-lock counterparts, and
+  # the in-lock ones are now FORBIDDEN rather than expected.
   for a64_fw_bad in \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN" \
+      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN" \
       "AARCH64_FUTEX_WAIT_DISPATCH_FAIL" \
       "AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed" \
       "AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=no_incoming" \

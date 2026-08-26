@@ -1913,6 +1913,63 @@ impl SharedKernel {
         })
     }
 
+    /// U9-QA §1 (ONE QUEUE-ADVANCE OWNER): the single authoritative off-lock queue-advancing
+    /// SELECTION step.
+    ///
+    /// Before U9-QA the FutexWait retirement drain and the U9-QA transaction each opened their
+    /// own rank-1 scheduler seam, authenticated the CPU themselves and called
+    /// `dispatch_next_selection_on` themselves. The selection *primitive* was already shared —
+    /// it is a `Scheduler` method — but the seam acquisition, the CPU authentication and the
+    /// refusal shape were written twice, which is exactly the surface on which a second
+    /// selection policy grows. This is now the one implementation of that step, and the two
+    /// off-lock queue-advance consumers reach the run queue through it and nothing else:
+    ///
+    /// * [`Self::futex_wait_dispatch_step_mut`] — the FutexWait retirement drain;
+    /// * `SharedKernel::queue_advance_commit_split` — the U9-QA transaction.
+    ///
+    /// The step takes rank 1 exactly once and performs, in order:
+    ///
+    /// 1. Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's `cpu` against the
+    ///    authoritative `sched.current_cpu` BEFORE any mutation. On mismatch NOTHING is
+    ///    dequeued and the typed `RefusedCpuMismatch` is returned; `site` names the caller so
+    ///    the `DISPATCH_STEP_REFUSED_CPU_MISMATCH` marker stays attributable.
+    /// 2. Stage 199D-WA3A-R1: produce the selection provenance INSIDE the scheduler mutation,
+    ///    so a `CpuDispatch::Selected` can only be minted by a real dequeue on a real CPU.
+    ///
+    /// It deliberately emits NO success marker: the two consumers own different telemetry
+    /// families (`QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK` vs `D6_GLOBAL_LOCK_DROP_PLAN_READY`) and
+    /// a shared step must not fabricate either.
+    pub(crate) fn queue_advance_select_step_split(
+        &self,
+        cpu: CpuId,
+        site: &'static str,
+    ) -> CpuDispatch {
+        self.with_scheduler_split_mut(|sched| {
+            let dispatch_cpu = sched.current_cpu;
+            // Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's CPU against the
+            // authoritative dispatch CPU BEFORE any mutation. On mismatch nothing is dequeued.
+            if dispatch_cpu != cpu {
+                crate::yarm_log!(
+                    "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}",
+                    site,
+                    cpu.0,
+                    dispatch_cpu.0
+                );
+                return CpuDispatch::RefusedCpuMismatch {
+                    requested: cpu,
+                    authoritative: dispatch_cpu,
+                };
+            }
+            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
+            let selection =
+                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
+            CpuDispatch::Selected {
+                cpu: dispatch_cpu,
+                selection,
+            }
+        })
+    }
+
     /// Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): the authoritative queue-advancing
     /// dispatch for a committed FutexWait block, run through the rank-1 scheduler seam with
     /// the global `SpinLock<KernelState>` already dropped by the trap-entry drain. The
@@ -1927,33 +1984,24 @@ impl SharedKernel {
     /// Stage 196E: un-gated to RISC-V — the same rank-1 dequeue drives the RISC-V out-of-lock
     /// FutexWait drain (the RISC-V arch hooks — SATP/ASID + sfence + trap-frame restore — run
     /// in the drain's `with_cpu` re-acquire, reusing the 196D switch machinery, NOT here).
+    ///
+    /// U9-QA §1 (ONE QUEUE-ADVANCE OWNER): the seam acquisition, the CPU authentication and the
+    /// dequeue are no longer written here — they are DELEGATED to
+    /// [`Self::queue_advance_select_step_split`], the one step the U9-QA transaction also uses.
+    /// What remains here is this class's telemetry, so a FutexWait retirement is still legible
+    /// in a live log by its own marker family. There is exactly one selection implementation
+    /// serving both, so no second dequeue policy can drift into existence.
     #[cfg(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
     pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
-        self.with_scheduler_split_mut(|sched| {
-            let dispatch_cpu = sched.current_cpu;
-            // Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's CPU against the
-            // authoritative dispatch CPU BEFORE any mutation. On mismatch nothing is dequeued.
-            if dispatch_cpu != cpu {
-                crate::yarm_log!(
-                    "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}",
-                    "futex_wait_dispatch_step_mut",
-                    cpu.0,
-                    dispatch_cpu.0
-                );
-                return CpuDispatch::RefusedCpuMismatch {
-                    requested: cpu,
-                    authoritative: dispatch_cpu,
-                };
-            }
-            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
-            let selection =
-                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
-            let incoming = selection.tid().map(|t| t.0);
-            match incoming {
+        let dispatch = self.queue_advance_select_step_split(cpu, "futex_wait_dispatch_step_mut");
+        // Telemetry only, and only for a genuine selection: a refusal already emitted its own
+        // marker inside the seam and dequeued nothing, so it must not be reported as a dequeue.
+        if matches!(dispatch, CpuDispatch::Selected { .. }) {
+            match dispatch.tid().map(|t| t.0) {
                 Some(tid) => crate::yarm_log!(
                     "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu={} tid={}",
                     cpu.0,
@@ -1963,11 +2011,8 @@ impl SharedKernel {
                     crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu={} tid=idle", cpu.0)
                 }
             }
-            CpuDispatch::Selected {
-                cpu: dispatch_cpu,
-                selection,
-            }
-        })
+        }
+        dispatch
     }
 
     /// Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): re-verify — out of the global lock,
@@ -2005,43 +2050,33 @@ impl SharedKernel {
     /// Yield drain (the AArch64 arch restore runs in the drain's `with_cpu` re-acquire).
     /// Stage 196D: un-gated to RISC-V — the same rank-1 dequeue drives the RISC-V queue-switch
     /// foundation drain (the RISC-V SATP/sfence + frame restore run in its `with_cpu` re-acquire).
+    ///
+    /// U9-QA §3 (ONE QUEUE-ADVANCE OWNER): the seam acquisition, the CPU authentication and the
+    /// dequeue are no longer written here — they are DELEGATED to
+    /// [`Self::queue_advance_select_step_split`], the same one step the FutexWait retirement drain
+    /// and the U9-QA transaction use. This is the TIMER's queue advance: a timer that expires a
+    /// quantum reaches `yield_current`, which re-enqueues the caller, clears `current` and defers
+    /// the dispatch to the trap-entry drain — so this seam IS the preemption-driven selection, on
+    /// all three architectures. It now selects through the single authoritative policy, and what
+    /// remains here is only this class's telemetry.
     #[cfg(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
     pub(crate) fn yield_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
-        self.with_scheduler_split_mut(|sched| {
-            let dispatch_cpu = sched.current_cpu;
-            // Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's CPU against the
-            // authoritative dispatch CPU BEFORE any mutation. On mismatch nothing is dequeued.
-            if dispatch_cpu != cpu {
-                crate::yarm_log!(
-                    "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}",
-                    "yield_dispatch_step_mut",
-                    cpu.0,
-                    dispatch_cpu.0
-                );
-                return CpuDispatch::RefusedCpuMismatch {
-                    requested: cpu,
-                    authoritative: dispatch_cpu,
-                };
-            }
-            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
-            let selection =
-                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
-            let incoming = selection.tid().map(|t| t.0);
-            match incoming {
+        let dispatch = self.queue_advance_select_step_split(cpu, "yield_dispatch_step_mut");
+        // Telemetry only, and only for a genuine selection: a refusal already emitted its own
+        // marker inside the seam and dequeued nothing, so it must not be reported as a dequeue.
+        if matches!(dispatch, CpuDispatch::Selected { .. }) {
+            match dispatch.tid().map(|t| t.0) {
                 Some(tid) => {
                     crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid={}", cpu.0, tid)
                 }
                 None => crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid=idle", cpu.0),
             }
-            CpuDispatch::Selected {
-                cpu: dispatch_cpu,
-                selection,
-            }
-        })
+        }
+        dispatch
     }
 
     /// Stage 168B (D2-GENUINE-RECV): does the incoming task have an initialized
@@ -10781,11 +10816,15 @@ mod tests {
             "trap_entry.rs drops from 3 to 2 with this retirement, then to 1 with U9-D3 §7"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
+        // U9-QA §2 made the one acquisition CONDITIONAL — a pre-lock route that published a
+        // terminal transition must not enter it — but did not change the acquisition itself.
+        // That is what this pins: the same call, on the same closure.
+        let flat = code
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
         assert!(
-            code.contains(
-                "let inner_result = shared
-        .with_cpu(cpu, |kernel| {"
-            ),
+            flat.contains("shared .with_cpu(cpu, |kernel| {"),
             "the canonical broad Phase-2 trap dispatch is present and unchanged"
         );
         // U9 (canonical 203C) moved the production restore out of the second acquisition; U9-D3

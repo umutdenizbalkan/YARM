@@ -256,6 +256,37 @@ pub(crate) fn ensure_user_return_cr3_split(
     let _ = (shared, tid, task_asid);
 }
 
+/// U9-QA §4 — the x86_64 post-lock TERMINAL-IDLE landing.
+///
+/// `QueueAdvanceOutcome::TerminalIdle` means the advance settled with no incoming task: the
+/// outgoing task stays parked, `current` stays clear, and no frame is restored. Every drain that
+/// can produce that outcome needs somewhere for the CPU to land.
+///
+/// AArch64 lands it by DIVERGING — `enter_post_lock_idle` never returns — because its vector
+/// epilogue would otherwise `eret` through the parked caller's frame. x86_64 deliberately does
+/// NOT copy that shape, and this function is not a second idle policy. The landing already
+/// exists, one level out: after `dispatch_trap_entry_with_shared_kernel` returns, the raw trap
+/// tail in `descriptor_tables.rs` reads the exiting TID and, on `None | Some(0)` with no
+/// revalidated owner, emits `SCHED_ENTER_IDLE_HLT`, clears `TRAP_DISPATCH_DEPTH`, runs the exit
+/// attestation epilogue and enters `idle_halt_loop()` — the same wake-capable `sti; hlt` the
+/// ordinary idle outcome uses. A drain that cleared `current` reaches exactly that landing by
+/// RETURNING normally.
+///
+/// Diverging from the drain instead would be strictly worse: it would skip the depth clear and
+/// the attestation epilogue the tail performs, and it would add a second place that decides how
+/// this architecture idles. So the settlement here is the attestation ONLY — it names the class
+/// that idled, so a live log can tell which drain settled this way, and gives the structural
+/// guard a fixed point to pin the landing to. The caller must restore no frame and simply
+/// return; `x86_terminal_idle_landing_is_the_raw_trap_tail` holds the tail to that contract.
+pub(crate) fn settle_post_lock_terminal_idle(cpu: CpuId, outgoing_tid: u64, class: &'static str) {
+    crate::yarm_log!(
+        "X86_POST_LOCK_TERMINAL_IDLE cpu={} outgoing_tid={} class={} landing=raw_trap_tail primitive=idle_halt_loop result=ok",
+        cpu.0,
+        outgoing_tid,
+        class
+    );
+}
+
 /// U3 (203C) — truthful divergence when an exact-token post-lock resume refuses.
 ///
 /// The x86 analogue of the established AArch64 `enter_post_lock_dispatch_fatal`. A refusal

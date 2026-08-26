@@ -327,12 +327,275 @@ fn post_switch_d6_cleanup_split(
     }
 }
 
+/// U9-QA — the Stage 117 switch-plan stash DRAIN, extracted verbatim so it has exactly one
+/// implementation and two callers.
+///
+/// It was inline in `handle_trap_entry_shared`, reachable only after the broad `with_cpu`
+/// returned. U9-QA gives it a second caller: a PRE-LOCK route that published its own terminal
+/// transition and stashed a plan through `SharedKernel::queue_advance_commit_split` must drive
+/// the same apply, and must not enter the terminal broad dispatcher to do it.
+///
+/// Nothing about the apply changed. It still takes the plan, performs the arch switch with no
+/// lock held, runs the U9/203C off-lock incoming restore on x86_64 and AArch64, and runs the
+/// U9-D3 §7 split D6 cleanup when a proof/D6-SWITCH-A run has just completed.
+fn drain_switch_plan_stash(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    mut frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        // SAFETY: single CPU, interrupts disabled, no concurrent accessor.
+        let plan = unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take() };
+        if let Some(plan) = plan {
+            // Stage 166 (D6-SWITCH-A): tag this as a real production unlocked
+            // switch when driven by `yarm.d6_switch_a=1` (proof knob off).
+            #[cfg(target_arch = "x86_64")]
+            let d6_switch_a_mode = crate::kernel::boot::d6_switch_a_enabled()
+                && !crate::kernel::boot::d6_controlled_switch_proof_enabled();
+            #[cfg(not(target_arch = "x86_64"))]
+            let d6_switch_a_mode = false;
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
+            if d6_switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_LOCK_DROPPED outgoing={} incoming={}",
+                    plan.outgoing_tid,
+                    plan.incoming_tid
+                );
+            }
+            crate::yarm_log!(
+                "D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
+            if d6_switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_SWITCH_ENTER outgoing={} incoming={}",
+                    plan.outgoing_tid,
+                    plan.incoming_tid
+                );
+            }
+            // Stage 118 Part D: detect first-resume path (x86_64 only).
+            // If the incoming frame's RIP points to the trampoline, stash a
+            // FirstResumeContext so the trampoline can switch back after
+            // calling post_switch_restore_arch_thread_state.
+            #[cfg(target_arch = "x86_64")]
+            {
+                unsafe extern "C" {
+                    fn yarm_kernel_thread_switch_trampoline() -> !;
+                }
+                let trampoline_ip = yarm_kernel_thread_switch_trampoline as *const () as usize;
+                // SAFETY: incoming_frame_ptr is stable (KernelState::tcbs fixed array).
+                let incoming_ip = unsafe { (*plan.incoming_frame_ptr).instruction_ptr() };
+                if incoming_ip == trampoline_ip {
+                    let ctx = crate::kernel::boot::FirstResumeContext {
+                        cpu_id: cpu,
+                        incoming_tid: plan.incoming_tid,
+                        outgoing_frame_ptr: plan.outgoing_frame_ptr as *const _,
+                        incoming_frame_ptr: plan.incoming_frame_ptr,
+                        outgoing_stack_top: plan.outgoing_stack_top,
+                    };
+                    // SAFETY: single CPU, interrupts disabled.
+                    unsafe {
+                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].store(ctx);
+                    }
+                }
+            }
+            // SAFETY: pointers derived from stable KernelState::tcbs storage under
+            // task_state_lock; valid because KernelState is alive for the program
+            // lifetime, the array is fixed-size (no reallocation), and the system is
+            // single-CPU with interrupts disabled (no concurrent modification).
+            // The dereferences are non-aliasing: outgoing and incoming indices were
+            // verified distinct in `maybe_switch_kernel_context`.
+            unsafe {
+                crate::arch::selected_isa::context_switch::switch_frames(
+                    &mut *plan.outgoing_frame_ptr,
+                    &*plan.incoming_frame_ptr,
+                    plan.incoming_stack_top,
+                );
+            }
+            // POINT 2: execution resumes here when the outgoing task is switched
+            // back in (either by the normal scheduler or by the first-resume
+            // trampoline switching back after post_switch_restore).
+            crate::yarm_log!(
+                "D6_SWITCH_FRAMES_RETURNED_UNLOCKED outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
+            if d6_switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_RETURNED outgoing={} incoming={}",
+                    plan.outgoing_tid,
+                    plan.incoming_tid
+                );
+            }
+            // Stage 139: hardware CR3 snapshot at POINT 2, before proof cleanup
+            // restores the correct address space.  The proof path does not touch
+            // CR3 in switch_frames or the trampoline, so this captures any
+            // divergence introduced by the proof's lock-drop switch.
+            #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+            {
+                let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+                crate::yarm_log!("D6_PROOF_CR3_AFTER_SWITCH_BACK cr3=0x{:016x}", hw_cr3);
+            }
+            let is_proof_done =
+                if crate::kernel::boot::d6_controlled_switch_proof_take_pending_done() {
+                    crate::kernel::boot::d6_controlled_switch_proof_mark_done();
+                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DONE");
+                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN");
+                    // Dispatch stash was consumed by take() above — re-verify empty.
+                    let dispatch_clear = unsafe {
+                        !crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan()
+                    };
+                    // First-resume stash was consumed by the trampoline — verify empty.
+                    let resume_clear = unsafe {
+                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx]
+                            .take()
+                            .is_none()
+                    };
+                    if dispatch_clear && resume_clear {
+                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STASH_CLEAR_OK");
+                    }
+                    // PENDING_DONE was swapped to false by take_pending_done; verify.
+                    let pending_clear =
+                        !crate::kernel::boot::D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE
+                            .load(core::sync::atomic::Ordering::Acquire);
+                    // GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE was cleared before the stash drain.
+                    let trap_path_clear = cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+                        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                    if pending_clear && trap_path_clear {
+                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STATE_CLEAR_OK");
+                    }
+                    true
+                } else {
+                    false
+                };
+            // U9 (canonical 203C): restore the incoming task's arch thread state (populate its
+            // trap frame with its user-mode register context) with NO broad lock re-acquired.
+            //
+            // Reached on x86_64 and AArch64 — the only architectures whose stash gate can
+            // populate `DISPATCH_SWITCH_PLAN_STASH` at all, since that gate (`exec_state.rs`)
+            // opens with `!cfg!(target_arch = "riscv64") && …`. This drain is therefore
+            // statically unreachable on RISC-V, which keeps its verbatim in-lock restore inside
+            // the tail below rather than an unproven split.
+            #[cfg(not(target_arch = "riscv64"))]
+            let restore_result =
+                post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut());
+            #[cfg(target_arch = "riscv64")]
+            let restore_result: Result<(), TrapHandleError> = Ok(());
+
+            // U9-D3 §7: the D6 cleanup overlay is the ONLY remaining consumer here, and it no
+            // longer touches the broad lock — this site holds NO broad acquisition at all. An
+            // ordinary production switch skips it entirely (`is_proof_done` is false).
+            //
+            // The `|| cfg!(target_arch = "riscv64")` arm went with the tail. It existed to run
+            // RISC-V's in-lock restore, and that arm was already statically unreachable: the stash
+            // gate in `maybe_switch_kernel_context` opens with `!cfg!(target_arch = "riscv64")`,
+            // so `has_plan()` — this block's entry condition — is never true on RISC-V. Removing
+            // an unreachable branch weakens nothing; the FOUNDATION restore stays defined.
+            //
+            // Order is preserved: the restore ran first and its result is propagated last, so the
+            // overlay still observes exactly the state it did before, and a restore error still
+            // surfaces only after the cleanup has run.
+            if is_proof_done {
+                post_switch_d6_cleanup_split(shared, cpu, d6_switch_a_mode);
+            }
+            restore_result?;
+            // Stage 132: arm the first post-cleanup trap diagnostic.
+            if is_proof_done {
+                let cpu_idx_set = cpu.0 as usize;
+                if cpu_idx_set < crate::kernel::scheduler::MAX_CPUS {
+                    crate::kernel::boot::D6_POST_CLEANUP_DIAG_PENDING[cpu_idx_set]
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    // Stage 133: arm the pre-lock #PF register diagnostic.
+                    #[cfg(target_arch = "x86_64")]
+                    crate::kernel::boot::D6_PRE_LOCK_PF_DIAG_PENDING[cpu_idx_set]
+                        .store(true, core::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// U9-QA §2 — the ONE owner of this CPU's trap-path-active window.
+///
+/// `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` means "a drainer WILL consume whatever this trap
+/// publishes". Stage 117 set it around the broad `with_cpu` only, because only in-lock code
+/// could publish. U9-QA gives the PRE-LOCK split route the same ability, so the window must
+/// open before that route runs — which is also what lets `queue_advance_admit_split` answer
+/// truthfully there instead of refusing `NoTrapDrainer`.
+///
+/// Widening the window widens the obligation to close it, and `handle_trap_entry_shared` now
+/// leaves through several paths: a completed non-switching split class, an ordinary syscall
+/// error, a kernel-side error, the broad dispatcher's own `?`, and the fall-through to the
+/// drains. Rather than duplicate the clear at each, this type owns it: `settle` clears exactly
+/// once and `Drop` calls `settle`, so every RETURNING path is covered without a written clear.
+///
+/// U9-QA §2 (RISC-V): the RISC-V wrapper `handle_riscv_trap_entry_shared` owns the same window
+/// for the same reason and uses this same type, so there is ONE flag lifecycle in the tree rather
+/// than one per bridge.
+///
+/// `Drop` cannot cover a DIVERGING path — the drains' idle and fatal landings never return, so
+/// they never unwind. That is why `settle` is also called explicitly at the single point after
+/// the broad dispatcher and before the drains: by the time any divergence is reachable, the
+/// window is already closed, and the later `Drop` is a no-op.
+pub(crate) struct TrapPathWindow {
+    cpu_idx: usize,
+    settled: core::cell::Cell<bool>,
+}
+
+impl TrapPathWindow {
+    pub(crate) fn establish(cpu: CpuId) -> Self {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        Self {
+            cpu_idx,
+            settled: core::cell::Cell::new(false),
+        }
+    }
+
+    /// Close the window. Idempotent by construction, so an explicit call before a divergence
+    /// and the `Drop` that follows a return together still clear it exactly once.
+    pub(crate) fn settle(&self) {
+        if self.settled.replace(true) {
+            return;
+        }
+        if self.cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[self.cpu_idx]
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for TrapPathWindow {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
 pub fn handle_trap_entry_shared(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
     context: ArchTrapContext,
     mut frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
+    use crate::kernel::syscall_split::SplitDispatchDisposition;
+
+    // Stage 117 / U9-QA §2: open the trap-path-active window HERE — before the pre-lock split
+    // dispatch, not just around `with_cpu`. See `TrapPathWindow`; it is the one owner of this
+    // flag and of clearing it on every path out of this function.
+    let cpu_idx = cpu.0 as usize;
+    let trap_path = TrapPathWindow::establish(cpu);
+
     // Stage 29: pre-global-lock split-dispatch seam (whitelist-only, default-deny).
     //
     // For a syscall trap whose number is on the `syscall_split` whitelist (today
@@ -343,9 +606,15 @@ pub fn handle_trap_entry_shared(
     // the arch return-register writeback exactly as on the global-lock path.
     //
     // Every other syscall (and any classification/precondition miss, or an absent
-    // requester TID) returns `None` and falls through to the UNCHANGED global-lock
-    // dispatch below. This is gated on the trap being a syscall so non-syscall
+    // requester TID) returns `NotHandled` and falls through to the UNCHANGED
+    // global-lock dispatch below. This is gated on the trap being a syscall so non-syscall
     // events (page faults, timer/external IRQs) never enter the seam.
+    //
+    // U9-QA §2: the seam now answers with three meanings rather than two. `NotHandled` and
+    // `Complete` behave exactly as `None` and `Some` did. `QueueAdvanceCommitted` is the new
+    // one: a terminal transition has been published, so this trap may neither enter the broad
+    // dispatcher nor return through the outgoing frame — it falls through to the drains.
+    let mut queue_advance_committed = false;
     if matches!(decode_trap_context(context), TrapEvent::Syscall) {
         if let Some(frame) = frame.as_deref_mut() {
             // Stage 160C: import the decoded syscall ABI into the frame BEFORE the
@@ -359,9 +628,35 @@ pub fn handle_trap_entry_shared(
             // "current" lookup would find afterwards — a direct NR6/NR7 transaction wakes and
             // enqueues another task, so that lookup is not a safe question to ask after it.
             let entering = split_return_identity(shared, cpu);
-            if let Some(result) =
-                crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
-            {
+            let disposition =
+                crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame);
+            // U9-QA §2: the COMMITTED disposition. The split route published a terminal
+            // transition, so the caller is no longer current on this CPU and the live frame no
+            // longer belongs to anything this trap may return through.
+            //
+            // Two things happen here and nowhere else. The architecture syscall-return ABI is
+            // finalized against the OUTGOING incarnation — the caller must observe its result
+            // and its advanced PC when it is later resumed, not when it next traps. Then the
+            // outgoing user context is captured into that exact TCB, keyed on the identity the
+            // deferral carries rather than on any ambient "current" lookup, because the drain
+            // is about to overwrite the live frame with the INCOMING task's context.
+            if matches!(disposition, SplitDispatchDisposition::QueueAdvanceCommitted) {
+                finalize_split_handled_syscall(shared, cpu, entering, frame);
+                let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+                let captured = outgoing
+                    .map(|t| shared.capture_outgoing_user_context_split(t, frame))
+                    .unwrap_or(false);
+                crate::yarm_log!(
+                    "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=queue_advance_committed outgoing={} captured={}",
+                    SPLIT_DISPATCH_ARCH_TAG,
+                    frame.syscall_num(),
+                    cpu.0,
+                    outgoing.unwrap_or(u64::MAX),
+                    u8::from(captured),
+                );
+                queue_advance_committed = true;
+            }
+            if let SplitDispatchDisposition::Complete(result) = disposition {
                 match result {
                     Ok(()) => {
                         // Stage 160C: a HANDLED split syscall must return to
@@ -463,47 +758,65 @@ pub fn handle_trap_entry_shared(
         FaultBookkeepingMode::RecordInHandleTrapEvent
     };
 
-    // Stage 117: signal to `maybe_switch_kernel_context` that this CPU is in
-    // the `handle_trap_entry_shared` path and the stash WILL be drained after
-    // `with_cpu` returns. Without this flag, direct-call paths (tests) would
-    // stash a plan with no external drainer, losing the context switch.
-    let cpu_idx = cpu.0 as usize;
-    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
-        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .store(true, core::sync::atomic::Ordering::Relaxed);
-    }
-
+    // Stage 117 / U9-QA §2: the broad dispatcher is entered ONLY after a `NotHandled`
+    // disposition — i.e. only when nothing has been mutated and the trap still needs handling.
+    //
+    // After `QueueAdvanceCommitted` it must be skipped, and not as an optimisation: the caller
+    // is already `Blocked(Futex)` and current on no CPU, so `handle_trap` would re-execute
+    // FutexWait against a task that has already blocked, and `dispatch_next_task` would advance
+    // the queue a second time for one publication. Skipping is what makes "the queue-advance
+    // drain runs exactly once" true.
+    //
+    // Note this is decided by the DISPOSITION, never by inspecting the switch-plan stash. A
+    // stale or unrelated stash must not be able to alter dispatch control flow.
+    //
     // Stage 117: pass `frame.as_deref_mut()` (reborrow) so that `frame` remains
     // available after `with_cpu` returns for the stash drain below.
-    let inner_result = shared
-        .with_cpu(cpu, |kernel| {
-            // Stage 120: diagnostic-only x86_64 proof hook. Default-off and
-            // one-shot; when enabled it stashes a normal DispatchSwitchPlan
-            // before regular trap handling, so the existing Stage 117 drain
-            // below proves the unlocked switch_frames path without changing
-            // scheduler policy or syscall ABI.
-            #[cfg(target_arch = "x86_64")]
-            kernel
-                .maybe_run_d6_controlled_switch_proof()
-                .map_err(|err| {
-                    TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::from(err))
-                })?;
-            handle_trap_entry_with_fault_bookkeeping_mode(
-                kernel,
-                cpu,
-                context,
-                frame.as_deref_mut(),
-                fault_bookkeeping_mode,
-            )
-        })
-        .map_err(|err| TrapHandleError::Syscall(err.into()));
+    // The `Ok(Ok(()))` shape mirrors the broad call exactly: the outer `Result` is the lock
+    // acquisition, the inner one the arch handler's own result. Skipping the acquisition yields
+    // a successful acquisition of nothing and a successful handler, so both `?` sites below stay
+    // untouched.
+    let inner_result: Result<Result<(), TrapHandleError>, TrapHandleError> =
+        if queue_advance_committed {
+            crate::yarm_log!(
+                "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=publication_committed",
+                cpu.0
+            );
+            Ok(Ok(()))
+        } else {
+            shared
+                .with_cpu(cpu, |kernel| {
+                    // Stage 120: diagnostic-only x86_64 proof hook. Default-off and
+                    // one-shot; when enabled it stashes a normal DispatchSwitchPlan
+                    // before regular trap handling, so the existing Stage 117 drain
+                    // below proves the unlocked switch_frames path without changing
+                    // scheduler policy or syscall ABI.
+                    #[cfg(target_arch = "x86_64")]
+                    kernel
+                        .maybe_run_d6_controlled_switch_proof()
+                        .map_err(|err| {
+                            TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::from(
+                                err,
+                            ))
+                        })?;
+                    handle_trap_entry_with_fault_bookkeeping_mode(
+                        kernel,
+                        cpu,
+                        context,
+                        frame.as_deref_mut(),
+                        fault_bookkeeping_mode,
+                    )
+                })
+                .map_err(|err| TrapHandleError::Syscall(err.into()))
+        };
 
-    // Clear the trap-path-active flag; the stash drain below handles whatever
-    // was stashed during the `with_cpu` call.
-    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
-        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .store(false, core::sync::atomic::Ordering::Relaxed);
-    }
+    // U9-QA §2: the SINGLE settlement point for the trap-path-active window, covering both
+    // paths that reach the drains. It is explicit rather than left to `Drop` because the drains
+    // below contain DIVERGING landings (idle, fatal) that never unwind — the window has to be
+    // closed before any of them is reachable. Every other exit from this function returns, so
+    // `TrapPathWindow::drop` closes it there; `settle` is idempotent, so it happens exactly once
+    // either way.
+    trap_path.settle();
 
     let inner_result = inner_result?;
     // `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.
@@ -1200,7 +1513,19 @@ pub fn handle_trap_entry_shared(
                 crate::kernel::boot::maybe_log_futex_wait_retired();
             } else {
                 // Nothing else runnable ⇒ idle (same as the D2 recv idle branch).
+                //
+                // U9-QA §4: this is the x86_64 TERMINAL-IDLE settlement, and it settles by
+                // RETURNING. The outgoing waiter is `Blocked(Futex)` and `current` is clear, so
+                // the raw trap tail's `exiting_tid is None` landing takes this CPU into
+                // `idle_halt_loop()` with the depth clear and attestation epilogue intact. No
+                // frame is restored here and nothing diverges — see
+                // `settle_post_lock_terminal_idle`.
                 crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                crate::arch::x86_64::trap::settle_post_lock_terminal_idle(
+                    cpu,
+                    outgoing.unwrap_or(u64::MAX),
+                    "futex_wait",
+                );
                 crate::yarm_log!("FUTEX_WAIT_SPLIT_DISPATCH_OK cpu={} incoming=idle", cpu.0);
                 crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_DONE result=ok");
                 crate::yarm_log!("FUTEX_WAIT_SPLIT_DONE result=blocked");
@@ -1725,183 +2050,7 @@ pub fn handle_trap_entry_shared(
     // task's kernel stack. All local variables below (`frame`, `shared`, `cpu`)
     // are now the INCOMING task's versions, which were on its own kernel stack
     // when it was last suspended at this exact code location.
-    let cpu_idx = cpu.0 as usize;
-    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
-        // SAFETY: single CPU, interrupts disabled, no concurrent accessor.
-        let plan = unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take() };
-        if let Some(plan) = plan {
-            // Stage 166 (D6-SWITCH-A): tag this as a real production unlocked
-            // switch when driven by `yarm.d6_switch_a=1` (proof knob off).
-            #[cfg(target_arch = "x86_64")]
-            let d6_switch_a_mode = crate::kernel::boot::d6_switch_a_enabled()
-                && !crate::kernel::boot::d6_controlled_switch_proof_enabled();
-            #[cfg(not(target_arch = "x86_64"))]
-            let d6_switch_a_mode = false;
-            crate::yarm_log!(
-                "D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing={} incoming={}",
-                plan.outgoing_tid,
-                plan.incoming_tid
-            );
-            if d6_switch_a_mode {
-                crate::yarm_log!(
-                    "D6_SWITCH_A_LOCK_DROPPED outgoing={} incoming={}",
-                    plan.outgoing_tid,
-                    plan.incoming_tid
-                );
-            }
-            crate::yarm_log!(
-                "D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing={} incoming={}",
-                plan.outgoing_tid,
-                plan.incoming_tid
-            );
-            if d6_switch_a_mode {
-                crate::yarm_log!(
-                    "D6_SWITCH_A_SWITCH_ENTER outgoing={} incoming={}",
-                    plan.outgoing_tid,
-                    plan.incoming_tid
-                );
-            }
-            // Stage 118 Part D: detect first-resume path (x86_64 only).
-            // If the incoming frame's RIP points to the trampoline, stash a
-            // FirstResumeContext so the trampoline can switch back after
-            // calling post_switch_restore_arch_thread_state.
-            #[cfg(target_arch = "x86_64")]
-            {
-                unsafe extern "C" {
-                    fn yarm_kernel_thread_switch_trampoline() -> !;
-                }
-                let trampoline_ip = yarm_kernel_thread_switch_trampoline as *const () as usize;
-                // SAFETY: incoming_frame_ptr is stable (KernelState::tcbs fixed array).
-                let incoming_ip = unsafe { (*plan.incoming_frame_ptr).instruction_ptr() };
-                if incoming_ip == trampoline_ip {
-                    let ctx = crate::kernel::boot::FirstResumeContext {
-                        cpu_id: cpu,
-                        incoming_tid: plan.incoming_tid,
-                        outgoing_frame_ptr: plan.outgoing_frame_ptr as *const _,
-                        incoming_frame_ptr: plan.incoming_frame_ptr,
-                        outgoing_stack_top: plan.outgoing_stack_top,
-                    };
-                    // SAFETY: single CPU, interrupts disabled.
-                    unsafe {
-                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].store(ctx);
-                    }
-                }
-            }
-            // SAFETY: pointers derived from stable KernelState::tcbs storage under
-            // task_state_lock; valid because KernelState is alive for the program
-            // lifetime, the array is fixed-size (no reallocation), and the system is
-            // single-CPU with interrupts disabled (no concurrent modification).
-            // The dereferences are non-aliasing: outgoing and incoming indices were
-            // verified distinct in `maybe_switch_kernel_context`.
-            unsafe {
-                crate::arch::selected_isa::context_switch::switch_frames(
-                    &mut *plan.outgoing_frame_ptr,
-                    &*plan.incoming_frame_ptr,
-                    plan.incoming_stack_top,
-                );
-            }
-            // POINT 2: execution resumes here when the outgoing task is switched
-            // back in (either by the normal scheduler or by the first-resume
-            // trampoline switching back after post_switch_restore).
-            crate::yarm_log!(
-                "D6_SWITCH_FRAMES_RETURNED_UNLOCKED outgoing={} incoming={}",
-                plan.outgoing_tid,
-                plan.incoming_tid
-            );
-            if d6_switch_a_mode {
-                crate::yarm_log!(
-                    "D6_SWITCH_A_RETURNED outgoing={} incoming={}",
-                    plan.outgoing_tid,
-                    plan.incoming_tid
-                );
-            }
-            // Stage 139: hardware CR3 snapshot at POINT 2, before proof cleanup
-            // restores the correct address space.  The proof path does not touch
-            // CR3 in switch_frames or the trampoline, so this captures any
-            // divergence introduced by the proof's lock-drop switch.
-            #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
-            {
-                let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
-                crate::yarm_log!("D6_PROOF_CR3_AFTER_SWITCH_BACK cr3=0x{:016x}", hw_cr3);
-            }
-            let is_proof_done =
-                if crate::kernel::boot::d6_controlled_switch_proof_take_pending_done() {
-                    crate::kernel::boot::d6_controlled_switch_proof_mark_done();
-                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DONE");
-                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN");
-                    // Dispatch stash was consumed by take() above — re-verify empty.
-                    let dispatch_clear = unsafe {
-                        !crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan()
-                    };
-                    // First-resume stash was consumed by the trampoline — verify empty.
-                    let resume_clear = unsafe {
-                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx]
-                            .take()
-                            .is_none()
-                    };
-                    if dispatch_clear && resume_clear {
-                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STASH_CLEAR_OK");
-                    }
-                    // PENDING_DONE was swapped to false by take_pending_done; verify.
-                    let pending_clear =
-                        !crate::kernel::boot::D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE
-                            .load(core::sync::atomic::Ordering::Acquire);
-                    // GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE was cleared before the stash drain.
-                    let trap_path_clear = cpu_idx >= crate::kernel::scheduler::MAX_CPUS
-                        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-                            .load(core::sync::atomic::Ordering::Relaxed);
-                    if pending_clear && trap_path_clear {
-                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STATE_CLEAR_OK");
-                    }
-                    true
-                } else {
-                    false
-                };
-            // U9 (canonical 203C): restore the incoming task's arch thread state (populate its
-            // trap frame with its user-mode register context) with NO broad lock re-acquired.
-            //
-            // Reached on x86_64 and AArch64 — the only architectures whose stash gate can
-            // populate `DISPATCH_SWITCH_PLAN_STASH` at all, since that gate (`exec_state.rs`)
-            // opens with `!cfg!(target_arch = "riscv64") && …`. This drain is therefore
-            // statically unreachable on RISC-V, which keeps its verbatim in-lock restore inside
-            // the tail below rather than an unproven split.
-            #[cfg(not(target_arch = "riscv64"))]
-            let restore_result =
-                post_switch_restore_arch_thread_state_split(shared, cpu, frame.as_deref_mut());
-            #[cfg(target_arch = "riscv64")]
-            let restore_result: Result<(), TrapHandleError> = Ok(());
-
-            // U9-D3 §7: the D6 cleanup overlay is the ONLY remaining consumer here, and it no
-            // longer touches the broad lock — this site holds NO broad acquisition at all. An
-            // ordinary production switch skips it entirely (`is_proof_done` is false).
-            //
-            // The `|| cfg!(target_arch = "riscv64")` arm went with the tail. It existed to run
-            // RISC-V's in-lock restore, and that arm was already statically unreachable: the stash
-            // gate in `maybe_switch_kernel_context` opens with `!cfg!(target_arch = "riscv64")`,
-            // so `has_plan()` — this block's entry condition — is never true on RISC-V. Removing
-            // an unreachable branch weakens nothing; the FOUNDATION restore stays defined.
-            //
-            // Order is preserved: the restore ran first and its result is propagated last, so the
-            // overlay still observes exactly the state it did before, and a restore error still
-            // surfaces only after the cleanup has run.
-            if is_proof_done {
-                post_switch_d6_cleanup_split(shared, cpu, d6_switch_a_mode);
-            }
-            restore_result?;
-            // Stage 132: arm the first post-cleanup trap diagnostic.
-            if is_proof_done {
-                let cpu_idx_set = cpu.0 as usize;
-                if cpu_idx_set < crate::kernel::scheduler::MAX_CPUS {
-                    crate::kernel::boot::D6_POST_CLEANUP_DIAG_PENDING[cpu_idx_set]
-                        .store(true, core::sync::atomic::Ordering::Release);
-                    // Stage 133: arm the pre-lock #PF register diagnostic.
-                    #[cfg(target_arch = "x86_64")]
-                    crate::kernel::boot::D6_PRE_LOCK_PF_DIAG_PENDING[cpu_idx_set]
-                        .store(true, core::sync::atomic::Ordering::Release);
-                }
-            }
-        }
-    }
+    drain_switch_plan_stash(shared, cpu, frame.as_deref_mut())?;
 
     // U7 (canonical 199E) — THE PRODUCTION IPC-TIMEOUT ENTRY, x86_64 + AArch64 cell.
     //
@@ -2241,6 +2390,15 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
     let raw_nr = frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8);
     if raw_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+        // U9-QA §2: FutexWait (NR 9) — the one SWITCHING pre-lock class. Without its ABI in the
+        // frame the split dispatcher sees `nr = 0` and declines, which is why AArch64 kept taking
+        // the in-lock deferral while x86_64 and RISC-V had moved to the pre-lock route. This is
+        // the AArch64 counterpart of the RISC-V `split_eligible` gate, and it admits NR 9 for the
+        // same reason: this architecture has the apply convention FutexWait needs
+        // (`direct_dispatch_resume_incoming_core` — TTBR0/ASID activation, exact EL0 context,
+        // exact parked completion), and its Stage 195E drain has driven it live for that class
+        // since it landed.
+        || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply
@@ -2301,8 +2459,14 @@ fn finalize_split_handled_syscall(
     // transactions (exact-incarnation TLS take, exact-incarnation context commit) — see
     // `split_finalize_handled_syscall`. NR6/NR7 are admitted through the canonical
     // `ipccall_direct_admission_enabled()` predicate, matching the import above.
+    //
+    // U9-QA §2: FutexWait (nr=9) joins them. It is the one SWITCHING class, and it needs this
+    // more than the others do: the blocked caller will not trap again to collect its result, so
+    // its `set_ok(1,0,0)` and its advanced SVC must be committed into THIS incarnation now, or
+    // it would re-execute the `svc` and re-block when the wake eventually resumes it.
     if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+        || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         || ((frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
             || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)

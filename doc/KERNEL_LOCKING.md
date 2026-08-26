@@ -14147,3 +14147,88 @@ kernel lock; no CNode capacity increase; NR 27 absent; reply-cap / shared-region
 (`scripts/qemu-second-cohort-ordinary-cap-seal.sh`):
 `SECOND_COHORT_ORDINARY_CAP_SEAL arches=3 classes=2 live_cells=6 result=ok`.
 Full record in `doc/SECOND_COHORT_ORDINARY_CAP_SEAL.md`.
+
+
+### U9-QA — the off-lock queue-advancing dispatch prerequisite. DELIVERED. CENSUS-DELTA 0.
+
+**U9-QA prerequisite DELIVERED. U9-QA — CENSUS-DELTA 0 prerequisite.** U9-QA builds the
+transaction a terminal dispatcher would need in order to be retired, and wires the consumers whose
+evidence qualifies. It removes no acquisition: the census stays **2 / 0 / 2**, because residual
+fallback classes still reach both terminal acquisitions. **Only the two terminal dispatchers
+remain counted** — `trap_entry.rs` Phase-2 dispatch and its RISC-V counterpart.
+
+**One queue-advance owner — scope stated exactly.**
+`SharedKernel::queue_advance_select_step_split` is the single off-lock selection implementation
+**for the U9-QA queue-advance consumers**: it takes rank 1 once, authenticates the trap CPU
+against the authoritative dispatch CPU before any mutation, and calls the same
+`Scheduler::dispatch_next_selection_on` the broad path calls. Three consumers delegate to it —
+`futex_wait_dispatch_step_mut`, `yield_dispatch_step_mut` and `queue_advance_commit_split` — and
+none performs a dequeue of its own.
+
+This is NOT a tree-wide claim, and the difference matters. Three pre-existing per-class seams —
+`d6_genuine_local_dispatch_step_mut`, `d2_recv_dispatch_step_mut` and `d2_send_dispatch_step_mut`
+— still call `dispatch_next_selection_on` inline, each with its own live-proof guards; U9-QA did
+not touch them, and unifying them is separate work. The deferred
+`local_dispatch_step_split_selection` in `scheduler_state.rs` likewise remains not live-wired. `queue_advance_admit_split` / `queue_advance_commit_split`
+are the admit/commit halves: every refusal is raised before the first mutation, and the commit
+cannot refuse.
+
+**The apply convention is explicit.** `QueueAdvanceApply` distinguishes `StashedKernelSwitch`
+(the Stage 117 plan stash, x86_64/AArch64 only) from `ExactTokenResume` (what the FutexWait,
+Yield and D2 drains actually do on all three architectures). The two stash-specific refusals are
+scoped to the stash convention; scoping them is what let RISC-V in. The resumability screen is
+per-convention and per-architecture: only x86_64 requires a restorable saved context, because a
+never-run task there takes the first-resume trampoline — which is the stash path.
+
+**Delivered consumers.**
+
+| Consumer | Architectures | Route |
+|---|---|---|
+| FutexWait (NR 9) | x86_64, AArch64, RISC-V | PRE-LOCK: publishes its block off the broad lock, returns `QueueAdvanceCommitted`, skips the broad dispatcher, settles through its existing deferral/drain |
+| Timer preemption (Yield) | x86_64, AArch64, RISC-V | selection unified onto the one owner; the advance was already off-lock via Stage 192B |
+
+The pre-lock split seam answers with three meanings — `NotHandled`, `Complete(..)`,
+`QueueAdvanceCommitted` — and the third is what makes a switching class expressible: falling back
+would re-execute the syscall on an already-blocked task, and early-returning would return through
+the parked caller's own frame. `TrapPathWindow` is the single owner of the trap-path-active
+window on both the shared and RISC-V bridges.
+
+**The RISC-V restore was PRE-EXISTING and REUSED, not newly built.** It was NOT written by
+U9-QA: `direct_dispatch_resume_incoming` and the `riscv64/boot.rs` bridge write-back are its
+PRE-EXISTING, live-proven owners, and U9-QA fixed admission rather than restoration: the first does
+SATP activation, exact saved-context apply and exact parked-completion consumption; the second is
+the one frame writer and the ONE async-preemption tag consumer, selecting exactly one of the four
+resume conventions. U9-QA fixed ADMISSION, not restoration. Writing a second restore would have
+recreated the two-consumer ambiguity canonical 199E-R2 measured (407 tags published, 407 consumed
+at the wrong seam, 0 of 187 switching write-backs authorized).
+
+**FutexWait parks no blocked-syscall completion.** Its result is written into the outgoing frame
+before the switch, so there is nothing for a resume boundary to consume for that class.
+
+**NOT retired, and why.**
+
+* **Timer entry — WIP-9 was selection-owner unification rather than timer retirement.**
+  `TimerInterrupt` entry REMAINS BROAD: the tick, the IPC timeout collector and ten diagnostic
+  hooks still run inside the broad arm. Two blockers: `process_ipc_timeout_deadlines` has no split twin (~210 lines
+  across ranks 2/3/1), and five of the ten hooks have no other call site, so returning early for
+  a non-preempting tick would silently stop them running. Claim/ack and re-arm are *not*
+  blockers — `hal_adapters` already exposes them lock-free. **No timer-preemption dequeue was
+  witnessed live**: `YIELD_DISPATCH_DEQUEUE_OK` is 0 in all three core smokes, so no
+  timer-preemption live claim is made.
+* **`Unknown` user exception.** No live witness on any architecture. Not delivered.
+* **Terminal user PageFault.** A live witness exists (AArch64 core smoke: user read at `0x0`,
+  `PAGE_FAULT_UNHANDLED` -> fault report -> replacement). It is still NOT routed: terminality
+  cannot be classified before mutation, because the classification IS the recovery attempt —
+  `try_handle_cow_fault` and `try_handle_demand_page_fault` both take `&mut self` and mutate as
+  part of deciding. A pure predicate would need demand-region decomposition or a COW primitive,
+  both out of scope.
+* **Blocking IpcRecv.** Gated behind a task-fault delivery that did not ship; not inspected.
+
+***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`).
+
+**Still deferred, unchanged by this prerequisite:** futex requeue, `WAIT_BITSET` and priority
+inheritance; recoverable demand/COW PageFault VM decomposition; timer-timeout decomposition;
+Spawn/Fork/Exit; RPi5; WA3C2; and direct-IpcCall production. No stage status changes merely
+because this prerequisite was delivered — U9-QA is CENSUS-DELTA 0, so the canonical stage
+arithmetic is unchanged.

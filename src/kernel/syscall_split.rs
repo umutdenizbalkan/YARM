@@ -187,6 +187,246 @@ pub(crate) fn try_split_dispatch(
 /// This is the pre-global-lock *result-writeback contract*. It is called from
 /// `handle_trap_entry_shared` BEFORE the global `with_cpu` lock is taken.
 ///
+/// U9-QA §2 — what the pre-lock split dispatcher DID, as three exact meanings.
+///
+/// Before U9-QA the answer was `Option<Result<(), TrapHandleError>>`, which could express only
+/// two: "not mine, fall back" and "mine, finished". Both are non-switching, and the trap entry
+/// acted on that — a `Some` early-returned through the live frame, because no split class had
+/// ever published a terminal transition.
+///
+/// FutexWait is the first that does. Its caller ends the trap `Blocked(Futex)` and current on no
+/// CPU, so BOTH old answers are wrong for it: falling back would re-execute the syscall on an
+/// already-blocked task, and early-returning would `iret`/`eret` through the parked caller's own
+/// frame. The third meaning names that state explicitly, so neither mistake is representable.
+// `QueueAdvanceCommitted` is constructed only by the pre-lock FutexWait route, which is
+// `cfg(not(hosted-dev))`; the hosted build compiles the type but never mints that variant.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum SplitDispatchDisposition {
+    /// The split route declined BEFORE it mutated anything. This is the ONLY route to a
+    /// fallback, and it is what makes the fallback safe: the trap enters the unchanged broad
+    /// dispatcher exactly as if the split route had never been consulted.
+    NotHandled,
+    /// A NON-SWITCHING split class serviced the syscall completely and wrote its result into the
+    /// frame. `Ok` is a success, `Err(Syscall(_))` an ordinary user-visible error the frame
+    /// carries back, any other `Err` a genuine kernel-side failure. The caller returns through
+    /// the architecture epilogue and runs NO queue-advance drain — there is nothing to drain.
+    Complete(Result<(), TrapHandleError>),
+    /// A terminal transition has been PUBLISHED: the caller is blocked/preempted/faulted, the
+    /// current slot is clear, and the exact outgoing identity is carried on the existing
+    /// per-CPU deferral. From here fallback is structurally impossible. The caller must NOT
+    /// enter the broad dispatcher and must NOT return through the outgoing frame; it falls
+    /// through to the existing post-lock drains, which consume that one deferral and settle the
+    /// trap as Switch, ResumeSame or TerminalIdle.
+    QueueAdvanceCommitted,
+}
+
+impl SplitDispatchDisposition {
+    /// The two-valued answer this seam gave before U9-QA.
+    ///
+    /// The five existing non-switching split classes must behave EXACTLY as they did, and their
+    /// coverage is written against that older shape. Rather than restate every one of those
+    /// assertions in new terms — which would quietly relicense what they prove — this maps the
+    /// two dispositions those classes can produce back onto it, so the cases keep asserting the
+    /// same facts about the same code.
+    ///
+    /// `QueueAdvanceCommitted` deliberately has NO legacy form. It is precisely the state the
+    /// old type could not express, and flattening it to either `None` or `Some` would reintroduce
+    /// one of the two mistakes the third variant exists to prevent, so it panics instead.
+    #[cfg(test)]
+    pub(crate) fn legacy(self) -> Option<Result<(), TrapHandleError>> {
+        match self {
+            Self::NotHandled => None,
+            Self::Complete(result) => Some(result),
+            Self::QueueAdvanceCommitted => {
+                panic!("a committed queue advance has no pre-U9-QA equivalent")
+            }
+        }
+    }
+}
+
+/// U9-QA §2 — the pre-lock split dispatcher.
+///
+/// FutexWait is tried first and separately because it is the only SWITCHING class: it must never
+/// reach the NR-only whitelist, whose whole contract is that every class on it is non-switching
+/// and may be early-returned. Every other class goes to the unchanged non-switching dispatcher
+/// and keeps its exact previous behavior — `None` becomes `NotHandled`, `Some(r)` becomes
+/// `Complete(r)`, and nothing about how those five are serviced changes.
+pub(crate) fn try_split_dispatch_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    match try_split_futex_wait_into_frame(shared, cpu, frame) {
+        SplitDispatchDisposition::NotHandled => {}
+        handled => return handled,
+    }
+    match try_split_dispatch_nonswitching_into_frame(shared, cpu, frame) {
+        None => SplitDispatchDisposition::NotHandled,
+        Some(result) => SplitDispatchDisposition::Complete(result),
+    }
+}
+
+/// U9-QA §2 — service `FutexWait` (NR 9) off the broad lock.
+///
+/// This is the migration of the EXISTING semantics onto the already-present split primitives —
+/// the same Phase A value check, the same Phase B block publication, and the same one-shot
+/// per-CPU deferral the in-lock `futex_wait_current` records. No timeout, no `WAIT_BITSET`, no
+/// requeue, no PI, no new flag and no ABI change.
+///
+/// The steps are ordered so that the LAST thing which can decline comes before the FIRST thing
+/// which mutates:
+///
+/// 1. **NR + ABI** — decoded exactly as `handle_futex_wait` decodes it. A non-`u32` argument is
+///    an `InvalidArgs` the broad handler owns, so it falls back.
+/// 2. **Phase A value check** — `futex_wait_would_block_split_read`. `None` is a validation miss
+///    whose canonical error is the broad handler's to produce; fall back and let it.
+/// 3. **Not blocking** — the futex word already moved. Nothing is published and no switch is
+///    needed, so this is an ordinary `Complete`, encoded exactly as the broad handler encodes it.
+/// 4. **Admission** — `queue_advance_admit_split`, plus this class's own precondition that no
+///    same-class deferral is outstanding. Every refusal lands here, while falling back is still
+///    safe. `Ok(None)` is ADMITTED: it means the advance will idle this CPU, which the drains
+///    already settle.
+/// 5. **Deferral reservation** — taken BEFORE the publication, because it is the only step that
+///    can fail for a reason unrelated to this caller. Reserving first keeps such a failure a
+///    pre-mutation refusal.
+/// 6. **Publication** — `futex_wait_publish_block_split_mut`. It returns `false` only when the
+///    caller has no TCB, and it does so BEFORE touching the scheduler, so that case is still
+///    unmutated: release the reservation and fall back.
+/// 7. **The result** — `set_ok(1, 0, 0)` into the OUTGOING frame, identical to the broad
+///    handler's `set_ok(usize::from(blocked), 0, 0)`. It is written before the switch so the
+///    caller observes it when it is later resumed.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_futex_wait_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
+    use SplitDispatchDisposition as D;
+
+    if frame.syscall_num() != crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR {
+        return D::NotHandled;
+    }
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return D::NotHandled;
+    }
+    // (1) ABI, identical to `handle_futex_wait`.
+    //
+    // Every decline from here on is ATTRIBUTED. These were silent, and that cost a diagnosis:
+    // AArch64 imported `nr=9` into the frame and still never took this route, with no marker to
+    // say which check declined it. A refusal that cannot be seen in a live log cannot be
+    // distinguished from a route that was never reached.
+    let addr = frame.arg(SYSCALL_ARG_CAP);
+    let (Ok(expected), Ok(observed)) = (
+        u32::try_from(frame.arg(SYSCALL_ARG_PTR)),
+        u32::try_from(frame.arg(SYSCALL_ARG_LEN)),
+    ) else {
+        // legacy: InvalidArgs, produced by the broad handler
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid=0 reason=arg_decode cpu={}",
+            cpu.0
+        );
+        return D::NotHandled;
+    };
+    let Some(tid) = shared.current_tid_authoritative(cpu) else {
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid=0 reason=no_current_task cpu={}",
+            cpu.0
+        );
+        return D::NotHandled;
+    };
+    // (2) Phase A: the off-lock value check.
+    let Some(would_block) = shared.futex_wait_would_block_split_read(tid, addr, expected, observed)
+    else {
+        // legacy: WrongObject / UserMemoryFault
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason=value_check addr={} expected={} observed={} cpu={}",
+            tid,
+            addr,
+            expected,
+            observed,
+            cpu.0
+        );
+        return D::NotHandled;
+    };
+    // (3) The non-blocking outcome: no transition, no switch, no drain.
+    if !would_block {
+        frame.set_ok(0, 0, 0);
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=not_blocked",
+            tid,
+            addr
+        );
+        return D::Complete(Ok(()));
+    }
+    // (4) ADMISSION — the last point at which falling back is safe.
+    if crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx) {
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason=already_deferred cpu={}",
+            tid,
+            cpu.0
+        );
+        return D::NotHandled;
+    }
+    // The FutexWait drains apply through the EXACT-TOKEN resume on all three architectures — they
+    // stash nothing and switch no kernel context — so admission is asked that convention's
+    // preconditions, not the stash's.
+    if let Err(refusal) = shared.queue_advance_admit_split(
+        cpu,
+        crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+    ) {
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason={:?} cpu={}",
+            tid,
+            refusal,
+            cpu.0
+        );
+        return D::NotHandled;
+    }
+    // (5) Reserve the deferral before publishing, so a reservation failure is pre-mutation.
+    if !crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid) {
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason=defer_unavailable cpu={}",
+            tid,
+            cpu.0
+        );
+        return D::NotHandled;
+    }
+    crate::yarm_log!("FUTEX_WAIT_SPLIT_BEGIN");
+    // (6) PUBLICATION. Past this line the trap MUST settle through the drains.
+    if !shared.futex_wait_publish_block_split_mut(cpu, tid, addr) {
+        // No TCB for the caller: the publish refused before it touched the scheduler, so
+        // nothing is mutated. Release the reservation and let the broad handler produce the
+        // canonical `TaskMissing`.
+        crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason=publish_no_tcb cpu={}",
+            tid,
+            cpu.0
+        );
+        return D::NotHandled;
+    }
+    crate::yarm_log!(
+        "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid={} cpu={}",
+        tid,
+        cpu_idx
+    );
+    // (7) The syscall's own result, into the outgoing frame, before the switch.
+    frame.set_ok(1, 0, 0);
+    D::QueueAdvanceCommitted
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_futex_wait_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
+}
+
 /// Returns:
 /// * `Some(Ok(()))`  — the syscall was a whitelisted split-eligible one, was
 ///   serviced via the per-domain split helpers, and the success payload was
@@ -203,7 +443,7 @@ pub(crate) fn try_split_dispatch(
 /// memory. Because no task switch occurs, `entering_tid == exiting_tid` and
 /// `task_switched == false` remain observable to the arch return-register
 /// writeback branch exactly as on the global-lock path.
-pub(crate) fn try_split_dispatch_into_frame(
+fn try_split_dispatch_nonswitching_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
@@ -1361,7 +1601,7 @@ mod tests {
         let requested = before.saturating_add(4);
         let mut frame = cnode_slots_frame(target, requested);
 
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())), "split seam must service NR 8");
         // Exact lanes the old global-lock handler produced: set_ok(slots, pid, 0).
         assert_eq!(frame.ret0(), requested, "ret0 == slots");
@@ -1393,7 +1633,7 @@ mod tests {
         // App requester (901) targeting a DIFFERENT pid (902) → MissingRight.
         let (kernel, _requester, target) = shared_with_app_requester();
         let mut frame = cnode_slots_frame(target, 16);
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(SyscallError::from(
@@ -1417,7 +1657,7 @@ mod tests {
         // the SAME Result the split-mut helper returns — never silently OK with a
         // bogus frame payload. Compare seam vs direct helper.
         let mut frame = cnode_slots_frame(unregistered_pid, 16);
-        let seam = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let seam = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         let direct =
             kernel.control_plane_set_process_cnode_slots_split_mut(900, unregistered_pid, 16);
         match (seam, direct) {
@@ -1455,12 +1695,12 @@ mod tests {
         let requested = before.saturating_add(6);
         let mut f1 = cnode_slots_frame(target, requested);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut f1),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut f1).legacy(),
             Some(Ok(()))
         );
         let mut f2 = cnode_slots_frame(target, requested);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut f2),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut f2).legacy(),
             Some(Ok(()))
         );
         assert_eq!(f2.ret0(), requested);
@@ -1485,14 +1725,14 @@ mod tests {
         let grow1 = base.saturating_add(2);
         let mut f1 = cnode_slots_frame(target, grow1);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut f1),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut f1).legacy(),
             Some(Ok(()))
         );
         assert_eq!(f1.ret0(), grow1);
         let grow2 = grow1.saturating_add(5);
         let mut f2 = cnode_slots_frame(target, grow2);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut f2),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut f2).legacy(),
             Some(Ok(()))
         );
         assert_eq!(f2.ret0(), grow2);
@@ -1510,7 +1750,7 @@ mod tests {
         let (kernel, _requester, target) = shared_with_app_requester();
         let mut frame = cnode_slots_frame(target, 16);
         let Some(Err(TrapHandleError::Syscall(err))) =
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy()
         else {
             panic!("expected a Syscall error");
         };
@@ -1525,7 +1765,7 @@ mod tests {
         let before_tid = kernel.current_tid_split_read(CPU0);
         assert_eq!(before_tid, Some(requester));
         let mut frame = cnode_slots_frame(target, 12);
-        let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         let after_tid = kernel.current_tid_split_read(CPU0);
         assert_eq!(
             after_tid,
@@ -1540,7 +1780,7 @@ mod tests {
         // its status is not changed to any blocked endpoint state.
         let (kernel, _requester, target) = shared_with_control_plane_requester();
         let mut frame = cnode_slots_frame(target, 14);
-        let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         let status = kernel.with(|state| state.task_status(target));
         assert!(
             !matches!(
@@ -1569,7 +1809,7 @@ mod tests {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
         let mut frame = TrapFrame::new(SYSCALL_IPC_SEND_NR, [1, 2, 3, 4, 5, 6]);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy(),
             None,
             "IPC send must fall back to the global-lock path"
         );
@@ -1581,7 +1821,7 @@ mod tests {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
         let mut frame = TrapFrame::new(SYSCALL_SPAWN_PROCESS_NR, [1, 2, 3, 4, 5, 6]);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy(),
             None
         );
         assert!(classify_split_eligible_nr_only(decode(SYSCALL_SPAWN_PROCESS_NR)).is_none());
@@ -1592,7 +1832,7 @@ mod tests {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
         let mut frame = TrapFrame::new(SYSCALL_VM_MAP_NR, [1, 2, 3, 4, 5, 6]);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy(),
             None
         );
         assert!(classify_split_eligible_nr_only(decode(SYSCALL_VM_MAP_NR)).is_none());
@@ -1609,7 +1849,7 @@ mod tests {
             [1, 2, 3, 4, 5, 6],
         );
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy(),
             None
         );
         assert!(
@@ -1730,7 +1970,7 @@ mod tests {
         let requested = before.saturating_add(3);
         let mut seam_frame = cnode_slots_frame(target, requested);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut seam_frame),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut seam_frame).legacy(),
             Some(Ok(()))
         );
 
@@ -1752,7 +1992,7 @@ mod tests {
         // path which never wrote set_ok on error.
         let (kernel, _requester, target) = shared_with_app_requester();
         let mut frame = cnode_slots_frame(target, 16);
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(SyscallError::from(
@@ -1770,7 +2010,7 @@ mod tests {
         let (kernel, requester, target) = shared_with_control_plane_requester();
         let entering = kernel.current_tid_split_read(CPU0);
         let mut frame = cnode_slots_frame(target, 10);
-        let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         let exiting = kernel.current_tid_split_read(CPU0);
         assert_eq!(entering, exiting);
         assert_eq!(exiting, Some(requester));
@@ -1786,7 +2026,7 @@ mod tests {
         // A NON-whitelisted syscall returns None from the seam.
         let mut send_frame = TrapFrame::new(SYSCALL_IPC_SEND_NR, [1, 2, 3, 4, 5, 6]);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut send_frame),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut send_frame).legacy(),
             None,
             "non-whitelisted syscall must fall back (None)"
         );
