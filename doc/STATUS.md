@@ -472,6 +472,74 @@ differ in exactly one line — a kernel code pointer that moved because the code
 `[ok]` counts equal (32/32 and 31/31) and `[error]` sets identical. The profiles' own end-to-end
 verdicts remain `result=fail` for the pre-existing reason above.
 
+
+### U9-QA — the off-lock queue-advancing dispatch prerequisite. CENSUS-DELTA 0.
+
+**U9-QA — CENSUS-DELTA 0 prerequisite.** U9-QA builds the transaction a terminal dispatcher would
+need in order to be retired, and wires the consumers whose evidence qualifies. It removes no
+acquisition: the census stays **2 / 0 / 2**, because residual fallback classes still reach both
+terminal acquisitions.
+
+**One queue-advance owner.** `SharedKernel::queue_advance_select_step_split` is the single
+off-lock selection step: it takes rank 1 once, authenticates the trap CPU against the
+authoritative dispatch CPU before any mutation, and calls the same
+`Scheduler::dispatch_next_selection_on` the broad path calls. Three consumers delegate to it —
+`futex_wait_dispatch_step_mut`, `yield_dispatch_step_mut` and `queue_advance_commit_split` — and
+none performs a dequeue of its own. `queue_advance_admit_split` / `queue_advance_commit_split`
+are the admit/commit halves: every refusal is raised before the first mutation, and the commit
+cannot refuse.
+
+**The apply convention is explicit.** `QueueAdvanceApply` distinguishes `StashedKernelSwitch`
+(the Stage 117 plan stash, x86_64/AArch64 only) from `ExactTokenResume` (what the FutexWait,
+Yield and D2 drains actually do on all three architectures). The two stash-specific refusals are
+scoped to the stash convention; scoping them is what let RISC-V in. The resumability screen is
+per-convention and per-architecture: only x86_64 requires a restorable saved context, because a
+never-run task there takes the first-resume trampoline — which is the stash path.
+
+**Delivered consumers.**
+
+| Consumer | Architectures | Route |
+|---|---|---|
+| FutexWait (NR 9) | x86_64, AArch64, RISC-V | PRE-LOCK: publishes its block off the broad lock, returns `QueueAdvanceCommitted`, skips the broad dispatcher, settles through its existing deferral/drain |
+| Timer preemption (Yield) | x86_64, AArch64, RISC-V | selection unified onto the one owner; the advance was already off-lock via Stage 192B |
+
+The pre-lock split seam answers with three meanings — `NotHandled`, `Complete(..)`,
+`QueueAdvanceCommitted` — and the third is what makes a switching class expressible: falling back
+would re-execute the syscall on an already-blocked task, and early-returning would return through
+the parked caller's own frame. `TrapPathWindow` is the single owner of the trap-path-active
+window on both the shared and RISC-V bridges.
+
+**The RISC-V restore was NOT written by U9-QA.** `direct_dispatch_resume_incoming` and the
+`riscv64/boot.rs` bridge write-back are its pre-existing, live-proven owners: the first does
+SATP activation, exact saved-context apply and exact parked-completion consumption; the second is
+the one frame writer and the ONE async-preemption tag consumer, selecting exactly one of the four
+resume conventions. U9-QA fixed ADMISSION, not restoration. Writing a second restore would have
+recreated the two-consumer ambiguity canonical 199E-R2 measured (407 tags published, 407 consumed
+at the wrong seam, 0 of 187 switching write-backs authorized).
+
+**FutexWait parks no blocked-syscall completion.** Its result is written into the outgoing frame
+before the switch, so there is nothing for a resume boundary to consume for that class.
+
+**NOT retired, and why.**
+
+* **Timer entry.** The tick, the IPC timeout collector and ten diagnostic hooks still run inside
+  the broad arm. Two blockers: `process_ipc_timeout_deadlines` has no split twin (~210 lines
+  across ranks 2/3/1), and five of the ten hooks have no other call site, so returning early for
+  a non-preempting tick would silently stop them running. Claim/ack and re-arm are *not*
+  blockers — `hal_adapters` already exposes them lock-free. **No timer-preemption dequeue was
+  witnessed live**; `YIELD_DISPATCH_DEQUEUE_OK` is 0 in all three core smokes.
+* **`Unknown` user exception.** No live witness on any architecture. Not delivered.
+* **Terminal user PageFault.** A live witness exists (AArch64 core smoke: user read at `0x0`,
+  `PAGE_FAULT_UNHANDLED` -> fault report -> replacement). It is still NOT routed: terminality
+  cannot be classified before mutation, because the classification IS the recovery attempt —
+  `try_handle_cow_fault` and `try_handle_demand_page_fault` both take `&mut self` and mutate as
+  part of deciding. A pure predicate would need demand-region decomposition or a COW primitive,
+  both out of scope.
+* **Blocking IpcRecv.** Gated behind a task-fault delivery that did not ship; not inspected.
+
+***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`).
+
 `doc/KERNEL_UNLOCKING.md` § U9-D3.
 
 **There is no U8 implementation outstanding.** Directive U8 was the AArch64

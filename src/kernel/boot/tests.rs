@@ -139487,6 +139487,168 @@ mod u9d3_split_unmap_drives_real_d3 {
     }
 }
 
+// ── U9-QA §4/§6: WHAT IS *NOT* RETIRED ────────────────────────────────────────────────────────
+//
+// Two routes were examined and deliberately NOT wired, and the reasons are structural rather than
+// incidental. A document that later claims either of them is retired would be wrong, so the
+// claims are pinned here in source instead of only in prose.
+//
+// TIMER. WIP-9 unified `yield_dispatch_step_mut` with the one selection owner — that is the
+// timer's queue ADVANCE, which Stage 192B had already moved off the broad lock. The timer ENTRY
+// is untouched: the tick, the IPC timeout collector and ten diagnostic hooks still run inside the
+// broad arm. Two of those are why a pre-lock timer route was not attempted — the timeout
+// collector has no split twin, and five hooks have no other call site, so returning early for a
+// non-preempting tick would silently stop them running.
+//
+// TASK FAULTS. `Unknown` has no live witness on any architecture, and the terminal user
+// PageFault — which DOES have one on AArch64 — cannot be classified as terminal before mutation,
+// because the classification IS the recovery attempt.
+#[cfg(test)]
+mod u9qa_not_retired {
+    const FAULT: &str = include_str!("fault_state.rs");
+    const MEMORY: &str = include_str!("memory_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+
+    /// Collapse whitespace so a multi-line method call still reads as one token sequence —
+    /// rustfmt wraps several of these calls, and the claim is about the call, not its layout.
+    fn flat(src: &str) -> alloc::string::String {
+        src.split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ")
+    }
+
+    /// The timer arm still owns the tick, the timeout collector and the diagnostic hooks, and
+    /// still re-arms — inside the broad handler. WIP-9 changed the SELECTION owner, not this.
+    #[test]
+    fn the_timer_entry_is_still_broad() {
+        let arm = FAULT
+            .split("Trap::TimerInterrupt => {")
+            .nth(1)
+            .and_then(|s| s.split("\n            Trap::").next())
+            .expect("the arch-neutral timer arm");
+        let arm_flat = flat(arm);
+        for step in [
+            "self.hal.acknowledge_interrupt(",
+            "self.tick_scheduler_timer()",
+            ".process_ipc_timeout_deadlines(_tick.0)",
+            "self.hal.program_timer_deadline(",
+        ] {
+            assert!(
+                arm_flat.contains(step),
+                "the timer entry must still perform `{step}` inside the broad arm — WIP-9 \
+                 retired the SELECTION owner, not the timer entry"
+            );
+        }
+        // The five hooks with no other call site. If any of these ever gains a pre-lock route,
+        // this list is where the claim has to be re-derived rather than quietly dropped.
+        for only in [
+            "self.maybe_run_cap_cnode_proof()",
+            "self.maybe_run_fault_delivery_proof()",
+            "self.maybe_run_spawn_lifecycle_proof()",
+            "self.maybe_run_global_state_audit()",
+            "self.maybe_run_smp_ready_audit()",
+        ] {
+            assert!(
+                arm.contains(only),
+                "the timer arm is the ONLY caller of `{only}`; a pre-lock timer route that \
+                 returned early would stop it running"
+            );
+            assert_eq!(
+                FAULT.matches(only).count(),
+                1,
+                "`{only}` must still have exactly one call site — that is what makes skipping \
+                 the broad timer arm a silent regression rather than a refactor"
+            );
+        }
+    }
+
+    /// The timeout collector still takes the broad `&mut self`: there is no split twin, which is
+    /// the first of the two named timer blockers.
+    #[test]
+    fn the_timeout_collector_has_no_split_twin() {
+        assert!(
+            flat(FAULT).contains(".process_ipc_timeout_deadlines(_tick.0)"),
+            "the timer arm must still call the broad timeout collector"
+        );
+        let ipc = include_str!("ipc_state.rs");
+        assert!(
+            flat(ipc).contains("pub(crate) fn process_ipc_timeout_deadlines( &mut self,"),
+            "the collector must still be a broad &mut KernelState method"
+        );
+        assert!(
+            !ipc.contains("fn process_ipc_timeout_deadlines_split"),
+            "no split twin exists; adding one is an IPC-domain increment, not this one"
+        );
+    }
+
+    /// Neither PageFault recovery path is a pure predicate: both take `&mut self` and mutate as
+    /// part of deciding. That is why "definitively terminal" cannot be classified before
+    /// mutation without demand-region decomposition or a COW primitive — both forbidden — and
+    /// therefore why the terminal user PageFault route was left unchanged.
+    #[test]
+    fn the_pagefault_classification_is_the_recovery_attempt() {
+        assert!(
+            flat(FAULT).contains("pub(crate) fn try_handle_demand_page_fault( &mut self,"),
+            "the demand handler decides by attempting, under &mut self"
+        );
+        assert!(
+            flat(MEMORY).contains("pub(crate) fn try_handle_cow_fault( &mut self,"),
+            "the COW handler decides by attempting, under &mut self"
+        );
+        // The order in the arm is: try COW (mutates), try demand (mutates), only then UNHANDLED.
+        let arm = FAULT
+            .split("TrapEvent::PageFault(fault) => {")
+            .nth(1)
+            .and_then(|s| s.split("TrapEvent::ExternalInterrupt").next())
+            .expect("the PageFault arm");
+        let cow = arm.find("try_handle_cow_fault(").expect("cow attempt");
+        let demand = arm
+            .find("try_handle_demand_page_fault(")
+            .expect("demand attempt");
+        let unhandled = arm
+            .find("PAGE_FAULT_UNHANDLED")
+            .expect("the terminal marker");
+        assert!(
+            cow < unhandled && demand < unhandled,
+            "terminality is only known AFTER both recovery attempts have run"
+        );
+    }
+
+    /// The terminal fault transaction still advances the queue through the BROAD dispatcher. No
+    /// U9-QA route was wired for it, so nothing may claim one.
+    #[test]
+    fn the_terminal_fault_route_still_uses_the_broad_dispatcher() {
+        let body = FAULT
+            .split("fn fault_current_task_with_fault(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("the terminal fault transaction");
+        assert!(
+            body.contains("self.dispatch_next_task()"),
+            "the fault route must still use the broad dispatcher — it was not retired"
+        );
+        assert!(
+            !body.contains("queue_advance_commit_split") && !body.contains("QueueAdvanceCommitted"),
+            "no U9-QA queue advance is wired into the fault route"
+        );
+    }
+
+    /// Direct IpcCall production stays off.
+    #[test]
+    fn direct_production_remains_false() {
+        assert!(
+            MOD_SRC.contains(
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    false\n}"
+            ),
+            "direct-IpcCall production must remain a compile-time false"
+        );
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "and must evaluate false"
+        );
+    }
+}
+
 // ── U9-QA §1: THE APPLY CONVENTION, AND WHY RISC-V WAS REFUSED ────────────────────────────────
 //
 // The transaction owns ONE selection policy, but the architectures have two established ways of

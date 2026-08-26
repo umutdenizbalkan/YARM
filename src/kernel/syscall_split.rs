@@ -198,6 +198,9 @@ pub(crate) fn try_split_dispatch(
 /// CPU, so BOTH old answers are wrong for it: falling back would re-execute the syscall on an
 /// already-blocked task, and early-returning would `iret`/`eret` through the parked caller's own
 /// frame. The third meaning names that state explicitly, so neither mistake is representable.
+// `QueueAdvanceCommitted` is constructed only by the pre-lock FutexWait route, which is
+// `cfg(not(hosted-dev))`; the hosted build compiles the type but never mints that variant.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 #[derive(Debug)]
 pub(crate) enum SplitDispatchDisposition {
     /// The split route declined BEFORE it mutated anything. This is the ONLY route to a

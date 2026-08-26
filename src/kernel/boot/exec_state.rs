@@ -192,6 +192,9 @@ pub(crate) fn ap_probe_stub_bytes() -> &'static [u8] {
 /// is no third state: once `Switch` is returned the outgoing task has been published as no longer
 /// current and the plan is stashed, so the caller MUST drive the arch apply and MUST NOT fall back
 /// to the terminal broad dispatcher.
+// Used by the pre-lock split route, which is `cfg(not(hosted-dev))`; the hosted build
+// compiles the transaction but has no caller for it.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueueAdvanceOutcome {
     /// The scheduler re-selected the same task. The interrupted frame is preserved untouched and
@@ -215,6 +218,9 @@ pub(crate) enum QueueAdvanceOutcome {
 /// putting the selected task on the CPU, and they have different preconditions. Admission asked
 /// only the first one's questions, which made it refuse RISC-V outright — for a reason that is
 /// true of the stash and false of the resume RISC-V actually uses.
+// Used by the pre-lock split route, which is `cfg(not(hosted-dev))`; the hosted build
+// compiles the transaction but has no caller for it.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueueAdvanceApply {
     /// The Stage 117 switch-plan stash, drained by `trap_entry::drain_switch_plan_stash`, which
@@ -233,6 +239,9 @@ pub(crate) enum QueueAdvanceApply {
 
 /// Why the queue advance declined. EVERY variant is raised before the first mutation, so a refused
 /// caller may safely fall through to the unchanged terminal broad dispatcher.
+// Used by the pre-lock split route, which is `cfg(not(hosted-dev))`; the hosted build
+// compiles the transaction but has no caller for it.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueueAdvanceRefusal {
     /// This architecture has no off-lock switch apply. The Stage 117 stash gate opens with
@@ -4251,6 +4260,7 @@ impl crate::runtime::SharedKernel {
     /// that the two stash-specific refusals are asked only of a caller that will actually stash.
     ///
     /// `Ok(None)` means "no candidate": the advance will legitimately idle this CPU.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub(crate) fn queue_advance_admit_split(
         &self,
         cpu: CpuId,
@@ -4409,6 +4419,7 @@ impl crate::runtime::SharedKernel {
     /// * **the superseding task is not resumable** — step (3) refuses, and the dequeue is undone
     ///   with its exact inverse. The queue and the current slot are left exactly as the wake left
     ///   them, and this CPU idles; nothing stale is switched to.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub(crate) fn queue_advance_commit_split(
         &self,
         cpu: CpuId,
