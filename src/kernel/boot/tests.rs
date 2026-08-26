@@ -140652,3 +140652,184 @@ mod u9qa_one_queue_advance_owner {
         );
     }
 }
+
+// ── U9-TM §1/§4: THE TIMER ENTRY, RE-DERIVED ─────────────────────────────────────────────────
+//
+// Two facts about the broad timer arm are load-bearing for U9-TM and neither was pinned before.
+//
+// FIRST: `process_ipc_timeout_deadlines` owns NO timeout class. U7 (canonical 199E) retired all
+// three — reply-receive, blocking-send, and finally the ordinary receive deadline — to the
+// off-lock pipeline (`run_due_ipc_timeout_work` -> `collect_due_ipc_timeout_work` ->
+// `drain_{reply,send,recv}_timeout_post_work`), which runs post-lock in every port's trap
+// wrapper. What is left in the broad scan is an unconditional `continue` above a preserved,
+// unreachable body. It is a NO-OP, so the timer entry has no timeout dependency to split.
+//
+// SECOND: the tick POLICY was never duplicated. `SchedulerTimer::tick_and_check` has one
+// definition; the broad arm's `&mut KernelState` was only ever the means of reaching
+// `sched.timer`. `scheduler_tick_split_mut` reaches the same field through the rank-1 seam.
+#[cfg(test)]
+mod u9tm_timer_entry {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::{SchedulerTickOutcome, SharedKernel};
+
+    const IPC: &str = include_str!("ipc_state.rs");
+    const SCHED_TIMER: &str = include_str!("../scheduler_timer.rs");
+    const SCHED_STATE: &str = include_str!("scheduler_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    /// STRUCTURAL: the broad scan short-circuits unconditionally before its preserved body, and
+    /// the body below is marked unreachable. This is what makes the function a no-op.
+    #[test]
+    fn the_broad_timeout_scan_owns_no_class() {
+        let body = IPC
+            .split("pub(crate) fn process_ipc_timeout_deadlines(")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub(crate) fn ").next())
+            .expect("the broad timeout scan");
+        let stop = body
+            .find("\n                    continue;\n                    #[allow(unreachable_code)]")
+            .expect("the unconditional short-circuit above the preserved body");
+        // Every earlier exit in the scan loop is also a `continue`, so no `tcb` can reach the
+        // selection arms. Nothing between the loop head and the short-circuit may collect.
+        let head = body
+            .find("for tcb in tcbs.iter_mut().flatten()")
+            .expect("the scan loop");
+        let prelude = &body[head..stop];
+        assert!(
+            !prelude.contains("expired[n] = Some("),
+            "no entry may be collected before the unconditional short-circuit"
+        );
+        let flat = body
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("this scan owns // NO timeout class at all"),
+            "the retired-class statement must remain in the source it describes"
+        );
+    }
+
+    /// The off-lock pipeline that owns all three classes exists and is driven post-lock from
+    /// BOTH trap wrappers. If either call site disappeared, the classes would have no owner.
+    #[test]
+    fn the_off_lock_timeout_pipeline_owns_all_three_classes() {
+        for f in [
+            "fn collect_due_ipc_timeout_work(",
+            "fn drain_reply_timeout_post_work(",
+            "fn drain_send_timeout_post_work(",
+            "fn drain_recv_timeout_post_work(",
+            "fn run_due_ipc_timeout_work(",
+        ] {
+            assert!(
+                RUNTIME.contains(f),
+                "the off-lock pipeline must provide `{f}`"
+            );
+        }
+        let shared = include_str!("../../arch/trap_entry.rs");
+        let riscv = include_str!("../../arch/riscv64/trap.rs");
+        assert!(
+            shared.contains("shared.run_due_ipc_timeout_work(cpu);"),
+            "the shared trap wrapper must drive the off-lock timeout pipeline"
+        );
+        assert!(
+            riscv.contains("shared.run_due_ipc_timeout_work(cpu);"),
+            "the RISC-V trap wrapper must drive the off-lock timeout pipeline"
+        );
+    }
+
+    /// EMPIRICAL: the broad scan collects nothing and reports nothing, for any tick.
+    #[test]
+    fn the_broad_timeout_scan_is_a_no_op() {
+        let mut state = Bootstrap::init().expect("init");
+        for now in [0u64, 1, 7, u64::MAX] {
+            let expired = state
+                .process_ipc_timeout_deadlines(now)
+                .expect("the scan must not error");
+            assert_eq!(
+                expired, 0,
+                "the broad scan must collect nothing at now={now}"
+            );
+        }
+    }
+
+    /// The tick policy has exactly ONE implementation, and both the broad arm and the rank-1
+    /// owner call it.
+    #[test]
+    fn the_tick_policy_has_one_implementation() {
+        assert_eq!(
+            SCHED_TIMER
+                .matches("pub fn tick_and_check(&mut self) -> (Tick, bool)")
+                .count(),
+            1,
+            "one tick policy"
+        );
+        assert!(
+            SCHED_STATE.contains("sched.timer.tick_and_check()"),
+            "the broad arm reaches the one policy"
+        );
+        let owner = RUNTIME
+            .split("pub(crate) fn scheduler_tick_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the rank-1 tick owner");
+        assert!(
+            owner.contains("sched.timer.tick_and_check()"),
+            "the rank-1 owner reaches the SAME policy — it does not restate it"
+        );
+        assert_eq!(
+            owner.matches("with_scheduler_split_mut").count(),
+            1,
+            "one rank-1 acquisition"
+        );
+        // It always ticks: no refusal may skip the increment.
+        assert!(
+            !owner.contains("return SchedulerTickOutcome::")
+                || !owner.contains("dispatch_cpu != cpu"),
+            "the tick owner must not gate the increment on a CPU check"
+        );
+    }
+
+    /// EMPIRICAL: the rank-1 owner produces the same increment and the same preemption predicate
+    /// the broad path would, tick for tick, across a whole quantum.
+    #[test]
+    fn the_split_tick_matches_the_broad_tick_across_a_quantum() {
+        // A short quantum, installed through the established test seam on BOTH kernels, so the
+        // window provably crosses a boundary. The production quantum is 50_000_000 ticks on this
+        // host, which would make a no-switch-only comparison the only feasible one.
+        const Q: u64 = 4;
+        let mut broad = Bootstrap::init().expect("init");
+        broad.set_timer_for_test(crate::kernel::scheduler_timer::Timer::new(Q));
+        let mut reference = alloc::vec::Vec::new();
+        let steps = (Q as usize) * 2 + 1;
+        for _ in 0..steps {
+            let (t, p) = broad.tick_scheduler_timer();
+            reference.push((t.0, p));
+        }
+        // Split run from an identical fresh kernel with the identical quantum.
+        let mut split_state = Bootstrap::init().expect("init");
+        split_state.set_timer_for_test(crate::kernel::scheduler_timer::Timer::new(Q));
+        let shared = SharedKernel::new(split_state);
+        let mut observed = alloc::vec::Vec::new();
+        for _ in 0..steps {
+            observed.push(match shared.scheduler_tick_split_mut(CpuId(0)) {
+                SchedulerTickOutcome::NoSwitch { tick, cpu } => {
+                    assert_eq!(cpu, CpuId(0), "the outcome carries the caller's CPU");
+                    (tick, false)
+                }
+                SchedulerTickOutcome::Preempt { tick, cpu } => {
+                    assert_eq!(cpu, CpuId(0), "the outcome carries the caller's CPU");
+                    (tick, true)
+                }
+            });
+        }
+        assert_eq!(
+            observed, reference,
+            "the rank-1 tick must match the broad tick increment and preemption predicate exactly"
+        );
+        assert!(
+            reference.iter().any(|(_, p)| *p),
+            "fixture check: the window must actually cross a quantum boundary"
+        );
+    }
+}
