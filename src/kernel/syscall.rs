@@ -589,7 +589,7 @@ pub(crate) fn complete_blocked_recv_for_waiter(
         app_opcode,
         app_payload.len(),
         cap_id,
-        recv_meta_flags as u64,
+        recv_meta_flags,
         msg.sender_tid.0,
     );
     match kernel.copy_to_user(
