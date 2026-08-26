@@ -1924,6 +1924,24 @@ impl SharedKernel {
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
+    /// U9-FT4 — the terminal-fault sibling of [`Self::futex_wait_reverify_blocked`].
+    ///
+    /// The post-lock drain admits exactly TWO outgoing states, and verifies each exactly: a
+    /// FutexWait caller is `Blocked(Futex)`, a terminally faulted task is `Faulted`. Both mean
+    /// the same thing to the drain — the outgoing task is off the CPU and a queue advance is
+    /// owed — so they share ONE drain rather than growing a second one. Neither predicate is
+    /// loosened: this one accepts `Faulted` and nothing else.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn terminal_fault_reverify_faulted(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| matches!(tcb.status, crate::kernel::task::TaskStatus::Faulted))
+                .unwrap_or(false)
+        })
+    }
+
     pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {
         self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()
@@ -4189,26 +4207,11 @@ impl SharedKernel {
             );
             return refusal;
         }
-        // (2) Capture the outgoing user context BEFORE anything can schedule.
-        let captured = self.capture_outgoing_user_context_split(tid, frame);
-        // (3) Admit the queue advance before the irreversible scheduler mutation, so a refusal
-        // still leaves the task current.
-        let admitted = match self.queue_advance_admit_split(
-            cpu,
-            crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
-        ) {
-            Ok(a) => a,
-            Err(refusal) => {
-                crate::yarm_log!(
-                    "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=admit reason={:?}",
-                    cpu.0,
-                    tid,
-                    refusal
-                );
-                return T::RefusedTransitionRejected;
-            }
-        };
-        // (4) rank 1 — clear `current`. Irreversible from here.
+        // U9-FT4: the outgoing context is captured by the CALLER, before publication and while
+        // the deferral reservation is held. Capturing again here would be a redundant second
+        // write of the same frame, so this transaction does not capture.
+        let _ = frame;
+        // (3) rank 1 — clear `current`. Irreversible from here.
         let removed = match self.block_current_on_cpu_split(cpu) {
             Ok(r) => r,
             Err(_) => return T::RefusedVictimChanged,
@@ -4240,29 +4243,16 @@ impl SharedKernel {
             );
             return T::RefusedTransitionRejected;
         }
-        // (6) The U9-QA selection owner performs the advance — no second selection policy.
-        let outcome = self.queue_advance_commit_split(cpu, tid, admitted);
-        let replacement = match outcome {
-            crate::kernel::boot::QueueAdvanceOutcome::Switch { incoming_tid, .. } => {
-                Some(incoming_tid)
-            }
-            // `ResumeSame` cannot occur here: the faulting task was just removed from `current`
-            // and marked `Faulted`, so it is not re-selectable. `TerminalIdle` means nothing is
-            // runnable and the architecture's existing idle path is entered.
-            crate::kernel::boot::QueueAdvanceOutcome::ResumeSame
-            | crate::kernel::boot::QueueAdvanceOutcome::TerminalIdle => None,
-        };
+        // U9-FT4: the transition does NOT advance the queue. The EXISTING post-lock drain owns
+        // selection and the incoming-context apply, through `queue_advance_select_step_split` —
+        // exactly as it does for FutexWait. Advancing here was the FT3 defect: it selected
+        // nothing and nothing applied an incoming context, so the faulting PC resumed.
         crate::yarm_log!(
-            "TERMINAL_FAULT_SPLIT_COMMITTED cpu={} tid={} captured={} replacement={:?}",
+            "TERMINAL_FAULT_SPLIT_COMMITTED cpu={} tid={} captured=1 advance=deferred",
             cpu.0,
-            tid,
-            u8::from(captured),
-            replacement
+            tid
         );
-        T::Committed {
-            faulted_tid: tid,
-            replacement,
-        }
+        T::Committed { faulted_tid: tid }
     }
 
     /// U9-FT3 §1 — the read-only buffered fault-report admission preflight.

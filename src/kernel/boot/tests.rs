@@ -139960,12 +139960,29 @@ mod u9qa_split_dispatch_disposition {
             !between.contains("DISPATCH_SWITCH_PLAN_STASH") && !between.contains("has_plan()"),
             "a stale or unrelated stash must not alter dispatch control flow"
         );
-        // And the flag it reads is set only by the committed arm.
+        // U9-FT4 re-derivation: the flag is now set by THREE explicit disposition arms rather
+        // than one, because a second class (the AArch64 terminal fault) commits. The semantic
+        // claim is unchanged and is what is asserted here: every setter sits inside an explicit
+        // `SplitDispatchDisposition` match arm, and none is inferred from a stash. The count is
+        // pinned so a fourth setter cannot appear unreviewed.
         assert_eq!(
             code.matches("queue_advance_committed = true;").count(),
-            1,
-            "exactly one place may declare a publication committed"
+            3,
+            "exactly three disposition arms may declare the broad dispatcher skipped: \
+             FutexWait publication, terminal-fault commit, terminal-fault fail-closed"
         );
+        for (i, _) in code.match_indices("queue_advance_committed = true;") {
+            let before = &code[..i];
+            let arm = before
+                .rfind("SplitDispatchDisposition::")
+                .or_else(|| before.rfind("D::"))
+                .expect("every setter must sit inside a typed disposition arm");
+            let between = &before[arm..];
+            assert!(
+                !between.contains("has_plan()") && !between.contains("DISPATCH_SWITCH_PLAN_STASH"),
+                "no setter may be gated on a stash inspection"
+            );
+        }
     }
 
     /// A `Complete` disposition returns through the architecture epilogue and therefore reaches
@@ -142265,17 +142282,33 @@ mod u9ft3_transition {
     }
 
     /// The outgoing context is captured BEFORE anything can schedule.
+    /// The outgoing context is captured BEFORE anything can schedule.
+    ///
+    /// U9-FT4 re-derivation: capture moved OUT of the transition and into the ROUTE, where it
+    /// happens while the deferral reservation is held and before any publication. The semantic
+    /// claim - capture precedes every scheduling step - is unchanged.
     #[test]
     fn the_outgoing_context_is_captured_before_scheduling() {
-        let b = body();
-        let capture = b
-            .find("self.capture_outgoing_user_context_split(tid, frame)")
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        let r = SPLIT_SRC
+            .split("fn try_split_terminal_page_fault_into_frame(")
+            .nth(1)
+            .expect("the terminal route");
+        let capture = r
+            .find("capture_outgoing_user_context_split(facts.tid, frame)")
             .expect("capture");
-        let block = b
-            .find("self.block_current_on_cpu_split(cpu)")
-            .expect("rank 1");
-        let commit = b.find("self.queue_advance_commit_split(").expect("advance");
-        assert!(capture < block && capture < commit);
+        let publish = r
+            .find("commit_buffered_fault_report_shared(")
+            .expect("publish");
+        let transition = r
+            .find("commit_terminal_fault_transition_shared(")
+            .expect("transition");
+        assert!(
+            capture < publish && capture < transition,
+            "capture must precede publication and the transition"
+        );
+        let b = body();
+        assert!(!b.contains("capture_outgoing_user_context_split"));
     }
 
     /// The status write happens exactly ONCE, through the existing transition owner.
@@ -142291,12 +142324,24 @@ mod u9ft3_transition {
     }
 
     /// The queue advance uses the U9-QA owner — no second selection policy is created.
+    /// The queue advance uses the U9-QA owner - no second selection policy is created.
+    ///
+    /// U9-FT4 re-derivation: the advance moved OUT of the transition and into the EXISTING
+    /// post-lock drain, which selects through `queue_advance_select_step_split`. The semantic
+    /// claim - exactly one selection policy, and it is U9-QA's - is unchanged and now asserted
+    /// against the drain, plus the transition's continued abstinence.
     #[test]
     fn the_advance_uses_the_u9qa_selection_owner() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        let step = RUNTIME_SRC
+            .split("pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the drain selection step");
+        assert!(step.contains("queue_advance_select_step_split(cpu"));
         let b = body();
-        assert!(b.contains("self.queue_advance_admit_split("));
-        assert!(b.contains("self.queue_advance_commit_split("));
         for forbidden in [
+            "queue_advance_commit_split",
             "dispatch_next_task",
             "dispatch_next_selection_on",
             "local_dispatch_step_split_selection",
@@ -142311,14 +142356,35 @@ mod u9ft3_transition {
 
     /// Admission precedes the irreversible scheduler mutation, so a refused advance still leaves
     /// the task current.
+    /// Admission precedes the irreversible scheduler mutation.
+    ///
+    /// U9-FT4 re-derivation: admission moved OUT of the transition and into the ROUTE, where it
+    /// runs before the deferral reservation and before any publication - strictly earlier than
+    /// before, and therefore still before the transition's rank-1 mutation.
     #[test]
     fn admission_precedes_the_irreversible_mutation() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        let r = SPLIT_SRC
+            .split("fn try_split_terminal_page_fault_into_frame(")
+            .nth(1)
+            .expect("the terminal route");
+        let admit = r.find("queue_advance_admit_split(").expect("admit");
+        let reserve = r.find("futex_wait_dispatch_try_defer(").expect("reserve");
+        let transition = r
+            .find("commit_terminal_fault_transition_shared(")
+            .expect("transition");
+        assert!(
+            admit < reserve && reserve < transition,
+            "admission must precede the reservation and the transition"
+        );
         let b = body();
-        let admit = b.find("self.queue_advance_admit_split(").expect("admit");
+        let validate = b
+            .find("task_transition_would_be_accepted")
+            .expect("the barrier");
         let block = b
             .find("self.block_current_on_cpu_split(cpu)")
             .expect("rank 1");
-        assert!(admit < block);
+        assert!(validate < block);
     }
 
     /// There is NO broad fallback anywhere in the transition — re-entering the broad emitter
@@ -142377,5 +142443,210 @@ mod u9ft3_transition {
         let check = b.find("if removed != Some(tid)").expect("victim check");
         let apply = b.find("apply_task_transition(").expect("status write");
         assert!(check < apply, "verify the victim before writing its status");
+    }
+}
+
+/// U9-FT4 — the AArch64 terminal PageFault route and its deferral/drain contract.
+mod u9ft4_route {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const ARM_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+
+    fn route() -> &'static str {
+        SPLIT_SRC
+            .split("fn try_split_terminal_page_fault_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the terminal route")
+    }
+
+    /// THE FT3 FIX: `QueueAdvanceCommitted` is returned ONLY with a reserved deferral. Without
+    /// one nothing applies an incoming context and the faulting PC resumes.
+    #[test]
+    fn queue_advance_committed_requires_a_reserved_deferral() {
+        let r = route();
+        let reserve = r
+            .find("futex_wait_dispatch_try_defer(cpu_idx, facts.tid)")
+            .expect("the reservation");
+        let commit = r
+            .rfind("D::QueueAdvanceCommitted")
+            .expect("the committed return");
+        assert!(
+            reserve < commit,
+            "the deferral must be reserved before QueueAdvanceCommitted is returned"
+        );
+        // And the route never returns Committed on a path that released the reservation.
+        let released: alloc::vec::Vec<usize> = r
+            .match_indices("futex_wait_dispatch_clear(cpu_idx)")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!released.is_empty(), "release paths must exist");
+        for i in released {
+            let tail = &r[i..];
+            let next_return = tail
+                .find("return D::")
+                .map(|j| &tail[j..j + 40])
+                .unwrap_or("");
+            assert!(
+                !next_return.contains("QueueAdvanceCommitted"),
+                "a released reservation must never be followed by QueueAdvanceCommitted"
+            );
+        }
+    }
+
+    /// ORDERING modelled on FutexWait: admit -> reserve -> publish -> transition.
+    #[test]
+    fn the_ordering_matches_futex_wait() {
+        let r = route();
+        let admit = r.find("queue_advance_admit_split(").expect("u9qa admit");
+        let reserve = r.find("futex_wait_dispatch_try_defer(").expect("reserve");
+        let publish = r
+            .find("commit_buffered_fault_report_shared(")
+            .expect("publish");
+        let transition = r
+            .find("commit_terminal_fault_transition_shared(")
+            .expect("transition");
+        assert!(
+            admit < reserve && reserve < publish && publish < transition,
+            "ordering must be admit -> reserve -> publish -> transition"
+        );
+        // The outgoing context is captured before publication.
+        let capture = r
+            .find("capture_outgoing_user_context_split(")
+            .expect("capture");
+        assert!(reserve < capture && capture < publish);
+    }
+
+    /// Any failure BEFORE publication releases the reservation and may fall back; after
+    /// publication there is no broad fallback.
+    #[test]
+    fn pre_publication_failures_release_and_may_fall_back() {
+        let r = route();
+        let publish = r
+            .find("commit_buffered_fault_report_shared(")
+            .expect("publish");
+        // The buffered-commit refusal arm releases and returns NotHandled.
+        let after = &r[publish..];
+        let refusal_arm = after
+            .find("futex_wait_dispatch_clear(cpu_idx);")
+            .expect("release on refused publication");
+        let not_handled = after.find("return D::NotHandled;").expect("fallback");
+        assert!(refusal_arm < not_handled);
+        // After a SUCCESSFUL publication the route never returns NotHandled.
+        let committed = after.rfind("D::QueueAdvanceCommitted").expect("committed");
+        let tail = &after[committed..];
+        assert!(!tail.contains("D::NotHandled"));
+    }
+
+    /// The route creates no second selection policy: it never selects, only defers.
+    #[test]
+    fn the_route_never_selects() {
+        let r = route();
+        for forbidden in [
+            "queue_advance_commit_split",
+            "dispatch_next_task",
+            "dispatch_next_selection_on",
+            "local_dispatch_step_split_selection",
+        ] {
+            assert!(
+                !r.contains(forbidden),
+                "the route must defer selection to the drain, not perform it: `{forbidden}`"
+            );
+        }
+    }
+
+    /// The terminal transition no longer advances the queue -- the drain owns it. This is the
+    /// exact FT3 regression this guard prevents.
+    #[test]
+    fn the_transition_does_not_advance_the_queue() {
+        let b = RUNTIME_SRC
+            .split("pub(crate) fn commit_terminal_fault_transition_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// U9-FT3 §1").next())
+            .expect("the transition");
+        assert!(
+            !b.contains("queue_advance_commit_split"),
+            "the transition must NOT perform the advance; the drain does"
+        );
+        assert!(b.contains("advance=deferred"));
+    }
+
+    /// ONE drain, widened to admit exactly TWO outgoing states, each verified exactly.
+    #[test]
+    fn one_drain_admits_exactly_two_outgoing_states() {
+        assert!(ENTRY_SRC.contains("shared.futex_wait_reverify_blocked(t)"));
+        assert!(ENTRY_SRC.contains("shared.terminal_fault_reverify_faulted(t)"));
+        // Each predicate stays exact: futex accepts only Blocked(Futex), terminal only Faulted.
+        let futex = RUNTIME_SRC
+            .split("pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("futex reverify");
+        assert!(futex.contains("WaitReason::Futex"));
+        assert!(!futex.contains("TaskStatus::Faulted"));
+        let terminal = RUNTIME_SRC
+            .split("pub(crate) fn terminal_fault_reverify_faulted(&self, tid: u64) -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("terminal reverify");
+        assert!(terminal.contains("TaskStatus::Faulted"));
+        assert!(!terminal.contains("WaitReason::Futex"));
+        // Exactly one drain body consumes the deferral on AArch64.
+        assert_eq!(
+            ENTRY_SRC
+                .matches("futex_wait_dispatch_is_deferred(cpu_idx)")
+                .count(),
+            2,
+            "one x86_64 drain and one AArch64 drain, no third"
+        );
+    }
+
+    /// AArch64 only: no other architecture takes the split terminal route.
+    #[test]
+    fn the_route_is_aarch64_only() {
+        let r = route();
+        assert!(r.contains(r#"if !cfg!(target_arch = "aarch64")"#));
+        assert!(r.contains(r#"page_fault_route_for("aarch64", class)"#));
+    }
+
+    /// Waiter delivery, COW and demand all stay broad: the route admits none of them.
+    #[test]
+    fn waiter_cow_and_demand_stay_broad() {
+        let r = route();
+        assert!(r.contains("PageFaultRoute::SplitTerminal"));
+        assert!(r.contains("A::WaiterPresent"), "waiter declines explicitly");
+        for forbidden in [
+            "complete_blocked_recv_for_waiter",
+            "try_handle_cow_fault",
+            "try_handle_demand_page_fault",
+            "SplitCow",
+        ] {
+            assert!(!r.contains(forbidden), "must not touch `{forbidden}`");
+        }
+    }
+
+    /// The AArch64 smoke asserts the chain POSITIVELY, not merely by fatal-pattern absence --
+    /// the FT3 attempt exited 0 while the faulting PC resumed.
+    #[test]
+    fn the_smoke_asserts_the_chain_positively() {
+        for required in [
+            "PAGE_FAULT_ENTRY tid=1 addr=0x0 access=Read",
+            "TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=3 queued=1 woke=0",
+            "TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred",
+            "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid=1 cpu=0",
+            "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=terminal_fault_committed",
+            "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=2",
+            "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid=2 asid=2",
+            "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid=2",
+            "PAGE_FAULT_ENTRY tid=18446744073709551615",
+        ] {
+            assert!(
+                ARM_SMOKE.contains(required),
+                "the AArch64 smoke must assert `{required}`"
+            );
+        }
+        assert!(ARM_SMOKE.contains("u9ft4_require_one"));
+        assert!(ARM_SMOKE.contains("u9ft4_require_zero"));
     }
 }

@@ -201,6 +201,202 @@ pub(crate) fn try_split_dispatch(
 // `QueueAdvanceCommitted` is constructed only by the pre-lock FutexWait route, which is
 // `cfg(not(hosted-dev))`; the hosted build compiles the type but never mints that variant.
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+/// U9-FT4 — the pre-lock AArch64 terminal PageFault route.
+///
+/// Admits ONLY the class an existing live witness proves: an AArch64 user PageFault below
+/// `KERNEL_SPACE_BASE`, classified `TerminallyUnhandled`, under a terminating policy, whose
+/// report is publishable on the BUFFERED path with no waiter.
+///
+/// ORDERING IS MODELLED ON FutexWait: admit -> reserve the deferral -> publish -> transition ->
+/// drain. The queue advance is NOT performed here; the EXISTING post-lock drain consumes the
+/// deferral once and applies the exact incoming context. `QueueAdvanceCommitted` is returned
+/// ONLY with a reserved deferral, which is what makes the incoming apply structurally guaranteed
+/// — returning it without one was the FT3 defect that resumed the faulting PC.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_terminal_page_fault_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    fault: Option<crate::kernel::trap::FaultInfo>,
+    frame: Option<&crate::kernel::trapframe::TrapFrame>,
+) -> SplitDispatchDisposition {
+    use crate::kernel::boot::{
+        BufferedFaultAdmission as A, BufferedFaultCommit as C, PageFaultRoute,
+        TerminalFaultTransition as T, page_fault_route_for,
+    };
+    use SplitDispatchDisposition as D;
+
+    if !cfg!(target_arch = "aarch64") {
+        return D::NotHandled;
+    }
+    let (Some(fault), Some(frame)) = (fault, frame) else {
+        return D::NotHandled;
+    };
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return D::NotHandled;
+    }
+    // (1) Classify off-lock. A stale identity refuses before anything is decided.
+    let Ok((class, Some(facts))) = shared.classify_page_fault_shared(cpu, fault) else {
+        return D::NotHandled;
+    };
+    if !matches!(
+        page_fault_route_for("aarch64", class),
+        PageFaultRoute::SplitTerminal
+    ) {
+        return D::NotHandled;
+    }
+    // (2) Terminal policy, against the EXACT coordinate we classified with. `NotifyAndContinue`
+    // reports and RESUMES — a different shape entirely — so it keeps the unchanged broad path.
+    let Ok(snapshot) = shared.read_terminal_fault_policy_shared(cpu, facts.tid, facts.asid) else {
+        return D::NotHandled;
+    };
+    if !snapshot.terminates_task() {
+        return D::NotHandled;
+    }
+    // (3) Buffered eligibility. A waiter, a full buffer, a stale endpoint or no route all decline
+    // here, before anything is published.
+    let admission = shared.admit_buffered_fault_report_shared(&snapshot);
+    let A::BufferedEligible {
+        endpoint_idx,
+        generation,
+        queued_before,
+        via_fault_handler,
+    } = admission
+    else {
+        crate::yarm_log!(
+            "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=admit reason={}",
+            cpu.0,
+            facts.tid,
+            match admission {
+                A::WaiterPresent { .. } => "waiter_present",
+                A::BufferFull { .. } => "buffer_full",
+                A::EndpointStale { .. } => "endpoint_stale",
+                A::NoRoute => "no_route",
+                A::BufferedEligible { .. } => "unreachable",
+            }
+        );
+        return D::NotHandled;
+    };
+    // (4) U9-QA admission — the capability check, before any mutation.
+    if let Err(refusal) = shared.queue_advance_admit_split(
+        cpu,
+        crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+    ) {
+        crate::yarm_log!(
+            "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=queue_admit reason={:?}",
+            cpu.0,
+            facts.tid,
+            refusal
+        );
+        return D::NotHandled;
+    }
+    // (5) RESERVE THE DEFERRAL BEFORE ANY PUBLICATION. A reservation failure is pre-mutation and
+    // may fall back; holding it is what guarantees the drain will apply an incoming context.
+    if !crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, facts.tid) {
+        crate::yarm_log!(
+            "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=defer reason=defer_unavailable",
+            cpu.0,
+            facts.tid
+        );
+        return D::NotHandled;
+    }
+    // (6) Capture the outgoing context while the reservation is held and nothing is published.
+    let captured = shared.capture_outgoing_user_context_split(facts.tid, frame);
+    // The exact facts the broad arm prints, in the broad arm's order. `PAGE_FAULT_ENTRY` is
+    // emitted here because this route intercepts BEFORE the broad arm that would have printed
+    // it, and the marker stream must stay faithful to what an observer sees today.
+    crate::yarm_log!(
+        "PAGE_FAULT_ENTRY tid={} addr=0x{:x} access={:?} rip=0x{:x}",
+        facts.tid,
+        fault.addr.0,
+        fault.access,
+        frame.saved_pc
+    );
+    crate::yarm_log!(
+        "PAGE_FAULT_UNHANDLED tid={} addr=0x{:x} access={:?} rip=0x{:x}",
+        facts.tid,
+        fault.addr.0,
+        fault.access,
+        frame.saved_pc
+    );
+    crate::yarm_log!(
+        "TASK_FAULT_CURRENT tid={} fault_addr=0x{:x} access={:?}",
+        facts.tid,
+        fault.addr.0,
+        Some(fault.access)
+    );
+    crate::yarm_log!("TASK_FAULT_REPORT_BEGIN tid={}", facts.tid);
+    crate::yarm_log!(
+        "TASK_FAULT_REPORT_TARGET tid={} endpoint={} generation={}",
+        facts.tid,
+        endpoint_idx,
+        generation
+    );
+    crate::yarm_log!(
+        "TASK_FAULT_REPORT_QUEUE_STATE_BEFORE endpoint={} waiters=0 queued={}",
+        endpoint_idx,
+        queued_before
+    );
+    // (7) PUBLISH. Past this line broad fallback is forbidden.
+    match shared.commit_buffered_fault_report_shared(
+        facts.tid,
+        fault,
+        endpoint_idx,
+        generation,
+        via_fault_handler,
+    ) {
+        C::Buffered { .. } => {}
+        // Pre-publication refusal: release the reservation and let the broad path run.
+        _ => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            return D::NotHandled;
+        }
+    }
+    // (8) The terminal task transition. Fail-closed from here.
+    match shared.commit_terminal_fault_transition_shared(cpu, facts.tid, facts.asid, frame) {
+        T::Committed { .. } => {}
+        _ => {
+            // The report is published, so the broad emitter must NOT run again. The deferral is
+            // released because the outgoing task is NOT `Faulted` — the drain's reverify would
+            // decline it anyway, and leaving it armed would strand the CPU.
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "TERMINAL_FAULT_SPLIT_FAILED_CLOSED cpu={} tid={} captured={}",
+                cpu.0,
+                facts.tid,
+                u8::from(captured)
+            );
+            return D::Complete(Ok(()));
+        }
+    }
+    crate::yarm_log!(
+        "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid={} cpu={}",
+        facts.tid,
+        cpu_idx
+    );
+    D::QueueAdvanceCommitted
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_terminal_page_fault_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _fault: Option<crate::kernel::trap::FaultInfo>,
+    _frame: Option<&crate::kernel::trapframe::TrapFrame>,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
+}
+
+/// U9-FT4 — the bridge entry for the terminal PageFault route.
+pub(crate) fn try_split_terminal_page_fault_dispatch(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    fault: Option<crate::kernel::trap::FaultInfo>,
+    frame: Option<&crate::kernel::trapframe::TrapFrame>,
+) -> SplitDispatchDisposition {
+    try_split_terminal_page_fault_into_frame(shared, cpu, fault, frame)
+}
+
 #[derive(Debug)]
 pub(crate) enum SplitDispatchDisposition {
     /// The split route declined BEFORE it mutated anything. This is the ONLY route to a
