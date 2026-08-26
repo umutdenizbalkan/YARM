@@ -5516,3 +5516,59 @@ rollback. The census remains **2 / 0 / 2** — both terminal acquisitions keep e
 they had. ***U9 remains OPEN*** and direct-IpcCall production remains OFF
 (`ipccall_direct_production_enabled()` is `const false`). U9-FT4 is CENSUS-DELTA 0, so the
 canonical stage arithmetic is unchanged.
+
+### U9-RX — the blocked-receive writeback twin. FOUNDATION. CENSUS-DELTA 0.
+
+**U9-RX — CENSUS-DELTA 0 prerequisite.** The derivation overturns this cohort's premise: **the
+SharedKernel twin of `complete_blocked_recv_for_waiter` already exists**, was delivered by earlier
+cohorts, and is already the production path. No twin was built, because building one would have
+been a second recv implementation. Neither optional arm is routed — both lack the evidence their
+own rule requires. The census stays **2 / 0 / 2**.
+
+**The twin exists, decomposed by cap class rather than as one function.**
+`DispatchPostWork::BlockedWaiter{Plain,OrdinaryCap,ReplyCap,SharedRegion}Delivery`, each with its
+own snapshot type and an off-lock executor, together implement the required phase order: a rank-3
+exact waiter/message claim into a snapshot, locks released, the user payload and meta copied
+through `copy_to_user_split` (VM rank 5 + memory rank 6), caps materialized through the existing
+split owners (`materialize_reply_cap_split`, `materialize_ordinary_cap_split`,
+`materialize_received_message_cap_routed_with_delegation_split`), and the completion/wake half
+through the single owner `complete_blocked_waiter_delivery_split` at ranks 3 → 2 → 1.
+
+**Rollback is per class and off-lock.** The ordinary-cap class rolls back through
+`rollback_materialized_recv_cap_no_vm_split`; the reply-cap class through
+`rollback_minted_cap_split`, because a reply cap carries a delegation link and a global
+`waiter_cap_id` the ordinary teardown does not touch. Neither re-enters the broad lock. The
+`with_cpu` mentions inside those executors are **prose** describing the retired broad re-entry —
+the code calls the split owners.
+
+**It is the production path, not a parallel one.** Measured live at this head:
+
+| Profile | off-lock `kind=blocked_waiter` | broad `IPC_RECV_BLOCKED_COMPLETE` | rollbacks |
+|---|---|---|---|
+| x86_64 core | **682** | **0** | 0 |
+| AArch64 core | **6** | **0** | 0 |
+
+688 blocked-waiter deliveries completed off the broad lock and **zero** through the broad
+completion. The broad `complete_blocked_recv_for_waiter` is retained and unmodified, and a guard
+pins that no off-lock path calls it.
+
+**Arm A — fault-report waiter delivery — NOT routed, for want of a witness.** A fault report
+reaching a *blocked waiter* has **zero** live witnesses: every recorded profile shows
+`TASK_FAULT_REPORT_QUEUE_STATE_BEFORE … waiters=0` and zero
+`TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND`. Under the standing rule that an arm without existing
+live evidence stays broad rather than having proof manufactured, it stays broad — and the U9-FT4
+terminal route continues to decline a present waiter outright (`reason=waiter_present`). A guard
+fails if this arm is wired without a witness.
+
+**Arm B — blocking IpcRecv — NOT routed.** `SplitEligibleSyscall::IpcRecvKernelTask` still returns
+`None`, so the *blocking* receive (park and switch away) stays on the broad path; only the
+already-queued case is split. Blocking itself IS witnessed — 114 `IPC_RECV_BLOCKED_STATE_SAVE` on
+x86_64 and 3 on AArch64 — so the reachability exists; what does not exist yet is the
+admit → reserve-deferral → publish-waiter → `QueueAdvanceCommitted` route, on the U9-FT4 model.
+That is the next increment, and it is a route, not a twin.
+
+**Unchanged.** Waiter-delivery fault reports, COW and demand all remain broad; the AArch64
+terminal PageFault route delivered by U9-FT4 is intact (18 positive assertions, 0 errors). The
+census remains **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`). U9-RX is CENSUS-DELTA 0, so the canonical
+stage arithmetic is unchanged.
