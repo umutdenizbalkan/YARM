@@ -1000,42 +1000,75 @@ impl KernelState {
         if len == 0 || !len.is_multiple_of(crate::kernel::vm::PAGE_SIZE) {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
-        if self.with_memory_state(|memory| memory.memory_objects.iter().flatten().count())
-            >= self.runtime_capacity_config().max_memory_objects
-        {
-            return Err(KernelError::MemoryObjectFull);
-        }
+        // U9-COW1: the capacity screen and the slot install are ONE rank-6 policy, and they are
+        // now stated once. `max_memory_objects` is read before the acquisition because the
+        // capacity config is not a memory-domain field — this is the same read order the two
+        // separate acquisitions performed, with the count and the install fused into the single
+        // acquisition an off-lock caller takes.
+        let max_objects = self.runtime_capacity_config().max_memory_objects;
         let id = self.with_memory_state_mut(|memory| {
-            let id = memory.next_memory_object_id;
-            memory.next_memory_object_id = memory.next_memory_object_id.wrapping_add(1);
-            let slot = memory
-                .memory_objects
-                .iter_mut()
-                .find(|entry| entry.is_none())
-                .ok_or(KernelError::MemoryObjectFull)?;
-            *slot = Some(MemoryObject {
-                id,
-                phys,
-                len,
-                cap_refcount: 0,
-                map_refcount: 0,
-                pin_refcount: 0,
-                kind,
-            });
-            Ok::<u64, KernelError>(id)
+            Self::create_memory_object_slot_locked(memory, phys, len, kind, max_objects)
         })?;
 
-        let rights = match kind {
-            MemoryObjectKind::Anonymous => CapRights::READ | CapRights::WRITE | CapRights::MAP,
-            // File-backed slices are read-only: no WRITE right.
-            MemoryObjectKind::InitramfsFileSlice { .. } => CapRights::READ | CapRights::MAP,
-        };
         let cap = self.mint_capability_for_current_context(Capability::new(
             CapObject::MemoryObject { id },
-            rights,
+            Self::memory_object_rights_for_kind(kind),
         ))?;
 
         Ok((id, cap))
+    }
+
+    /// U9-COW1 — THE rank-6 half of memory-object creation: capacity screen, id allocation,
+    /// slot install and the three initial refcounts.
+    ///
+    /// Both owners drive this. The broad `create_memory_object_with_len_and_kind` reaches it
+    /// through `with_memory_state_mut`; `SharedKernel::alloc_anonymous_memory_object_split`
+    /// reaches it through `with_memory_split_mut`. Copying the body instead would put the
+    /// capacity rule and the initial refcounts in two places, and a private-copy COW frame
+    /// created with different starting refcounts than every other anonymous object is exactly
+    /// the kind of divergence that shows up later as a leak rather than as a failure.
+    ///
+    /// `max_objects` is a parameter rather than a read, because the capacity config lives
+    /// outside the memory domain and must not be fetched while this lock is held.
+    ///
+    /// Length validation stays with the callers: it is a pure argument check that needs no lock.
+    pub(crate) fn create_memory_object_slot_locked(
+        memory: &mut MemorySubsystem,
+        phys: PhysAddr,
+        len: usize,
+        kind: MemoryObjectKind,
+        max_objects: usize,
+    ) -> Result<u64, KernelError> {
+        if memory.memory_objects.iter().flatten().count() >= max_objects {
+            return Err(KernelError::MemoryObjectFull);
+        }
+        let id = memory.next_memory_object_id;
+        memory.next_memory_object_id = memory.next_memory_object_id.wrapping_add(1);
+        let slot = memory
+            .memory_objects
+            .iter_mut()
+            .find(|entry| entry.is_none())
+            .ok_or(KernelError::MemoryObjectFull)?;
+        *slot = Some(MemoryObject {
+            id,
+            phys,
+            len,
+            cap_refcount: 0,
+            map_refcount: 0,
+            pin_refcount: 0,
+            kind,
+        });
+        Ok(id)
+    }
+
+    /// U9-COW1 — the rights an object of `kind` is minted with. One rule, two owners; a
+    /// file-backed slice must never gain `WRITE` because a second site forgot the distinction.
+    pub(crate) fn memory_object_rights_for_kind(kind: MemoryObjectKind) -> CapRights {
+        match kind {
+            MemoryObjectKind::Anonymous => CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            // File-backed slices are read-only: no WRITE right.
+            MemoryObjectKind::InitramfsFileSlice { .. } => CapRights::READ | CapRights::MAP,
+        }
     }
 
     /// Create a read-only `MemoryObject` backed by a slice of the boot initramfs CPIO.

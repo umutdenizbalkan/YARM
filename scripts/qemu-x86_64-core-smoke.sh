@@ -1331,9 +1331,20 @@ if [[ "$VM_COW" == "1" ]]; then
       vm_cow_fail=1
     fi
   done
-  # TLB-shootdown prep markers must accompany a COW/unmap that changed a mapping.
-  if log_has_pattern "VM_TLB_LOCAL_FLUSH" && ! log_has_pattern "VM_TLB_SHOOTDOWN_DEFERRED"; then
-    echo "[error] VM-COW: local TLB flush without shootdown-deferred prep marker"
+  # A COW/unmap that changed a mapping must ACCOUNT for the remote shootdown — it may never
+  # flush locally and say nothing about the other CPUs.
+  #
+  # U9-COW2 re-derives this rather than dropping it. The claim is unchanged; what satisfies it
+  # is now two things instead of one, because there are now two owners. The broad handler
+  # accounts for the shootdown by DEFERRING it (`VM_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live`,
+  # a prep marker and nothing more). The split route accounts for it by PERFORMING it, through
+  # the generation-matched coordinator, and attests the result on
+  # `VM_COW_SPLIT_COMMITTED ... acked=`. Requiring the deferral marker specifically would fail
+  # the owner that does the stronger thing.
+  if log_has_pattern "VM_TLB_LOCAL_FLUSH" \
+     && ! log_has_pattern "VM_TLB_SHOOTDOWN_DEFERRED" \
+     && ! log_has_pattern "VM_COW_SPLIT_COMMITTED"; then
+    echo "[error] VM-COW: local TLB flush with the remote shootdown neither deferred nor performed"
     vm_cow_fail=1
   fi
   # Hard failure markers (must never appear).

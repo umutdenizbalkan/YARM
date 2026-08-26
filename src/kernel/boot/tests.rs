@@ -141230,22 +141230,58 @@ mod u9tm_proof_gate {
     /// the disposition — never a stash inspection.
     #[test]
     fn both_bridges_skip_the_broad_arm_on_post_work() {
-        for (name, src) in [
-            ("shared", include_str!("../../arch/trap_entry.rs")),
-            ("riscv", include_str!("../../arch/riscv64/trap.rs")),
+        // U9-COW2 re-derives this. The claim it protects is unchanged and is if anything
+        // stated more strictly: the broad arm is skipped ONLY on an explicitly enumerated
+        // committed disposition, the gate precedes the acquisition, and no stash may decide
+        // control flow. What changed is the arity — a recovered COW fault is a third legal
+        // reason, and it is NEITHER of the other two: it publishes no deferral (so it is not a
+        // queue advance) and owes no architecture tail work (so it is not post-work). Folding
+        // it into either would tell an observer something false about what happened, so the
+        // gate names it, and this guard enumerates every arm rather than counting to two.
+        //
+        // The shared bridge carries all three; the RISC-V bridge carries the original two,
+        // because the COW route is x86_64-only and RISC-V has no witness for it.
+        for (name, src, arms) in [
+            (
+                "shared",
+                include_str!("../../arch/trap_entry.rs"),
+                "if queue_advance_committed || post_work_committed || cow_recovered {",
+            ),
+            (
+                "riscv",
+                include_str!("../../arch/riscv64/trap.rs"),
+                "if queue_advance_committed || post_work_committed {",
+            ),
         ] {
             assert!(
-                src.contains("if queue_advance_committed || post_work_committed {"),
-                "{name} bridge must skip the broad arm on either committed disposition"
+                src.contains(arms),
+                "{name} bridge must skip the broad arm on exactly its enumerated committed \
+                 dispositions: `{arms}`"
             );
             assert_eq!(
                 src.matches("post_work_committed = true;").count(),
                 1,
                 "{name} bridge: exactly one place may declare post-work committed"
             );
-            let gate = src
-                .find("if queue_advance_committed || post_work_committed {")
-                .expect("the gate");
+            if name == "shared" {
+                assert_eq!(
+                    src.matches("cow_recovered = true;").count(),
+                    1,
+                    "{name} bridge: exactly one place may declare a COW recovery committed"
+                );
+                // The third arm must carry its OWN skip reason. Reusing `publication_committed`
+                // would claim a terminal transition that never happened.
+                assert!(
+                    src.contains("\"cow_recovered\""),
+                    "{name} bridge: the COW arm must report its own skip reason"
+                );
+            } else {
+                assert!(
+                    !src.contains("cow_recovered"),
+                    "{name} bridge: the COW route is x86_64-only and must not reach RISC-V"
+                );
+            }
+            let gate = src.find(arms).expect("the gate");
             let call = src
                 .find(".with_cpu(cpu, |kernel| {")
                 .expect("the broad acquisition");
