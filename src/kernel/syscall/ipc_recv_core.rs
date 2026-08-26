@@ -269,6 +269,57 @@ pub(crate) fn should_strip_inline_opcode_prefix_parts(opcode: u16, flags: u16) -
 /// `pub(crate)` (not `pub(super)`): `kernel/recv_core.rs` lives outside the
 /// `syscall` module subtree and is a genuine cross-module caller (Stage 155
 /// convergence). Never widen to bare `pub`.
+/// U9-RX4 — THE receiver-visible cap projection: which cap id and which
+/// `recv_meta_flags` a recv-v2 receiver is told about, given the message it is being
+/// handed and the receiver-local cap that was materialized for it.
+///
+/// ## Why this is one function and not a rule each writeback restates
+///
+/// The two halves of the answer come from different places — the FLAGS are a property of
+/// the MESSAGE (only the sender knows whether it attached a reply cap or an ordinary
+/// transfer), while the CAP ID is a property of the receiver's cnode (only the
+/// materialization step knows the minted id). A writeback that derives one from the other,
+/// or that special-cases a class, silently changes what userspace decodes.
+///
+/// That is exactly what went wrong. The Stage-32B queued-plain split boundary wrote
+/// `(NO_TRANSFER_CAP, 0)` for a REPLY cap it had itself just minted — deliberately, scoped
+/// out of Stage 193F — so `IpcRecvMetaV2.reply_cap` decoded to `u32::MAX` on a receive that
+/// really did carry a one-shot reply cap. PM answered `PM_RECV_DECODE_FAIL`, never replied,
+/// and its caller stayed blocked; the minted cap sat orphaned in PM's cnode with no CapId
+/// ever exposed. The broad blocked-waiter completion had always derived it correctly. Two
+/// derivations, one of them wrong, is the shape this removes.
+///
+/// ## The rule
+///
+/// * `FLAG_REPLY_CAP` wins — a reply cap is never reported as an ordinary transfer;
+/// * else either cap-transfer flag reports an ordinary transfer;
+/// * else no flags at all, the historical plain-path constant.
+///
+/// The cap id is `materialized_cap` when one exists and `NO_TRANSFER_CAP` when none does,
+/// independently of the flags. That pairing matters: userspace reads the id FIRST and maps
+/// `NO_TRANSFER_CAP` to `None` before it ever consults the flags, so a flag set with no cap
+/// still decodes to "no cap" — which is precisely what must happen when materialization
+/// declined. `u32::MAX` therefore survives if and only if there is genuinely no cap.
+///
+/// Pure: no kernel state, no locks, no cap mutation, no user copy.
+pub(crate) fn recv_meta_cap_projection(
+    msg_flags: u16,
+    materialized_cap: Option<u64>,
+) -> (u64, u64) {
+    use crate::kernel::ipc::Message;
+    let recv_meta_flags = if (msg_flags & Message::FLAG_REPLY_CAP) != 0 {
+        crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64
+    } else if (msg_flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0 {
+        crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64
+    } else {
+        0
+    };
+    (
+        materialized_cap.unwrap_or(Message::NO_TRANSFER_CAP),
+        recv_meta_flags,
+    )
+}
+
 pub(crate) fn encode_recv_v2_meta(
     status: u64,
     opcode: u16,

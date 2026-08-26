@@ -975,7 +975,12 @@ pub(crate) fn execute_user_asid_plain_writeback_boundary(
         } => (ptr, user_buf_len),
         _ => unreachable!("execute_user_asid_plain_writeback_boundary: non-UserMemory plan"),
     };
-    let payload = snapshot.msg.as_slice();
+    // U9-RX4 — the same canonical receiver-visible projection its recv-v2 sibling applies, for
+    // the same reason: the broad legacy receive opens with it, and a framed cap-bearing message
+    // copied raw hands the receiver two prefix bytes it does not expect. Identity for a plain
+    // message, so that class copies exactly the bytes it copied before.
+    let payload =
+        crate::kernel::syscall::ipc_recv_core::project_recv_delivery(&snapshot.msg).app_payload;
     if user_buf_len < payload.len() {
         return RecvUserWritebackOutcome::UndersizedBuffer;
     }
@@ -1013,35 +1018,55 @@ pub(crate) fn execute_user_asid_plain_v2_writeback_boundary(
         _ => unreachable!("execute_user_asid_plain_v2_writeback_boundary: non-UserMemoryV2 plan"),
     };
     let msg = &snapshot.msg;
-    let app_payload = msg.as_slice();
-
-    // Stage 193F: surface the receiver-local cap that Phase A materialized into
-    // the recv-v2 meta so a recv_v2 caller can discover an **ordinary** transferred
-    // cap. For a PLAIN message `materialized_cap` is `None` → `NO_TRANSFER_CAP` +
-    // `recv_meta_flags = 0` (the historical plain-path constants, byte-identical).
-    // For an ordinary cap-transfer queued message the boundary seam minted a fresh
-    // receiver-local cap; without this the cap would be orphaned in the receiver's
-    // cnode with no CapId exposed to userspace.
+    // U9-RX4 — the SECOND half of the same divergence, in the same owner.
     //
-    // Reply caps (`is_reply_cap`) deliberately RETAIN the historical split-path
-    // behavior — the cap is hidden from the v2 meta here. The reply-cap delivery
-    // contract on this queued split (e.g. the supervisor fault/restart chain, which
-    // recvs a one-shot reply cap through this exact writeback) depends on the meta
-    // reporting no cap; surfacing it there changes that receiver's behavior and is
-    // out of 193F scope (ordinary-cap no-waiter enqueue only).
-    let (meta_cap_id, meta_recv_flags) = match snapshot.materialized_cap {
-        Some(cap) if !snapshot.is_reply_cap => (
-            cap,
-            crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
-        ),
-        _ => (Message::NO_TRANSFER_CAP, 0),
-    };
+    // The broad receives open with `project_recv_delivery`, described there as the "canonical
+    // receiver-visible projection (single rule, shared with every other delivery path)". It
+    // strips the two-byte inline opcode prefix a framed cap-bearing message carries, so the
+    // receiver sees the APPLICATION opcode and the application payload. This boundary
+    // executor read `msg.opcode` and `msg.as_slice()` raw, so the same message that the broad
+    // path delivered as `opcode=12 len=8` arrived here as `opcode=0 len=10` — PM's decode then
+    // failed on the opcode even once its reply cap was restored.
+    //
+    // The predicate is `opcode == OPCODE_INLINE && (FLAG_REPLY_CAP | FLAG_CAP_TRANSFER)`, so
+    // the projection is the IDENTITY for a plain message: that class copies exactly the bytes
+    // it copied before, from exactly the same slice.
+    let delivery = crate::kernel::syscall::ipc_recv_core::project_recv_delivery(msg);
+    let app_payload = delivery.app_payload;
+
+    // U9-RX4 — THE FIX, and it is one call.
+    //
+    // Stage 193F surfaced the receiver-local cap for an ORDINARY transfer here but
+    // deliberately kept hiding a REPLY cap, on the stated belief that "the reply-cap
+    // delivery contract on this queued split depends on the meta reporting no cap".
+    // Live evidence contradicted that: PM receives a one-shot reply cap through exactly
+    // this writeback, decodes `IpcRecvMetaV2.reply_cap` as `u32::MAX`, answers
+    // `PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295`, and never replies — leaving its
+    // caller blocked for the rest of the boot and the minted cap orphaned in PM's cnode
+    // with no CapId ever exposed.
+    //
+    // The broad blocked-waiter completion derived this correctly the whole time. Rather
+    // than copy its derivation into a second place, both now call the ONE projection, so a
+    // divergence between what the broad and split receives tell userspace is no longer
+    // expressible. Nothing about the layout, the ABI or the plain-message case changes:
+    // a plain message still yields `NO_TRANSFER_CAP` + no flags, byte-identically.
+    let (meta_cap_id, meta_recv_flags) =
+        crate::kernel::syscall::ipc_recv_core::recv_meta_cap_projection(
+            msg.flags,
+            snapshot.materialized_cap,
+        );
+    debug_assert!(
+        !snapshot.is_reply_cap
+            || (msg.flags & Message::FLAG_REPLY_CAP) != 0
+            || snapshot.materialized_cap.is_none(),
+        "a snapshot flagged as a reply cap must carry a reply-cap message"
+    );
 
     // Same single pure recv-v2 codec, same plain-path constants as the
     // `&mut KernelState` sibling (§55 / Stage 155 convergence).
     let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
         msg.sender_tid.0,
-        msg.opcode,
+        delivery.app_opcode,
         msg.flags,
         app_payload.len() as u32,
         meta_cap_id,
