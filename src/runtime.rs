@@ -1956,6 +1956,40 @@ impl SharedKernel {
         }
     }
 
+    /// U9-TM §4 — tick ONLY if this tick would not preempt, atomically.
+    ///
+    /// No existing profile witnesses a timer-driven preemption: across 77 recorded profiles on
+    /// all three architectures, `YARM_SCHED_TICK ... preempt=1` occurs zero times and no
+    /// `YIELD_DISPATCH_DEQUEUE_OK` is ever produced by a timer. So the preempting branch of a
+    /// split timer route cannot be live-proven, and shipping it unproven is not acceptable.
+    ///
+    /// This is the honest alternative. The lookahead and the tick happen inside ONE rank-1
+    /// acquisition, so the answer cannot go stale between them:
+    ///
+    /// * would preempt -> `None`, with NOTHING incremented and nothing mutated. The caller falls
+    ///   through to the unchanged broad arm, which ticks and preempts exactly as it always has.
+    /// * would not preempt -> the normal tick runs and `NoSwitch` is returned.
+    ///
+    /// It delegates to the SAME `SchedulerTimer` policy as [`Self::scheduler_tick_split_mut`] —
+    /// `would_preempt_next` reads the remaining budget and `tick_and_check` performs the tick.
+    /// The quantum calculation is not restated here.
+    pub(crate) fn scheduler_tick_if_no_switch_split_mut(
+        &self,
+        cpu: CpuId,
+    ) -> Option<SchedulerTickOutcome> {
+        self.with_scheduler_split_mut(|sched| {
+            if sched.timer.would_preempt_next() {
+                return None;
+            }
+            let (tick, should_preempt) = sched.timer.tick_and_check();
+            debug_assert!(
+                !should_preempt,
+                "the lookahead and the tick are one acquisition; they cannot disagree"
+            );
+            Some(SchedulerTickOutcome::NoSwitch { cpu, tick: tick.0 })
+        })
+    }
+
     /// U9-QA §1 (ONE QUEUE-ADVANCE OWNER): the single authoritative off-lock queue-advancing
     /// SELECTION step.
     ///

@@ -615,7 +615,37 @@ pub fn handle_trap_entry_shared(
     // one: a terminal transition has been published, so this trap may neither enter the broad
     // dispatcher nor return through the outgoing frame — it falls through to the drains.
     let mut queue_advance_committed = false;
-    if matches!(decode_trap_context(context), TrapEvent::Syscall) {
+    // U9-TM §2: the pre-lock TIMER route. It runs before the syscall seam and is mutually
+    // exclusive with it — a timer interrupt carries no syscall NR — and it refuses BEFORE any
+    // claim, tick or mutation when a proof knob is armed or when this tick would preempt, so a
+    // refused trap reaches the unchanged broad arm having changed nothing.
+    let mut post_work_committed = false;
+    {
+        let is_timer = matches!(decode_trap_context(context), TrapEvent::TimerInterrupt);
+        match crate::kernel::syscall_split::try_split_timer_dispatch(shared, cpu, is_timer) {
+            SplitDispatchDisposition::NotHandled => {}
+            SplitDispatchDisposition::PostWorkCommitted => {
+                // The tick and the re-arm are done and no scheduler state changed. Skip the
+                // broad arm — entering it would tick a SECOND time — and fall through so the
+                // architecture tail still runs the production timeout pipeline.
+                post_work_committed = true;
+            }
+            other => {
+                // The timer route produces only those two. Anything else would mean a
+                // non-preempting tick had claimed a terminal transition.
+                crate::yarm_log!(
+                    "TIMER_SPLIT_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                    cpu.0,
+                    other
+                );
+                debug_assert!(
+                    false,
+                    "the timer route yields NotHandled or PostWorkCommitted"
+                );
+            }
+        }
+    }
+    if !post_work_committed && matches!(decode_trap_context(context), TrapEvent::Syscall) {
         if let Some(frame) = frame.as_deref_mut() {
             // Stage 160C: import the decoded syscall ABI into the frame BEFORE the
             // split dispatch inspects it (AArch64-only, proof-knob-gated; no-op on
@@ -777,10 +807,15 @@ pub fn handle_trap_entry_shared(
     // a successful acquisition of nothing and a successful handler, so both `?` sites below stay
     // untouched.
     let inner_result: Result<Result<(), TrapHandleError>, TrapHandleError> =
-        if queue_advance_committed {
+        if queue_advance_committed || post_work_committed {
             crate::yarm_log!(
-                "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=publication_committed",
-                cpu.0
+                "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason={}",
+                cpu.0,
+                if queue_advance_committed {
+                    "publication_committed"
+                } else {
+                    "timer_post_work_committed"
+                }
             );
             Ok(Ok(()))
         } else {

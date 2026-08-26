@@ -629,15 +629,24 @@ fi
 if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
   strict_fail=0
 
-  for required_timer in "YARM_TIMER_IRQ_DELIVERED" "YARM_TIMER_EOI_DONE" "YARM_SCHED_TICK"; do
-    if ! log_has_pattern "$required_timer"; then
-      echo "[warn] strict smoke: missing timer/scheduler marker: $required_timer"
-      strict_fail=1
-    fi
-  done
+  # U9-TM §2: with the proof knobs off, TimerInterrupt is serviced by the pre-lock split route,
+  # which claims, ticks and re-arms itself — so the three BROAD-arm markers legitimately do not
+  # appear. The progression claim is unchanged and is now attested by `TIMER_SPLIT_TICK_OK
+  # cpu=N tick=T preempt=0 rearm=1`, which carries the same tick field. Accept EITHER attestation;
+  # requiring neither would delete the check rather than re-derive it.
+  if log_has_pattern "TIMER_SPLIT_TICK_OK"; then
+    :
+  else
+    for required_timer in "YARM_TIMER_IRQ_DELIVERED" "YARM_TIMER_EOI_DONE" "YARM_SCHED_TICK"; do
+      if ! log_has_pattern "$required_timer"; then
+        echo "[warn] strict smoke: missing timer/scheduler marker: $required_timer"
+        strict_fail=1
+      fi
+    done
+  fi
 
-  tick_lines=$(tr '\r' '\n' <"$LOGFILE" | rg -a -o "YARM_SCHED_TICK cpu=[0-9]+ tick=[0-9]+" || true)
-  tick_count=$(printf '%s\n' "$tick_lines" | rg -c "YARM_SCHED_TICK" 2>/dev/null || echo 0)
+  tick_lines=$(tr '\r' '\n' <"$LOGFILE" | rg -a -o "(YARM_SCHED_TICK|TIMER_SPLIT_TICK_OK) cpu=[0-9]+ tick=[0-9]+" || true)
+  tick_count=$(printf '%s\n' "$tick_lines" | rg -c "(YARM_SCHED_TICK|TIMER_SPLIT_TICK_OK)" 2>/dev/null || echo 0)
   first_tick=$(printf '%s\n' "$tick_lines" | head -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
   last_tick=$(printf '%s\n' "$tick_lines" | tail -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
 

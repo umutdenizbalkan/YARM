@@ -140153,8 +140153,9 @@ mod u9qa_split_dispatch_disposition {
             "the committed arm must fall through to the drains, never return early"
         );
         // The broad phase is gated on the disposition, never on a stash inspection.
+        // U9-TM §2 added the post-work term to the same gate; the claim it carries is unchanged.
         let gate_at = RISCV_TRAP
-            .find("if queue_advance_committed {")
+            .find("if queue_advance_committed || post_work_committed {")
             .expect("the broad-dispatch gate");
         let call = RISCV_TRAP
             .find(".with_cpu(cpu, |kernel| {")
@@ -140831,5 +140832,227 @@ mod u9tm_timer_entry {
             reference.iter().any(|(_, p)| *p),
             "fixture check: the window must actually cross a quantum boundary"
         );
+    }
+}
+
+// ── U9-TM §1/§2/§3: THE PROOF-MODE GATE AND THE DEFAULT TIMER ROUTE ───────────────────────────
+//
+// U9-TM does NOT retire TimerInterrupt. It routes the default configuration off-lock and keeps
+// two explicit fallbacks, both taken before anything is claimed, ticked or mutated. These cases
+// pin the gate's exhaustiveness, the fail-before-mutation ordering, and the fact that a
+// non-preempting tick uses its own disposition rather than borrowing a queue-advance one.
+#[cfg(test)]
+mod u9tm_proof_gate {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const FAULT: &str = include_str!("fault_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TIMER: &str = include_str!("../scheduler_timer.rs");
+
+    fn gate_body() -> &'static str {
+        MOD_SRC
+            .split("pub(crate) fn timer_proof_hooks_armed() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the proof-mode gate")
+    }
+
+    /// The gate is built from the five EXISTING knob predicates — no new flag, no new selector.
+    #[test]
+    fn the_gate_is_built_from_existing_knobs_only() {
+        let g = gate_body();
+        for k in [
+            "cap_cnode_enabled()",
+            "fault_delivery_enabled()",
+            "spawn_lifecycle_enabled()",
+            "global_state_enabled()",
+            "smp_ready_enabled()",
+        ] {
+            assert!(
+                g.contains(k),
+                "the gate must consult the existing knob `{k}`"
+            );
+        }
+        assert_eq!(g.matches("||").count(), 4, "exactly five terms, disjoined");
+        assert!(
+            !g.contains("static ") && !g.contains("AtomicBool"),
+            "the gate must introduce no new flag of its own"
+        );
+    }
+
+    /// EXHAUSTIVENESS: every hook whose ONLY call site is the broad timer arm must appear in the
+    /// gate. Adding a sixth timer-only hook without extending the gate fails here — which is the
+    /// whole point, since such a hook would be silently skipped by the split route.
+    #[test]
+    fn the_gate_covers_every_timer_only_hook() {
+        let arm = FAULT
+            .split("Trap::TimerInterrupt => {")
+            .nth(1)
+            .and_then(|s| s.split("\n            Trap::").next())
+            .expect("the broad timer arm");
+        let g = gate_body();
+        let mut timer_only = alloc::vec::Vec::new();
+        for line in arm.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("self.maybe_run_") else {
+                continue;
+            };
+            let Some(name) = rest.split("()").next() else {
+                continue;
+            };
+            let call = alloc::format!("self.maybe_run_{name}()");
+            if FAULT.matches(call.as_str()).count() == 1 {
+                timer_only.push(alloc::string::String::from(name));
+            }
+        }
+        assert_eq!(
+            timer_only.len(),
+            5,
+            "expected exactly five timer-only hooks, found {timer_only:?}"
+        );
+        for name in &timer_only {
+            // Each hook's knob predicate shares its stem: `maybe_run_X_proof`/`_audit` -> `X_enabled`.
+            let stem = name.trim_end_matches("_proof").trim_end_matches("_audit");
+            assert!(
+                g.contains(&alloc::format!("{stem}_enabled()")),
+                "timer-only hook `maybe_run_{name}` has no term in the proof-mode gate"
+            );
+        }
+    }
+
+    /// FAIL BEFORE MUTATION: both refusals precede the claim, the tick and the re-arm.
+    #[test]
+    fn both_refusals_precede_every_mutation() {
+        let route = SPLIT
+            .split("fn try_split_timer_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the timer route");
+        let gate = route
+            .find("timer_proof_hooks_armed()")
+            .expect("the proof-mode refusal");
+        let preempt = route
+            .find("scheduler_tick_if_no_switch_split_mut(cpu)")
+            .expect("the would-preempt refusal");
+        let claim = route
+            .find("acknowledge_interrupt(cpu, 0)")
+            .expect("the claim");
+        let rearm = route.find("program_timer_deadline(").expect("the re-arm");
+        assert!(
+            gate < preempt && preempt < claim && claim < rearm,
+            "order must be: proof gate -> would-preempt -> claim -> re-arm"
+        );
+        // The proof-mode refusal happens before the tick seam is even consulted.
+        assert!(
+            route[..gate].find("scheduler_tick").is_none(),
+            "nothing may tick before the proof-mode gate is evaluated"
+        );
+    }
+
+    /// The would-preempt refusal is ATOMIC with the tick: one acquisition, and the declining
+    /// path increments nothing.
+    #[test]
+    fn the_would_preempt_refusal_increments_nothing() {
+        let seam = RUNTIME
+            .split("pub(crate) fn scheduler_tick_if_no_switch_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the no-switch tick seam");
+        assert_eq!(
+            seam.matches("with_scheduler_split_mut").count(),
+            1,
+            "the lookahead and the tick must share ONE acquisition"
+        );
+        let look = seam.find("would_preempt_next()").expect("the lookahead");
+        let tick = seam.find("tick_and_check()").expect("the tick");
+        assert!(look < tick, "the lookahead must precede the tick");
+        let refusal = seam.find("return None;").expect("the refusal");
+        assert!(
+            refusal < tick,
+            "the refusal must return BEFORE the tick, having incremented nothing"
+        );
+        // And it delegates rather than restating the quantum arithmetic.
+        assert!(
+            !seam.contains("quantum_ticks"),
+            "the seam must not restate the quantum calculation"
+        );
+        let la = TIMER
+            .split("pub fn would_preempt_next(&self) -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the lookahead body");
+        assert!(
+            la.contains("self.ticks_remaining == 1") && !la.contains("quantum_ticks"),
+            "the lookahead reads remaining budget only"
+        );
+    }
+
+    /// A non-preempting tick uses its OWN disposition. Borrowing `Complete` would skip the
+    /// production timeout pipeline; borrowing `QueueAdvanceCommitted` would send a tick that
+    /// changed no scheduler state into the queue-advance drains.
+    #[test]
+    fn a_non_preempting_tick_uses_its_own_disposition() {
+        assert!(
+            SPLIT.contains("PostWorkCommitted,"),
+            "the fourth disposition must exist"
+        );
+        let route = SPLIT
+            .split("fn try_split_timer_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the timer route");
+        assert!(
+            route.contains("D::PostWorkCommitted"),
+            "the timer route must settle as PostWorkCommitted"
+        );
+        for wrong in ["D::Complete", "D::QueueAdvanceCommitted"] {
+            assert!(
+                !route.contains(wrong),
+                "a non-preempting tick must not borrow `{wrong}`"
+            );
+        }
+        // It performs no queue selection and publishes no transition.
+        for banned in [
+            "queue_advance_select_step_split",
+            "queue_advance_commit_split",
+            "yield_dispatch_try_defer",
+            "dispatch_next_selection_on",
+        ] {
+            assert!(
+                !route.contains(banned),
+                "a non-preempting tick must not `{banned}`"
+            );
+        }
+    }
+
+    /// Both trap bridges skip the broad arm for the committed post-work outcome, and the gate is
+    /// the disposition — never a stash inspection.
+    #[test]
+    fn both_bridges_skip_the_broad_arm_on_post_work() {
+        for (name, src) in [
+            ("shared", include_str!("../../arch/trap_entry.rs")),
+            ("riscv", include_str!("../../arch/riscv64/trap.rs")),
+        ] {
+            assert!(
+                src.contains("if queue_advance_committed || post_work_committed {"),
+                "{name} bridge must skip the broad arm on either committed disposition"
+            );
+            assert_eq!(
+                src.matches("post_work_committed = true;").count(),
+                1,
+                "{name} bridge: exactly one place may declare post-work committed"
+            );
+            let gate = src
+                .find("if queue_advance_committed || post_work_committed {")
+                .expect("the gate");
+            let call = src
+                .find(".with_cpu(cpu, |kernel| {")
+                .expect("the broad acquisition");
+            assert!(gate < call, "{name}: the gate must precede the acquisition");
+            assert!(
+                !src[gate..call].contains("DISPATCH_SWITCH_PLAN_STASH"),
+                "{name}: a stash must never decide dispatch control flow"
+            );
+        }
     }
 }

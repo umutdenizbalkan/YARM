@@ -2430,6 +2430,30 @@ pub(crate) fn set_cap_cnode_enabled(enabled: bool) {
     CAP_CNODE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
 }
 
+/// U9-TM §1 — is ANY timer-only proof hook armed?
+///
+/// Five `maybe_run_*` hooks are called ONLY from the broad `Trap::TimerInterrupt` arm. A split
+/// timer route that returned early would stop them running, which is a silent regression rather
+/// than a refactor — each is armed by an existing profile and carries a dozen test references.
+///
+/// U9-TM does not relocate them. Instead the split route REFUSES whenever any of their knobs is
+/// armed, before it claims the interrupt, ticks, or mutates anything at all, and the unchanged
+/// broad arm then executes the tick and every hook exactly as before. This is a TEMPORARY
+/// proof-mode fallback, not TimerInterrupt retirement: while it stands, an armed proof profile
+/// still reaches the terminal broad dispatcher through the timer.
+///
+/// Every term is one of the five existing knob sources — no new flag, no new selector. The
+/// disjunction is exhaustive over the timer-only set, and
+/// `u9tm_proof_gate::the_gate_covers_every_timer_only_hook` pins that a sixth timer-only hook
+/// cannot be added without extending it.
+pub(crate) fn timer_proof_hooks_armed() -> bool {
+    cap_cnode_enabled()
+        || fault_delivery_enabled()
+        || spawn_lifecycle_enabled()
+        || global_state_enabled()
+        || smp_ready_enabled()
+}
+
 pub(crate) fn cap_cnode_enabled() -> bool {
     CAP_CNODE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }

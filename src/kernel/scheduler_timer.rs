@@ -62,6 +62,21 @@ impl Timer {
     /// Call this on voluntary task switches (block, yield-to-other) so the
     /// next scheduled task always starts with a full quantum rather than
     /// inheriting the stale remainder from the task that just left the CPU.
+    /// U9-TM §4 — would the NEXT [`Self::tick_and_check`] report `should_preempt`?
+    ///
+    /// A pure lookahead on the same two fields that call decides from: it decrements
+    /// `ticks_remaining` and preempts when the result is zero, so the next tick preempts exactly
+    /// when one tick of budget is left. This restates NO quantum arithmetic — it does not touch
+    /// `quantum_ticks` and does not know how the quantum is reset; it only asks how much budget
+    /// remains, which is the single fact the decision turns on.
+    ///
+    /// It exists so a caller can decline a tick it is not equipped to settle WITHOUT having
+    /// incremented anything. Reading it and then ticking must happen under one acquisition, or
+    /// the answer is stale.
+    pub fn would_preempt_next(&self) -> bool {
+        self.ticks_remaining == 1
+    }
+
     pub fn reset_quantum(&mut self) {
         self.ticks_remaining = self.quantum_ticks;
     }

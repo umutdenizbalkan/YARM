@@ -219,6 +219,22 @@ pub(crate) enum SplitDispatchDisposition {
     /// through to the existing post-lock drains, which consume that one deferral and settle the
     /// trap as Switch, ResumeSame or TerminalIdle.
     QueueAdvanceCommitted,
+    /// U9-TM §3 — the route finished its own work, mutated no scheduler state, and still owes the
+    /// architecture tail's POST-WORK.
+    ///
+    /// `Complete` is wrong for this: it returns through the epilogue immediately, and the trap
+    /// entry's `run_due_ipc_timeout_work` sits far below that early return — so a `Complete`
+    /// timer tick would silently skip the production timeout pipeline that owns all three
+    /// timeout classes.
+    ///
+    /// `QueueAdvanceCommitted` is wrong too, and more dangerously: it means a terminal
+    /// transition was published, which for a NON-preempting tick is simply false. Using it would
+    /// send a tick that changed no scheduler state into the queue-advance drains.
+    ///
+    /// So this is its own outcome: the broad dispatcher is skipped, NO queue selection runs, the
+    /// existing post-work drains run exactly once, and the trap then settles through its normal
+    /// frame/idle path. It is decided by the ROUTE, never inferred from a non-empty stash.
+    PostWorkCommitted,
 }
 
 impl SplitDispatchDisposition {
@@ -241,6 +257,9 @@ impl SplitDispatchDisposition {
             Self::QueueAdvanceCommitted => {
                 panic!("a committed queue advance has no pre-U9-QA equivalent")
             }
+            Self::PostWorkCommitted => {
+                panic!("a committed post-work outcome has no pre-U9-QA equivalent")
+            }
         }
     }
 }
@@ -252,6 +271,20 @@ impl SplitDispatchDisposition {
 /// and may be early-returned. Every other class goes to the unchanged non-switching dispatcher
 /// and keeps its exact previous behavior — `None` becomes `NotHandled`, `Some(r)` becomes
 /// `Complete(r)`, and nothing about how those five are serviced changes.
+/// U9-TM §2 — the pre-lock TIMER entry point.
+///
+/// Separate from [`try_split_dispatch_into_frame`] because a timer interrupt is not a syscall:
+/// it carries no NR, no ABI and no frame arguments, and the syscall dispatcher's whole default-
+/// deny structure is written against those. Keeping them apart is what stops a timer trap being
+/// classified by a syscall whitelist it has no business reaching.
+pub(crate) fn try_split_timer_dispatch(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    is_timer: bool,
+) -> SplitDispatchDisposition {
+    try_split_timer_into_frame(shared, cpu, is_timer)
+}
+
 pub(crate) fn try_split_dispatch_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
@@ -265,6 +298,88 @@ pub(crate) fn try_split_dispatch_into_frame(
         None => SplitDispatchDisposition::NotHandled,
         Some(result) => SplitDispatchDisposition::Complete(result),
     }
+}
+
+/// U9-TM §2 — service a NON-PREEMPTING `TimerInterrupt` off the broad lock.
+///
+/// This is a DEFAULT-CONFIGURATION route, not TimerInterrupt retirement. Two fallbacks remain,
+/// both taken before anything is claimed, ticked or mutated:
+///
+/// 1. **any timer-only proof knob armed** — the five `maybe_run_*` hooks are called only from the
+///    broad arm; U9-TM does not relocate them, so an armed profile takes the unchanged broad
+///    route and every hook runs exactly as before.
+/// 2. **this tick would preempt** — no existing profile witnesses a timer-driven preemption
+///    (zero `preempt=1` across 77 recorded profiles), so the preempting branch cannot be
+///    live-proven and is not shipped. `scheduler_tick_if_no_switch_split_mut` refuses atomically,
+///    having incremented nothing.
+///
+/// What the route does own, when neither fallback applies:
+///
+/// * claim/ack through the SAME lock-free adapter the `Hal` method delegates to;
+/// * exactly ONE tick, through the single `SchedulerTimer` policy;
+/// * re-arm through the same adapter — on RISC-V SBI `set_timer` is itself the completion, and
+///   PLIC source 0 is never touched;
+/// * and then `PostWorkCommitted`, so the architecture tail still runs the production timeout
+///   pipeline that owns all three timeout classes.
+///
+/// It performs NO queue selection and publishes no transition: a non-preempting tick changes no
+/// scheduler state beyond the tick itself.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_timer_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    is_timer: bool,
+) -> SplitDispatchDisposition {
+    use SplitDispatchDisposition as D;
+
+    if !is_timer {
+        return D::NotHandled;
+    }
+    // (1) FAIL BEFORE MUTATION — the proof-mode gate. Evaluated before claim, tick, timeout work,
+    // preemption or re-arm, so a refused trap reaches the broad arm having changed nothing.
+    if crate::kernel::boot::timer_proof_hooks_armed() {
+        crate::yarm_log!("TIMER_SPLIT_REFUSED cpu={} reason=proof_hooks_armed", cpu.0);
+        return D::NotHandled;
+    }
+    // (2) The would-preempt refusal, also before any mutation. One rank-1 acquisition decides
+    // and, when it declines, has incremented nothing.
+    let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu) else {
+        crate::yarm_log!("TIMER_SPLIT_REFUSED cpu={} reason=would_preempt", cpu.0);
+        return D::NotHandled;
+    };
+    // Past this point the tick HAS happened; there is no route back to the broad arm, which
+    // would tick a second time.
+    let tick = match outcome {
+        crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => tick,
+        // Unreachable: the seam returns `None` rather than a preempting outcome.
+        crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => tick,
+    };
+    // (3) Claim/ack — the SAME free function `Hal::acknowledge_interrupt` delegates to.
+    crate::arch::hal_adapters::acknowledge_interrupt(cpu, 0);
+    // (4) Re-arm — the SAME free function `Hal::program_timer_deadline` delegates to, with the
+    // same deadline constant the broad arm passes. On RISC-V this single SBI `set_timer` both
+    // clears the pending condition and programs the next deadline: it IS the completion, and
+    // there is no separate end-of-interrupt.
+    crate::arch::hal_adapters::program_timer_deadline(
+        cpu,
+        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    );
+    crate::yarm_log!(
+        "TIMER_SPLIT_TICK_OK cpu={} tick={} preempt=0 rearm=1",
+        cpu.0,
+        tick
+    );
+    // (5) The architecture tail still owes the production timeout pipeline.
+    D::PostWorkCommitted
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_timer_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _is_timer: bool,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
 }
 
 /// U9-QA §2 — service `FutexWait` (NR 9) off the broad lock.
