@@ -3838,7 +3838,11 @@ impl SharedKernel {
     /// a write of CPU 0 over CPU 0, because the consumer returns immediately unless `cpu.0 == 0`
     /// and the broad Phase-2 trap guard already bound the same value.) No broad fallback, no
     /// drain, no retry.
-    #[cfg(target_arch = "x86_64")]
+    /// U9-RX3: the `x86_64` cfg gate was removed. The body is architecture-NEUTRAL — it calls
+    /// the scheduler's own `on_preempt_prefer_on(cpu, tid)` under rank 1 and touches nothing
+    /// architecture-specific. The gate reflected where the U3 caller happened to live, not where
+    /// the transaction is sound, and the receive-block unwind needs the same rank-1 step to
+    /// re-establish the unwound receiver as current.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn on_preempt_prefer_on_cpu_split(
         &self,
@@ -4253,6 +4257,158 @@ impl SharedKernel {
             tid
         );
         T::Committed { faulted_tid: tid }
+    }
+
+    /// U9-RX3 — Phase A twin (scheduler, rank 1): remove the receiver from `current`.
+    ///
+    /// Mirrors `KernelState::recv_block_phase_a_scheduler`. Returns the EXACT blocked tid and its
+    /// captured ASID as an opaque token half; the caller never reconstructs either.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn recv_block_phase_a_split(
+        &self,
+        cpu: CpuId,
+        expected_tid: u64,
+    ) -> Option<crate::kernel::vm::Asid> {
+        let removed = self.block_current_on_cpu_split(cpu).ok().flatten()?;
+        if removed != expected_tid {
+            // A different task was current than the one this route classified. Nothing else has
+            // been touched, so the caller unwinds this single step and declines.
+            crate::yarm_log!(
+                "D2_RECV_SPLIT_REFUSED cpu={} phase=a reason=victim_changed expected={} removed={}",
+                cpu.0,
+                expected_tid,
+                removed
+            );
+            let _ = self.on_preempt_prefer_on_cpu_split(cpu, removed);
+            return None;
+        }
+        crate::yarm_log!("SCHED_BLOCK tid={}", removed);
+        Some(
+            self.task_asid_opt_split_read(removed)
+                .unwrap_or(crate::kernel::vm::Asid(0)),
+        )
+    }
+
+    /// U9-RX3 — Phase B twin (task, rank 2): mint the FRESH wait generation, mark the receiver
+    /// `Blocked(EndpointReceive)`, stage the deadline, and store the blocked-recv writeback state
+    /// — all in ONE acquisition.
+    ///
+    /// The `BlockedRecvState` is stored HERE, before the waiter is published, so a sender that
+    /// finds the waiter can never complete a receiver whose payload/meta pointers do not yet
+    /// exist. Checked generation advancement fails closed exactly as the broad phase does.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn recv_block_phase_b_split(
+        &self,
+        tid: u64,
+        recv_cap: crate::kernel::capabilities::CapId,
+        deadline: Option<u64>,
+        state: crate::kernel::task::BlockedRecvState,
+    ) -> Option<u64> {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let wait_gen = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
+            let next = tcb.blocked_recv_generation.checked_add(1)?;
+            tcb.blocked_recv_generation = next;
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            tcb.ipc_timeout_deadline = deadline;
+            tcb.ipc_timeout_fired = false;
+            tcb.blocked_recv_state = Some(state);
+            Some(next)
+        })?;
+        crate::yarm_log!(
+            "D2_RECV_WAITER_TASK_BLOCKED tid={} wait_gen={}",
+            tid,
+            wait_gen
+        );
+        crate::yarm_log!(
+            "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={}",
+            tid,
+            recv_cap.0,
+            state.payload_user_ptr,
+            state.payload_user_len,
+            state.meta_user_ptr,
+            state.meta_user_len
+        );
+        Some(wait_gen)
+    }
+
+    /// U9-RX3 — Phase C twin (IPC, rank 3): the atomic queue-recheck and waiter publish, through
+    /// the ONE policy owner `publish_recv_waiter_locked` that the broad form also runs.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn recv_block_phase_c_split(
+        &self,
+        endpoint_idx: usize,
+        record: crate::kernel::boot::EndpointWaiterRecord,
+        recv_cap: crate::kernel::capabilities::CapId,
+    ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
+        let outcome = self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::publish_recv_waiter_locked(ipc, endpoint_idx, record, recv_cap)
+        });
+        if matches!(
+            outcome,
+            crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
+        ) {
+            crate::yarm_log!("D2_RECV_WAITER_PUBLISHED tid={}", record.receiver.tid.0);
+        }
+        outcome
+    }
+
+    /// U9-RX3 — the EXACT inverse of Phase B then Phase A, for the `QueueNonEmpty` race.
+    ///
+    /// Reverses in strict reverse order: clear the blocked-recv writeback state and restore the
+    /// task to `Runnable` (rank 2), then re-establish it as `current` on the SAME cpu (rank 1).
+    /// The wait generation is deliberately NOT rolled back — generations only ever advance, and a
+    /// rollback would let a stale record compare equal to a newer one.
+    ///
+    /// Returns `true` only when the receiver is provably `current` again. A `false` return means
+    /// the caller must fail closed rather than resume a task that is still Blocked.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn recv_block_unwind_race_split(&self, cpu: CpuId, tid: u64) -> bool {
+        use crate::kernel::task::TaskStatus;
+        crate::yarm_log!("D2_PUBLISH_RACE_UNWIND endpoint=split tid={}", tid);
+        crate::yarm_log!("D2_RECV_WAITER_RACE_UNWIND tid={}", tid);
+        // Rank 2 — the exact inverse of Phase B's task half.
+        let cleared = self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                Some(tcb) => {
+                    tcb.blocked_recv_state = None;
+                    tcb.ipc_timeout_deadline = None;
+                    tcb.ipc_timeout_fired = false;
+                    tcb.status = TaskStatus::Runnable;
+                    true
+                }
+                None => false,
+            }
+        });
+        if !cleared {
+            crate::yarm_log!(
+                "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=b reason=task_missing",
+                tid
+            );
+            return false;
+        }
+        // Rank 1 — the exact inverse of Phase A: re-enqueue and make current again.
+        if self
+            .wake_tid_to_runnable_split(cpu, crate::kernel::ipc::ThreadId(tid))
+            .is_err()
+        {
+            crate::yarm_log!("D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=wake", tid);
+            return false;
+        }
+        match self.on_preempt_prefer_on_cpu_split(cpu, tid) {
+            Some(now) if now == tid => {
+                crate::yarm_log!("D2_RECV_SPLIT_UNWIND_OK cpu={} tid={}", cpu.0, tid);
+                true
+            }
+            other => {
+                crate::yarm_log!(
+                    "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=not_current observed={:?}",
+                    tid,
+                    other
+                );
+                false
+            }
+        }
     }
 
     /// U9-FT3 §1 — the read-only buffered fault-report admission preflight.

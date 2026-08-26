@@ -39,7 +39,7 @@ mod ipc_state;
 // through the `SharedKernel` split-mut seams (no duplicated transaction).
 pub(crate) use ipc_state::{
     BlockingSendProducerOutcome, DetachOutcome, ReplyTimeoutDomains, complete_reply_timeout_over,
-    complete_server_death_over,
+    complete_server_death_over, publish_recv_waiter_locked,
 };
 mod memory_lifecycle_state;
 mod memory_state;

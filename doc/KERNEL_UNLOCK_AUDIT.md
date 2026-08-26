@@ -4025,17 +4025,25 @@ were a direct caller of `wake_tid_to_runnable` when the real chain runs through
 `apply_scheduler_wake_plan`. The two layers are now separate, and the caller sets are pinned by
 `the_helper_writer_direct_caller_sets_are_pinned`.
 
-**Layer 1 — the 22 CAN status-assignment sites** (this is the census; the counts are the
+**Layer 1 — the 23 CAN status-assignment sites** (this is the census; the counts are the
 classification table's):
 
 | file | function | sites |
 |---|---|---|
 | `ipc_state.rs` | `rt_commit_receiver_runnable`, `wake_tid_to_runnable`, `process_ipc_timeout_deadlines`, `signal_notification`, `wake_destroyed_notification_waiter` | 5 |
-| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`, `wake_tid_to_runnable_split`, `drain_recv_timeout_post_work` | 6 |
+| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`, `wake_tid_to_runnable_split`, `drain_recv_timeout_post_work`, `recv_block_unwind_race_split` | 7 |
 | `restart_state.rs` | `exit_task`, `restart_task`, `mark_task_dead`, `reap_faulted_task_noalloc_cleanup` | 4 |
 | `exec_state.rs` | `spawn_user_task_from_image`, `dispatch_next_task`, `yield_current` ×2, `yield_current_to` ×2 | 6 |
 | `scheduler_state.rs` | `apply_cross_cpu_wake_task` | 1 |
 | `fault_state.rs` | `fault_current_task_with_fault` | 1 |
+
+**U9-RX3 — `recv_block_unwind_race_split`.** The split form of the reversal
+`KernelState::recv_block_unwind_race` performs, and a CAN path because it writes
+`Blocked(EndpointReceive) -> Runnable`. Its origin is exactly one: the `QueueNonEmpty` branch of
+the split receive-block route, taken only when the rank-3 recheck found a message **before any
+waiter was published**. It is the exact inverse of `recv_block_phase_b_split` and runs in reverse
+rank order (task 2, then scheduler 1). It cannot act on a receiver that any sender can observe,
+because no waiter exists for it to be found through.
 | `capability_lifecycle_state.rs` | `wake_destroyed_notification_waiter_split` | 1 |
 
 **Layer 2 — logical origins**, i.e. every direct production caller of each helper writer:

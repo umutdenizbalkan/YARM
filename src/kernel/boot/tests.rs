@@ -116789,7 +116789,23 @@ mod stage199d_wa2a_ownership_boundary {
             // the broad lock — and it writes only after the exact `{tid, asid,
             // send_generation}` claim, in the same acquisition that parks the `TimedOut`
             // completion, so the completion is always visible before the wake.
-            ("src/runtime.rs", 9),
+            //
+            // U9-RX3: 9 -> 11. Two writers, an exact BLOCK/UNWIND pair, both split forms of
+            // existing in-lock writers in the same phase decomposition:
+            //
+            // - `recv_block_phase_b_split` writes `Running -> Blocked(EndpointReceive)`, the
+            //   split form of `KernelState::recv_block_phase_b_task`. It is a BLOCK owner: it
+            //   can only move a task OUT of runnability, and it does so in the SAME rank-2
+            //   acquisition that mints the fresh wait generation and stores the blocked-recv
+            //   writeback state, so a task cannot be Blocked for a receive whose generation was
+            //   never advanced or whose payload/meta pointers do not yet exist.
+            // - `recv_block_unwind_race_split` writes `Blocked -> Runnable`, the split form of
+            //   the reversal `KernelState::recv_block_unwind_race` performs. It is the EXACT
+            //   inverse of the writer above and runs only on the `QueueNonEmpty` race, before
+            //   any waiter was published. The wait generation is deliberately NOT rolled back —
+            //   generations only advance, and a rollback would let a stale record compare equal
+            //   to a newer one.
+            ("src/runtime.rs", 11),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -116811,11 +116827,12 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            37,
-            "34 raw writes (U6 added `commit_blocking_send_split`; U7 added \
+            39,
+            "36 raw writes (U6 added `commit_blocking_send_split`; U7 added \
              `drain_send_timeout_post_work`; U9-F added \
-             `wake_destroyed_notification_waiter_split`), the WA3A barrier's single write, and \
-             the WA3B barrier's two"
+             `wake_destroyed_notification_waiter_split`; U9-RX3 added the exact BLOCK/UNWIND \
+             pair `recv_block_phase_b_split` and `recv_block_unwind_race_split`), the WA3A \
+             barrier's single write, and the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -117302,6 +117319,26 @@ mod stage199d_wa2b_wake_owner_census {
             Verdict::Can,
         ),
         ("src/runtime.rs", "futex_wake_split_mut", 1, Verdict::Cannot),
+        // U9-RX3: the BLOCK half of the split receive-block pair. It moves a task INTO
+        // `Blocked(EndpointReceive)` in the same rank-2 acquisition that mints the fresh wait
+        // generation and stores the blocked-recv writeback state, so it is never a transition
+        // OUT of Blocked and cannot act on an already-blocked receiver.
+        (
+            "src/runtime.rs",
+            "recv_block_phase_b_split",
+            1,
+            Verdict::IntoBlocked,
+        ),
+        // U9-RX3: the UNWIND half — the exact inverse of the writer above, taken only on the
+        // `QueueNonEmpty` race before any waiter was published. It acts on a
+        // `Blocked(EndpointReceive)` task, so it carries the same verdict as the in-lock
+        // reversal it mirrors (`recv_block_unwind_race`).
+        (
+            "src/runtime.rs",
+            "recv_block_unwind_race_split",
+            1,
+            Verdict::Can,
+        ),
         ("src/runtime.rs", "sr_wake_receiver_split", 1, Verdict::Can),
         (
             "src/runtime.rs",
@@ -117744,6 +117781,23 @@ mod stage199d_wa2b_wake_owner_census {
             "if !matches!(old_status, TaskStatus::Runnable) {",
             "}",
         ),
+        // U9-RX3: the split receive-block BLOCK/UNWIND pair.
+        (
+            "src/runtime.rs",
+            "recv_block_phase_b_split",
+            "tcb.status",
+            "TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))",
+            "tcb.blocked_recv_generation = next;",
+            "tcb.ipc_timeout_deadline = deadline;",
+        ),
+        (
+            "src/runtime.rs",
+            "recv_block_unwind_race_split",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "tcb.ipc_timeout_fired = false;",
+            "true",
+        ),
         (
             "src/runtime.rs",
             "futex_wake_split_mut",
@@ -117882,7 +117936,7 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            33,
+            35,
             "33 raw writes: U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
              split form of \
@@ -117958,7 +118012,7 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            42,
+            44,
             "37 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
              `commit_blocking_send_split`, U3 (203C)'s `wake_tid_to_runnable_split`, and U7 \
              (199E)'s `drain_send_timeout_post_work`"
@@ -117973,8 +118027,9 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            42,
-            "33 raw writes + 8 transition-barriered sites + 1 reservation-barriered site"
+            44,
+            "35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair) + 8 transition-barriered \
+             sites + 1 reservation-barriered site"
         );
     }
 
@@ -118273,7 +118328,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            42,
+            44,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -118290,9 +118345,16 @@ mod stage199d_wa2b_wake_owner_census {
         // rank-2 claim refuses every status but `Blocked(EndpointSend(_))` before mutating
         // anything, so it can never act on a `Blocked(EndpointReceive)` task — CANNOT moves
         // 16 → 17 and nothing else moves.
+        // U9-RX3 adds exactly TWO rows, one to each of two classes, and nothing else moves.
+        // `recv_block_unwind_race_split` joins CAN (14 → 15): it writes
+        // `Blocked(EndpointReceive) -> Runnable`, the split form of the reversal
+        // `recv_block_unwind_race` performs, so it is the same class as the in-lock writer it
+        // mirrors. `recv_block_phase_b_split` joins INTO-BLOCKED (8 → 9): it only ever moves a
+        // task INTO `Blocked(EndpointReceive)`, in the same rank-2 acquisition that mints the
+        // fresh wait generation, so it is never a transition out.
         assert_eq!(
             (can, cannot, into_blocked, fresh, non_production),
-            (14, 17, 8, 2, 1)
+            (15, 17, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -118553,7 +118615,7 @@ mod stage199d_wa2b_wake_owner_census {
         // A. writer sites and logical origins are two explicit layers, and every helper's
         // direct callers are named (not a transitive caller standing in for the real one).
         assert!(
-            matrix.contains("Layer 1 — the 22 CAN status-assignment sites")
+            matrix.contains("Layer 1 — the 23 CAN status-assignment sites")
                 && matrix.contains("Layer 2 — logical origins"),
             "the matrix must separate writer sites from logical origins"
         );
