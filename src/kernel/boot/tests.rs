@@ -22918,7 +22918,7 @@ mod stage29a_live_split_dispatch_tests {
         let requested = before.saturating_add(4);
         let mut frame = cnode_slots_frame(target, requested);
 
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())), "seam must service NR 8");
         assert_eq!(frame.ret0(), requested, "ret0 == slots");
         assert_eq!(frame.ret1(), target as usize, "ret1 == target pid");
@@ -22946,7 +22946,7 @@ mod stage29a_live_split_dispatch_tests {
             .expect("before capacity");
         let grown = before.saturating_add(8);
         let mut frame = cnode_slots_frame(requester, grown);
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -22969,7 +22969,7 @@ mod stage29a_live_split_dispatch_tests {
         let before_tid = kernel.current_tid_split_read(CPU0);
         assert_eq!(before_tid, Some(requester));
         let mut frame = cnode_slots_frame(requester, 600);
-        let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         let after_tid = kernel.current_tid_split_read(CPU0);
         assert_eq!(
             after_tid,
@@ -22998,7 +22998,7 @@ mod stage29a_live_split_dispatch_tests {
         });
         // App 901 targeting a DIFFERENT pid 902 → MissingRight.
         let mut frame = cnode_slots_frame(902, 16);
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(SyscallError::from(
@@ -23044,7 +23044,7 @@ mod stage29a_live_split_dispatch_tests {
         let grown = before.saturating_add(8);
         let mut frame = cnode_slots_frame(requester, grown);
         assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy(),
             Some(Ok(())),
             "self-grow by the resolved running requester must be result=ok"
         );
@@ -23407,7 +23407,8 @@ mod stage31_split_recv_tests {
             [901, requested, 0, 0, 0, 0],
         );
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, Some(Ok(())), "NR 8 split dispatch must still work");
         assert_eq!(frame.ret0(), requested);
         assert_eq!(frame.ret1(), 901);
@@ -23494,7 +23495,8 @@ mod stage31_split_recv_tests {
         });
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             Some(Ok(())),
             "IpcRecv kernel-task queued plain is serviced by the live seam (Stage 32B)"
         );
@@ -24038,7 +24040,8 @@ mod stage32_cap_resolution_tests {
             [901, requested, 0, 0, 0, 0],
         );
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, Some(Ok(())), "NR 8 split dispatch must still work");
         assert_eq!(frame.ret0(), requested);
         assert_eq!(frame.ret1(), 901);
@@ -24053,7 +24056,8 @@ mod stage32_cap_resolution_tests {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -24082,7 +24086,8 @@ mod stage32_cap_resolution_tests {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"pong");
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -24110,7 +24115,8 @@ mod stage32_cap_resolution_tests {
         });
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
             "user-ASID split path: undersized buffer → InvalidArgs (Stage 36)"
         );
@@ -24126,7 +24132,8 @@ mod stage32_cap_resolution_tests {
         });
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             None,
             "empty endpoint must fall back through the live seam"
         );
@@ -24138,7 +24145,8 @@ mod stage32_cap_resolution_tests {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_v2_frame(recv_cap);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             None,
             "recv-v2 must fall back through the live seam"
         );
@@ -24151,7 +24159,8 @@ mod stage32_cap_resolution_tests {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let mut frame = recv_frame(CapId(987_654));
         let split =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         let mut ref_state = Bootstrap::init().expect("init");
         let mut ref_frame = recv_frame(CapId(987_654));
         let ref_err = crate::kernel::syscall::dispatch(&mut ref_state, &mut ref_frame).err();
@@ -24173,7 +24182,8 @@ mod stage32_cap_resolution_tests {
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             None,
             "IpcRecvTimeout must fall back (not split-eligible)"
         );
@@ -24203,7 +24213,8 @@ mod stage32_cap_resolution_tests {
             [target as usize, requested, 0, 0, 0, 0],
         );
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             Some(Ok(())),
             "NR 8 split dispatch must still succeed"
         );
@@ -24330,7 +24341,8 @@ mod stage33_34 {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let mut frame = recv_frame(CapId(987_654));
         let split =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         let mut ref_state = Bootstrap::init().expect("init");
         let mut ref_frame = recv_frame(CapId(987_654));
         let ref_err = crate::kernel::syscall::dispatch(&mut ref_state, &mut ref_frame).err();
@@ -24352,7 +24364,8 @@ mod stage33_34 {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"pong");
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -24384,7 +24397,8 @@ mod stage33_34 {
         });
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
             "user-ASID split path: undersized buffer → InvalidArgs (Stage 36)"
         );
@@ -24395,7 +24409,8 @@ mod stage33_34 {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_v2_frame(recv_cap);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             None,
             "canonical core must fall back for recv-v2 (meta user-copy required)"
         );
@@ -24432,7 +24447,8 @@ mod stage33_34 {
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             None,
             "IpcRecvTimeout must fall back through live seam (NR 5 not split-eligible)"
         );
@@ -24474,7 +24490,8 @@ mod stage33_34 {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_v2_frame(recv_cap);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             None,
             "recv-v2 must fall back via live seam (meta user-copy required)"
         );
@@ -24505,7 +24522,8 @@ mod stage33_34 {
         let mut frame = recv_frame(recv_cap);
         // Split path attempts user-ASID recv, finds undersized buffer → Err(InvalidArgs).
         let split =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             split,
             Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
@@ -24772,7 +24790,8 @@ mod stage33_34 {
             [target as usize, 16, 0, 0, 0, 0],
         );
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             Some(Ok(())),
             "NR 8 (ControlPlaneSetCnodeSlots) must still work after Stage 33"
         );
@@ -24786,7 +24805,8 @@ mod stage33_34 {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"hello");
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -24812,7 +24832,8 @@ mod stage33_34 {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"mark");
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -24830,7 +24851,8 @@ mod stage33_34 {
         });
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             None,
             "empty endpoint must fall back through canonical core"
         );
@@ -25029,7 +25051,8 @@ mod stage35 {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"stage35");
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -25057,7 +25080,8 @@ mod stage35 {
         });
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
@@ -25258,7 +25282,8 @@ mod stage36 {
         let (kernel, recv_cap) = kernel_with_user_asid_and_queued_plain(b"hello");
         let mut frame = recv_frame(recv_cap); // ptr=0, len=0 < 5 bytes
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
@@ -25273,7 +25298,8 @@ mod stage36 {
         let (kernel, recv_cap) = kernel_with_user_asid_and_queued_plain(b"data");
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)))
@@ -25299,7 +25325,8 @@ mod stage36 {
         });
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, None, "empty queue → fallback (None)");
     }
 
@@ -25320,7 +25347,8 @@ mod stage36 {
         });
         let mut frame = recv_frame(recv_cap); // ptr=0, len=0; payload is 0 bytes → fits
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, Some(Ok(())), "empty payload → split delivers");
         assert_eq!(frame.ret0(), 3, "sender tid in ret0");
         assert_eq!(frame.ret1(), 0, "payload len 0 in ret1");
@@ -25351,7 +25379,8 @@ mod stage36 {
         let _ = (user_ptr, user_len); // suppress unused warnings
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         // Empty payload always fits (user_buf_len=0 >= payload_len=0).
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 9);
@@ -25445,7 +25474,8 @@ mod stage36 {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"stage36");
         let mut frame = recv_frame(recv_cap);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -25465,7 +25495,8 @@ mod stage36 {
             [recv_cap.0 as usize, 0x1000, 64, 0x5000, 40, 0],
         );
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result, None,
             "recv-v2 must still fall back (meta user-copy)"
@@ -25533,7 +25564,8 @@ mod stage36 {
         // At dequeue time the message is dequeued; cap materialization fails for
         // handle 0 (no transfer envelope) → InvalidCapability.
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(
@@ -25975,7 +26007,8 @@ mod stage37 {
             kernel_with_user_asid_v2_and_queued_plain(b"");
         let mut frame = recv_v2_frame(recv_cap, payload_ptr, 64, meta_ptr);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, Some(Ok(())), "empty payload v2 split must succeed");
         assert_eq!(frame.ret0(), 0, "recv-v2 ret0 must be 0 (not sender tid)");
         assert_eq!(
@@ -25992,7 +26025,8 @@ mod stage37 {
             kernel_with_user_asid_v2_and_queued_plain(b"");
         let mut frame = recv_v2_frame(recv_cap, payload_ptr, 64, meta_ptr);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret1(), 0, "payload len = 0");
     }
@@ -26013,7 +26047,8 @@ mod stage37 {
         });
         let mut frame = recv_v2_frame(recv_cap, 0x8000, 64, 0x9000);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(SyscallError::PageFault))),
@@ -26036,7 +26071,8 @@ mod stage37 {
         });
         let mut frame = recv_v2_frame(recv_cap, 0x8000, 64, 0x9000);
         let _ =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         // Queue must now be empty.
         kernel.with(|state| state.unbind_task_asid(0).expect("unbind"));
         let empty = kernel.with(|state| state.try_ipc_recv(recv_cap).expect("try_recv"));
@@ -26050,7 +26086,8 @@ mod stage37 {
         // payload_len=2 < message payload (5 bytes) → InvalidArgs after meta copy.
         let mut frame = recv_v2_frame(recv_cap, 0x8000, 2, meta_ptr);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
@@ -26070,7 +26107,8 @@ mod stage37 {
         });
         let mut frame = recv_v2_frame(recv_cap, 0x1000, 64, 0x2000);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, None, "empty queue → fallback (None)");
     }
 
@@ -26092,7 +26130,8 @@ mod stage37 {
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, Some(Ok(())), "kernel-plain split still live");
         assert_eq!(frame.ret0(), 7, "sender tid");
         assert_eq!(frame.ret1(), b"stage37".len());
@@ -26116,7 +26155,8 @@ mod stage37 {
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, Some(Ok(())), "Stage 36 user-plain path still live");
         assert_eq!(frame.ret0(), 9, "sender tid");
     }
@@ -26353,7 +26393,7 @@ mod stage38 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         // Stage 42+43: split path dequeues the cap-transfer message and attempts
         // materialization; with a fake handle (99) the envelope lookup fails →
         // Some(Err(InvalidCapability)).
@@ -26476,7 +26516,7 @@ mod stage38 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -26521,7 +26561,7 @@ mod stage38 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())));
 
         kernel.with(|state| {
@@ -26644,7 +26684,7 @@ mod stage38 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 7, "sender tid");
         assert_eq!(frame.ret1(), b"stage38".len());
@@ -26667,7 +26707,7 @@ mod stage38 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 9, "sender tid");
     }
@@ -26706,7 +26746,7 @@ mod stage38 {
                 0,
             ],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 0, "ret0=0 in recv-v2 mode");
     }
@@ -27087,7 +27127,7 @@ mod stage40 {
         // or an error — never a v3-specific delivery.
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let mut frame = TrapFrame::new(Syscall::IpcRecv as usize, [0, 0, 0, 0, 0, 0]);
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         // v3 has no syscall number; result must be None (fallback) or an error —
         // never a successful v3 delivery.
         assert!(
@@ -27112,7 +27152,7 @@ mod stage40 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 3);
         assert_eq!(frame.ret1(), b"stage40".len());
@@ -27135,7 +27175,7 @@ mod stage40 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 6);
     }
@@ -27394,7 +27434,7 @@ mod stage42 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 11, "sender tid");
         assert_eq!(frame.ret1(), b"stage42".len());
@@ -27416,7 +27456,7 @@ mod stage42 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 12, "sender tid");
     }
@@ -27685,7 +27725,7 @@ mod stage44 {
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
-        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 99, "sender tid");
     }
@@ -32999,7 +33039,8 @@ mod stage114_d3_vm_brk_shrink_live {
 
         let mut frame = brk_frame(base);
         let result =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy();
         assert_eq!(result, Some(Ok(())), "NR 14 must route to the live D3 seam");
         assert!(
             !kernel
@@ -33555,7 +33596,8 @@ mod stage114_d3_vm_brk_shrink_live {
         let (kernel, _asid) = shared_task0_with_known_asid();
         let mut frame = TrapFrame::new(Syscall::IpcSend as usize, [0, 0, 0, 0, 0, 0]);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             None,
             "IpcSend must remain non-split-eligible"
         );
@@ -33604,7 +33646,8 @@ mod stage114_d3_vm_brk_shrink_live {
         let (kernel, _asid) = shared_task0_with_known_asid();
         let mut frame = TrapFrame::new(Syscall::VmMap as usize, [0, 0, 0, 0, 0, 0]);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                .legacy(),
             None,
             "VmMap must remain non-split-eligible (D3-FULL out of scope)"
         );
@@ -43412,11 +43455,14 @@ mod stage160b_aarch64_recv_split_dispatch_audit {
     //    clean (no per-syscall log spam when the oracle proof is not requested).
     #[test]
     fn stage160b_diagnostics_gated_by_proof_knob() {
+        // U9-QA §2 split the seam in two: a small front door that decides between the one
+        // SWITCHING class and everything else, and the unchanged non-switching dispatcher that
+        // still owns the whitelist routing — and therefore still owns these diagnostics.
         let block = SYSCALL_SPLIT_SRC
-            .split("fn try_split_dispatch_into_frame")
+            .split("fn try_split_dispatch_nonswitching_into_frame")
             .nth(1)
             .and_then(|s| s.split("\nfn ").next())
-            .expect("dispatcher must exist");
+            .expect("the non-switching dispatcher must exist");
         assert!(
             block.contains("ipc_recv_oracle_proof_enabled()") && block.contains("if probe"),
             "routing diagnostics must be gated by the ipc_recv_oracle_proof knob"
@@ -43495,14 +43541,31 @@ mod stage160c_aarch64_trap_abi_bracketing {
 
     // 2. A handled split syscall exports results to user GPRs and advances the
     //    SVC PC on BOTH the success and the handled-error arms.
+    //
+    //    U9-QA §2: and on the COMMITTED arm, which needs it most. A blocked FutexWait caller
+    //    will not trap again to collect its result, so its return lanes and its advanced SVC
+    //    have to be committed into that incarnation now — otherwise it re-executes the `svc`
+    //    and re-blocks when a wake finally resumes it. Three arms handle a syscall; three arms
+    //    finalize.
     #[test]
     fn stage160c_exports_and_advances_on_handled_split() {
         assert_eq!(
             TRAP_ENTRY_SRC
                 .matches("finalize_split_handled_syscall(shared, cpu, entering, frame)")
                 .count(),
-            2,
-            "finalize must run on both the Ok and handled-error split arms"
+            3,
+            "finalize must run on the Ok, handled-error and queue-advance-committed arms"
+        );
+        // Each of the three is reached from its own disposition arm, not from a shared prelude.
+        let committed = TRAP_ENTRY_SRC
+            .find("if matches!(disposition, SplitDispatchDisposition::QueueAdvanceCommitted) {")
+            .expect("the committed arm");
+        let complete = TRAP_ENTRY_SRC
+            .find("if let SplitDispatchDisposition::Complete(result) = disposition {")
+            .expect("the complete arm");
+        assert!(
+            committed < complete,
+            "the committed arm must be decided before the complete arm consumes the disposition"
         );
         // Stage 199D: the entering identity is captured BEFORE the split dispatch, so the
         // finalize never re-discovers an unqualified "current task" after the transaction.
@@ -61055,8 +61118,15 @@ mod stage190a_ap_sched_loop {
             );
         }
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        // Whitespace-insensitive: U9-QA §2 made the acquisition conditional, so rustfmt reindents
+        // it inside the `else`. The claim is that the call is still there on that closure, not
+        // what column it sits in.
+        let flat = TRAP_ENTRY
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
         assert!(
-            TRAP_ENTRY.contains("shared\n        .with_cpu(cpu, |kernel| {"),
+            flat.contains("shared .with_cpu(cpu, |kernel| {"),
             "the global lock is NOT retired: the authoritative Phase-2 trap dispatch still \
              takes it, and every AP syscall runs through that closure"
         );
@@ -138132,9 +138202,37 @@ mod u9_production_post_switch_restore {
         assert_eq!(code.matches(".with_cpu(").count(), 1);
         assert_eq!(code.matches(".with(|").count(), 0);
         assert_eq!(code.matches("state.lock()").count(), 0);
+        // U9-QA §2: the ONE surviving acquisition is unchanged in body and in its role — it is
+        // still the canonical broad Phase-2 trap dispatch. What changed is that it is now
+        // CONDITIONAL: a trap whose pre-lock route already published a terminal transition must
+        // not enter it, or the broad handler would re-execute that syscall and advance the queue
+        // a second time. The guard therefore pins both facts: the call itself, and that the only
+        // thing standing in front of it is the disposition — never an inspection of the stash.
+        let flat = code
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
         assert!(
-            code.contains("let inner_result = shared\n        .with_cpu(cpu, |kernel| {"),
+            flat.contains("shared .with_cpu(cpu, |kernel| {"),
             "the survivor is the canonical broad Phase-2 trap dispatch, unchanged"
+        );
+        assert!(
+            code.contains("if queue_advance_committed {"),
+            "and it is entered only when no publication has committed"
+        );
+        let gate = code
+            .find("if queue_advance_committed {")
+            .expect("the broad-dispatch gate");
+        let call = code
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("the broad dispatch");
+        assert!(
+            gate < call,
+            "the gate must precede the acquisition it guards"
+        );
+        assert!(
+            !code[gate..call].contains("DISPATCH_SWITCH_PLAN_STASH"),
+            "a stale or unrelated stash must never decide dispatch control flow"
         );
     }
 
@@ -139331,6 +139429,324 @@ mod u9d3_split_unmap_drives_real_d3 {
         assert!(
             sched_end < asid_at,
             "rank 1 is released before rank 2 is entered"
+        );
+    }
+}
+
+// ── U9-QA §2: THE THREE-WAY PRE-LOCK DISPOSITION ──────────────────────────────────────────────
+//
+// The pre-lock split seam used to answer with two meanings, and the trap entry acted on that: a
+// `Some` early-returned through the live frame, a `None` fell back to the broad dispatcher. Both
+// are correct for a NON-SWITCHING class and both are wrong for a switching one — falling back
+// re-executes the syscall on an already-blocked task, and early-returning returns through the
+// parked caller's own frame.
+//
+// These cases pin the third meaning and the control flow around it: which disposition may reach
+// the broad dispatcher, which may reach the drains, that neither reaches both, and that the
+// trap-path-active window is opened before admission can ask about it and closed exactly once on
+// every way out.
+#[cfg(test)]
+mod u9qa_split_dispatch_disposition {
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    /// `handle_trap_entry_shared`, comment-stripped, so ordering assertions read code and not
+    /// the prose that explains it.
+    fn entry_code() -> alloc::string::String {
+        let start = TRAP_ENTRY
+            .find("pub fn handle_trap_entry_shared")
+            .expect("the shared trap entry");
+        TRAP_ENTRY[start..]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// All three dispositions exist and mean exactly what the restructure needs them to mean.
+    #[test]
+    fn the_seam_answers_with_three_exact_meanings() {
+        for variant in [
+            "NotHandled,",
+            "Complete(Result<(), TrapHandleError>),",
+            "QueueAdvanceCommitted,",
+        ] {
+            assert!(
+                SPLIT.contains(variant),
+                "the disposition must carry `{variant}`"
+            );
+        }
+        // The committed variant carries NO payload: everything the drains need is already on the
+        // existing per-CPU deferral, so there is no second channel to get out of step with it.
+        let decl = SPLIT
+            .split("pub(crate) enum SplitDispatchDisposition {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the enum body");
+        assert!(
+            decl.contains("QueueAdvanceCommitted,") && !decl.contains("QueueAdvanceCommitted {"),
+            "the committed variant must carry no payload of its own"
+        );
+    }
+
+    /// Pre-mutation refusal is the ONLY route to `NotHandled`: in the FutexWait route every
+    /// `NotHandled` sits before the publication, and the one after the reservation releases it.
+    #[test]
+    fn not_handled_is_only_reachable_before_any_mutation() {
+        let route = SPLIT
+            .split("fn try_split_futex_wait_into_frame")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the FutexWait route");
+        let publish = route
+            .find("futex_wait_publish_block_split_mut(cpu, tid, addr)")
+            .expect("the publication");
+        // Everything after the publication line must be the committed path only.
+        let after = &route[publish..];
+        let tail = after
+            .split_once("D::QueueAdvanceCommitted")
+            .map(|(t, _)| t)
+            .unwrap_or(after);
+        // The single `NotHandled` after the publication CALL is the publish-refused arm, and it
+        // releases the reservation first, so nothing is left mutated.
+        assert_eq!(
+            tail.matches("return D::NotHandled;").count(),
+            1,
+            "exactly one post-publish-call refusal: the publish-refused arm"
+        );
+        let clear = tail
+            .find("futex_wait_dispatch_clear(cpu_idx)")
+            .expect("it must release the reservation");
+        let refuse = tail.find("return D::NotHandled;").expect("the refusal");
+        assert!(
+            clear < refuse,
+            "the reservation must be released BEFORE the refusal returns"
+        );
+    }
+
+    /// Admission precedes the reservation, which precedes the publication. Ordering the only
+    /// failure-prone step before the mutation is what makes "no refusal after publication" true.
+    #[test]
+    fn admission_then_reservation_then_publication() {
+        let route = SPLIT
+            .split("fn try_split_futex_wait_into_frame")
+            .nth(1)
+            .expect("the FutexWait route");
+        let admit = route
+            .find("shared.queue_advance_admit_split(cpu)")
+            .expect("admission");
+        let reserve = route
+            .find("futex_wait_dispatch_try_defer(cpu_idx, tid)")
+            .expect("the deferral reservation");
+        let publish = route
+            .find("futex_wait_publish_block_split_mut(cpu, tid, addr)")
+            .expect("the publication");
+        assert!(
+            admit < reserve && reserve < publish,
+            "admit -> reserve -> publish, so every failure lands before the mutation"
+        );
+    }
+
+    /// The broad dispatcher is entered only when nothing was published, and the gate is the
+    /// DISPOSITION — never an inspection of the switch-plan stash.
+    #[test]
+    fn the_broad_dispatcher_is_gated_on_the_disposition_alone() {
+        let code = entry_code();
+        let gate = code
+            .find("if queue_advance_committed {")
+            .expect("the broad-dispatch gate");
+        let call = code
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("the broad dispatch");
+        assert!(gate < call, "the gate must precede the acquisition");
+        let between = &code[gate..call];
+        assert!(
+            !between.contains("DISPATCH_SWITCH_PLAN_STASH") && !between.contains("has_plan()"),
+            "a stale or unrelated stash must not alter dispatch control flow"
+        );
+        // And the flag it reads is set only by the committed arm.
+        assert_eq!(
+            code.matches("queue_advance_committed = true;").count(),
+            1,
+            "exactly one place may declare a publication committed"
+        );
+    }
+
+    /// A `Complete` disposition returns through the architecture epilogue and therefore reaches
+    /// NO drain; a `QueueAdvanceCommitted` one reaches the drains and never returns early.
+    #[test]
+    fn complete_returns_early_and_committed_falls_through() {
+        let code = entry_code();
+        let complete = code
+            .find("if let SplitDispatchDisposition::Complete(result) = disposition {")
+            .expect("the complete arm");
+        let arm_end = code[complete..]
+            .find("\n        }\n    }")
+            .map(|r| complete + r)
+            .expect("the end of the split block");
+        let arm = &code[complete..arm_end];
+        // Every path out of the Complete arm is a return: three arms, three returns.
+        assert_eq!(
+            arm.matches("return ").count(),
+            3,
+            "each Complete outcome returns through the architecture epilogue"
+        );
+        assert!(
+            !arm.contains("queue_advance_committed = true;"),
+            "a Complete disposition must never mark a publication"
+        );
+        // The committed arm sets the flag and does NOT return.
+        let committed_at = code
+            .find("if matches!(disposition, SplitDispatchDisposition::QueueAdvanceCommitted) {")
+            .expect("the committed arm");
+        let committed = &code[committed_at..complete];
+        assert!(
+            committed.contains("queue_advance_committed = true;") && !committed.contains("return "),
+            "the committed arm must fall through to the drains, never return early"
+        );
+    }
+
+    /// The trap-path-active window opens BEFORE the split dispatch, so admission can answer
+    /// truthfully there instead of refusing `NoTrapDrainer`.
+    #[test]
+    fn the_window_opens_before_admission_can_ask_about_it() {
+        let code = entry_code();
+        let establish = code
+            .find("TrapPathWindow::establish(cpu)")
+            .expect("the window must be established");
+        let dispatch = code
+            .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+            .expect("the split dispatch");
+        assert!(
+            establish < dispatch,
+            "the window must be open before the pre-lock route asks for admission"
+        );
+    }
+
+    /// One owner, one clear. The flag is written in exactly two places — both inside the owner —
+    /// and the owner's `settle` is idempotent, so success, refusal and error each clear once.
+    #[test]
+    fn the_window_is_cleared_exactly_once_on_every_path() {
+        // WRITES, not reads: the drain legitimately READS the flag as a precondition. What must
+        // be centralised is who may CHANGE it — establish sets it, settle clears it, nobody else.
+        let writes = TRAP_ENTRY
+            .split("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[")
+            .skip(1)
+            .filter(|tail| {
+                tail.split_once('\n')
+                    .map(|(_, rest)| rest)
+                    .unwrap_or(tail)
+                    .trim_start()
+                    .starts_with(".store(")
+            })
+            .count();
+        assert_eq!(
+            writes, 2,
+            "the flag may be WRITTEN only by TrapPathWindow::establish and ::settle"
+        );
+        let settle = TRAP_ENTRY
+            .split("fn settle(&self) {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the settle body");
+        assert!(
+            settle.contains("if self.settled.replace(true) {") && settle.contains("return;"),
+            "settle must be idempotent, so an explicit call and the Drop still clear once"
+        );
+        assert!(
+            TRAP_ENTRY.contains("impl Drop for TrapPathWindow {")
+                && TRAP_ENTRY.contains("self.settle();"),
+            "Drop must cover every RETURNING path without a written clear"
+        );
+        // And the explicit call exists for the diverging drains, which never unwind.
+        let code = entry_code();
+        let settle_at = code
+            .find("trap_path.settle();")
+            .expect("the explicit settle");
+        let drain = code
+            .find("drain_switch_plan_stash(shared, cpu, ")
+            .expect("the drain");
+        assert!(
+            settle_at < drain,
+            "the window must be closed before any diverging landing is reachable"
+        );
+    }
+
+    /// The queue-advance drain is consumed once. The split-plan drain has exactly one call site
+    /// in the entry, and the trap reaches it by one route.
+    #[test]
+    fn the_drain_runs_exactly_once() {
+        let code = entry_code();
+        assert_eq!(
+            code.matches("drain_switch_plan_stash(shared, cpu, ")
+                .count(),
+            1,
+            "one drain call site in the trap entry"
+        );
+        assert_eq!(
+            code.matches("shared.futex_wait_dispatch_step_mut(cpu)")
+                .count(),
+            3,
+            "the three existing per-architecture FutexWait drain sites, unchanged in number"
+        );
+    }
+
+    /// The five existing non-switching classes still go through the unchanged dispatcher, and
+    /// FutexWait is deliberately NOT on that whitelist — the whitelist's contract is that
+    /// everything on it may be early-returned.
+    #[test]
+    fn futex_wait_is_not_on_the_non_switching_whitelist() {
+        let whitelist = SPLIT
+            .split("fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the NR whitelist");
+        assert!(
+            !whitelist.contains("Syscall::FutexWait"),
+            "the switching class must never join the early-returnable whitelist"
+        );
+        for class in [
+            "Syscall::ControlPlaneSetCnodeSlots",
+            "Syscall::IpcRecv",
+            "Syscall::VmBrk",
+            "Syscall::DebugLog",
+            "Syscall::FutexWake",
+        ] {
+            assert!(
+                whitelist.contains(class),
+                "the five non-switching classes must be unchanged: {class}"
+            );
+        }
+    }
+
+    /// RISC-V has no off-lock switch apply yet, so a committed publication there would strand a
+    /// blocked caller. Its bridge matches the variant explicitly and fails loudly.
+    #[test]
+    fn riscv_refuses_a_committed_publication_loudly() {
+        assert!(
+            RISCV_TRAP.contains("SplitDispatchDisposition::QueueAdvanceCommitted"),
+            "the RISC-V bridge must match the committed disposition explicitly"
+        );
+        let arm = RISCV_TRAP
+            .split("RISCV_SPLIT_QUEUE_ADVANCE_UNSUPPORTED")
+            .nth(1)
+            .expect("the loud refusal");
+        assert!(
+            arm.split("\n        }")
+                .next()
+                .is_some_and(|a| a.contains("return Err(")),
+            "it must fail loudly, not fold into the fall-through"
+        );
+        // FutexWait's NR is still not admitted there.
+        let gate = RISCV_TRAP
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("the RISC-V eligibility gate");
+        assert!(
+            !gate.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "RISC-V must not admit FutexWait before its off-lock switch apply exists"
         );
     }
 }

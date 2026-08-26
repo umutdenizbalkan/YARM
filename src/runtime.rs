@@ -10826,11 +10826,15 @@ mod tests {
             "trap_entry.rs drops from 3 to 2 with this retirement, then to 1 with U9-D3 §7"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
+        // U9-QA §2 made the one acquisition CONDITIONAL — a pre-lock route that published a
+        // terminal transition must not enter it — but did not change the acquisition itself.
+        // That is what this pins: the same call, on the same closure.
+        let flat = code
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
         assert!(
-            code.contains(
-                "let inner_result = shared
-        .with_cpu(cpu, |kernel| {"
-            ),
+            flat.contains("shared .with_cpu(cpu, |kernel| {"),
             "the canonical broad Phase-2 trap dispatch is present and unchanged"
         );
         // U9 (canonical 203C) moved the production restore out of the second acquisition; U9-D3

@@ -523,12 +523,75 @@ fn drain_switch_plan_stash(
     Ok(())
 }
 
+/// U9-QA §2 — the ONE owner of this CPU's trap-path-active window.
+///
+/// `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` means "a drainer WILL consume whatever this trap
+/// publishes". Stage 117 set it around the broad `with_cpu` only, because only in-lock code
+/// could publish. U9-QA gives the PRE-LOCK split route the same ability, so the window must
+/// open before that route runs — which is also what lets `queue_advance_admit_split` answer
+/// truthfully there instead of refusing `NoTrapDrainer`.
+///
+/// Widening the window widens the obligation to close it, and `handle_trap_entry_shared` now
+/// leaves through several paths: a completed non-switching split class, an ordinary syscall
+/// error, a kernel-side error, the broad dispatcher's own `?`, and the fall-through to the
+/// drains. Rather than duplicate the clear at each, this type owns it: `settle` clears exactly
+/// once and `Drop` calls `settle`, so every RETURNING path is covered without a written clear.
+///
+/// `Drop` cannot cover a DIVERGING path — the drains' idle and fatal landings never return, so
+/// they never unwind. That is why `settle` is also called explicitly at the single point after
+/// the broad dispatcher and before the drains: by the time any divergence is reachable, the
+/// window is already closed, and the later `Drop` is a no-op.
+struct TrapPathWindow {
+    cpu_idx: usize,
+    settled: core::cell::Cell<bool>,
+}
+
+impl TrapPathWindow {
+    fn establish(cpu: CpuId) -> Self {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        Self {
+            cpu_idx,
+            settled: core::cell::Cell::new(false),
+        }
+    }
+
+    /// Close the window. Idempotent by construction, so an explicit call before a divergence
+    /// and the `Drop` that follows a return together still clear it exactly once.
+    fn settle(&self) {
+        if self.settled.replace(true) {
+            return;
+        }
+        if self.cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[self.cpu_idx]
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for TrapPathWindow {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
 pub fn handle_trap_entry_shared(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
     context: ArchTrapContext,
     mut frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
+    use crate::kernel::syscall_split::SplitDispatchDisposition;
+
+    // Stage 117 / U9-QA §2: open the trap-path-active window HERE — before the pre-lock split
+    // dispatch, not just around `with_cpu`. See `TrapPathWindow`; it is the one owner of this
+    // flag and of clearing it on every path out of this function.
+    let cpu_idx = cpu.0 as usize;
+    let trap_path = TrapPathWindow::establish(cpu);
+
     // Stage 29: pre-global-lock split-dispatch seam (whitelist-only, default-deny).
     //
     // For a syscall trap whose number is on the `syscall_split` whitelist (today
@@ -539,9 +602,15 @@ pub fn handle_trap_entry_shared(
     // the arch return-register writeback exactly as on the global-lock path.
     //
     // Every other syscall (and any classification/precondition miss, or an absent
-    // requester TID) returns `None` and falls through to the UNCHANGED global-lock
-    // dispatch below. This is gated on the trap being a syscall so non-syscall
+    // requester TID) returns `NotHandled` and falls through to the UNCHANGED
+    // global-lock dispatch below. This is gated on the trap being a syscall so non-syscall
     // events (page faults, timer/external IRQs) never enter the seam.
+    //
+    // U9-QA §2: the seam now answers with three meanings rather than two. `NotHandled` and
+    // `Complete` behave exactly as `None` and `Some` did. `QueueAdvanceCommitted` is the new
+    // one: a terminal transition has been published, so this trap may neither enter the broad
+    // dispatcher nor return through the outgoing frame — it falls through to the drains.
+    let mut queue_advance_committed = false;
     if matches!(decode_trap_context(context), TrapEvent::Syscall) {
         if let Some(frame) = frame.as_deref_mut() {
             // Stage 160C: import the decoded syscall ABI into the frame BEFORE the
@@ -555,9 +624,35 @@ pub fn handle_trap_entry_shared(
             // "current" lookup would find afterwards — a direct NR6/NR7 transaction wakes and
             // enqueues another task, so that lookup is not a safe question to ask after it.
             let entering = split_return_identity(shared, cpu);
-            if let Some(result) =
-                crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
-            {
+            let disposition =
+                crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame);
+            // U9-QA §2: the COMMITTED disposition. The split route published a terminal
+            // transition, so the caller is no longer current on this CPU and the live frame no
+            // longer belongs to anything this trap may return through.
+            //
+            // Two things happen here and nowhere else. The architecture syscall-return ABI is
+            // finalized against the OUTGOING incarnation — the caller must observe its result
+            // and its advanced PC when it is later resumed, not when it next traps. Then the
+            // outgoing user context is captured into that exact TCB, keyed on the identity the
+            // deferral carries rather than on any ambient "current" lookup, because the drain
+            // is about to overwrite the live frame with the INCOMING task's context.
+            if matches!(disposition, SplitDispatchDisposition::QueueAdvanceCommitted) {
+                finalize_split_handled_syscall(shared, cpu, entering, frame);
+                let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+                let captured = outgoing
+                    .map(|t| shared.capture_outgoing_user_context_split(t, frame))
+                    .unwrap_or(false);
+                crate::yarm_log!(
+                    "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=queue_advance_committed outgoing={} captured={}",
+                    SPLIT_DISPATCH_ARCH_TAG,
+                    frame.syscall_num(),
+                    cpu.0,
+                    outgoing.unwrap_or(u64::MAX),
+                    u8::from(captured),
+                );
+                queue_advance_committed = true;
+            }
+            if let SplitDispatchDisposition::Complete(result) = disposition {
                 match result {
                     Ok(()) => {
                         // Stage 160C: a HANDLED split syscall must return to
@@ -659,47 +754,65 @@ pub fn handle_trap_entry_shared(
         FaultBookkeepingMode::RecordInHandleTrapEvent
     };
 
-    // Stage 117: signal to `maybe_switch_kernel_context` that this CPU is in
-    // the `handle_trap_entry_shared` path and the stash WILL be drained after
-    // `with_cpu` returns. Without this flag, direct-call paths (tests) would
-    // stash a plan with no external drainer, losing the context switch.
-    let cpu_idx = cpu.0 as usize;
-    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
-        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .store(true, core::sync::atomic::Ordering::Relaxed);
-    }
-
+    // Stage 117 / U9-QA §2: the broad dispatcher is entered ONLY after a `NotHandled`
+    // disposition — i.e. only when nothing has been mutated and the trap still needs handling.
+    //
+    // After `QueueAdvanceCommitted` it must be skipped, and not as an optimisation: the caller
+    // is already `Blocked(Futex)` and current on no CPU, so `handle_trap` would re-execute
+    // FutexWait against a task that has already blocked, and `dispatch_next_task` would advance
+    // the queue a second time for one publication. Skipping is what makes "the queue-advance
+    // drain runs exactly once" true.
+    //
+    // Note this is decided by the DISPOSITION, never by inspecting the switch-plan stash. A
+    // stale or unrelated stash must not be able to alter dispatch control flow.
+    //
     // Stage 117: pass `frame.as_deref_mut()` (reborrow) so that `frame` remains
     // available after `with_cpu` returns for the stash drain below.
-    let inner_result = shared
-        .with_cpu(cpu, |kernel| {
-            // Stage 120: diagnostic-only x86_64 proof hook. Default-off and
-            // one-shot; when enabled it stashes a normal DispatchSwitchPlan
-            // before regular trap handling, so the existing Stage 117 drain
-            // below proves the unlocked switch_frames path without changing
-            // scheduler policy or syscall ABI.
-            #[cfg(target_arch = "x86_64")]
-            kernel
-                .maybe_run_d6_controlled_switch_proof()
-                .map_err(|err| {
-                    TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::from(err))
-                })?;
-            handle_trap_entry_with_fault_bookkeeping_mode(
-                kernel,
-                cpu,
-                context,
-                frame.as_deref_mut(),
-                fault_bookkeeping_mode,
-            )
-        })
-        .map_err(|err| TrapHandleError::Syscall(err.into()));
+    // The `Ok(Ok(()))` shape mirrors the broad call exactly: the outer `Result` is the lock
+    // acquisition, the inner one the arch handler's own result. Skipping the acquisition yields
+    // a successful acquisition of nothing and a successful handler, so both `?` sites below stay
+    // untouched.
+    let inner_result: Result<Result<(), TrapHandleError>, TrapHandleError> =
+        if queue_advance_committed {
+            crate::yarm_log!(
+                "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=publication_committed",
+                cpu.0
+            );
+            Ok(Ok(()))
+        } else {
+            shared
+                .with_cpu(cpu, |kernel| {
+                    // Stage 120: diagnostic-only x86_64 proof hook. Default-off and
+                    // one-shot; when enabled it stashes a normal DispatchSwitchPlan
+                    // before regular trap handling, so the existing Stage 117 drain
+                    // below proves the unlocked switch_frames path without changing
+                    // scheduler policy or syscall ABI.
+                    #[cfg(target_arch = "x86_64")]
+                    kernel
+                        .maybe_run_d6_controlled_switch_proof()
+                        .map_err(|err| {
+                            TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::from(
+                                err,
+                            ))
+                        })?;
+                    handle_trap_entry_with_fault_bookkeeping_mode(
+                        kernel,
+                        cpu,
+                        context,
+                        frame.as_deref_mut(),
+                        fault_bookkeeping_mode,
+                    )
+                })
+                .map_err(|err| TrapHandleError::Syscall(err.into()))
+        };
 
-    // Clear the trap-path-active flag; the stash drain below handles whatever
-    // was stashed during the `with_cpu` call.
-    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
-        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .store(false, core::sync::atomic::Ordering::Relaxed);
-    }
+    // U9-QA §2: the SINGLE settlement point for the trap-path-active window, covering both
+    // paths that reach the drains. It is explicit rather than left to `Drop` because the drains
+    // below contain DIVERGING landings (idle, fatal) that never unwind — the window has to be
+    // closed before any of them is reachable. Every other exit from this function returns, so
+    // `TrapPathWindow::drop` closes it there; `settle` is idempotent, so it happens exactly once
+    // either way.
+    trap_path.settle();
 
     let inner_result = inner_result?;
     // `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.
@@ -2333,8 +2446,14 @@ fn finalize_split_handled_syscall(
     // transactions (exact-incarnation TLS take, exact-incarnation context commit) — see
     // `split_finalize_handled_syscall`. NR6/NR7 are admitted through the canonical
     // `ipccall_direct_admission_enabled()` predicate, matching the import above.
+    //
+    // U9-QA §2: FutexWait (nr=9) joins them. It is the one SWITCHING class, and it needs this
+    // more than the others do: the blocked caller will not trap again to collect its result, so
+    // its `set_ok(1,0,0)` and its advanced SVC must be committed into THIS incarnation now, or
+    // it would re-execute the `svc` and re-block when the wake eventually resumes it.
     if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+        || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         || ((frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
             || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)

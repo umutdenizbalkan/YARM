@@ -733,8 +733,28 @@ pub fn handle_riscv_trap_entry_shared(
         if log_split {
             crate::yarm_log!("RISCV_SPLIT_ABI_IMPORT_OK nr={}", nr);
         }
-        if let Some(result) =
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
+        let disposition =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame);
+        // U9-QA §2: RISC-V admits DebugLog, FutexWake and (gated) NR6/NR7 only — all
+        // NON-SWITCHING. FutexWait's NR never reaches the dispatcher from here, so
+        // `QueueAdvanceCommitted` is unreachable on this bridge. It is matched explicitly
+        // anyway, and FAILS LOUDLY rather than being folded into the fall-through: this
+        // architecture has no off-lock switch apply yet, so a committed publication here would
+        // leave a blocked caller with nothing to settle it. If NR 9 is ever admitted above
+        // before that apply exists, this is the line that says so.
+        if matches!(
+            disposition,
+            crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted
+        ) {
+            crate::yarm_log!(
+                "RISCV_SPLIT_QUEUE_ADVANCE_UNSUPPORTED nr={} cpu={} reason=no_off_lock_switch_apply",
+                nr,
+                cpu.0
+            );
+            return Err(TrapHandleError::MissingTrapFrame);
+        }
+        if let crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) =
+            disposition
         {
             match result {
                 Ok(()) => {
@@ -773,7 +793,7 @@ pub fn handle_riscv_trap_entry_shared(
                 Err(other) => return Err(other),
             }
         }
-        // The helper declined (None: unavailable requester, or a FutexWake
+        // The helper declined (`NotHandled`: unavailable requester, or a FutexWake
         // validation miss that the global-lock path must encode canonically) —
         // fall through to the unchanged broad-lock handler exactly once.
     }
