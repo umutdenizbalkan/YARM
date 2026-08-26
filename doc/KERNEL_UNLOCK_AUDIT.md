@@ -5107,12 +5107,14 @@ Spawn/Fork/Exit; RPi5; WA3C2; and direct-IpcCall production. No stage status cha
 because this prerequisite was delivered — U9-TM is CENSUS-DELTA 0, so the canonical stage
 arithmetic is unchanged.
 
-### U9-PF — PageFault route matrix and witness census. ANALYSIS CHECKPOINT. No route delivered.
+### U9-PF — PageFault classification and the witnessed routing matrix. PARTIAL. CENSUS-DELTA 0.
 
-**U9-PF — CENSUS-DELTA 0 prerequisite.** This entry records the §1 derivation only. **No PageFault
-route has been moved off the terminal broad dispatchers**, so the census stays **2 / 0 / 2** and
-both terminal acquisitions keep every reason they had. It is recorded because the derivation
-overturns three premises that later increments would otherwise re-derive.
+**U9-PF — CENSUS-DELTA 0 prerequisite.** Delivered: the §1 derivation, the pure Phase-A
+classification, the single routing-matrix owner and the §7 demand blocker record. **No PageFault
+route has been moved off the terminal broad dispatchers** — the two witnessed transactions
+themselves are NOT built — so the census stays **2 / 0 / 2** and both terminal acquisitions keep
+every reason they had. The derivation is recorded because it overturns three premises that later
+increments would otherwise re-derive.
 
 **Where PageFault is handled today.** One arm, `KernelState::handle_trap_entry`'s
 `TrapEvent::PageFault(fault)` in `fault_state.rs`, reached only inside the broad dispatcher. It
@@ -5183,6 +5185,48 @@ bit** — and the PageFault arm performs no origin test; the sole kernel-space g
 three revoke obligations (`resolve_phys`, `copy_frame`, `remap` failures), all currently through
 broad `revoke_capability_in_cnode`. The demand handler's `alloc_anonymous_memory_object()?`
 followed by `map_user_page_in_asid_with_caps(...)?` has **no revoke on the map failure path**.
+
+**Delivered: the pure Phase-A classification.** `KernelState::classify_page_fault_split(&self,
+cpu, FaultInfo)` yields `PageFaultClass` — `CowCandidate`, `DemandCandidate`,
+`TerminallyUnhandled`, `KernelOrAbsentTask` — plus `PageFaultFacts { cpu, tid, asid, page,
+access, mapping_present, mapping_writable, cow_marked, demand_region }`. It takes `&self`, so
+PTE, task, capability and refcount mutation is not expressible and no allocation can occur, and
+it reproduces the broad arm's ORDER exactly (COW first and only for writes, then the demand
+screen, then the terminal fall-through) so split and broad can never disagree about a fault's
+class. `CpuId` is an explicit parameter; there is no ambient `current_cpu` read.
+
+**Identity.** `ThreadControlBlock` carries NO per-task incarnation counter — only per-purpose
+generations (`blocked_recv`, `blocked_send`, `async_preempt`, `reply_record`). The authoritative
+fault coordinate is therefore `{tid, asid}`, exactly as both existing handlers use it: a reused
+numeric TID in a fresh address space carries a different ASID. No new generation field was
+invented, and no privilege-origin bit was invented either.
+
+**Delivered: the routing matrix, in one evaluator.** `page_fault_route_for(arch, class)` takes
+architecture as a parameter rather than reading `cfg!`, so the matrix is exhaustively testable
+for all three ports from the hosted suite:
+
+| Architecture | Class | Route |
+|---|---|---|
+| x86_64 | `CowCandidate` | `SplitCow` (2 live witnesses at base) |
+| AArch64 | `TerminallyUnhandled` | `SplitTerminal` (1 live witness at base) |
+| any | `DemandCandidate` | **`Broad`** — zero witnesses anywhere |
+| all other pairs | — | `Broad` |
+
+**NOT delivered, and what remains.** The `SplitCow` and `SplitTerminal` transactions are declared
+in the matrix but not yet wired: no fault takes either route today. Building them requires a
+split fault-report emitter and a split fault-policy read, which do not exist yet — the other
+seams they need (`block_current_on_cpu_split`, `with_task_tcbs_split_mut`, `with_ipc_split_mut`,
+and the U9-QA queue-advance owner) already do. Until both transactions ship and are live-proven,
+`TimerInterrupt`'s fault-delivery proof hook is NOT relocated and the timer broad-proof blockers
+remain **five**, unchanged.
+
+**§7 — the demand-page blocker, pinned as an UNRESOLVED prerequisite.** Demand recovery is not
+implemented and no demand route is claimed. Two guards hold the line: every demand candidate is
+asserted to stay `Broad` on every architecture, and the missing rollback is pinned directly. The
+second guard is deliberately written to FAIL if the rollback is ever repaired, instructing the
+author to replace it with a positive rollback assertion — it records an open prerequisite rather
+than freezing the leak as desired behaviour. A future demand increment must FIRST provide a live
+witness AND repair that rollback; no demand-page safety or retirement claim is made here.
 
 ***U9 remains OPEN*** and direct-IpcCall production remains OFF
 (`ipccall_direct_production_enabled()` is `const false`). No stage status changes: U9-PF is
