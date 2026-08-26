@@ -12243,3 +12243,101 @@ delivery stays broad for want of any live witness; COW and demand are untouched;
 terminal route is intact. The census remains **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall
 production remains OFF (`ipccall_direct_production_enabled()` is `const false`). U9-RX2 is
 CENSUS-DELTA 0, so the canonical stage arithmetic is unchanged.
+
+### U9-RX3 — the off-lock receive-block unwind, and the genuine blocking-IpcRecv route. CENSUS-DELTA 0.
+
+**U9-RX3 — the blocker U9-RX2 recorded is retired.** Delivered: the four `SharedKernel`
+receive-block phase twins, and the pre-lock blocking `IpcRecv` route they made possible. The route
+is **live-witnessed on x86_64**; AArch64 and RISC-V keep the unchanged broad entry, each for a
+recorded reason. The census stays **2 / 0 / 2**.
+
+**THE ORDERING IS FORCED BY SOURCE, NOT CHOSEN.** `block_current_on_receive_with_deadline` runs
+scheduler(1) → task(2) → ipc(3), and the comment above it says why the publish may not be hoisted
+ahead of the block: a sender that observes a published waiter must also observe a `Blocked` TCB, or
+it will attempt direct delivery to a task that is still `Running`. So the `QueueNonEmpty` recheck
+cannot be made mutation-free, and any pre-lock route must be able to **undo the rank-1 block**.
+That is the whole reason the unwind twin had to exist before the route could.
+
+**The four twins**, in `src/runtime.rs`. `recv_block_phase_a_split(cpu, expected_tid)` blocks the
+current task and returns its ASID, refusing if a different task was current than the one the route
+classified. `recv_block_phase_b_split(tid, recv_cap, deadline, state)` mints the fresh blocked-recv
+generation in the SAME rank-2 acquisition that marks the task `Blocked(EndpointReceive)` — checked
+advancement, so a wrap fails closed rather than letting a stale record compare equal.
+`recv_block_phase_c_split` drives `publish_recv_waiter_locked`, the ONE publish policy U9-RX2
+extracted, so the split and broad routes cannot drift. `recv_block_unwind_race_split(cpu, tid)` is
+the exact inverse: rank 2 clears the blocked-recv state, deadline and timeout flag and restores
+`Runnable`, then rank 1 re-enqueues and makes the task current again, so the broad fallback can
+re-run its syscall on a task the scheduler still holds.
+
+**THE ROUTE.** `try_split_blocking_ipc_recv_into_frame` is the SECOND switching pre-lock class, and
+it is dispatched before the non-switching whitelist for the reason FutexWait is: that whitelist's
+contract is that every class on it may be early-returned through the caller's own frame, and a
+blocking receive may not. Its steps are ordered so the last thing that can decline precedes the
+first thing that mutates — NR and architecture, the publication gates, the ABI (`recv-v2` only,
+decoded through the same canonical `RecvRequest` builder the broad entry uses), the capability, the
+would-block read, admission, and only then the reservation and the three phases.
+
+**IT CREATES NO SECOND DRAIN.** Blocking recv already owns a deferral/drain topology —
+`d2_recv_dispatch_try_defer` published by the in-lock entry, consumed by the shared trap-entry
+drain that re-verifies `Blocked(EndpointReceive)`, selects, marks Running and resumes. The route
+publishes into that same one. The reservation is taken BEFORE any publication, so a reservation
+failure stays a pre-mutation refusal; holding it is what makes the incoming apply structurally
+guaranteed, which is precisely what U9-FT3 got wrong and U9-FT4 fixed.
+
+**The would-block read is conservative, and deliberately so.** The broad entry answers "would this
+block?" by *attempting* the take and observing `None`; a pre-lock route cannot, because the attempt
+is the mutation. `recv_would_block_split_read` asks the structural question instead, in ONE rank-3
+acquisition: live generation, `Buffered` mode, empty queue, no sender waiter, no receive waiter.
+Any other shape falls back. A wrong `true` would block a receiver that had a message — a hang; a
+wrong `false` costs one fallback.
+
+**THE `QueueNonEmpty` RACE IS NOW REACHABLE.** The broad entry documents that branch as
+unreachable, and under the serialized broad lock it is: Phases A/B/C run inside one
+`&mut KernelState` borrow, so no sender can interleave. The pre-lock route removes that
+serialization. The branch runs the inverse, releases the reservation and falls back, and it is
+proven by a hosted test that forces the interleaving by hand
+(`u9rx3_forced_publish_race_unwinds_the_block_completely`) rather than by the absence of a marker
+— a regression here is a hang, not a wrong value.
+
+**LIVE, x86_64.** One trap, end to end: `IPC_RECV_ENTER tid=3 cap=65536` → `SCHED_BLOCK tid=3` →
+`D2_RECV_WAITER_TASK_BLOCKED tid=3 wait_gen=1` → `D2_RECV_WAITER_PUBLISHED tid=3` →
+`IPC_RECV_BLOCK_REGISTER endpoint=0 tid=3` → `QUEUE_ADVANCING_DISPATCH_DEFERRED
+reason=blocking_recv_switch_required` → `nr=2 result=queue_advance_committed` →
+`QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED reason=publication_committed` →
+`D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid=3` → `result=switch incoming=1`. Zero
+`IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED`, zero race unwinds, boot continues.
+
+**WHY AArch64 IS NOT ROUTED — a live finding, not caution.** The route body is
+architecture-neutral, and admitting NR 2 into `pre_split_import_syscall_abi` does make it fire
+correctly there: measured, the block publishes, the deferral is reserved, and the existing D2-recv
+drain resumes the replacement cleanly. But the import is not selective — it makes NR 2 visible to
+the WHOLE pre-lock dispatcher, and the Stage 32B queued-plain split recv is reached first. On
+AArch64 that route then services PM's receive and PM answers `PM_RECV_DECODE_FAIL opcode=0
+reply_cap=4294967295`: the split writeback delivers the message without its reply cap, PM never
+replies, and the caller (tid 2) stays blocked on endpoint 5 for the rest of the boot — the U9-FT4
+terminal-fault witness then selects tid 3 instead of tid 2 because tid 2 is no longer runnable.
+**The same `PM_RECV_DECODE_FAIL` is already present on x86_64**, where that route has always been
+live. So this is a PRE-EXISTING defect in the queued-plain split writeback, and importing NR 2
+would newly impose it on a second architecture. The import was measured, the regression was seen,
+and it was reverted; fixing that writeback is its own increment with its own proof. RISC-V is
+excluded for want of a live witness, not for a structural reason — its D2-recv drain is the same
+shape.
+
+**Two Stage 115 fences re-derived, narrowed rather than weakened.**
+`stage115_d2_blocking_recv_orchestrator_still_calls_with_cpu` carried two claims in one assertion:
+that the broad orchestrator is never called from `syscall_split.rs`, and by implication that no
+pre-lock blocking route exists. The second is retired by this increment and is not restated; the
+first is unchanged and still load-bearing, because that orchestrator takes `&mut KernelState` and
+calling it pre-lock would alias the storage the split seams project raw pointers into.
+`stage115_d2_task_seam_not_called_from_d2_blocking_path` guarded exactly the premise that changed,
+so it now pins the invariant that made the wiring admissible: the route reaches the task domain
+ONLY through `SharedKernel` twins, never a `&mut KernelState` method.
+
+**Unchanged.** Blocking IpcRecv stays broad on AArch64 and RISC-V, and on x86_64 for every case the
+route declines — legacy (non-`recv-v2`) receives, a non-empty endpoint, a parked sender, an
+existing waiter, an armed acknowledgement gate. Fault-report waiter delivery stays broad for want
+of any live witness; COW and demand are untouched; the U9-FT4 AArch64 terminal route is intact. The
+four-class completion transaction remains the sole completion/writeback owner. The census remains
+**2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`). U9-RX3 is CENSUS-DELTA 0, so the canonical
+stage arithmetic is unchanged.
