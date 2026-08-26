@@ -143254,3 +143254,311 @@ mod u9rx3_route {
         }
     }
 }
+
+/// U9-COW2 §5 — the routed x86_64 private-copy COW recovery.
+///
+/// These pin the properties whose violation is a leak or a hang rather than a wrong value, so
+/// each is asserted positively over the transaction's own source and typed outcomes rather than
+/// inferred from the absence of a marker.
+mod u9cow2_route {
+    use crate::kernel::boot::{CowRecovery, KernelError};
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const MEMORY_SRC: &str = include_str!("memory_state.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    /// The transaction body with comments stripped: every guard here asks about CODE, so an
+    /// explanatory comment naming a symbol must neither satisfy nor trip one.
+    fn txn() -> alloc::string::String {
+        let i = RUNTIME_SRC
+            .find("pub(crate) fn cow_recover_private_copy_split(")
+            .expect("the COW transaction must exist");
+        let rest = &RUNTIME_SRC[i..];
+        let end = rest
+            .find("\n    /// U9-COW1 §3 — the page copy")
+            .expect("the transaction is followed by its copy helper");
+        rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn at(hay: &str, needle: &str) -> usize {
+        hay.find(needle)
+            .unwrap_or_else(|| panic!("expected `{needle}`"))
+    }
+
+    /// ADMISSION MISMATCH REFUSES BEFORE MUTATING. Every identity/mapping revalidation must
+    /// precede the first allocation, and each must produce a pre-mutation refusal.
+    #[test]
+    fn every_revalidation_precedes_the_first_allocation() {
+        let t = txn();
+        let first_mutation = at(&t, "alloc_contiguous(1)");
+        for check in [
+            "task_cnode_split(facts.tid)",
+            "spaces.get(asid).and_then(|space| space.resolve(page))",
+            "old_mapping.flags.write",
+            "cow_pages",
+            "current_tid_split_read(facts.cpu)",
+        ] {
+            assert!(
+                at(&t, check) < first_mutation,
+                "`{check}` must be evaluated before the first allocation"
+            );
+        }
+        for refusal in [
+            "RefusedNoCnode",
+            "RefusedMappingChanged",
+            "RefusedIdentityChanged",
+        ] {
+            assert!(
+                t[..first_mutation].contains(refusal),
+                "`{refusal}` must be reachable before the first allocation"
+            );
+        }
+    }
+
+    /// NO BROAD FALLBACK AFTER THE FIRST MUTATION. This is the whole reason the outcome is
+    /// three-way: `Refused*` mutated nothing and may fall back; `FailedClosed*` allocated and
+    /// may not, because the broad arm would allocate a second frame for a fault it never saw
+    /// declined.
+    #[test]
+    fn only_pre_mutation_outcomes_may_fall_back() {
+        for pre in [
+            CowRecovery::RefusedIdentityChanged,
+            CowRecovery::RefusedMappingChanged,
+            CowRecovery::RefusedNoCnode,
+            CowRecovery::RefusedAllocation,
+        ] {
+            assert!(pre.may_fall_back_to_broad(), "{pre:?} is pre-mutation");
+            assert!(pre.kernel_error().is_none(), "{pre:?} carries no error");
+        }
+        for post in [
+            CowRecovery::FailedClosedResolve(KernelError::MemoryObjectMissing),
+            CowRecovery::FailedClosedCopy(KernelError::UserMemoryFault),
+            CowRecovery::FailedClosedRemap(KernelError::TaskMissing),
+        ] {
+            assert!(
+                !post.may_fall_back_to_broad(),
+                "{post:?} allocated a frame and must never reach the broad arm"
+            );
+            assert!(
+                post.kernel_error().is_some(),
+                "{post:?} must carry the exact error the broad arm would produce"
+            );
+        }
+        // The route must act on the classification, not on its own re-reading of the variants.
+        let route = SPLIT_SRC
+            .split("fn try_split_cow_page_fault_into_frame")
+            .nth(1)
+            .expect("the route");
+        assert!(
+            route.contains("may_fall_back_to_broad()"),
+            "the route must decide fallback by the typed predicate"
+        );
+    }
+
+    /// EVERY POST-ALLOCATION FAILURE RUNS THE SAME EXACT INVERSE. Three failure sites, one
+    /// rollback closure — not three hand-written cleanups that can drift apart.
+    #[test]
+    fn every_post_allocation_failure_runs_one_exact_inverse() {
+        let t = txn();
+        let alloc = at(&t, "alloc_contiguous(1)");
+        let after = &t[alloc..];
+        // Stated as the enumeration, not a bare count: EVERY post-allocation failure RETURN
+        // must be immediately preceded by the inverse. Counting to a number lets a newly added
+        // arm slip through by coincidence; this cannot.
+        let mut failure_returns = 0usize;
+        for (idx, _) in after.match_indices("return R::FailedClosed") {
+            failure_returns += 1;
+            let before = &after[..idx];
+            let last_rollback = before.rfind("rollback(self);").unwrap_or(0);
+            let last_alloc = before.rfind("alloc_contiguous(1)").unwrap_or(0);
+            assert!(
+                last_rollback > last_alloc,
+                "a FailedClosed return at byte {idx} is not preceded by the inverse"
+            );
+        }
+        assert_eq!(
+            failure_returns, 5,
+            "resolve (mismatch + error), copy, and remap (error + no-aspace) are the five \
+             post-allocation failure arms"
+        );
+        // The inverse itself: revoke the slot + drop the mint refcount, then reclaim the frame
+        // once the object is unreferenced.
+        let rb = after
+            .split("let rollback = |shared: &Self| {")
+            .nth(1)
+            .expect("the rollback closure")
+            .split("};")
+            .next()
+            .expect("its body");
+        assert!(
+            rb.contains("rollback_minted_cap_split(cnode, new_mem_cap, object)")
+                && rb.contains("reclaim_memory_object_for_phys_locked(memory, new_phys)"),
+            "the inverse must undo both the cap and the frame"
+        );
+    }
+
+    /// THE §14.4 ORDER: PTE replacement, then invalidation, then ACK, then reclaim — and the
+    /// reclaim is CONDITIONAL on the acknowledgement.
+    #[test]
+    fn reclaim_follows_a_completed_shootdown_and_never_precedes_it() {
+        let t = txn();
+        let map = at(&t, "space.map_page(");
+        let book = at(&t, "note_mapping_removed_locked");
+        let shoot = at(&t, "complete_unmap_shootdown_split(asid, page)");
+        let reclaim = at(
+            &t,
+            "reclaim_memory_object_for_phys_locked(memory, old_phys)",
+        );
+        assert!(
+            map < book && book < shoot && shoot < reclaim,
+            "order must be map({map}) -> bookkeeping({book}) -> shootdown({shoot}) -> reclaim({reclaim})"
+        );
+        assert!(
+            t[shoot..reclaim].contains("shootdown_acked"),
+            "the old frame's reclaim must be gated on the acknowledgement, never unconditional"
+        );
+        // Nothing may be held while the shootdown waits: the acquisitions on either side are
+        // separate closures, so the seam is closed before the call and reopened after it.
+        let between = &t[book..shoot];
+        assert!(
+            between.matches("with_memory_split_mut").count() <= 1
+                && !between.contains("with_vm_user_spaces_split_mut"),
+            "no domain lock may still be open when the shootdown is driven"
+        );
+    }
+
+    /// PERMISSIONS ARE THE ORIGINAL FLAGS PLUS WRITE — nothing else is widened, so an
+    /// executable or shared-region invariant cannot be relaxed by this path.
+    #[test]
+    fn the_replacement_widens_only_the_write_bit() {
+        let t = txn();
+        assert!(
+            t.contains("let mut flags = old_mapping.flags;") && t.contains("flags.write = true;"),
+            "the new mapping's flags must be derived from the old ones"
+        );
+        for widened in [
+            "flags.execute = true",
+            "flags.user = true",
+            "flags.read = true",
+            "PageFlags::USER_RWX",
+        ] {
+            assert!(!t.contains(widened), "must not widen `{widened}`");
+        }
+    }
+
+    /// ONE OWNER PER EFFECT. The rank-6 object-slot policy and the per-kind rights rule are
+    /// stated once and driven by BOTH creators.
+    #[test]
+    fn the_object_slot_and_rights_rules_have_one_owner_each() {
+        for owner in [
+            "create_memory_object_slot_locked",
+            "memory_object_rights_for_kind",
+        ] {
+            assert_eq!(
+                MEMORY_SRC
+                    .matches(&alloc::format!("pub(crate) fn {owner}"))
+                    .count(),
+                1,
+                "`{owner}` must have exactly one definition"
+            );
+            assert!(
+                MEMORY_SRC.contains(&alloc::format!("Self::{owner}")),
+                "the broad creator must drive `{owner}`"
+            );
+            assert!(
+                RUNTIME_SRC.contains(&alloc::format!("{owner}(")),
+                "the split transaction must drive `{owner}`"
+            );
+        }
+    }
+
+    /// SCOPE: x86_64 private-copy only. Demand and terminal routing are untouched, and the
+    /// already-writable arm — which has zero live witnesses — stays broad.
+    #[test]
+    fn only_the_witnessed_x86_64_private_copy_class_is_routed() {
+        let route = SPLIT_SRC
+            .split("fn try_split_cow_page_fault_into_frame")
+            .nth(1)
+            .expect("the route")
+            .split("\n#[cfg(feature = \"hosted-dev\")]")
+            .next()
+            .expect("its body");
+        assert!(
+            route.contains("cfg!(target_arch = \"x86_64\")"),
+            "the route is x86_64-only"
+        );
+        assert!(
+            route.contains("FaultAccess::Write"),
+            "COW is attempted only for writes, exactly as the broad arm attempts it"
+        );
+        assert!(
+            route.contains("PageFaultRoute::SplitCow"),
+            "admission must go through the existing pure routing matrix"
+        );
+        assert!(
+            route.contains("facts.mapping_writable || !facts.mapping_present"),
+            "the already-writable arm (zero witnesses) must decline to the broad handler"
+        );
+        // Demand and terminal classes are not reachable from here.
+        assert!(
+            !route.contains("DemandCandidate") && !route.contains("SplitTerminal"),
+            "the COW route must not touch the demand or terminal classes"
+        );
+    }
+
+    /// THE WITNESS IS MANDATORY. The smoke must fail on zero forks or zero COW faults; the
+    /// vacuous `if marker exists` gates that let a zero-fault boot pass are gone.
+    #[test]
+    fn the_smoke_requires_the_witness_rather_than_tolerating_its_absence() {
+        for required in [
+            "selector on but ZERO fork transactions",
+            "selector on but ZERO COW write faults",
+            "no genuine path=private_copy recovery",
+            "counts disagree",
+            "FORK_PROOF_COW_WITNESS_ISOLATION_OK role=parent",
+            "FORK_PROOF_COW_WITNESS_ISOLATION_OK role=child",
+        ] {
+            assert!(
+                SMOKE_SRC.contains(required),
+                "the VM_COW gate must assert `{required}`"
+            );
+        }
+        assert!(
+            !SMOKE_SRC.contains("if log_has_pattern \"VM_COW_FAULT_BEGIN\"; then"),
+            "the vacuous fault-conditional wrapper must not come back"
+        );
+    }
+
+    /// THE BRIDGE SETTLES A RECOVERED COW FAULT AS A HANDLED TRAP: no queue advance, no
+    /// deferral, and the same result the broad arm would have returned.
+    #[test]
+    fn a_recovered_cow_fault_publishes_no_deferral_and_advances_no_queue() {
+        let route = SPLIT_SRC
+            .split("fn try_split_cow_page_fault_into_frame")
+            .nth(1)
+            .expect("the route")
+            .split("\n#[cfg(feature = \"hosted-dev\")]")
+            .next()
+            .expect("its body");
+        for forbidden in [
+            "QueueAdvanceCommitted",
+            "dispatch_try_defer",
+            "PostWorkCommitted",
+        ] {
+            assert!(
+                !route.contains(forbidden),
+                "a recovered COW fault must not reach `{forbidden}`"
+            );
+        }
+        assert!(
+            TRAP_SRC.contains("Ok(cow_result.unwrap_or(Ok(())))"),
+            "the bridge must carry the route's own result, exactly as the broad arm would"
+        );
+    }
+}
