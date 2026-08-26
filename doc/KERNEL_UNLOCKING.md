@@ -11722,3 +11722,84 @@ inheritance; recoverable demand/COW PageFault VM decomposition; timer-timeout de
 Spawn/Fork/Exit; RPi5; WA3C2; and direct-IpcCall production. No stage status changes merely
 because this prerequisite was delivered — U9-TM is CENSUS-DELTA 0, so the canonical stage
 arithmetic is unchanged.
+
+### U9-PF — PageFault route matrix and witness census. ANALYSIS CHECKPOINT. No route delivered.
+
+**U9-PF — CENSUS-DELTA 0 prerequisite.** This entry records the §1 derivation only. **No PageFault
+route has been moved off the terminal broad dispatchers**, so the census stays **2 / 0 / 2** and
+both terminal acquisitions keep every reason they had. It is recorded because the derivation
+overturns three premises that later increments would otherwise re-derive.
+
+**Where PageFault is handled today.** One arm, `KernelState::handle_trap_entry`'s
+`TrapEvent::PageFault(fault)` in `fault_state.rs`, reached only inside the broad dispatcher. It
+attempts COW first (write faults only), then demand, then falls through to
+`PAGE_FAULT_UNHANDLED` + `fault_current_task_for_fault`.
+
+**FINDING 1 — the recovery verdicts ARE purely classifiable; U9-QA's blocker was overstated.**
+U9-QA recorded that terminal PageFault could not be routed because "terminality cannot be
+classified before mutation, because the classification IS the recovery attempt". That is **too
+strong**. Both verdict predicates are `&self` and mutate nothing:
+
+| Predicate | Signature | Purity |
+|---|---|---|
+| `is_cow_page` | `(&self, Asid, VirtAddr) -> bool` | pure read of `memory.cow_pages` |
+| `fault_addr_in_demand_backed_region` | `(&self, tid, addr) -> bool` | pure read of brk bounds + `user_stack_top` |
+
+Every `Ok(false)` decline in **both** `try_handle_cow_fault` and `try_handle_demand_page_fault`
+is reached **before that function's first mutation**. The `&mut self` on each is required for the
+RECOVERY, not for the VERDICT. A pure Phase-A classifier is therefore extractable.
+
+**FINDING 2 — but a demand attempt that returns `Ok(true)` can still route terminal.** After
+`try_handle_demand_page_fault` returns true — having allocated a frame, mapped a page, repaired
+intermediate PTEs and flushed the TLB — the caller re-verifies with `pte_ok && hw_demand_ok`. If
+that verification fails, control **falls through to `PAGE_FAULT_UNHANDLED` and terminates the
+task**. So "recovery attempted" is not "recovery succeeded", and any split demand route must
+treat a true return as a COMMITTED-MUTATION state whose terminal settlement is
+`QueueAdvanceCommitted` — never a broad fallback.
+
+**FINDING 3 — the demand-page class has NO live witness on any architecture.** Measured at base
+`adcf229` with fresh matched artifacts:
+
+| Class | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| COW, `path=private_copy` | **2** (`VM_COW=1` profile) | 0 | 0 |
+| COW, `path=already_writable` | 0 | 0 | 0 |
+| Demand page | **0** | **0** | **0** |
+| Terminal user PageFault | 0 | **1** (core profile) | 0 |
+
+The x86_64 COW witness is the full transaction — `VM_COW_PHASE_METADATA` →
+`VM_COW_PHASE_FRAME_ALLOC` → `VM_COW_PHASE_PT_UPDATE` → `VM_COW_PHASE_TLB_FLUSH` →
+`VM_COW_DONE path=private_copy` → `PAGE_FAULT_HANDLED_COW` — twice, in ASIDs 1 and 13. The
+AArch64 witness is the mandatory one: `PAGE_FAULT_ENTRY tid=1 addr=0x0 access=Read` →
+`PAGE_FAULT_UNHANDLED`, exactly once. The plain x86_64 core, RISC-V core, `FAULT_DELIVERY` and
+`SPAWN_LIFECYCLE` profiles produce **zero** page faults of any class.
+
+**Consequent scope bound.** Under the standing rule that an architecture lacking an existing
+witness keeps its route unchanged rather than having proof manufactured:
+
+* COW is routable on **x86_64 only**;
+* terminal user PageFault is routable on **AArch64 only**;
+* the demand-page transaction is **not routable anywhere** — it cannot be live-proven, so §3's
+  transaction would ship unwitnessed;
+* RISC-V has no routable PageFault class at all, and decodes only load (13) and store (15) page
+  faults — it has no `Execute` PageFault class.
+
+**FINDING 4 — the fault-delivery proof hook does not use the fault transactions.**
+`maybe_run_fault_delivery_proof` builds a **synthetic** identity (`tid=0xF17E0001`,
+`addr=0xDEAD0000`) and a **scratch endpoint**, then exercises the report encode and send. It calls
+`try_handle_cow_fault`, `try_handle_demand_page_fault`, `is_cow_page` and
+`fault_addr_in_demand_backed_region` **zero** times. Its only fault-owner call is
+`fault_current_task()`. So converting it "to use the new owner-local fault transactions" is
+founded only for the TERMINAL transition; there is no demand or COW recovery in it to convert,
+and relocating it cannot be justified by that premise alone.
+
+**Other recorded facts.** `FaultInfo` carries `{addr, access}` only — **no user/kernel origin
+bit** — and the PageFault arm performs no origin test; the sole kernel-space guard is
+`page >= KERNEL_SPACE_BASE` inside the demand handler. `try_handle_cow_fault` carries exactly
+three revoke obligations (`resolve_phys`, `copy_frame`, `remap` failures), all currently through
+broad `revoke_capability_in_cnode`. The demand handler's `alloc_anonymous_memory_object()?`
+followed by `map_user_page_in_asid_with_caps(...)?` has **no revoke on the map failure path**.
+
+***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`). No stage status changes: U9-PF is
+CENSUS-DELTA 0 and no route was delivered, so the canonical stage arithmetic is unchanged.
