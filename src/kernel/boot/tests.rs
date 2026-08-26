@@ -143165,13 +143165,15 @@ mod u9rx3_route {
         );
     }
 
-    /// AARCH64 IS NOT ADMITTED, AND THE REASON IS RECORDED. `pre_split_import_syscall_abi` is the
-    /// gate: without NR 2 in it the frame carries `nr = 0` there and every recv class falls back.
-    /// The exclusion is deliberate — importing NR 2 also reaches the queued-plain split recv,
-    /// whose writeback loses the reply cap — so it is pinned together with the finding, and a
-    /// future increment that fixes the writeback has to delete the note to admit the class.
+    /// AARCH64 IS NOW ADMITTED — U9-RX4 met the precondition U9-RX3 was waiting on.
+    ///
+    /// This guard used to pin the EXCLUSION, together with the live finding that justified it:
+    /// importing NR 2 also reaches the queued-plain split recv, whose writeback dropped the
+    /// reply cap. U9-RX4 fixed that writeback in its one owner, so the exclusion is retired and
+    /// the guard now pins the admission and the dependency that makes it sound — if the
+    /// projection owner ever stops being called, this says why that matters here.
     #[test]
-    fn aarch64_does_not_import_the_recv_abi_and_says_why() {
+    fn aarch64_imports_the_recv_abi_now_that_the_writeback_is_repaired() {
         let i = TRAP_ENTRY_SRC
             .find("fn pre_split_import_syscall_abi(frame: &mut TrapFrame)")
             .expect("the AArch64 ABI import gate must exist");
@@ -143183,12 +143185,16 @@ mod u9rx3_route {
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
         assert!(
-            !code.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2 must not be imported unconditionally on AArch64"
+            code.contains("raw_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_NR"),
+            "NR 2 must be imported so the pre-lock recv classes are reachable on AArch64"
         );
+        // The admission is only sound while the queued-plain writeback still delivers what the
+        // broad receive delivers — both halves of it.
+        let recv_core = include_str!("../recv_core.rs");
         assert!(
-            body.contains("PM_RECV_DECODE_FAIL"),
-            "the recorded reason for the exclusion must stay with the gate"
+            recv_core.contains("recv_meta_cap_projection(")
+                && recv_core.contains("project_recv_delivery(msg)"),
+            "the AArch64 admission depends on the U9-RX4 writeback repair staying in place"
         );
     }
 
