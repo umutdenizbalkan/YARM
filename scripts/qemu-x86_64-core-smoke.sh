@@ -1261,7 +1261,11 @@ if [[ "$VM_COW" == "1" ]]; then
   vm_cow_faults="$(log_count_pattern 'VM_COW_FAULT_BEGIN')"
   vm_cow_dones="$(log_count_pattern 'VM_COW_DONE')"
   vm_cow_handled="$(log_count_pattern 'PAGE_FAULT_HANDLED_COW')"
-  vm_cow_private="$(tr '\r' '\n' <"$LOGFILE" | rg -a -c -- 'path=private_copy' || true)"
+  # Counted on VM_COW_DONE specifically: `path=private_copy` also appears on the proof-gated
+  # PF_PROOF_COW_HANDLE_OK line, so a bare substring count double-reports every recovery. The
+  # gate outcome is the same either way; the NUMBER has to be right because the split-route
+  # comparison comes back to it.
+  vm_cow_private="$(tr '\r' '\n' <"$LOGFILE" | rg -a -c -- 'VM_COW_DONE .*path=private_copy' || true)"
   vm_cow_private="${vm_cow_private:-0}"
   if [[ "$vm_cow_forks" -lt 1 ]]; then
     echo "[error] VM-COW: selector on but ZERO fork transactions (VM_COW_FORK_BEGIN=$vm_cow_forks)"
