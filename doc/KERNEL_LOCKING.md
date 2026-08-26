@@ -14472,3 +14472,77 @@ witness AND repair that rollback; no demand-page safety or retirement claim is m
 ***U9 remains OPEN*** and direct-IpcCall production remains OFF
 (`ipccall_direct_production_enabled()` is `const false`). No stage status changes: U9-PF is
 CENSUS-DELTA 0 and no route was delivered, so the canonical stage arithmetic is unchanged.
+
+### U9-FT — the terminal-fault trace and the owner-local policy read. PARTIAL / FOUNDATION. CENSUS-DELTA 0.
+
+**U9-FT — CENSUS-DELTA 0 prerequisite.** Delivered: the §1 end-to-end trace of the live AArch64
+terminal-fault transaction, and the §2 owner-local FaultPolicy read. **NO fault route is wired**
+— no PageFault takes a split route, the census stays **2 / 0 / 2**, and the timer proof blockers
+remain **five**. The trace is recorded because it overturns two premises and exposes one
+structural blocker that governs all remaining U9-FT work.
+
+**The witness, traced from a live capture at base `f5c6a9a`.** `PAGE_FAULT_ENTRY tid=1 addr=0x0
+access=Read rip=0x40307c` → `PAGE_FAULT_UNHANDLED` → `TASK_FAULT_CURRENT` →
+`TASK_FAULT_REPORT_TARGET tid=1 endpoint=3 generation=1` →
+`TASK_FAULT_REPORT_SENDER tid=1 sender_tid=0 opcode=0 len=17` →
+`TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=3 queued=1 woke=0` → `TASK_FAULT_REPORT_SENT
+target=supervisor` → `D6_DISPATCH_SPLIT_BEGIN` → `D6_LOCAL_DISPATCH cpu=0 tid=Some(2)` →
+`SCHED_DISPATCH_NEXT chosen_tid=2` → TTBR0 switch to `asid=2`.
+
+**Report publication and the task transition are NOT transactionally atomic today.**
+`emit_fault_report_for_fault` returns `()` and **swallows every failure** — missing route, stale
+endpoint, message-build failure and enqueue failure all log and return. The task transition then
+proceeds regardless. The two are sequential and independent, made mutually exclusive only by the
+broad lock. Source therefore dictates the report-first shape; a rollback-on-report-failure
+ordering would introduce behaviour the kernel has never had.
+
+**"No report without a terminal transition" is FALSE in source.** The report is emitted BEFORE
+the policy check, so a `NotifyAndContinue` task receives a report and then resumes. That branch is
+API-reachable (`set_fault_policy`, `fault_policy_override`) but **not production-reachable**: the
+default is `KillTask` and the only production override written is also `KillTask`. The branch is
+preserved and the invariant cannot be enforced as stated without changing behaviour.
+
+**The witness delivers BUFFERED, not to a waiter** — `waiters=0`, `queued` 0 → 1, `woke=0`. There
+is no receiver wake on this path at all, so "receiver wake exactly once" is vacuous here and must
+not be asserted as an observed event.
+
+**CORRECTION to U9-QA.** It records that `local_dispatch_step_split_selection` "remains not
+live-wired". **That is false.** It is called from `dispatch_next_task` (`exec_state.rs`) and from
+`scheduler_state.rs`, and it is the selection step this witness actually uses — the
+`D6_DISPATCH_SPLIT_BEGIN` / `D6_LOCAL_DISPATCH` markers above are emitted by it. The x86_64-only
+D6 deferral branch is a different mechanism and is not what AArch64 takes. Wiring U9-QA into the
+terminal route therefore **replaces a live-proven selection step** rather than filling a gap.
+
+**Delivered: the owner-local FaultPolicy read.** `read_terminal_fault_policy_split(&self, tid)`
+yields a NAMED `TerminalFaultPolicySnapshot { tid, asid, status, policy, target }`, with
+`FaultReportTarget { endpoint_idx, generation, via_fault_handler, waiters_before, queued_before }`
+and typed refusals `{ NoCurrentTask, NotCurrentTask, TaskNotFound }` raised before the first
+domain acquisition. It **delegates to the existing `effective_fault_policy_for`**, so there is
+exactly one FaultPolicy implementation and both routes read it. It takes **no `CpuId`**, because
+terminal fault policy is CPU-independent in source. It fabricates **no generation** — the only
+generation carried is the endpoint's, read from the IPC owner. Ranks: task (2), fault (8), IPC (3),
+acquired sequentially, with a guard proving the rank-2 read encloses neither of the others.
+
+**THE STRUCTURAL BLOCKER for everything remaining.** `classify_page_fault_split` (U9-PF) and
+`read_terminal_fault_policy_split` (U9-FT) are both `&self` methods **on `KernelState`**, so they
+are callable only while the broad lock is held. Off-lock code can never obtain a `&KernelState`:
+the `with_*_split*` seams deliberately derive raw FIELD pointers via `addr_of!`/`addr_of_mut!`
+without forming a reference to the whole `KernelState`, and every off-lock read in the tree is a
+`SharedKernel` method built on those seams. Both readers are therefore correct, mutation-free and
+usable by the broad path — but **not yet callable from the pre-lock split seam**. Before any
+terminal route can be wired, each needs a `SharedKernel` twin built on
+`with_task_tcbs_split_mut`, `with_vm_user_spaces_split_mut`, `with_memory_split_mut` and
+`with_ipc_split_mut`. Their types, ordering, policy delegation and guards transfer unchanged; only
+the receiver and the seam calls differ.
+
+**Still to build, in order:** the two `SharedKernel` twins; the split report emitter (all its
+seams exist — `with_ipc_split_mut` for the rank-3 enqueue and `wake_tid_to_runnable_split` for the
+wake); the reservation/atomicity state machine; the composed terminal transaction; the AArch64
+wiring and its live chain; and only then the fault-delivery proof-hook relocation.
+
+**Unchanged by this prerequisite.** x86_64 COW remains unwired and broad; demand paging remains
+blocked on a live witness and exact map-failure rollback; the fault-delivery timer proof hook
+remains broad, so the timer proof blockers remain **five**. The census remains **2 / 0 / 2**.
+***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`). U9-FT is CENSUS-DELTA 0, so the
+canonical stage arithmetic is unchanged.

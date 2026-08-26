@@ -88,6 +88,63 @@ pub(crate) fn page_fault_route_for(arch: &str, class: PageFaultClass) -> PageFau
     }
 }
 
+/// U9-FT §2 — where a fault report would be published, captured as a named fact.
+///
+/// The route is exactly what `emit_fault_report_for_fault` resolves: the fault-handler endpoint
+/// if one is registered, otherwise the supervisor endpoint. `generation` is the endpoint's real
+/// generation, read from the IPC owner — it is NOT fabricated, and it is the only generation
+/// this snapshot carries because it is the only one source provides for this transaction.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FaultReportTarget {
+    pub endpoint_idx: usize,
+    pub generation: u64,
+    /// True when the route resolved to the fault-handler endpoint, false for the supervisor
+    /// endpoint. Preserved because the existing markers print it as `target=`.
+    pub via_fault_handler: bool,
+    pub waiters_before: usize,
+    pub queued_before: usize,
+}
+
+/// U9-FT §2 — the owner-local terminal-fault policy snapshot.
+///
+/// A NAMED snapshot, never a positional tuple, carrying only source-authoritative facts needed
+/// for terminal settlement. It carries no invented generation: `ThreadControlBlock` has no
+/// general task-incarnation counter (U9-PF §1), so the task coordinate is `{tid, asid}` and the
+/// only generation present is the endpoint's.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalFaultPolicySnapshot {
+    pub tid: u64,
+    pub asid: Option<crate::kernel::vm::Asid>,
+    pub status: TaskStatus,
+    pub policy: FaultPolicy,
+    /// `None` when neither a fault-handler nor a supervisor endpoint is registered — exactly the
+    /// case the existing emitter reports as `TASK_FAULT_NO_SUPERVISOR_ROUTE`.
+    pub target: Option<FaultReportTarget>,
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl TerminalFaultPolicySnapshot {
+    /// Does existing policy require the faulting task to be terminated? `NotifyAndContinue`
+    /// reports and lets the task continue; `KillTask` blocks it and marks it `Faulted`.
+    pub(crate) fn terminates_task(self) -> bool {
+        matches!(self.policy, FaultPolicy::KillTask)
+    }
+}
+
+/// U9-FT §2 — a typed refusal raised BEFORE any mutation.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalFaultPolicyRefusal {
+    /// No task is current on this CPU.
+    NoCurrentTask,
+    /// The named tid is not the current task — a stale identity.
+    NotCurrentTask,
+    /// The tid has no TCB.
+    TaskNotFound,
+}
+
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
 const DEMAND_STACK_GROWTH_WINDOW: u64 = 8 * 1024 * 1024;
 #[allow(dead_code)]
@@ -272,6 +329,83 @@ impl KernelState {
                 sw_demand
             );
         }
+    }
+
+    /// U9-FT §2 — the owner-local terminal-fault policy read.
+    ///
+    /// Takes `&self`: it performs no IPC, scheduler or VM mutation and cannot allocate. A stale
+    /// or missing task is a TYPED refusal raised before any mutation, never a panic and never a
+    /// silent default.
+    ///
+    /// ONE POLICY IMPLEMENTATION. The policy itself is not re-derived here — it delegates to the
+    /// existing `effective_fault_policy_for`, which is the same function the broad
+    /// `fault_current_task_with_fault` consults. There is exactly one FaultPolicy implementation
+    /// and both routes read it.
+    ///
+    /// NO CPU PARAMETER. Terminal fault policy does not depend on the CPU: it is the task's
+    /// `fault_policy_override` if set, else the kernel default. Threading a `CpuId` through would
+    /// imply a dependence that source does not have. The caller's CPU identity is carried by
+    /// `PageFaultFacts` instead, where it IS load-bearing.
+    ///
+    /// RANKS. Three SEQUENTIAL acquisitions, never nested in reverse: task (rank 2) for identity
+    /// and status, fault (rank 8) for the endpoint route, IPC (rank 3) for the endpoint
+    /// generation and queue state. `effective_fault_policy_for` internally nests fault (8) inside
+    /// task (2), which is ascending and therefore legal; that nesting is preserved exactly rather
+    /// than restructured.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn read_terminal_fault_policy_split(
+        &self,
+        tid: u64,
+    ) -> Result<TerminalFaultPolicySnapshot, TerminalFaultPolicyRefusal> {
+        // Validate the exact current task the way the existing terminal path does: it resolves
+        // `current_tid()` and faults THAT task, so a caller naming a different tid is stale.
+        let current = self
+            .current_tid()
+            .ok_or(TerminalFaultPolicyRefusal::NoCurrentTask)?;
+        if current != tid {
+            return Err(TerminalFaultPolicyRefusal::NotCurrentTask);
+        }
+        // Rank 2 — identity and status, from the one task owner.
+        let found = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| (tcb.asid, tcb.status))
+        });
+        let Some((asid, status)) = found else {
+            return Err(TerminalFaultPolicyRefusal::TaskNotFound);
+        };
+        // The ONE policy implementation, shared with the broad path.
+        let policy = self.effective_fault_policy_for(tid);
+        // Rank 8 — the endpoint route, resolved exactly as the existing emitter resolves it:
+        // fault-handler first, then supervisor.
+        let route = self.with_fault_state(|faults| {
+            faults
+                .fault_handler_endpoint
+                .map(|idx| (idx, true))
+                .or_else(|| faults.supervisor_endpoint.map(|idx| (idx, false)))
+        });
+        // Rank 3 — the endpoint's REAL generation and queue state. A route that names an
+        // endpoint slot which no longer exists yields `None`, exactly the stale-supervisor case
+        // the existing emitter refuses to publish into.
+        let target = route.and_then(|(endpoint_idx, via_fault_handler)| {
+            self.endpoint_fault_report_stats(endpoint_idx).map(
+                |(generation, waiters_before, queued_before)| FaultReportTarget {
+                    endpoint_idx,
+                    generation,
+                    via_fault_handler,
+                    waiters_before,
+                    queued_before,
+                },
+            )
+        });
+        Ok(TerminalFaultPolicySnapshot {
+            tid,
+            asid,
+            status,
+            policy,
+            target,
+        })
     }
 
     /// U9-PF §1 — the PURE Phase-A PageFault classification.
