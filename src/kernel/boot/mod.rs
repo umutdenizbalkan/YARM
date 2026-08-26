@@ -20,6 +20,17 @@ mod exec_state;
 pub(crate) use exec_state::QueueAdvanceApply;
 mod fault_endpoint_state;
 mod fault_state;
+// U9-FT2 §2: the ONE PageFault classification evaluator and its named fact types are
+// re-exported so the OFF-LOCK `SharedKernel::classify_page_fault_shared` twin in
+// `crate::runtime` can call the SAME evaluator the broad form calls, rather than
+// re-deriving the policy against the split seams.
+#[cfg_attr(feature = "hosted-dev", allow(unused_imports))]
+pub(crate) use fault_state::{
+    FaultReportTarget, PageFaultClass, PageFaultFacts, TerminalFaultPolicyRefusal,
+    TerminalFaultPolicySnapshot, evaluate_cow_marked, evaluate_demand_backed_region,
+    evaluate_fault_policy, evaluate_fault_report_route, evaluate_page_fault_class,
+    page_fault_addr_is_kernel_space,
+};
 mod ipc_state;
 // Stage 200C2B: the reply-timeout completion transaction abstraction + single generic
 // body are re-exported so the OFF-LOCK drain in `crate::runtime` can run the SAME body

@@ -70,13 +70,16 @@ impl KernelState {
     }
 
     pub(crate) fn effective_fault_policy_for(&self, tid: u64) -> FaultPolicy {
-        self.with_tcbs(|tcbs| {
+        // U9-FT2 §3: gather the two facts here, but leave the RULE to the one owner the
+        // off-lock twin also calls.
+        let task_override = self.with_tcbs(|tcbs| {
             tcbs.iter()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == tid)
                 .and_then(|tcb| tcb.fault_policy_override)
-                .unwrap_or(self.with_fault_state(|faults| faults.fault_policy))
-        })
+        });
+        let kernel_default = self.with_fault_state(|faults| faults.fault_policy);
+        crate::kernel::boot::evaluate_fault_policy(task_override, kernel_default)
     }
 
     pub fn task_asid(&self, tid: u64) -> Option<Asid> {

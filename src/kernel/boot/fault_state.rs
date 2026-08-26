@@ -53,6 +53,114 @@ pub(crate) struct PageFaultFacts {
     pub demand_region: bool,
 }
 
+/// U9-FT2 §3 — THE one effective-fault-policy rule.
+///
+/// The task's `fault_policy_override` wins if set, otherwise the kernel default. Both
+/// `KernelState::effective_fault_policy_for` and the off-lock
+/// `SharedKernel::read_terminal_fault_policy_shared` delegate here, so the rule exists once.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn evaluate_fault_policy(
+    task_override: Option<FaultPolicy>,
+    kernel_default: FaultPolicy,
+) -> FaultPolicy {
+    task_override.unwrap_or(kernel_default)
+}
+
+/// U9-FT2 §3 — THE one fault-report route rule.
+///
+/// Exactly what `emit_fault_report_for_fault` resolves: the fault-handler endpoint if one is
+/// registered, otherwise the supervisor endpoint. Returns `(endpoint_idx, via_fault_handler)`;
+/// `None` is the `TASK_FAULT_NO_SUPERVISOR_ROUTE` case.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn evaluate_fault_report_route(
+    fault_handler_endpoint: Option<usize>,
+    supervisor_endpoint: Option<usize>,
+) -> Option<(usize, bool)> {
+    fault_handler_endpoint
+        .map(|idx| (idx, true))
+        .or_else(|| supervisor_endpoint.map(|idx| (idx, false)))
+}
+
+/// U9-FT2 §2 — THE one demand-backed-region policy, as a pure function of gathered facts.
+///
+/// `KernelState::fault_addr_in_demand_backed_region` and the off-lock twin both delegate here, so
+/// the brk-window and stack-growth-window rules exist in exactly one place. The rule is
+/// unchanged: the address is demand-backed if it lies in the task's brk range, or within
+/// [`DEMAND_STACK_GROWTH_WINDOW`] below its user stack top.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn evaluate_demand_backed_region(
+    brk_bounds: Option<(usize, usize)>,
+    user_stack_top: Option<crate::kernel::vm::VirtAddr>,
+    fault_addr: u64,
+) -> bool {
+    if let Some((base, end)) = brk_bounds
+        && fault_addr >= base as u64
+        && fault_addr < end as u64
+    {
+        return true;
+    }
+    user_stack_top
+        .map(|top| {
+            let low = top.0.saturating_sub(DEMAND_STACK_GROWTH_WINDOW);
+            fault_addr >= low && fault_addr < top.0
+        })
+        .unwrap_or(false)
+}
+
+/// U9-FT2 §2 — THE one COW-mark policy, as a pure function of the gathered set membership.
+///
+/// Trivial by construction, but pinned as a named owner so neither form can drift into a
+/// different notion of "is COW" (for example by consulting the PTE write bit instead of the
+/// software mark).
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn evaluate_cow_marked(marked_in_owner_set: bool) -> bool {
+    marked_in_owner_set
+}
+
+/// U9-FT2 §2 — the kernel/fallback boundary predicate, in ONE place.
+///
+/// Evaluated by BOTH classification forms BEFORE any VM read, exactly where the original broad
+/// classifier evaluated it, so a kernel-space fault still costs no rank-5 acquisition. It is a
+/// pure function of the address; `FaultInfo` carries no privilege-origin bit and none is
+/// invented.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn page_fault_addr_is_kernel_space(page: crate::kernel::vm::VirtAddr) -> bool {
+    page.0 >= crate::kernel::vm::KERNEL_SPACE_BASE
+}
+
+/// U9-FT2 §2 — THE one pure PageFault classification evaluator.
+///
+/// A free function of named facts: no `self`, no lock, no allocation, no mutation. Both the broad
+/// `KernelState::classify_page_fault_split` and the off-lock
+/// `SharedKernel::classify_page_fault_shared` delegate here, which is what makes them
+/// mechanically equivalent rather than merely similar.
+///
+/// The caller is responsible for the identity screen (absent task / absent ASID) and for
+/// [`page_fault_addr_is_kernel_space`], because both are decided before any VM read; this
+/// evaluator owns the COW / demand / terminal decision and nothing else. The order is the broad
+/// arm's order: COW first and only for writes, then the demand screen, then the terminal
+/// fall-through.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn evaluate_page_fault_class(facts: PageFaultFacts) -> PageFaultClass {
+    // COW is attempted FIRST and ONLY for writes, mirroring the broad arm.
+    if matches!(facts.access, FaultAccess::Write) && facts.cow_marked {
+        return PageFaultClass::CowCandidate;
+    }
+    // The demand screen, mirroring `try_handle_demand_page_fault`'s pre-mutation checks:
+    // execute faults decline, the address must be demand-backed, and a PRESENT mapping only
+    // qualifies when it already satisfies the faulting access (a write fault on a present
+    // read-only page is a protection/COW fault, not a demand fault).
+    if !matches!(facts.access, FaultAccess::Execute) && facts.demand_region {
+        let write_satisfied = !matches!(facts.access, FaultAccess::Write) || facts.mapping_writable;
+        if !facts.mapping_present || write_satisfied {
+            return PageFaultClass::DemandCandidate;
+        }
+    }
+    // Neither recovery owner would claim it, so existing policy reaches
+    // `PAGE_FAULT_UNHANDLED` and the terminal fault transaction.
+    PageFaultClass::TerminallyUnhandled
+}
+
 /// U9-PF §1 — the authorized routing matrix, in ONE place.
 ///
 /// A class is routed off the broad dispatcher only where an EXISTING live witness proves the
@@ -256,24 +364,16 @@ impl KernelState {
     }
 
     fn fault_addr_in_demand_backed_region(&self, tid: u64, fault_addr: u64) -> bool {
-        if let Some((base, end)) = self.task_brk_bounds(tid)
-            && fault_addr >= base as u64
-            && fault_addr < end as u64
-        {
-            return true;
-        }
-
-        self.with_tcbs(|tcbs| {
+        // U9-FT2 §2: gather the facts here, but leave the RULE to the one owner that the
+        // off-lock twin also calls.
+        let brk_bounds = self.task_brk_bounds(tid);
+        let user_stack_top = self.with_tcbs(|tcbs| {
             tcbs.iter()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == tid)
                 .and_then(|tcb| tcb.user_stack_top)
-                .map(|top| {
-                    let low = top.0.saturating_sub(DEMAND_STACK_GROWTH_WINDOW);
-                    fault_addr >= low && fault_addr < top.0
-                })
-                .unwrap_or(false)
-        })
+        });
+        evaluate_demand_backed_region(brk_bounds, user_stack_top, fault_addr)
     }
 
     /// Stage 163H: proof-gated, fully-decoded page-table-entry diagnostic. Logs the
@@ -380,10 +480,7 @@ impl KernelState {
         // Rank 8 — the endpoint route, resolved exactly as the existing emitter resolves it:
         // fault-handler first, then supervisor.
         let route = self.with_fault_state(|faults| {
-            faults
-                .fault_handler_endpoint
-                .map(|idx| (idx, true))
-                .or_else(|| faults.supervisor_endpoint.map(|idx| (idx, false)))
+            evaluate_fault_report_route(faults.fault_handler_endpoint, faults.supervisor_endpoint)
         });
         // Rank 3 — the endpoint's REAL generation and queue state. A route that names an
         // endpoint slot which no longer exists yields `None`, exactly the stale-supervisor case
@@ -444,7 +541,7 @@ impl KernelState {
             return (PageFaultClass::KernelOrAbsentTask, None);
         };
         let page = fault.addr.page_align_down();
-        if page.0 >= crate::kernel::vm::KERNEL_SPACE_BASE {
+        if page_fault_addr_is_kernel_space(page) {
             return (PageFaultClass::KernelOrAbsentTask, None);
         }
         let mapping = self.with_user_spaces(|s| s.get(asid).and_then(|a| a.resolve(page)));
@@ -461,24 +558,9 @@ impl KernelState {
             cow_marked,
             demand_region,
         };
-        // COW is attempted FIRST and ONLY for writes, mirroring the broad arm.
-        if matches!(fault.access, FaultAccess::Write) && cow_marked {
-            return (PageFaultClass::CowCandidate, Some(facts));
-        }
-        // The demand screen, mirroring `try_handle_demand_page_fault`'s pre-mutation checks:
-        // execute faults decline, the address must be demand-backed, and a PRESENT mapping only
-        // qualifies when it already satisfies the faulting access (a write fault on a present
-        // read-only page is a protection/COW fault, not a demand fault).
-        if !matches!(fault.access, FaultAccess::Execute) && demand_region {
-            let write_satisfied = !matches!(fault.access, FaultAccess::Write)
-                || mapping.map(|m| m.flags.write).unwrap_or(false);
-            if mapping.is_none() || write_satisfied {
-                return (PageFaultClass::DemandCandidate, Some(facts));
-            }
-        }
-        // Neither recovery owner would claim it, so existing policy reaches
-        // `PAGE_FAULT_UNHANDLED` and the terminal fault transaction.
-        (PageFaultClass::TerminallyUnhandled, Some(facts))
+        // U9-FT2 §2: the COW / demand / terminal decision belongs to the ONE evaluator, which
+        // the off-lock twin also calls. This form owns only the fact-gathering.
+        (evaluate_page_fault_class(facts), Some(facts))
     }
 
     pub(crate) fn try_handle_demand_page_fault(

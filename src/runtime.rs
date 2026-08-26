@@ -872,6 +872,18 @@ pub(crate) struct TakenTransferEnvelopeFacts {
     pub(crate) pinned_object: Option<CapObject>,
 }
 
+/// U9-FT2 §2 — a typed refusal from the off-lock PageFault classifier.
+///
+/// Raised BEFORE any mutation and before any routing decision. The broad form has no equivalent
+/// because it holds the broad lock across the whole classification.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedPageFaultRefusal {
+    /// The current task or its ASID changed between the separate rank-local acquisitions, so the
+    /// gathered facts describe a departed incarnation.
+    IdentityChanged,
+}
+
 impl SharedKernel {
     /// Stage 114 fix: this used to also cache `scheduler_state` /
     /// `boot_config_state_lock` / `boot_config` raw pointers computed from
@@ -4117,6 +4129,188 @@ impl SharedKernel {
     /// # Validation status
     /// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — called by
     ///   `try_split_vm_brk_shrink_into_frame` once per unmapped page.
+    /// U9-FT2 §3 — the OFF-LOCK terminal FaultPolicy snapshot twin.
+    ///
+    /// The caller supplies the EXACT `{tid, asid}` it classified against; this refuses if either
+    /// coordinate no longer matches, so a snapshot can never describe a departed incarnation.
+    /// There is no ambient current-task read: the tid is a parameter, and the CPU is one too
+    /// because the current-task check needs it — but the POLICY itself does not depend on the
+    /// CPU, exactly as in the broad form.
+    ///
+    /// Ranks: scheduler (1) for the explicit-CPU current task, task (2) for
+    /// `{asid, status, override}`, fault (8) for the default policy and route, IPC (3) for the
+    /// endpoint generation and queue state. Each is taken and released separately; none nests.
+    ///
+    /// ONE POLICY EVALUATOR: the override-then-default rule and the route rule are
+    /// `evaluate_fault_policy` and `evaluate_fault_report_route`, the same owners the broad
+    /// `KernelState::read_terminal_fault_policy_split` delegates to.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn read_terminal_fault_policy_shared(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Result<
+        crate::kernel::boot::TerminalFaultPolicySnapshot,
+        crate::kernel::boot::TerminalFaultPolicyRefusal,
+    > {
+        use crate::kernel::boot as fs;
+        // Rank 1 — the current task on the EXPLICIT cpu, matching the broad form's use of
+        // `current_tid()` to decide whose policy applies.
+        let Some(current) = self.current_tid_split_read(cpu) else {
+            return Err(fs::TerminalFaultPolicyRefusal::NoCurrentTask);
+        };
+        if current != tid {
+            return Err(fs::TerminalFaultPolicyRefusal::NotCurrentTask);
+        }
+        // Rank 2 — identity, status and the policy override, in ONE task acquisition.
+        let Some((found_asid, status, task_override)) = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| (t.asid, t.status, t.fault_policy_override))
+        }) else {
+            return Err(fs::TerminalFaultPolicyRefusal::TaskNotFound);
+        };
+        // EXACT ASID revalidation against the coordinate the caller classified with.
+        if found_asid != Some(asid) {
+            return Err(fs::TerminalFaultPolicyRefusal::NotCurrentTask);
+        }
+        // Rank 8 — the kernel default policy and the endpoint route, from the fault owner.
+        let (kernel_default, route) = self.with_fault_split_mut(|faults| {
+            (
+                faults.fault_policy,
+                crate::kernel::boot::evaluate_fault_report_route(
+                    faults.fault_handler_endpoint,
+                    faults.supervisor_endpoint,
+                ),
+            )
+        });
+        // THE one policy rule, shared with the broad form.
+        let policy = crate::kernel::boot::evaluate_fault_policy(task_override, kernel_default);
+        // Rank 3 — the endpoint's REAL generation and queue state. A route naming a slot that no
+        // longer exists yields `None`: the stale-supervisor case the emitter refuses to publish
+        // into. No generation is fabricated.
+        let target = route.and_then(|(endpoint_idx, via_fault_handler)| {
+            self.with_ipc_split_mut(|ipc| {
+                let generation = *ipc.endpoint_generations.get(endpoint_idx)?;
+                let queued_before = ipc
+                    .endpoints
+                    .get(endpoint_idx)?
+                    .as_ref()
+                    .map(|ep| crate::kernel::boot::kernel_ref(ep).queued())?;
+                let waiters_before = usize::from(ipc.endpoint_waiter_present(endpoint_idx));
+                Some(fs::FaultReportTarget {
+                    endpoint_idx,
+                    generation,
+                    via_fault_handler,
+                    waiters_before,
+                    queued_before,
+                })
+            })
+        });
+        Ok(fs::TerminalFaultPolicySnapshot {
+            tid,
+            asid: found_asid,
+            status,
+            policy,
+            target,
+        })
+    }
+
+    /// U9-FT2 §2 — the OFF-LOCK PageFault classification twin.
+    ///
+    /// The broad `KernelState::classify_page_fault_split` cannot be called from pre-lock code:
+    /// it is a `&self` method on `KernelState`, and off-lock code can never obtain a
+    /// `&KernelState` — the `with_*_split*` seams derive raw FIELD pointers without forming a
+    /// whole-`KernelState` reference. This gathers the same facts through rank-local seams and
+    /// hands them to the SAME evaluator, so the two forms are mechanically equivalent rather
+    /// than merely similar.
+    ///
+    /// Rank order, each acquisition taken and released separately with no nesting:
+    /// scheduler (1) for the explicit-CPU current task, task (2) for `{asid, user_stack_top}`,
+    /// vm (5) for the mapping, memory (6) for the COW mark and brk bounds.
+    ///
+    /// REVALIDATION. Because the acquisitions are separate, the task or its ASID can change
+    /// underneath them. The identity is therefore re-read at the end and compared; a change is a
+    /// typed refusal, never a stale classification. The broad form needs no such check because it
+    /// holds the broad lock throughout.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn classify_page_fault_shared(
+        &self,
+        cpu: CpuId,
+        fault: crate::kernel::trap::FaultInfo,
+    ) -> Result<
+        (
+            crate::kernel::boot::PageFaultClass,
+            Option<crate::kernel::boot::PageFaultFacts>,
+        ),
+        SharedPageFaultRefusal,
+    > {
+        use crate::kernel::boot as fs;
+        // (1) rank 1 — the current task on the EXPLICIT cpu. Never an ambient current read.
+        let Some(tid) = self.current_tid_split_read(cpu) else {
+            return Ok((fs::PageFaultClass::KernelOrAbsentTask, None));
+        };
+        // (2) rank 2 — identity and the stack top the demand rule needs.
+        let Some((asid_opt, user_stack_top)) = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| (t.asid, t.user_stack_top))
+        }) else {
+            return Ok((fs::PageFaultClass::KernelOrAbsentTask, None));
+        };
+        let Some(asid) = asid_opt else {
+            return Ok((fs::PageFaultClass::KernelOrAbsentTask, None));
+        };
+        let page = fault.addr.page_align_down();
+        // The kernel boundary is decided BEFORE any VM read, exactly as the broad form decides
+        // it, so a kernel-space fault costs no rank-5 acquisition here either.
+        if fs::page_fault_addr_is_kernel_space(page) {
+            return Ok((fs::PageFaultClass::KernelOrAbsentTask, None));
+        }
+        // (3) rank 5 — the mapping.
+        let mapping = self.with_vm_user_spaces_split_mut(|spaces| {
+            spaces.get(asid).and_then(|space| space.resolve(page))
+        });
+        // (4) rank 6 — the COW mark and the brk bounds, from the memory owner.
+        let (cow_in_set, brk_bounds) = self.with_memory_split_mut(|memory| {
+            let cow = memory
+                .cow_pages
+                .get(&asid.0)
+                .is_some_and(|set| set.contains(&page.0));
+            let brk = crate::kernel::boot::KernelState::task_brk_bounds_locked(memory, tid);
+            (cow, brk)
+        });
+        // (5) EXACT REVALIDATION — the acquisitions above were separate, so re-read the identity
+        // and refuse if anything moved. Facts gathered against a departed incarnation must never
+        // be classified.
+        let still_current = self.current_tid_split_read(cpu) == Some(tid);
+        let still_same_asid = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.asid)
+        }) == Some(Some(asid));
+        if !still_current || !still_same_asid {
+            return Err(SharedPageFaultRefusal::IdentityChanged);
+        }
+        let facts = fs::PageFaultFacts {
+            cpu,
+            tid,
+            asid,
+            page,
+            access: fault.access,
+            mapping_present: mapping.is_some(),
+            mapping_writable: mapping.map(|m| m.flags.write).unwrap_or(false),
+            cow_marked: fs::evaluate_cow_marked(cow_in_set),
+            demand_region: fs::evaluate_demand_backed_region(brk_bounds, user_stack_top, page.0),
+        };
+        // THE one evaluator, shared with the broad form.
+        Ok((fs::evaluate_page_fault_class(facts), Some(facts)))
+    }
+
     pub(crate) fn with_vm_user_spaces_split_mut<R>(
         &self,
         f: impl FnOnce(&mut crate::kernel::vm::AddressSpaceManager) -> R,

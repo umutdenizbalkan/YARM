@@ -141122,9 +141122,17 @@ mod u9pf_classification {
 
     /// COW is tested BEFORE demand and ONLY for writes, mirroring the broad arm's order. If the
     /// two orders diverged, the split and broad routes could classify one fault differently.
+    ///
+    /// U9-FT2 re-derivation: the ordering rule moved OUT of the broad body into the single
+    /// `evaluate_page_fault_class` owner that both forms now call. The semantic assertion is
+    /// unchanged and is re-anchored on that owner; it is NOT weakened.
     #[test]
     fn cow_is_screened_before_demand_and_only_for_writes() {
-        let body = classifier_body();
+        let body = FAULT_SRC
+            .split("pub(crate) fn evaluate_page_fault_class(facts: PageFaultFacts)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the one evaluator");
         let cow_at = body.find("PageFaultClass::CowCandidate").expect("cow arm");
         let demand_at = body
             .find("PageFaultClass::DemandCandidate")
@@ -141135,9 +141143,11 @@ mod u9pf_classification {
         );
         let cow_guard = &body[..cow_at];
         assert!(
-            cow_guard.contains("matches!(fault.access, FaultAccess::Write) && cow_marked"),
+            cow_guard.contains("matches!(facts.access, FaultAccess::Write) && facts.cow_marked"),
             "the COW arm must be gated on a WRITE access and the COW mark"
         );
+        // And the broad fact-gatherer still delegates to that owner rather than re-deriving it.
+        assert!(classifier_body().contains("evaluate_page_fault_class(facts)"));
     }
 
     /// The kernel/fallback boundary is exactly the one current policy already uses, and no
@@ -141145,7 +141155,19 @@ mod u9pf_classification {
     #[test]
     fn the_kernel_boundary_is_the_existing_one() {
         let body = classifier_body();
-        assert!(body.contains("page.0 >= crate::kernel::vm::KERNEL_SPACE_BASE"));
+        // U9-FT2 re-derivation: the boundary comparison moved into the single
+        // `page_fault_addr_is_kernel_space` owner. Assert BOTH that the owner still makes the
+        // exact comparison and that this form still consults it before any VM read.
+        assert!(FAULT_SRC.contains("page.0 >= crate::kernel::vm::KERNEL_SPACE_BASE"));
+        assert!(body.contains("page_fault_addr_is_kernel_space(page)"));
+        let boundary = body
+            .find("page_fault_addr_is_kernel_space(page)")
+            .expect("boundary check");
+        let vm_read = body.find("self.with_user_spaces(").expect("the VM read");
+        assert!(
+            boundary < vm_read,
+            "the kernel boundary must be decided before the VM read"
+        );
         assert!(body.contains("let Some(tid) = self.current_tid()"));
         assert!(body.contains("let Some(asid) = self.task_asid(tid)"));
         // Check CODE, not prose: the body's own comments legitimately discuss the absent
@@ -141493,5 +141515,493 @@ mod u9ft_policy_read {
         };
         assert!(mk(FaultPolicy::KillTask).terminates_task());
         assert!(!mk(FaultPolicy::NotifyAndContinue).terminates_task());
+    }
+}
+
+/// U9-FT2 §2/§9 — one PageFault evaluator, shared by the broad and off-lock forms.
+mod u9ft2_one_evaluator {
+    use crate::kernel::boot::fault_state::{PageFaultRoute, page_fault_route_for};
+    use crate::kernel::boot::{
+        PageFaultClass, PageFaultFacts, evaluate_demand_backed_region, evaluate_page_fault_class,
+        page_fault_addr_is_kernel_space,
+    };
+    use crate::kernel::trap::FaultAccess;
+    use crate::kernel::vm::{Asid, VirtAddr};
+
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn facts(
+        access: FaultAccess,
+        present: bool,
+        writable: bool,
+        cow: bool,
+        demand: bool,
+    ) -> PageFaultFacts {
+        PageFaultFacts {
+            cpu: crate::kernel::scheduler::CpuId(0),
+            tid: 1,
+            asid: Asid(1),
+            page: VirtAddr(0x1000),
+            access,
+            mapping_present: present,
+            mapping_writable: writable,
+            cow_marked: cow,
+            demand_region: demand,
+        }
+    }
+
+    /// BOTH forms delegate to the ONE evaluator. Neither re-derives the COW/demand/terminal rule.
+    #[test]
+    fn both_forms_delegate_to_the_one_evaluator() {
+        let broad = FAULT_SRC
+            .split("pub(crate) fn classify_page_fault_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("broad form");
+        let shared = RUNTIME_SRC
+            .split("pub(crate) fn classify_page_fault_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("shared form");
+        for body in [broad, shared] {
+            assert!(
+                body.contains("evaluate_page_fault_class(facts)"),
+                "both forms must call the one evaluator"
+            );
+            // Neither may inline the decision itself.
+            assert!(
+                !body.contains("PageFaultClass::CowCandidate")
+                    && !body.contains("PageFaultClass::DemandCandidate")
+                    && !body.contains("PageFaultClass::TerminallyUnhandled"),
+                "neither form may re-derive the COW/demand/terminal decision"
+            );
+        }
+        // And the evaluator itself is defined exactly once.
+        assert_eq!(
+            FAULT_SRC
+                .matches("pub(crate) fn evaluate_page_fault_class(facts: PageFaultFacts)")
+                .count(),
+            1
+        );
+    }
+
+    /// The demand-region RULE has one owner too, called by the broad form.
+    #[test]
+    fn the_demand_region_rule_has_one_owner() {
+        assert_eq!(
+            FAULT_SRC
+                .matches("pub(crate) fn evaluate_demand_backed_region(")
+                .count(),
+            1
+        );
+        let broad = FAULT_SRC
+            .split("fn fault_addr_in_demand_backed_region(&self,")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("broad demand read");
+        assert!(broad.contains("evaluate_demand_backed_region("));
+        assert!(
+            !broad.contains("DEMAND_STACK_GROWTH_WINDOW"),
+            "the window rule belongs to the owner, not the fact-gatherer"
+        );
+        assert!(RUNTIME_SRC.contains("fs::evaluate_demand_backed_region("));
+    }
+
+    /// EXHAUSTIVE class coverage: every access × mapping × COW × demand combination evaluates to
+    /// the class the broad arm's order dictates.
+    #[test]
+    fn the_evaluator_is_exhaustively_correct() {
+        use FaultAccess::*;
+        for access in [Read, Write, Execute] {
+            for present in [false, true] {
+                for writable in [false, true] {
+                    for cow in [false, true] {
+                        for demand in [false, true] {
+                            let got = evaluate_page_fault_class(facts(
+                                access, present, writable, cow, demand,
+                            ));
+                            // The broad arm's order, restated independently.
+                            let want = if matches!(access, Write) && cow {
+                                PageFaultClass::CowCandidate
+                            } else if !matches!(access, Execute) && demand {
+                                let write_satisfied = !matches!(access, Write) || writable;
+                                if !present || write_satisfied {
+                                    PageFaultClass::DemandCandidate
+                                } else {
+                                    PageFaultClass::TerminallyUnhandled
+                                }
+                            } else {
+                                PageFaultClass::TerminallyUnhandled
+                            };
+                            assert_eq!(
+                                got, want,
+                                "access={access:?} present={present} writable={writable} cow={cow} demand={demand}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A write fault on a PRESENT read-only page is terminal, not demand — the exact case the
+    /// source comment calls out as an infinite-loop hazard if misclassified.
+    #[test]
+    fn present_read_only_write_fault_is_not_demand() {
+        assert_eq!(
+            evaluate_page_fault_class(facts(FaultAccess::Write, true, false, false, true)),
+            PageFaultClass::TerminallyUnhandled
+        );
+    }
+
+    /// The routing matrix at fb30b74 is unchanged by this decomposition: 3 architectures × 4
+    /// classes, still AArch64-terminal and x86_64-COW only.
+    #[test]
+    fn the_routing_matrix_is_unchanged() {
+        use PageFaultClass::*;
+        use PageFaultRoute::*;
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            for class in [
+                CowCandidate,
+                DemandCandidate,
+                TerminallyUnhandled,
+                KernelOrAbsentTask,
+            ] {
+                let want = match (arch, class) {
+                    ("x86_64", CowCandidate) => SplitCow,
+                    ("aarch64", TerminallyUnhandled) => SplitTerminal,
+                    _ => Broad,
+                };
+                assert_eq!(
+                    page_fault_route_for(arch, class),
+                    want,
+                    "arch={arch} class={class:?}"
+                );
+            }
+        }
+    }
+
+    /// The kernel boundary is one predicate, evaluated by both forms BEFORE any VM read.
+    #[test]
+    fn the_kernel_boundary_is_one_predicate_checked_before_the_vm_read() {
+        assert!(page_fault_addr_is_kernel_space(VirtAddr(
+            crate::kernel::vm::KERNEL_SPACE_BASE
+        )));
+        assert!(!page_fault_addr_is_kernel_space(VirtAddr(0x1000)));
+        let shared = RUNTIME_SRC
+            .split("pub(crate) fn classify_page_fault_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("shared form");
+        let boundary = shared
+            .find("page_fault_addr_is_kernel_space(page)")
+            .expect("boundary check");
+        let vm_read = shared
+            .find("with_vm_user_spaces_split_mut")
+            .expect("the rank-5 read");
+        assert!(
+            boundary < vm_read,
+            "the kernel boundary must be decided before the rank-5 acquisition"
+        );
+    }
+
+    /// The off-lock twin uses an EXPLICIT CpuId and never an ambient current read, and it
+    /// revalidates identity after its separate acquisitions.
+    #[test]
+    fn the_shared_twin_is_explicit_cpu_and_revalidates() {
+        let shared = RUNTIME_SRC
+            .split("pub(crate) fn classify_page_fault_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("shared form");
+        assert!(shared.contains("self.current_tid_split_read(cpu)"));
+        assert!(
+            !shared.contains("current_cpu()"),
+            "no ambient current-CPU read in the off-lock twin"
+        );
+        // Revalidation of BOTH coordinates, and a typed refusal.
+        assert!(shared.contains("still_current"));
+        assert!(shared.contains("still_same_asid"));
+        assert!(shared.contains("SharedPageFaultRefusal::IdentityChanged"));
+        let evaluate = shared
+            .find("evaluate_page_fault_class")
+            .expect("evaluator call");
+        let refusal = shared
+            .find("SharedPageFaultRefusal::IdentityChanged")
+            .expect("refusal");
+        assert!(
+            refusal < evaluate,
+            "identity must be revalidated BEFORE the classification is produced"
+        );
+    }
+
+    /// The off-lock twin acquires rank-locally and never nests one domain inside another.
+    #[test]
+    fn the_shared_twin_takes_no_nested_domain_acquisition() {
+        let shared = RUNTIME_SRC
+            .split("pub(crate) fn classify_page_fault_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("shared form");
+        // The vm closure must not contain a memory or task acquisition, and vice versa.
+        let vm = shared
+            .split("self.with_vm_user_spaces_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("});").next())
+            .expect("vm closure");
+        assert!(!vm.contains("with_memory_split_mut") && !vm.contains("with_task_tcbs_split_mut"));
+        let mem = shared
+            .split("self.with_memory_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("});").next())
+            .expect("memory closure");
+        assert!(
+            !mem.contains("with_vm_user_spaces_split_mut")
+                && !mem.contains("with_task_tcbs_split_mut")
+        );
+        assert!(
+            !shared.contains("with_cpu("),
+            "the off-lock twin must take no broad acquisition"
+        );
+    }
+
+    /// The demand-region rule itself, exercised directly at its boundaries.
+    #[test]
+    fn the_demand_region_rule_boundaries() {
+        // brk range is half-open [base, end).
+        assert!(evaluate_demand_backed_region(
+            Some((0x1000, 0x2000)),
+            None,
+            0x1000
+        ));
+        assert!(evaluate_demand_backed_region(
+            Some((0x1000, 0x2000)),
+            None,
+            0x1fff
+        ));
+        assert!(!evaluate_demand_backed_region(
+            Some((0x1000, 0x2000)),
+            None,
+            0x2000
+        ));
+        assert!(!evaluate_demand_backed_region(
+            Some((0x1000, 0x2000)),
+            None,
+            0xfff
+        ));
+        // stack window is [top - WINDOW, top).
+        let top = VirtAddr(0x8000_0000);
+        assert!(evaluate_demand_backed_region(
+            None,
+            Some(top),
+            0x8000_0000 - 1
+        ));
+        assert!(!evaluate_demand_backed_region(None, Some(top), 0x8000_0000));
+        assert!(evaluate_demand_backed_region(
+            None,
+            Some(top),
+            0x8000_0000 - 8 * 1024 * 1024
+        ));
+        assert!(!evaluate_demand_backed_region(
+            None,
+            Some(top),
+            0x8000_0000 - 8 * 1024 * 1024 - 1
+        ));
+        // No facts at all means not demand-backed.
+        assert!(!evaluate_demand_backed_region(None, None, 0x1000));
+    }
+}
+
+/// U9-FT2 §3/§9 — one terminal-policy evaluator, shared by the broad and off-lock forms.
+mod u9ft2_policy_twin {
+    use crate::kernel::boot::{evaluate_fault_policy, evaluate_fault_report_route};
+    use crate::kernel::task::FaultPolicy;
+
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const ENDPOINT_SRC: &str = include_str!("fault_endpoint_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn shared_body() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn read_terminal_fault_policy_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the shared policy twin")
+    }
+
+    /// ONE policy rule. Both forms delegate; neither re-derives override-then-default.
+    #[test]
+    fn one_policy_rule_owner() {
+        assert_eq!(
+            FAULT_SRC
+                .matches("pub(crate) fn evaluate_fault_policy(")
+                .count(),
+            1
+        );
+        assert!(ENDPOINT_SRC.contains("evaluate_fault_policy(task_override, kernel_default)"));
+        assert!(shared_body().contains("evaluate_fault_policy(task_override, kernel_default)"));
+        // The broad owner no longer inlines `.unwrap_or(` over the override.
+        let broad = ENDPOINT_SRC
+            .split("pub(crate) fn effective_fault_policy_for(&self, tid: u64) -> FaultPolicy {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("broad policy read");
+        assert!(
+            !broad.contains(".unwrap_or(self.with_fault_state"),
+            "the rule must live in the owner, not the fact-gatherer"
+        );
+    }
+
+    /// ONE route rule. Both the broad snapshot and the twin delegate to it.
+    #[test]
+    fn one_route_rule_owner() {
+        assert_eq!(
+            FAULT_SRC
+                .matches("pub(crate) fn evaluate_fault_report_route(")
+                .count(),
+            1
+        );
+        assert!(FAULT_SRC.contains("evaluate_fault_report_route(faults.fault_handler_endpoint"));
+        assert!(shared_body().contains("evaluate_fault_report_route("));
+    }
+
+    /// The rules themselves, exercised directly over every variant.
+    #[test]
+    fn the_policy_and_route_rules_are_correct() {
+        // Override wins when present; default otherwise.
+        assert_eq!(
+            evaluate_fault_policy(Some(FaultPolicy::NotifyAndContinue), FaultPolicy::KillTask),
+            FaultPolicy::NotifyAndContinue
+        );
+        assert_eq!(
+            evaluate_fault_policy(Some(FaultPolicy::KillTask), FaultPolicy::NotifyAndContinue),
+            FaultPolicy::KillTask
+        );
+        assert_eq!(
+            evaluate_fault_policy(None, FaultPolicy::KillTask),
+            FaultPolicy::KillTask
+        );
+        assert_eq!(
+            evaluate_fault_policy(None, FaultPolicy::NotifyAndContinue),
+            FaultPolicy::NotifyAndContinue
+        );
+        // Fault-handler is preferred; supervisor is the fallback; neither is "no route".
+        assert_eq!(
+            evaluate_fault_report_route(Some(7), Some(3)),
+            Some((7, true))
+        );
+        assert_eq!(evaluate_fault_report_route(None, Some(3)), Some((3, false)));
+        assert_eq!(evaluate_fault_report_route(Some(7), None), Some((7, true)));
+        assert_eq!(evaluate_fault_report_route(None, None), None);
+    }
+
+    /// The twin refuses on every stale-identity case BEFORE reading policy or route.
+    #[test]
+    fn the_twin_refuses_stale_identity_before_reading_policy() {
+        let b = shared_body();
+        for refusal in [
+            "TerminalFaultPolicyRefusal::NoCurrentTask",
+            "TerminalFaultPolicyRefusal::NotCurrentTask",
+            "TerminalFaultPolicyRefusal::TaskNotFound",
+        ] {
+            assert!(b.contains(refusal), "must pin `{refusal}`");
+        }
+        // ASID mismatch is refused explicitly, against the coordinate the caller classified with.
+        assert!(
+            b.contains("if found_asid != Some(asid)"),
+            "the twin must revalidate the exact ASID"
+        );
+        let last_refusal = b.rfind("TerminalFaultPolicyRefusal::").expect("refusal");
+        let policy_read = b.find("with_fault_split_mut").expect("the rank-8 read");
+        assert!(
+            last_refusal < policy_read,
+            "every identity refusal must precede the policy/route read"
+        );
+    }
+
+    /// The twin takes an explicit CpuId for the current-task check, never an ambient read, and
+    /// the POLICY still does not depend on the CPU.
+    #[test]
+    fn the_twin_is_explicit_cpu_with_cpu_independent_policy() {
+        let b = shared_body();
+        assert!(b.contains("self.current_tid_split_read(cpu)"));
+        assert!(!b.contains("current_cpu()"), "no ambient current-CPU read");
+        // `cpu` is used only for the current-task lookup, never passed to the policy rule.
+        assert!(
+            b.contains("evaluate_fault_policy(task_override, kernel_default)"),
+            "the policy rule takes no CPU"
+        );
+    }
+
+    /// No generation is fabricated: the endpoint generation is read from the IPC owner.
+    #[test]
+    fn the_twin_fabricates_no_generation() {
+        let b = shared_body();
+        assert!(b.contains("ipc.endpoint_generations.get(endpoint_idx)"));
+        for invented in [
+            "generation: 0",
+            "wrapping_add",
+            "task_generation",
+            "incarnation",
+        ] {
+            assert!(
+                !b.contains(invented),
+                "no fabricated generation: `{invented}`"
+            );
+        }
+    }
+
+    /// The twin mutates nothing and takes no broad acquisition, despite using `_split_mut` seams
+    /// (which are the only accessors the split architecture provides).
+    #[test]
+    fn the_twin_mutates_nothing_and_takes_no_broad_lock() {
+        let b = shared_body();
+        assert!(!b.contains("with_cpu("), "no broad acquisition");
+        for mutator in [
+            "push(",
+            "insert(",
+            "remove(",
+            "= true",
+            "= false",
+            "take_endpoint_waiter",
+            "send(",
+            "wake_",
+            "dispatch_",
+        ] {
+            assert!(
+                !b.contains(mutator),
+                "the policy read must not mutate: `{mutator}`"
+            );
+        }
+    }
+
+    /// Rank discipline: four sequential acquisitions, none nested inside another.
+    #[test]
+    fn the_twin_takes_no_nested_acquisition() {
+        let b = shared_body();
+        let task = b.find("self.with_task_tcbs_split_mut(").expect("rank 2");
+        let fault = b.find("self.with_fault_split_mut(").expect("rank 8");
+        let ipc = b.find("self.with_ipc_split_mut(").expect("rank 3");
+        assert!(task < fault && fault < ipc);
+        let task_closure = b
+            .split("self.with_task_tcbs_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("}) else").next())
+            .expect("task closure");
+        assert!(
+            !task_closure.contains("with_fault_split_mut")
+                && !task_closure.contains("with_ipc_split_mut"),
+            "the rank-2 read must not enclose a higher-rank acquisition"
+        );
+        let fault_closure = b
+            .split("self.with_fault_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("});").next())
+            .expect("fault closure");
+        assert!(
+            !fault_closure.contains("with_ipc_split_mut"),
+            "the rank-8 read must not enclose the rank-3 acquisition"
+        );
     }
 }
