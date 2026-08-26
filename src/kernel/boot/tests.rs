@@ -142230,3 +142230,152 @@ mod u9ft3_buffered {
         assert!(!commit_body().contains("with_cpu("));
     }
 }
+
+/// U9-FT3 §3/§6 — the split terminal task transition.
+mod u9ft3_transition {
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    fn body() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn commit_terminal_fault_transition_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// U9-FT3 §1").next())
+            .expect("the terminal transition")
+    }
+
+    /// The victim is validated at rank 2 BEFORE the irreversible scheduler mutation, exactly as
+    /// the broad path does — a check after `block_current` would be a check after commit.
+    #[test]
+    fn the_victim_is_validated_before_the_scheduler_mutation() {
+        let b = body();
+        let validate = b
+            .find("task_transition_would_be_accepted")
+            .expect("the barrier");
+        let block = b
+            .find("self.block_current_on_cpu_split(cpu)")
+            .expect("rank 1");
+        assert!(
+            validate < block,
+            "validation must precede clearing `current`"
+        );
+        // The exact incarnation is revalidated too.
+        let asid = b.find("t.asid != Some(asid)").expect("asid revalidation");
+        assert!(asid < block);
+    }
+
+    /// The outgoing context is captured BEFORE anything can schedule.
+    #[test]
+    fn the_outgoing_context_is_captured_before_scheduling() {
+        let b = body();
+        let capture = b
+            .find("self.capture_outgoing_user_context_split(tid, frame)")
+            .expect("capture");
+        let block = b
+            .find("self.block_current_on_cpu_split(cpu)")
+            .expect("rank 1");
+        let commit = b.find("self.queue_advance_commit_split(").expect("advance");
+        assert!(capture < block && capture < commit);
+    }
+
+    /// The status write happens exactly ONCE, through the existing transition owner.
+    #[test]
+    fn the_status_write_happens_exactly_once() {
+        let b = body();
+        assert_eq!(
+            b.matches("apply_task_transition(").count(),
+            1,
+            "exactly one status write"
+        );
+        assert!(b.contains("TaskTransition::FaultRunningCurrent"));
+    }
+
+    /// The queue advance uses the U9-QA owner — no second selection policy is created.
+    #[test]
+    fn the_advance_uses_the_u9qa_selection_owner() {
+        let b = body();
+        assert!(b.contains("self.queue_advance_admit_split("));
+        assert!(b.contains("self.queue_advance_commit_split("));
+        for forbidden in [
+            "dispatch_next_task",
+            "dispatch_next_selection_on",
+            "local_dispatch_step_split_selection",
+            "dispatch_next_on",
+        ] {
+            assert!(
+                !b.contains(forbidden),
+                "the transition must not create a second selection policy: `{forbidden}`"
+            );
+        }
+    }
+
+    /// Admission precedes the irreversible scheduler mutation, so a refused advance still leaves
+    /// the task current.
+    #[test]
+    fn admission_precedes_the_irreversible_mutation() {
+        let b = body();
+        let admit = b.find("self.queue_advance_admit_split(").expect("admit");
+        let block = b
+            .find("self.block_current_on_cpu_split(cpu)")
+            .expect("rank 1");
+        assert!(admit < block);
+    }
+
+    /// There is NO broad fallback anywhere in the transition — re-entering the broad emitter
+    /// after a published report would publish a second one.
+    #[test]
+    fn there_is_no_broad_fallback_after_publication() {
+        let b = body();
+        assert!(!b.contains("with_cpu("), "no broad acquisition");
+        assert!(
+            !b.contains("emit_fault_report"),
+            "the transition must never re-enter report emission"
+        );
+    }
+
+    /// Non-atomicity is preserved: no rollback of a committed report is introduced, because the
+    /// broad path performs none.
+    #[test]
+    fn no_report_rollback_is_introduced() {
+        let b = body();
+        for rollback in [
+            "recv(",
+            "unsend",
+            "dequeue_report",
+            "retract",
+            "rollback_report",
+        ] {
+            assert!(
+                !b.contains(rollback),
+                "the transition must not roll back a published report: `{rollback}`"
+            );
+        }
+        // And every refusal variant is fail-closed, documented as retaining the report.
+        assert!(FAULT_SRC.contains("the already-published report is retained"));
+    }
+
+    /// Every refusal is typed and attributed on the wire.
+    #[test]
+    fn every_refusal_is_typed_and_attributed() {
+        let b = body();
+        for refusal in [
+            "T::RefusedIdentityChanged",
+            "T::RefusedTransitionRejected",
+            "T::RefusedVictimChanged",
+        ] {
+            assert!(b.contains(refusal), "must pin `{refusal}`");
+        }
+        assert!(b.contains("TERMINAL_FAULT_SPLIT_REFUSED"));
+        assert!(b.contains("TERMINAL_FAULT_SPLIT_COMMITTED"));
+    }
+
+    /// The scheduler must remove the task we validated; anything else is refused.
+    #[test]
+    fn the_removed_victim_is_verified() {
+        let b = body();
+        assert!(b.contains("if removed != Some(tid)"));
+        let check = b.find("if removed != Some(tid)").expect("victim check");
+        let apply = b.find("apply_task_transition(").expect("status write");
+        assert!(check < apply, "verify the victim before writing its status");
+    }
+}

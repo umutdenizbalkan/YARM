@@ -3761,7 +3761,11 @@ impl SharedKernel {
     /// waiter, wake or barrier logic here. The removed TID is returned verbatim, `Some(0)`
     /// included, and `None` when the CPU has no current task. The guard is released when this
     /// returns, before the caller's `printk_emit_sync`.
-    #[cfg(target_arch = "x86_64")]
+    /// U9-FT3 §3: the `x86_64` cfg gate was removed. The body is architecture-NEUTRAL — it
+    /// validates the CPU and runs the scheduler's own `block_current_on(cpu)` under rank 1, and
+    /// touches nothing architecture-specific. The gate reflected where the U3 caller happened to
+    /// live, not where the transaction is sound, and the AArch64 terminal-fault transition needs
+    /// the same rank-1 step.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn block_current_on_cpu_split(
         &self,
@@ -4129,6 +4133,138 @@ impl SharedKernel {
     /// # Validation status
     /// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — called by
     ///   `try_split_vm_brk_shrink_into_frame` once per unmapped page.
+    /// U9-FT3 §3 — the split terminal task transition.
+    ///
+    /// Runs AFTER the buffered report is published (or after policy determined none was
+    /// required), and mirrors the broad `fault_current_task_with_fault` ordering step for step:
+    /// validate the victim at rank 2 BEFORE the irreversible scheduler mutation, capture the
+    /// outgoing context, clear `current` at rank 1, verify the scheduler removed the task we
+    /// validated, then apply `FaultRunningCurrent` at rank 2 and advance the queue.
+    ///
+    /// NON-ATOMICITY IS PRESERVED, NOT REPAIRED. If this refuses, the already-published report
+    /// stays published — exactly what the broad path does, since its emitter swallows failures
+    /// and its transition can refuse independently. No rollback of a committed report is
+    /// introduced, because the broad path performs none.
+    ///
+    /// FAIL-CLOSED. After the report is published there is no broad fallback: re-entering the
+    /// broad emitter would publish a SECOND report. Every refusal here leaves the task alive and
+    /// the trap returning through the existing path, and is attributed on the wire.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn commit_terminal_fault_transition_shared(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+        frame: &crate::kernel::trapframe::TrapFrame,
+    ) -> crate::kernel::boot::TerminalFaultTransition {
+        use crate::kernel::boot::TerminalFaultTransition as T;
+        // (1) Revalidate the EXACT incarnation at rank 2, and run the same transition barrier the
+        // broad path runs BEFORE the scheduler mutation — a check placed after `block_current`
+        // would be a check after an irreversible commit.
+        let validated = self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(t) = tcbs.iter().flatten().find(|t| t.tid.0 == tid) else {
+                return Err(T::RefusedIdentityChanged);
+            };
+            if t.asid != Some(asid) {
+                return Err(T::RefusedIdentityChanged);
+            }
+            if crate::kernel::task_transition::task_transition_would_be_accepted(
+                tcbs,
+                tid,
+                None,
+                crate::kernel::task_transition::TaskTransition::FaultRunningCurrent,
+            )
+            .is_err()
+            {
+                return Err(T::RefusedTransitionRejected);
+            }
+            Ok(())
+        });
+        if let Err(refusal) = validated {
+            crate::yarm_log!(
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=validate reason={:?}",
+                cpu.0,
+                tid,
+                refusal
+            );
+            return refusal;
+        }
+        // (2) Capture the outgoing user context BEFORE anything can schedule.
+        let captured = self.capture_outgoing_user_context_split(tid, frame);
+        // (3) Admit the queue advance before the irreversible scheduler mutation, so a refusal
+        // still leaves the task current.
+        let admitted = match self.queue_advance_admit_split(
+            cpu,
+            crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+        ) {
+            Ok(a) => a,
+            Err(refusal) => {
+                crate::yarm_log!(
+                    "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=admit reason={:?}",
+                    cpu.0,
+                    tid,
+                    refusal
+                );
+                return T::RefusedTransitionRejected;
+            }
+        };
+        // (4) rank 1 — clear `current`. Irreversible from here.
+        let removed = match self.block_current_on_cpu_split(cpu) {
+            Ok(r) => r,
+            Err(_) => return T::RefusedVictimChanged,
+        };
+        if removed != Some(tid) {
+            crate::yarm_log!(
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=block reason=victim_changed observed={:?}",
+                cpu.0,
+                tid,
+                removed
+            );
+            return T::RefusedVictimChanged;
+        }
+        // (5) rank 2 — the status write, exactly once, through the same transition owner.
+        let applied = self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::task_transition::apply_task_transition(
+                tcbs,
+                tid,
+                None,
+                crate::kernel::task_transition::TaskTransition::FaultRunningCurrent,
+            )
+            .is_ok()
+        });
+        if !applied {
+            crate::yarm_log!(
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=apply reason=transition_rejected",
+                cpu.0,
+                tid
+            );
+            return T::RefusedTransitionRejected;
+        }
+        // (6) The U9-QA selection owner performs the advance — no second selection policy.
+        let outcome = self.queue_advance_commit_split(cpu, tid, admitted);
+        let replacement = match outcome {
+            crate::kernel::boot::QueueAdvanceOutcome::Switch { incoming_tid, .. } => {
+                Some(incoming_tid)
+            }
+            // `ResumeSame` cannot occur here: the faulting task was just removed from `current`
+            // and marked `Faulted`, so it is not re-selectable. `TerminalIdle` means nothing is
+            // runnable and the architecture's existing idle path is entered.
+            crate::kernel::boot::QueueAdvanceOutcome::ResumeSame
+            | crate::kernel::boot::QueueAdvanceOutcome::TerminalIdle => None,
+        };
+        crate::yarm_log!(
+            "TERMINAL_FAULT_SPLIT_COMMITTED cpu={} tid={} captured={} replacement={:?}",
+            cpu.0,
+            tid,
+            u8::from(captured),
+            replacement
+        );
+        T::Committed {
+            faulted_tid: tid,
+            replacement,
+        }
+    }
+
     /// U9-FT3 §1 — the read-only buffered fault-report admission preflight.
     ///
     /// Classifies whether this fault's report can be published on the BUFFERED path off-lock.

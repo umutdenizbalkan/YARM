@@ -53,6 +53,29 @@ pub(crate) struct PageFaultFacts {
     pub demand_region: bool,
 }
 
+/// U9-FT3 §3 — the outcome of the split terminal task transition.
+///
+/// Reached only AFTER a buffered report has been published (or after policy determined none was
+/// required). Every refusal here is fail-closed: the report stays published, exactly as the broad
+/// path leaves it, and there is NO broad fallback — re-entering the broad emitter would publish a
+/// second report.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalFaultTransition {
+    /// The faulting task is blocked and `Faulted`, and the queue advance is committed.
+    Committed {
+        faulted_tid: u64,
+        replacement: Option<u64>,
+    },
+    /// The task or its ASID moved before the transition began. Nothing was mutated by this
+    /// transition; the already-published report is retained, matching current semantics.
+    RefusedIdentityChanged,
+    /// The task-transition barrier rejected the victim before the scheduler mutation.
+    RefusedTransitionRejected,
+    /// The scheduler removed a different task than the one validated.
+    RefusedVictimChanged,
+}
+
 /// U9-FT3 §1 — the buffered fault-report admission verdict.
 ///
 /// Produced by a read-only preflight. ONLY [`Self::BufferedEligible`] may proceed on the split
