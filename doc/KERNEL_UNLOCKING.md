@@ -12057,3 +12057,78 @@ rollback; the fault-delivery timer proof hook remains broad, so the timer proof 
 **five**. The census remains **2 / 0 / 2**. ***U9 remains OPEN*** and direct-IpcCall production
 remains OFF (`ipccall_direct_production_enabled()` is `const false`). U9-FT3 is CENSUS-DELTA 0, so
 the canonical stage arithmetic is unchanged.
+
+### U9-FT4 — the AArch64 terminal PageFault route. DELIVERED. CENSUS-DELTA 0.
+
+**U9-FT4 — CENSUS-DELTA 0 prerequisite.** The witnessed AArch64 terminal user PageFault now
+completes end to end — buffered report, terminal transition, queue selection and exact
+replacement-context application — **without entering the terminal broad dispatcher**. The census
+stays **2 / 0 / 2**: this retires one class on one architecture, not an acquisition.
+
+**The FT3 defect and its fix.** FT3 returned `QueueAdvanceCommitted` while performing the queue
+advance itself. It selected nothing (`replacement=None`) and nothing applied an incoming context,
+so the faulting PC resumed. The fix is topological:
+
+* the **route** reserves the existing per-CPU deferral **before any publication**;
+* the **transition** no longer advances the queue at all;
+* the **existing post-lock drain** consumes the deferral once, selects through
+  `queue_advance_select_step_split`, and applies the exact incoming context.
+
+`QueueAdvanceCommitted` is now returned **only** with a reserved deferral, which is what makes the
+incoming apply structurally guaranteed rather than hoped for. No second drain was created.
+
+**Ordering, modelled on FutexWait.** classify → policy → buffered admission → U9-QA admission →
+**reserve deferral** → capture outgoing → publish report → terminal transition →
+`QueueAdvanceCommitted` → broad skipped → existing drain selects and applies. Any failure **before**
+publication releases the reservation and falls back to the unchanged broad path. After publication
+there is no broad fallback: a refused transition releases the reservation — the outgoing task is
+not `Faulted`, so the drain would decline it and a held reservation would strand the CPU — and
+settles `Complete`, leaving the report published exactly as broad semantics require.
+
+**One drain, two admissible outgoing states.** The drain's reverify was **widened, not loosened**:
+a FutexWait caller is `Blocked(Futex)`, a terminally faulted task is `Faulted`. Both mean the
+outgoing task is off the CPU and an advance is owed, so they share one drain. Each predicate stays
+exact, and a guard pins that neither leaks into the other.
+`block_current_on_cpu_split` lost its `x86_64` cfg gate (architecture-neutral body), and the
+duplicate outgoing-context capture was removed from the transition — the route owns it.
+
+**Live witness — asserted positively.**
+
+| Marker | Count |
+|---|---|
+| `PAGE_FAULT_ENTRY tid=1 addr=0x0 access=Read` | 1 |
+| `PAGE_FAULT_UNHANDLED tid=1 addr=0x0 access=Read` | 1 |
+| `TASK_FAULT_REPORT_TARGET tid=1 endpoint=3 generation=1` | 1 |
+| `TASK_FAULT_REPORT_ENQUEUE_OK … queued=1 woke=0` | 1 |
+| `TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred` | 1 |
+| `QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required` | 1 |
+| `QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=terminal_fault_committed` | 1 |
+| `QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=2` | 1 |
+| `AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid=2 asid=2` | 1 |
+| `AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid=2` | 1 |
+| `AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok` | 1 |
+| ownerless re-fault / refusal / fail-closed / `NO_INCOMING` | **0** |
+
+Buffered delivery with `woke=0` is the correct and valid outcome here. The AArch64 smoke now
+asserts this chain **positively**, in 18 checks. That matters: the FT3 attempt **exited 0** while
+the faulting PC resumed, so fatal-pattern absence is demonstrably insufficient. A negative control
+confirms the new assertions reject the FT3 log — it carries 1 ownerless re-fault (guard requires 0)
+and 0 queue selections (requires 1).
+
+**The fault-delivery timer proof hook is NOT relocated, and the timer proof blockers remain FIVE.**
+Its publication IS buffered-eligible — the live profile shows `FAULT_DELIVERY_QUEUE_BEGIN` →
+`FAULT_DELIVERY_QUEUE_OK` with no `DIRECT_RECV` markers — so that half would qualify. But the hook
+as a whole cannot leave the broad lock: it builds its scratch endpoint with `create_endpoint`,
+which mints send/recv capabilities into the current CNode (rank 4) and has no split twin, and it
+tears those capabilities down the same way. Relocating only its publication would not let
+`fault_delivery_enabled()` come out of `timer_proof_hooks_armed()`, because the rest still needs
+the broad lock. Its live profile is also x86_64-only; the AArch64 smoke has no `FAULT_DELIVERY`
+knob at all. It is therefore left broad, and this did not block the AArch64 delivery.
+
+**Unchanged.** Waiter delivery remains broad pending a split blocked-receive write-back; x86_64 COW
+remains broad and its witness is intact (`VM_COW=1`: `COW_BEGIN=2 DONE=2 HANDLED_COW=2`, zero
+terminal-split markers); demand paging remains blocked on a live witness and exact map-failure
+rollback. The census remains **2 / 0 / 2** — both terminal acquisitions keep every other reason
+they had. ***U9 remains OPEN*** and direct-IpcCall production remains OFF
+(`ipccall_direct_production_enabled()` is `const false`). U9-FT4 is CENSUS-DELTA 0, so the
+canonical stage arithmetic is unchanged.
