@@ -343,6 +343,99 @@ fn rt_prepare_timeout_result<D: ReplyTimeoutDomains>(d: &mut D, tid: u64, asid: 
 /// function rather than introducing a second resume path. `error_code` is the canonical
 /// `SyscallError` discriminant to deliver — `TimedOut` for a fired deadline, `ServerDied`
 /// for a dead replier — and it is the ONLY thing that differs between the two outcomes.
+/// Stage 199G-B §A — **the ONE blocked-receive completion publication**, for every class that
+/// completes a parked receiver remotely: reply timeout, server death, and (new in 199G-B) the
+/// ordinary NR 2 / NR 5 receive-timeout drain.
+///
+/// It writes the result and nothing else — no status change, no wake, no enqueue, no user copy.
+/// The caller owns the transition and performs it after this returns, which is what keeps the
+/// `TimedOut` fact visible strictly before the receiver becomes `Runnable`.
+///
+/// # Why one body, and why it is architecture-shaped
+///
+/// The three ports deliver a remote completion by three different mechanisms, and getting any of
+/// them wrong is silent:
+///
+/// * **x86_64** resumes a blocked recv by SAVED-FRAME return with no syscall re-run, so the
+///   canonical result is installed straight into the saved result registers — `ret0` (RAX) = 0
+///   and `err` (RCX) = the code, with RDX/R8 cleared. That is exactly the two writes the broad
+///   `handle_ipc_recv_result_with_empty_error` empty arm performs (`set_err` +
+///   `encode_transfer_cap_ret(None)`).
+/// * **RISC-V** publishes through the canonical return helper, which owns the saved-continuation
+///   mirror synchronization (`user_gprs` a0/a1 *and* their argument lanes).
+/// * **AArch64** must NOT write a result register: its resume boundary mirrors `arg0..arg5` into
+///   `x0..x5`, so any `user_gprs` write is overwritten — the defect Stage 200C2C2C fixed. It is
+///   served by the parked record below.
+///
+/// The generation-bearing [`BlockedSyscallCompletion`](crate::kernel::task::BlockedSyscallCompletion)
+/// is parked UNCONDITIONALLY on every port: it is the arch-neutral record of "this blocked
+/// receiver was completed remotely, with this exact outcome and identity". AArch64 consumes it
+/// at its resume boundary; x86_64 and RISC-V have already installed the equivalent saved result
+/// and simply never consume it — a later receive bumps `blocked_recv_generation`, which
+/// invalidates it.
+///
+/// `error_code` is the canonical `SyscallError` discriminant: `TimedOut` for an expired deadline,
+/// `ServerDied` for a dead replier. It is the only thing that differs between the outcomes.
+pub(crate) fn publish_blocked_recv_timeout_result_with_identity(
+    tcb: &mut crate::kernel::task::ThreadControlBlock,
+    error_code: u64,
+    tid: u64,
+    asid: Asid,
+) {
+    let timed_out = error_code;
+    #[cfg(target_arch = "x86_64")]
+    {
+        tcb.user_context.arg0 = 0;
+        tcb.user_context.user_gprs[0] = 0; // RAX = ret0
+        tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error
+        tcb.user_context.user_gprs[3] = 0; // RDX
+        tcb.user_context.user_gprs[7] = 0; // R8
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        tcb.publish_riscv_user_return(0, 0, timed_out as usize);
+        // Stage 200C2C2C-R2C: attest the STORED TCB lanes — the middle link of the RISC-V return
+        // chain (kernel final a0 at the resume boundary, stored TCB a0 here, first userspace a0
+        // in the caller). Reporting them from the TCB *after* publication is what makes the three
+        // independently observed values comparable.
+        crate::yarm_log!(
+            "RISCV_BLOCKED_RETURN_PUBLISHED tid={} code={} stored_a0={} stored_a1={} stored_arg0={} stored_arg1={} result=ok",
+            tid,
+            error_code,
+            tcb.user_context.user_gprs[10],
+            tcb.user_context.user_gprs[11],
+            tcb.user_context.arg0,
+            tcb.user_context.arg1
+        );
+    }
+    tcb.pending_syscall_completion = Some(crate::kernel::task::BlockedSyscallCompletion {
+        syscall_class: crate::kernel::task::BlockedSyscallClass::IpcRecv,
+        result: timed_out,
+        tid,
+        asid,
+        blocked_generation: tcb.blocked_recv_generation,
+    });
+    let _ = (timed_out, tid);
+}
+
+/// Stage 199G-B §A — [`publish_blocked_recv_timeout_result_with_identity`] for a caller that
+/// already holds the exact TCB and needs the identity read back off it.
+///
+/// The ordinary receive-timeout drain has matched `{tid, asid, blocked_recv_generation}` before
+/// reaching here, so taking the identity from the TCB names the same incarnation the claim
+/// validated. A TCB with no bound ASID cannot be a user receiver awaiting a saved-frame resume,
+/// so it publishes nothing rather than inventing an ASID for the parked record.
+pub(crate) fn publish_blocked_recv_timeout_result(
+    tcb: &mut crate::kernel::task::ThreadControlBlock,
+    error_code: u64,
+) {
+    let tid = tcb.tid.0;
+    let Some(asid) = tcb.asid else {
+        return;
+    };
+    publish_blocked_recv_timeout_result_with_identity(tcb, error_code, tid, asid);
+}
+
 pub(crate) fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
     d: &mut D,
     tid: u64,
@@ -359,67 +452,10 @@ pub(crate) fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
                     TaskStatus::Blocked(WaitReason::EndpointReceive(_))
                 )
         })?;
-        // x86_64: the blocked recv-v2 resumes via SAVED-FRAME return (NO syscall re-run),
-        // so install the canonical recv-v2 TIMEOUT into the saved result registers directly
-        // — RAX=ret0 (user_gprs[0]) = 0, RCX=error (user_gprs[2]) = `TimedOut`. The userspace
-        // wrapper reads RCX and maps `TimedOut` to `Ok(None)`.
-        #[cfg(target_arch = "x86_64")]
-        {
-            tcb.user_context.arg0 = 0;
-            tcb.user_context.user_gprs[0] = 0; // RAX = ret0
-            tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error
-            tcb.user_context.user_gprs[3] = 0; // RDX
-            tcb.user_context.user_gprs[7] = 0; // R8
-        }
-        // RISC-V: publish the completed result through the CANONICAL helper, which owns the
-        // saved-continuation mirror synchronization (`user_gprs` a0/a1 AND their argument lanes).
-        // Publishing here — before the task is made Runnable, and long before the scheduler
-        // enqueue — guarantees the result is already visible when the resume path reconstructs the
-        // outgoing frame. No user-memory copy, no lock; the enclosing lookup already matched the
-        // exact `{tid, asid}` incarnation and blocked state, so this is never a numeric-TID-only
-        // publication.
-        #[cfg(target_arch = "riscv64")]
-        {
-            tcb.publish_riscv_user_return(0, 0, timed_out as usize);
-            // Stage 200C2C2C-R2C: attest the STORED TCB lanes — the middle link of the RISC-V
-            // return chain (kernel final a0 at the resume boundary, stored TCB a0 here, first
-            // userspace a0 in the caller). Reporting them from the TCB *after* publication is
-            // what makes the three independently observed values comparable; a metadata lane
-            // can never override the raw error this way.
-            crate::yarm_log!(
-                "RISCV_BLOCKED_RETURN_PUBLISHED tid={} code={} stored_a0={} stored_a1={} stored_arg0={} stored_arg1={} result=ok",
-                tid,
-                error_code,
-                tcb.user_context.user_gprs[10],
-                tcb.user_context.user_gprs[11],
-                tcb.user_context.arg0,
-                tcb.user_context.arg1
-            );
-        }
-        // AArch64 (and other non-x86 saved-frame-resume ports): the blocked recv is NEVER
-        // re-entered — its SVC `ELR_EL1` already points past the instruction, so the caller
-        // resumes straight to userspace from its saved context. A remote completion therefore
-        // cannot deliver its result by "returning" from the handler, and it must NOT write a
-        // result register here: the AArch64 resume boundary MIRRORS `arg0..arg5` into `x0..x5`,
-        // so any `user_gprs` write is overwritten (that is precisely the defect this stage
-        // fixes — the caller observed its own stale endpoint-cap argument as a bogus result).
-        //
-        // Instead PARK a generation-bearing pending completion. The resume boundary consumes it
-        // exactly once, validates the exact `{tid, asid}` + blocked generation, and encodes the
-        // canonical result into the resumed frame. No register write, no ELR mutation here.
-        // Parked UNCONDITIONALLY: it is the arch-neutral record of "this blocked caller was
-        // completed remotely, with this exact outcome and identity". AArch64 consumes it at its
-        // resume boundary (its only delivery mechanism); x86_64 has already installed the
-        // equivalent saved-frame result above and simply never consumes the record — a later
-        // receive on that caller bumps `blocked_recv_generation`, which invalidates it.
-        tcb.pending_syscall_completion = Some(crate::kernel::task::BlockedSyscallCompletion {
-            syscall_class: crate::kernel::task::BlockedSyscallClass::IpcRecv,
-            result: timed_out,
-            tid,
-            asid,
-            blocked_generation: tcb.blocked_recv_generation,
-        });
-        let _ = timed_out;
+        // Stage 199G-B §A — ONE publication owner, shared with the ordinary-receive timeout
+        // drain. The body moved to `publish_blocked_recv_timeout_result` so both callers write
+        // the identical three-architecture shape instead of one of them re-deriving it.
+        publish_blocked_recv_timeout_result_with_identity(tcb, timed_out, tid, asid);
         tcb.status = TaskStatus::Runnable;
         Some(tcb.cpu_affinity)
     })

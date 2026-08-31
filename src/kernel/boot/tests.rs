@@ -95013,13 +95013,33 @@ mod stage200c2c2c_r2a_riscv_publication {
     // never dispatch a task whose stored result is still stale.
     #[test]
     fn p06_publication_precedes_runnable_and_enqueue() {
+        // Stage 199G-B §A: the publication BODY moved into
+        // `publish_blocked_recv_timeout_result_with_identity`, the one owner the ordinary
+        // receive-timeout drain now shares. The ordering therefore spans two functions, and
+        // both halves are pinned: the owner writes the RISC-V lanes and NEVER flips status,
+        // and its caller calls it strictly before doing so.
+        let owner = IPC_STATE_SRC
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
+            .nth(1)
+            .expect("publication owner")
+            .split("\n/// ")
+            .next()
+            .expect("owner bounded");
+        assert!(
+            owner.contains("publish_riscv_user_return"),
+            "the owner publishes the RISC-V lanes"
+        );
+        assert!(
+            !owner.contains("tcb.status = TaskStatus::Runnable"),
+            "the publication owner must not flip status — its caller owns the transition"
+        );
         let body = IPC_STATE_SRC
             .split("fn rt_commit_receiver_runnable")
             .nth(1)
             .expect("commit body");
         let body = body.split("\npub(crate) fn ").next().unwrap();
         let publish = body
-            .find("publish_riscv_user_return")
+            .find("publish_blocked_recv_timeout_result_with_identity(")
             .expect("publication call");
         let runnable = body
             .find("tcb.status = TaskStatus::Runnable")
@@ -95048,12 +95068,13 @@ mod stage200c2c2c_r2a_riscv_publication {
             2,
             "one riscv64 definition + one hosted mirror, no third"
         );
-        // The completion boundary uses the helper, not paired ad-hoc writes.
+        // The completion boundary uses the helper, not paired ad-hoc writes. Stage 199G-B §A:
+        // that boundary is now the shared publication owner.
         let body = IPC_STATE_SRC
-            .split("fn rt_commit_receiver_runnable")
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
             .nth(1)
-            .expect("commit body");
-        let body = body.split("\npub(crate) fn ").next().unwrap();
+            .expect("publication owner");
+        let body = body.split("\n/// ").next().unwrap();
         assert!(body.contains("tcb.publish_riscv_user_return(0, 0, timed_out as usize);"));
         // No RISC-V a0/a1 lane is written directly at this boundary. Stage 200C2C2C-R2C:
         // the stored-lane attestation READS both lanes to report them, so the guard targets
@@ -96725,11 +96746,13 @@ mod stage200d1_publication_and_guards {
         assert_eq!(tcb.user_context.user_gprs[11], 0, "secondary result lane");
         assert_eq!(tcb.user_context.arg1, 0, "secondary mirror");
         // The completion helper publishes RISC-V lanes ONLY through the canonical helper.
+        // Stage 199G-B §A: that helper is the shared publication owner.
         let body = IPC_STATE_SRC
-            .split("fn rt_commit_receiver_runnable")
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
             .nth(1)
             .expect("body");
-        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        // Bound to the owner's OWN body: the next item's doc comment starts the sibling.
+        let body = body.split("\n/// ").next().unwrap_or(body);
         assert!(body.contains("tcb.publish_riscv_user_return(0, 0, timed_out as usize);"));
         let direct =
             body.matches("user_gprs[10] =").count() + body.matches("user_gprs[11] =").count();
@@ -96737,9 +96760,21 @@ mod stage200d1_publication_and_guards {
             direct, 0,
             "no direct single-mirror RISC-V write is permitted"
         );
-        // Publication happens BEFORE the task becomes Runnable and before any enqueue.
-        let pub_at = body.find("publish_riscv_user_return").expect("publish");
-        let runnable_at = body
+        // Publication happens BEFORE the task becomes Runnable and before any enqueue. The
+        // owner itself never flips status; its caller calls it strictly before doing so.
+        assert!(
+            !body.contains("tcb.status = TaskStatus::Runnable"),
+            "the publication owner must not flip status"
+        );
+        let caller = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let caller = caller.split("\npub(crate) fn ").next().unwrap();
+        let pub_at = caller
+            .find("publish_blocked_recv_timeout_result_with_identity(")
+            .expect("publish");
+        let runnable_at = caller
             .find("tcb.status = TaskStatus::Runnable")
             .expect("runnable");
         assert!(pub_at < runnable_at, "publication precedes Runnable");
@@ -96750,10 +96785,11 @@ mod stage200d1_publication_and_guards {
     #[test]
     fn g04_aarch64_parked_completion_contract() {
         const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+        // Stage 199G-B §A: the parked completion is written by the shared publication owner.
         let body = IPC_STATE_SRC
-            .split("fn rt_commit_receiver_runnable")
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
             .nth(1)
-            .expect("body");
+            .expect("publication owner");
         // The parked completion carries the parameterized code, so ServerDied uses it too.
         assert!(body.contains("result: timed_out,"));
         assert!(body.contains("pending_syscall_completion = Some("));
@@ -96776,11 +96812,15 @@ mod stage200d1_publication_and_guards {
     /// written by the completion that could override it.
     #[test]
     fn g05_x86_saved_frame_contract() {
+        // Stage 199G-B §A: the x86_64 saved-frame install lives in the shared publication owner.
         let body = IPC_STATE_SRC
-            .split("fn rt_commit_receiver_runnable")
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
             .nth(1)
-            .expect("body");
-        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+            .expect("publication owner");
+        let body = body
+            .split("\n/// Stage 199G-B §A — [`publish_blocked")
+            .next()
+            .unwrap_or(body);
         assert!(body.contains("#[cfg(target_arch = \"x86_64\")]"));
         assert!(
             body.contains("tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error")
@@ -97643,20 +97683,28 @@ mod stage200d2a_deferred_death {
     // ── (19)(20)(21)(22) publication ordering + no late overwrite ───────────────────
     #[test]
     fn f19_result_publication_precedes_runnable() {
-        // Source contract: the publication write happens before the status flip, inside
-        // the single completion helper both timeout and death share.
+        // Source contract: the publication write happens before the status flip. Stage 199G-B §A
+        // moved the write into `publish_blocked_recv_timeout_result_with_identity` — the single
+        // completion owner timeout, death AND the ordinary receive-timeout drain now share — so
+        // the ordering is the CALL preceding the status flip in the committing function.
         let body = IPC_STATE_SRC
             .split("fn rt_commit_receiver_runnable")
             .nth(1)
             .expect("body");
-        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        let body = body.split("\npub(crate) fn ").next().unwrap_or(body);
         let publish = body
-            .find("tcb.pending_syscall_completion = Some(")
+            .find("publish_blocked_recv_timeout_result_with_identity(")
             .expect("publish");
         let runnable = body
             .find("tcb.status = TaskStatus::Runnable")
             .expect("runnable");
         assert!(publish < runnable, "result publication precedes Runnable");
+        // …and the owner it calls is the one that actually parks the record.
+        let owner = IPC_STATE_SRC
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
+            .nth(1)
+            .expect("publication owner");
+        assert!(owner.contains("tcb.pending_syscall_completion = Some("));
     }
 
     #[test]
@@ -118185,12 +118233,17 @@ mod stage199d_wa2b_wake_owner_census {
             "tcb.asid = Some(client_asid);",
             "tcb.user_context.instruction_ptr = VirtAddr(CLIENT_CODE_VA);",
         ),
+        // Stage 199G-B §A: RE-DERIVED, not re-pinned. The publication body moved into
+        // `publish_blocked_recv_timeout_result_with_identity` — the one owner the ordinary
+        // receive-timeout drain now shares — so the line immediately preceding this status
+        // write is the CALL to that owner. The status write itself is unchanged, and the
+        // ordering it encodes (publish, then Runnable) is exactly what moved with it.
         (
             "src/kernel/boot/ipc_state.rs",
             "rt_commit_receiver_runnable",
             "tcb.status",
             "TaskStatus::Runnable",
-            "let _ = timed_out;",
+            "publish_blocked_recv_timeout_result_with_identity(tcb, timed_out, tid, asid);",
             "Some(tcb.cpu_affinity)",
         ),
         (
@@ -118434,12 +118487,16 @@ mod stage199d_wa2b_wake_owner_census {
         // Canonical 199E: the ordinary RECEIVE timeout wake, moved off the broad lock. Its
         // neighbourhood is the close of the exact-claim guards and the deadline clear that
         // publishes the `TimedOut` fact in the same rank-2 acquisition.
+        // Stage 199G-B §A: RE-DERIVED. The drain now publishes the completion RESULT through
+        // the shared owner in this same rank-2 acquisition, immediately before the status
+        // write, so the preceding line is that call's closing `);` rather than the closing `}`
+        // of the last refusal guard. The status write and its ordering are unchanged.
         (
             "src/runtime.rs",
             "drain_recv_timeout_post_work",
             "tcb.status",
             "TaskStatus::Runnable",
-            "}",
+            ");",
             "tcb.ipc_timeout_deadline = None;",
         ),
         (

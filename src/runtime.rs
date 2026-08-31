@@ -10015,6 +10015,30 @@ impl SharedKernel {
                 if deadline != work.deadline || now < deadline {
                     return false;
                 }
+                // Stage 199G-B §A — PUBLISH `TimedOut` INTO THE SAVED INCOMING CONTEXT, in this
+                // same acquisition, BEFORE the task becomes `Runnable`.
+                //
+                // Before 199G-B this claim published only the FLAG. That was sound while every
+                // ordinary-recv timeout victim was still inside its live trap frame:
+                // `ipc_recv_until_deadline` returns in place and the running handler writes
+                // `err = TimedOut` from `consume_ipc_timeout_fired_for_tid`. A receiver that
+                // LEFT its frame has no such handler, and would resume on whatever its frame
+                // last held — the pre-lock route's `WouldBlock` — reporting "would block" for a
+                // deadline that actually expired.
+                //
+                // The publication owner is the one that already exists and is arch-complete:
+                // x86_64 installs the saved result registers, RISC-V publishes through the
+                // canonical return helper with its mirror lanes, and every port parks the
+                // generation-bearing `BlockedSyscallCompletion` that AArch64's resume boundary
+                // consumes exactly once. It is invoked here rather than reimplemented so the
+                // timeout and the reply/server-death classes keep ONE completion shape.
+                //
+                // Ordering is what makes it safe: the `TimedOut` fact is visible before the
+                // wake, and nothing enqueues until phase (3).
+                crate::kernel::boot::publish_blocked_recv_timeout_result(
+                    tcb,
+                    crate::kernel::syscall::SyscallError::TimedOut.code() as u64,
+                );
                 tcb.status = TaskStatus::Runnable;
                 tcb.ipc_timeout_deadline = None;
                 tcb.ipc_timeout_fired = true;

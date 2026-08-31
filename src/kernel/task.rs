@@ -21,9 +21,52 @@ pub enum WaitReason {
     Poll,
 }
 
+/// Which receive ABI a blocked receiver's completion must be written back in.
+///
+/// **This is an INTERNAL model, not a syscall ABI.** Both variants describe receives whose
+/// register-level contract already exists and is unchanged; the variant only tells the one
+/// completion owner which of the two writeback shapes the parked caller is owed.
+///
+/// Stage 199G-B §A adds `LegacyTimeout`. Before it, this enum had a single variant and
+/// `BlockedRecvState` was stored on exactly one path — `handle_ipc_recv`'s recv-v2 arm — so a
+/// blocked NR 5 receiver had NO completion record at all. That was sound only because every NR 5
+/// victim stayed inside its live trap frame: `ipc_recv_until_deadline` returns in place and the
+/// still-running handler writes the result from locals. A receiver that LEAVES its frame — which
+/// is what a pre-lock route does — has no such handler to return to, so without a record it would
+/// resume on whatever its frame last held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvAbiVariant {
+    /// NR 2 with a metadata buffer: the 40-byte `encode_recv_v2_meta` struct is written to
+    /// `meta_user_ptr`, and `ret0` is 0 because every field travels in the struct.
     RecvV2,
+    /// NR 5 (`ipc_recv_timeout`), and the legacy NR 2 shape it shares: payload only, **no
+    /// metadata write**, `ret0` carries the sender TID. `meta_user_ptr` / `meta_user_len` are
+    /// not part of this variant's contract and are stored as 0.
+    ///
+    /// The empty outcomes are the two `handle_ipc_recv_result_with_empty_error` writes and
+    /// nothing else: `err = TimedOut` (deadline won) or `err = WouldBlock` (non-blocking probe),
+    /// with the transfer-cap return lane cleared.
+    LegacyTimeout,
+}
+
+impl RecvAbiVariant {
+    /// Whether this variant owes the receiver a recv-v2 metadata struct.
+    ///
+    /// The single question every writeback-shape decision asks, so no site re-derives it by
+    /// comparing variants itself.
+    #[must_use]
+    pub const fn writes_recv_v2_meta(self) -> bool {
+        matches!(self, Self::RecvV2)
+    }
+
+    /// Stable slug for markers/telemetry.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::RecvV2 => "recv_v2",
+            Self::LegacyTimeout => "legacy_timeout",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +77,30 @@ pub struct BlockedRecvState {
     pub meta_user_ptr: usize,
     pub meta_user_len: usize,
     pub recv_abi: RecvAbiVariant,
+}
+
+impl BlockedRecvState {
+    /// Stage 199G-B §A — the NR 5 / legacy blocked-receive completion contract.
+    ///
+    /// Constructed where the caller still holds its live trap frame, so the payload destination
+    /// it names is the one the caller actually passed. `meta_user_ptr`/`meta_user_len` are 0 by
+    /// construction: `RecvAbiVariant::LegacyTimeout` writes no metadata, and storing a pointer
+    /// this variant will never honour would be a lie a later reader could act on.
+    #[must_use]
+    pub const fn legacy_timeout(
+        recv_cap: CapId,
+        payload_user_ptr: usize,
+        payload_user_len: usize,
+    ) -> Self {
+        Self {
+            recv_cap,
+            payload_user_ptr,
+            payload_user_len,
+            meta_user_ptr: 0,
+            meta_user_len: 0,
+            recv_abi: RecvAbiVariant::LegacyTimeout,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

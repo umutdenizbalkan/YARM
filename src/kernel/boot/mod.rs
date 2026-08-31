@@ -4619,6 +4619,10 @@ pub(crate) use ipc_state::{
     ipc_try_recv_queued_admitted_locked, ipc_try_recv_queued_plain_endpoint_only_locked,
     ipc_try_recv_queued_with_cap_transfer_locked,
 };
+// Stage 199G-B §A: the ONE blocked-receive completion publication, re-exported so the off-lock
+// ordinary receive-timeout drain in `runtime.rs` writes the identical three-architecture result
+// shape the reply-timeout and server-death classes already write.
+pub(crate) use ipc_state::publish_blocked_recv_timeout_result;
 
 /// Which reverse link a close is entitled to remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
