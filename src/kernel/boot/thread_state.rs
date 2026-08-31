@@ -11,6 +11,39 @@ use crate::kernel::task::{
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::Asid;
 
+/// Stage 199G-B §1 — the values the ONE delivery writeback projects, gathered by the drain that
+/// already holds them.
+///
+/// It exists so the completion transaction takes ONE parameter instead of several positional
+/// scalars whose order a caller could silently transpose — `sender_tid` and `payload_len` are
+/// both plain integers, and swapping them would be invisible at the call site and wrong in
+/// userspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockedRecvDeliveryResult {
+    /// The receive ABI the WAITER issued, from its saved blocked-receive state.
+    pub(crate) recv_abi: crate::kernel::task::RecvAbiVariant,
+    /// The sending thread — the legacy projection's `ret0`.
+    pub(crate) sender_tid: u64,
+    /// Receiver-visible payload length — the legacy projection's `ret1`.
+    pub(crate) payload_len: usize,
+    /// The receiver-local capability this delivery materialized, if any — the legacy
+    /// projection's `ret2`. `None` projects the canonical no-transfer sentinel, which is what
+    /// the broad path's `encode_transfer_cap_ret(frame, None)` writes.
+    pub(crate) transfer_cap: Option<crate::kernel::capabilities::CapId>,
+}
+
+impl BlockedRecvDeliveryResult {
+    /// The recv-v2 projection: every field travels in the meta struct, so the register lanes are
+    /// the canonical success shape. Byte-identical to what `clear_blocked_recv_return_regs_locked`
+    /// wrote before 199G-B.
+    pub(crate) const RECV_V2: Self = Self {
+        recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+        sender_tid: 0,
+        payload_len: 0,
+        transfer_cap: None,
+    };
+}
+
 pub(crate) const KERNEL_STACK_REGION_BASE: usize = 0xFFFF_8000_0000_0000;
 /// Per-task kernel-stack region size.
 ///
@@ -378,16 +411,25 @@ impl KernelState {
     /// the broad borrow drops). See that call site for the x86_64 register-slot
     /// rationale (RCX/RDX/R8 must be zeroed because the resumption path restores
     /// `user_gprs` verbatim).
+    /// Stage 199G-B §1: this is now the recv-v2 SPELLING of
+    /// [`Self::publish_blocked_recv_delivery_result`] — same single writeback owner, so the
+    /// broad-lock and off-lock deliveries cannot drift apart.
     pub(crate) fn clear_blocked_recv_return_regs(&mut self, waiter_tid: u64) {
-        self.with_tcb_mut(waiter_tid, |tcb| {
-            tcb.user_context.arg0 = 0;
-            tcb.user_context.user_gprs[0] = 0; // RAX / x0  = ret0  = 0 (success)
-            #[cfg(target_arch = "x86_64")]
-            {
-                tcb.user_context.user_gprs[2] = 0; // RCX = error = 0 (success)
-                tcb.user_context.user_gprs[3] = 0; // RDX = ret2  = 0
-                tcb.user_context.user_gprs[7] = 0; // R8  = ret1  = 0
-            }
+        self.publish_blocked_recv_delivery_result(waiter_tid, BlockedRecvDeliveryResult::RECV_V2);
+    }
+
+    /// Stage 199G-B §1: broad-lock sibling of
+    /// [`Self::publish_blocked_recv_delivery_result_locked`], for the delivery paths that still
+    /// hold `&mut KernelState`. It delegates to that one owner rather than repeating the
+    /// projection, so there is exactly ONE place that decides what a satisfied blocked receiver
+    /// sees in its return registers.
+    pub(crate) fn publish_blocked_recv_delivery_result(
+        &mut self,
+        waiter_tid: u64,
+        result: BlockedRecvDeliveryResult,
+    ) {
+        self.with_tcbs_mut(|tcbs| {
+            Self::publish_blocked_recv_delivery_result_locked(tcbs, waiter_tid, result);
         });
     }
 
@@ -400,9 +442,7 @@ impl KernelState {
         Self::publish_blocked_recv_delivery_result_locked(
             tcbs,
             waiter_tid,
-            crate::kernel::task::RecvAbiVariant::RecvV2,
-            0,
-            0,
+            BlockedRecvDeliveryResult::RECV_V2,
         );
     }
 
@@ -431,17 +471,18 @@ impl KernelState {
     pub(crate) fn publish_blocked_recv_delivery_result_locked(
         tcbs: &mut [Option<crate::kernel::task::ThreadControlBlock>],
         waiter_tid: u64,
-        recv_abi: crate::kernel::task::RecvAbiVariant,
-        sender_tid: u64,
-        payload_len: usize,
+        result: BlockedRecvDeliveryResult,
     ) {
-        let (ret0, ret1, ret2) = if recv_abi.writes_recv_v2_meta() {
+        let (ret0, ret1, ret2) = if result.recv_abi.writes_recv_v2_meta() {
             (0usize, 0usize, 0usize)
         } else {
             (
-                sender_tid as usize,
-                payload_len,
-                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+                result.sender_tid as usize,
+                result.payload_len,
+                result
+                    .transfer_cap
+                    .map_or(crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP, |c| c.0)
+                    as usize,
             )
         };
         if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == waiter_tid) {

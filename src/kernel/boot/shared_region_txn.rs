@@ -57,6 +57,16 @@ pub(crate) enum SharedRegionTxnState {
 /// resolved after the lock drops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecvBoundarySharedRegionSnapshot {
+    /// Stage 199G-B §1 — which receive ABI the RECEIVER issued, read from its saved
+    /// blocked-receive state in Phase A and never re-derived later.
+    ///
+    /// It selects the final register/meta projection and nothing else: the envelope consume,
+    /// rights attenuation, mint, mapping, rollback, waiter claim, completion and wake are shared
+    /// by both variants. Carrying it on the snapshot rather than inferring it in the transaction
+    /// is what keeps that true — neither the message shape nor the syscall number can tell you
+    /// which ABI the *receiver* asked for, and guessing from either is how a legacy receiver
+    /// would get a metadata write it never provided a buffer for.
+    pub(crate) recv_abi: crate::kernel::task::RecvAbiVariant,
     pub(crate) receiver_cnode: crate::kernel::capabilities::CNodeId,
     /// Frozen source object identity (MemoryObject/DmaRegion) — authoritative.
     pub(crate) object: CapObject,
@@ -355,6 +365,7 @@ impl KernelState {
         meta_ptr: u64,
         msg: Message,
         origin_direct: bool,
+        recv_abi: crate::kernel::task::RecvAbiVariant,
     ) -> Result<RecvBoundarySharedRegionSnapshot, KernelError> {
         // Consume the envelope KEEPING the pin (no reference gap): the snapshot owns it now.
         let envelope = self
@@ -392,6 +403,7 @@ impl KernelState {
             .ok_or(KernelError::UserMemoryFault)?;
         let receiver_pid = self.process_id(receiver_tid).unwrap_or(receiver_tid);
         Ok(RecvBoundarySharedRegionSnapshot {
+            recv_abi,
             receiver_cnode,
             object,
             object_generation,
@@ -547,7 +559,13 @@ pub(crate) trait SharedRegionExecCtx {
     /// non-nested, no IPC/cap/VM/memory lock held during the wake, the enqueue the LAST visible
     /// action. When `blocked_endpoint_waiter` is false it is a plain best-effort wake (always
     /// `Some`), preserving the accepted transaction-executor semantics.
-    fn ctx_finalize_and_wake(&mut self, snap: &RecvBoundarySharedRegionSnapshot) -> Option<bool>;
+    /// `result` is the Stage 199G-B §1 final projection the completion publishes into the
+    /// receiver's saved return registers — the ONLY part of this step that varies by receive ABI.
+    fn ctx_finalize_and_wake(
+        &mut self,
+        snap: &RecvBoundarySharedRegionSnapshot,
+        result: crate::kernel::boot::BlockedRecvDeliveryResult,
+    ) -> Option<bool>;
     /// rank 6: release the transferred object pin (once).
     fn ctx_release_pin(&mut self, object: CapObject);
     /// rank 5 + TLB: unmap the mapped prefix via the two-phase shootdown-before-reclaim contract.
@@ -734,6 +752,11 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
     }
 
     // Phase 7: user metadata copy OUTSIDE all locks (recv-v2 meta).
+    //
+    // Stage 199G-B §1: the ONE projection step that varies by receive ABI. A `LegacyTimeout`
+    // receiver provided no metadata buffer (its saved state carries a zero pointer AND a zero
+    // length), so there is nothing to encode and nothing to write; its sender TID, payload length
+    // and receiver-local cap travel in the return registers published by the finalize below.
     let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
         txn.snapshot.msg.sender_tid.0,
         txn.snapshot.msg.opcode,
@@ -744,11 +767,12 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
         txn.snapshot.msg.sender_tid.0,
     );
     let copy_ok = !hook_force_copy_fault()
-        && ctx.ctx_copy_meta(
-            txn.snapshot.receiver_asid,
-            VirtAddr(txn.snapshot.meta_ptr),
-            &meta,
-        );
+        && (!txn.snapshot.recv_abi.writes_recv_v2_meta()
+            || ctx.ctx_copy_meta(
+                txn.snapshot.receiver_asid,
+                VirtAddr(txn.snapshot.meta_ptr),
+                &meta,
+            ));
     if !copy_ok {
         rollback_shared_region_txn(ctx, &mut txn);
         return Err(SharedRegionTxnError::CopyFault);
@@ -770,7 +794,13 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
     // enqueue. If the waiter is stale (missing / replaced by a different task) it returns false
     // WITHOUT enqueuing, and the transaction rolls back with NO wake (StalePublish). On success the
     // receiver was enqueued exactly once, AFTER its blocked-return + endpoint-waiter state cleared.
-    let woke = match ctx.ctx_finalize_and_wake(&txn.snapshot) {
+    let delivery_result = crate::kernel::boot::BlockedRecvDeliveryResult {
+        recv_abi: txn.snapshot.recv_abi,
+        sender_tid: txn.snapshot.msg.sender_tid.0,
+        payload_len: txn.snapshot.msg.as_slice().len(),
+        transfer_cap: Some(minted),
+    };
+    let woke = match ctx.ctx_finalize_and_wake(&txn.snapshot, delivery_result) {
         Some(woke) => woke,
         None => {
             // Stale finalization (missing / replacement endpoint waiter): no enqueue happened.
@@ -886,7 +916,11 @@ impl SharedRegionExecCtx for KernelState {
     fn ctx_copy_meta(&mut self, asid: crate::kernel::vm::Asid, va: VirtAddr, bytes: &[u8]) -> bool {
         self.copy_to_user(asid, va, bytes).is_ok()
     }
-    fn ctx_finalize_and_wake(&mut self, snap: &RecvBoundarySharedRegionSnapshot) -> Option<bool> {
+    fn ctx_finalize_and_wake(
+        &mut self,
+        snap: &RecvBoundarySharedRegionSnapshot,
+        result: crate::kernel::boot::BlockedRecvDeliveryResult,
+    ) -> Option<bool> {
         use crate::kernel::task::{TaskStatus, WaitReason};
         if !snap.blocked_endpoint_waiter {
             // Plain wake path (queued dequeue / txn proofs): no endpoint-waiter identity to claim.
@@ -961,8 +995,11 @@ impl SharedRegionExecCtx for KernelState {
         });
         match class {
             2 => {
-                // rank 2: clear blocked-return registers, THEN rank 2→1 wake (set Runnable + enqueue).
-                self.clear_blocked_recv_return_regs(snap.receiver_tid);
+                // rank 2: publish the blocked-return registers, THEN rank 2→1 wake (set Runnable +
+                // enqueue). Stage 199G-B §1: the ONE variant-driven writeback owner — recv-v2
+                // still gets the canonical zeroed success shape, a legacy receiver gets its
+                // sender TID / payload length / receiver-local cap in the return lanes.
+                self.publish_blocked_recv_delivery_result(snap.receiver_tid, result);
                 Some(self.apply_split_receiver_wake_plan(receiver.tid).is_ok())
             }
             // Dead/removed OR replaced (ASID changed) receiver after the IDENTITY claim: the claimed

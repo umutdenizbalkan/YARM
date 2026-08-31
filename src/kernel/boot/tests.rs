@@ -49779,6 +49779,8 @@ mod stage188a_dispatch_return_delivery_channel {
             *b = i as u8;
         }
         let snap = BlockedWaiterPlainDeliverySnapshot {
+            recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            sender_tid: 0,
             waiter_tid: 1,
             waiter_asid: asid,
             payload_user_ptr: 0x4000,
@@ -65791,7 +65793,17 @@ mod stage198e2a_shared_region_direct {
         )
         .expect("msg");
         state
-            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg, true)
+            .shared_region_phase_a(
+                handle,
+                endpoint,
+                2,
+                MAP_VA,
+                map_write,
+                META_PTR,
+                msg,
+                true,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A")
     }
 
@@ -66211,7 +66223,17 @@ mod stage198e2a_shared_region_direct {
         .expect("m");
         assert!(
             state
-                .shared_region_phase_a(rh, endpoint, 2, MAP_VA, false, META_PTR, rmsg, true)
+                .shared_region_phase_a(
+                    rh,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    rmsg,
+                    true,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err()
         );
         // Ordinary (non-shared) MemoryObject envelope → Phase A rejects (no shared_region descriptor).
@@ -66229,7 +66251,17 @@ mod stage198e2a_shared_region_direct {
         .expect("m");
         assert!(
             state
-                .shared_region_phase_a(oh, endpoint, 2, MAP_VA, false, META_PTR, omsg, true)
+                .shared_region_phase_a(
+                    oh,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    omsg,
+                    true,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err()
         );
     }
@@ -66285,7 +66317,17 @@ mod stage198e2a_shared_region_direct {
         )
         .expect("m");
         let snap = state
-            .shared_region_phase_a(handle, endpoint, 2, MAP_VA + 1, false, META_PTR, msg, true)
+            .shared_region_phase_a(
+                handle,
+                endpoint,
+                2,
+                MAP_VA + 1,
+                false,
+                META_PTR,
+                msg,
+                true,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A");
         assert_eq!(
             state.shared_region_execute(snap),
@@ -66392,7 +66434,17 @@ mod stage198e2a1_shared_region_txn_race {
         )
         .expect("msg");
         state
-            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, false, META_PTR, msg, true)
+            .shared_region_phase_a(
+                handle,
+                endpoint,
+                2,
+                MAP_VA,
+                false,
+                META_PTR,
+                msg,
+                true,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A")
     }
 
@@ -66855,6 +66907,7 @@ mod stage198e2b_shared_region_enqueue {
             META_PTR,
             msg,
             false,
+            crate::kernel::task::RecvAbiVariant::RecvV2,
         )
     }
 
@@ -66961,7 +67014,17 @@ mod stage198e2b_shared_region_enqueue {
         let h = msg.transferred_cap().expect("h").0;
         assert!(
             state
-                .shared_region_phase_a(h, endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .shared_region_phase_a(
+                    h,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    msg,
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err(),
             "non-shared object must be rejected at dequeue"
         );
@@ -66989,7 +67052,17 @@ mod stage198e2b_shared_region_enqueue {
         let h = msg.transferred_cap().expect("h").0;
         assert!(
             state
-                .shared_region_phase_a(h, endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .shared_region_phase_a(
+                    h,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    msg,
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err(),
             "reply object excluded from queued shared-region path"
         );
@@ -67028,7 +67101,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(fx.handle),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "envelope not re-consumable"
@@ -67190,7 +67264,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(fx.handle),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "second receiver cannot consume the same envelope"
@@ -67216,7 +67291,17 @@ mod stage198e2b_shared_region_enqueue {
         );
         let h = msg.transferred_cap().expect("h").0;
         let snap = state
-            .shared_region_phase_a(h, fx.endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+            .shared_region_phase_a(
+                h,
+                fx.endpoint,
+                2,
+                MAP_VA,
+                false,
+                META_PTR,
+                msg,
+                false,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A");
         assert_eq!(shared_envelope_count(&state), 0, "envelope consumed once");
         assert!(
@@ -67229,7 +67314,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(h),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "envelope not re-consumable"
@@ -67259,7 +67345,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(stale),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "stale handle must fail closed"
@@ -67401,7 +67488,17 @@ mod stage198e2b_shared_region_enqueue {
         let h = msg.transferred_cap().expect("h").0;
         assert!(
             state
-                .shared_region_phase_a(h, endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .shared_region_phase_a(
+                    h,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    msg,
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err(),
             "inert queued message cannot produce a transaction"
         );
@@ -67427,7 +67524,17 @@ mod stage198e2b_shared_region_enqueue {
         let h = msg.transferred_cap().expect("h").0;
         assert!(
             state
-                .shared_region_phase_a(h, fx.endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .shared_region_phase_a(
+                    h,
+                    fx.endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    msg,
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err(),
             "no transaction after the receiver association is removed"
         );
@@ -67489,7 +67596,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(fx.handle),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "no transaction survives endpoint teardown"
@@ -68438,7 +68546,17 @@ mod stage198e3b2a_offlock_ctx {
         )
         .expect("msg");
         let snap = s
-            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg, true)
+            .shared_region_phase_a(
+                handle,
+                endpoint,
+                2,
+                MAP_VA,
+                map_write,
+                META_PTR,
+                msg,
+                true,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A");
         Fx {
             shared: SharedKernel::new(s),
@@ -69413,7 +69531,11 @@ mod stage198e3b2b_drain_switch {
             k.with_tcb_mut(2, |tcb| tcb.status = TaskStatus::Exited(0));
         });
         assert_eq!(
-            d.shared.sr_commit_blocked_receiver_split(2, d.asid),
+            d.shared.sr_commit_blocked_receiver_split(
+                2,
+                d.asid,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             ReceiverCommit::GoneDead,
             "an exited receiver commits as GoneDead"
         );
@@ -69460,7 +69582,11 @@ mod stage198e3b2b_drain_switch {
             k.bind_task_asid(2, new_asid).expect("rebind");
         });
         assert_eq!(
-            d.shared.sr_commit_blocked_receiver_split(2, orig_asid),
+            d.shared.sr_commit_blocked_receiver_split(
+                2,
+                orig_asid,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             ReceiverCommit::Replaced
         );
         assert_eq!(ret_reg(&d), 0xDEAD, "no register cleared on Replaced");
@@ -82765,8 +82891,11 @@ mod stage199a2d1_races {
         fx.k.with(|s| s.mark_task_dead(1).expect("caller exits"));
 
         // (A) attempt to commit the caller wake — GoneDead: no register mutated, no wake.
-        let commit =
-            fx.k.sr_commit_blocked_receiver_split(fx.caller.tid.0, fx.caller.asid);
+        let commit = fx.k.sr_commit_blocked_receiver_split(
+            fx.caller.tid.0,
+            fx.caller.asid,
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             commit,
             ReceiverCommit::GoneDead,
@@ -82929,8 +83058,11 @@ mod stage199a2d1_races {
         fx.k.with(|s| s.mark_task_dead(2).expect("server exits"));
 
         // Delivery commit → GoneDead (no register mutated, no wake).
-        let commit =
-            fx.k.sr_commit_blocked_receiver_split(fx.server.tid.0, fx.server.asid);
+        let commit = fx.k.sr_commit_blocked_receiver_split(
+            fx.server.tid.0,
+            fx.server.asid,
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             commit,
             ReceiverCommit::GoneDead,
@@ -83017,8 +83149,11 @@ mod stage199a2d1_races {
                         ) {
                             Some(_claim) => {
                                 cl.fetch_add(1, O::Relaxed);
-                                match k.sr_commit_blocked_receiver_split(server.tid.0, server.asid)
-                                {
+                                match k.sr_commit_blocked_receiver_split(
+                                    server.tid.0,
+                                    server.asid,
+                                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                                ) {
                                     ReceiverCommit::Committed(affinity) => {
                                         rn.fetch_add(1, O::Relaxed);
                                         k.sr_enqueue_committed_receiver_split(
@@ -88281,10 +88416,14 @@ mod stage199a2d2c2b2_guards {
     }
 
     // (6) recv-v2 result registers are cleared/completed BEFORE the receiver is set Runnable.
+    //
+    // Stage 199G-B §1: `clear_blocked_recv_return_regs_locked` became the recv-v2 SPELLING of the
+    // one variant-driven writeback owner, and this commit publishes through the owner directly
+    // (NR6/NR7 pass `RECV_V2`, which is byte-identical to the old clear). Same site, same order.
     #[test]
     fn recv_v2_result_completed_before_runnable() {
         let clear = RUNTIME
-            .find("clear_blocked_recv_return_regs_locked(tcbs, tid)")
+            .find("publish_blocked_recv_delivery_result_locked(tcbs, tid, result)")
             .unwrap();
         // The relevant Runnable transition is the one in the same commit, AFTER the register clear.
         let runnable = clear
@@ -88550,7 +88689,10 @@ mod stage199a2d2c2b3_guards {
     // Runnable, and BlockedUnfinalized is never selectable (so no fresh re-entry frame is used).
     #[test]
     fn recv_result_not_overwritten_by_fresh_entry() {
-        assert!(RUNTIME.contains("clear_blocked_recv_return_regs_locked(tcbs, tid)"));
+        // Stage 199G-B §1: the commit publishes through the ONE variant-driven writeback owner;
+        // for the NR6/NR7 direct paths the projection passed in is `RECV_V2`, byte-identical to
+        // the clear this assertion used to pin.
+        assert!(RUNTIME.contains("publish_blocked_recv_delivery_result_locked(tcbs, tid, result)"));
         use crate::arch::x86_64::ap_sched::{
             DispatchReject, TaskDispatchState, select_return_source,
         };
@@ -91706,9 +91848,11 @@ mod stage200c_reply_timeout_transaction {
             )
             .is_some()
         {
-            if let ReceiverCommit::Committed(aff) =
-                fx.k.sr_commit_blocked_receiver_split(1, fx.caller_asid)
-            {
+            if let ReceiverCommit::Committed(aff) = fx.k.sr_commit_blocked_receiver_split(
+                1,
+                fx.caller_asid,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+            ) {
                 fx.k.sr_enqueue_committed_receiver_split(1, aff);
                 return true;
             }
@@ -92347,7 +92491,7 @@ mod stage200c_reply_timeout_transaction {
                                 .is_some()
                                 {
                                     if let ReceiverCommit::Committed(aff) =
-                                        k.sr_commit_blocked_receiver_split(1, asid)
+                                        k.sr_commit_blocked_receiver_split(1, asid, crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2)
                                     {
                                         k.sr_enqueue_committed_receiver_split(1, aff);
                                         reply_won.fetch_add(1, O::Relaxed);
@@ -115594,6 +115738,7 @@ mod stage199d_shared_region_enqueue_rejection {
             .expect("resolve recv endpoint")
             .endpoint;
         let snap = RecvBoundarySharedRegionSnapshot {
+            recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
             receiver_cnode: k.with(|s| s.task_cnode(2)).expect("cnode"),
             object: endpoint,
             object_generation: 0,
@@ -115669,7 +115814,10 @@ mod stage199d_shared_region_enqueue_rejection {
             s.set_task_home_cpu(2, CpuId(1)).expect("pin");
         });
         assert_eq!(
-            fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+            fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                &fx.snap,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+            ),
             None,
             "a refused placement is NOT a wake — Some(true) would be a lie"
         );
@@ -115691,7 +115839,10 @@ mod stage199d_shared_region_enqueue_rejection {
             let _ = fx.k.sr_enqueue_committed_receiver_split(tid, Some(here));
         }
         assert_eq!(
-            fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+            fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                &fx.snap,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+            ),
             None
         );
         assert_no_wake_and_restored(&fx, "queue full");
@@ -115715,7 +115866,10 @@ mod stage199d_shared_region_enqueue_rejection {
                 ReceiverEnqueue::Enqueued { .. }
             ));
             assert_eq!(
-                fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+                fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                    &fx.snap,
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                ),
                 None,
                 "an unreconciled collision is not a wake"
             );
@@ -115737,7 +115891,10 @@ mod stage199d_shared_region_enqueue_rejection {
                 s.dispatch_next_on_cpu(here).expect("make current");
             });
             assert_eq!(
-                fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+                fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                    &fx.snap,
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                ),
                 None
             );
             assert_eq!(
@@ -115760,7 +115917,10 @@ mod stage199d_shared_region_enqueue_rejection {
                 ReceiverEnqueue::Enqueued { .. }
             ));
             assert_eq!(
-                fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+                fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                    &fx.snap,
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                ),
                 None
             );
             assert_eq!(
@@ -123450,7 +123610,13 @@ mod u3_blocked_waiter_completion_transaction {
 
         let (b, eb) = fixture(wake_status, wake_asid);
         let b_census = waiters_linked();
-        let _ = b.complete_blocked_waiter_delivery_split(cpu, WAITER, eb, wake.map(ThreadId));
+        let _ = b.complete_blocked_waiter_delivery_split(
+            cpu,
+            WAITER,
+            eb,
+            wake.map(ThreadId),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         let obs_b = observe(&b, eb);
         let b_delta = waiters_linked() as i64 - b_census as i64;
 
@@ -123541,7 +123707,13 @@ mod u3_blocked_waiter_completion_transaction {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(1), WAITER, eidx, None),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(1),
+                WAITER,
+                eidx,
+                None,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Ok(())
         );
         assert_eq!(
@@ -123558,7 +123730,13 @@ mod u3_blocked_waiter_completion_transaction {
             k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
             let before = observe(&k, eidx);
             let err = k
-                .complete_blocked_waiter_delivery_split(bad, WAITER, eidx, Some(ThreadId(WAKE)))
+                .complete_blocked_waiter_delivery_split(
+                    bad,
+                    WAITER,
+                    eidx,
+                    Some(ThreadId(WAKE)),
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                )
                 .expect_err("refused");
             assert_eq!(
                 err,
@@ -123575,7 +123753,13 @@ mod u3_blocked_waiter_completion_transaction {
     fn u3_bw_wake_none_clears_registers_only() {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, None),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(0),
+                WAITER,
+                eidx,
+                None,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Ok(())
         );
         let (regs, slot, status, deadline, fired, ..) = observe(&k, eidx);
@@ -123594,7 +123778,13 @@ mod u3_blocked_waiter_completion_transaction {
     fn u3_bw_absent_waiter_tcb_is_not_an_error() {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(0), 9_999, eidx, None),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(0),
+                9_999,
+                eidx,
+                None,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Ok(()),
             "an absent waiter TCB mutates nothing and raises no new error"
         );
@@ -123624,8 +123814,13 @@ mod u3_blocked_waiter_completion_transaction {
             eidx
         });
         let linked = waiters_linked();
-        let _ =
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        let _ = k.complete_blocked_waiter_delivery_split(
+            CpuId(0),
+            WAITER,
+            eidx,
+            Some(ThreadId(WAKE)),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx))),
             Some(ThreadId(WAKE)),
@@ -123638,8 +123833,13 @@ mod u3_blocked_waiter_completion_transaction {
     fn u3_bw_identity_match_removes_through_the_central_path_exactly_once() {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         let linked = waiters_linked();
-        let _ =
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        let _ = k.complete_blocked_waiter_delivery_split(
+            CpuId(0),
+            WAITER,
+            eidx,
+            Some(ThreadId(WAKE)),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx))),
             None,
@@ -123647,8 +123847,13 @@ mod u3_blocked_waiter_completion_transaction {
         );
         assert_eq!(waiters_linked(), linked - 1, "unlinked exactly once");
         // A second completion is a no-op and must not double-unlink.
-        let _ =
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        let _ = k.complete_blocked_waiter_delivery_split(
+            CpuId(0),
+            WAITER,
+            eidx,
+            Some(ThreadId(WAKE)),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(waiters_linked(), linked - 1, "no double unlink");
     }
 
@@ -123662,8 +123867,13 @@ mod u3_blocked_waiter_completion_transaction {
                 ipc.set_endpoint_waiter(eidx, EndpointWaiterRecord::new(ident(WAKE, ASID), 77));
             })
         });
-        let _ =
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        let _ = k.complete_blocked_waiter_delivery_split(
+            CpuId(0),
+            WAITER,
+            eidx,
+            Some(ThreadId(WAKE)),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx))),
             None,
@@ -123694,6 +123904,7 @@ mod u3_blocked_waiter_completion_transaction {
                 WAITER,
                 eb,
                 Some(ThreadId(WAKE)),
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
             );
             assert_eq!(
                 observe(&a, ea),
@@ -123708,7 +123919,13 @@ mod u3_blocked_waiter_completion_transaction {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         let before = k.with(|s| s.runnable_count_on_cpu(CpuId(0)));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE))),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(0),
+                WAITER,
+                eidx,
+                Some(ThreadId(WAKE)),
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Ok(())
         );
         let (_, _, status, deadline, fired, q0, ..) = observe(&k, eidx);
@@ -123733,6 +123950,7 @@ mod u3_blocked_waiter_completion_transaction {
                     WAITER,
                     eidx,
                     Some(ThreadId(WAKE)),
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
                 )
                 .expect_err("refused");
             assert_eq!(err, KernelError::WouldBlock, "{bad:?}: same refusal");
@@ -123743,7 +123961,13 @@ mod u3_blocked_waiter_completion_transaction {
     fn u3_bw_missing_wake_task_is_task_missing() {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(4_242))),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(0),
+                WAITER,
+                eidx,
+                Some(ThreadId(4_242)),
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Err(KernelError::TaskMissing)
         );
     }
