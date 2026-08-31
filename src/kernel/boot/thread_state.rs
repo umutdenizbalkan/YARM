@@ -397,15 +397,63 @@ impl KernelState {
         tcbs: &mut [Option<crate::kernel::task::ThreadControlBlock>],
         waiter_tid: u64,
     ) {
+        Self::publish_blocked_recv_delivery_result_locked(
+            tcbs,
+            waiter_tid,
+            crate::kernel::task::RecvAbiVariant::RecvV2,
+            0,
+            0,
+        );
+    }
+
+    /// Stage 199G-B §A — **the ONE variant-driven blocked-receive DELIVERY writeback.**
+    ///
+    /// A blocked receiver that a sender satisfied is owed a success result, and the two receive
+    /// ABIs owe DIFFERENT success results. Which one is not a property of the delivering path —
+    /// it is a property of the receive the waiter issued — so it is passed in from the snapshot
+    /// that captured it, and no call site re-derives it by inspecting the message.
+    ///
+    /// * [`RecvAbiVariant::RecvV2`] — `ret0 = 0`. Every field the receiver needs travels in the
+    ///   40-byte meta struct the delivery already copied, so the register lanes are cleared to
+    ///   the canonical success shape. This is byte-identical to what
+    ///   `clear_blocked_recv_return_regs_locked` wrote before 199G-B, which is why that name
+    ///   survives as the recv-v2 spelling of this call.
+    /// * [`RecvAbiVariant::LegacyTimeout`] — the NR 5 / legacy shape, which writes **no
+    ///   metadata at all**: `ret0 = sender_tid`, `ret1 = payload_len`,
+    ///   `ret2 = SYSCALL_NO_TRANSFER_CAP`, error = 0. These are exactly the lanes the broad
+    ///   `handle_ipc_recv_result_with_empty_error` success arm installs for a legacy receive
+    ///   (`set_ok(sender, payload_len, …)` + `encode_transfer_cap_ret`), so a receiver cannot
+    ///   tell which route delivered its message.
+    ///
+    /// Non-x86 ports mirror `arg0` and clear `user_gprs[0]`; their resume boundaries reconstruct
+    /// the outgoing frame from the argument lanes, which is why `arg0` is written on every port
+    /// and the extra x86 lanes only there.
+    pub(crate) fn publish_blocked_recv_delivery_result_locked(
+        tcbs: &mut [Option<crate::kernel::task::ThreadControlBlock>],
+        waiter_tid: u64,
+        recv_abi: crate::kernel::task::RecvAbiVariant,
+        sender_tid: u64,
+        payload_len: usize,
+    ) {
+        let (ret0, ret1, ret2) = if recv_abi.writes_recv_v2_meta() {
+            (0usize, 0usize, 0usize)
+        } else {
+            (
+                sender_tid as usize,
+                payload_len,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+            )
+        };
         if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == waiter_tid) {
-            tcb.user_context.arg0 = 0;
-            tcb.user_context.user_gprs[0] = 0; // RAX / x0  = ret0  = 0 (success)
+            tcb.user_context.arg0 = ret0;
+            tcb.user_context.user_gprs[0] = ret0; // RAX / x0 = ret0
             #[cfg(target_arch = "x86_64")]
             {
                 tcb.user_context.user_gprs[2] = 0; // RCX = error = 0 (success)
-                tcb.user_context.user_gprs[3] = 0; // RDX = ret2  = 0
-                tcb.user_context.user_gprs[7] = 0; // R8  = ret1  = 0
+                tcb.user_context.user_gprs[3] = ret2; // RDX = ret2
+                tcb.user_context.user_gprs[7] = ret1; // R8  = ret1
             }
+            let _ = (ret1, ret2);
         }
     }
 
