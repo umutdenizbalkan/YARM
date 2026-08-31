@@ -146382,3 +146382,290 @@ mod stage199gc4_ipc_mutation_owners {
         assert!(queue_words(&split_k, split_e).is_empty());
     }
 }
+
+/// 199G-C4 §3 — THE plain blocked-waiter delivery policy, and its two gatherers.
+///
+/// The delivery decisions that need no lock — the receiver-visible projection, the payload
+/// length contract, the per-variant metadata contract, the meta encoding, the by-value payload
+/// capture and the choice of which user ranges must be proven writable — live in one plan
+/// owner. The broad producer and the off-lock producer differ only in how they gather the two
+/// facts that do need locks (the consumed blocked state and the waiter ASID) and in which seam
+/// they validate through. These tests hold that line from both ends.
+#[cfg(test)]
+mod stage199gc4_plain_delivery_policy {
+    use super::*;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{
+        blocked_waiter_plain_delivery_class_matches, plan_blocked_waiter_plain_delivery,
+    };
+    use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+    use crate::kernel::vm::Asid;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const USER_MEM_SRC: &str = include_str!("user_memory_state.rs");
+
+    fn v2_state(payload_len: usize) -> BlockedRecvState {
+        BlockedRecvState {
+            recv_cap: CapId(7),
+            payload_user_ptr: 0x4000,
+            payload_user_len: payload_len,
+            meta_user_ptr: 0x5000,
+            meta_user_len: 40,
+            recv_abi: RecvAbiVariant::RecvV2,
+        }
+    }
+
+    #[test]
+    fn the_class_predicate_admits_only_capability_free_messages() {
+        assert!(blocked_waiter_plain_delivery_class_matches(
+            &Message::new(3, b"plain").expect("msg")
+        ));
+        for flags in [
+            Message::FLAG_CAP_TRANSFER,
+            Message::FLAG_CAP_TRANSFER_PLAIN,
+            Message::FLAG_REPLY_CAP,
+        ] {
+            let carrying = Message::with_header(3, 0, flags, Some(11), b"x").expect("msg");
+            assert!(
+                !blocked_waiter_plain_delivery_class_matches(&carrying),
+                "a message carrying a cap under flags {flags:#x} is another class's"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_owner_names_exactly_the_ranges_the_snapshot_will_write() {
+        let msg = Message::new(3, b"hello").expect("msg");
+        let state = v2_state(64);
+        let plan = plan_blocked_waiter_plain_delivery(9, Asid(2), &state, 4, &msg).expect("plan");
+
+        // The payload range is the PROJECTED length, not the raw message length, and it is the
+        // same length the snapshot will copy.
+        assert_eq!(plan.writable.payload_ptr, state.payload_user_ptr);
+        assert_eq!(plan.writable.payload_len, plan.snapshot.payload_len);
+        assert_eq!(plan.snapshot.payload_user_ptr, state.payload_user_ptr);
+        // The meta range is the encoded meta length the drain writes, at the waiter's pointer.
+        assert_eq!(plan.writable.meta_ptr, state.meta_user_ptr);
+        assert_eq!(
+            plan.writable.meta_len,
+            crate::kernel::dispatch_post_work::DISPATCH_POST_WORK_META_LEN
+        );
+        assert_eq!(plan.snapshot.meta_user_ptr, state.meta_user_ptr);
+        // Identity is carried, never re-derived.
+        assert_eq!(plan.snapshot.waiter_tid, 9);
+        assert_eq!(plan.snapshot.waiter_asid, Asid(2));
+        assert_eq!(plan.snapshot.recv_abi, state.recv_abi);
+        assert_eq!(plan.snapshot.endpoint_idx, 4);
+        assert_eq!(plan.snapshot.sender_tid, 3);
+        assert_eq!(
+            plan.snapshot.wake_tid,
+            Some(crate::kernel::ipc::ThreadId(9))
+        );
+    }
+
+    #[test]
+    fn the_plan_owner_enforces_both_length_contracts() {
+        let msg = Message::new(3, b"0123456789").expect("msg");
+        // Payload buffer too small for the projected payload.
+        assert!(
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &v2_state(2), 4, &msg).is_err(),
+            "an undersized payload buffer is a real delivery error"
+        );
+
+        // recv-v2 waiter with an undersized metadata buffer.
+        let mut short_meta = v2_state(64);
+        short_meta.meta_user_len = 8;
+        assert!(
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &short_meta, 4, &msg).is_err(),
+            "a recv-v2 waiter must have room for the whole meta struct"
+        );
+
+        // A LegacyTimeout waiter carries no metadata buffer and must be delivered, not rejected.
+        let legacy = BlockedRecvState::legacy_timeout(CapId(7), 0x4000, 64);
+        let plan =
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &legacy, 4, &msg).expect("legacy plan");
+        assert_eq!(plan.snapshot.recv_abi, RecvAbiVariant::LegacyTimeout);
+        assert_eq!(plan.writable.meta_ptr, 0);
+
+        // ...but one that somehow carries a metadata buffer is refused: writing it would be a
+        // metadata write this variant promises never to perform.
+        let mut lying = legacy;
+        lying.meta_user_ptr = 0x5000;
+        assert!(
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &lying, 4, &msg).is_err(),
+            "a LegacyTimeout waiter must not name a metadata buffer"
+        );
+    }
+
+    #[test]
+    fn the_projection_is_applied_once_by_the_plan_owner() {
+        // The projected payload is what the snapshot carries, byte for byte.
+        let msg = Message::new(3, b"\x07\x00payload-bytes").expect("msg");
+        let projected = crate::kernel::syscall::ipc_recv_core::project_recv_delivery(&msg);
+        let plan =
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &v2_state(64), 4, &msg).expect("plan");
+        assert_eq!(plan.snapshot.payload_len, projected.app_payload.len());
+        assert_eq!(
+            &plan.snapshot.payload[..plan.snapshot.payload_len],
+            projected.app_payload
+        );
+    }
+
+    #[test]
+    fn both_producers_call_the_one_plan_owner_and_neither_re_decides() {
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn plan_blocked_waiter_plain_delivery(")
+                .count(),
+            1,
+            "one plan owner"
+        );
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn blocked_waiter_plain_delivery_class_matches(")
+                .count(),
+            1,
+            "one class predicate"
+        );
+
+        // The broad producer is now a gatherer: it calls both owners and re-decides nothing.
+        let broad_start = SYSCALL_SRC
+            .find("pub(crate) fn produce_blocked_waiter_plain_delivery(")
+            .expect("broad producer");
+        let broad_end = SYSCALL_SRC[broad_start..]
+            .find("\n}\n")
+            .expect("broad producer ends")
+            + broad_start;
+        let broad = &SYSCALL_SRC[broad_start..broad_end];
+        assert!(broad.contains("blocked_waiter_plain_delivery_class_matches(msg)"));
+        assert!(broad.contains("plan_blocked_waiter_plain_delivery("));
+        for redecided in [
+            "encode_recv_v2_meta(",
+            "project_recv_delivery(",
+            "writes_recv_v2_meta()",
+            "BlockedWaiterPlainDeliverySnapshot {",
+        ] {
+            assert!(
+                !broad.contains(redecided),
+                "the broad gatherer must not re-decide `{redecided}`"
+            );
+        }
+
+        // The off-lock producer is the same shape.
+        let split_start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_plain_delivery_split(")
+            .expect("split producer");
+        let split_end = RUNTIME_SRC[split_start..]
+            .find("\n    }\n")
+            .expect("split producer ends")
+            + split_start;
+        let split = &RUNTIME_SRC[split_start..split_end];
+        assert!(split.contains("blocked_waiter_plain_delivery_class_matches(msg)"));
+        assert!(split.contains("plan_blocked_waiter_plain_delivery("));
+        for redecided in [
+            "encode_recv_v2_meta(",
+            "project_recv_delivery(",
+            "writes_recv_v2_meta()",
+            "BlockedWaiterPlainDeliverySnapshot {",
+        ] {
+            assert!(
+                !split.contains(redecided),
+                "the off-lock gatherer must not re-decide `{redecided}`"
+            );
+        }
+        // And it never forms a broad borrow.
+        for forbidden in ["self.with(", "&mut KernelState"] {
+            assert!(
+                !split.contains(forbidden),
+                "the off-lock producer must not reach for the broad lock (saw `{forbidden}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_producer_validates_the_planned_ranges_through_the_shared_page_walk() {
+        // One page-walk owner, used by both the broad validator and its off-lock mirror.
+        assert_eq!(
+            USER_MEM_SRC
+                .matches("pub(crate) fn walk_user_range_by_page(")
+                .count(),
+            1,
+            "one writable-range walk"
+        );
+        for validator in [
+            "pub(crate) fn validate_user_range_writable_for_asid(",
+            "pub(crate) fn validate_user_range_writable_for_asid_split(",
+        ] {
+            let start = USER_MEM_SRC.find(validator).expect(validator);
+            let end = USER_MEM_SRC[start..].find("\n    }\n").expect("body ends") + start;
+            assert!(
+                USER_MEM_SRC[start..end].contains("walk_user_range_by_page("),
+                "`{validator}` must use the one walk, not its own"
+            );
+        }
+
+        // The split producer validates exactly the two ranges the plan named — no more, no
+        // fewer, and never a range it computed itself.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_plain_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert_eq!(
+            split
+                .matches("validate_user_range_writable_for_asid_split(")
+                .count(),
+            2,
+            "exactly the payload range and the meta range"
+        );
+        assert!(split.contains("plan.writable.payload_ptr"));
+        assert!(split.contains("plan.writable.payload_len"));
+        assert!(split.contains("plan.writable.meta_ptr"));
+        assert!(split.contains("plan.writable.meta_len"));
+    }
+
+    #[test]
+    fn the_split_producer_takes_its_locks_in_rank_order_and_holds_none_across_another() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_plain_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+
+        // Rank 1 (current CPU) → rank 2 (blocked state + ASID) → rank 5 (validation).
+        let cpu = split.find("current_cpu_split_read()").expect("rank 1");
+        let task = split.find("with_task_tcbs_split_mut(").expect("rank 2");
+        let vm = split
+            .find("validate_user_range_writable_for_asid_split(")
+            .expect("rank 5");
+        assert!(cpu < task && task < vm, "acquisitions must ascend in rank");
+
+        // Exactly one rank-2 acquisition: the take and the ASID read are one step, so no
+        // holder can observe a waiter whose state is taken but whose ASID is unread.
+        assert_eq!(split.matches("with_task_tcbs_split_mut(").count(), 1);
+
+        // No rank-3 or rank-4 acquisition belongs to this producer at all.
+        for forbidden in [
+            "with_ipc_split_mut",
+            "with_capability_state_split_mut",
+            "resolve_capability_for_task_split",
+        ] {
+            assert!(
+                !split.contains(forbidden),
+                "a plain delivery touches no IPC or capability state (saw `{forbidden}`)"
+            );
+        }
+
+        // The class question is asked before any acquisition, so a foreign class is refused
+        // having touched nothing.
+        let class = split
+            .find("blocked_waiter_plain_delivery_class_matches(msg)")
+            .expect("class predicate");
+        assert!(
+            class < cpu,
+            "the class question must precede every acquisition"
+        );
+    }
+}

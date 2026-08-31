@@ -8122,6 +8122,110 @@ impl SharedKernel {
         self.with_memory_split_mut(|m| KernelState::release_transfer_pin_locked(m, token))
     }
 
+    /// 199G-C4 §3 — the OFF-LOCK PLAIN blocked-waiter delivery producer: the split counterpart
+    /// of `produce_blocked_waiter_plain_delivery`, and the direct-delivery step NR1's pre-lock
+    /// route needs when a send finds a recv-v2 blocked receiver.
+    ///
+    /// Same three answers as the broad producer, meaning the same things:
+    /// * `Ok(true)` — the post-work is stashed; the caller must NOT clear the waiter slot or
+    ///   wake inline, because the trap-entry drain does both.
+    /// * `Ok(false)` — not this class, or no drainer will run. **Nothing was consumed**, so the
+    ///   caller may still route the message any other way.
+    /// * `Err(_)` — a real Phase-A error raised AFTER the blocked state was consumed, exactly
+    ///   as the broad producer (and the legacy in-lock helper) behave.
+    ///
+    /// Rank order, each acquisition taken and fully released before the next:
+    /// 1. rank 1 — read `current_cpu` to address the per-CPU drainer flag and stash;
+    /// 2. rank 2 — consume the waiter's blocked state and read its ASID, in ONE acquisition, so
+    ///    no other holder can observe a waiter whose state is taken but whose ASID is unread;
+    /// 3. no lock — the shared plan owner decides projection, both length contracts, the meta
+    ///    encoding, the payload capture and the ranges to validate;
+    /// 4. rank 5 — pre-validate exactly those ranges, through the same page walk the broad
+    ///    producer uses, so the deferred copy is infallible for the same reason;
+    /// 5. per-CPU — stash the snapshot the drain will execute.
+    ///
+    /// The class predicate is asked FIRST and touches nothing, so a message belonging to
+    /// another class leaves the waiter exactly as it was found.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn produce_blocked_waiter_plain_delivery_split(
+        &self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<bool, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::dispatch_post_work::DispatchPostWork;
+        use crate::kernel::syscall::{
+            SyscallError, blocked_waiter_plain_delivery_class_matches,
+            plan_blocked_waiter_plain_delivery,
+        };
+
+        // (0) The class question — THE one owner, asked before anything is touched.
+        if !blocked_waiter_plain_delivery_class_matches(msg) {
+            return Ok(false);
+        }
+        // (1) rank 1 — only produce when a trap-entry drainer will run, exactly as the broad
+        // producer decides. Without a drainer the snapshot would never be executed.
+        let cpu_idx = self.current_cpu_split_read().0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+            || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+
+        // (2) rank 2 — consume the blocked state and read the ASID. The broad producer takes
+        // two separate rank-2 acquisitions for these two facts; one acquisition here is the
+        // only difference, and it is strictly tighter — nothing can run between the take and
+        // the read. The dispositions are deliberately identical to the broad producer's: a
+        // missing TCB or missing blocked state is `InvalidArgs` having consumed nothing, and a
+        // missing ASID is `InvalidArgs` with the state already consumed (the broad producer's
+        // `take` likewise precedes its `task_asid`). Changing that would be a delivery-policy
+        // change, which is not this pass's.
+        let taken = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == waiter_tid)?;
+            let state = tcb.blocked_recv_state.take()?;
+            Some((state, tcb.asid))
+        });
+        let (blocked_state, waiter_asid) = taken.ok_or(SyscallError::InvalidArgs)?;
+        let waiter_asid = waiter_asid.ok_or(SyscallError::InvalidArgs)?;
+
+        // (3) no lock — the shared plan.
+        let plan = plan_blocked_waiter_plain_delivery(
+            waiter_tid,
+            waiter_asid,
+            &blocked_state,
+            endpoint_idx,
+            msg,
+        )?;
+
+        // (4) rank 5 — pre-validate the planned ranges (no copy, no fault-in).
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            plan.writable.payload_ptr,
+            plan.writable.payload_len,
+        )
+        .map_err(SyscallError::from)?;
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            plan.writable.meta_ptr,
+            plan.writable.meta_len,
+        )
+        .map_err(SyscallError::from)?;
+
+        // (5) per-CPU stash — the drain executes it after this route returns.
+        // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+        // identical discipline to the broad producer's store.
+        unsafe {
+            crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx]
+                .store(DispatchPostWork::BlockedWaiterPlainDelivery(plan.snapshot));
+        }
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_plain waiter_tid={}",
+            waiter_tid
+        );
+        Ok(true)
+    }
+
     /// 199G-C4 §3 — the OFF-LOCK endpoint-only enqueue: the split entry to THE enqueue policy
     /// the broad `ipc_try_send_queued_plain_endpoint_only` also calls.
     ///

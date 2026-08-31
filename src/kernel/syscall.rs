@@ -652,69 +652,63 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     Ok(())
 }
 
-/// Stage 188B — Phase A producer for a PLAIN (no-cap, no-reply-cap) blocked
-/// recv-v2 waiter delivery, wired into the Stage 188A dispatch-return channel.
+/// 199G-C4 §3 — the user ranges a deferred blocked-waiter delivery must be proven able to
+/// write before its snapshot may be stashed.
 ///
-/// Instead of copying the payload+meta into the waiter's user buffers under the
-/// broad `&mut KernelState` borrow (as `complete_blocked_recv_for_waiter` does),
-/// this consumes the waiter's blocked state, resolves + **pre-validates** its
-/// user buffers (a read-only page-table walk — no copy), pre-encodes the recv-v2
-/// meta, and stashes a `DispatchPostWork::BlockedWaiterPlainDelivery` snapshot.
-/// The trap-entry drain then performs the user copy through the Stage 186E seam
-/// and clears the waiter slot + wakes it — all AFTER the broad borrow is dropped
-/// (`SharedKernel::execute_dispatch_post_work`).
+/// The plan owner decides them, so the broad gatherer and the off-lock gatherer pre-validate
+/// the SAME two ranges instead of each choosing its own. Pre-validation is what makes the
+/// deferred copy infallible; two callers disagreeing about what to validate would make one of
+/// them wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeliveryWritableRanges {
+    pub(crate) payload_ptr: usize,
+    pub(crate) payload_len: usize,
+    pub(crate) meta_ptr: usize,
+    pub(crate) meta_len: usize,
+}
+
+/// 199G-C4 §3 — a planned PLAIN blocked-waiter delivery: the snapshot to stash, and the ranges
+/// that must be proven writable first.
+pub(crate) struct PlainDeliveryPlan {
+    pub(crate) snapshot: crate::kernel::dispatch_post_work::BlockedWaiterPlainDeliverySnapshot,
+    pub(crate) writable: DeliveryWritableRanges,
+}
+
+/// 199G-C4 §3 — THE plain blocked-waiter delivery CLASS predicate.
 ///
-/// Returns:
-/// - `Ok(true)`  — produced post-work; the caller must NOT clear the waiter slot
-///   or wake inline (the executor does both in Phase C). External behaviour is
-///   byte-identical to the legacy `complete_blocked_recv_for_waiter` + slot-clear
-///   + wake sequence for a plain message.
-/// - `Ok(false)` — NOT eligible (message carries a cap / reply-cap, or no
-///   trap-entry drainer is active); the caller MUST use the legacy path.
-/// - `Err(e)`    — a real Phase-A error (undersized buffer, unmapped/non-writable
-///   waiter buffer) the legacy path would also raise; caller maps it exactly as
-///   it maps a legacy delivery error.
+/// A message belongs to the plain class exactly when it carries no capability of any kind: no
+/// transfer flag, no plain-transfer flag, no reply-cap flag, and no transferred cap. Anything
+/// else is some other class's message and this delivery must decline it untouched.
+#[must_use]
+pub(crate) fn blocked_waiter_plain_delivery_class_matches(msg: &Message) -> bool {
+    (msg.flags
+        & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN | Message::FLAG_REPLY_CAP))
+        == 0
+        && msg.transferred_cap().is_none()
+}
+
+/// 199G-C4 §3 — THE plain blocked-waiter delivery PLAN: everything the delivery decides that
+/// needs no lock at all.
 ///
-/// Pre-validation makes the deferred copy infallible on the supported single-CPU
-/// user-scheduling config: nothing runs between here (inside `with_cpu`) and the
-/// drain (right after `with_cpu` returns) to change the waiter's mapping.
-pub(crate) fn produce_blocked_waiter_plain_delivery(
-    kernel: &mut KernelState,
+/// Pure, and therefore shared verbatim by the broad producer and its off-lock counterpart: the
+/// receiver-visible projection, the payload-length contract, the per-variant metadata contract,
+/// the recv-v2 meta encoding, the by-value payload capture and the resulting snapshot are one
+/// implementation. The caller supplies the two facts that DO need locks — the waiter's consumed
+/// blocked state and its ASID — and is left with only the ranges to validate and the stash.
+///
+/// The blocked state is passed by reference and already consumed by the caller: an error here
+/// is a real delivery error raised after consumption, exactly as the legacy in-lock helper
+/// behaves (it too consumes, then faults).
+pub(crate) fn plan_blocked_waiter_plain_delivery(
     waiter_tid: u64,
+    waiter_asid: crate::kernel::vm::Asid,
+    blocked_state: &crate::kernel::task::BlockedRecvState,
     endpoint_idx: usize,
     msg: &Message,
-) -> Result<bool, SyscallError> {
+) -> Result<PlainDeliveryPlan, SyscallError> {
     use crate::kernel::dispatch_post_work::{
-        BlockedWaiterPlainDeliverySnapshot, DISPATCH_POST_WORK_META_LEN, DispatchPostWork,
+        BlockedWaiterPlainDeliverySnapshot, DISPATCH_POST_WORK_META_LEN,
     };
-    // Plain only: any cap / reply-cap message stays on the legacy path.
-    let plain = (msg.flags
-        & (Message::FLAG_CAP_TRANSFER
-            | Message::FLAG_CAP_TRANSFER_PLAIN
-            | Message::FLAG_REPLY_CAP))
-        == 0
-        && msg.transferred_cap().is_none();
-    if !plain {
-        return Ok(false);
-    }
-    // Only produce when a trap-entry drainer will run (mirrors the Stage 117
-    // stash discipline). Direct/kernel-internal callers (no drainer) fall back.
-    let cpu_idx = kernel.current_cpu().0 as usize;
-    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
-        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .load(core::sync::atomic::Ordering::Relaxed)
-    {
-        return Ok(false);
-    }
-
-    // Phase A — consume blocked state (byte-identical to the legacy top-of-helper).
-    let blocked_state = kernel
-        .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
-        .flatten()
-        .ok_or(SyscallError::InvalidArgs)?;
-    let waiter_asid = kernel
-        .task_asid(waiter_tid)
-        .ok_or(SyscallError::InvalidArgs)?;
 
     // Canonical receiver-visible projection (single rule, shared with every other
     // delivery path including the off-lock direct NR6 transaction).
@@ -750,6 +744,102 @@ pub(crate) fn produce_blocked_waiter_plain_delivery(
         msg.sender_tid.0,
     );
 
+    let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
+    payload_buf[..app_payload.len()].copy_from_slice(app_payload);
+
+    Ok(PlainDeliveryPlan {
+        snapshot: BlockedWaiterPlainDeliverySnapshot {
+            // Stage 199G-B §1 — carried from the waiter's own saved state, never re-derived.
+            recv_abi: blocked_state.recv_abi,
+            waiter_tid,
+            waiter_asid,
+            payload_user_ptr: blocked_state.payload_user_ptr,
+            payload_len: app_payload.len(),
+            payload: payload_buf,
+            meta_user_ptr: blocked_state.meta_user_ptr,
+            meta,
+            sender_tid: msg.sender_tid.0,
+            endpoint_idx,
+            wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
+        },
+        writable: DeliveryWritableRanges {
+            payload_ptr: blocked_state.payload_user_ptr,
+            payload_len: app_payload.len(),
+            meta_ptr: blocked_state.meta_user_ptr,
+            meta_len: DISPATCH_POST_WORK_META_LEN,
+        },
+    })
+}
+
+/// Stage 188B — Phase A producer for a PLAIN (no-cap, no-reply-cap) blocked
+/// recv-v2 waiter delivery, wired into the Stage 188A dispatch-return channel.
+///
+/// Instead of copying the payload+meta into the waiter's user buffers under the
+/// broad `&mut KernelState` borrow (as `complete_blocked_recv_for_waiter` does),
+/// this consumes the waiter's blocked state, resolves + **pre-validates** its
+/// user buffers (a read-only page-table walk — no copy), pre-encodes the recv-v2
+/// meta, and stashes a `DispatchPostWork::BlockedWaiterPlainDelivery` snapshot.
+/// The trap-entry drain then performs the user copy through the Stage 186E seam
+/// and clears the waiter slot + wakes it — all AFTER the broad borrow is dropped
+/// (`SharedKernel::execute_dispatch_post_work`).
+///
+/// Returns:
+/// - `Ok(true)`  — produced post-work; the caller must NOT clear the waiter slot
+///   or wake inline (the executor does both in Phase C). External behaviour is
+///   byte-identical to the legacy `complete_blocked_recv_for_waiter` + slot-clear
+///   + wake sequence for a plain message.
+/// - `Ok(false)` — NOT eligible (message carries a cap / reply-cap, or no
+///   trap-entry drainer is active); the caller MUST use the legacy path.
+/// - `Err(e)`    — a real Phase-A error (undersized buffer, unmapped/non-writable
+///   waiter buffer) the legacy path would also raise; caller maps it exactly as
+///   it maps a legacy delivery error.
+///
+/// Pre-validation makes the deferred copy infallible on the supported single-CPU
+/// user-scheduling config: nothing runs between here (inside `with_cpu`) and the
+/// drain (right after `with_cpu` returns) to change the waiter's mapping.
+pub(crate) fn produce_blocked_waiter_plain_delivery(
+    kernel: &mut KernelState,
+    waiter_tid: u64,
+    endpoint_idx: usize,
+    msg: &Message,
+) -> Result<bool, SyscallError> {
+    use crate::kernel::dispatch_post_work::DispatchPostWork;
+    // Plain only: any cap / reply-cap message stays on the legacy path. 199G-C4 §3 — the class
+    // question has one owner, asked identically by the off-lock gatherer.
+    if !blocked_waiter_plain_delivery_class_matches(msg) {
+        return Ok(false);
+    }
+    // Only produce when a trap-entry drainer will run (mirrors the Stage 117
+    // stash discipline). Direct/kernel-internal callers (no drainer) fall back.
+    let cpu_idx = kernel.current_cpu().0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return Ok(false);
+    }
+
+    // Phase A — consume blocked state (byte-identical to the legacy top-of-helper).
+    let blocked_state = kernel
+        .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
+        .flatten()
+        .ok_or(SyscallError::InvalidArgs)?;
+    let waiter_asid = kernel
+        .task_asid(waiter_tid)
+        .ok_or(SyscallError::InvalidArgs)?;
+
+    // 199G-C4 §3 — the projection, both length contracts, the meta encoding and the by-value
+    // payload capture belong to the plan owner, which the off-lock gatherer calls with the same
+    // arguments. The plan also names the ranges to pre-validate, so the two gatherers cannot
+    // come to validate different memory.
+    let plan = plan_blocked_waiter_plain_delivery(
+        waiter_tid,
+        waiter_asid,
+        &blocked_state,
+        endpoint_idx,
+        msg,
+    )?;
+
     // Pre-validate BOTH user buffers writable (no copy) so the deferred copy is
     // infallible. A validation failure is the same real error the legacy copy
     // would raise, returned synchronously here (blocked state already consumed —
@@ -757,35 +847,19 @@ pub(crate) fn produce_blocked_waiter_plain_delivery(
     kernel
         .validate_user_range_writable_for_asid(
             waiter_asid,
-            blocked_state.payload_user_ptr,
-            app_payload.len(),
+            plan.writable.payload_ptr,
+            plan.writable.payload_len,
         )
         .map_err(SyscallError::from)?;
     kernel
         .validate_user_range_writable_for_asid(
             waiter_asid,
-            blocked_state.meta_user_ptr,
-            DISPATCH_POST_WORK_META_LEN,
+            plan.writable.meta_ptr,
+            plan.writable.meta_len,
         )
         .map_err(SyscallError::from)?;
 
-    let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
-    payload_buf[..app_payload.len()].copy_from_slice(app_payload);
-
-    let snapshot = BlockedWaiterPlainDeliverySnapshot {
-        // Stage 199G-B §1 — carried from the waiter's own saved state, never re-derived.
-        recv_abi: blocked_state.recv_abi,
-        waiter_tid,
-        waiter_asid,
-        payload_user_ptr: blocked_state.payload_user_ptr,
-        payload_len: app_payload.len(),
-        payload: payload_buf,
-        meta_user_ptr: blocked_state.meta_user_ptr,
-        meta,
-        sender_tid: msg.sender_tid.0,
-        endpoint_idx,
-        wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
-    };
+    let snapshot = plan.snapshot;
     // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
     // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` store.
     unsafe {
