@@ -145742,3 +145742,171 @@ mod stage199gc2_synchronous_is_production_unreachable {
         );
     }
 }
+
+/// 199D-KR §1 — the restart-control KERNEL-cap IPC path is PRODUCTION-UNREACHABLE.
+///
+/// `ipc_send_routed` reaches `handle_restart_control_kernel_ipc` only for a capability whose
+/// object is `CapObject::Kernel` AND which carries `CapRights::SEND`. This guard recomputes, from
+/// source, that no production build can mint, delegate or hold such a capability — so the branch
+/// cannot execute, and the typed kernel reply authority it would need has no production request to
+/// represent.
+///
+/// It fails the moment a production Kernel-capability minter appears, which is exactly when that
+/// conclusion would stop being true.
+mod stage199dkr_kernel_control_cap_is_production_unreachable {
+    const CAPS: &str = include_str!("../capabilities.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const INIT_CORE: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/core/mod.rs"
+    );
+
+    /// Text of a file with its `#[cfg(test)] mod tests { .. }` tail removed, so "production
+    /// source" means what a non-test build actually compiles.
+    fn production_prefix(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// (1) The branch's precondition is a Kernel object WITH the SEND right — stated here so the
+    /// guard is pinned to the real gate rather than to the object class alone.
+    #[test]
+    fn the_branch_requires_a_kernel_object_with_send() {
+        let routed = IPC_STATE
+            .split("fn ipc_send_routed")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("ipc_send_routed");
+        let send_gate = routed
+            .find("if !capability.has_right(CapRights::SEND)")
+            .expect("the SEND gate");
+        let kernel_branch = routed
+            .find("if capability.object == CapObject::Kernel")
+            .expect("the Kernel branch");
+        assert!(
+            send_gate < kernel_branch,
+            "the SEND right is required before the Kernel branch is reachable"
+        );
+    }
+
+    /// (2) `src/kernel/capabilities.rs` mints Kernel capabilities only inside its test module.
+    #[test]
+    fn the_capability_module_mints_kernel_caps_only_in_tests() {
+        let production = production_prefix(CAPS);
+        assert_eq!(
+            production.matches("CapObject::Kernel").count(),
+            0,
+            "no production code in capabilities.rs may name the Kernel object"
+        );
+        assert!(
+            CAPS.matches("CapObject::Kernel").count() > 0,
+            "the test corpus still exercises Kernel capabilities"
+        );
+    }
+
+    /// (3) THE GUARD. The only `CapRights::SEND` Kernel mint in the tree — the delegation that
+    /// would give the process manager restart-control authority — is `#[cfg(test)]`, and so is its
+    /// only caller. A production build therefore delegates no such capability.
+    #[test]
+    fn the_only_kernel_send_delegation_is_test_gated() {
+        let at = INIT_CORE
+            .find("fn delegate_process_manager_restart_control_cap")
+            .expect("the delegation");
+        let before = &INIT_CORE[at.saturating_sub(120)..at];
+        assert!(
+            before.contains("#[cfg(test)]"),
+            "the Kernel-SEND delegation must be test-gated"
+        );
+        // Exactly one definition and exactly one call site.
+        assert_eq!(
+            INIT_CORE
+                .matches("delegate_process_manager_restart_control_cap")
+                .count(),
+            2,
+            "one definition, one caller"
+        );
+        // And that caller is itself test-gated.
+        let call = INIT_CORE
+            .rfind("Self::delegate_process_manager_restart_control_cap")
+            .expect("the call site");
+        let enclosing = INIT_CORE[..call]
+            .rfind("    pub fn ")
+            .expect("the enclosing function");
+        let head = &INIT_CORE[enclosing.saturating_sub(60)..enclosing];
+        assert!(
+            head.contains("#[cfg(test)]"),
+            "the caller of the Kernel-SEND delegation must itself be test-gated"
+        );
+    }
+
+    /// (4) No OTHER production source anywhere mints a Kernel capability.
+    #[test]
+    fn no_production_source_mints_a_kernel_capability() {
+        for (name, src) in [
+            ("kernel/capabilities.rs", CAPS),
+            ("kernel/boot/ipc_state.rs", IPC_STATE),
+            (
+                "kernel/boot/thread_state.rs",
+                include_str!("thread_state.rs"),
+            ),
+            ("kernel/boot/exec_state.rs", include_str!("exec_state.rs")),
+            (
+                "kernel/boot/bootstrap_state.rs",
+                include_str!("bootstrap_state.rs"),
+            ),
+            (
+                "kernel/boot/orchestrator_state.rs",
+                include_str!("orchestrator_state.rs"),
+            ),
+            (
+                "kernel/boot/capability_state.rs",
+                include_str!("capability_state.rs"),
+            ),
+            (
+                "kernel/syscall/process.rs",
+                include_str!("../syscall/process.rs"),
+            ),
+            ("kernel/syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+        ] {
+            let production = production_prefix(src);
+            assert!(
+                !production.contains("Capability::new(CapObject::Kernel"),
+                "{name}: production source must not mint a Kernel capability"
+            );
+        }
+        // The init crate's only such mint is the test-gated delegation asserted above.
+        assert_eq!(
+            INIT_CORE
+                .matches("Capability::new(\n            CapObject::Kernel,")
+                .count()
+                + INIT_CORE
+                    .matches("Capability::new(CapObject::Kernel")
+                    .count(),
+            1,
+            "the init crate holds exactly one Kernel mint, and it is the test-gated delegation"
+        );
+    }
+
+    /// (5) Every remaining production mention of the Kernel object is a REJECT or DENY arm — a
+    /// fork-inheritance denial and an endpoint-resolution rejection — never a construction.
+    #[test]
+    fn remaining_production_mentions_are_refusals() {
+        let thread_state = include_str!("thread_state.rs");
+        assert!(
+            production_prefix(thread_state).contains("CapObject::Kernel"),
+            "fork inheritance still names the class"
+        );
+        // In the fork policy it sits in the `=> false` (do not inherit) group.
+        let policy = thread_state
+            .split("fn fork_should_inherit_capability")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("the fork policy");
+        let kernel_at = policy.find("CapObject::Kernel").expect("the arm");
+        assert!(
+            policy[kernel_at..].contains("=> false"),
+            "a Kernel capability is never inherited across fork"
+        );
+    }
+}
