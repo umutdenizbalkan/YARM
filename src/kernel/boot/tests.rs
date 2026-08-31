@@ -146683,7 +146683,7 @@ mod stage199gc4_ordinary_cap_delivery_policy {
     use crate::kernel::ipc::Message;
     use crate::kernel::syscall::{
         OPCODE_SHARED_MEM, blocked_waiter_ordinary_cap_delivery_class_matches,
-        check_blocked_recv_meta_contract, plan_blocked_waiter_ordinary_cap_prelude,
+        check_blocked_recv_meta_contract, plan_blocked_waiter_delivery_prelude,
     };
     use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
 
@@ -146740,7 +146740,7 @@ mod stage199gc4_ordinary_cap_delivery_policy {
         let msg = Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER, Some(11), b"\x09\x00body")
             .expect("msg");
         let state = v2_state(64);
-        let prelude = plan_blocked_waiter_ordinary_cap_prelude(&state, &msg).expect("prelude");
+        let prelude = plan_blocked_waiter_delivery_prelude(&state, &msg).expect("prelude");
         let projected = crate::kernel::syscall::ipc_recv_core::project_recv_delivery(&msg);
 
         assert_eq!(prelude.app_opcode, projected.app_opcode);
@@ -146763,7 +146763,7 @@ mod stage199gc4_ordinary_cap_delivery_policy {
 
         // The payload-length contract is the prelude's, and it refuses before anything is
         // consumed.
-        assert!(plan_blocked_waiter_ordinary_cap_prelude(&v2_state(1), &msg).is_err());
+        assert!(plan_blocked_waiter_delivery_prelude(&v2_state(1), &msg).is_err());
     }
 
     #[test]
@@ -146827,7 +146827,7 @@ mod stage199gc4_ordinary_cap_delivery_policy {
 
             // Shared owners, not re-decided policy.
             assert!(body.contains("blocked_waiter_ordinary_cap_delivery_class_matches(msg)"));
-            assert!(body.contains("plan_blocked_waiter_ordinary_cap_prelude("));
+            assert!(body.contains("plan_blocked_waiter_delivery_prelude("));
             assert!(body.contains("check_blocked_recv_meta_contract("));
             assert!(body.contains("plan_blocked_waiter_ordinary_cap_snapshot("));
             for redecided in [
@@ -146913,5 +146913,245 @@ mod stage199gc4_ordinary_cap_delivery_policy {
             .find("blocked_waiter_ordinary_cap_delivery_class_matches(msg)")
             .expect("class predicate");
         assert!(class < cpu);
+    }
+}
+
+/// 199G-C4 §3 — THE reply-cap blocked-waiter delivery policy, and its two gatherers.
+///
+/// The reply class is the ordinary-cap class plus two obligations of its own: the transferred
+/// object must still be a live `Reply`, and the receiver's cspace must be provisioned by the
+/// producer, because the executor's mint does not provision and would fail on a growable one.
+/// These tests hold the sharing, the two obligations, and the validate/consume ordering.
+#[cfg(test)]
+mod stage199gc4_reply_cap_delivery_policy {
+    use super::*;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::blocked_waiter_reply_cap_delivery_class_matches;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const CAP_LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+
+    #[test]
+    fn the_class_predicate_admits_only_flagged_reply_cap_transfers() {
+        let reply =
+            Message::with_header(3, 0, Message::FLAG_REPLY_CAP, Some(11), b"x").expect("msg");
+        assert!(blocked_waiter_reply_cap_delivery_class_matches(&reply));
+
+        // An ordinary transfer, a plain-transfer, and a capability-free message are all other
+        // classes' — the reply flag alone decides, and only with a handle present.
+        for other in [
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER, Some(11), b"x").expect("msg"),
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER_PLAIN, Some(11), b"x")
+                .expect("msg"),
+            Message::new(3, b"x").expect("msg"),
+        ] {
+            assert!(!blocked_waiter_reply_cap_delivery_class_matches(&other));
+        }
+    }
+
+    #[test]
+    fn one_prelude_serves_every_delivery_class() {
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn plan_blocked_waiter_delivery_prelude(")
+                .count(),
+            1,
+            "one pre-consume plan owner"
+        );
+        // All three class plans/producers go through it rather than projecting for themselves.
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("plan_blocked_waiter_delivery_prelude(")
+                .count(),
+            4,
+            "the owner plus its three broad callers (plain plan, ordinary-cap, reply-cap)"
+        );
+        // Across the whole module the projection is applied in exactly two places: the shared
+        // prelude, and the legacy in-lock `complete_blocked_recv_for_waiter` that still serves
+        // the classes no producer claims. No producer projects for itself.
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("let delivery = self::ipc_recv_core::project_recv_delivery(msg);")
+                .count(),
+            2,
+            "the prelude and the legacy in-lock helper, and nothing else"
+        );
+        for producer in [
+            "pub(crate) fn produce_blocked_waiter_plain_delivery(",
+            "pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(",
+            "pub(crate) fn produce_blocked_waiter_reply_cap_delivery(",
+        ] {
+            let start = SYSCALL_SRC.find(producer).expect(producer);
+            let end = SYSCALL_SRC[start..].find("\n}\n").expect("ends") + start;
+            assert!(
+                !SYSCALL_SRC[start..end].contains("project_recv_delivery("),
+                "`{producer}` must take its projection from the prelude"
+            );
+        }
+    }
+
+    #[test]
+    fn both_reply_cap_producers_share_the_owners_and_keep_the_validation_order() {
+        for (src, name, needle) in [
+            (
+                SYSCALL_SRC,
+                "broad",
+                "pub(crate) fn produce_blocked_waiter_reply_cap_delivery(",
+            ),
+            (
+                RUNTIME_SRC,
+                "split",
+                "pub(crate) fn produce_blocked_waiter_reply_cap_delivery_split(",
+            ),
+        ] {
+            let start = src
+                .find(needle)
+                .unwrap_or_else(|| panic!("{name} producer"));
+            let terminator = if name == "broad" {
+                "\n}\n"
+            } else {
+                "\n    }\n"
+            };
+            let end = src[start..]
+                .find(terminator)
+                .unwrap_or_else(|| panic!("{name} producer ends"))
+                + start;
+            let body = &src[start..end];
+
+            assert!(body.contains("blocked_waiter_reply_cap_delivery_class_matches(msg)"));
+            assert!(body.contains("plan_blocked_waiter_delivery_prelude("));
+            assert!(body.contains("plan_blocked_waiter_reply_cap_snapshot("));
+            for redecided in [
+                "project_recv_delivery(",
+                "BlockedWaiterReplyCapDeliverySnapshot {",
+                "writes_recv_v2_meta()",
+            ] {
+                assert!(
+                    !body.contains(redecided),
+                    "the {name} gatherer must not re-decide `{redecided}`"
+                );
+            }
+
+            // Payload validated, then the envelope consumed, then meta validated.
+            let payload = body
+                .find("payload_writable.0")
+                .unwrap_or_else(|| panic!("{name}: payload validation"));
+            let meta = body
+                .find("meta_writable.0")
+                .unwrap_or_else(|| panic!("{name}: meta validation"));
+            let consume = if name == "broad" {
+                body.find("phase_a_take_reply_envelope(")
+                    .expect("broad consume")
+            } else {
+                body.find("take_transfer_envelope_facts_split(")
+                    .expect("split consume")
+            };
+            assert!(
+                payload < consume,
+                "{name}: a payload fault must leave the envelope unconsumed"
+            );
+            assert!(
+                consume < meta,
+                "{name}: the meta range is validated after the single consume"
+            );
+
+            // The cspace is provisioned before the snapshot is published, in both.
+            let provision = if name == "broad" {
+                body.find("ensure_cnode_space(")
+                    .expect("broad provisioning")
+            } else {
+                body.find("ensure_cnode_space_split(")
+                    .expect("split provisioning")
+            };
+            assert!(
+                provision < body.find("DISPATCH_POST_WORK_STASH").unwrap_or(body.len()),
+                "{name}: provisioning must precede publication"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cnode_provisioning_policy_has_one_implementation() {
+        assert_eq!(
+            CAP_LIFECYCLE_SRC
+                .matches("pub(crate) fn ensure_cnode_space_locked(")
+                .count(),
+            1,
+            "one provisioning owner"
+        );
+        // The broad entry keeps its acquisition and delegates the policy.
+        let start = CAP_LIFECYCLE_SRC
+            .find("pub(crate) fn ensure_cnode_space_with_slots(")
+            .expect("broad entry");
+        let end = CAP_LIFECYCLE_SRC[start..]
+            .find("\n    }\n")
+            .expect("body ends")
+            + start;
+        let broad = &CAP_LIFECYCLE_SRC[start..end];
+        assert!(broad.contains("self.with_capability_state_mut(|capability| {"));
+        assert!(broad.contains("Self::ensure_cnode_space_locked("));
+        assert!(
+            !broad.contains("CapabilitySpace::try_with_slots("),
+            "the broad wrapper must not re-implement the allocation"
+        );
+
+        // The split entry: one bounded rank-4 acquisition, same owner, and nothing else taken.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn ensure_cnode_space_split(")
+            .expect("split entry");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert_eq!(split.matches("with_capability_state_split_mut").count(), 1);
+        assert!(split.contains("KernelState::ensure_cnode_space_locked("));
+        for forbidden in [
+            "with_ipc_split_mut",
+            "with_task_tcbs_split_mut",
+            "self.with(",
+        ] {
+            assert!(
+                !split.contains(forbidden),
+                "the split provisioning entry takes rank 4 and nothing else (saw `{forbidden}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_reply_cap_producer_mints_nothing_and_requires_a_live_reply_object() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_reply_cap_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+
+        // A producer never mints, and never touches the reply record.
+        for minting in [
+            "sr_mint_split(",
+            "materialize_reply_cap_split(",
+            "reserve_existing_reply_record_split(",
+            "consume_reply_record_split(",
+        ] {
+            assert!(
+                !body.contains(minting),
+                "a producer must not mint or bind the reply record (saw `{minting}`)"
+            );
+        }
+
+        // The transferred object must be a Reply whose generation is still live.
+        assert!(body.contains("CapObject::Reply { index, generation }"));
+        assert!(body.contains("reply_object_live_split(reply_index, reply_generation)"));
+        // A pinned envelope belongs to the shared-region class.
+        assert!(body.contains("facts.pinned_object.is_some()"));
+        // Exactly one blocked-state acquisition and one envelope consume.
+        assert_eq!(body.matches("with_task_tcbs_split_mut(").count(), 1);
+        assert_eq!(
+            body.matches("take_transfer_envelope_facts_split(").count(),
+            1
+        );
+        // The class question precedes every acquisition.
+        let class = body
+            .find("blocked_waiter_reply_cap_delivery_class_matches(msg)")
+            .expect("class predicate");
+        assert!(class < body.find("current_cpu_split_read()").expect("rank 1"));
     }
 }

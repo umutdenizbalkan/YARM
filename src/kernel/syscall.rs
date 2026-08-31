@@ -719,35 +719,28 @@ pub(crate) fn plan_blocked_waiter_plain_delivery(
     endpoint_idx: usize,
     msg: &Message,
 ) -> Result<PlainDeliveryPlan, SyscallError> {
-    use crate::kernel::dispatch_post_work::{
-        BlockedWaiterPlainDeliverySnapshot, DISPATCH_POST_WORK_META_LEN,
-    };
+    use crate::kernel::dispatch_post_work::BlockedWaiterPlainDeliverySnapshot;
 
-    // Canonical receiver-visible projection (single rule, shared with every other
-    // delivery path including the off-lock direct NR6 transaction).
-    let delivery = self::ipc_recv_core::project_recv_delivery(msg);
-    let (app_opcode, app_payload) = (delivery.app_opcode, delivery.app_payload);
-    if blocked_state.payload_user_len < app_payload.len() {
-        return Err(SyscallError::InvalidArgs);
-    }
+    // The projection, the payload-length contract, the by-value payload capture and both ranges
+    // come from the prelude every delivery class shares.
+    let prelude = plan_blocked_waiter_delivery_prelude(blocked_state, msg)?;
     // Stage 199G-B §1, one owner since 199G-C4 §3.
     check_blocked_recv_meta_contract(blocked_state)?;
 
     // Plain path: no transferred cap materialized (cap_id = NO_TRANSFER_CAP,
     // recv_meta_flags = 0), byte-identical to the plain branch of the legacy
-    // helper's meta encoding (status=0, msg-flags word=0).
+    // helper's meta encoding (status=0, msg-flags word=0). This is the one thing a plain
+    // delivery can settle up front that a cap-carrying one cannot: with no capability to mint,
+    // the whole metadata struct is already known here.
     let meta = self::ipc_recv_core::encode_recv_v2_meta(
         0,
-        app_opcode,
+        prelude.app_opcode,
         0,
-        app_payload.len() as u32,
+        prelude.payload_len as u32,
         SYSCALL_NO_TRANSFER_CAP,
         0,
         msg.sender_tid.0,
     );
-
-    let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
-    payload_buf[..app_payload.len()].copy_from_slice(app_payload);
 
     Ok(PlainDeliveryPlan {
         snapshot: BlockedWaiterPlainDeliverySnapshot {
@@ -756,8 +749,8 @@ pub(crate) fn plan_blocked_waiter_plain_delivery(
             waiter_tid,
             waiter_asid,
             payload_user_ptr: blocked_state.payload_user_ptr,
-            payload_len: app_payload.len(),
-            payload: payload_buf,
+            payload_len: prelude.payload_len,
+            payload: prelude.payload,
             meta_user_ptr: blocked_state.meta_user_ptr,
             meta,
             sender_tid: msg.sender_tid.0,
@@ -765,10 +758,10 @@ pub(crate) fn plan_blocked_waiter_plain_delivery(
             wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
         },
         writable: DeliveryWritableRanges {
-            payload_ptr: blocked_state.payload_user_ptr,
-            payload_len: app_payload.len(),
-            meta_ptr: blocked_state.meta_user_ptr,
-            meta_len: DISPATCH_POST_WORK_META_LEN,
+            payload_ptr: prelude.payload_writable.0,
+            payload_len: prelude.payload_writable.1,
+            meta_ptr: prelude.meta_writable.0,
+            meta_len: prelude.meta_writable.1,
         },
     })
 }
@@ -888,15 +881,16 @@ pub(crate) fn blocked_waiter_ordinary_cap_delivery_class_matches(msg: &Message) 
     is_transfer && !is_reply && msg.transferred_cap().is_some() && msg.opcode != OPCODE_SHARED_MEM
 }
 
-/// 199G-C4 §3 — the ordinary cap-transfer delivery's PRE-CONSUME plan: everything that must be
-/// decided, and the range that must be validated, BEFORE the transfer envelope is consumed.
+/// 199G-C4 §3 — the PRE-CONSUME plan shared by every blocked-waiter delivery class: everything
+/// decidable, and the ranges that must be validated, before any capability state is touched.
 ///
-/// The split is not cosmetic. The broad producer validates the PAYLOAD buffer before consuming
-/// the envelope, so a payload fault leaves the envelope intact — byte-identical to the legacy
-/// path, whose payload copy precedes materialization — and validates the META buffer after.
-/// Modelling that as one flat plan would let a gatherer validate both at once and silently lose
-/// the envelope on a meta fault, so the ordering is carried in the types.
-pub(crate) struct OrdinaryCapDeliveryPrelude {
+/// Keeping the two ranges separate is not cosmetic. A cap-carrying producer validates the
+/// PAYLOAD buffer before consuming the transfer envelope, so a payload fault leaves the envelope
+/// intact — byte-identical to the legacy path, whose payload copy precedes materialization — and
+/// validates the META buffer after. Handing a gatherer one flat "validate this" would let it
+/// validate both at once and silently lose the envelope on a meta fault, so the ordering is
+/// carried in the types.
+pub(crate) struct BlockedWaiterDeliveryPrelude {
     pub(crate) app_opcode: u16,
     pub(crate) payload: [u8; Message::MAX_PAYLOAD],
     pub(crate) payload_len: usize,
@@ -906,16 +900,16 @@ pub(crate) struct OrdinaryCapDeliveryPrelude {
     pub(crate) meta_writable: (usize, usize),
 }
 
-/// 199G-C4 §3 — THE ordinary cap-transfer pre-consume plan (pure).
+/// 199G-C4 §3 — THE pre-consume delivery plan (pure), for every class.
 ///
-/// Projection, the payload-length contract, the shared per-variant metadata contract, the
-/// by-value payload capture and both ranges — one implementation for the broad producer and its
-/// off-lock counterpart. The order in which the two ranges are validated stays the caller's,
-/// because it is a rank/ownership decision, not a data one.
-pub(crate) fn plan_blocked_waiter_ordinary_cap_prelude(
+/// Projection, the payload-length contract, the by-value payload capture and both ranges — one
+/// implementation, used by the plain, ordinary-cap and reply-cap plans and therefore by all six
+/// gatherers. The ORDER in which the two ranges are validated stays the caller's, because it is
+/// a rank and ownership decision rather than a data one.
+pub(crate) fn plan_blocked_waiter_delivery_prelude(
     blocked_state: &crate::kernel::task::BlockedRecvState,
     msg: &Message,
-) -> Result<OrdinaryCapDeliveryPrelude, SyscallError> {
+) -> Result<BlockedWaiterDeliveryPrelude, SyscallError> {
     use crate::kernel::dispatch_post_work::DISPATCH_POST_WORK_META_LEN;
 
     // Canonical receiver-visible projection (single rule, shared with every other
@@ -927,7 +921,7 @@ pub(crate) fn plan_blocked_waiter_ordinary_cap_prelude(
     }
     let mut payload = [0u8; Message::MAX_PAYLOAD];
     payload[..app_payload.len()].copy_from_slice(app_payload);
-    Ok(OrdinaryCapDeliveryPrelude {
+    Ok(BlockedWaiterDeliveryPrelude {
         app_opcode,
         payload,
         payload_len: app_payload.len(),
@@ -949,7 +943,7 @@ pub(crate) fn plan_blocked_waiter_ordinary_cap_snapshot(
     blocked_state: &crate::kernel::task::BlockedRecvState,
     endpoint_idx: usize,
     msg: &Message,
-    prelude: &OrdinaryCapDeliveryPrelude,
+    prelude: &BlockedWaiterDeliveryPrelude,
     transfer: (CapObject, CapRights, u64, CapId, CNodeId),
 ) -> crate::kernel::dispatch_post_work::BlockedWaiterOrdinaryCapDeliverySnapshot {
     let (object, rights, source_tid, source_cap, receiver_cnode) = transfer;
@@ -1051,7 +1045,7 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
 
     // 199G-C4 §3 — the projection, the payload-length contract, the by-value payload capture
     // and both validation ranges belong to the plan owner the off-lock gatherer also calls.
-    let prelude = plan_blocked_waiter_ordinary_cap_prelude(&blocked_state, msg)?;
+    let prelude = plan_blocked_waiter_delivery_prelude(&blocked_state, msg)?;
 
     // Phase A.2 — pre-validate the PAYLOAD buffer writable (no copy) BEFORE
     // consuming the envelope, so a payload fault leaves the envelope UNconsumed —
@@ -1354,19 +1348,59 @@ pub(crate) fn produce_queued_shared_region_delivery(
 /// dispatch-return site); a reply carrying a reply cap does not occur in the
 /// current boot, so this path is exercised end-to-end by unit tests, and the
 /// rank-inversion seam is proven safe for the future `ipc_call` wiring.
+/// 199G-C4 §3 — THE reply-cap blocked-waiter delivery CLASS predicate.
+///
+/// `FLAG_REPLY_CAP` set with a transferred cap handle. Anything else (plain, ordinary transfer,
+/// shared region, no cap) belongs to another class and must be declined untouched.
+#[must_use]
+pub(crate) fn blocked_waiter_reply_cap_delivery_class_matches(msg: &Message) -> bool {
+    (msg.flags & Message::FLAG_REPLY_CAP) != 0 && msg.transferred_cap().is_some()
+}
+
+/// 199G-C4 §3 — THE reply-cap snapshot assembly (pure).
+///
+/// The receiver's Reply capability is NOT minted here: only the registry coordinates
+/// (`reply_index`, `reply_generation`) and the receiver cnode travel, and the executor's seam
+/// performs the atomic mint together with the reply-record binding. Stating that arrangement in
+/// one place keeps the two gatherers from carrying different ones.
+pub(crate) fn plan_blocked_waiter_reply_cap_snapshot(
+    waiter_tid: u64,
+    waiter_asid: crate::kernel::vm::Asid,
+    blocked_state: &crate::kernel::task::BlockedRecvState,
+    endpoint_idx: usize,
+    msg: &Message,
+    prelude: &BlockedWaiterDeliveryPrelude,
+    reply_snap: &crate::kernel::cap_transfer_split::ReplyCapRecvSnapshot,
+) -> crate::kernel::dispatch_post_work::BlockedWaiterReplyCapDeliverySnapshot {
+    crate::kernel::dispatch_post_work::BlockedWaiterReplyCapDeliverySnapshot {
+        // Stage 199G-B §1 — carried from the waiter's own saved state, never re-derived.
+        recv_abi: blocked_state.recv_abi,
+        waiter_tid,
+        waiter_asid,
+        payload_user_ptr: blocked_state.payload_user_ptr,
+        payload_len: prelude.payload_len,
+        payload: prelude.payload,
+        meta_user_ptr: blocked_state.meta_user_ptr,
+        app_opcode: prelude.app_opcode,
+        sender_tid: msg.sender_tid.0,
+        receiver_cnode: reply_snap.receiver_cnode,
+        reply_index: reply_snap.reply_index,
+        reply_generation: reply_snap.reply_generation,
+        endpoint_idx,
+        wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
+    }
+}
+
 pub(crate) fn produce_blocked_waiter_reply_cap_delivery(
     kernel: &mut KernelState,
     waiter_tid: u64,
     endpoint_idx: usize,
     msg: &Message,
 ) -> Result<bool, SyscallError> {
-    use crate::kernel::dispatch_post_work::{
-        BlockedWaiterReplyCapDeliverySnapshot, DISPATCH_POST_WORK_META_LEN, DispatchPostWork,
-    };
-    // Reply-cap only: FLAG_REPLY_CAP set with a transferred cap handle. Anything
-    // else (plain, ordinary transfer, no cap) stays on the legacy path.
-    let reply_cap = (msg.flags & Message::FLAG_REPLY_CAP) != 0 && msg.transferred_cap().is_some();
-    if !reply_cap {
+    use crate::kernel::dispatch_post_work::DispatchPostWork;
+    // Reply-cap only. 199G-C4 §3 — the class question has one owner, asked identically by the
+    // off-lock gatherer.
+    if !blocked_waiter_reply_cap_delivery_class_matches(msg) {
         return Ok(false);
     }
     // Only produce when a trap-entry drainer will run (mirrors 188B/188C).
@@ -1391,20 +1425,16 @@ pub(crate) fn produce_blocked_waiter_reply_cap_delivery(
         .map_err(SyscallError::from)?
         .object;
 
-    // Canonical receiver-visible projection (single rule, shared with every other
-    // delivery path including the off-lock direct NR6 transaction).
-    let delivery = self::ipc_recv_core::project_recv_delivery(msg);
-    let (app_opcode, app_payload) = (delivery.app_opcode, delivery.app_payload);
-    if blocked_state.payload_user_len < app_payload.len() {
-        return Err(SyscallError::InvalidArgs);
-    }
+    // 199G-C4 §3 — the projection, the payload-length contract, the by-value payload capture
+    // and both validation ranges belong to the shared prelude.
+    let prelude = plan_blocked_waiter_delivery_prelude(&blocked_state, msg)?;
     // Phase A.2 — pre-validate the PAYLOAD buffer (no copy) BEFORE consuming the
     // envelope, so a payload fault leaves the envelope UNconsumed (legacy order).
     kernel
         .validate_user_range_writable_for_asid(
             waiter_asid,
-            blocked_state.payload_user_ptr,
-            app_payload.len(),
+            prelude.payload_writable.0,
+            prelude.payload_writable.1,
         )
         .map_err(SyscallError::from)?;
     // Stage 199G-B §1, one owner since 199G-C4 §3.
@@ -1433,31 +1463,20 @@ pub(crate) fn produce_blocked_waiter_reply_cap_delivery(
     kernel
         .validate_user_range_writable_for_asid(
             waiter_asid,
-            blocked_state.meta_user_ptr,
-            DISPATCH_POST_WORK_META_LEN,
+            prelude.meta_writable.0,
+            prelude.meta_writable.1,
         )
         .map_err(SyscallError::from)?;
 
-    let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
-    payload_buf[..app_payload.len()].copy_from_slice(app_payload);
-
-    let snapshot = BlockedWaiterReplyCapDeliverySnapshot {
-        // Stage 199G-B §1 — carried from the waiter's own saved state, never re-derived.
-        recv_abi: blocked_state.recv_abi,
+    let snapshot = plan_blocked_waiter_reply_cap_snapshot(
         waiter_tid,
         waiter_asid,
-        payload_user_ptr: blocked_state.payload_user_ptr,
-        payload_len: app_payload.len(),
-        payload: payload_buf,
-        meta_user_ptr: blocked_state.meta_user_ptr,
-        app_opcode,
-        sender_tid: msg.sender_tid.0,
-        receiver_cnode: reply_snap.receiver_cnode,
-        reply_index: reply_snap.reply_index,
-        reply_generation: reply_snap.reply_generation,
+        &blocked_state,
         endpoint_idx,
-        wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
-    };
+        msg,
+        &prelude,
+        &reply_snap,
+    );
     // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
     // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` store.
     unsafe {

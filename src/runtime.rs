@@ -8268,7 +8268,7 @@ impl SharedKernel {
         use crate::kernel::dispatch_post_work::DispatchPostWork;
         use crate::kernel::syscall::{
             SyscallError, blocked_waiter_ordinary_cap_delivery_class_matches,
-            check_blocked_recv_meta_contract, plan_blocked_waiter_ordinary_cap_prelude,
+            check_blocked_recv_meta_contract, plan_blocked_waiter_delivery_prelude,
             plan_blocked_waiter_ordinary_cap_snapshot,
         };
 
@@ -8307,7 +8307,7 @@ impl SharedKernel {
         }
 
         // (4) no lock — the shared pre-consume plan.
-        let prelude = plan_blocked_waiter_ordinary_cap_prelude(&blocked_state, msg)?;
+        let prelude = plan_blocked_waiter_delivery_prelude(&blocked_state, msg)?;
 
         // (5) rank 5 — the PAYLOAD range, BEFORE the envelope is consumed, so a payload fault
         // leaves the transfer intact and the source capability recoverable.
@@ -8377,6 +8377,175 @@ impl SharedKernel {
         }
         crate::yarm_log!(
             "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid={}",
+            waiter_tid
+        );
+        Ok(true)
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK cnode-space provisioning: the split entry to THE provisioning
+    /// policy the broad `ensure_cnode_space` also calls.
+    ///
+    /// One bounded rank-4 acquisition. The capacity limits are read first, off that lock,
+    /// exactly as the broad entry reads them before taking it.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn ensure_cnode_space_split(
+        &self,
+        cnode: crate::kernel::capabilities::CNodeId,
+    ) -> Result<(), KernelError> {
+        let limits = self.runtime_capacity_config_split_read();
+        let max_total_cnode_slots = limits.max_total_cnode_slots;
+        let bounded = KernelState::normalize_requested_cnode_slots(
+            crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+            limits,
+        )?;
+        self.with_capability_state_split_mut(|capability| {
+            KernelState::ensure_cnode_space_locked(
+                capability,
+                cnode,
+                bounded,
+                max_total_cnode_slots,
+            )
+        })
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK REPLY-CAP blocked-waiter delivery producer: the split
+    /// counterpart of `produce_blocked_waiter_reply_cap_delivery`.
+    ///
+    /// The same shape and the same envelope disposition as the ordinary-cap producer — payload
+    /// range before the single consume, metadata range after — plus the two things the reply
+    /// class carries of its own: the transferred object must still be a LIVE `Reply`, and the
+    /// receiver's cspace must be provisioned here, because the executor's rank-4 mint does not
+    /// provision and would otherwise fail on a growable cspace.
+    ///
+    /// Nothing is minted and no reply record is touched: only the reply object's registry
+    /// coordinates and the receiver cnode travel in the snapshot, and the executor's seam does
+    /// the mint and the record binding together.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn produce_blocked_waiter_reply_cap_delivery_split(
+        &self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<bool, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::dispatch_post_work::DispatchPostWork;
+        use crate::kernel::syscall::{
+            SyscallError, blocked_waiter_reply_cap_delivery_class_matches,
+            check_blocked_recv_meta_contract, plan_blocked_waiter_delivery_prelude,
+            plan_blocked_waiter_reply_cap_snapshot,
+        };
+
+        // (0) The class question — THE one owner, asked before anything is touched.
+        if !blocked_waiter_reply_cap_delivery_class_matches(msg) {
+            return Ok(false);
+        }
+        // (1) rank 1 — no drainer, no snapshot: nothing would ever execute it.
+        let cpu_idx = self.current_cpu_split_read().0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+            || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+
+        // (2) rank 2 — the two waiter facts together; dispositions identical to the broad
+        // producer's, including that a missing ASID fails with the state already consumed.
+        let taken = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == waiter_tid)?;
+            let state = tcb.blocked_recv_state.take()?;
+            Some((state, tcb.asid))
+        });
+        let (blocked_state, waiter_asid) = taken.ok_or(SyscallError::InvalidArgs)?;
+        let waiter_asid = waiter_asid.ok_or(SyscallError::InvalidArgs)?;
+
+        // (3) rank 2+4 — the endpoint the envelope is bound to, from the waiter's saved cap.
+        let recv_endpoint = self
+            .resolve_capability_for_task_split(waiter_tid, blocked_state.recv_cap)
+            .map_err(SyscallError::from)?
+            .object;
+        match recv_endpoint {
+            CapObject::Endpoint { index, .. } if index == endpoint_idx => {}
+            _ => return Err(SyscallError::InvalidCapability),
+        }
+
+        // (4) no lock — the shared prelude.
+        let prelude = plan_blocked_waiter_delivery_prelude(&blocked_state, msg)?;
+
+        // (5) rank 5 — the PAYLOAD range, BEFORE the envelope is consumed.
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            prelude.payload_writable.0,
+            prelude.payload_writable.1,
+        )
+        .map_err(SyscallError::from)?;
+        // (6) no lock — the shared metadata contract, still before the consume.
+        check_blocked_recv_meta_contract(&blocked_state)?;
+
+        // (7) rank 3 — consume the envelope exactly once, then require the transferred object to
+        // be a `Reply` whose generation is still live. A `pinned_object` would mean a
+        // shared-region envelope reached this class; refuse rather than take a pin this producer
+        // does not own.
+        let facts = self
+            .take_transfer_envelope_facts_split(
+                msg.transferred_cap()
+                    .ok_or(SyscallError::InvalidCapability)?
+                    .0,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(waiter_tid),
+            )
+            .ok_or(SyscallError::InvalidCapability)?;
+        if facts.pinned_object.is_some() {
+            return Err(SyscallError::InvalidCapability);
+        }
+        let (reply_index, reply_generation) = match facts.source_object {
+            CapObject::Reply { index, generation } => (index, generation),
+            _ => return Err(SyscallError::WrongObject),
+        };
+        if !self.reply_object_live_split(reply_index, reply_generation) {
+            return Err(SyscallError::InvalidCapability);
+        }
+        // (8) rank 2 then rank 4 — the receiver's cnode, and its provisioning, so the
+        // executor's mint cannot fail on an unprovisioned growable cspace.
+        let receiver_cnode = self
+            .task_cnode_split(waiter_tid)
+            .ok_or(SyscallError::InvalidCapability)?;
+        self.ensure_cnode_space_split(receiver_cnode)
+            .map_err(SyscallError::from)?;
+
+        // (9) rank 5 — the META range. The envelope is consumed; nothing was minted, so there is
+        // nothing to roll back.
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            prelude.meta_writable.0,
+            prelude.meta_writable.1,
+        )
+        .map_err(SyscallError::from)?;
+
+        // (10) the shared snapshot assembly, then the stash.
+        let snapshot = plan_blocked_waiter_reply_cap_snapshot(
+            waiter_tid,
+            waiter_asid,
+            &blocked_state,
+            endpoint_idx,
+            msg,
+            &prelude,
+            &crate::kernel::cap_transfer_split::ReplyCapRecvSnapshot {
+                handle: msg.transferred_cap().map_or(0, |c| c.0),
+                endpoint: recv_endpoint,
+                reply_index,
+                reply_generation,
+                receiver_tid: waiter_tid,
+                receiver_cnode,
+            },
+        );
+        // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+        // identical discipline to the broad producer's store.
+        unsafe {
+            crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx]
+                .store(DispatchPostWork::BlockedWaiterReplyCapDelivery(snapshot));
+        }
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_reply_cap waiter_tid={}",
             waiter_tid
         );
         Ok(true)
