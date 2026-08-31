@@ -8121,6 +8121,127 @@ impl SharedKernel {
     pub(crate) fn sr_release_pin_token_split(&self, token: crate::kernel::boot::TransferPinToken) {
         self.with_memory_split_mut(|m| KernelState::release_transfer_pin_locked(m, token))
     }
+
+    /// 199G-C4 §2 — the OFF-LOCK transfer-envelope stash: the split counterpart of
+    /// `KernelState::stash_transfer_envelope`, and the transaction NR1's pre-lock route needs
+    /// before it can carry a capability transfer.
+    ///
+    /// Rank order is strictly SEQUENTIAL, never nested — each domain is released before the next
+    /// is taken:
+    ///
+    /// 1. **rank 2 → 4** — resolve the sender's source capability, giving the frozen
+    ///    `source_object` the envelope will carry. A stale or missing capability refuses here,
+    ///    before anything is pinned or published.
+    /// 2. **rank 6 (read)** — for a `MemoryObject`, its length, which is the only fact the bound
+    ///    policy needs that the caller cannot compute.
+    /// 3. **pure** — `transfer_shared_region_bounds_ok`, THE shared descriptor policy, identical
+    ///    to the one the broad stash applies.
+    /// 4. **rank 6 (write)** — acquire the pin, and ONLY when `transfer_envelope_owes_pin` says
+    ///    this envelope owes one. Ordinary caps, reply caps, inline `MemoryObject`/`DmaRegion`
+    ///    sends and no-cap sends acquire nothing.
+    /// 5. **rank 3** — publish the envelope into the same table, with the same generation
+    ///    discipline, the broad stash uses.
+    ///
+    /// The rank-6 acquisition is released before rank 3 is taken, so the two domains are never
+    /// held together. If the publication then fails — no free slot — the pin is released exactly
+    /// once through the token, so a refused publication can never leave a pin behind.
+    ///
+    /// On success the caller owns the returned token and must transfer it to the settlement path:
+    /// `settle_blocked_send_envelope_split` already releases the owed pin on every terminal
+    /// outcome, and the shared-region transaction takes it over with no reference gap.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn stash_transfer_envelope_split(
+        &self,
+        source_tid: crate::kernel::ipc::ThreadId,
+        source_cap: CapId,
+        endpoint: CapObject,
+        receiver_tid: Option<crate::kernel::ipc::ThreadId>,
+        shared_region: Option<crate::kernel::boot::TransferSharedRegion>,
+    ) -> Result<StashedTransferEnvelope, TransferStashRefusal> {
+        use crate::kernel::boot::{MAX_TRANSFER_ENVELOPES, TransferEnvelope, TransferState};
+
+        // (1) rank 2 → 4: the frozen source object. Released before anything else is taken.
+        let source_object = self
+            .resolve_capability_for_task_split(source_tid.0, source_cap)
+            .map_err(|_| TransferStashRefusal::SourceCapUnresolved)?
+            .object;
+
+        // (2)+(3) the descriptor policy, for a shared-region envelope only.
+        if let Some(region) = shared_region {
+            // rank 6 read, released immediately.
+            let memory_object_len = match source_object {
+                CapObject::MemoryObject { id } => Some(
+                    self.with_memory_split_mut(|m| {
+                        m.memory_objects
+                            .iter()
+                            .flatten()
+                            .find(|entry| entry.id == id)
+                            .map(|entry| entry.len)
+                    })
+                    .ok_or(TransferStashRefusal::ObjectStale)?,
+                ),
+                _ => None,
+            };
+            crate::kernel::boot::transfer_shared_region_bounds_ok(
+                source_object,
+                region,
+                memory_object_len,
+            )
+            .map_err(|_| TransferStashRefusal::DescriptorRejected)?;
+        }
+
+        // (4) rank 6 write: acquire the pin, and only when the ONE policy says this envelope owes
+        // one. Released before rank 3 is taken below.
+        let pin = if KernelState::transfer_envelope_owes_pin(shared_region) {
+            Some(
+                self.sr_acquire_pin_split(source_object)
+                    .map_err(TransferStashRefusal::Pin)?,
+            )
+        } else {
+            None
+        };
+
+        // (5) rank 3: publish, with the broad stash's exact slot search and generation discipline
+        // — first free slot, generation incremented and never zero.
+        let published = self.with_ipc_split_mut(|ipc| {
+            for idx in 0..MAX_TRANSFER_ENVELOPES {
+                if ipc.transfer_envelopes[idx].is_some() {
+                    continue;
+                }
+                let mut generation = ipc.transfer_envelope_generations[idx].wrapping_add(1);
+                if generation == 0 {
+                    generation = 1;
+                }
+                ipc.transfer_envelope_generations[idx] = generation;
+                ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
+                    source_tid,
+                    source_cap,
+                    source_object,
+                    endpoint,
+                    receiver_tid,
+                    state: TransferState::Created,
+                    shared_region,
+                    generation,
+                });
+                ipc.telemetry.transfer_records_created =
+                    ipc.telemetry.transfer_records_created.saturating_add(1);
+                return u64::try_from(idx).ok().map(|i| (generation << 16) | i);
+            }
+            None
+        });
+
+        match published {
+            Some(handle) => Ok(StashedTransferEnvelope { handle, pin }),
+            None => {
+                // The envelope table is full. Release the pin EXACTLY once, through the token, so
+                // a refused publication leaves the refcount exactly as it was.
+                if let Some(token) = pin {
+                    self.sr_release_pin_token_split(token);
+                }
+                Err(TransferStashRefusal::TableFull)
+            }
+        }
+    }
     /// Equivalent to `capability_object_live`: MemoryObject/DmaRegion are unconditionally live;
     /// Endpoint/Notification/Reply are generation-checked under the IPC lock (rank 3).
     pub(crate) fn sr_object_live_split(&self, object: CapObject) -> bool {
@@ -11308,6 +11429,42 @@ pub(crate) enum ReplyTimeoutOutcome {
     LostToTerminal,
     /// The token fire claim failed (stale/duplicate/cancelled): nothing was mutated.
     StaleToken,
+}
+
+/// 199G-C4 §2 — a published off-lock transfer envelope and, when the envelope owes one, the
+/// authority to release its object pin.
+///
+/// The token is `Option` for a reason the §1 derivation makes exact: an envelope owes a pin **iff
+/// it carries a shared-region descriptor**. An ordinary capability, a reply capability, an inline
+/// `MemoryObject`/`DmaRegion` send and a no-cap send all publish an envelope with `pin: None`, and
+/// a settlement that finds `None` must not release anything.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StashedTransferEnvelope {
+    /// The `(generation << 16) | index` handle the message carries as its transferred cap.
+    pub(crate) handle: u64,
+    /// Release authority for this envelope's pin, or `None` when it owes none.
+    pub(crate) pin: Option<crate::kernel::boot::TransferPinToken>,
+}
+
+/// 199G-C4 §2 — why an off-lock envelope stash refused. Every variant is raised with the pin
+/// balance exactly as it was on entry.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferStashRefusal {
+    /// The sender's source capability no longer resolves — a stale or revoked cap. Nothing was
+    /// pinned or published.
+    SourceCapUnresolved,
+    /// A `MemoryObject` descriptor named an object the memory table no longer carries.
+    ObjectStale,
+    /// The shared-region descriptor is not admissible for this object (zero length, overflow, or
+    /// outside the object's or the capability's window).
+    DescriptorRejected,
+    /// The rank-6 acquire refused — not pinnable, stale, or at the refcount ceiling.
+    Pin(crate::kernel::boot::TransferPinRefusal),
+    /// No free envelope slot. Any pin taken for this attempt was released exactly once before
+    /// this was returned, so the refcount is unchanged.
+    TableFull,
 }
 
 /// Stage 198E3B2A: the OFF-LOCK shared-region execution context. Implements the single

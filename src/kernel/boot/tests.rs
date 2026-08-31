@@ -145910,3 +145910,242 @@ mod stage199dkr_kernel_control_cap_is_production_unreachable {
         );
     }
 }
+
+/// 199G-C4 §2/§6 — the off-lock transfer-envelope stash, and the pin balance it must keep on
+/// every exit.
+mod stage199gc4_split_envelope_stash {
+    use super::*;
+    use crate::kernel::boot::TransferSharedRegion;
+    use crate::kernel::capabilities::{CapId, CapObject};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::vm::PhysAddr;
+    use crate::runtime::{SharedKernel, TransferStashRefusal};
+
+    struct Fx {
+        k: SharedKernel,
+        endpoint: CapObject,
+        mem_id: u64,
+        mem_cap: CapId,
+        ep_send_cap: CapId,
+    }
+
+    fn fixture() -> Fx {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("sender");
+        let (eidx, ep_send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = CapObject::Endpoint {
+            index: eidx,
+            generation: state.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]),
+        };
+        let (mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0x30_0000))
+            .expect("memory object");
+        // Give the sender the caps in its own cspace.
+        let mem_cap = state
+            .grant_capability_task_to_task(0, mem_cap, 1)
+            .expect("grant mem");
+        let ep_send_cap = state
+            .grant_capability_task_to_task(0, ep_send_cap, 1)
+            .expect("grant ep");
+        Fx {
+            k: SharedKernel::new(state),
+            endpoint,
+            mem_id,
+            mem_cap,
+            ep_send_cap,
+        }
+    }
+
+    fn pin_of(fx: &Fx) -> u32 {
+        fx.k.with(|s| {
+            s.with_memory_state(|m| {
+                m.memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|e| e.id == fx.mem_id)
+                    .map(|e| e.pin_refcount)
+                    .expect("object")
+            })
+        })
+    }
+
+    fn envelopes_live(fx: &Fx) -> usize {
+        fx.k.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.transfer_envelopes
+                    .iter()
+                    .filter(|e| e.is_some())
+                    .count()
+            })
+        })
+    }
+
+    /// A NON-shared envelope — an ordinary endpoint capability — publishes with NO pin.
+    #[test]
+    fn an_ordinary_cap_envelope_owes_no_pin() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        let stashed = fx
+            .k
+            .stash_transfer_envelope_split(ThreadId(1), fx.ep_send_cap, fx.endpoint, None, None)
+            .expect("an ordinary cap stashes");
+        assert!(stashed.pin.is_none(), "an ordinary cap owes no pin");
+        assert_eq!(pin_of(&fx), before, "and takes none");
+        assert_eq!(envelopes_live(&fx), 1);
+    }
+
+    /// A MemoryObject cap sent WITHOUT a shared-region descriptor — the inline-transfer class —
+    /// also owes no pin. This is the §1 finding: the pin is the descriptor's, not the object's.
+    #[test]
+    fn an_inline_memory_object_transfer_owes_no_pin() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        let stashed =
+            fx.k.stash_transfer_envelope_split(ThreadId(1), fx.mem_cap, fx.endpoint, None, None)
+                .expect("an inline MemoryObject transfer stashes");
+        assert!(
+            stashed.pin.is_none(),
+            "a MemoryObject cap with no descriptor owes no pin"
+        );
+        assert_eq!(pin_of(&fx), before);
+    }
+
+    /// A shared-region grant acquires EXACTLY one pin, and the token names the object.
+    #[test]
+    fn a_shared_region_grant_acquires_exactly_one_pin() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        let stashed =
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                fx.mem_cap,
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion { offset: 0, len: 8 }),
+            )
+            .expect("a shared-region grant stashes");
+        let token = stashed.pin.expect("it owes a pin");
+        assert_eq!(token.object(), CapObject::MemoryObject { id: fx.mem_id });
+        assert_eq!(pin_of(&fx), before + 1, "exactly one");
+        // And the settlement releases exactly one.
+        fx.k.sr_release_pin_token_split(token);
+        assert_eq!(pin_of(&fx), before, "balanced");
+    }
+
+    /// A stale source capability refuses before anything is pinned or published.
+    #[test]
+    fn a_stale_source_cap_refuses_without_mutation() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        assert_eq!(
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                CapId(0xDEAD),
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion { offset: 0, len: 8 })
+            ),
+            Err(TransferStashRefusal::SourceCapUnresolved)
+        );
+        assert_eq!(pin_of(&fx), before, "nothing pinned");
+        assert_eq!(envelopes_live(&fx), 0, "nothing published");
+    }
+
+    /// An inadmissible descriptor refuses BEFORE the pin is taken — the bound policy runs first.
+    #[test]
+    fn an_inadmissible_descriptor_refuses_before_the_pin() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        // Zero length is refused by the shared bound policy.
+        assert_eq!(
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                fx.mem_cap,
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion { offset: 0, len: 0 })
+            ),
+            Err(TransferStashRefusal::DescriptorRejected)
+        );
+        assert_eq!(pin_of(&fx), before, "the pin is never taken");
+        assert_eq!(envelopes_live(&fx), 0);
+        // A descriptor larger than the object is refused the same way.
+        assert_eq!(
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                fx.mem_cap,
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion {
+                    offset: 0,
+                    len: u64::MAX
+                })
+            ),
+            Err(TransferStashRefusal::DescriptorRejected)
+        );
+        assert_eq!(pin_of(&fx), before);
+    }
+
+    /// A REFUSED publication releases the pin exactly once: filling the envelope table and then
+    /// attempting a shared-region stash must leave the refcount exactly as it was.
+    #[test]
+    fn a_refused_publication_releases_the_pin_exactly_once() {
+        let fx = fixture();
+        // Fill every envelope slot with pin-free ordinary-cap envelopes.
+        let mut filled = 0usize;
+        while fx
+            .k
+            .stash_transfer_envelope_split(ThreadId(1), fx.ep_send_cap, fx.endpoint, None, None)
+            .is_ok()
+        {
+            filled += 1;
+            assert!(
+                filled <= crate::kernel::boot::MAX_TRANSFER_ENVELOPES + 1,
+                "bounded"
+            );
+        }
+        assert_eq!(filled, crate::kernel::boot::MAX_TRANSFER_ENVELOPES);
+        let before = pin_of(&fx);
+        assert_eq!(
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                fx.mem_cap,
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion { offset: 0, len: 8 })
+            ),
+            Err(TransferStashRefusal::TableFull)
+        );
+        assert_eq!(
+            pin_of(&fx),
+            before,
+            "a refused publication leaves the pin balance untouched"
+        );
+    }
+
+    /// The broad and split stashes read the SAME descriptor policy and the SAME pin policy.
+    #[test]
+    fn both_stashes_share_one_policy() {
+        const TRANSFER_SRC: &str = include_str!("transfer_state.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        assert_eq!(
+            TRANSFER_SRC
+                .matches("pub(crate) fn transfer_shared_region_bounds_ok")
+                .count(),
+            1,
+            "the descriptor policy is defined once"
+        );
+        assert!(
+            TRANSFER_SRC.contains("transfer_shared_region_bounds_ok(capability.object, region,"),
+            "the broad stash asks it"
+        );
+        assert!(
+            RUNTIME_SRC.contains("crate::kernel::boot::transfer_shared_region_bounds_ok("),
+            "the split stash asks the same one"
+        );
+        assert!(
+            RUNTIME_SRC.contains("KernelState::transfer_envelope_owes_pin(shared_region)"),
+            "and the split stash asks the one pin policy"
+        );
+    }
+}

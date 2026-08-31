@@ -57,6 +57,7 @@ mod task_policy_state;
 mod thread_state;
 mod tid_allocation_policy;
 mod transfer_state;
+pub(crate) use transfer_state::transfer_shared_region_bounds_ok;
 mod types;
 mod user_memory_state;
 /// Stage 199D-WA2A-R1 — the endpoint-waiter ownership primitive.
