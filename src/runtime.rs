@@ -8904,11 +8904,23 @@ impl SharedKernel {
     /// owned generation-bearing `WaiterClaim`. An endpoint destroyed/recreated (generation changed),
     /// a different or absent waiter → no claim (`None`), slot untouched. The endpoint generation is
     /// part of the claim authority: a same-index-but-newer endpoint can never be claimed.
+    /// Stage 199D-WA3C2: the claim is now **owned**, not merely performed.
+    ///
+    /// The order is load-bearing: the ownership CLAIM happens BEFORE the waiter is removed, so
+    /// the slot is already `Claimed` when `take_endpoint_waiter`'s structural retire runs — and
+    /// that retire correctly declines a live claim rather than emptying the slot. What survives
+    /// the rank-3 release is therefore an occupied ownership slot naming this exact incarnation
+    /// and this owner, which is precisely the window a second receiver must not publish into.
+    ///
+    /// A refused ownership claim refuses the whole waiter claim, with the waiter table
+    /// **untouched** — an incarnation another owner is already driving can never be claimed
+    /// twice, so there is no duplicate terminal winner.
     pub(crate) fn sr_claim_endpoint_waiter_split(
         &self,
         eidx: usize,
         egen: u64,
         receiver: crate::kernel::boot::ReceiverWaiterIdentity,
+        owner: crate::kernel::boot::waiter_ownership::WaiterOwner,
     ) -> Option<WaiterClaim> {
         self.with_ipc_split_mut(|ipc| {
             // Stage 198E3B2B2: the slot must hold the COMPLETE identity (tid + ASID) — numeric TID
@@ -8920,16 +8932,75 @@ impl SharedKernel {
                 && ipc.endpoint_generations[eidx] == egen
                 && record.map(|r| r.receiver) == Some(receiver)
             {
+                let record = record?;
+                let key = ipc.waiter_ownership_key_for(eidx, record)?;
+                let token = match ipc.waiter_ownership_claim(key, owner) {
+                    Ok(token) => token,
+                    Err(err) => {
+                        crate::yarm_log!(
+                            "WA3C2_WAITER_CLAIM_REFUSED endpoint={} tid={} wait_gen={} owner={} error={:?}",
+                            eidx,
+                            record.tid().0,
+                            record.wait_generation,
+                            owner.as_str(),
+                            err
+                        );
+                        return None;
+                    }
+                };
                 ipc.take_endpoint_waiter(eidx);
                 Some(WaiterClaim {
                     eidx,
                     generation: egen,
                     receiver,
-                    wait_generation: record.map(|r| r.wait_generation).unwrap_or(0),
+                    wait_generation: record.wait_generation,
+                    token,
                 })
             } else {
                 None
             }
+        })
+    }
+
+    /// Stage 199D-WA3C2 — settle a waiter claim as **delivered**: CONSUME, then RETIRE.
+    ///
+    /// Called on every path where the claimed incarnation actually received its message and
+    /// will be woken. Consume-then-retire is what returns the endpoint's ownership slot to
+    /// `Vacant`, so quiescent occupancy is zero and the next receiver can publish. Returns
+    /// whether the slot is now free of this incarnation.
+    pub(crate) fn sr_consume_endpoint_waiter_claim_split(&self, claim: &WaiterClaim) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            if let Err(err) = ipc.waiter_ownership_consume(claim.token) {
+                crate::yarm_log!(
+                    "WA3C2_WAITER_CONSUME_FAILED endpoint={} tid={} error={:?}",
+                    claim.eidx,
+                    claim.receiver.tid.0,
+                    err
+                );
+                return false;
+            }
+            ipc.waiter_ownership_retire_current(claim.key()).is_ok()
+        })
+    }
+
+    /// Stage 199D-WA3C2 — settle a waiter claim as **abandoned**: CANCEL, then RETIRE.
+    ///
+    /// This is the settle for the arms that deliberately do NOT restore the waiter — the
+    /// receiver exited or was replaced after the claim, so re-installing it would fabricate a
+    /// waiter for a vanished incarnation. The ownership slot must still return to `Vacant`, or
+    /// the endpoint index stays wedged against every future receiver.
+    pub(crate) fn sr_cancel_endpoint_waiter_claim_split(&self, claim: &WaiterClaim) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            if let Err(err) = ipc.waiter_ownership_cancel(claim.token) {
+                crate::yarm_log!(
+                    "WA3C2_WAITER_CANCEL_FAILED endpoint={} tid={} error={:?}",
+                    claim.eidx,
+                    claim.receiver.tid.0,
+                    err
+                );
+                return false;
+            }
+            ipc.waiter_ownership_retire_current(claim.key()).is_ok()
         })
     }
 
@@ -8979,7 +9050,13 @@ impl SharedKernel {
     /// therefore never fabricate or overwrite a waiter for a replacement task. (The numeric-TID
     /// Replaced→restore of Stage 198E3B2B1 is removed; the shared-region finalizer no longer restores,
     /// so this is a guarded primitive whose exact-identity contract is proven by the focused tests.)
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// Stage 199D-WA3C2: a restore re-installs the waiter **under the claim that never left**.
+    /// The ownership slot has held this exact incarnation as `Claimed` for the whole off-lock
+    /// window, so `restore` is settled FIRST — it moves `Claimed → Available` for this exact
+    /// key, which is what the republish's pre-flight then finds already consistent. Doing it the
+    /// other way round would make the republish see a live claim and refuse, which is true but
+    /// leaves the slot claimed by a transaction that has already given up.
     pub(crate) fn sr_restore_endpoint_waiter_split(&self, claim: &WaiterClaim) -> bool {
         // rank 2: the task must still be blocked on recv with the EXACT claimed identity.
         if !self.sr_prevalidate_blocked_receiver_split(claim.receiver.tid.0, claim.receiver.asid) {
@@ -8991,13 +9068,29 @@ impl SharedKernel {
                 && ipc.endpoint_generations[claim.eidx] == claim.generation
                 && !ipc.endpoint_waiter_present(claim.eidx)
             {
-                ipc.set_endpoint_waiter(
-                    claim.eidx,
-                    crate::kernel::boot::EndpointWaiterRecord::new(
-                        claim.receiver,
-                        claim.wait_generation,
-                    ),
+                let record = crate::kernel::boot::EndpointWaiterRecord::new(
+                    claim.receiver,
+                    claim.wait_generation,
                 );
+                if let Err(err) = ipc.waiter_ownership_restore(claim.token) {
+                    crate::yarm_log!(
+                        "WA3C2_WAITER_RESTORE_FAILED endpoint={} tid={} error={:?}",
+                        claim.eidx,
+                        claim.receiver.tid.0,
+                        err
+                    );
+                    return false;
+                }
+                let (_, ownership) = ipc.publish_endpoint_waiter(claim.eidx, record);
+                if !ownership.permits_publication() {
+                    crate::yarm_log!(
+                        "WA3C2_WAITER_RESTORE_UNOWNED endpoint={} tid={} reason={}",
+                        claim.eidx,
+                        claim.receiver.tid.0,
+                        ownership.as_str()
+                    );
+                    return false;
+                }
                 true
             } else {
                 false
@@ -10166,7 +10259,15 @@ impl SharedKernel {
         // Phase 2 (rank 3): the exact, generation-bearing IDENTITY claim (remove once). Because the
         // claim requires the full {tid, ASID} identity, a replacement task (reused numeric TID, new
         // ASID) can never be claimed or cleared here.
-        let claim = self.sr_claim_endpoint_waiter_split(eidx, egen, receiver)?;
+        // Stage 199D-WA3C2: `LegacyDelivery` — in-lock endpoint delivery is exactly what the
+        // shared-region finalizer performs, and naming the owner is what lets a concurrent
+        // publication report *who* holds the incarnation it was refused.
+        let claim = self.sr_claim_endpoint_waiter_split(
+            eidx,
+            egen,
+            receiver,
+            crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
+        )?;
         // Stage 199D: capture the wait reason before the commit clears it, so a refused
         // placement can restore the exact blocked state.
         let recv_cap = self.blocked_recv_cap_split_read(snap.receiver_tid, snap.receiver_asid);
@@ -10186,7 +10287,13 @@ impl SharedKernel {
                 // receiver's membership is unknown: fail closed with ZERO mutation — do not force
                 // it Blocked on top of live membership, and do not touch its queue entry.
                 match self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity) {
-                    ReceiverEnqueue::Enqueued { .. } => Some(true),
+                    ReceiverEnqueue::Enqueued { .. } => {
+                        // Stage 199D-WA3C2: the receiver is placed and will run — the claimed
+                        // incarnation is DELIVERED. Consume + retire, so the endpoint's
+                        // ownership slot returns to `Vacant` and the next receiver may publish.
+                        let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);
+                        Some(true)
+                    }
                     ReceiverEnqueue::Rejected { cpu, error, .. } => {
                         let unplaced = !matches!(
                             error,
@@ -10201,6 +10308,14 @@ impl SharedKernel {
                                 )
                             })
                             && self.sr_restore_endpoint_waiter_split(&claim);
+                        // Stage 199D-WA3C2: a successful restore already settled the claim
+                        // (`Claimed → Available`, waiter republished). Every other shape leaves
+                        // it LIVE, and a live claim wedges the endpoint index against all future
+                        // receivers — so cancel + retire it here. Cancel rather than consume:
+                        // nothing was delivered.
+                        if !restored {
+                            let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
+                        }
                         crate::yarm_log!(
                             "SR_RECEIVER_ENQUEUE_REJECTED tid={} cpu={} error={:?} restored={} result=no_wake",
                             snap.receiver_tid,
@@ -10217,7 +10332,16 @@ impl SharedKernel {
             // correctly stale and MUST NOT be restored (the old numeric-TID Replaced→restore is
             // removed; a restore could only ever target the vanished incarnation, never a live
             // replacement task). Zero wake; the transaction rolls back.
-            ReceiverCommit::GoneDead | ReceiverCommit::Replaced => None,
+            //
+            // Stage 199D-WA3C2: the WAITER is correctly left removed, but the ownership CLAIM
+            // must still be settled — an unsettled claim for a vanished incarnation would wedge
+            // this endpoint index against every future receiver. CANCEL is the exact settle for
+            // "abandoned, not delivered", and the retire that follows returns the slot to
+            // `Vacant` so a replacement task can publish here immediately.
+            ReceiverCommit::GoneDead | ReceiverCommit::Replaced => {
+                let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
+                None
+            }
         }
     }
 
@@ -10902,6 +11026,29 @@ pub(crate) struct WaiterClaim {
     /// Stage 199D-WA3C1: the wait generation of the record that was removed, so a restore
     /// republishes the SAME incarnation rather than minting a fresh-looking one.
     pub(crate) wait_generation: u64,
+    /// Stage 199D-WA3C2: the unforgeable ownership token minted for this exact incarnation.
+    ///
+    /// It is what makes the removal above *owned* rather than merely performed: the ownership
+    /// slot stays occupied for the whole off-lock window, so no second receiver can publish
+    /// into an endpoint this transaction is still going to deliver to and wake. Every terminal
+    /// arm of the owning transaction must settle it — CONSUME on delivery, RESTORE on a
+    /// rollback that reinstates the waiter, CANCEL when the receiver vanished — or the endpoint
+    /// index stays wedged, which is fail-closed but is a liveness bug.
+    pub(crate) token: crate::kernel::boot::waiter_ownership::WaiterClaimToken,
+}
+
+impl WaiterClaim {
+    /// The exact incarnation key this claim owns. Derived from the claim's own four components
+    /// rather than re-read from the table, so a retire can never name a newer incarnation than
+    /// the one that was claimed.
+    pub(crate) fn key(&self) -> crate::kernel::boot::waiter_ownership::WaiterKey {
+        crate::kernel::boot::waiter_ownership::WaiterKey {
+            endpoint_index: self.eidx,
+            endpoint_generation: self.generation,
+            waiter: self.receiver,
+            wait_generation: self.wait_generation,
+        }
+    }
 }
 
 /// Stage 199D — what the single rank-1 receiver enqueue actually did.

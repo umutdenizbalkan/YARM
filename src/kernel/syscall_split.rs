@@ -771,12 +771,47 @@ fn try_split_blocking_ipc_recv_into_frame(
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return D::NotHandled;
     }
-    // (2) The publication gates the broad blocked-recv arm owns.
-    if cfg!(feature = "shared-region-direct-oracle")
-        || crate::kernel::boot::ipccall_direct_publication_enabled()
-    {
+    // (2) The publication work that still requires a broad `&KernelState`.
+    //
+    // Stage 199D-WA3C2 NARROWS this. It used to yield on `ipccall_direct_publication_enabled()`
+    // outright, because the NR6/NR7 acknowledgements could only be published from the broad
+    // blocked-recv arm — and with the x86_64 production default now ON, that yield would fire on
+    // EVERY boot and silently retire the delivered split blocking-IpcRecv route. The publication
+    // bodies are now shared (`publish_ipccall_direct_blocked_server_ack_with` /
+    // `publish_ipcreply_direct_blocked_caller_ack_with`), so this route publishes its own
+    // acknowledgements at step (10) below and no longer has to yield the whole receive.
+    //
+    // The shared-region oracle's acknowledgement family is unrelated to those two and still
+    // broad-only, so it keeps its yield unconditionally.
+    if cfg!(feature = "shared-region-direct-oracle") {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=shared_region_ack_publication_armed",
+            cpu.0
+        );
+        return D::NotHandled;
+    }
+    // NON-x86_64: UNCHANGED from before WA3C2. The narrowing is scoped to x86_64 because that is
+    // the architecture WA3C2 qualified — the default core boot, the four AP cross-CPU profiles
+    // and the SMP=2 bidirectional seal are all x86_64 witnesses. On AArch64 direct publication is
+    // armed only by its oracle knob, and that oracle's live round-trip depends on blocked-recv
+    // work this route does not reproduce, so it keeps yielding exactly as it did at `894cc5a`.
+    // Widening it is a separate increment with its own AArch64 witness, not a side effect here.
+    #[cfg(not(target_arch = "x86_64"))]
+    if crate::kernel::boot::ipccall_direct_publication_enabled() {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=ack_publication_armed",
+            cpu.0
+        );
+        return D::NotHandled;
+    }
+    // x86_64: the yield is scoped to an ARMED SELECTOR, never to the production default. The
+    // policy has ONE owner — the `boot` predicate called just below — and it is not an admission
+    // question, so the split dispatcher's admission logic stays free of proof-gate terms. See
+    // that predicate for which blocked-recv work only the broad arm performs.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    if crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm() {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=direct_oracle_selector_armed",
             cpu.0
         );
         return D::NotHandled;
@@ -945,7 +980,17 @@ fn try_split_blocking_ipc_recv_into_frame(
         // exactly, release the reservation, and let the broad path service the message. This is
         // the branch the serialized broad entry documents as unreachable and this route makes
         // reachable — it is why the unwind twin had to exist first.
-        crate::kernel::recv_waiter_split::PublishWaiterOutcome::QueueNonEmpty => {
+        // Stage 199D-WA3C2 — the same reversal as the race, for the same reason: NOTHING was
+        // published, so ranks 2 and 1 unwind to the exact pre-block state and the route
+        // declines. The decline is deliberate rather than terminal — the broad
+        // `block_current_on_receive_with_deadline` is the ONE owner of the ownership-busy
+        // policy (it answers `WouldBlock`), and this route must not fork a second copy of it.
+        crate::kernel::recv_waiter_split::PublishWaiterOutcome::WaiterOwnershipBusy
+        | crate::kernel::recv_waiter_split::PublishWaiterOutcome::QueueNonEmpty => {
+            let busy = matches!(
+                outcome,
+                crate::kernel::recv_waiter_split::PublishWaiterOutcome::WaiterOwnershipBusy
+            );
             let unwound = shared.recv_block_unwind_race_split(cpu, tid);
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
             if !unwound {
@@ -961,10 +1006,15 @@ fn try_split_blocking_ipc_recv_into_frame(
                 )));
             }
             crate::yarm_log!(
-                "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} endpoint={} reason=queue_non_empty",
+                "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} endpoint={} reason={}",
                 cpu.0,
                 tid,
-                endpoint_idx
+                endpoint_idx,
+                if busy {
+                    "waiter_ownership_busy"
+                } else {
+                    "queue_non_empty"
+                }
             );
             return D::NotHandled;
         }
@@ -984,6 +1034,45 @@ fn try_split_blocking_ipc_recv_into_frame(
                 crate::kernel::syscall::SyscallError::WrongObject,
             )));
         }
+    }
+    // (10) Stage 199D-WA3C2 — publish the NR6/NR7 blocked-waiter acknowledgements from the
+    // SAME fully-committed recv-v2 point the broad arm uses: Phase B stored `BlockedRecvState`,
+    // Phase C linked the waiter, and the task is `Blocked(EndpointReceive)`. This is what makes
+    // direct IpcCall/IpcReply production reachable for receivers that took the split route —
+    // without it the x86_64 default would admit NR6/NR7 with nothing ever to claim.
+    //
+    // The two reads the shared bodies need are supplied off-lock: the receiver ASID from the
+    // rank-2 seam, and the live waiter identity from the rank-3 seam. Both publishers are
+    // strict no-ops when publication is not enabled or the endpoint is not admitted.
+    {
+        let endpoint = crate::kernel::capabilities::CapObject::Endpoint {
+            index: endpoint_idx,
+            generation,
+        };
+        let asid = Some(receiver_asid);
+        let waiter_identity = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(tid),
+            receiver_asid,
+        );
+        let live_waiter = |index: usize| {
+            shared
+                .endpoint_waiter_is_split_read(index, generation, waiter_identity)
+                .then_some(waiter_identity)
+        };
+        let _ = crate::kernel::boot::publish_ipccall_direct_blocked_server_ack_with(
+            tid,
+            asid,
+            endpoint,
+            &state,
+            live_waiter,
+        );
+        let _ = crate::kernel::boot::publish_ipcreply_direct_blocked_caller_ack_with(
+            tid,
+            asid,
+            endpoint,
+            &state,
+            live_waiter,
+        );
     }
     crate::yarm_log!(
         "IPC_RECV_BLOCK_REGISTER endpoint={} tid={}",

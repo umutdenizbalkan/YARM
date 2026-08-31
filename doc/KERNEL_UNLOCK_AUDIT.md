@@ -5952,3 +5952,132 @@ and RPi5 are untouched. **The census remains 2 / 0 / 2** — both terminal acqui
 reachable by their residual classes, so neither is retired. ***U9 remains OPEN*** and
 direct-IpcCall production remains OFF (`ipccall_direct_production_enabled()` is `const false`).
 U9-COW2 is CENSUS-DELTA 0, so the canonical stage arithmetic is unchanged.
+### 199D-WA3C2 — authoritative endpoint-waiter ownership, and the x86_64 direct-IPC production default. CENSUS-DELTA 0.
+
+**199D-WA3C2 — `WAITER_OWNERSHIP_EXCLUSIVE=yes` now holds, and `ipccall_direct_production_enabled()`
+is `cfg!(target_arch = "x86_64")` instead of `const false`.** The census stays **2 / 0 / 2**.
+
+**What WA1-GATE was protecting against.** Stage 199D-WA1-GATE set the direct-IPC production
+default to an unconditional `false` because the endpoint receive-waiter table was not exclusive.
+The direct NR6/NR7 transactions publish the reply record, the provisional server-local reply cap
+and the receiver's user memory BEFORE claiming the endpoint waiter — and the claim *removes* the
+waiter. Between that removal and the transaction's settle, the waiter table says "nobody is
+waiting on this endpoint" while an in-flight transaction is still going to deliver into, and wake,
+that exact incarnation. Nothing recorded the window, so a second receiver could publish into the
+endpoint and become the target of a wake it never earned.
+
+**The wiring is structural, not scattered.** WA2A-R2 shipped `waiter_ownership.rs` with zero
+production callers. WA3C2 wires it inside the two functions that are already the single publish
+point and the single clear point of the authoritative waiter table —
+`IpcSubsystem::publish_endpoint_waiter` and `IpcSubsystem::remove_endpoint_waiter_at`. That is the
+same argument `release_direct_ack_lease` and the waiter census already make in those two bodies: a
+new removal or publication path inherits ownership for free and cannot forget it. ARM and RETIRE
+therefore have production callers on **every** waiter lifecycle edge — publication,
+last-receiver-wins replacement, legacy delivery, ordinary and reply timeout, notification wake,
+endpoint destruction and task death — without one scattered call. CLAIM, CONSUME, CANCEL and
+RESTORE are the explicit half, used where an owner must hold an incarnation across a rank-3
+release: the off-lock NR6/NR7 transactions and the shared-region finalizer claim through
+`SharedKernel::sr_claim_endpoint_waiter_split`, which now takes a `WaiterOwner` and mints the
+token before removing the waiter.
+
+**The exclusivity, and why `arm_current` was not weakened.** A claim keeps the ownership slot
+occupied for the whole off-lock window. `arm_current` refuses an occupied slot, so a publication
+that would take the endpoint out from under a live claim is REFUSED —
+`PublishWaiterOutcome::WaiterOwnershipBusy`, with the waiter table, the direct-ack lease and the
+waiter census all exactly as found. The refusal is decided in a pre-flight
+(`waiter_ownership_publication_admits`) that asks the ownership SLOT rather than the displaced
+record, because the common conflict is precisely the one with no displaced record to look at: an
+empty waiter slot whose incarnation an owner is still driving.
+`block_current_on_receive_with_deadline` is the ONE owner of the busy policy — it reverses ranks 2
+and 1 and answers `WouldBlock`. It is deliberately not the `QueueNonEmpty` answer, which means "a
+message is waiting, dequeue it now"; here the queue is empty, and returning that would send the
+recv loop back for a dequeue that finds nothing and re-blocks into the same claim. The window is
+bounded by the OWNER's settle, which happens on that transaction's own commit or rollback and
+never depends on the refused receiver making progress, so the retry cannot livelock against
+itself.
+
+**The displaced-receiver defect is repaired, and last-receiver-wins is preserved.**
+`publish_recv_waiter_locked` used to log `D2_RECV_WAITER_DISPLACED` and DROP the displaced record,
+leaving the old receiver blocked with neither a waiter nor an owner. Replacement still happens;
+what changed is that the departing incarnation now reaches a terminal ownership state under a named
+owner first — CLAIM(`WaiterOwner::Teardown`) → CANCEL → RETIRE → ARM(new). Claiming first is what
+makes the transition exclusive: if a direct transaction already owns the departing incarnation the
+claim is refused and the whole displacement is refused with it, rather than raced. CANCEL rather
+than CONSUME, because a displaced receiver was abandoned, not delivered to.
+
+**Terminal balance, and the leak WA3C2 closes.** Every claim site now settles on every terminal
+arm. Two arms previously wrote `let _ = claim;` — the direct request's `ServerGone` and the direct
+reply's `CallerGone` — which correctly left the waiter removed but LEAKED the ownership slot,
+wedging that endpoint index against the replacement task about to receive on it. Both now CANCEL.
+`the_ownership_primitive_has_production_callers` censuses this from source: one claim site per
+transaction body, settles counted per body (request 3, reply 6, shared-region finalizer 4), and
+`let _ = claim;` forbidden outright. A recycled endpoint index is handled too:
+`waiter_ownership_retire_superseded` reclaims a slot naming a superseded endpoint generation,
+which no exact key could ever retire — without it a destroyed-and-recreated endpoint would refuse
+every future receiver.
+
+**The gate is removed, and the default is unconfined.** `ipccall_direct_production_enabled()` is
+`cfg!(target_arch = "x86_64")`. Because that term is `true` on x86_64, every consumer —
+`ipccall_direct_admission_enabled`, `ipccall_direct_publication_enabled` and both
+`*_endpoint_admitted` predicates — short-circuits before consulting any oracle endpoint or knob.
+Ordinary production endpoints are admitted; the oracle's provisioned index has no special status
+and the predicate never reads it. The existing selectors still START their workloads; they no
+longer decide admission. `ordinary_production_reaches_direct_nr6_and_nr7_on_x86_64` checks this
+behaviourally with NO selector armed, across four arbitrary endpoint indices, and
+`no_branch_silently_restores_the_production_default` pins that the predicate's whole body is the
+architecture test with no `||`, `&&`, `load(`, `enabled()`, `oracle`, `proof` or `feature = ` term
+in it. `true` on x86_64 only — AArch64 and RISC-V keep the legacy path until their own profiles
+qualify, which is a scope statement, not a gate to re-open.
+
+**The blocked-recv acknowledgement had to become reachable from the split route, or the default
+would have retired it.** The off-lock blocking-IpcRecv route delivered by U9-RX3/RX4 yielded the
+whole receive whenever `ipccall_direct_publication_enabled()` was true, because the NR6/NR7
+acknowledgements could only be published from the broad blocked-recv arm. With the production
+default on, that yield would have fired on every x86_64 boot and silently retired a delivered
+route. The two publication bodies are therefore now shared —
+`publish_ipccall_direct_blocked_server_ack_with` / `publish_ipcreply_direct_blocked_caller_ack_with`,
+parameterised by the receiver ASID and the live-waiter read — so the broad arm and the split route
+run the identical reserve → verify → commit sequence instead of one re-deriving it. The split route
+publishes its own acknowledgements from the same fully-committed recv-v2 point. What still needs a
+broad `&KernelState` stays on the wrappers: the `..._SMP_SERVER_BLOCKED` / `..._SMP_CALLER_BLOCKED`
+markers, which re-verify runqueue absence and home-CPU placement against authoritative broad state.
+While any direct proof/oracle selector is armed the route yields exactly as it did at `894cc5a`;
+that policy has one named owner, `blocked_recv_split_route_yields_to_broad_arm()`, and it is
+deliberately not an admission question, so the split dispatcher's admission logic still carries no
+proof-gate term. On AArch64 the yield is unchanged in full, because that oracle's live round-trip
+depends on blocked-recv work this route does not reproduce.
+
+**Live acceptance.** A default x86_64 core boot with NO direct-oracle feature and NO knob:
+`IPC_DIRECT_PATH_COUNTERS phase=settled dir=nr6 attempts=2 eligible=2 declined_pre_txn=1
+completed=1 failed=0 legacy_fallback=0 balanced=1` and `IPC_DIRECT_ACK_COUNTERS phase=settled
+dir=nr6 reserve=1 commit=1 consume=1 cancel=0 live=0 high_watermark=1` — an ordinary production
+direct NR6 completed off-lock on a production endpoint, with **zero live records at quiescence**
+and every fuse at zero; the split blocking-IpcRecv route stayed live alongside it
+(`IPC_RECV_BLOCK_SPLIT_DONE` n=3). `qemu-x86_64-ap-cross-cpu-reply-smoke.sh` five consecutive
+times, each `STAGE_199_IPCREPLY_DIRECT_SMP_REPLY_USER_SEAL … sender_cpu=1 receiver_cpu=0
+cross_cpu=1 saved_resume=1 ring3_payload_read=1 ring3_metadata_read=1 duplicate_replies_refused=1
+result=ok` and `STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL … cross_cpu_request=1 cross_cpu_reply=1
+request_copies=1 reply_copies=1 server_wakes=1 caller_wakes=1 duplicate_deliveries=0
+duplicate_replies=0 result=ok`. The AP cross-CPU request, user-consume and saved-return profiles,
+`qemu-x86_64-ap-recv-v2-block-smoke.sh`, `qemu-ipccall-reply-direct-x86_64-smoke.sh` and
+`qemu-ipccall-direct-x86_64-smp-request-smoke.sh` all pass. AArch64 and RISC-V core smokes pass, as
+do `qemu-ipccall-reply-direct-aarch64-smoke.sh`, `qemu-ipccall-reply-direct-riscv64-smoke.sh` and
+`qemu-shared-region-direct-riscv64-smoke.sh`.
+
+**Pre-existing failures, measured at `894cc5a` and unchanged here.** Four profiles are red at
+base and at head with **byte-identical failure sets**, compared line-for-line out of an isolated
+`894cc5a` worktree: `qemu-shared-region-direct-x86_64-smoke.sh`,
+`qemu-shared-region-direct-aarch64-smoke.sh` (9 failures each side),
+`qemu-ipc-reply-timeout-x86_64-retirement-smoke.sh` (5 each side) and
+`qemu-x86-exit-current-task-smoke.sh` (40 each side). None is caused or worsened by WA3C2, and
+none is repaired by it.
+
+**Unchanged.** The lock-rank order, the D3 unmap-before-ACK-before-reclaim fence, terminal-fault
+routing, the COW route delivered by U9-COW2, demand PageFault, Spawn/Fork/Exit, endpoint creation,
+the futex features and RPi5 are all untouched. `arm_current` is not weakened, no new syscall, ABI
+lane, cap slot, script, selector, workload or marker family is introduced, and the ownership table
+remains rank-3 co-located with module-private methods reachable only through the typed
+`IpcSubsystem::waiter_ownership_*` surface. **The census remains 2 / 0 / 2** — both terminal
+acquisition sites keep residual classes, so neither is retired. ***U9 remains OPEN.*** WA3C2 is
+CENSUS-DELTA 0, so the canonical stage arithmetic is unchanged; it is the prerequisite 199G/U9
+named, and it is now met.

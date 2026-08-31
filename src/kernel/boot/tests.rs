@@ -3411,13 +3411,16 @@ fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_pl
 
     // Directly inject receiver waiter state: task 1 blocked on recv.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[endpoint_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                ThreadId(1),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            endpoint_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
     state.with_tcbs_mut(|tcbs| {
         if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 1) {
@@ -15725,7 +15728,7 @@ fn sync_endpoint_phase4_helper_rejects_mismatched_waiter() {
         .expect("recv trap");
     // Clear the waiter slot manually to simulate a timeout clearing the slot.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[eid] = None;
+        let _ = ipc.take_endpoint_waiter(eid);
     });
 
     let msg = Message::new(1, b"stale").expect("msg");
@@ -17621,13 +17624,16 @@ fn exit_task_clears_endpoint_receiver_waiter_slot() {
     // the task's WaitReason to EndpointReceive (mirrors what ipc_recv does).
     let asid200 = state.task_asid(200).unwrap_or(crate::kernel::vm::Asid(0));
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(200),
-                asid200,
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(200),
+                    asid200,
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -17700,13 +17706,16 @@ fn mark_task_dead_clears_endpoint_waiter_slot() {
     let (ep_idx, _ep_recv_cap, _ep_send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(202),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(202),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
 
     assert_eq!(state.endpoint_waiter_count(ep_idx), 1, "before");
@@ -18226,13 +18235,16 @@ fn recv_timeout_process_clears_endpoint_waiter_and_deadline() {
 
         // Inject receiver waiter and deadline directly (mirrors ipc_recv_with_deadline internals).
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-                crate::kernel::boot::ReceiverWaiterIdentity::new(
-                    crate::kernel::ipc::ThreadId(280),
-                    crate::kernel::vm::Asid(0),
+            let _ = ipc.set_endpoint_waiter(
+                ep_idx,
+                crate::kernel::boot::EndpointWaiterRecord::new(
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        crate::kernel::ipc::ThreadId(280),
+                        crate::kernel::vm::Asid(0),
+                    ),
+                    1,
                 ),
-                1,
-            ));
+            );
         });
         state
             .with_tcbs_mut(|tcbs| {
@@ -18360,13 +18372,16 @@ fn exit_before_ipc_recv_timeout_clears_waiter_and_deadline() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(282),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(282),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18494,14 +18509,16 @@ fn repeated_recv_timeout_cycles_no_stale_receiver_waiter() {
             state.register_task(tid).expect("register");
 
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[ep_idx] =
-                    Some(crate::kernel::boot::EndpointWaiterRecord::new(
+                let _ = ipc.set_endpoint_waiter(
+                    ep_idx,
+                    crate::kernel::boot::EndpointWaiterRecord::new(
                         crate::kernel::boot::ReceiverWaiterIdentity::new(
                             crate::kernel::ipc::ThreadId(tid),
                             crate::kernel::vm::Asid(0),
                         ),
                         1,
-                    ));
+                    ),
+                );
             });
             state
                 .with_tcbs_mut(|tcbs| {
@@ -18635,13 +18652,16 @@ fn wake_endpoint_waiter_dead_task_does_not_resurrect_task() {
 
     // Simulate a stale entry: Dead task's TID still in waiter slot.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(292),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(292),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
 
     // wake_waiter_for_endpoint should either return WouldBlock or Ok without
@@ -18667,13 +18687,16 @@ fn wake_endpoint_waiter_exited_task_does_not_resurrect_task() {
 
     // exit_task cleared the waiter slot; re-inject to simulate stale pointer.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(293),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(293),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
 
     let _ = state.wake_waiter_for_endpoint(ep_idx);
@@ -18695,13 +18718,16 @@ fn exit_then_mark_dead_waiter_cleanup_is_idempotent() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(300),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(300),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18741,13 +18767,16 @@ fn clear_ipc_waiters_is_idempotent_for_all_waiter_types() {
 
     // Inject in all three waiter types.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(301),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(301),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
         ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
             asid: None,
             send_generation: 0,
@@ -18778,13 +18807,16 @@ fn timeout_fires_then_exit_no_double_disruption() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(302),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(302),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18946,13 +18978,16 @@ fn repeated_mixed_waiter_block_exit_no_stale_state() {
     // TID 315: endpoint receiver waiter
     state.register_task(315).expect("task 315");
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(315),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(315),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -19017,13 +19052,16 @@ fn ipc_deadline_cleared_after_delivery_before_timeout() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-            crate::kernel::boot::ReceiverWaiterIdentity::new(
-                crate::kernel::ipc::ThreadId(318),
-                crate::kernel::vm::Asid(0),
+        let _ = ipc.set_endpoint_waiter(
+            ep_idx,
+            crate::kernel::boot::EndpointWaiterRecord::new(
+                crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    crate::kernel::ipc::ThreadId(318),
+                    crate::kernel::vm::Asid(0),
+                ),
+                1,
             ),
-            1,
-        ));
+        );
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -19077,13 +19115,16 @@ fn repeated_recv_block_timeout_delivery_no_stale_timeout() {
         let deadline = 100 + i;
 
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-                crate::kernel::boot::ReceiverWaiterIdentity::new(
-                    crate::kernel::ipc::ThreadId(tid),
-                    crate::kernel::vm::Asid(0),
+            let _ = ipc.set_endpoint_waiter(
+                ep_idx,
+                crate::kernel::boot::EndpointWaiterRecord::new(
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        crate::kernel::ipc::ThreadId(tid),
+                        crate::kernel::vm::Asid(0),
+                    ),
+                    1,
                 ),
-                1,
-            ));
+            );
         });
         state
             .with_tcbs_mut(|tcbs| {
@@ -20830,14 +20871,16 @@ fn stage24_cnode_teardown_with_endpoint_cap_does_not_leave_receiver_waiter() {
 
             // Inject task 1 as the endpoint receiver waiter.
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[endpoint_idx] =
-                    Some(crate::kernel::boot::EndpointWaiterRecord::new(
+                let _ = ipc.set_endpoint_waiter(
+                    endpoint_idx,
+                    crate::kernel::boot::EndpointWaiterRecord::new(
                         crate::kernel::boot::ReceiverWaiterIdentity::new(
                             ThreadId(1),
                             crate::kernel::vm::Asid(0),
                         ),
                         1,
-                    ));
+                    ),
+                );
             });
             assert_eq!(
                 state.endpoint_waiter_count(endpoint_idx),
@@ -22393,13 +22436,16 @@ fn stage25d_task_exit_clears_endpoint_receiver_waiter() {
             state.register_task(1).expect("task1");
             let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[ep] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(
-                        ThreadId(1),
-                        crate::kernel::vm::Asid(0),
+                let _ = ipc.set_endpoint_waiter(
+                    ep,
+                    crate::kernel::boot::EndpointWaiterRecord::new(
+                        crate::kernel::boot::ReceiverWaiterIdentity::new(
+                            ThreadId(1),
+                            crate::kernel::vm::Asid(0),
+                        ),
+                        1,
                     ),
-                    1,
-                ));
+                );
             });
             assert_eq!(
                 state.endpoint_waiter_count(ep),
@@ -22471,13 +22517,16 @@ fn stage25d_repeated_waiter_cleanup_idempotent() {
             state.register_task(1).expect("task1");
             let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[ep] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(
-                        ThreadId(1),
-                        crate::kernel::vm::Asid(0),
+                let _ = ipc.set_endpoint_waiter(
+                    ep,
+                    crate::kernel::boot::EndpointWaiterRecord::new(
+                        crate::kernel::boot::ReceiverWaiterIdentity::new(
+                            ThreadId(1),
+                            crate::kernel::vm::Asid(0),
+                        ),
+                        1,
                     ),
-                    1,
-                ));
+                );
             });
 
             state.clear_ipc_waiters_for_tid(1);
@@ -50188,14 +50237,16 @@ mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
         });
         // Register task 1 as the endpoint waiter (Phase C clears this slot).
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[endpoint_idx] =
-                Some(crate::kernel::boot::EndpointWaiterRecord::new(
+            let _ = ipc.set_endpoint_waiter(
+                endpoint_idx,
+                crate::kernel::boot::EndpointWaiterRecord::new(
                     crate::kernel::boot::ReceiverWaiterIdentity::new(
                         ThreadId(1),
                         crate::kernel::vm::Asid(0),
                     ),
                     1,
-                ));
+                ),
+            );
         });
 
         // Stash the transfer envelope bound to (recv_endpoint, task 1).
@@ -50892,14 +50943,16 @@ mod stage188d_reply_cap_rank_inversion_seam {
             });
         });
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[endpoint_idx] =
-                Some(crate::kernel::boot::EndpointWaiterRecord::new(
+            let _ = ipc.set_endpoint_waiter(
+                endpoint_idx,
+                crate::kernel::boot::EndpointWaiterRecord::new(
                     crate::kernel::boot::ReceiverWaiterIdentity::new(
                         ThreadId(1),
                         crate::kernel::vm::Asid(0),
                     ),
                     1,
-                ));
+                ),
+            );
         });
 
         let recv_endpoint = state
@@ -63314,7 +63367,7 @@ mod stage193b_ipc_send_plain_oracle {
         );
         // The push is atomic with the publish: it follows the waiter write in the same body.
         let write_at = publish
-            .find("set_endpoint_waiter(endpoint_idx, record)")
+            .find("publish_endpoint_waiter(endpoint_idx, record)")
             .expect("the waiter write");
         let push_at = publish
             .find("proof_send_plain_oracle_coordination_target(endpoint_idx)")
@@ -67776,14 +67829,16 @@ mod stage198e3_shared_region_live {
             });
         });
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[endpoint_idx] =
-                Some(crate::kernel::boot::EndpointWaiterRecord::new(
+            let _ = ipc.set_endpoint_waiter(
+                endpoint_idx,
+                crate::kernel::boot::EndpointWaiterRecord::new(
                     crate::kernel::boot::ReceiverWaiterIdentity::new(
                         ThreadId(1),
                         crate::kernel::vm::Asid(0),
                     ),
                     1,
-                ));
+                ),
+            );
         });
         let endpoint = state
             .resolve_capability_for_task(1, recv_cap_task1)
@@ -68728,12 +68783,20 @@ mod stage198e3b2b_drain_switch {
         // Stage 198E3B2B2: park the waiter as a COMPLETE identity (tid + task 2's bound ASID), so it
         // matches the identity the production finalizer resolves from the snapshot.
         s.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[eidx] = waiter_slot.map(|t| {
-                crate::kernel::boot::EndpointWaiterRecord::new(
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(t), asid),
-                    1,
-                )
-            });
+            match waiter_slot {
+                Some(t) => {
+                    ipc.set_endpoint_waiter(
+                        eidx,
+                        crate::kernel::boot::EndpointWaiterRecord::new(
+                            crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(t), asid),
+                            1,
+                        ),
+                    );
+                }
+                None => {
+                    ipc.take_endpoint_waiter(eidx);
+                }
+            };
         });
         let region = TransferSharedRegion {
             offset: 0,
@@ -68837,13 +68900,16 @@ mod stage198e3b2b_drain_switch {
         // A different task 3 replaced the waiter slot after the producer ran.
         d.shared.with(|k| {
             k.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[d.eidx] = Some(crate::kernel::boot::EndpointWaiterRecord::new(
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(
-                        ThreadId(3),
-                        crate::kernel::vm::Asid(0),
+                let _ = ipc.set_endpoint_waiter(
+                    d.eidx,
+                    crate::kernel::boot::EndpointWaiterRecord::new(
+                        crate::kernel::boot::ReceiverWaiterIdentity::new(
+                            ThreadId(3),
+                            crate::kernel::vm::Asid(0),
+                        ),
+                        1,
                     ),
-                    1,
-                ))
+                );
             })
         });
         assert!(drain(&d).is_err(), "stale finalization fails the drain");
@@ -69113,7 +69179,8 @@ mod stage198e3b2b_drain_switch {
                 .sr_claim_endpoint_waiter_split(
                     d.eidx,
                     egen,
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
                 )
                 .is_none(),
             "a stale endpoint generation cannot be claimed"
@@ -69146,7 +69213,8 @@ mod stage198e3b2b_drain_switch {
                 .sr_claim_endpoint_waiter_split(
                     d.eidx,
                     egen,
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
                 )
                 .is_none(),
             "generation is part of the claim authority — a recreated endpoint is not our endpoint"
@@ -69175,7 +69243,8 @@ mod stage198e3b2b_drain_switch {
                 .sr_claim_endpoint_waiter_split(
                     d.eidx,
                     egen,
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
                 )
                 .is_none(),
             "a different waiter TID cannot be claimed"
@@ -69215,7 +69284,8 @@ mod stage198e3b2b_drain_switch {
                 .sr_claim_endpoint_waiter_split(
                     d.eidx,
                     egen,
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), orig_asid)
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), orig_asid),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
                 )
                 .is_none(),
             "a same-numeric-TID / different-ASID replacement cannot be claimed by the original identity"
@@ -69241,7 +69311,8 @@ mod stage198e3b2b_drain_switch {
                 .sr_claim_endpoint_waiter_split(
                     d.eidx,
                     egen,
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
                 )
                 .is_none(),
             "a missing waiter cannot be claimed"
@@ -69261,7 +69332,8 @@ mod stage198e3b2b_drain_switch {
                 .sr_claim_endpoint_waiter_split(
                     d.eidx,
                     egen,
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(7), d.asid)
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(7), d.asid),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
                 )
                 .is_none(),
             "wrong receiver → claim fails"
@@ -69279,7 +69351,8 @@ mod stage198e3b2b_drain_switch {
                 .sr_claim_endpoint_waiter_split(
                     d.eidx,
                     endpoint_gen(&d) + 5,
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
                 )
                 .is_none(),
             "stale generation → no claim"
@@ -69303,6 +69376,7 @@ mod stage198e3b2b_drain_switch {
                 d.eidx,
                 egen,
                 crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
             )
             .expect("claim");
         assert_eq!(waiter(&d), None, "the claimed waiter is removed");
@@ -69311,7 +69385,8 @@ mod stage198e3b2b_drain_switch {
                 .sr_claim_endpoint_waiter_split(
                     d.eidx,
                     egen,
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
                 )
                 .is_none(),
             "the waiter cannot be claimed twice"
@@ -69331,6 +69406,7 @@ mod stage198e3b2b_drain_switch {
                 d.eidx,
                 egen,
                 crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
             )
             .expect("claim");
         d.shared.with(|k| {
@@ -69375,6 +69451,7 @@ mod stage198e3b2b_drain_switch {
                 d.eidx,
                 egen,
                 crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
             )
             .expect("claim");
         assert_eq!(waiter(&d), None, "claimed");
@@ -69411,6 +69488,7 @@ mod stage198e3b2b_drain_switch {
                 d.eidx,
                 egen,
                 crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
             )
             .expect("claim");
         // Case A: slot free → restore re-installs the claimed waiter (no live task stranded).
@@ -69515,7 +69593,8 @@ mod stage198e3b2b_drain_switch {
                 .sr_claim_endpoint_waiter_split(
                     d.eidx,
                     egen,
-                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
                 )
                 .is_none(),
             "the emptied waiter slot cannot be re-claimed"
@@ -69637,7 +69716,12 @@ mod stage198e3b2b2_waiter_identity {
         // (3) same tid, different asid → no claim, slot untouched.
         assert!(
             shared
-                .sr_claim_endpoint_waiter_split(eidx, egen, ident(2, 99))
+                .sr_claim_endpoint_waiter_split(
+                    eidx,
+                    egen,
+                    ident(2, 99),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
+                )
                 .is_none(),
             "same numeric TID with a different ASID cannot be claimed"
         );
@@ -69649,13 +69733,23 @@ mod stage198e3b2b2_waiter_identity {
         // (4) generation mismatch → no claim.
         assert!(
             shared
-                .sr_claim_endpoint_waiter_split(eidx, egen + 1, ident(2, 7))
+                .sr_claim_endpoint_waiter_split(
+                    eidx,
+                    egen + 1,
+                    ident(2, 7),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
+                )
                 .is_none(),
             "a stale endpoint generation cannot be claimed"
         );
         // (2) exact identity + generation → claim succeeds (remove once).
         let claim = shared
-            .sr_claim_endpoint_waiter_split(eidx, egen, ident(2, 7))
+            .sr_claim_endpoint_waiter_split(
+                eidx,
+                egen,
+                ident(2, 7),
+                crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
+            )
             .expect("exact identity claims");
         assert_eq!(claim.receiver, ident(2, 7));
         assert!(
@@ -69699,7 +69793,12 @@ mod stage198e3b2b2_waiter_identity {
         // Stale finalizer with the ORIGINAL identity: cannot claim/clear the replacement.
         assert!(
             shared
-                .sr_claim_endpoint_waiter_split(eidx, egen, ident(2, 7))
+                .sr_claim_endpoint_waiter_split(
+                    eidx,
+                    egen,
+                    ident(2, 7),
+                    crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery
+                )
                 .is_none(),
             "the stale original identity cannot claim the replacement waiter"
         );
@@ -79559,11 +79658,16 @@ mod stage199a2b2f_wiring {
             "the trap source copy must hold no broad/ranked lock"
         );
         // Publisher: no wake/mint/user-copy/scheduler mutation/retirement marker.
+        //
+        // Stage 199D-WA3C2: the body moved into the shared `publish_*_with` function, so this
+        // follows it. The window is taken in CHARACTERS, not bytes — the surrounding prose
+        // contains non-ASCII, and a byte slice can land mid-codepoint.
         let pubf = MOD_SRC
-            .split("fn maybe_publish_ipccall_direct_blocked_server_ack")
+            .split("fn publish_ipccall_direct_blocked_server_ack_with")
             .nth(1)
             .expect("publisher body");
-        let pubf = &pubf[..pubf.len().min(2000)];
+        let pubf: alloc::string::String = pubf.chars().take(2000).collect();
+        let pubf = pubf.as_str();
         assert!(
             !pubf.contains("enqueue")
                 && !pubf.contains("mint")
@@ -82737,8 +82841,12 @@ mod stage199a2d1_races {
 
         // The reply work item's waiter claim uses the OLD (ack) generation → rejected
         // (generation mismatch); the replacement waiter is never touched.
-        let claim =
-            fx.k.sr_claim_endpoint_waiter_split(eidx, old_egen, ack.caller);
+        let claim = fx.k.sr_claim_endpoint_waiter_split(
+            eidx,
+            old_egen,
+            ack.caller,
+            crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
+        );
         assert!(claim.is_none(), "stale-generation waiter claim rejected");
 
         // The replacement waiter is byte-identical (not mutated / not cleared).
@@ -82749,11 +82857,24 @@ mod stage199a2d1_races {
 
         // Restoring the OLD-generation waiter is refused (cannot re-arm a stale waiter
         // over the newer generation / replacement).
+        // Stage 199D-WA3C2: the stale claim now carries a token too, and the token is
+        // deliberately one no table ever minted — a stale restore must be refused on the
+        // endpoint generation alone, BEFORE ownership is consulted, so an unmintable token
+        // cannot be what saves it.
         let stale_claim = crate::runtime::WaiterClaim {
             eidx,
             generation: old_egen,
             receiver: ack.caller,
             wait_generation: 1,
+            token: crate::kernel::boot::waiter_ownership::WaiterClaimToken::for_test(
+                crate::kernel::boot::waiter_ownership::WaiterKey {
+                    endpoint_index: eidx,
+                    endpoint_generation: old_egen,
+                    waiter: ack.caller,
+                    wait_generation: 1,
+                },
+                crate::kernel::boot::waiter_ownership::WaiterOwner::DirectReply,
+            ),
         };
         assert!(
             !fx.k.sr_restore_endpoint_waiter_split(&stale_claim),
@@ -82795,8 +82916,13 @@ mod stage199a2d1_races {
 
         // Claim the server's endpoint waiter (models "after ack claim").
         let claim =
-            fx.k.sr_claim_endpoint_waiter_split(eidx, egen, fx.server)
-                .expect("server waiter claimed");
+            fx.k.sr_claim_endpoint_waiter_split(
+                eidx,
+                egen,
+                fx.server,
+                crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
+            )
+            .expect("server waiter claimed");
         assert_eq!(claim.receiver, fx.server);
 
         // The server exits before the delivery commit.
@@ -82883,7 +83009,12 @@ mod stage199a2d1_races {
                     .stack_size(8 * 1024 * 1024)
                     .spawn(move || {
                         b.wait();
-                        match k.sr_claim_endpoint_waiter_split(eidx, egen, server) {
+                        match k.sr_claim_endpoint_waiter_split(
+                            eidx,
+                            egen,
+                            server,
+                            crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
+                        ) {
                             Some(_claim) => {
                                 cl.fetch_add(1, O::Relaxed);
                                 match k.sr_commit_blocked_receiver_split(server.tid.0, server.asid)
@@ -85442,7 +85573,7 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "false",
+            "cfg!(target_arch = \"x86_64\")",
             "the whole condition is the target architecture: x86_64 is production-default, \
              every other architecture is not"
         );
@@ -85516,23 +85647,27 @@ mod stage199d_production_default_guards {
             "porting the terminal lease is recorded as future 199E work"
         );
         // AArch64 and RISC-V are explicitly unchanged.
-        // WA1-GATE-DOC-SEAL: the old wording singled out AArch64/RISC-V because x86_64 was the
-        // exception. With the default off everywhere the equivalent statement is stronger, so
-        // this pins the universal form instead of deleting the check.
+        // WA3C2-DOC-SEAL: WA1-GATE's universal fall-back wording is retired with the gate. The
+        // record now names the architecture split, which is what the predicate actually says.
         assert!(
-            doc.contains("Ordinary `IpcCall`/`IpcReply` traffic on **every** architecture, x86_64 included, falls back")
-                && doc.contains("to the legacy path"),
-            "the record states that ordinary traffic falls back on every architecture"
+            doc.contains("`true` on x86_64 only")
+                && doc.contains("AArch64 and RISC-V keep the legacy path"),
+            "the record states which architectures are production-default and which are not"
         );
-        // Stage 199D-WA1-GATE: repointed — the default is OFF while
-        // WAITER_OWNERSHIP_EXCLUSIVE=no, and the explicit proof gate is what admits NR6/NR7.
-        assert!(!crate::kernel::boot::ipccall_direct_production_enabled());
-        // With production off, admission and publication are EXACTLY the proof gate — the
-        // ordinary configuration reaches neither, and the explicit selector reaches both.
+        // Stage 199D-WA3C2: the default is ON for x86_64 and OFF elsewhere.
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64")
+        );
+        // Where production is off, admission and publication are EXACTLY the proof gate: the
+        // ordinary configuration reaches neither, and the explicit selector reaches both. Where
+        // production is on, ordinary traffic is admitted with no selector at all — which is the
+        // whole point of the WA3C2 default, so it is asserted rather than skipped.
         crate::kernel::boot::set_ipccall_direct_proof_enabled(false);
-        assert!(
-            !crate::kernel::boot::ipccall_direct_admission_enabled(),
-            "ordinary production configuration must not reach direct NR6/NR7"
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_admission_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "with no selector armed, admission is exactly the production default"
         );
         crate::kernel::boot::set_ipccall_direct_proof_enabled(true);
         assert!(
@@ -85629,9 +85764,13 @@ mod stage199d_production_default_guards {
     /// proof gate.
     #[test]
     fn acknowledgement_publication_has_no_oracle_or_proof_dependency() {
+        // Stage 199D-WA3C2: the publication BODIES moved into the two shared
+        // `publish_*_with` functions, so the off-lock split blocking-recv route runs the
+        // identical sequence instead of re-deriving it. The broad `maybe_publish_*` wrappers
+        // now supply the two reads and emit the SMP marker. This guard follows the body.
         for publisher in [
-            "pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack",
-            "pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack",
+            "pub(crate) fn publish_ipccall_direct_blocked_server_ack_with",
+            "pub(crate) fn publish_ipcreply_direct_blocked_caller_ack_with",
         ] {
             let body = MODRS
                 .split(publisher)
@@ -85658,6 +85797,41 @@ mod stage199d_production_default_guards {
                 "{publisher}: endpoint filtering is the arch-split admission"
             );
         }
+        // …and each broad wrapper DELEGATES rather than keeping a second copy of the sequence.
+        for (wrapper, shared) in [
+            (
+                "pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack",
+                "publish_ipccall_direct_blocked_server_ack_with",
+            ),
+            (
+                "pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack",
+                "publish_ipcreply_direct_blocked_caller_ack_with",
+            ),
+        ] {
+            let body = MODRS
+                .split(wrapper)
+                .nth(1)
+                .expect("wrapper present")
+                .split("\n/// ")
+                .next()
+                .expect("body bounded");
+            assert!(
+                body.contains(shared),
+                "{wrapper} must delegate to `{shared}`"
+            );
+            assert!(
+                !body.contains("::reserve(") && !body.contains("::commit("),
+                "{wrapper} must not carry a second copy of the reserve/commit sequence"
+            );
+        }
+        // The off-lock split blocking-recv route calls the SAME two bodies, which is what keeps
+        // direct production reachable for receivers that never touch the broad arm.
+        let split = include_str!("../syscall_split.rs");
+        assert!(
+            split.contains("publish_ipccall_direct_blocked_server_ack_with")
+                && split.contains("publish_ipcreply_direct_blocked_caller_ack_with"),
+            "the split blocking-recv route must publish through the shared bodies"
+        );
     }
 
     /// Nothing blocks an otherwise eligible production pair from reserving, committing or
@@ -86068,13 +86242,15 @@ mod stage199d_multi_pair_boundary {
     #[test]
     fn production_publish_sites_reserve_before_they_commit() {
         let src = include_str!("mod.rs");
+        // Stage 199D-WA3C2: both reserve → cancel → commit sequences moved into the shared
+        // `publish_*_with` bodies; the broad wrappers delegate. This guard follows the body.
         for (publisher, module) in [
             (
-                "pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack",
+                "pub(crate) fn publish_ipccall_direct_blocked_server_ack_with",
                 "ipccall_direct_ack",
             ),
             (
-                "pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack",
+                "pub(crate) fn publish_ipcreply_direct_blocked_caller_ack_with",
                 "ipcreply_direct_ack",
             ),
         ] {
@@ -91526,6 +91702,7 @@ mod stage200c_reply_timeout_transaction {
                 identity.reply_endpoint_index,
                 identity.reply_endpoint_generation,
                 caller(fx),
+                crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,
             )
             .is_some()
         {
@@ -92166,8 +92343,7 @@ mod stage200c_reply_timeout_transaction {
                                 if k.sr_claim_endpoint_waiter_split(
                                     identity.reply_endpoint_index,
                                     identity.reply_endpoint_generation,
-                                    caller_id,
-                                )
+                                    caller_id, crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,)
                                 .is_some()
                                 {
                                     if let ReceiverCommit::Committed(aff) =
@@ -107034,6 +107210,10 @@ mod stage199d_waiter_census {
             s.with_ipc_state_mut(|ipc| {
                 for idx in 0..ipc.endpoint_waiters.len() {
                     if ipc.endpoint_waiters[idx].is_some() {
+                        // Deliberately a RAW slot write, not `take_endpoint_waiter`: the whole
+                        // point is to inject the orphan the removal funnel exists to prevent.
+                        // Routing it through the primitive would retire the lease (and, since
+                        // WA3C2, the ownership slot too) and there would be nothing to detect.
                         ipc.endpoint_waiters[idx] = None;
                         break;
                     }
@@ -108071,8 +108251,9 @@ mod stage199d_aarch64_readiness_audit {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "false",
-            "AArch64 stays off until its blockers are closed"
+            "cfg!(target_arch = \"x86_64\")",
+            "AArch64 stays off until its blockers are closed — the predicate names x86_64 and \
+             nothing else, so no AArch64 term can hide in it"
         );
         assert!(
             !cfg!(target_arch = "aarch64")
@@ -108524,7 +108705,7 @@ mod stage199d_split_return_without_broad_lock {
             .split("\n}\n")
             .next()
             .expect("body bounded");
-        assert_eq!(body.trim(), "false");
+        assert_eq!(body.trim(), "cfg!(target_arch = \"x86_64\")");
     }
 }
 
@@ -109267,13 +109448,15 @@ mod stage199d_aarch64_offlock_dispatch {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
-        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
-        // the disabled predicate just as exactly as it pinned the enabled one.
-        assert_eq!(production.trim(), "false");
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "the predicate is false on every architecture"
+        // Stage 199D-WA3C2: the x86_64 production DEFAULT is ON — endpoint-waiter ownership
+        // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
+        // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
+        // disabled one, and it still pins every OTHER architecture off.
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "the predicate is true on x86_64 and false on every other architecture"
         );
         assert_eq!(
             crate::kernel::boot::offlock_authoritative_dispatch_enabled(),
@@ -110847,7 +111030,7 @@ mod stage199d_closure_matrix {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "false",
+            "cfg!(target_arch = \"x86_64\")",
             "x86_64 ON, every other architecture OFF"
         );
     }
@@ -112371,13 +112554,15 @@ mod stage199d_riscv_narrow_trap_snapshots {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
-        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
-        // the disabled predicate just as exactly as it pinned the enabled one.
-        assert_eq!(production.trim(), "false");
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "the predicate is false on every architecture"
+        // Stage 199D-WA3C2: the x86_64 production DEFAULT is ON — endpoint-waiter ownership
+        // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
+        // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
+        // disabled one, and it still pins every OTHER architecture off.
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "the predicate is true on x86_64 and false on every other architecture"
         );
     }
 
@@ -112566,7 +112751,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "false",
+            "cfg!(target_arch = \"x86_64\")",
             "production is x86_64-only, so it is compile-time false on RISC-V"
         );
         assert!(
@@ -112610,7 +112795,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "false",
+            "cfg!(target_arch = \"x86_64\")",
             "production is x86_64-only, so on RISC-V admission adds no term beyond proof"
         );
     }
@@ -112732,13 +112917,15 @@ mod stage199d_riscv_canonical_admission {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
-        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
-        // the disabled predicate just as exactly as it pinned the enabled one.
-        assert_eq!(production.trim(), "false");
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "the predicate is false on every architecture"
+        // Stage 199D-WA3C2: the x86_64 production DEFAULT is ON — endpoint-waiter ownership
+        // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
+        // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
+        // disabled one, and it still pins every OTHER architecture off.
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "the predicate is true on x86_64 and false on every other architecture"
         );
         let admission = MOD_SRC
             .split("pub fn ipccall_direct_admission_enabled() -> bool {")
@@ -113279,13 +113466,15 @@ mod stage199d_riscv_remote_wake_readiness {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
-        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
-        // the disabled predicate just as exactly as it pinned the enabled one.
-        assert_eq!(production.trim(), "false");
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "the predicate is false on every architecture"
+        // Stage 199D-WA3C2: the x86_64 production DEFAULT is ON — endpoint-waiter ownership
+        // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
+        // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
+        // disabled one, and it still pins every OTHER architecture off.
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "the predicate is true on x86_64 and false on every other architecture"
         );
     }
 
@@ -113955,13 +114144,15 @@ mod stage199d_riscv_link2_wake_only_online {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
-        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
-        // the disabled predicate just as exactly as it pinned the enabled one.
-        assert_eq!(production.trim(), "false");
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "the predicate is false on every architecture"
+        // Stage 199D-WA3C2: the x86_64 production DEFAULT is ON — endpoint-waiter ownership
+        // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
+        // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
+        // disabled one, and it still pins every OTHER architecture off.
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "the predicate is true on x86_64 and false on every other architecture"
         );
     }
 }
@@ -114394,13 +114585,15 @@ mod stage199d_runqueue_withdrawal_foundation {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
-        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
-        // the disabled predicate just as exactly as it pinned the enabled one.
-        assert_eq!(production.trim(), "false");
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "the predicate is false on every architecture"
+        // Stage 199D-WA3C2: the x86_64 production DEFAULT is ON — endpoint-waiter ownership
+        // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
+        // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
+        // disabled one, and it still pins every OTHER architecture off.
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "the predicate is true on x86_64 and false on every other architecture"
         );
     }
 }
@@ -114714,13 +114907,15 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
-        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
-        // the disabled predicate just as exactly as it pinned the enabled one.
-        assert_eq!(production.trim(), "false");
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "the predicate is false on every architecture"
+        // Stage 199D-WA3C2: the x86_64 production DEFAULT is ON — endpoint-waiter ownership
+        // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
+        // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
+        // disabled one, and it still pins every OTHER architecture off.
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "the predicate is true on x86_64 and false on every other architecture"
         );
     }
 }
@@ -115586,8 +115781,22 @@ mod stage199d_shared_region_enqueue_rejection {
             .expect("the finalizer");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("end")];
         assert!(
-            body.contains("ReceiverEnqueue::Enqueued { .. } => Some(true),"),
+            body.contains("ReceiverEnqueue::Enqueued { .. } => {")
+                && body.contains("Some(true)")
+                && !body.contains("ReceiverEnqueue::Rejected { .. } => Some(true)"),
             "only a committed enqueue reports a wake"
+        );
+        // Stage 199D-WA3C2: that success arm is also the ONE place the finalizer settles its
+        // waiter-ownership claim as delivered. A wake it did not perform must not consume one.
+        assert!(
+            body.contains("sr_consume_endpoint_waiter_claim_split"),
+            "the committed enqueue consumes the ownership claim"
+        );
+        assert_eq!(
+            body.matches("sr_consume_endpoint_waiter_claim_split")
+                .count(),
+            1,
+            "and consumes it exactly once"
         );
         assert!(
             body.contains("ReceiverEnqueue::Rejected {"),
@@ -115924,21 +116133,44 @@ mod stage199d_wa1_gate {
 
     // ── The gate ────────────────────────────────────────────────────────────────────────────
 
-    /// Ordinary production configuration reaches NEITHER direction; the explicit selector
-    /// reaches BOTH. Behavioural, driven through the real predicates.
+    /// Stage 199D-WA3C2 — the gate is RETIRED, and this is its inverse: with NO selector
+    /// armed, an ordinary configuration reaches BOTH directions on x86_64 and NEITHER
+    /// elsewhere. The explicit selector still reaches both everywhere.
+    ///
+    /// Behavioural, driven through the real predicates — the same ones the trap gates call.
     #[test]
-    fn ordinary_production_cannot_reach_direct_nr6_or_nr7() {
+    fn ordinary_production_reaches_direct_nr6_and_nr7_on_x86_64() {
         use crate::kernel::boot::*;
-        assert!(!ipccall_direct_production_enabled());
+        assert_eq!(
+            ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64")
+        );
         set_ipccall_direct_proof_enabled(false);
-        assert!(
-            !ipccall_direct_admission_enabled(),
-            "ordinary configuration must not reach direct NR6/NR7"
+        assert_eq!(
+            ipccall_direct_admission_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "ordinary configuration reaches direct NR6/NR7 exactly where production is default"
         );
-        assert!(
-            !ipccall_direct_publication_enabled(),
-            "…and must publish no blocked-waiter acknowledgement"
+        assert_eq!(
+            ipccall_direct_publication_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "…and publishes a blocked-waiter acknowledgement in exactly the same places"
         );
+        // Admission is not restricted to the oracle's endpoint. With no selector armed there IS
+        // no oracle endpoint, so an arbitrary index must still be admitted on x86_64 — this is
+        // the "production-default is unconfined" property, checked behaviourally.
+        for eidx in [0usize, 1, 7, 63] {
+            assert_eq!(
+                ipccall_direct_request_endpoint_admitted(eidx),
+                cfg!(target_arch = "x86_64"),
+                "request endpoint {eidx} admission must not depend on an oracle endpoint"
+            );
+            assert_eq!(
+                ipccall_direct_reply_endpoint_admitted(eidx),
+                cfg!(target_arch = "x86_64"),
+                "reply endpoint {eidx} admission must not depend on an oracle endpoint"
+            );
+        }
         set_ipccall_direct_proof_enabled(true);
         assert!(
             ipccall_direct_admission_enabled() && ipccall_direct_publication_enabled(),
@@ -115955,14 +116187,34 @@ mod stage199d_wa1_gate {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the predicate");
-        assert_eq!(body.trim(), "false", "the whole body is `false`");
-        for forbidden in ["target_arch", "cfg!", "||", "&&", "load(", "enabled()"] {
+        assert_eq!(
+            body.trim(),
+            "cfg!(target_arch = \"x86_64\")",
+            "the whole body is the architecture test"
+        );
+        // Stage 199D-WA3C2: `target_arch` / `cfg!` ARE the body now, so they leave the
+        // forbidden set. What stays forbidden is everything that would make the default
+        // something other than a compile-time architecture fact — a second disjunct, a runtime
+        // load, or a call to any other predicate, which is what an oracle/knob dependency
+        // would have to look like.
+        for forbidden in [
+            "||",
+            "&&",
+            "load(",
+            "enabled()",
+            "oracle",
+            "proof",
+            "feature = ",
+        ] {
             assert!(
                 !body.contains(forbidden),
                 "the predicate must carry no `{forbidden}` term"
             );
         }
-        // Admission is exactly the proof gate now.
+        // …and it names exactly one architecture.
+        assert_eq!(body.matches("target_arch").count(), 1);
+        assert!(!body.contains("aarch64") && !body.contains("riscv"));
+        // Admission keeps its form: production OR proof, with production now true on x86_64.
         let adm = MODRS
             .split("pub fn ipccall_direct_admission_enabled() -> bool {")
             .nth(1)
@@ -115971,7 +116223,7 @@ mod stage199d_wa1_gate {
         assert_eq!(
             adm.trim(),
             "ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()",
-            "admission is unchanged in form; only its production term went false"
+            "admission is unchanged in form; only its production term flipped"
         );
     }
 
@@ -116280,47 +116532,198 @@ mod stage199d_wa2a_ownership_boundary {
         &rest[..end]
     }
 
-    // ── Zero production wiring (unchanged from WA2A) ────────────────────────────────────────
+    // ── Stage 199D-WA3C2: production wiring, censused from source ───────────────────────────
 
-    /// **Zero production call sites.** A repo-wide walk: only the primitive's own file, the two
-    /// boot-domain files that declare and initialize the field, the module declaration and this
-    /// guard file may name it.
+    /// **The ownership primitive HAS production callers, and its terminal balance is exact.**
+    ///
+    /// This is the inverse of WA2A-R2's `the_primitive_has_no_production_caller`, and it is
+    /// deliberately a *census* rather than a "nonzero" check: a wiring increment that armed
+    /// without retiring, or claimed without settling, would satisfy "has callers" and still
+    /// wedge every endpoint index it touched.
+    ///
+    /// Recomputed from source on every run — the expectations below are the audited WA3C2
+    /// topology, so moving a call without re-deriving them fails here rather than in QEMU.
     #[test]
-    fn the_primitive_has_no_production_caller() {
-        const OWNERS: &[&str] = &[
-            "src/kernel/boot/waiter_ownership.rs",
-            "src/kernel/boot/defs.rs",
-            "src/kernel/boot/bootstrap_state.rs",
-            "src/kernel/boot/mod.rs",
-        ];
-        let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-        let mut owners_seen = 0usize;
+    fn the_ownership_primitive_has_production_callers() {
+        const OWNERSHIP_MODULE: &str = "src/kernel/boot/waiter_ownership.rs";
+        // Read one production source by repo-relative path, out of the same walk every other
+        // guard in this module uses — so "production" means the same thing here as there.
+        fn production_source(rel: &str) -> alloc::string::String {
+            production_sources()
+                .into_iter()
+                .find(|(r, _)| r == rel)
+                .unwrap_or_else(|| panic!("{rel} not found in the production walk"))
+                .1
+        }
+        // The dormancy fence is GONE. Its presence would mean the module is still dead code.
+        assert!(
+            !OWNERSHIP.contains("#![cfg_attr(not(test), allow(dead_code))]"),
+            "the helper-only dead-code fence must be removed once the primitive is wired"
+        );
+        assert!(
+            !OWNERSHIP.contains("It is helper-only: zero production call sites"),
+            "and the module doc must no longer claim dormancy"
+        );
+
+        // ── The ARM/RETIRE structural edge: one publish point and one clear point. ──────────
+        let ipc = production_source("src/kernel/boot/ipc_state.rs");
+        let publish = ipc
+            .split("pub(crate) fn publish_endpoint_waiter(")
+            .nth(1)
+            .expect("the one publish point")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded");
+        assert!(
+            publish.contains("waiter_ownership_displace(idx, old)"),
+            "a displacement runs the explicit displaced-receiver transition"
+        );
+        assert!(
+            publish.contains("waiter_ownership_reconcile_arrival(idx, record)"),
+            "and the arriving incarnation is armed in the same body"
+        );
+        // The refusal happens BEFORE the waiter table moves, or the unwind would not be a no-op.
+        let refuse_at = publish
+            .find("return (None, admission);")
+            .expect("the busy refusal");
+        let write_at = publish
+            .find("self.endpoint_waiters[idx] = Some(record);")
+            .expect("the waiter write");
+        assert!(
+            refuse_at < write_at,
+            "an ownership refusal must precede every mutation, so the unwind is a true no-op"
+        );
+
+        let remove = ipc
+            .split("fn remove_endpoint_waiter_at(")
+            .nth(1)
+            .expect("the one clear point")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded");
+        assert!(
+            remove.contains("waiter_ownership_reconcile_departure(idx, record)"),
+            "every removal retires the departing incarnation"
+        );
+
+        // ── Terminal balance: every CLAIM site settles on every exit. ───────────────────────
+        let runtime = production_source("src/runtime.rs");
+        assert_eq!(
+            runtime
+                .matches("ipc.waiter_ownership_claim(key, owner)")
+                .count(),
+            1,
+            "`sr_claim_endpoint_waiter_split` is the ONE place a production claim is minted"
+        );
         for (rel, src) in production_sources() {
-            let names = src.contains("waiter_ownership")
-                || src.contains("WaiterOwnershipTable")
-                || src.contains("WaiterClaimToken")
-                || src.contains("WaiterOwner::");
-            if !names {
+            if rel == OWNERSHIP_MODULE || rel == "src/runtime.rs" {
                 continue;
             }
-            if OWNERS.contains(&rel.as_str()) {
-                owners_seen += 1;
-            } else {
-                callers.push(rel);
-            }
+            assert!(
+                !src.contains("waiter_ownership_claim("),
+                "{rel} mints a claim outside the one seam"
+            );
         }
-        assert_eq!(
-            owners_seen,
-            OWNERS.len(),
-            "the walk must have reached every owner — an empty result below would be vacuous"
-        );
+
+        // Each transaction body: claims == 1, and every terminal arm settles.
+        const TXN_BODIES: &[(&str, &str, usize, usize)] = &[
+            // (file, fn header, claim sites, settle sites — consume + cancel + restore)
+            (
+                "src/kernel/ipccall_direct_txn.rs",
+                "pub(crate) fn ipc_call_direct_request_txn(",
+                1,
+                // 1 consume (delivered) + 2 cancel (unreconciled fail-closed, server gone).
+                // The rollback helper's restore/cancel arms live in a separate fn.
+                3,
+            ),
+            (
+                "src/kernel/ipccall_direct_txn.rs",
+                "pub(crate) fn ipc_reply_direct_txn(",
+                1,
+                // 1 consume + 4 cancel (record-consume defence, unreconciled fail-closed,
+                // failed caller restore, caller gone) + 1 restore (rollback).
+                6,
+            ),
+            (
+                "src/runtime.rs",
+                "pub(crate) fn sr_finalize_blocked_receiver_and_wake_split(",
+                1,
+                // 1 consume (enqueued) + 2 cancel (failed restore, receiver gone) + 1 restore.
+                4,
+            ),
+        ];
+        for (rel, header, claims, settles) in TXN_BODIES {
+            let src = production_source(rel);
+            let at = src
+                .find(header)
+                .unwrap_or_else(|| panic!("{rel}: {header} not found"));
+            let body = &src[at..][..src[at..].find("\n    }\n").expect("fn end")];
+            assert_eq!(
+                body.matches("sr_claim_endpoint_waiter_split(").count(),
+                *claims,
+                "{header} must claim exactly {claims} time(s)"
+            );
+            let settled = body
+                .matches("sr_consume_endpoint_waiter_claim_split(")
+                .count()
+                + body
+                    .matches("sr_cancel_endpoint_waiter_claim_split(")
+                    .count()
+                + body.matches("sr_restore_endpoint_waiter_split(").count();
+            assert_eq!(
+                settled, *settles,
+                "{header} must settle its claim on every terminal arm"
+            );
+            // The dropped-claim form WA3C2 removed: a claim discarded without a settle leaks
+            // the ownership slot and wedges the endpoint index against the next receiver.
+            assert!(
+                !body.contains("let _ = claim;"),
+                "{header} must not DROP a claim — settle it (consume / cancel / restore)"
+            );
+        }
+
+        // ── The wired owners each have a production minting site. ───────────────────────────
+        //
+        // Three are minted by their transactions, outside the primitive. `Teardown` is minted
+        // INSIDE it, by `waiter_ownership_displace` — the displaced-receiver transition is a
+        // decision about the state machine, so it belongs with the state machine.
+        for owner in [
+            "WaiterOwner::DirectRequest",
+            "WaiterOwner::DirectReply",
+            "WaiterOwner::LegacyDelivery",
+        ] {
+            let mut sites = 0usize;
+            for (rel, src) in production_sources() {
+                if rel == OWNERSHIP_MODULE {
+                    continue; // the enum's own definition
+                }
+                sites += src.matches(owner).count();
+            }
+            assert!(sites > 0, "`{owner}` must have a production minting site");
+        }
+        let displace = OWNERSHIP
+            .split("pub(crate) fn waiter_ownership_displace(")
+            .nth(1)
+            .expect("the displaced-receiver transition")
+            .split("\n    /// ")
+            .next()
+            .unwrap_or("");
         assert!(
-            callers.is_empty(),
-            "the primitive is helper-only in WA2A-R1; production callers: {callers:?}"
+            displace.contains("self.waiter_ownership_claim(key, WaiterOwner::Teardown)")
+                && displace.contains("self.waiter_ownership_cancel(token)")
+                && displace.contains("self.waiter_ownership_reconcile_departure(idx, departing)"),
+            "the displacement must be CLAIM(Teardown) -> CANCEL -> RETIRE, in that order"
         );
+        let claim_at = displace.find("waiter_ownership_claim(").expect("claim");
+        let cancel_at = displace.find("waiter_ownership_cancel(").expect("cancel");
         assert!(
-            OWNERSHIP.contains("#![cfg_attr(not(test), allow(dead_code))]"),
-            "the helper-only marker must be present while there are no callers"
+            claim_at < cancel_at,
+            "the claim asserts exclusivity BEFORE the departing incarnation is ended"
+        );
+        // `arm_current` is NOT weakened: the displacement retires, it never overwrites.
+        assert!(
+            !displace.contains("arm_current"),
+            "a displacement may not arm over an occupied slot"
         );
     }
 
@@ -116487,6 +116890,14 @@ mod stage199d_wa2a_ownership_boundary {
             "waiter_ownership_view",
             "waiter_ownership_claimed_count",
             "waiter_ownership_occupied_count",
+            // Stage 199D-WA3C2 — the structural reconciliation surface. It lives on
+            // `IpcSubsystem` like the rest, so it inherits the same rank-3 requirement.
+            "waiter_ownership_key_for",
+            "waiter_ownership_reconcile_departure",
+            "waiter_ownership_reconcile_arrival",
+            "waiter_ownership_retire_superseded",
+            "waiter_ownership_publication_admits",
+            "waiter_ownership_displace",
         ] {
             assert!(
                 surface.contains(&alloc::format!("pub(crate) fn {method}(")),
@@ -116495,7 +116906,7 @@ mod stage199d_wa2a_ownership_boundary {
         }
         assert_eq!(
             surface.matches("pub(crate) fn ").count(),
-            9,
+            15,
             "and nothing else is exposed"
         );
     }
@@ -116547,7 +116958,15 @@ mod stage199d_wa2a_ownership_boundary {
         // declaration and the single struct-literal initializer.
         let mut namers: alloc::vec::Vec<alloc::string::String> = production_sources()
             .into_iter()
-            .filter(|(rel, src)| rel != OWNERSHIP_MODULE && src.contains("waiter_ownership:"))
+            // `waiter_ownership:` is the FIELD; `waiter_ownership::` is the module PATH, which
+            // WA3C2's callers legitimately name to reach `WaiterOwner` / `WaiterKey` /
+            // `WaiterClaimToken`. Naming a public type is not naming the field.
+            .filter(|(rel, src)| {
+                rel != OWNERSHIP_MODULE
+                    && src
+                        .match_indices("waiter_ownership:")
+                        .any(|(at, _)| !src[at..].starts_with("waiter_ownership::"))
+            })
             .map(|(rel, _)| rel)
             .collect();
         namers.sort();
@@ -116697,12 +117116,36 @@ mod stage199d_wa2a_ownership_boundary {
 
     /// No ownership mutation is reachable through the task, scheduler, capability, VM or
     /// broad-state APIs: outside the ownership module nothing in the tree names the methods.
+    ///
+    /// Stage 199D-WA3C2: the primitive is wired now, so this can no longer be "nobody names the
+    /// methods". It is instead an EXHAUSTIVE ALLOW-LIST, and the argument is unchanged — every
+    /// one of these methods takes `&mut IpcSubsystem`, which only the ipc rank-3 guard hands
+    /// out, so a task/scheduler/capability/VM/broad-state API cannot call one even if it wanted
+    /// to. The list is what stops a *new* file quietly joining them.
     #[test]
     fn no_ownership_mutation_is_reachable_through_a_non_ipc_domain_api() {
+        fn production_source(rel: &str) -> alloc::string::String {
+            production_sources()
+                .into_iter()
+                .find(|(r, _)| r == rel)
+                .unwrap_or_else(|| panic!("{rel} not found in the production walk"))
+                .1
+        }
+        // Only `runtime.rs` names the six raw operations outside the primitive: it holds the
+        // one claim seam and the two settle seams, each strictly inside `with_ipc_split_mut`.
+        //
+        // `ipc_state.rs` — the two structural funnels — deliberately does NOT. It calls the
+        // reconciliation entry points instead, which live in the ownership module and decide
+        // there what each waiter-table edge means. That is the whole point of the reconciliation
+        // surface: `ipc_state` supplies the edge, the primitive supplies the state machine, and
+        // no second copy of the transition rules exists.
+        const RANK3_CALLERS: &[&str] = &["src/runtime.rs"];
+        let mut callers_seen: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
             if rel == "src/kernel/boot/waiter_ownership.rs" {
                 continue;
             }
+            let mut names_any = false;
             for method in [
                 "waiter_ownership_arm_current",
                 "waiter_ownership_claim",
@@ -116711,11 +117154,48 @@ mod stage199d_wa2a_ownership_boundary {
                 "waiter_ownership_cancel",
                 "waiter_ownership_retire_current",
             ] {
+                if src.contains(method) {
+                    names_any = true;
+                    assert!(
+                        RANK3_CALLERS.contains(&rel.as_str()),
+                        "{rel} must not reach ownership mutation (`{method}`)"
+                    );
+                }
+            }
+            if names_any {
+                callers_seen.push(rel);
+            }
+        }
+        callers_seen.sort();
+        assert_eq!(
+            callers_seen,
+            alloc::vec!["src/runtime.rs".to_string()],
+            "the allow-list must be exactly the one rank-3 caller file — no more, and not \
+             fewer (a vacuous pass would mean the wiring vanished)"
+        );
+        // Every mutation in that file is inside a rank-3 acquisition.
+        for rel in RANK3_CALLERS {
+            let src = production_source(rel);
+            for (at, _) in src.match_indices("waiter_ownership_claim(") {
                 assert!(
-                    !src.contains(method),
-                    "{rel} must not reach ownership mutation (`{method}`)"
+                    src[..at].contains("with_ipc_split_mut")
+                        || src[..at].contains("with_ipc_state_mut"),
+                    "{rel} claims ownership without a preceding rank-3 acquisition"
                 );
             }
+        }
+        // …and `ipc_state.rs` reaches the primitive through the reconciliation surface, which
+        // is what makes ARM and RETIRE structural rather than scattered.
+        let ipc_state = production_source("src/kernel/boot/ipc_state.rs");
+        for entry in [
+            "waiter_ownership_displace(",
+            "waiter_ownership_reconcile_departure(",
+            "waiter_ownership_reconcile_arrival(",
+        ] {
+            assert!(
+                ipc_state.contains(entry),
+                "the waiter funnels must reconcile ownership through `{entry}`"
+            );
         }
         // And the primitive itself never enters another domain.
         for forbidden in [
@@ -117134,17 +117614,25 @@ mod stage199d_wa2a_ownership_boundary {
         }
     }
 
-    /// Every WA1-GATE status figure is intact.
+    /// Stage 199D-WA3C2 — the status figures the gate's retirement changes, and the ones it
+    /// does not.
     #[test]
-    fn the_wa1_gate_status_is_unchanged() {
+    fn the_wa3c2_production_status_is_recorded() {
         let production = MODRS
             .split("pub const fn ipccall_direct_production_enabled() -> bool {")
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the predicate");
-        assert_eq!(production.trim(), "false");
-        assert!(!crate::kernel::boot::ipccall_direct_production_enabled());
-        assert!(AUDIT.contains("WAITER_OWNERSHIP_EXCLUSIVE=no"));
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64")
+        );
+        assert!(
+            AUDIT.contains("WAITER_OWNERSHIP_EXCLUSIVE=yes` now holds"),
+            "the audit must record the exclusivity WA3C2 established, in the WA3C2 section — \
+             not the forward-looking mention an earlier section made of it"
+        );
         assert!(AUDIT.contains("39 / 7 / 46") && STATUS.contains("39 / 7 / 46"));
         assert!(
             AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
@@ -118270,6 +118758,17 @@ mod stage199d_wa2b_wake_owner_census {
                     // logical wake origin — recorded here rather than suppressed.
                     ("src/kernel/boot/ipc_state.rs", "destroy_endpoint", 1),
                     ("src/kernel/boot/ipc_state.rs", "recv_block_unwind_race", 1),
+                    // Stage 199D-WA3C2: the OWNERSHIP-BUSY unwind. When an in-flight direct
+                    // transaction still holds the endpoint's previous receive incarnation, the
+                    // publish is refused and the receiver's rank-2/rank-1 block is reversed —
+                    // the same reversal the race unwind performs, and for the same reason
+                    // (nothing was published). A new direct caller of this body, recorded here
+                    // rather than folded into the race row.
+                    (
+                        "src/kernel/boot/ipc_state.rs",
+                        "block_current_on_receive_with_deadline",
+                        1,
+                    ),
                     (
                         "src/kernel/boot/ipc_state.rs",
                         "wake_waiter_for_endpoint",
@@ -120843,7 +121342,10 @@ mod stage199d_wa3c1_waiter_record {
             ipc.contains("D2_RECV_WAITER_DISPLACED"),
             "WA3C1 preserves replacement semantics"
         );
-        // Ownership remains helper-only: ZERO production callers.
+        // Stage 199D-WA3C2 — ownership is WIRED. WA3C1's dormancy assertion is replaced by its
+        // exact inverse: each of the six operations must have at least one production caller.
+        // `the_ownership_primitive_has_production_callers` censuses the per-site topology and
+        // terminal balance; this one only pins that none of the six fell back to dormant.
         for op in [
             "waiter_ownership_arm_current",
             "waiter_ownership_claim",
@@ -120852,15 +121354,32 @@ mod stage199d_wa3c1_waiter_record {
             "waiter_ownership_restore",
             "waiter_ownership_retire_current",
         ] {
+            let mut sites = 0usize;
             for (rel, src) in super::stage199d_wa2a_ownership_boundary::production_sources() {
+                let needle = alloc::format!("{op}(");
                 if rel == "src/kernel/boot/waiter_ownership.rs" {
-                    continue; // the primitive's own definition
+                    // Inside the primitive, a call is a caller only if it is NOT the wrapper's
+                    // own definition line, and not the wrapper's delegation into the table. The
+                    // reconciliation entry points live here on purpose, and `ipc_state.rs`
+                    // calls THEM — proven by
+                    // `no_ownership_mutation_is_reachable_through_a_non_ipc_domain_api`.
+                    sites += src
+                        .match_indices(needle.as_str())
+                        .filter(|(at, _)| !src[..*at].trim_end().ends_with("fn"))
+                        .count()
+                        .saturating_sub(
+                            src.matches(&alloc::format!("self.waiter_ownership.{op}"))
+                                .count(),
+                        );
+                } else {
+                    sites += src.matches(needle.as_str()).count();
                 }
-                assert!(
-                    !src.contains(&alloc::format!("{op}(")),
-                    "{rel} calls `{op}` — WA3C1 keeps the ownership primitive helper-only"
-                );
             }
+            assert!(
+                sites > 0,
+                "`{op}` has no production caller — WA3C2 requires every ownership operation \
+                 to be wired, not merely available"
+            );
         }
     }
 
@@ -125472,9 +125991,9 @@ mod u3_ordinary_cap_sender_wake {
         let mod_rs = include_str!("mod.rs");
         assert!(
             mod_rs.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    false\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
             ),
-            "direct production must remain an unconditional false"
+            "direct production is the target architecture and nothing else"
         );
     }
 }
@@ -125590,16 +126109,22 @@ mod u4_cross_arch_queue_advancing_dispatch {
         assert!(queue_advancing_dispatch_enabled(), "restored");
     }
 
-    /// Direct production stays false and cannot influence the new predicate: the predicate does
-    /// not consult direct admission at all, unlike `offlock_authoritative_dispatch_enabled`.
+    /// Direct production cannot influence the new predicate: the predicate does not consult
+    /// direct admission at all, unlike `offlock_authoritative_dispatch_enabled`.
+    ///
+    /// Stage 199D-WA3C2 turns direct production ON for x86_64, which makes this the load-bearing
+    /// form of the check — the independence is now observable rather than vacuous.
     #[test]
-    fn direct_production_is_off_and_cannot_affect_the_predicate() {
-        assert!(!ipccall_direct_production_enabled());
+    fn direct_production_cannot_affect_the_predicate() {
+        assert_eq!(
+            ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64")
+        );
         assert!(
             MOD_SRC.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    false\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
             ),
-            "direct production must remain an unconditional false"
+            "direct production is the target architecture and nothing else"
         );
         let body = body_of(
             MOD_SRC,
@@ -125957,9 +126482,16 @@ mod u4_cross_arch_queue_advancing_dispatch {
 
     // ── 16/17: scope ─────────────────────────────────────────────────────────────────────
 
+    /// Stage 199D-WA3C2 replaces U4's dormancy scope guard with its inverse, keeping the same
+    /// intent: the ownership primitive must stay OUT of the two terminal trap dispatchers.
+    ///
+    /// Wiring it was WA3C2's mission, so "no production caller anywhere" is no longer the
+    /// property to hold. What U4 actually protects is that the arch trap entries do not grow
+    /// IPC-domain state transitions of their own — ownership is settled by the transactions and
+    /// the waiter funnels, under rank 3, never by a dispatcher.
     #[test]
-    fn no_waiter_ownership_primitive_gains_a_production_caller() {
-        for src in [MOD_SRC, IPC_STATE, TRAP_ENTRY, RISCV_TRAP, RUNTIME] {
+    fn the_waiter_ownership_primitive_stays_out_of_the_trap_dispatchers() {
+        for src in [TRAP_ENTRY, RISCV_TRAP] {
             for op in [
                 ".waiter_ownership_arm_current(",
                 ".waiter_ownership_claim(",
@@ -125967,10 +126499,28 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 ".waiter_ownership_restore(",
                 ".waiter_ownership_cancel(",
                 ".waiter_ownership_retire_current(",
+                ".waiter_ownership_displace(",
             ] {
-                assert!(!src.contains(op), "`{op}` must gain no production caller");
+                assert!(
+                    !src.contains(op),
+                    "`{op}` must not be reachable from a terminal trap dispatcher"
+                );
             }
         }
+        // Positive control: the wiring exists where it belongs, so the scan above is not
+        // passing merely because the primitive went dormant again.
+        assert!(
+            RUNTIME.contains(".waiter_ownership_claim(")
+                && RUNTIME.contains(".waiter_ownership_consume(")
+                && RUNTIME.contains(".waiter_ownership_cancel(")
+                && RUNTIME.contains(".waiter_ownership_restore("),
+            "the off-lock transactions must still own their claims"
+        );
+        assert!(
+            IPC_STATE.contains("waiter_ownership_reconcile_arrival(")
+                && IPC_STATE.contains("waiter_ownership_reconcile_departure("),
+            "the waiter funnels must still reconcile ownership"
+        );
     }
 
     // ── U4-CLOSE: the two genuine blocking-send origins, through the REAL production entry ──
@@ -128347,9 +128897,9 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 }
                 assert!(
                     MOD_SRC.contains(
-                        "pub const fn ipccall_direct_production_enabled() -> bool {\n    false\n}"
+                        "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
                     ),
-                    "direct production stays an unconditional false"
+                    "direct production is the target architecture and nothing else"
                 );
                 // The general capability-rollback family is untouched by this increment.
                 assert!(
@@ -129288,14 +129838,16 @@ mod u8_production_timeout_coverage {
             s.register_task(70).expect("task");
             let (ep_idx, _send, recv_cap) = s.create_endpoint(4).expect("endpoint");
             s.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[ep_idx] =
-                    Some(crate::kernel::boot::EndpointWaiterRecord::new(
+                let _ = ipc.set_endpoint_waiter(
+                    ep_idx,
+                    crate::kernel::boot::EndpointWaiterRecord::new(
                         crate::kernel::boot::ReceiverWaiterIdentity::new(
                             crate::kernel::ipc::ThreadId(70),
                             crate::kernel::vm::Asid(0),
                         ),
                         1,
-                    ));
+                    ),
+                );
             });
             s.with_tcbs_mut(|tcbs| {
                 let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 70).unwrap();
@@ -139817,18 +140369,20 @@ mod u9qa_not_retired {
         );
     }
 
-    /// Direct IpcCall production stays off.
+    /// Direct IpcCall production is a compile-time architecture constant, and U9-QA did not
+    /// touch it. Stage 199D-WA3C2 set it to x86_64; this pins the shape, not a stale value.
     #[test]
-    fn direct_production_remains_false() {
+    fn direct_production_remains_a_compile_time_architecture_constant() {
         assert!(
             MOD_SRC.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    false\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
             ),
-            "direct-IpcCall production must remain a compile-time false"
+            "direct-IpcCall production must remain a compile-time architecture constant"
         );
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "and must evaluate false"
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            cfg!(target_arch = "x86_64"),
+            "and must evaluate to the target architecture"
         );
     }
 }
@@ -143560,5 +144114,495 @@ mod u9cow2_route {
             TRAP_SRC.contains("Ok(cow_result.unwrap_or(Ok(())))"),
             "the bridge must carry the route's own result, exactly as the broad arm would"
         );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// Stage 199D-WA3C2 — the endpoint-waiter ownership lifecycle, WIRED.
+//
+// WA2A-R2 proved the primitive's state machine in isolation. What this module proves is the
+// thing that actually made `WAITER_OWNERSHIP_EXCLUSIVE=no` true: that every production edge of
+// the waiter table now moves the ownership slot with it, that a claim survives the rank-3
+// release, and that a publication which would take an endpoint out from under a live claim is
+// REFUSED rather than performed.
+//
+// Every test drives the PRODUCTION seams — `set_endpoint_waiter` / `take_endpoint_waiter` /
+// `clear_endpoint_waiter*` / `publish_recv_waiter_locked` / `sr_claim_endpoint_waiter_split` —
+// never the table's own methods. A test that reached past them would prove the state machine
+// again and the wiring not at all.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod stage199d_wa3c2_ownership_wiring {
+    use super::*;
+    use crate::kernel::boot::waiter_ownership::{WaiterOwner, WaiterOwnershipView, WaiterSlotKind};
+    use crate::kernel::boot::{EndpointWaiterRecord, ReceiverWaiterIdentity};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::vm::Asid;
+
+    fn ident(tid: u64, asid: u16) -> ReceiverWaiterIdentity {
+        ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+
+    fn rec(tid: u64, asid: u16, wait_gen: u64) -> EndpointWaiterRecord {
+        EndpointWaiterRecord::new(ident(tid, asid), wait_gen)
+    }
+
+    /// The ownership view of whatever incarnation `record` names at `eidx`.
+    fn view(state: &KernelState, eidx: usize, record: EndpointWaiterRecord) -> WaiterOwnershipView {
+        state.with_ipc_state(|ipc| {
+            let key = ipc
+                .waiter_ownership_key_for(eidx, record)
+                .expect("the endpoint index has an ownership slot");
+            ipc.waiter_ownership_view(&key)
+        })
+    }
+
+    fn occupied(state: &KernelState) -> usize {
+        state.with_ipc_state(|ipc| ipc.waiter_ownership_occupied_count())
+    }
+
+    fn claimed(state: &KernelState) -> usize {
+        state.with_ipc_state(|ipc| ipc.waiter_ownership_claimed_count())
+    }
+
+    /// A kernel with one endpoint, and the endpoint's index.
+    fn fixture() -> (KernelState, usize) {
+        let mut state = Bootstrap::init().expect("init");
+        let (eidx, _send, _recv) = state.create_endpoint(4).expect("ep");
+        (state, eidx)
+    }
+
+    // ── 1. ARM is structural: publishing a waiter arms its exact incarnation ────────────────
+
+    #[test]
+    fn publishing_a_waiter_arms_its_exact_incarnation() {
+        let (mut state, eidx) = fixture();
+        assert_eq!(occupied(&state), 0, "a fresh kernel arms nothing");
+        let r = rec(1, 7, 3);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, r);
+        });
+        assert_eq!(
+            view(&state, eidx, r),
+            WaiterOwnershipView::Available,
+            "the published incarnation is armed and unclaimed"
+        );
+        assert_eq!(occupied(&state), 1);
+        assert_eq!(claimed(&state), 0);
+    }
+
+    /// A DIFFERENT incarnation of the same endpoint is foreign, never claimable.
+    #[test]
+    fn a_different_incarnation_of_the_same_endpoint_is_foreign() {
+        let (mut state, eidx) = fixture();
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
+        });
+        for other in [rec(1, 7, 4), rec(1, 8, 3), rec(2, 7, 3)] {
+            assert!(
+                matches!(
+                    view(&state, eidx, other),
+                    WaiterOwnershipView::ForeignIncarnation { .. }
+                ),
+                "a different tid / asid / wait generation is a different incarnation"
+            );
+        }
+    }
+
+    // ── 2. RETIRE is structural, on every removal family ────────────────────────────────────
+
+    #[test]
+    fn every_removal_family_retires_the_incarnation() {
+        // `take`, exact-identity clear, and identity-wide clear each funnel through the one
+        // removal body, so each must return the slot to `Vacant`.
+        for family in 0..3 {
+            let (mut state, eidx) = fixture();
+            let r = rec(1, 7, 3);
+            state.with_ipc_state_mut(|ipc| {
+                ipc.set_endpoint_waiter(eidx, r);
+            });
+            assert_eq!(occupied(&state), 1, "family {family}: armed");
+            state.with_ipc_state_mut(|ipc| match family {
+                0 => {
+                    ipc.take_endpoint_waiter(eidx);
+                }
+                1 => {
+                    ipc.clear_endpoint_waiter_if_identity(eidx, ident(1, 7));
+                }
+                _ => ipc.clear_endpoint_waiters_for_identity(ident(1, 7)),
+            });
+            assert_eq!(
+                view(&state, eidx, r),
+                WaiterOwnershipView::Vacant,
+                "family {family}: the departing incarnation is retired"
+            );
+            assert_eq!(
+                occupied(&state),
+                0,
+                "family {family}: quiescent occupancy returns to zero"
+            );
+        }
+    }
+
+    /// A refused exact-identity clear removes nothing and retires nothing.
+    #[test]
+    fn a_refused_clear_leaves_the_incarnation_armed() {
+        let (mut state, eidx) = fixture();
+        let r = rec(1, 7, 3);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, r);
+        });
+        let cleared = state
+            .with_ipc_state_mut(|ipc| ipc.clear_endpoint_waiter_if_identity(eidx, ident(2, 7)));
+        assert!(!cleared, "a foreign identity clears nothing");
+        assert_eq!(view(&state, eidx, r), WaiterOwnershipView::Available);
+        assert_eq!(occupied(&state), 1);
+    }
+
+    // ── 3. The displaced-receiver transition ────────────────────────────────────────────────
+
+    /// Last-receiver-wins is PRESERVED, and the departing incarnation now reaches a terminal
+    /// ownership state under a named owner instead of being dropped.
+    #[test]
+    fn a_displacement_retires_the_departing_and_arms_the_arriving() {
+        let (mut state, eidx) = fixture();
+        let old = rec(1, 7, 3);
+        let new = rec(2, 9, 5);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, old);
+        });
+        let displaced = state.with_ipc_state_mut(|ipc| ipc.set_endpoint_waiter(eidx, new));
+        assert_eq!(displaced, Some(old), "last-receiver-wins is preserved");
+        assert_eq!(
+            view(&state, eidx, old),
+            WaiterOwnershipView::ForeignIncarnation {
+                holding: WaiterSlotKind::Available
+            },
+            "the departing incarnation no longer holds the slot"
+        );
+        assert_eq!(
+            view(&state, eidx, new),
+            WaiterOwnershipView::Available,
+            "the arriving incarnation is armed"
+        );
+        assert_eq!(
+            occupied(&state),
+            1,
+            "a displacement is net zero — one slot, not two"
+        );
+    }
+
+    /// The publish policy both routes share reports the displacement rather than swallowing it.
+    #[test]
+    fn the_publish_policy_displaces_and_reports_published() {
+        use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
+        let (mut state, eidx) = fixture();
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
+        });
+        let outcome = state.with_ipc_state_mut(|ipc| {
+            super::super::ipc_state::publish_recv_waiter_locked(
+                ipc,
+                eidx,
+                rec(2, 9, 5),
+                crate::kernel::capabilities::CapId(0),
+            )
+        });
+        assert_eq!(outcome, PublishWaiterOutcome::Published);
+        assert_eq!(occupied(&state), 1);
+    }
+
+    // ── 4. A CLAIM is exclusive, and it survives the rank-3 release ─────────────────────────
+
+    #[test]
+    fn a_claim_keeps_the_slot_occupied_while_the_waiter_is_gone() {
+        let (mut state, eidx) = fixture();
+        let r = rec(1, 7, 3);
+        let egen = state.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, r);
+        });
+        let shared = crate::runtime::SharedKernel::new(state);
+        let claim = shared
+            .sr_claim_endpoint_waiter_split(eidx, egen, ident(1, 7), WaiterOwner::DirectRequest)
+            .expect("the armed incarnation is claimable");
+        shared.with(|state| {
+            assert!(
+                state.with_ipc_state(|ipc| ipc.endpoint_waiter_record(eidx).is_none()),
+                "the claim removed the waiter"
+            );
+            assert_eq!(
+                view(state, eidx, r),
+                WaiterOwnershipView::Claimed {
+                    owner: WaiterOwner::DirectRequest
+                },
+                "…but the ownership slot is still occupied, by its owner"
+            );
+            assert_eq!(claimed(state), 1);
+        });
+        // THE EXCLUSIVITY: a second claim of the same incarnation is refused.
+        assert!(
+            shared
+                .sr_claim_endpoint_waiter_split(eidx, egen, ident(1, 7), WaiterOwner::DirectReply)
+                .is_none(),
+            "an incarnation another owner is driving is never claimed twice"
+        );
+        // Settle, so the fixture does not leave a wedged slot behind.
+        assert!(shared.sr_consume_endpoint_waiter_claim_split(&claim));
+    }
+
+    /// A stale endpoint generation and a replaced ASID are both refused — before any mutation.
+    #[test]
+    fn a_stale_generation_or_replaced_identity_is_never_claimed() {
+        let (mut state, eidx) = fixture();
+        let egen = state.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
+        });
+        let shared = crate::runtime::SharedKernel::new(state);
+        assert!(
+            shared
+                .sr_claim_endpoint_waiter_split(
+                    eidx,
+                    egen.wrapping_add(5),
+                    ident(1, 7),
+                    WaiterOwner::DirectRequest
+                )
+                .is_none(),
+            "a recycled endpoint generation is not this incarnation"
+        );
+        assert!(
+            shared
+                .sr_claim_endpoint_waiter_split(eidx, egen, ident(1, 8), WaiterOwner::DirectRequest)
+                .is_none(),
+            "a replacement task reusing the numeric TID is not this incarnation"
+        );
+        shared.with(|state| {
+            assert!(
+                state.with_ipc_state(|ipc| ipc.endpoint_waiter_record(eidx).is_some()),
+                "a refused claim mutates nothing"
+            );
+            assert_eq!(claimed(state), 0);
+        });
+    }
+
+    // ── 5. THE REFUSAL: no publication into an endpoint under a live claim ──────────────────
+
+    #[test]
+    fn a_publication_over_a_live_claim_is_refused_with_zero_mutation() {
+        use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
+        let (mut state, eidx) = fixture();
+        let egen = state.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
+        });
+        let shared = crate::runtime::SharedKernel::new(state);
+        let claim = shared
+            .sr_claim_endpoint_waiter_split(eidx, egen, ident(1, 7), WaiterOwner::DirectRequest)
+            .expect("claim");
+        let linked_before = crate::kernel::direct_ack_census::waiters_current();
+        shared.with(|state| {
+            let outcome = state.with_ipc_state_mut(|ipc| {
+                super::super::ipc_state::publish_recv_waiter_locked(
+                    ipc,
+                    eidx,
+                    rec(2, 9, 5),
+                    crate::kernel::capabilities::CapId(0),
+                )
+            });
+            assert_eq!(
+                outcome,
+                PublishWaiterOutcome::WaiterOwnershipBusy,
+                "a second receiver may not take an endpoint an owner is still driving"
+            );
+            // ZERO mutation — the waiter table, the census and the ownership slot are as found.
+            assert!(
+                state.with_ipc_state(|ipc| ipc.endpoint_waiter_record(eidx).is_none()),
+                "the refused publish installed no waiter"
+            );
+            assert_eq!(
+                view(state, eidx, rec(1, 7, 3)),
+                WaiterOwnershipView::Claimed {
+                    owner: WaiterOwner::DirectRequest
+                },
+                "the owner still holds its incarnation"
+            );
+        });
+        assert_eq!(
+            crate::kernel::direct_ack_census::waiters_current(),
+            linked_before,
+            "a refused publish moves the waiter census by zero"
+        );
+        // Once the owner settles, the same publication succeeds — the window is bounded by the
+        // OWNER's completion, never by the refused receiver's progress.
+        assert!(shared.sr_consume_endpoint_waiter_claim_split(&claim));
+        shared.with(|state| {
+            let outcome = state.with_ipc_state_mut(|ipc| {
+                super::super::ipc_state::publish_recv_waiter_locked(
+                    ipc,
+                    eidx,
+                    rec(2, 9, 5),
+                    crate::kernel::capabilities::CapId(0),
+                )
+            });
+            assert_eq!(outcome, PublishWaiterOutcome::Published);
+            assert_eq!(occupied(state), 1, "and exactly one incarnation is armed");
+        });
+    }
+
+    // ── 6. Settling: CONSUME, CANCEL and RESTORE each return the slot to a usable state ─────
+
+    #[test]
+    fn consume_retires_the_incarnation_and_frees_the_endpoint() {
+        let (mut state, eidx) = fixture();
+        let egen = state.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
+        });
+        let shared = crate::runtime::SharedKernel::new(state);
+        let claim = shared
+            .sr_claim_endpoint_waiter_split(eidx, egen, ident(1, 7), WaiterOwner::DirectRequest)
+            .expect("claim");
+        assert!(shared.sr_consume_endpoint_waiter_claim_split(&claim));
+        shared.with(|state| {
+            assert_eq!(view(state, eidx, rec(1, 7, 3)), WaiterOwnershipView::Vacant);
+            assert_eq!(occupied(state), 0, "quiescent ownership count is zero");
+        });
+    }
+
+    #[test]
+    fn cancel_retires_the_incarnation_when_the_receiver_vanished() {
+        let (mut state, eidx) = fixture();
+        let egen = state.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
+        });
+        let shared = crate::runtime::SharedKernel::new(state);
+        let claim = shared
+            .sr_claim_endpoint_waiter_split(eidx, egen, ident(1, 7), WaiterOwner::DirectReply)
+            .expect("claim");
+        assert!(shared.sr_cancel_endpoint_waiter_claim_split(&claim));
+        shared.with(|state| {
+            assert_eq!(view(state, eidx, rec(1, 7, 3)), WaiterOwnershipView::Vacant);
+            assert_eq!(
+                occupied(state),
+                0,
+                "an abandoned claim must not wedge the endpoint index"
+            );
+        });
+    }
+
+    /// A settled claim cannot be settled twice — no duplicate terminal winner.
+    #[test]
+    fn a_settled_claim_cannot_be_settled_again() {
+        let (mut state, eidx) = fixture();
+        let egen = state.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
+        });
+        let shared = crate::runtime::SharedKernel::new(state);
+        let claim = shared
+            .sr_claim_endpoint_waiter_split(eidx, egen, ident(1, 7), WaiterOwner::LegacyDelivery)
+            .expect("claim");
+        assert!(shared.sr_consume_endpoint_waiter_claim_split(&claim));
+        assert!(
+            !shared.sr_consume_endpoint_waiter_claim_split(&claim),
+            "the same claim cannot consume twice"
+        );
+        assert!(
+            !shared.sr_cancel_endpoint_waiter_claim_split(&claim),
+            "…nor cancel after consuming"
+        );
+        shared.with(|state| assert_eq!(occupied(state), 0));
+    }
+
+    // ── 7. Endpoint destruction and task death retire through the same funnel ───────────────
+
+    #[test]
+    fn endpoint_destruction_and_task_death_retire_the_incarnation() {
+        // Task death: the identity-wide clear is what teardown uses, and it funnels through the
+        // one removal body — so the ownership slot follows the waiter out.
+        let (mut state, eidx) = fixture();
+        let r = rec(1, 7, 3);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, r);
+        });
+        state.with_ipc_state_mut(|ipc| ipc.clear_endpoint_waiters_for_identity(ident(1, 7)));
+        assert_eq!(view(&state, eidx, r), WaiterOwnershipView::Vacant);
+        assert_eq!(occupied(&state), 0);
+
+        // Endpoint destruction: the waiter is removed while the OLD generation is still
+        // authoritative, so the retire names the incarnation that actually existed.
+        let (mut state, eidx) = fixture();
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
+        });
+        state.with_ipc_state_mut(|ipc| {
+            ipc.take_endpoint_waiter_record(eidx);
+            ipc.endpoint_generations[eidx] = ipc.endpoint_generations[eidx].wrapping_add(1);
+        });
+        assert_eq!(
+            occupied(&state),
+            0,
+            "a destroyed endpoint leaves no ownership record behind"
+        );
+    }
+
+    /// A recycled index whose slot survived the generation bump is reclaimed, not wedged.
+    #[test]
+    fn a_superseded_generation_is_reclaimed_on_the_next_publication() {
+        let (mut state, eidx) = fixture();
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, rec(1, 7, 3));
+        });
+        // Bump the generation WITHOUT removing the waiter — the shape a stale slot would have.
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_generations[eidx] = ipc.endpoint_generations[eidx].wrapping_add(1);
+        });
+        // The replacement publishes at the NEW generation and is not refused.
+        let new = rec(2, 9, 5);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(eidx, new);
+        });
+        assert_eq!(
+            view(&state, eidx, new),
+            WaiterOwnershipView::Available,
+            "an incarnation of a superseded generation may not wedge the index"
+        );
+        assert_eq!(occupied(&state), 1);
+    }
+
+    // ── 8. Many endpoints: ownership is per index and never crosses ─────────────────────────
+
+    #[test]
+    fn ownership_is_per_endpoint_and_never_crosses() {
+        let mut state = Bootstrap::init().expect("init");
+        let (e0, _, _) = state.create_endpoint(4).expect("e0");
+        let (e1, _, _) = state.create_endpoint(4).expect("e1");
+        assert_ne!(e0, e1);
+        let g0 = state.with_ipc_state(|ipc| ipc.endpoint_generations[e0]);
+        state.with_ipc_state_mut(|ipc| {
+            ipc.set_endpoint_waiter(e0, rec(1, 7, 3));
+            ipc.set_endpoint_waiter(e1, rec(2, 9, 4));
+        });
+        assert_eq!(occupied(&state), 2);
+        let shared = crate::runtime::SharedKernel::new(state);
+        let claim = shared
+            .sr_claim_endpoint_waiter_split(e0, g0, ident(1, 7), WaiterOwner::DirectRequest)
+            .expect("claim e0");
+        shared.with(|state| {
+            // e1 is untouched by e0's claim, and still publishable.
+            assert_eq!(
+                view(state, e1, rec(2, 9, 4)),
+                WaiterOwnershipView::Available
+            );
+            assert_eq!(claimed(state), 1, "exactly one live claim");
+        });
+        assert!(shared.sr_consume_endpoint_waiter_claim_split(&claim));
+        shared.with(|state| {
+            assert_eq!(occupied(state), 1, "only e1 remains armed");
+            state.with_ipc_state_mut(|ipc| ipc.clear_endpoint_waiters_for_identity(ident(2, 9)));
+            assert_eq!(occupied(state), 0, "and the tree quiesces to zero");
+        });
     }
 }

@@ -252,12 +252,25 @@ impl SharedKernel {
             // The wait reason was not captured, so the exact blocked state cannot be
             // reconstructed. Everything externally visible is still reclaimed above; the
             // acknowledgement will be discarded rather than restored.
+            //
+            // Stage 199D-WA3C2: the ownership claim is settled on EVERY exit of this helper,
+            // including the ones that restore nothing — an unsettled claim would wedge the
+            // endpoint index against a server that is about to be retried on it.
+            let _ = self.sr_cancel_endpoint_waiter_claim_split(claim);
             return false;
         };
         if !self.sr_uncommit_blocked_receiver_split(ack.server.tid.0, ack.server.asid, recv_cap) {
+            let _ = self.sr_cancel_endpoint_waiter_claim_split(claim);
             return false;
         }
-        self.sr_restore_endpoint_waiter_split(claim)
+        // A successful restore settles the claim itself (`Claimed → Available`, waiter
+        // republished as the SAME incarnation). A failed one leaves it live, so cancel it.
+        if self.sr_restore_endpoint_waiter_split(claim) {
+            true
+        } else {
+            let _ = self.sr_cancel_endpoint_waiter_claim_split(claim);
+            false
+        }
     }
 
     /// Settle the acknowledgement lease after a PRE-waiter-claim failure: restore it
@@ -471,10 +484,15 @@ impl SharedKernel {
 
         // (9) atomically claim the EXACT endpoint waiter (remove once). A changed /
         // missing waiter leaves the slot untouched.
+        // Stage 199D-WA3C2: claimed as `DirectRequest`, and the claim now OUTLIVES this rank-3
+        // section — that is what stops a second receiver publishing into this endpoint while
+        // steps (10)–(13) are still going to wake this exact server incarnation. It is the
+        // exclusivity the x86_64 direct production default rests on.
         let claim = match self.sr_claim_endpoint_waiter_split(
             ack.endpoint_index,
             ack.endpoint_generation,
             ack.server,
+            crate::kernel::boot::waiter_ownership::WaiterOwner::DirectRequest,
         ) {
             Some(c) => c,
             None => {
@@ -585,6 +603,11 @@ impl SharedKernel {
                         let _ = self.cancel_direct_reply_record_split(idx, rgen);
                         self.sr_revoke_split(server_cnode, server_cap, reply_object);
                         lease.discard();
+                        // Stage 199D-WA3C2: fail-closed on the SERVER's placement is not a
+                        // reason to leak the endpoint's ownership slot. Nothing is restored
+                        // here — hence CANCEL, not RESTORE — but the slot still returns to
+                        // `Vacant` so the endpoint index is not wedged forever.
+                        let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
                         crate::yarm_log!(
                             "IPC_DIRECT_REQUEST_ENQUEUE_UNRECONCILED server_tid={} record_index={} error={:?} membership={:?} restored=0 result=failed_closed",
                             ack.server.tid.0,
@@ -634,6 +657,11 @@ impl SharedKernel {
                 };
                 // (13) consume the acknowledgement lease exactly once.
                 let _ = lease.consume(lease_commit_seq);
+                // (13b) Stage 199D-WA3C2: the server is enqueued and the record is Available —
+                // the claimed incarnation is DELIVERED. CONSUME + RETIRE returns the endpoint's
+                // ownership slot to `Vacant`, which is what makes quiescent occupancy zero and
+                // lets the server's NEXT receive publish here.
+                let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);
                 Ok(IpcCallDirectSuccess {
                     record_index: idx,
                     record_generation: rgen,
@@ -646,7 +674,11 @@ impl SharedKernel {
             // could only target the gone incarnation). Reclaim; discard the ack; zero
             // wake. `claim` is intentionally dropped (waiter left removed).
             ReceiverCommit::GoneDead | ReceiverCommit::Replaced => {
-                let _ = claim;
+                // Stage 199D-WA3C2: the waiter stays removed (restoring it would fabricate one
+                // for a vanished incarnation), but the CLAIM is settled rather than dropped —
+                // `let _ = claim` used to leak the ownership slot, wedging this endpoint index
+                // against the replacement task that is about to receive on it.
+                let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
                 self.sr_revoke_split(server_cnode, server_cap, reply_object);
                 let _ = self.cancel_direct_reply_record_split(idx, rgen);
                 lease.discard();
@@ -848,10 +880,15 @@ impl SharedKernel {
         }
 
         // (5) atomically claim the EXACT caller waiter (remove once).
+        // Stage 199D-WA3C2: claimed as `DirectReply`, held across the rank-3 release for the
+        // same reason the request path holds its own — steps (6)–(8) are still going to wake
+        // this exact caller incarnation, so no second receiver may publish into its reply
+        // endpoint in the meantime.
         let claim = match self.sr_claim_endpoint_waiter_split(
             ack.endpoint_index,
             ack.endpoint_generation,
             ack.caller,
+            crate::kernel::boot::waiter_ownership::WaiterOwner::DirectReply,
         ) {
             Some(c) => c,
             None => {
@@ -876,6 +913,9 @@ impl SharedKernel {
                     // dispatch). Discard record + ack; zero wake.
                     let _ = self.discard_reply_record_split(idx, rgen);
                     lease.discard();
+                    // Stage 199D-WA3C2: settle the ownership claim even on the defensive arm.
+                    // Nothing is restored, so CANCEL — but the slot must not stay wedged.
+                    let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
                     return Err(IpcReplyDirectError::RecordConsumeFailed);
                 }
                 // (8) enqueue the caller LAST — the single wake. It reports what it ACTUALLY
@@ -908,6 +948,9 @@ impl SharedKernel {
                     };
                     if !outcome.rejection_is_runtime_recoverable() {
                         lease.discard();
+                        // Stage 199D-WA3C2: fail-closed on the CALLER's placement still settles
+                        // the ownership claim — CANCEL, since nothing is restored here.
+                        let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
                         crate::yarm_log!(
                             "IPC_DIRECT_REPLY_ENQUEUE_UNRECONCILED caller_tid={} record_index={} error={:?} membership={:?} authority_restored=0 result=failed_closed",
                             ack.caller.tid.0,
@@ -927,6 +970,11 @@ impl SharedKernel {
                             cap,
                         )
                     }) && self.sr_restore_endpoint_waiter_split(&claim);
+                    // Stage 199D-WA3C2: a successful restore settled the claim itself. Every
+                    // other shape leaves it live, so cancel + retire it.
+                    if !caller_restored {
+                        let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
+                    }
                     // Stage 199D — RECOVERABLE, including `AlreadyQueued` reconciled as
                     // `Removed`: the caller provably never became `current`, so the delivery was
                     // not observed and the exact one-shot authority may be re-armed. The
@@ -951,6 +999,11 @@ impl SharedKernel {
                     return Err(IpcReplyDirectError::EnqueueRejected(error));
                 };
                 let _ = lease.consume(lease_commit_seq);
+                // Stage 199D-WA3C2: the caller is enqueued — the claimed incarnation is
+                // DELIVERED. CONSUME + RETIRE returns the reply endpoint's ownership slot to
+                // `Vacant`, so quiescent occupancy is zero and the caller's next receive on it
+                // can publish.
+                let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);
                 Ok(IpcReplyDirectSuccess {
                     record_index: idx,
                     record_generation: rgen,
@@ -961,7 +1014,10 @@ impl SharedKernel {
             // the vanished incarnation — do NOT restore it. Consume the record (barrier),
             // discard the ack; zero wake.
             ReceiverCommit::GoneDead | ReceiverCommit::Replaced => {
-                let _ = claim;
+                // Stage 199D-WA3C2: the waiter is correctly left removed, but the CLAIM is
+                // settled rather than dropped — `let _ = claim` used to leak the ownership
+                // slot, wedging this reply endpoint against the caller's replacement.
+                let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
                 let _ = self.discard_reply_record_split(idx, rgen);
                 lease.discard();
                 Err(IpcReplyDirectError::CallerGone)

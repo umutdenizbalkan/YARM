@@ -716,14 +716,86 @@ impl IpcSubsystem {
     ///
     /// Stage 199D-WA3C1 deliberately PRESERVES last-receiver-wins: a new receiver may replace an
     /// existing waiter. That semantic is load-bearing for the relay, direct-request, direct-reply
-    /// and reply-timeout paths, which have their own replacement/rollback contracts, so changing
-    /// it is out of scope here and is WA3C2's question to answer.
+    /// and reply-timeout paths, which have their own replacement/rollback contracts, and WA3C2
+    /// keeps it.
+    ///
+    /// Stage 199D-WA3C2: [`Self::publish_endpoint_waiter`] is **the one place an arriving
+    /// incarnation is armed** in the ownership table, for the same structural reason the
+    /// direct-ack lease and the waiter census live in these two bodies — a new publication path
+    /// inherits ownership rather than having to remember it. This shim keeps the many call sites
+    /// that only need the displaced record unchanged.
     pub(crate) fn set_endpoint_waiter(
         &mut self,
         idx: usize,
         record: EndpointWaiterRecord,
     ) -> Option<EndpointWaiterRecord> {
+        self.publish_endpoint_waiter(idx, record).0
+    }
+
+    /// [`Self::set_endpoint_waiter`] with its ownership verdict.
+    ///
+    /// The verdict is what a publication policy needs and the plain shim cannot express: whether
+    /// the arriving incarnation actually took ownership of the endpoint, or whether an in-flight
+    /// owner still holds the previous one. `permits_publication()` is false in exactly the cases
+    /// where a caller must unwind rather than proceed.
+    pub(crate) fn publish_endpoint_waiter(
+        &mut self,
+        idx: usize,
+        record: EndpointWaiterRecord,
+    ) -> (
+        Option<EndpointWaiterRecord>,
+        crate::kernel::boot::waiter_ownership::WaiterOwnershipTransition,
+    ) {
+        use crate::kernel::boot::waiter_ownership::WaiterOwnershipTransition;
         let displaced = self.endpoint_waiters.get(idx).copied().flatten();
+        // A recycled endpoint index may still name an incarnation of the generation that was
+        // destroyed. That incarnation is unclaimable and unretirable by key, so reclaim it here
+        // — otherwise a destroyed-and-recreated endpoint would refuse every future receiver.
+        if let Some(stale) = self.waiter_ownership_retire_superseded(idx) {
+            crate::yarm_log!(
+                "WA3C2_WAITER_SUPERSEDED_RETIRED endpoint={} holding={:?}",
+                idx,
+                stale
+            );
+        }
+        // Stage 199D-WA3C2 — PRE-FLIGHT, before any mutation whatsoever.
+        //
+        // Ownership is asked first because it is the only step that can refuse, and a refusal
+        // must leave the waiter table, the direct-ack lease and the waiter census exactly as
+        // found so the publisher's unwind is a true no-op.
+        //
+        // It asks the ownership SLOT, not the displaced record. The direct transactions remove
+        // the waiter as part of claiming it, so the common conflict is precisely the one with
+        // no displaced record to look at: an empty waiter slot whose incarnation an owner is
+        // still driving.
+        let admission = self.waiter_ownership_publication_admits(idx, displaced, record);
+        if !admission.permits_publication() {
+            crate::yarm_log!(
+                "WA3C2_WAITER_PUBLISH_REFUSED endpoint={} new_tid={} new_wait_gen={} reason={}",
+                idx,
+                record.tid().0,
+                record.wait_generation,
+                admission.as_str()
+            );
+            return (None, admission);
+        }
+        // The DISPLACED-RECEIVER TRANSITION. The pre-flight already proved the departing
+        // incarnation is not under a live claim, so this cannot refuse — but it is still
+        // checked rather than assumed, because an unsettled departure would wedge the index.
+        let departure = match displaced {
+            Some(old) => self.waiter_ownership_displace(idx, old),
+            None => WaiterOwnershipTransition::AlreadyConsistent,
+        };
+        if let WaiterOwnershipTransition::HeldByOwner { owner } = departure {
+            crate::yarm_log!(
+                "WA3C2_WAITER_PUBLISH_REFUSED endpoint={} new_tid={} new_wait_gen={} reason=departing_held_by owner={}",
+                idx,
+                record.tid().0,
+                record.wait_generation,
+                owner.as_str()
+            );
+            return (None, departure);
+        }
         // A displacement removes the old waiter, so its direct-ack lease must retire with it —
         // exactly as any other removal would. Without this a replaced waiter's lease would
         // outlive its waiter, which is the leak the central removal body exists to prevent.
@@ -737,7 +809,20 @@ impl IpcSubsystem {
         if displaced.is_none() {
             crate::kernel::direct_ack_census::note_waiter_linked();
         }
-        displaced
+        let arrival = self.waiter_ownership_reconcile_arrival(idx, record);
+        if let WaiterOwnershipTransition::ArmRefused { holding } = arrival {
+            // The pre-flight admitted this publication, so reaching here means the slot moved
+            // underneath it — impossible inside one rank-3 section. Report it loudly rather
+            // than silently leaving an unowned waiter behind.
+            crate::yarm_log!(
+                "WA3C2_WAITER_ARM_REFUSED endpoint={} tid={} wait_gen={} holding={:?}",
+                idx,
+                record.tid().0,
+                record.wait_generation,
+                holding
+            );
+        }
+        (displaced, arrival)
     }
 
     /// Stage 199D — **the one place a departing endpoint receive-waiter retires its
@@ -814,6 +899,16 @@ impl IpcSubsystem {
         // direct-ack contract.
         self.release_direct_ack_lease(idx, record.receiver);
         self.note_waiter_removed();
+        // Stage 199D-WA3C2 — **the one place a departing incarnation is retired** in the
+        // ownership table. Every removal family funnels here, so timeout, notification wake,
+        // legacy delivery, endpoint destruction and task death all retire without a single
+        // scattered call.
+        //
+        // `HeldByOwner` is the EXPECTED report on the direct/shared-region claim paths: those
+        // claim the incarnation and *then* remove the waiter, and the whole point of the claim
+        // is that the slot stays occupied across the lock release until its owner settles. So
+        // it is deliberately silent — it is the mechanism working, not an anomaly.
+        let _ = self.waiter_ownership_reconcile_departure(idx, record);
         Some(record)
     }
 
@@ -993,9 +1088,25 @@ pub(crate) fn publish_recv_waiter_locked(
     // Stage 199D-WA3C1: store the COMPLETE generation-bearing RECORD. Canonical
     // last-receiver-wins is PRESERVED on purpose — the relay, direct-request,
     // direct-reply and reply-timeout paths each have their own replacement/rollback
-    // contract built on it. Whether YARM should keep replacement at all is WA3C2's
-    // question; this increment must not answer it by accident.
-    if let Some(displaced) = ipc.set_endpoint_waiter(endpoint_idx, record) {
+    // contract built on it, and WA3C2 keeps it.
+    //
+    // Stage 199D-WA3C2: what WA3C2 removes is the OWNERLESS form of that replacement. The
+    // displaced record used to be logged and dropped, leaving the old receiver blocked with
+    // neither a waiter nor an owner; `publish_endpoint_waiter` now runs the explicit
+    // CLAIM(Teardown) → CANCEL → RETIRE transition first, and refuses outright when the
+    // departing incarnation is still held by an in-flight direct transaction.
+    let (displaced, ownership) = ipc.publish_endpoint_waiter(endpoint_idx, record);
+    if !ownership.permits_publication() {
+        crate::yarm_log!(
+            "D2_RECV_WAITER_OWNERSHIP_BUSY endpoint={} tid={} wait_gen={} reason={}",
+            endpoint_idx,
+            receiver_tid.0,
+            record.wait_generation,
+            ownership.as_str()
+        );
+        return PublishWaiterOutcome::WaiterOwnershipBusy;
+    }
+    if let Some(displaced) = displaced {
         crate::yarm_log!(
             "D2_RECV_WAITER_DISPLACED endpoint={} old_tid={} old_wait_gen={} new_tid={} new_wait_gen={}",
             endpoint_idx,
@@ -3817,6 +3928,28 @@ impl KernelState {
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published => {}
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::QueueNonEmpty => {
                 return self.recv_block_unwind_race(plan);
+            }
+            // Stage 199D-WA3C2 — THE ONE OWNER of the ownership-busy policy, for both routes.
+            //
+            // An in-flight direct transaction still holds this endpoint's previous receive
+            // incarnation. Nothing was published, so reversing ranks 2 and 1 restores the exact
+            // pre-block state; the receiver then observes `WouldBlock` and retries. It is
+            // deliberately NOT the `QueueNonEmpty` answer: that one means "a message is waiting,
+            // dequeue it now", and here the queue is empty — returning it would send the recv
+            // loop back for a dequeue that finds nothing and re-blocks into the same claim.
+            //
+            // The window is bounded by the OWNER's settle, which happens on that transaction's
+            // own commit or rollback and never depends on this receiver making progress, so the
+            // retry cannot livelock against itself.
+            crate::kernel::recv_waiter_split::PublishWaiterOutcome::WaiterOwnershipBusy => {
+                crate::yarm_log!(
+                    "D2_RECV_WAITER_BUSY_UNWIND endpoint={} tid={}",
+                    plan.endpoint_idx,
+                    plan.blocked_tid.0
+                );
+                self.wake_tid_to_runnable(plan.blocked_tid)?;
+                let _ = self.dispatch_next_task()?;
+                return Err(KernelError::WouldBlock);
             }
             // The live primitive preserves canonical overwrite semantics for
             // a pre-existing waiter (it never returns ReceiverAlreadyWaiting)

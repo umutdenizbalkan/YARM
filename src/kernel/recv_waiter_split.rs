@@ -125,6 +125,19 @@ pub enum PublishWaiterOutcome {
     /// Endpoint index out of range or generation mismatch on the snapshot.
     /// Caller surfaces `KernelError::InvalidCapability`.
     InvalidEndpoint,
+    /// Stage 199D-WA3C2 — an in-flight owner still holds the endpoint's PREVIOUS receive
+    /// incarnation, so publishing would take the endpoint out from under a transaction that is
+    /// still going to deliver to, and wake, that incarnation.
+    ///
+    /// **Nothing was mutated**: the waiter table, the direct-ack lease and the waiter census are
+    /// exactly as they were, because ownership is settled before any of them move. The receiver
+    /// must therefore unwind its block and retry — the window is bounded by the owning
+    /// transaction's settle, which happens on its own completion or rollback, never on this
+    /// receiver's progress.
+    ///
+    /// This is the exclusivity `WAITER_OWNERSHIP_EXCLUSIVE=no` reported missing, and it is what
+    /// the x86_64 direct-IPC production default rests on.
+    WaiterOwnershipBusy,
 }
 
 /// D2 helper — atomic publish under IPC rank 3.

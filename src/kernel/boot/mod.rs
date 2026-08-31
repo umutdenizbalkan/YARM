@@ -55,9 +55,20 @@ mod tid_allocation_policy;
 mod transfer_state;
 mod types;
 mod user_memory_state;
-/// Stage 199D-WA2A-R1 — helper-only endpoint-waiter ownership primitive, private to the
-/// boot/IPC domain (zero production callers).
-mod waiter_ownership;
+/// Stage 199D-WA2A-R1 — the endpoint-waiter ownership primitive.
+///
+/// Stage 199D-WA3C2 raises this from `mod` to `pub(crate)`, because the off-lock direct NR6/NR7
+/// transactions and the shared-region finalizer live outside `boot` and must be able to NAME an
+/// owner and carry a claim token across a lock release.
+///
+/// **The encapsulation argument is unchanged**, and this is why: what widens is the ability to
+/// name `WaiterOwner`, `WaiterKey` and the opaque `WaiterClaimToken` — not the ability to
+/// operate the table. Every `WaiterOwnershipTable` method stays module-private, the
+/// `waiter_ownership` field stays `pub(in crate::kernel::boot)`, and the token's fields stay
+/// private so no struct literal outside that module can forge one. The only cross-module surface
+/// remains the typed `IpcSubsystem::waiter_ownership_*` methods, and reaching *those* still
+/// requires the `&mut IpcSubsystem` that only the ipc rank-3 guard hands out.
+pub(crate) mod waiter_ownership;
 
 use super::capabilities::{
     CNodeId, CapId, CapObject, CapRights, Capability, CapabilityDeriveError, CapabilitySpace,
@@ -836,8 +847,9 @@ pub(crate) fn d6_genuine_enabled() -> bool {
 ///   [`offlock_authoritative_dispatch_enabled`], whose AArch64 arm is
 ///   `ipccall_direct_admission_enabled()`: that belongs to the proof-gated direct NR6/NR7
 ///   transaction, and ordinary blocking IpcRecv/IpcSend must not become coupled to direct
-///   production. `ipccall_direct_production_enabled()` remains an unconditional `false` and
-///   cannot influence this predicate.
+///   production. Stage 199D-WA3C2 turns `ipccall_direct_production_enabled()` on for x86_64,
+///   which makes this independence load-bearing rather than academic: the body below names
+///   neither predicate, so the x86_64 default cannot reach it.
 /// * **no dependency on waiter ownership.**
 ///
 /// The remaining per-CPU eligibility (a trap-entry drainer is active, and this is the single
@@ -858,10 +870,12 @@ pub(crate) fn queue_advancing_dispatch_enabled() -> bool {
 /// * **x86_64** — unchanged: exactly `d6_genuine_enabled()`.
 /// * **AArch64** — admitted, but only through the same `ipccall_direct_admission_enabled()`
 ///   the direct NR6/NR7 path already uses, and only when no D6-switch diagnostic owns the
-///   switch path. Since Stage 199D-WA1-GATE `ipccall_direct_production_enabled()` is `false` on
-///   every architecture, so that resolves to the armed proof/oracle gate everywhere: **the
-///   AArch64 production default is OFF** — as is x86_64's — and an ordinary boot on either
-///   publishes no work item and drains nothing.
+///   switch path. Stage 199D-WA3C2 enables `ipccall_direct_production_enabled()` on x86_64
+///   ONLY, so on AArch64 that term stays `false` and this still resolves to the armed
+///   proof/oracle gate: **the AArch64 production default is OFF**, and an ordinary AArch64 boot
+///   publishes no work item and drains nothing. The x86_64 arm of this predicate is
+///   `d6_genuine_enabled()` and does not consult direct admission at all, so the new x86_64
+///   direct default does not reach here either.
 /// * **RISC-V** — not admitted (no RISC-V work in this increment).
 // The only production caller is the AArch64 publication site; a hosted (x86_64) `lib` build
 // compiles no route to it, exactly like the sibling arch-gated predicates.
@@ -3398,59 +3412,109 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// **Future canonical 199E work:** porting the reply-win terminal lease into the direct NR7
 /// transaction, which would let the arbitrated population go off-lock too. Until then those
 /// replies take the legacy path by design, counted as `declined_terminal_arbitration`.
-/// ─── Stage 199D-WA1-GATE: the x86_64 production DEFAULT is DISABLED ────────────────────────
+/// ─── Stage 199D-WA3C2: the x86_64 production DEFAULT is ENABLED ────────────────────────────
 ///
-/// `WAITER_OWNERSHIP_EXCLUSIVE=no`, and the reachability is REAL, not mechanism-level. The
+/// WA1-GATE set this to an unconditional `false` because `WAITER_OWNERSHIP_EXCLUSIVE=no`: the
 /// direct NR6/NR7 transactions publish the reply record, the provisional server-local reply cap
-/// and the receiver's user memory BEFORE claiming the endpoint waiter, and
+/// and the receiver's user memory BEFORE claiming the endpoint waiter, and nothing recorded
+/// that the claimed incarnation was still owned across the off-lock window. A second receiver
+/// could publish into the endpoint and become the target of a wake it never earned.
+///
+/// **WA3C2 makes that ownership authoritative**, which is what this default rests on:
+///
+/// * the endpoint-waiter ownership table is armed and retired STRUCTURALLY, inside the single
+///   publish point and the single clear point of the waiter table
+///   (`IpcSubsystem::publish_endpoint_waiter` / `remove_endpoint_waiter_at`), so every
+///   lifecycle edge — publication, replacement, delivery, timeout, notification, endpoint
+///   destruction, task death — is covered without a scattered call;
+/// * the direct transactions CLAIM their incarnation before removing the waiter and settle it
+///   on every terminal arm (CONSUME on delivery, RESTORE on a rollback that reinstates the
+///   waiter, CANCEL when the receiver vanished), so the slot stays occupied for exactly the
+///   window they are still going to deliver into;
+/// * `arm_current` is unweakened, so a publication that would take the endpoint out from under
+///   a live claim is REFUSED — `PublishWaiterOutcome::WaiterOwnershipBusy`, nothing mutated,
+///   the receiver unwinds and retries. That is the missing exclusivity, and it is bounded by
+///   the owner's settle rather than by the refused receiver's progress.
+///
+/// The remaining reachability WA1-GATE named is unchanged and unaffected:
 /// `process_ipc_timeout_deadlines` wakes a `Blocked(EndpointReceive)` task at task rank before
-/// invalidating its waiter at ipc rank — so it cannot lose to a claim it never consults.
+/// invalidating its waiter at ipc rank. Ordinary recv/send deadlines are armed by
+/// `recv_block_phase_b_task`, its send-block twin and the queued-recv block path, all of which
+/// set `ipc_timeout_deadline` **without** a `reply_timeout_token`, so they are independent of
+/// the reply-terminal arbitration that gates direct NR7 eligibility — and an NR7-eligible reply
+/// is by construction NOT terminal-arbitrated. The notification signal wake never consults the
+/// endpoint waiter at all. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.30.
 ///
-/// Ordinary recv/send deadlines are armed by `recv_block_phase_b_task`, its send-block twin and
-/// the queued-recv block path, all of which set `ipc_timeout_deadline` **without** a
-/// `reply_timeout_token`. They are therefore fully independent of the reply-terminal
-/// arbitration that gates direct NR7 eligibility. The notification signal wake never consults
-/// the endpoint waiter at all. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.30.
+/// # Why this is architecture-scoped, and what "production-default" means here
 ///
-/// This is a GATE, not a retraction. Every explicit proof/oracle selector is untouched:
-/// `ipccall_direct_admission_enabled()` still admits NR6/NR7 whenever
-/// `ipccall_direct_proof_enabled()` is armed, so every knob-gated mechanism seal stays
-/// reproducible. Ordinary traffic falls back to the accepted legacy path.
+/// `true` on x86_64 only. That is not a knob and not a selector: it is the architecture whose
+/// direct request, direct reply, cross-CPU and saved-return paths have live profiles, including
+/// SMP=2 in both directions. AArch64 and RISC-V keep the legacy path until their own profiles
+/// qualify — a scope statement, not a gate to re-open.
+///
+/// On x86_64 the default is **unconfined**: because this term is `true`, every consumer below
+/// (`admission`, `publication`, and both endpoint-admission predicates) short-circuits before
+/// consulting any oracle endpoint or knob. Ordinary production endpoints are admitted. The
+/// existing selectors still START their workloads; they no longer decide admission.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    false
+    cfg!(target_arch = "x86_64")
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.
 ///
-/// Stage 199D-WA1-GATE: the production term is `false` on every architecture, so this is now
-/// exactly the proof gate. Ordinary traffic — on x86_64 as much as anywhere else — is not
-/// admitted and takes the legacy path; only an explicitly armed proof/oracle selector admits.
+/// Stage 199D-WA3C2: on x86_64 the production term is `true`, so this is unconditionally true
+/// there and ordinary traffic is admitted. Elsewhere it remains exactly the proof gate.
 pub fn ipccall_direct_admission_enabled() -> bool {
     ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()
 }
 
 /// True iff a blocked-waiter acknowledgement may be published at all.
 ///
-/// Same predicate as [`ipccall_direct_admission_enabled`], and since WA1-GATE that means: the
-/// explicit proof/oracle selector, on every architecture. Without it the request path finds
-/// nothing to claim and every ordinary call declines to legacy — which is the current default
-/// everywhere.
+/// Same predicate as [`ipccall_direct_admission_enabled`]: since WA3C2 that means every
+/// committed recv-v2 block on x86_64 publishes, and elsewhere only an armed proof/oracle
+/// selector does.
 pub fn ipccall_direct_publication_enabled() -> bool {
     ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()
 }
 
+/// Stage 199D-WA3C2 — **does the off-lock blocking-IpcRecv route yield the whole receive to the
+/// broad blocked-recv arm?**
+///
+/// This is deliberately NOT an admission question, and it deliberately does not live in the
+/// split dispatcher: direct NR6/NR7 *admission* is a production decision with no proof-gate
+/// term, and `the_split_dispatcher_has_no_proof_gate_dependency` pins that. What this answers is
+/// a different question — whether a blocked receive still needs work only the broad arm does.
+///
+/// It does, while any direct proof/oracle selector is armed. Every such profile depends on
+/// blocked-recv work the split route does not reproduce: the SMP oracle's
+/// `..._SMP_SERVER_BLOCKED` / `..._SMP_CALLER_BLOCKED` markers re-verify runqueue absence and
+/// home-CPU placement against authoritative broad state, and the single-CPU round-trip oracles
+/// assert on the broad arm's exact marker order. So under a selector the route yields exactly as
+/// it did before WA3C2.
+///
+/// With NO selector armed — the ordinary production configuration, which is what the x86_64
+/// direct default is about — it does not yield. The route publishes its waiter, defers the
+/// dispatch, and publishes its own NR6/NR7 acknowledgements through the shared publication
+/// bodies. That is what keeps the delivered split blocking-recv route and direct production
+/// alive at the same time, instead of one silently retiring the other.
+pub fn blocked_recv_split_route_yields_to_broad_arm() -> bool {
+    ipccall_direct_proof_enabled()
+}
+
 /// True iff this REQUEST endpoint index is admitted to the off-lock path.
 ///
-/// Stage 199D-WA1-GATE: with the production term `false` on every architecture, admission is
-/// exactly the oracle's provisioned request endpoint — the confinement the explicit selector
-/// authorizes, and nothing wider. The `production ||` term is retained so re-enabling the
-/// default in WA2 restores the Buffered-only eligibility contract without another edit here.
+/// Stage 199D-WA3C2: the `production ||` term short-circuits on x86_64, so admission there is
+/// **not restricted to any endpoint** — the oracle's provisioned index has no special status
+/// and the predicate never consults it. Elsewhere the production term is `false` and admission
+/// is exactly the oracle's provisioned request endpoint, the confinement its selector
+/// authorizes and nothing wider.
 pub fn ipccall_direct_request_endpoint_admitted(eidx: usize) -> bool {
     ipccall_direct_production_enabled() || ipccall_direct_oracle_request_endpoint_is(eidx)
 }
 
-/// True iff this REPLY endpoint index is admitted to the off-lock path. See the request twin —
-/// since WA1-GATE this too is exactly the oracle's provisioned reply endpoint.
+/// True iff this REPLY endpoint index is admitted to the off-lock path. See the request twin:
+/// unconfined on x86_64 since WA3C2, and exactly the oracle's provisioned reply endpoint
+/// elsewhere.
 pub fn ipccall_direct_reply_endpoint_admitted(eidx: usize) -> bool {
     ipccall_direct_production_enabled() || ipccall_direct_oracle_reply_endpoint_is(eidx)
 }
@@ -6436,33 +6500,73 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
     endpoint: crate::kernel::capabilities::CapObject,
     state: &crate::kernel::task::BlockedRecvState,
 ) {
-    use crate::kernel::capabilities::CapObject;
-    if !ipccall_direct_publication_enabled() {
-        return;
-    }
-    let CapObject::Endpoint { index, generation } = endpoint else {
+    let Some((index, generation, seq)) = publish_ipccall_direct_blocked_server_ack_with(
+        receiver_tid,
+        kernel.task_asid(receiver_tid),
+        endpoint,
+        state,
+        |index| kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index)),
+    ) else {
         return;
     };
-    // Stage 199D-WA1-GATE: with the production term `false` on every architecture, publication
-    // is confined to the oracle's provisioned request endpoint EVERYWHERE — x86_64 included —
-    // so every normal boot stays byte-identical to the legacy path. The `production ||` term is
-    // retained so WA2 can restore the eligibility-contract behaviour without editing here.
-    // Hosted wiring
-    // tests have no service chain and no provisioned oracle endpoint, so they keep the
-    // unconfined publish the fixtures rely on.
+    // Stage 199A2D2C2B1: emit the AUTHORITATIVE cross-CPU blocked-server marker EXACTLY ONCE, only
+    // for the x86_64 SMP oracle's CPU-1 recv-v2 server, and ONLY once every authoritative
+    // blocking-order condition has committed: the saved continuation is captured, the exact endpoint
+    // waiter equals the server, the server is absent from every runqueue, its home CPU is 1, and the
+    // ack has published.
+    //
+    // Stage 199D-WA3C2: this is the ONE step that needs a broad `&KernelState`, which is why it
+    // stays on this wrapper rather than moving into the shared body below — the split
+    // blocked-recv route has no broad reference, and yields outright while a selector needs it.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    maybe_emit_ipccall_direct_smp_server_blocked(kernel, receiver_tid, index, generation, seq);
+    let _ = (index, generation, seq);
+}
+
+/// Stage 199D-WA3C2 — **the ONE NR6 acknowledgement publication body**, shared by the broad
+/// blocked-recv arm above and the off-lock split blocking-IpcRecv route.
+///
+/// Before WA3C2 this body was reachable only through a `&KernelState`, so the split route had
+/// to YIELD whenever publication was armed — and with the x86_64 production default on, that
+/// yield would have fired on every boot and silently retired the delivered split route.
+/// Parameterising the two reads it actually needs (the receiver's ASID, and the live waiter
+/// identity) is what lets both arms run the identical reserve → verify → commit sequence
+/// instead of one of them re-deriving it.
+///
+/// Returns `(endpoint index, endpoint generation, ack seq)` on a committed publication.
+pub(crate) fn publish_ipccall_direct_blocked_server_ack_with(
+    receiver_tid: u64,
+    receiver_asid: Option<crate::kernel::vm::Asid>,
+    endpoint: crate::kernel::capabilities::CapObject,
+    state: &crate::kernel::task::BlockedRecvState,
+    live_waiter: impl FnOnce(usize) -> Option<ReceiverWaiterIdentity>,
+) -> Option<(usize, u64, u64)> {
+    use crate::kernel::capabilities::CapObject;
+    if !ipccall_direct_publication_enabled() {
+        return None;
+    }
+    let CapObject::Endpoint { index, generation } = endpoint else {
+        return None;
+    };
+    // Stage 199D-WA3C2: on x86_64 the production term is `true`, so this short-circuits and
+    // publication is UNCONFINED — ordinary production endpoints publish, and the oracle's
+    // provisioned index has no special status. On every other architecture the term is `false`
+    // and publication stays confined to the oracle's request endpoint. Hosted wiring tests have
+    // no service chain and no provisioned oracle endpoint, so they keep the unconfined publish
+    // the fixtures rely on.
     #[cfg(not(feature = "hosted-dev"))]
     if !ipccall_direct_request_endpoint_admitted(index) {
-        return;
+        return None;
     }
     // Complete-commit contract: recv-v2, valid payload dest, non-null meta dest.
     if state.recv_abi != crate::kernel::task::RecvAbiVariant::RecvV2
         || state.payload_user_ptr == 0
         || state.meta_user_ptr == 0
     {
-        return;
+        return None;
     }
-    let Some(asid) = kernel.task_asid(receiver_tid) else {
-        return;
+    let Some(asid) = receiver_asid else {
+        return None;
     };
     let server = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
     // Stage 199D reserve → commit → cancel. RESERVE first: capacity (and a still-live pair
@@ -6472,21 +6576,21 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
         Ok(reservation) => reservation,
         Err(crate::kernel::direct_ack_store::AckReserveError::EndpointAlreadyLive) => {
             crate::yarm_log!("IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server");
-            return;
+            return None;
         }
         Err(crate::kernel::direct_ack_store::AckReserveError::CapacityExhausted) => {
             crate::yarm_log!("IPCCALL_DIRECT_ACK_CAPACITY_REFUSED slot=server");
-            return;
+            return None;
         }
     };
     // Re-read the endpoint waiter identity under the IPC lock immediately before
     // publication and require an EXACT match (else the record is not fully committed
     // for this endpoint — publish nothing). CANCEL returns the reserved slot to vacant
     // with no server identity readable: a rollback with no slot or waiter leak.
-    let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
+    let waiter = live_waiter(index);
     if waiter != Some(server) {
         ipccall_direct_ack::cancel(reservation);
-        return;
+        return None;
     }
     let ack = crate::kernel::ipccall_direct::BlockedServerAck {
         server,
@@ -6502,18 +6606,10 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
         Ok(seq) => seq,
         Err(reservation) => {
             ipccall_direct_ack::cancel(reservation);
-            return;
+            return None;
         }
     };
-    // Stage 199A2D2C2B1: emit the AUTHORITATIVE cross-CPU blocked-server marker EXACTLY ONCE, only
-    // for the x86_64 SMP oracle's CPU-1 recv-v2 server, and ONLY once every authoritative
-    // blocking-order condition has committed: the saved continuation is captured, the exact endpoint
-    // waiter equals the server, the server is absent from every runqueue, its home CPU is 1, and the
-    // ack has published. Not a userspace log — a kernel marker. Never emits IPCCALL_DIRECT_SMP_
-    // REQUEST_OK (this stage does not deliver a request).
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    maybe_emit_ipccall_direct_smp_server_blocked(kernel, receiver_tid, index, generation, seq);
-    let _ = seq;
+    Some((index, generation, seq))
 }
 
 /// Stage 199A2D2C2B1: one-shot authoritative `IPCCALL_DIRECT_SMP_SERVER_BLOCKED` marker for the
@@ -6804,28 +6900,59 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
     endpoint: crate::kernel::capabilities::CapObject,
     state: &crate::kernel::task::BlockedRecvState,
 ) {
-    use crate::kernel::capabilities::CapObject;
-    if !ipccall_direct_publication_enabled() {
-        return;
-    }
-    let CapObject::Endpoint { index, generation } = endpoint else {
+    let Some((index, generation, seq)) = publish_ipcreply_direct_blocked_caller_ack_with(
+        receiver_tid,
+        kernel.task_asid(receiver_tid),
+        endpoint,
+        state,
+        |index| kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index)),
+    ) else {
         return;
     };
-    // Stage 199D-WA1-GATE: with the production term `false` on every architecture, reply
-    // publication is confined to the oracle's provisioned reply endpoint EVERYWHERE — x86_64
-    // included. Hosted wiring tests keep the unconfined publish their fixtures rely on.
+    // Stage 199A2D2C2C: emit the AUTHORITATIVE cross-CPU blocked-CALLER marker EXACTLY ONCE, only for
+    // the x86_64 SMP oracle's CPU-0 client blocking on its reply endpoint, and ONLY once every
+    // authoritative blocking-order condition has committed. The reply-side analog of
+    // `IPCCALL_DIRECT_SMP_SERVER_BLOCKED`.
+    //
+    // Stage 199D-WA3C2: like its NR6 twin, this is the ONE step needing a broad `&KernelState`,
+    // so it stays here rather than in the shared body below.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    maybe_emit_ipcreply_direct_smp_caller_blocked(kernel, receiver_tid, index, generation, seq);
+    let _ = (index, generation, seq);
+}
+
+/// Stage 199D-WA3C2 — **the ONE NR7 acknowledgement publication body**, shared by the broad
+/// blocked-recv arm above and the off-lock split blocking-IpcRecv route. See the NR6 twin
+/// [`publish_ipccall_direct_blocked_server_ack_with`] for why it is parameterised this way.
+pub(crate) fn publish_ipcreply_direct_blocked_caller_ack_with(
+    receiver_tid: u64,
+    receiver_asid: Option<crate::kernel::vm::Asid>,
+    endpoint: crate::kernel::capabilities::CapObject,
+    state: &crate::kernel::task::BlockedRecvState,
+    live_waiter: impl FnOnce(usize) -> Option<ReceiverWaiterIdentity>,
+) -> Option<(usize, u64, u64)> {
+    use crate::kernel::capabilities::CapObject;
+    if !ipccall_direct_publication_enabled() {
+        return None;
+    }
+    let CapObject::Endpoint { index, generation } = endpoint else {
+        return None;
+    };
+    // Stage 199D-WA3C2: unconfined on x86_64 (the production term short-circuits), and confined
+    // to the oracle's provisioned reply endpoint on every other architecture. Hosted wiring
+    // tests keep the unconfined publish their fixtures rely on.
     #[cfg(not(feature = "hosted-dev"))]
     if !ipccall_direct_reply_endpoint_admitted(index) {
-        return;
+        return None;
     }
     if state.recv_abi != crate::kernel::task::RecvAbiVariant::RecvV2
         || state.payload_user_ptr == 0
         || state.meta_user_ptr == 0
     {
-        return;
+        return None;
     }
-    let Some(asid) = kernel.task_asid(receiver_tid) else {
-        return;
+    let Some(asid) = receiver_asid else {
+        return None;
     };
     let caller = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
     // Stage 199D reserve → commit → cancel: capacity is refused here, before any
@@ -6834,18 +6961,18 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
         Ok(reservation) => reservation,
         Err(crate::kernel::direct_ack_store::AckReserveError::EndpointAlreadyLive) => {
             crate::yarm_log!("IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE slot=caller");
-            return;
+            return None;
         }
         Err(crate::kernel::direct_ack_store::AckReserveError::CapacityExhausted) => {
             crate::yarm_log!("IPCREPLY_DIRECT_ACK_CAPACITY_REFUSED slot=caller");
-            return;
+            return None;
         }
     };
     // Re-read the endpoint waiter identity under the IPC lock immediately before publish.
-    let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
+    let waiter = live_waiter(index);
     if waiter != Some(caller) {
         ipcreply_direct_ack::cancel(reservation);
-        return;
+        return None;
     }
     let ack = crate::kernel::ipccall_direct::BlockedCallerAck {
         caller,
@@ -6861,17 +6988,10 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
         Ok(seq) => seq,
         Err(reservation) => {
             ipcreply_direct_ack::cancel(reservation);
-            return;
+            return None;
         }
     };
-    // Stage 199A2D2C2C: emit the AUTHORITATIVE cross-CPU blocked-CALLER marker EXACTLY ONCE, only for
-    // the x86_64 SMP oracle's CPU-0 client blocking on its reply endpoint, and ONLY once every
-    // authoritative blocking-order condition has committed (saved continuation captured, the exact
-    // reply-endpoint waiter equals the caller, the caller is absent from every runqueue, its home CPU
-    // is 0, and the ack has published). The reply-side analog of `IPCCALL_DIRECT_SMP_SERVER_BLOCKED`.
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    maybe_emit_ipcreply_direct_smp_caller_blocked(kernel, receiver_tid, index, generation, seq);
-    let _ = seq;
+    Some((index, generation, seq))
 }
 
 /// Stage 199A2D2C2C: one-shot authoritative `IPCREPLY_DIRECT_SMP_CALLER_BLOCKED` marker for the x86_64
