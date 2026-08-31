@@ -1111,7 +1111,7 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
 ///
 /// SAFETY: local-CPU trap path, interrupts disabled, no concurrent access — identical discipline
 /// to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` store.
-fn stash_shared_region_delivery(
+pub(crate) fn stash_shared_region_delivery(
     cpu_idx: usize,
     snapshot: crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
     endpoint_idx: usize,
@@ -1133,30 +1133,39 @@ fn stash_shared_region_delivery(
     }
 }
 
-/// Stage 198E3 — is the shared-region live path eligible for this send? (gated + drainer-active)
-fn shared_region_live_eligible(kernel: &KernelState, msg: &Message) -> Option<usize> {
+/// 199G-C4 §3 — THE shared-region blocked-waiter delivery CLASS predicate.
+///
+/// A transfer flag, the shared-memory opcode, and a transferred cap. That is the class question
+/// alone; whether the live path is armed for this boot is the separate question below.
+#[must_use]
+pub(crate) fn blocked_waiter_shared_region_delivery_class_matches(msg: &Message) -> bool {
     let is_transfer =
         (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0;
-    let shared_region =
-        is_transfer && msg.opcode == OPCODE_SHARED_MEM && msg.transferred_cap().is_some();
-    if !shared_region {
-        return None;
-    }
-    // Stage 198E3 foundation: LIVE only under the oracle-proof knob (INERT on a normal boot — the
-    // legacy shared-region delivery path runs and no live-class markers are emitted).
-    if !crate::kernel::boot::ipc_recv_oracle_proof_enabled() {
-        return None;
-    }
-    // Only produce when a trap-entry drainer will run (mirrors the Stage 117 / 188C stash
-    // discipline). Direct/kernel-internal callers (no drainer) fall back to the legacy path.
-    let cpu_idx = kernel.current_cpu().0 as usize;
-    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
-        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+    is_transfer && msg.opcode == OPCODE_SHARED_MEM && msg.transferred_cap().is_some()
+}
+
+/// 199G-C4 §3 — THE shared-region live-path arming question, asked about one CPU.
+///
+/// Two conditions, both owned here so the broad gatherer and its off-lock counterpart cannot
+/// come to differ on when the live path runs: the oracle-proof knob must be armed (the path is
+/// INERT on a normal boot, where the legacy delivery runs and no live-class markers are
+/// emitted), and a trap-entry drainer must be active on this CPU, because without one the
+/// snapshot would never be executed.
+#[must_use]
+pub(crate) fn shared_region_live_armed(cpu_idx: usize) -> bool {
+    crate::kernel::boot::ipc_recv_oracle_proof_enabled()
+        && cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
             .load(core::sync::atomic::Ordering::Relaxed)
-    {
+}
+
+/// Stage 198E3 — is the shared-region live path eligible for this send? (gated + drainer-active)
+fn shared_region_live_eligible(kernel: &KernelState, msg: &Message) -> Option<usize> {
+    if !blocked_waiter_shared_region_delivery_class_matches(msg) {
         return None;
     }
-    Some(cpu_idx)
+    let cpu_idx = kernel.current_cpu().0 as usize;
+    shared_region_live_armed(cpu_idx).then_some(cpu_idx)
 }
 
 /// Stage 198E3 — Phase A producer for a shared-region (MemoryObject / DmaRegion) DIRECT delivery

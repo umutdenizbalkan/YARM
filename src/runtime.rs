@@ -864,12 +864,18 @@ pub(crate) struct ReplyCapMaterialization {
 /// `pinned_object` is `Some` exactly when the consumed envelope was a shared-region one and
 /// therefore still owes ONE rank-6 pin release. The reply-cap and ordinary-cap classes never
 /// carry one, so a `Some` is the caller's signal that it took a class it must not service.
+///
+/// 199G-C4 §3: `shared_region` carries the envelope's descriptor for the ONE class that does
+/// service a pinned envelope. That class does not release the reported pin — it takes over the
+/// pin's lifetime, so the refcount never transiently reaches zero — which is exactly why this
+/// consume reports the obligation instead of discharging it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TakenTransferEnvelopeFacts {
     pub(crate) source_object: CapObject,
     pub(crate) source_tid: u64,
     pub(crate) source_cap: CapId,
     pub(crate) pinned_object: Option<CapObject>,
+    pub(crate) shared_region: Option<crate::kernel::boot::TransferSharedRegion>,
 }
 
 /// U9-FT2 §2 — a typed refusal from the off-lock PageFault classifier.
@@ -6043,6 +6049,7 @@ impl SharedKernel {
                     .shared_region
                     .is_some()
                     .then_some(envelope.source_object),
+                shared_region: envelope.shared_region,
             })
         })
     }
@@ -8377,6 +8384,238 @@ impl SharedKernel {
         }
         crate::yarm_log!(
             "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid={}",
+            waiter_tid
+        );
+        Ok(true)
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK shared-region Phase A: the split counterpart of
+    /// `KernelState::shared_region_phase_a`.
+    ///
+    /// It consumes the shared-region envelope ONCE and TAKES OVER its object pin — the pin is
+    /// never released and re-acquired, so its refcount cannot transiently reach zero and the
+    /// region cannot be reclaimed underneath a transfer in flight. That is why the rank-3
+    /// consume reports the pin obligation rather than discharging it, and why the only rank-6
+    /// touch here is the release on the one rejection path that abandons the transfer.
+    ///
+    /// Rank order, each acquisition taken and fully released before the next:
+    /// 1. rank 3 — consume the envelope, receiving its descriptor and the pin obligation;
+    /// 2. no lock — the shared admission rule for the source object class;
+    /// 3. rank 6 — ONLY on rejection: release the pin this snapshot will not own;
+    /// 4. rank 2+4 — resolve the source capability ONCE, for its rights;
+    /// 5. no lock — the shared destination-rights attenuation;
+    /// 6. rank 2 — the receiver's cnode, ASID and process id.
+    ///
+    /// The result is the SAME `RecvBoundarySharedRegionSnapshot` the broad Phase A produces,
+    /// executed by the same origin-neutral transaction: this is one mechanism reached two ways,
+    /// not a second shared-region transfer.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn shared_region_phase_a_split(
+        &self,
+        handle: u64,
+        endpoint: CapObject,
+        endpoint_idx: usize,
+        receiver_tid: u64,
+        map_va: u64,
+        map_write: bool,
+        meta_ptr: u64,
+        msg: crate::kernel::ipc::Message,
+        origin_direct: bool,
+        recv_abi: crate::kernel::task::RecvAbiVariant,
+    ) -> Result<crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot, KernelError>
+    {
+        use crate::kernel::boot::shared_region_txn::{
+            RecvBoundarySharedRegionSnapshot, shared_region_admit_source_object,
+            shared_region_destination_rights,
+        };
+
+        // (1) rank 3 — the single consume. A pin, if any, is REPORTED and not released: this
+        // snapshot is about to own it.
+        let facts = self
+            .take_transfer_envelope_facts_split(
+                handle,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(receiver_tid),
+            )
+            .ok_or(KernelError::InvalidCapability)?;
+        let Some(descriptor) = facts.shared_region else {
+            // Not a shared-region envelope: it owed no pin, so there is nothing to release.
+            return Err(KernelError::WrongObject);
+        };
+        // (2)/(3) the shared admission rule; a rejected object's kept pin is released here, and
+        // here only.
+        let Some((object, object_generation)) =
+            shared_region_admit_source_object(facts.source_object)
+        else {
+            if let Some(pinned) = facts.pinned_object {
+                self.sr_release_pin_split(pinned);
+            }
+            return Err(KernelError::WrongObject);
+        };
+        // (4)/(5) source rights resolved ONCE, then the shared attenuation.
+        let source_capability =
+            self.resolve_capability_for_task_split(facts.source_tid, facts.source_cap)?;
+        let rights = shared_region_destination_rights(source_capability.rights(), map_write);
+        // (6) rank 2 — the receiver's generation-bearing authority.
+        let receiver_cnode = self
+            .task_cnode_split(receiver_tid)
+            .ok_or(KernelError::InvalidCapability)?;
+        let receiver_asid = self
+            .task_asid_opt_split_read(receiver_tid)
+            .ok_or(KernelError::UserMemoryFault)?;
+        let receiver_pid = self
+            .process_id_split_read(receiver_tid)
+            .unwrap_or(receiver_tid);
+        Ok(RecvBoundarySharedRegionSnapshot {
+            recv_abi,
+            receiver_cnode,
+            object,
+            object_generation,
+            rights,
+            descriptor,
+            source_tid: facts.source_tid,
+            source_cap: facts.source_cap,
+            receiver_tid,
+            receiver_pid,
+            receiver_asid,
+            endpoint,
+            map_va,
+            meta_ptr,
+            map_write,
+            pin_owned: true,
+            // Default: NOT a blocked endpoint waiter. The direct blocked-receiver producer sets
+            // this true after Phase A, exactly as it does on the broad path.
+            blocked_endpoint_waiter: false,
+            origin_direct,
+            msg,
+        })
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK SHARED-REGION blocked-waiter delivery producer: the split
+    /// counterpart of `produce_blocked_waiter_shared_region_delivery`.
+    ///
+    /// The shared-region class is the one direct delivery that carries an object pin, and its
+    /// correctness rests on that pin never lapsing: Phase A takes it over from the consumed
+    /// envelope rather than releasing and re-acquiring it. Nothing is mapped, minted or copied
+    /// here — the drain's origin-neutral `shared_region_execute` does all of it after this route
+    /// returns and the broad borrow would have been dropped.
+    ///
+    /// The authoritative acknowledgement is checked NON-destructively before any mutation and
+    /// consumed only after the post-work is published, exactly as in the broad producer: a
+    /// too-early or duplicate send is refused with the canonical retryable `WouldBlock` having
+    /// taken no blocked state, mapped and minted nothing, and left the transfer envelope for the
+    /// outer path to release so the sender can retry.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn produce_blocked_waiter_shared_region_delivery_split(
+        &self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<bool, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::syscall::{
+            SyscallError, blocked_waiter_shared_region_delivery_class_matches,
+            shared_region_live_armed, stash_shared_region_delivery,
+        };
+
+        // (0) The class question and the arming question — the same two owners the broad
+        // producer asks, in the same order, before anything is touched.
+        if !blocked_waiter_shared_region_delivery_class_matches(msg) {
+            return Ok(false);
+        }
+        let cpu_idx = self.current_cpu_split_read().0 as usize;
+        if !shared_region_live_armed(cpu_idx) {
+            return Ok(false);
+        }
+
+        // (1) Stage 198E3C1C — the AUTHORITATIVE ack gate, FAIL CLOSED before any mutation and
+        // checked non-destructively; the consume happens only after publication below.
+        #[cfg(feature = "shared-region-direct-oracle")]
+        if crate::kernel::boot::shared_region_direct_oracle_enabled()
+            && !crate::kernel::boot::shared_region_blocked_recv::matches_for_delivery(
+                waiter_tid,
+                endpoint_idx,
+            )
+        {
+            crate::yarm_log!(
+                "SHARED_REGION_DIRECT_DECLINE_NO_ACK tid={} endpoint={} result=retry",
+                waiter_tid,
+                endpoint_idx
+            );
+            return Err(SyscallError::WouldBlock);
+        }
+
+        // (2) rank 2 — consume the waiter's blocked state; its ABI travels into the snapshot and
+        // selects the final projection only.
+        let blocked_state = self
+            .with_task_tcbs_split_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == waiter_tid)
+                    .and_then(|tcb| tcb.blocked_recv_state.take())
+            })
+            .ok_or(SyscallError::InvalidArgs)?;
+        let recv_abi = blocked_state.recv_abi;
+
+        // (3) rank 2+4 — the endpoint the envelope is bound to, from the waiter's saved cap.
+        let recv_endpoint = self
+            .resolve_capability_for_task_split(waiter_tid, blocked_state.recv_cap)
+            .map_err(SyscallError::from)?
+            .object;
+        match recv_endpoint {
+            CapObject::Endpoint { index, .. } if index == endpoint_idx => {}
+            _ => return Err(SyscallError::InvalidCapability),
+        }
+
+        // (4) the shared Phase A: one consume, the pin taken over, rights attenuated once. The
+        // receiver's recv buffers supply the map VA and the metadata target; read-only for the
+        // primary live seal, matching the broad producer.
+        let mut snapshot = self
+            .shared_region_phase_a_split(
+                msg.transferred_cap()
+                    .ok_or(SyscallError::InvalidCapability)?
+                    .0,
+                recv_endpoint,
+                endpoint_idx,
+                waiter_tid,
+                blocked_state.payload_user_ptr as u64,
+                false,
+                blocked_state.meta_user_ptr as u64,
+                *msg,
+                true,
+                recv_abi,
+            )
+            .map_err(SyscallError::from)?;
+        // The receiver was consumed as a BLOCKED ENDPOINT WAITER: finalization must clear its
+        // blocked-return state + the endpoint waiter slot before waking (structural, not the
+        // origin marker).
+        snapshot.blocked_endpoint_waiter = true;
+        stash_shared_region_delivery(
+            cpu_idx,
+            snapshot,
+            endpoint_idx,
+            crate::kernel::boot::SharedRegionLiveOrigin::Direct,
+        );
+
+        // (5) the delivery is now committed to the drain — CONSUME the ack exactly once, so a
+        // duplicate send finds it consumed and fails closed above, and no pre-publication
+        // failure could have consumed it.
+        #[cfg(feature = "shared-region-direct-oracle")]
+        if crate::kernel::boot::shared_region_direct_oracle_enabled()
+            && !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(
+                waiter_tid,
+                endpoint_idx,
+            )
+        {
+            crate::yarm_log!(
+                "SHARED_REGION_DIRECT_ACK_CONSUME_RACE tid={} endpoint={}",
+                waiter_tid,
+                endpoint_idx
+            );
+        }
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_shared_region waiter_tid={}",
             waiter_tid
         );
         Ok(true)

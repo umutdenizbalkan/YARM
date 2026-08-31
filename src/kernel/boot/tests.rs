@@ -147155,3 +147155,261 @@ mod stage199gc4_reply_cap_delivery_policy {
         assert!(class < body.find("current_cpu_split_read()").expect("rank 1"));
     }
 }
+
+/// 199G-C4 §3 — THE shared-region blocked-waiter delivery policy, and its two Phase As.
+///
+/// The shared-region class is the one direct delivery that carries an object pin, and its
+/// correctness rests on that pin never lapsing: Phase A takes it over from the consumed envelope
+/// rather than releasing and re-acquiring it. These tests hold the shared decisions, the pin
+/// discipline, and the arming rule that keeps the class inert on a normal boot.
+#[cfg(test)]
+mod stage199gc4_shared_region_delivery_policy {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        shared_region_admit_source_object, shared_region_destination_rights,
+    };
+    use crate::kernel::capabilities::{CapObject, CapRights};
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{
+        OPCODE_SHARED_MEM, blocked_waiter_shared_region_delivery_class_matches,
+    };
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TXN_SRC: &str = include_str!("shared_region_txn.rs");
+
+    #[test]
+    fn the_class_predicate_admits_only_shared_memory_transfers() {
+        let shared = Message::with_header(
+            3,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(11),
+            b"x",
+        )
+        .expect("msg");
+        assert!(blocked_waiter_shared_region_delivery_class_matches(&shared));
+
+        // The opcode alone distinguishes it from an ordinary transfer of the same shape.
+        let ordinary =
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER, Some(11), b"x").expect("msg");
+        assert!(!blocked_waiter_shared_region_delivery_class_matches(
+            &ordinary
+        ));
+        // And a shared-memory opcode with no cap is not a transfer at all.
+        assert!(!blocked_waiter_shared_region_delivery_class_matches(
+            &Message::new(3, b"x").expect("msg")
+        ));
+    }
+
+    #[test]
+    fn only_physically_backed_objects_are_admitted_as_a_shared_region_source() {
+        for admitted in [
+            CapObject::MemoryObject { id: 7 },
+            CapObject::DmaRegion {
+                id: 7,
+                offset: 0,
+                len: 0x1000,
+            },
+        ] {
+            let (object, generation) =
+                shared_region_admit_source_object(admitted).expect("admitted");
+            assert_eq!(object, admitted, "the frozen identity is the object itself");
+            assert_eq!(generation, 0, "these classes carry no object generation");
+        }
+        for refused in [
+            CapObject::Endpoint {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Reply {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Kernel,
+        ] {
+            assert!(
+                shared_region_admit_source_object(refused).is_none(),
+                "{refused:?} names no physically-backed region"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_transfer_attenuates_to_an_allow_list_not_a_subtraction() {
+        let source = CapRights::READ | CapRights::WRITE | CapRights::MAP | CapRights::SEND;
+        // A writable mapping carries the source rights unchanged.
+        assert_eq!(
+            shared_region_destination_rights(source, true),
+            source,
+            "a writable transfer is not attenuated"
+        );
+        // A read-only mapping keeps exactly READ|MAP — GRANT does not ride along.
+        let attenuated = shared_region_destination_rights(source, false);
+        assert!(attenuated.contains(CapRights::READ));
+        assert!(attenuated.contains(CapRights::MAP));
+        assert!(!attenuated.contains(CapRights::WRITE));
+        assert!(
+            !attenuated.contains(CapRights::SEND),
+            "an allow-list drops every right it does not name"
+        );
+        // And the receiver never gains a right the sender lacked.
+        let narrow = CapRights::READ;
+        assert_eq!(shared_region_destination_rights(narrow, false), narrow);
+        assert_eq!(shared_region_destination_rights(narrow, true), narrow);
+    }
+
+    #[test]
+    fn both_phase_as_share_the_admission_and_attenuation_owners() {
+        for owner in [
+            "pub(crate) fn shared_region_admit_source_object(",
+            "pub(crate) fn shared_region_destination_rights(",
+        ] {
+            assert_eq!(TXN_SRC.matches(owner).count(), 1, "one owner for `{owner}`");
+        }
+        // The broad Phase A delegates both decisions.
+        let start = TXN_SRC
+            .find("pub(crate) fn shared_region_phase_a(")
+            .expect("broad phase A");
+        let end = TXN_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let broad = &TXN_SRC[start..end];
+        assert!(broad.contains("shared_region_admit_source_object("));
+        assert!(broad.contains("shared_region_destination_rights("));
+        assert!(
+            !broad.contains("CapRights::READ | CapRights::MAP"),
+            "the broad Phase A must not re-spell the attenuation"
+        );
+
+        // The split Phase A calls the same two owners and forms no broad borrow.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn shared_region_phase_a_split(")
+            .expect("split phase A");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert!(split.contains("shared_region_admit_source_object("));
+        assert!(split.contains("shared_region_destination_rights("));
+        assert!(!split.contains("CapRights::READ | CapRights::MAP"));
+        assert!(!split.contains("self.with("));
+    }
+
+    #[test]
+    fn the_split_phase_a_takes_over_the_pin_and_releases_it_on_exactly_one_path() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn shared_region_phase_a_split(")
+            .expect("split phase A");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+
+        // The snapshot owns the pin.
+        assert!(
+            body.contains("pin_owned: true"),
+            "the snapshot takes over the pin's lifetime"
+        );
+        // Exactly one release, and it is the abandon-the-transfer path.
+        assert_eq!(
+            body.matches("sr_release_pin_split(").count(),
+            1,
+            "the pin is released on exactly one path"
+        );
+        // Never re-acquired: a release-then-acquire would let the refcount reach zero.
+        assert!(
+            !body.contains("sr_acquire_pin_split("),
+            "taking the pin over means never re-acquiring it"
+        );
+        // Exactly one consume.
+        assert_eq!(
+            body.matches("take_transfer_envelope_facts_split(").count(),
+            1
+        );
+        // The consume precedes the release, which precedes the source-capability resolve.
+        let consume = body
+            .find("take_transfer_envelope_facts_split(")
+            .expect("consume");
+        let release = body.find("sr_release_pin_split(").expect("release");
+        let resolve = body
+            .find("resolve_capability_for_task_split(facts.source_tid")
+            .expect("resolve");
+        assert!(consume < release && release < resolve, "rank 3 → 6 → 2+4");
+    }
+
+    #[test]
+    fn the_arming_rule_has_one_owner_and_keeps_the_class_inert_on_a_normal_boot() {
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn shared_region_live_armed(")
+                .count(),
+            1,
+            "one arming owner"
+        );
+        // A normal boot leaves the oracle-proof knob off, so the live path is not armed and the
+        // producers decline before touching anything.
+        assert!(
+            !crate::kernel::boot::ipc_recv_oracle_proof_enabled(),
+            "the oracle-proof knob is off by default"
+        );
+        assert!(
+            !crate::kernel::syscall::shared_region_live_armed(0),
+            "with the knob off the live shared-region path is inert on every CPU"
+        );
+
+        // Both gatherers ask the same owner rather than re-reading the knob.
+        let start = SYSCALL_SRC
+            .find("fn shared_region_live_eligible(")
+            .expect("broad eligibility");
+        let end = SYSCALL_SRC[start..].find("\n}\n").expect("ends") + start;
+        assert!(SYSCALL_SRC[start..end].contains("shared_region_live_armed(cpu_idx)"));
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_shared_region_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert!(split.contains("shared_region_live_armed(cpu_idx)"));
+        assert!(
+            !split.contains("ipc_recv_oracle_proof_enabled()"),
+            "the gatherer must not re-read the knob behind the owner's back"
+        );
+    }
+
+    #[test]
+    fn the_split_producer_checks_the_ack_before_mutating_and_consumes_it_after_publishing() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_shared_region_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+
+        let check = body
+            .find("matches_for_delivery(")
+            .expect("non-destructive ack check");
+        let take = body
+            .find("blocked_recv_state.take()")
+            .expect("first mutation");
+        let publish = body
+            .find("stash_shared_region_delivery(")
+            .expect("publication");
+        let consume = body.find("consume_for_delivery(").expect("ack consume");
+        assert!(
+            check < take,
+            "the ack is checked before the first mutation, so a refusal strands nothing"
+        );
+        assert!(
+            publish < consume,
+            "the ack is consumed only after the delivery is committed to the drain"
+        );
+
+        // Nothing is mapped, minted or copied by the producer.
+        for executor_work in [
+            "map_user_page_in_asid_split(",
+            "sr_mint_split(",
+            "copy_slice_to_user_asid_split_write(",
+            "sr_wake_receiver_split(",
+        ] {
+            assert!(
+                !body.contains(executor_work),
+                "a producer must leave `{executor_work}` to the drain"
+            );
+        }
+        // The receiver is marked as what it is: a consumed blocked endpoint waiter.
+        assert!(body.contains("snapshot.blocked_endpoint_waiter = true;"));
+    }
+}
