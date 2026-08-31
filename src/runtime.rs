@@ -8122,6 +8122,29 @@ impl SharedKernel {
         self.with_memory_split_mut(|m| KernelState::release_transfer_pin_locked(m, token))
     }
 
+    /// 199G-C4 §3 — the OFF-LOCK endpoint-only enqueue: the split entry to THE enqueue policy
+    /// the broad `ipc_try_send_queued_plain_endpoint_only` also calls.
+    ///
+    /// One bounded rank-3 acquisition and nothing else. Every decision — the waiter and
+    /// sender-waiter classification, the reply-cap exclusion, the endpoint-missing and
+    /// non-`Buffered` refusals, the bounded `endpoint.send(msg)` and its queue-full refusal —
+    /// belongs to the shared owner, so this cannot drift from the broad path: FIFO order, sparse
+    /// slots, framing and every `Ineligible` reason are identical by construction.
+    ///
+    /// `ReceiverWaiterFound` is returned, not acted on: whether that receiver can take a direct
+    /// delivery is a rank-2 question the caller must ask outside this acquisition, exactly as the
+    /// broad caller does.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn ipc_try_send_queued_plain_endpoint_only_split(
+        &self,
+        endpoint_idx: usize,
+        msg: crate::kernel::ipc::Message,
+    ) -> crate::kernel::boot::IpcEndpointSendResult {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::ipc_try_send_queued_plain_endpoint_only_locked(ipc, endpoint_idx, msg)
+        })
+    }
+
     /// 199G-C4 §2 — the OFF-LOCK transfer-envelope stash: the split counterpart of
     /// `KernelState::stash_transfer_envelope`, and the transaction NR1's pre-lock route needs
     /// before it can carry a capability transfer.

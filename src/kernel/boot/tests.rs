@@ -146149,3 +146149,236 @@ mod stage199gc4_split_envelope_stash {
         );
     }
 }
+
+/// 199G-C4 §3 — the authoritative rank-3 IPC mutation owners.
+///
+/// The directive requires that each policy have exactly ONE implementation, with broad and
+/// split entry points supplying only different acquisition wrappers over the same core owner.
+/// These tests hold the endpoint-only enqueue policy to that: structurally (one body, two thin
+/// wrappers) and behaviourally (identical result and identical resulting queue state for the
+/// same input on two identically-built kernels).
+#[cfg(test)]
+mod stage199gc4_ipc_mutation_owners {
+    use super::*;
+    use crate::kernel::boot::{IpcEndpointSendResult, IpcEndpointSplitRejectReason};
+    use crate::kernel::ipc::Message;
+    use crate::runtime::SharedKernel;
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn plain_msg(word: u8) -> Message {
+        Message::new(1, &[word]).expect("plain message")
+    }
+
+    /// Two kernels built by the same recipe, so a broad run and a split run are comparable.
+    fn fixture() -> (SharedKernel, usize) {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("sender");
+        let (eidx, _send, _recv) = state.create_endpoint(4).expect("endpoint");
+        (SharedKernel::new(state), eidx)
+    }
+
+    /// Non-destructive FIFO snapshot: drain the endpoint, recording word 0 in order, then
+    /// refill it in the same order so the endpoint is left exactly as it was found.
+    fn queue_words(k: &SharedKernel, eidx: usize) -> alloc::vec::Vec<u8> {
+        k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                let mut out = alloc::vec::Vec::new();
+                let Some(endpoint) = ipc.endpoints[eidx].as_mut() else {
+                    return out;
+                };
+                let mut drained = alloc::vec::Vec::new();
+                while let Some(msg) = endpoint.recv() {
+                    out.push(msg.payload[0]);
+                    drained.push(msg);
+                }
+                for msg in drained {
+                    endpoint.send(msg).expect("refill what we drained");
+                }
+                out
+            })
+        })
+    }
+
+    #[test]
+    fn the_endpoint_enqueue_policy_has_exactly_one_implementation() {
+        // The policy body lives in exactly one function.
+        assert_eq!(
+            IPC_SRC
+                .matches("fn ipc_try_send_queued_plain_endpoint_only_locked(")
+                .count(),
+            1,
+            "one and only one endpoint-only enqueue owner"
+        );
+
+        // The broad entry is a thin acquisition wrapper: it delegates, and it no longer carries
+        // the classification/refusal decisions itself.
+        let broad_start = IPC_SRC
+            .find("pub(crate) fn ipc_try_send_queued_plain_endpoint_only(")
+            .expect("broad entry");
+        let broad_end = IPC_SRC[broad_start..]
+            .find("\n    }\n")
+            .expect("broad entry body ends")
+            + broad_start;
+        let broad_body = &IPC_SRC[broad_start..broad_end];
+        assert!(
+            broad_body.contains("self.with_ipc_state_mut(|ipc| {")
+                || broad_body.contains("self.with_ipc_state_mut(|ipc| Self::"),
+            "the broad entry still owns its rank-3 acquisition"
+        );
+        assert!(
+            broad_body.contains("Self::ipc_try_send_queued_plain_endpoint_only_locked("),
+            "and delegates the policy to the one owner"
+        );
+        for decision in [
+            "IpcEndpointSplitRejectReason::EndpointIndexOutOfRange",
+            "IpcEndpointSplitRejectReason::SenderWaiterPresent",
+            "IpcEndpointSplitRejectReason::TransferOrReplyCapMessage",
+            "IpcEndpointSplitRejectReason::EndpointMissing",
+            "IpcEndpointSplitRejectReason::NonBufferedEndpoint",
+            "IpcEndpointSplitRejectReason::EndpointQueueFull",
+            "endpoint.send(msg)",
+        ] {
+            assert!(
+                !broad_body.contains(decision),
+                "the broad wrapper must not re-implement `{decision}` — it belongs to the owner"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_entry_is_the_same_owner_under_a_different_acquisition() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn ipc_try_send_queued_plain_endpoint_only_split(")
+            .expect("split entry exists");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("body ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+        assert!(
+            body.contains("self.with_ipc_split_mut(|ipc| {"),
+            "the split entry acquires rank 3 through the split seam"
+        );
+        assert!(
+            body.contains("KernelState::ipc_try_send_queued_plain_endpoint_only_locked("),
+            "and calls the same policy owner as the broad entry"
+        );
+        // Exactly one lock acquisition: nothing else may be taken inside this entry.
+        assert_eq!(
+            body.matches("with_ipc_split_mut").count(),
+            1,
+            "one bounded rank-3 acquisition"
+        );
+        for forbidden in [
+            "with_task_split_mut",
+            "with_memory_split_mut",
+            "with_scheduler_split_mut",
+            "with_capability_split_mut",
+            "self.with(",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the split enqueue entry must take rank 3 and nothing else (saw `{forbidden}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn broad_and_split_enqueue_agree_on_the_success_path_and_on_queue_state() {
+        let (broad_k, broad_e) = fixture();
+        let (split_k, split_e) = fixture();
+        assert_eq!(broad_e, split_e, "same fixture recipe, same endpoint index");
+
+        for word in [11_u8, 22, 33] {
+            let via_broad = broad_k
+                .with(|s| s.ipc_try_send_queued_plain_endpoint_only(broad_e, plain_msg(word)));
+            let via_split =
+                split_k.ipc_try_send_queued_plain_endpoint_only_split(split_e, plain_msg(word));
+            assert_eq!(via_broad, IpcEndpointSendResult::Enqueued);
+            assert_eq!(via_broad, via_split, "one policy, one outcome");
+        }
+
+        // FIFO order and framing are the endpoint primitive's, identical on both routes.
+        assert_eq!(queue_words(&broad_k, broad_e), [11_u8, 22, 33]);
+        assert_eq!(
+            queue_words(&broad_k, broad_e),
+            queue_words(&split_k, split_e),
+            "identical resulting queue state"
+        );
+    }
+
+    #[test]
+    fn broad_and_split_agree_on_the_queue_full_refusal_without_mutating() {
+        let (broad_k, broad_e) = fixture();
+        let (split_k, split_e) = fixture();
+        for word in 0..4_u8 {
+            assert_eq!(
+                broad_k
+                    .with(|s| s.ipc_try_send_queued_plain_endpoint_only(broad_e, plain_msg(word))),
+                IpcEndpointSendResult::Enqueued
+            );
+            assert_eq!(
+                split_k.ipc_try_send_queued_plain_endpoint_only_split(split_e, plain_msg(word)),
+                IpcEndpointSendResult::Enqueued
+            );
+        }
+        let before_broad = queue_words(&broad_k, broad_e);
+        let before_split = queue_words(&split_k, split_e);
+
+        let full =
+            IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::EndpointQueueFull);
+        assert_eq!(
+            broad_k.with(|s| s.ipc_try_send_queued_plain_endpoint_only(broad_e, plain_msg(99))),
+            full
+        );
+        assert_eq!(
+            split_k.ipc_try_send_queued_plain_endpoint_only_split(split_e, plain_msg(99)),
+            full
+        );
+        assert_eq!(
+            queue_words(&broad_k, broad_e),
+            before_broad,
+            "refusal does not mutate"
+        );
+        assert_eq!(
+            queue_words(&split_k, split_e),
+            before_split,
+            "refusal does not mutate"
+        );
+    }
+
+    #[test]
+    fn broad_and_split_agree_on_the_structural_refusals() {
+        let (broad_k, broad_e) = fixture();
+        let (split_k, split_e) = fixture();
+
+        let oor = IpcEndpointSendResult::Ineligible(
+            IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+        );
+        let bad = broad_k.with(|s| s.with_ipc_state(|ipc| ipc.endpoints.len()));
+        assert_eq!(
+            broad_k.with(|s| s.ipc_try_send_queued_plain_endpoint_only(bad, plain_msg(1))),
+            oor
+        );
+        assert_eq!(
+            split_k.ipc_try_send_queued_plain_endpoint_only_split(bad, plain_msg(1)),
+            oor
+        );
+
+        // A reply-cap message is excluded on both routes, for the same reason, without enqueue.
+        let reply = Message::with_header(1, 0, Message::FLAG_REPLY_CAP, Some(9), b"r")
+            .expect("reply-cap message");
+        let excluded = IpcEndpointSendResult::Ineligible(
+            IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+        );
+        assert_eq!(
+            broad_k.with(|s| s.ipc_try_send_queued_plain_endpoint_only(broad_e, reply)),
+            excluded
+        );
+        assert_eq!(
+            split_k.ipc_try_send_queued_plain_endpoint_only_split(split_e, reply),
+            excluded
+        );
+        assert!(queue_words(&broad_k, broad_e).is_empty());
+        assert!(queue_words(&split_k, split_e).is_empty());
+    }
+}

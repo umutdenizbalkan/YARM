@@ -4826,81 +4826,99 @@ impl KernelState {
         endpoint_idx: usize,
         msg: Message,
     ) -> IpcEndpointSendResult {
+        // 199G-C4 §3: the body is THE endpoint-only enqueue policy, extracted so the broad entry
+        // here and the off-lock `SharedKernel` entry call one implementation. Only the
+        // acquisition wrapper differs — `with_ipc_state_mut` here, `with_ipc_split_mut` there.
         self.with_ipc_state_mut(|ipc| {
-            if endpoint_idx >= ipc.endpoints.len() {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
-                );
-            }
-            let receiver_waiter = ipc.endpoint_waiter_identity(endpoint_idx);
-            let has_sender_waiters = ipc.endpoint_sender_waiters[endpoint_idx]
-                .iter()
-                .any(Option::is_some);
-
-            match (receiver_waiter, has_sender_waiters) {
-                (Some(_), true) => {
-                    // Both receiver and sender waiters present: complex ordering state.
-                    // Fall back to the full IPC send path which handles this correctly.
-                    return IpcEndpointSendResult::Ineligible(
-                        IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                    );
-                }
-                (Some(receiver), false) => {
-                    // Receiver waiter present, no sender waiters.
-                    // TID comes from a locked ipc_state_lock read — no unlocked access needed.
-                    // Caller must check is_task_recv_v2_blocked (task_state_lock rank 3) before
-                    // calling ipc_try_send_to_plain_receiver_endpoint_only (ipc_state_lock rank 4).
-                    return IpcEndpointSendResult::ReceiverWaiterFound(receiver);
-                }
-                (None, true) => {
-                    return IpcEndpointSendResult::Ineligible(
-                        IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                    );
-                }
-                (None, false) => {
-                    // No waiters: fall through to Stage 4E queue-enqueue logic below.
-                }
-            }
-
-            // Stage 4E: FLAG_REPLY_CAP messages carry a kernel reply-cap handle and
-            // must use the full send path (reply-cap semantics require endpoint-side
-            // tracking not present here).
-            //
-            // FLAG_CAP_TRANSFER and FLAG_CAP_TRANSFER_PLAIN are safe for Stage 4E:
-            // stash_transfer_handle already moved the cap into the transfer-envelope
-            // table before this call, so the message's transferred_cap field is merely
-            // a numeric envelope handle.  For the no-receiver buffered-enqueue case,
-            // ipc_send_with_optional_deadline does an identical endpoint.send(msg),
-            // making Stage 4E a strict behavioural subset of the full path.
-            // The receiver's ipc_recv (or ipc_recv_timeout) falls through to the full
-            // path to materialise the cap, since Stage 4C/4D still rejects cap-transfer
-            // messages on the recv side.
-            if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
-                );
-            }
-
-            let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointMissing,
-                );
-            };
-            let endpoint = kernel_mut(endpoint_storage);
-            if endpoint.mode() != EndpointMode::Buffered {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::NonBufferedEndpoint,
-                );
-            }
-
-            if endpoint.send(msg).is_err() {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointQueueFull,
-                );
-            }
-
-            IpcEndpointSendResult::Enqueued
+            Self::ipc_try_send_queued_plain_endpoint_only_locked(ipc, endpoint_idx, msg)
         })
+    }
+
+    /// 199G-C4 §3 — THE endpoint-only enqueue policy, over `&mut IpcSubsystem` (rank 3 only).
+    ///
+    /// Extracted verbatim from the broad entry above so there is one implementation of: the
+    /// waiter/sender-waiter classification and its `Ineligible` reasons, the reply-cap exclusion,
+    /// the endpoint-missing and non-`Buffered` refusals, and the bounded `endpoint.send(msg)`
+    /// with its queue-full refusal. FIFO order, sparse-slot behaviour, message framing and every
+    /// refusal code are the endpoint primitive's, unchanged.
+    pub(crate) fn ipc_try_send_queued_plain_endpoint_only_locked(
+        ipc: &mut IpcSubsystem,
+        endpoint_idx: usize,
+        msg: Message,
+    ) -> IpcEndpointSendResult {
+        if endpoint_idx >= ipc.endpoints.len() {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+            );
+        }
+        let receiver_waiter = ipc.endpoint_waiter_identity(endpoint_idx);
+        let has_sender_waiters = ipc.endpoint_sender_waiters[endpoint_idx]
+            .iter()
+            .any(Option::is_some);
+
+        match (receiver_waiter, has_sender_waiters) {
+            (Some(_), true) => {
+                // Both receiver and sender waiters present: complex ordering state.
+                // Fall back to the full IPC send path which handles this correctly.
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
+                );
+            }
+            (Some(receiver), false) => {
+                // Receiver waiter present, no sender waiters.
+                // TID comes from a locked ipc_state_lock read — no unlocked access needed.
+                // Caller must check is_task_recv_v2_blocked (task_state_lock rank 3) before
+                // calling ipc_try_send_to_plain_receiver_endpoint_only (ipc_state_lock rank 4).
+                return IpcEndpointSendResult::ReceiverWaiterFound(receiver);
+            }
+            (None, true) => {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
+                );
+            }
+            (None, false) => {
+                // No waiters: fall through to Stage 4E queue-enqueue logic below.
+            }
+        }
+
+        // Stage 4E: FLAG_REPLY_CAP messages carry a kernel reply-cap handle and
+        // must use the full send path (reply-cap semantics require endpoint-side
+        // tracking not present here).
+        //
+        // FLAG_CAP_TRANSFER and FLAG_CAP_TRANSFER_PLAIN are safe for Stage 4E:
+        // stash_transfer_handle already moved the cap into the transfer-envelope
+        // table before this call, so the message's transferred_cap field is merely
+        // a numeric envelope handle.  For the no-receiver buffered-enqueue case,
+        // ipc_send_with_optional_deadline does an identical endpoint.send(msg),
+        // making Stage 4E a strict behavioural subset of the full path.
+        // The receiver's ipc_recv (or ipc_recv_timeout) falls through to the full
+        // path to materialise the cap, since Stage 4C/4D still rejects cap-transfer
+        // messages on the recv side.
+        if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+            );
+        }
+
+        let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointMissing,
+            );
+        };
+        let endpoint = kernel_mut(endpoint_storage);
+        if endpoint.mode() != EndpointMode::Buffered {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+            );
+        }
+
+        if endpoint.send(msg).is_err() {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointQueueFull,
+            );
+        }
+
+        IpcEndpointSendResult::Enqueued
     }
 
     /// Stage 193E (BROAD-IPC DECOMPOSITION): the IpcSend PLAIN no-waiter enqueue boundary
