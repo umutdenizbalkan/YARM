@@ -422,7 +422,19 @@ u9rx4_require_one "the replier side of the one-shot is revoked once" \
   'IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538'
 u9rx4_require_one "the caller side of the one-shot is revoked once" \
   'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2'
-u9rx4_require_one "the blocked caller resumes exactly once" 'IPC_REPLY_WAKE_CALLER tid=2'
+# Stage 199G-B §2: the caller's reply-wait is an NR 5 receive, so it now parks through the
+# pre-lock route and saves a real blocked-receive record. That makes the reply-boundary producer
+# ACCEPT, and the wake moves from the legacy in-lock `IPC_REPLY_WAKE_CALLER` to the deferred
+# plain-delivery executor's own single wake. Both are the same event — the caller resuming exactly
+# once — so the witness accepts whichever owner performed it, and still requires exactly one.
+u9rx4_caller_wake_legacy="$(u9rx4_count 'IPC_REPLY_WAKE_CALLER tid=2')"
+u9rx4_caller_wake_split="$(u9rx4_count 'DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_plain')"
+if (( u9rx4_caller_wake_legacy + u9rx4_caller_wake_split != 1 )); then
+  echo "[error] U9-RX4: the blocked caller resumes exactly once -- expected exactly 1, got legacy=${u9rx4_caller_wake_legacy} split=${u9rx4_caller_wake_split}"
+  u9rx4_fail=1
+else
+  echo "[ok] U9-RX4: the blocked caller resumes exactly once (legacy=${u9rx4_caller_wake_legacy} split=${u9rx4_caller_wake_split})"
+fi
 # The defect's own signatures must be gone.
 u9rx4_require_zero "no reply cap is lost to the u32::MAX sentinel" 'reply_cap=4294967295'
 u9rx4_require_zero "PM never fails to decode" 'PM_RECV_DECODE_FAIL'
