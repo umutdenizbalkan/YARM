@@ -747,13 +747,14 @@ pub(super) fn handle_ipc_recv(
                 tcb.blocked_recv_state = Some(state);
             });
             crate::yarm_log!(
-                "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={}",
+                "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={} abi={}",
                 recv_tid,
                 cap.0,
                 state.payload_user_ptr,
                 state.payload_user_len,
                 state.meta_user_ptr,
-                state.meta_user_len
+                state.meta_user_len,
+                state.recv_abi.slug()
             );
             // Stage 198E3C1B-H: publish the AUTHORITATIVE blocked-recv acknowledgement now that the
             // blocked-recv record is FULLY committed — the endpoint waiter was linked + the task
@@ -927,11 +928,13 @@ pub(super) fn handle_ipc_recv_timeout(
                     tcb.blocked_recv_state = Some(state);
                 });
                 crate::yarm_log!(
-                    "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x0 meta_len=0 abi={}",
+                    "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={} abi={}",
                     recv_tid,
                     cap.0,
                     state.payload_user_ptr,
                     state.payload_user_len,
+                    state.meta_user_ptr,
+                    state.meta_user_len,
                     state.recv_abi.slug()
                 );
                 if let Some(deadline) = preread_deadline {

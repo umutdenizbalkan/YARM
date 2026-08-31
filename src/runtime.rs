@@ -4326,13 +4326,14 @@ impl SharedKernel {
             wait_gen
         );
         crate::yarm_log!(
-            "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={}",
+            "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={} abi={}",
             tid,
             recv_cap.0,
             state.payload_user_ptr,
             state.payload_user_len,
             state.meta_user_ptr,
-            state.meta_user_len
+            state.meta_user_len,
+            state.recv_abi.slug()
         );
         Some(wait_gen)
     }

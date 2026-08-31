@@ -113003,12 +113003,16 @@ mod stage199d_riscv_canonical_admission {
         let at = w
             .find("let split_eligible = is_syscall")
             .expect("the whitelist");
-        let whitelist = &w[at..at + 420];
+        let whitelist = &w[at..at + 500];
         for nr in [
             "SYSCALL_DEBUG_LOG_NR",
             "SYSCALL_FUTEX_WAKE_NR",
             // U9-QA §2: the one SWITCHING member.
             "SYSCALL_FUTEX_WAIT_NR",
+            // Stage 199G-B §2: the SECOND switching member — IpcRecvTimeout (NR 5), whose
+            // pre-lock route is NR 2's route and whose completion is the shared D2-recv drain
+            // this bridge has driven since U4.
+            "SYSCALL_IPC_RECV_TIMEOUT_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -113016,11 +113020,16 @@ mod stage199d_riscv_canonical_admission {
                 "the whitelist must still admit `{nr}`"
             );
         }
-        // Nothing else was added to the whitelist.
+        // Nothing else was added to the whitelist. NR 2 in particular is NOT here: 199G-B §2
+        // admits NR 5 without disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            3,
-            "exactly three literal NRs plus the gated direct-IPC term"
+            4,
+            "exactly four literal NRs plus the gated direct-IPC term"
+        );
+        assert!(
+            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "NR 2 admission on RISC-V is a separate class with its own witness"
         );
         // The arch-tagged NR6/NR7 markers are emitted by the kernel drain, not by this gate.
         assert!(

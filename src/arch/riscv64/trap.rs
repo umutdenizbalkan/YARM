@@ -758,10 +758,19 @@ pub fn handle_riscv_trap_entry_shared(
     // completion consumed — which the Stage 196E FutexWait drain below already drives, live, off
     // the broad lock. What was missing was never the restore; it was that admission asked the
     // STASH convention's preconditions of a caller that stashes nothing.
+    // Stage 199G-B §2: IpcRecvTimeout (NR 5) joins the RISC-V whitelist. This is the gate the
+    // directive names — the shared route is architecture-neutral, but on RISC-V it is reachable
+    // only for an NR listed here, so without this line NR 5 would keep its terminal broad edge on
+    // this architecture no matter what the route admits. What the class needs from RISC-V it has:
+    // the homologous D2-recv drain below (`d2_recv_reverify_blocked`,
+    // `d2_recv_dispatch_step_mut`, `direct_dispatch_resume_incoming`), live since U4. NR 2 is
+    // deliberately NOT added — that is a separate class with its own witness, and §2 says not to
+    // disturb its admission.
     let split_eligible = is_syscall
         && (nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+            || nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
