@@ -36,7 +36,10 @@ impl KernelState {
                 .resolve_capability_for_task(source_tid.0, source_cap)
                 .ok()?
                 .object;
-            if shared_region.is_some() {
+            // 199G-C §2: the SHARED pin policy. An envelope owes exactly one object pin iff it
+            // carries a shared-region descriptor — not because it carries a transfer capability.
+            // The split envelope stash asks the same predicate, so the two stashes cannot drift.
+            if Self::transfer_envelope_owes_pin(shared_region) {
                 self.adjust_memory_object_pin_refcount(source_object, 1);
             }
             self.with_ipc_state_mut(|ipc| {
@@ -86,7 +89,9 @@ impl KernelState {
             }
         }
         envelope = envelope.transition(TransferState::Released)?;
-        if envelope.shared_region.is_some() {
+        // 199G-C §2: the same shared policy the stash used, so acquire and release are one
+        // decision read twice rather than two spellings that could diverge.
+        if Self::transfer_envelope_owes_pin(envelope.shared_region) {
             self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
         }
         self.with_ipc_state_mut(|ipc| {

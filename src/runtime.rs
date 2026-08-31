@@ -3314,11 +3314,12 @@ impl SharedKernel {
             // A shared-region envelope owes exactly ONE rank-6 pin release, which the caller
             // performs after this lock is dropped. Reporting it here — rather than releasing it
             // here — is what keeps the two domains strictly sequential instead of nested.
+            //
+            // 199G-C §2: the predicate is the SHARED pin policy, so this split release, the
+            // broad release and the (broad and split) stashes all read one decision.
             (
                 true,
-                envelope
-                    .shared_region
-                    .is_some()
+                KernelState::transfer_envelope_owes_pin(envelope.shared_region)
                     .then_some(envelope.source_object),
             )
         })
@@ -8094,6 +8095,31 @@ impl SharedKernel {
         self.with_memory_split_mut(|m| {
             KernelState::adjust_memory_object_pin_refcount_locked(m, object, -1)
         })
+    }
+
+    /// 199G-C §2 — rank 6: ACQUIRE the transferred object pin (once). The exact counterpart of
+    /// [`Self::sr_release_pin_split`], and deliberately placed beside it so the pair is one
+    /// readable policy rather than two seams discovered separately.
+    ///
+    /// One bounded `with_memory_split_mut` acquisition, no other rank held across it. Returns
+    /// the authority to release exactly this pin, or a typed refusal raised before any counter
+    /// moves. See `KernelState::acquire_transfer_pin_locked` for why this is outside the
+    /// AI_AGENT_RULES §14.4 D3 fence: it performs no PTE, map/unmap, TLB, frame-reclaim or
+    /// address-space work, so it owes no shootdown.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn sr_acquire_pin_split(
+        &self,
+        object: CapObject,
+    ) -> Result<crate::kernel::boot::TransferPinToken, crate::kernel::boot::TransferPinRefusal>
+    {
+        self.with_memory_split_mut(|m| KernelState::acquire_transfer_pin_locked(m, object))
+    }
+
+    /// 199G-C §2 — rank 6: release through the token, so the object released is provably the
+    /// object acquired. Same counter update as [`Self::sr_release_pin_split`].
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn sr_release_pin_token_split(&self, token: crate::kernel::boot::TransferPinToken) {
+        self.with_memory_split_mut(|m| KernelState::release_transfer_pin_locked(m, token))
     }
     /// Equivalent to `capability_object_live`: MemoryObject/DmaRegion are unconditionally live;
     /// Endpoint/Notification/Reply are generation-checked under the IPC lock (rank 3).

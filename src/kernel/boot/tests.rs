@@ -145350,3 +145350,250 @@ mod stage199d_wa3c2_ownership_wiring {
         });
     }
 }
+
+/// 199G-C §2/§6 — the exact rank-6 transfer-pin acquire owner, and the one pin policy shared by
+/// the broad and split envelope stashes.
+mod stage199gc_transfer_pin_owner {
+    use super::*;
+    use crate::kernel::boot::{TransferPinRefusal, TransferPinToken};
+    use crate::kernel::capabilities::CapObject;
+    use crate::kernel::vm::PhysAddr;
+
+    fn pin_of(state: &KernelState, id: u64) -> u32 {
+        state.with_memory_state(|m| {
+            m.memory_objects
+                .iter()
+                .flatten()
+                .find(|e| e.id == id)
+                .map(|e| e.pin_refcount)
+                .expect("the object exists")
+        })
+    }
+
+    /// A MemoryObject acquires exactly one pin, and the token names that exact object.
+    #[test]
+    fn acquire_increments_exactly_once_and_mints_the_release_authority() {
+        let mut state = Bootstrap::init().expect("init");
+        let (id, _cap) = state
+            .create_memory_object(PhysAddr(0x20_0000))
+            .expect("memory object");
+        let object = CapObject::MemoryObject { id };
+        let before = pin_of(&state, id);
+        let token = state
+            .with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(m, object))
+            .expect("a live object is pinnable");
+        assert_eq!(token.object(), object, "the token names the pinned object");
+        assert_eq!(pin_of(&state, id), before + 1, "exactly one pin");
+        // And the token-driven release is the exact inverse.
+        state.with_memory_state_mut(|m| KernelState::release_transfer_pin_locked(m, token));
+        assert_eq!(pin_of(&state, id), before, "the pair balances to zero");
+    }
+
+    /// A DmaRegion is the other pinnable class, and it is pinned by its object id.
+    #[test]
+    fn a_dma_region_is_pinnable_by_id() {
+        let mut state = Bootstrap::init().expect("init");
+        let (id, _cap) = state
+            .create_memory_object(PhysAddr(0x21_0000))
+            .expect("memory object");
+        let object = CapObject::DmaRegion {
+            id,
+            offset: 0x1000,
+            len: 0x1000,
+        };
+        let token = state
+            .with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(m, object))
+            .expect("a DmaRegion over a live object is pinnable");
+        assert_eq!(pin_of(&state, id), 1, "the pin lands on the backing object");
+        state.with_memory_state_mut(|m| KernelState::release_transfer_pin_locked(m, token));
+        assert_eq!(pin_of(&state, id), 0);
+    }
+
+    /// Every OTHER capability class is not pinnable, and says so rather than silently succeeding.
+    /// This is the §1 finding: the pin is not a property of "has a transfer cap".
+    #[test]
+    fn non_pinnable_classes_refuse_without_mutation() {
+        let mut state = Bootstrap::init().expect("init");
+        for object in [
+            CapObject::Endpoint {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Notification {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Reply {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Kernel,
+        ] {
+            assert_eq!(
+                state
+                    .with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(m, object)),
+                Err(TransferPinRefusal::NotPinnable),
+                "{object:?} carries no pin_refcount"
+            );
+        }
+    }
+
+    /// A stale object id — one no live memory object carries — refuses before any mutation.
+    #[test]
+    fn a_stale_object_refuses() {
+        let mut state = Bootstrap::init().expect("init");
+        assert_eq!(
+            state.with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(
+                m,
+                CapObject::MemoryObject { id: 0xDEAD_BEEF }
+            )),
+            Err(TransferPinRefusal::Stale)
+        );
+    }
+
+    /// Overflow refuses BEFORE the store, leaving the counter untouched. The broad `+1`
+    /// saturates here, which would hand back a pin the matching `-1` then under-drops.
+    #[test]
+    fn overflow_refuses_before_mutation() {
+        let mut state = Bootstrap::init().expect("init");
+        let (id, _cap) = state
+            .create_memory_object(PhysAddr(0x22_0000))
+            .expect("memory object");
+        let object = CapObject::MemoryObject { id };
+        state.with_memory_state_mut(|m| {
+            let slot = m
+                .memory_objects
+                .iter()
+                .position(|e| e.is_some_and(|o| o.id == id))
+                .expect("slot");
+            m.memory_objects[slot].as_mut().expect("obj").pin_refcount = u32::MAX;
+        });
+        assert_eq!(
+            state.with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(m, object)),
+            Err(TransferPinRefusal::Overflow)
+        );
+        assert_eq!(
+            pin_of(&state, id),
+            u32::MAX,
+            "a refused acquire leaves the counter exactly as it was"
+        );
+        // The broad path's saturating `+1` is what this diverges from, deliberately.
+        state.adjust_memory_object_pin_refcount(object, 1);
+        assert_eq!(pin_of(&state, id), u32::MAX, "the broad path saturates");
+    }
+
+    /// THE pin policy: an envelope owes a pin iff it carries a shared-region descriptor.
+    #[test]
+    fn the_pin_policy_is_the_shared_region_descriptor_not_the_transfer_cap() {
+        use crate::kernel::boot::TransferSharedRegion;
+        assert!(!KernelState::transfer_envelope_owes_pin(None));
+        assert!(KernelState::transfer_envelope_owes_pin(Some(
+            TransferSharedRegion { offset: 0, len: 8 }
+        )));
+    }
+
+    /// One policy, read by every stash and every release — broad and split alike.
+    #[test]
+    fn every_stash_and_release_reads_the_one_policy() {
+        const TRANSFER_SRC: &str = include_str!("transfer_state.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const MEM_SRC: &str = include_str!("memory_lifecycle_state.rs");
+        // Defined once.
+        assert_eq!(
+            MEM_SRC
+                .matches("pub(crate) const fn transfer_envelope_owes_pin")
+                .count(),
+            1
+        );
+        // The broad stash and the broad release both call it, and neither keeps its own spelling.
+        assert_eq!(
+            TRANSFER_SRC.matches("transfer_envelope_owes_pin(").count(),
+            2,
+            "the broad stash and the broad release each ask the policy exactly once"
+        );
+        assert!(
+            !TRANSFER_SRC.contains("if shared_region.is_some() {")
+                && !TRANSFER_SRC.contains("if envelope.shared_region.is_some() {"),
+            "no second spelling of the policy survives in the broad envelope owner"
+        );
+        // The split release reports its pin through the same policy.
+        assert!(
+            RUNTIME_SRC.contains("KernelState::transfer_envelope_owes_pin(envelope.shared_region)"),
+            "the split release asks the same policy"
+        );
+        // Exactly one acquire owner and one token-release owner.
+        assert_eq!(
+            MEM_SRC
+                .matches("pub(crate) fn acquire_transfer_pin_locked")
+                .count(),
+            1
+        );
+        assert_eq!(
+            RUNTIME_SRC.matches("fn sr_acquire_pin_split").count(),
+            1,
+            "one rank-6 acquire seam"
+        );
+    }
+
+    /// The acquire performs no forbidden rank-6 work — the AI_AGENT_RULES §14.4 boundary is
+    /// stated as a property of the source, not an assertion in prose.
+    #[test]
+    fn the_acquire_owner_touches_only_the_pin_counter() {
+        const MEM_SRC: &str = include_str!("memory_lifecycle_state.rs");
+        let body = MEM_SRC
+            .split("pub(crate) fn acquire_transfer_pin_locked")
+            .nth(1)
+            .and_then(|s| {
+                s.split(
+                    "
+    /// ",
+                )
+                .next()
+            })
+            .expect("the acquire body");
+        for forbidden in [
+            "map_page",
+            "unmap",
+            "shootdown",
+            "flush_tlb",
+            "invlpg",
+            "alloc_frame",
+            "free_frame",
+            "reclaim",
+            "page_table",
+            "with_vm",
+            "with_scheduler",
+            "with_ipc",
+            "with_task",
+            "user_spaces",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the rank-6 acquire must not reach `{forbidden}`"
+            );
+        }
+        // What it DOES touch: the pin counter, checked.
+        assert!(body.contains("pin_refcount"));
+        assert!(
+            body.contains("checked_add(1)"),
+            "the increment must be checked, not saturating"
+        );
+    }
+
+    /// A `TransferPinToken` cannot be fabricated: its field is private, so the only way to hold
+    /// one is to have actually acquired a pin.
+    #[test]
+    fn the_token_is_unforgeable() {
+        const MEM_SRC: &str = include_str!("memory_lifecycle_state.rs");
+        let decl = MEM_SRC
+            .split("pub(crate) struct TransferPinToken {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("the token declaration");
+        assert!(
+            !decl.contains("pub"),
+            "every field must be private so the token cannot be constructed elsewhere"
+        );
+        let _assert_copy: fn(TransferPinToken) -> TransferPinToken = |t| t;
+    }
+}
