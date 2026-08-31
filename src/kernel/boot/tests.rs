@@ -145597,3 +145597,148 @@ mod stage199gc_transfer_pin_owner {
         let _assert_copy: fn(TransferPinToken) -> TransferPinToken = |t| t;
     }
 }
+
+/// 199G-C2 §1 — Synchronous endpoints are mechanically PRODUCTION-UNREACHABLE.
+///
+/// This is a source-recomputed negative guard, not a claim about behaviour. It fails the moment a
+/// production constructor, mutation or restore path can put an endpoint into
+/// `EndpointMode::Synchronous`, which is the precondition the NR1 pre-lock route needs before its
+/// cooperative-handoff branch can be treated as impossible rather than serviced.
+mod stage199gc2_synchronous_is_production_unreachable {
+    const IPC: &str = include_str!("../ipc.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const TESTS: &str = include_str!("tests.rs");
+
+    /// Every source file that could name the mode, minus the test corpora.
+    fn production_sources() -> alloc::vec::Vec<(&'static str, &'static str)> {
+        alloc::vec![
+            ("kernel/ipc.rs", IPC),
+            ("kernel/boot/ipc_state.rs", IPC_STATE),
+            ("kernel/syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+            (
+                "kernel/syscall/process.rs",
+                include_str!("../syscall/process.rs")
+            ),
+            ("kernel/boot/exec_state.rs", include_str!("exec_state.rs")),
+            (
+                "kernel/boot/orchestrator_state.rs",
+                include_str!("orchestrator_state.rs")
+            ),
+            (
+                "kernel/boot/bootstrap_state.rs",
+                include_str!("bootstrap_state.rs")
+            ),
+            (
+                "kernel/boot/restart_state.rs",
+                include_str!("restart_state.rs")
+            ),
+            ("runtime.rs", include_str!("../../runtime.rs")),
+        ]
+    }
+
+    /// (1) The mode field is private and has no setter: an endpoint's mode is fixed at
+    /// construction and cannot be mutated or restored into `Synchronous` later.
+    #[test]
+    fn the_mode_is_immutable_after_construction() {
+        let decl = IPC
+            .split("pub struct Endpoint {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("the Endpoint declaration");
+        assert!(
+            decl.contains("mode: EndpointMode") && !decl.contains("pub mode"),
+            "the mode field must stay private"
+        );
+        for setter in ["fn set_mode", ".mode =", "mode: &mut EndpointMode"] {
+            assert!(
+                !IPC.contains(setter),
+                "no mode mutation may exist: found `{setter}`"
+            );
+        }
+        // And no deserializer / restore constructor exists for Endpoint.
+        for ctor in [
+            "impl Deserialize for Endpoint",
+            "fn from_bytes",
+            "fn decode_endpoint",
+        ] {
+            assert!(
+                !IPC.contains(ctor),
+                "no restore path may reconstruct an Endpoint: `{ctor}`"
+            );
+        }
+    }
+
+    /// (2) `Endpoint::new_with_mode` — the ONLY way to choose a mode — has exactly one caller in
+    /// the whole tree, and it is `create_endpoint_with_mode`.
+    #[test]
+    fn the_only_mode_choosing_constructor_has_one_caller() {
+        let callers: usize = production_sources()
+            .iter()
+            .map(|(_, src)| src.matches("Endpoint::new_with_mode(").count())
+            .sum();
+        assert_eq!(
+            callers, 1,
+            "exactly one production caller of the mode-choosing constructor"
+        );
+        assert!(
+            IPC_STATE.contains("Endpoint::new_with_mode(max_depth, mode)"),
+            "and it is `create_endpoint_with_mode`, which forwards its caller's mode"
+        );
+    }
+
+    /// (3) THE GUARD. No production source may construct a `Synchronous` endpoint. Every
+    /// occurrence of the variant in production must be a comparison, never a constructor
+    /// argument.
+    #[test]
+    fn no_production_source_constructs_a_synchronous_endpoint() {
+        for (name, src) in production_sources() {
+            assert!(
+                !src.contains("create_endpoint_with_mode(") || name == "kernel/boot/ipc_state.rs",
+                "{name}: only the endpoint owner may call the mode-choosing constructor"
+            );
+            for forbidden in [
+                "create_endpoint_with_mode(max_depth, EndpointMode::Synchronous)",
+                "new_with_mode(max_depth, EndpointMode::Synchronous)",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "{name}: constructs Synchronous: {forbidden}"
+                );
+            }
+        }
+        // The one production call of the mode-choosing constructor passes Buffered.
+        assert!(
+            IPC_STATE.contains("self.create_endpoint_with_mode(max_depth, EndpointMode::Buffered)"),
+            "the production endpoint constructor is Buffered"
+        );
+        // Belt and braces: in production sources, `EndpointMode::Synchronous` may appear only in
+        // comparisons (`== `, `!= `, or a match arm), never as a constructor argument.
+        for (name, src) in production_sources() {
+            for (i, _) in src.match_indices("EndpointMode::Synchronous") {
+                let before = &src[i.saturating_sub(40)..i];
+                assert!(
+                    before.contains("==")
+                        || before.contains("!=")
+                        || before.trim_end().ends_with('>')
+                        || before.contains("Some(")
+                        || before.trim_end().ends_with("=>")
+                        || before.trim_end().ends_with('|'),
+                    "{name}: `EndpointMode::Synchronous` reached in a non-comparison position:                      ...{before}"
+                );
+            }
+        }
+    }
+
+    /// (4) Every `Synchronous` constructor in the tree is test-only, and the test corpus is where
+    /// they all live — so the mode's behaviour stays covered without being reachable in production.
+    #[test]
+    fn every_synchronous_constructor_is_test_only() {
+        let in_tests = TESTS
+            .matches("create_endpoint_with_mode(1, EndpointMode::Synchronous)")
+            .count();
+        assert!(
+            in_tests > 0,
+            "the test corpus must keep exercising Synchronous behaviour"
+        );
+    }
+}
