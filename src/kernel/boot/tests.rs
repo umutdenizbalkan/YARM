@@ -140872,6 +140872,374 @@ mod u9qa_apply_convention {
         );
     }
 
+    // ── 203C-XFR §5 — the mechanical gates, recomputed from source ──────────────────────────
+
+    /// NR 5 terminal edges: 3 → 0.
+    ///
+    /// An "edge" here is an ARCHITECTURE on which `ipc_recv_timeout` has no pre-lock owner at
+    /// all, so every NR 5 trap necessarily reaches the terminal broad dispatcher. Before 199G-B
+    /// that was all three; this recomputes it, and each architecture's gate is named explicitly
+    /// rather than assumed from the shared route.
+    #[test]
+    fn nr5_terminal_edges_are_zero_on_all_three_architectures() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+
+        // The shared route admits NR 5 and does NOT exclude any architecture for it. NR 2 keeps
+        // its own two-architecture gate, which is what "do not disturb NR2 admission" means.
+        assert!(
+            SPLIT_SRC.contains("Ok(Syscall::IpcRecvTimeout) => true,"),
+            "the pre-lock receive route must admit NR 5"
+        );
+        assert!(
+            SPLIT_SRC.contains(
+                "if !recv_timeout && !cfg!(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))"
+            ),
+            "the architecture exclusion must apply to NR 2 only"
+        );
+        // x86_64 needs no import gate: its ABI is already in the frame.
+        // AArch64: the pre-split ABI import must admit NR 5, or the dispatcher sees nr=0.
+        assert!(
+            TRAP_ENTRY.contains("raw_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR"),
+            "AArch64 must import the NR 5 ABI before the split dispatch inspects it"
+        );
+        // RISC-V: the whitelist must admit NR 5, and must still NOT admit NR 2.
+        let whitelist = RISCV
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("the RISC-V whitelist");
+        assert!(
+            whitelist.contains("SYSCALL_IPC_RECV_TIMEOUT_NR"),
+            "RISC-V must admit NR 5 into the split dispatcher"
+        );
+        assert!(
+            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "NR 2's RISC-V admission is a separate class and stays untouched"
+        );
+        // And nothing in the route yields NR 5 back to the broad arm: all three publication
+        // yields are scoped to NR 2, whose handler owns the hooks they protect.
+        for yielded in [
+            "if !recv_timeout && cfg!(feature = \"shared-region-direct-oracle\")",
+            "if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled()",
+            "if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm()",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(yielded),
+                "every broad-arm yield must be scoped to NR 2: {yielded}"
+            );
+        }
+    }
+
+    /// `X86FirstResume` has ONE policy owner and ONE apply owner, and neither is duplicated in
+    /// the trap entry.
+    #[test]
+    fn first_resume_has_one_policy_owner_and_one_apply_owner() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
+
+        // One policy owner: the classifier is defined once and is the only producer of the
+        // convention value.
+        assert_eq!(
+            EXEC.matches("pub(crate) fn classify_incoming_resume_convention")
+                .count(),
+            1,
+            "the classifier is defined exactly once"
+        );
+        assert_eq!(
+            EXEC.matches("IncomingResumeConvention::X86FirstResume =>")
+                .count()
+                + EXEC
+                    .matches("Some(IncomingResumeConvention::X86FirstResume)")
+                    .count(),
+            1,
+            "the convention is produced in exactly one place"
+        );
+        // One apply owner: the x86_64 exact-token resume, which revalidates and consumes.
+        assert_eq!(
+            X86_TRAP
+                .matches("direct_dispatch_classify_and_consume_convention_split")
+                .count(),
+            1,
+            "exactly one apply site revalidates the convention"
+        );
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("tcb.first_resume_consumed = true;")
+                .count(),
+            1,
+            "the one-shot snapshot is consumed in exactly one place"
+        );
+        // No first-resume logic in the trap entry, and no fabricated identity or token: the
+        // convention is always derived from the token's exact incarnation.
+        assert!(
+            !TRAP_ENTRY.contains("IncomingResumeConvention"),
+            "the shared trap entry must not carry first-resume policy"
+        );
+        assert!(
+            !TRAP_ENTRY.contains("first_resume_consumed"),
+            "the shared trap entry must not touch the one-shot latch"
+        );
+        assert!(
+            RUNTIME_SRC.contains("let expected = token.expect_asid()?;")
+                && RUNTIME_SRC.contains("t.tid.0 == incoming && t.asid == Some(expected)"),
+            "the convention is resolved by the token's exact tid+asid, never a fabricated one"
+        );
+    }
+
+    /// No post-dequeue refusal path is introduced: the classifier's refusal is raised at
+    /// admission, before any mutation, and the apply's revalidation reuses the EXISTING
+    /// `Context` refusal with its existing exact rollback.
+    #[test]
+    fn the_classification_adds_no_post_dequeue_refusal_path() {
+        const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
+        let apply = X86_TRAP
+            .split("pub(crate) fn x86_post_lock_resume_marked_incoming")
+            .nth(1)
+            .and_then(|s| s.split("\n/// ").next())
+            .expect("the apply body");
+        // The revalidation maps onto the refusal that already existed, not a new variant.
+        assert!(
+            apply.contains(
+                "direct_dispatch_classify_and_consume_convention_split(token)\n        .ok_or(X86ResumeRefusal::Context)?"
+            ),
+            "revalidation must reuse the existing Context refusal"
+        );
+        // No new refusal variant was added.
+        assert_eq!(
+            X86_TRAP.matches("pub(crate) enum X86ResumeRefusal").count(),
+            1
+        );
+        let refusals = X86_TRAP
+            .split("pub(crate) enum X86ResumeRefusal {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("the refusal enum");
+        for v in ["SchedulerCurrent,", "Asid,", "Context,"] {
+            assert!(refusals.contains(v), "{v} must remain");
+        }
+        assert_eq!(
+            refusals.matches(",\n").count(),
+            3,
+            "no refusal variant was added or removed"
+        );
+    }
+
+    /// AArch64 and RISC-V resume owners are untouched, and NR 2 / FutexWait still route through
+    /// the same U9-QA selection owner.
+    #[test]
+    fn other_architectures_and_classes_are_unchanged() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        // The classifier's non-stash arm is architecture-neutral: it asks for a bound ASID and a
+        // restorable continuation, which is exactly what AArch64/RISC-V already required
+        // (`tcb.asid.is_some()`), so their admitted set is unchanged.
+        let classifier = EXEC
+            .split("pub(crate) fn classify_incoming_resume_convention")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the classifier");
+        assert!(
+            !classifier.contains("target_arch"),
+            "the classifier must not fork by architecture"
+        );
+        // Both switching classes still admit through the one selection owner.
+        assert!(
+            SPLIT_SRC.contains("QueueAdvanceApply::ExactTokenResume"),
+            "the pre-lock routes still admit as exact-token resumes"
+        );
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("fn queue_advance_select_step_split")
+                .count(),
+            1,
+            "there is one selection owner"
+        );
+    }
+
+    // ── 203C-XFR §6 — behaviour of the classification itself ────────────────────────────────
+
+    use crate::kernel::boot::{
+        IncomingResumeConvention, QueueAdvanceApply, classify_incoming_resume_convention,
+    };
+    use crate::kernel::ipc::ThreadId as XfrTid;
+    use crate::kernel::task::ThreadControlBlock as XfrTcb;
+    use crate::kernel::vm::{Asid as XfrAsid, VirtAddr as XfrVa};
+
+    /// A task that has run: a bound ASID and a committed continuation with a real RIP/RSP and a
+    /// non-zero GPR file.
+    fn xfr_resumed_tcb() -> XfrTcb {
+        let mut tcb = XfrTcb::new(XfrTid(41), Some(XfrAsid(4)));
+        tcb.user_context.instruction_ptr = XfrVa(0x40_1000);
+        tcb.user_context.stack_ptr = XfrVa(0x7fff_0000);
+        tcb.user_context.user_gprs[0] = 0xDEAD;
+        tcb.user_context.arg0 = 41;
+        tcb
+    }
+
+    /// A never-run task with the snapshot `spawn_user_task_from_image` seeds: entry, startup
+    /// stack, the task id in `arg0`, and a zero GPR file.
+    fn xfr_fresh_tcb() -> XfrTcb {
+        let mut tcb = XfrTcb::new(XfrTid(42), Some(XfrAsid(5)));
+        tcb.user_context.instruction_ptr = XfrVa(0x40_20f0);
+        tcb.user_context.stack_ptr = XfrVa(0x7fff_ff68);
+        tcb.user_context.arg0 = 42;
+        tcb
+    }
+
+    /// An initialized incarnation classifies as the exact-token resume.
+    #[test]
+    fn xfr_a_resumed_task_classifies_as_exact_token() {
+        assert_eq!(
+            classify_incoming_resume_convention(
+                &xfr_resumed_tcb(),
+                QueueAdvanceApply::ExactTokenResume
+            ),
+            Some(IncomingResumeConvention::ExactToken)
+        );
+    }
+
+    /// A valid never-run task classifies as the one-shot first resume — the case the old
+    /// `kernel_context.initialized` screen refused for every production service task.
+    #[test]
+    fn xfr_a_valid_never_run_task_classifies_as_first_resume() {
+        let fresh = xfr_fresh_tcb();
+        assert!(
+            !fresh.kernel_context.initialized,
+            "a production user task never has an initialized kernel context"
+        );
+        assert_eq!(
+            classify_incoming_resume_convention(&fresh, QueueAdvanceApply::ExactTokenResume),
+            Some(IncomingResumeConvention::X86FirstResume),
+            "the screen the old one applied would have refused exactly this task"
+        );
+    }
+
+    /// An INCOMPLETE or stale startup snapshot is refused — and refused by the classifier, which
+    /// admission runs before anything is dequeued.
+    #[test]
+    fn xfr_an_incomplete_snapshot_is_refused() {
+        // No bound address space: nothing for the resume owner to activate.
+        let mut no_asid = xfr_fresh_tcb();
+        no_asid.asid = None;
+        assert_eq!(
+            classify_incoming_resume_convention(&no_asid, QueueAdvanceApply::ExactTokenResume),
+            None
+        );
+        // Zero entry point: `flush_trap_context_to_iret_frame` would leave the OUTGOING task's
+        // rip in the hardware frame.
+        let mut no_entry = xfr_fresh_tcb();
+        no_entry.user_context.instruction_ptr = XfrVa(0);
+        assert_eq!(
+            classify_incoming_resume_convention(&no_entry, QueueAdvanceApply::ExactTokenResume),
+            None
+        );
+        // Zero stack: same hazard on the rsp lane.
+        let mut no_stack = xfr_fresh_tcb();
+        no_stack.user_context.stack_ptr = XfrVa(0);
+        assert_eq!(
+            classify_incoming_resume_convention(&no_stack, QueueAdvanceApply::ExactTokenResume),
+            None
+        );
+        // A wholly default TCB — the shape a reserved-but-unspawned slot has.
+        let bare = XfrTcb::new(XfrTid(43), Some(XfrAsid(6)));
+        assert_eq!(
+            classify_incoming_resume_convention(&bare, QueueAdvanceApply::ExactTokenResume),
+            None
+        );
+    }
+
+    /// The startup snapshot is returned through EXACTLY ONCE: a consumed latch refuses the
+    /// first-resume convention rather than silently restarting the task at its entry point.
+    #[test]
+    fn xfr_a_startup_snapshot_is_consumed_once() {
+        let mut tcb = xfr_fresh_tcb();
+        assert_eq!(
+            classify_incoming_resume_convention(&tcb, QueueAdvanceApply::ExactTokenResume),
+            Some(IncomingResumeConvention::X86FirstResume)
+        );
+        tcb.first_resume_consumed = true;
+        assert_eq!(
+            classify_incoming_resume_convention(&tcb, QueueAdvanceApply::ExactTokenResume),
+            None,
+            "the same startup state must not be returned through twice"
+        );
+        // Consuming the latch does NOT affect a task with a real saved continuation: a resumed
+        // task is admitted on the strength of that continuation, which the latch says nothing
+        // about.
+        let mut resumed = xfr_resumed_tcb();
+        resumed.first_resume_consumed = true;
+        assert_eq!(
+            classify_incoming_resume_convention(&resumed, QueueAdvanceApply::ExactTokenResume),
+            Some(IncomingResumeConvention::ExactToken)
+        );
+    }
+
+    /// The stash convention is untouched: it still asks exactly what the plan builder requires,
+    /// and a never-run user task is still not stash-resumable.
+    #[test]
+    fn xfr_the_stash_convention_is_unchanged() {
+        assert_eq!(
+            classify_incoming_resume_convention(
+                &xfr_fresh_tcb(),
+                QueueAdvanceApply::StashedKernelSwitch
+            ),
+            None,
+            "a task with no kernel switch frame cannot be switch_frames-resumed"
+        );
+        let mut kernel_thread = xfr_fresh_tcb();
+        kernel_thread.kernel_context.initialized = true;
+        assert_eq!(
+            classify_incoming_resume_convention(
+                &kernel_thread,
+                QueueAdvanceApply::StashedKernelSwitch
+            ),
+            Some(IncomingResumeConvention::ExactToken)
+        );
+    }
+
+    /// Both projections of the receive ABI stay live and stay distinct. 203C-XFR §1: the shape is
+    /// selected from the caller's own metadata contract, never from the syscall number, so "NR 5"
+    /// and "register-only" are not synonyms.
+    #[test]
+    fn xfr_both_receive_projections_are_covered() {
+        use crate::kernel::capabilities::CapId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        // Register-only: no metadata target at all.
+        let legacy = BlockedRecvState::legacy_timeout(CapId(7), 0x1000, 128);
+        assert_eq!(legacy.recv_abi, RecvAbiVariant::LegacyTimeout);
+        assert!(!legacy.recv_abi.writes_recv_v2_meta());
+        assert_eq!(legacy.meta_user_ptr, 0);
+        assert_eq!(legacy.meta_user_len, 0);
+        // Metadata-carrying: the shape every live `yarm-user-rt` NR 5 caller actually uses.
+        let v2 = BlockedRecvState {
+            recv_cap: CapId(7),
+            payload_user_ptr: 0x1000,
+            payload_user_len: 128,
+            meta_user_ptr: 0x2000,
+            meta_user_len: 40,
+            recv_abi: RecvAbiVariant::RecvV2,
+        };
+        assert!(v2.recv_abi.writes_recv_v2_meta());
+        assert_ne!(legacy.recv_abi, v2.recv_abi);
+        // The NR 5 handler and the pre-lock route both derive the shape from args 4/5, using the
+        // same predicate the immediate-success owner uses — not from the syscall number.
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        for src in [IPC_SRC, SPLIT_SRC] {
+            assert!(
+                src.contains("meta_user_ptr != 0") && src.contains("IPC_RECV_META_V2_ENCODED_LEN"),
+                "the projection must be derived from the caller's metadata contract"
+            );
+        }
+        assert!(
+            IPC_SRC.contains("let recv_v2_meta_written = meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN;"),
+            "and it must be the SAME predicate the immediate-success owner computes"
+        );
+    }
+
     /// The FutexWait route names the convention it actually uses.
     #[test]
     fn the_futex_route_admits_as_an_exact_token_resume() {
