@@ -74422,14 +74422,28 @@ mod stage196a_riscv_shared_trap_foundation {
         // stronger companion check that every NR 9 line COMMITTED a queue advance rather than
         // returning early — which for a switching class would mean returning through the parked
         // caller's own frame.
+        //
+        // Stage 199G-B §2 widened it again, to IpcRecvTimeout (NR 5) — the SECOND switching
+        // class — with the same committed-only companion check, plus one more that pins the
+        // defect that stage fixed: a committed NR 5 line whose outgoing user context was never
+        // captured left the parked receiver with a stale saved pc and faulted on resume.
         assert!(
             RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15")
-                && RISCV_SMOKE.contains("non-DebugLog/FutexWake/FutexWait syscall"),
-            "smoke must assert DebugLog+FutexWake+FutexWait-only split dispatch"
+                && RISCV_SMOKE.contains("non-DebugLog/FutexWake/FutexWait/IpcRecvTimeout syscall"),
+            "smoke must assert DebugLog+FutexWake+FutexWait+IpcRecvTimeout-only split dispatch"
         );
         assert!(
             RISCV_SMOKE.contains("RISC-V FutexWait split did not commit a queue advance"),
             "smoke must assert every NR 9 split line committed a queue advance"
+        );
+        assert!(
+            RISCV_SMOKE.contains("RISC-V IpcRecvTimeout split did not commit a queue advance"),
+            "smoke must assert every NR 5 split line committed a queue advance"
+        );
+        assert!(
+            RISCV_SMOKE
+                .contains("RISC-V IpcRecvTimeout committed without capturing the outgoing context"),
+            "smoke must reject a committed NR 5 line that captured no outgoing context"
         );
     }
 
