@@ -8226,6 +8226,162 @@ impl SharedKernel {
         Ok(true)
     }
 
+    /// 199G-C4 §3 — the OFF-LOCK ORDINARY cap-transfer blocked-waiter delivery producer: the
+    /// split counterpart of `produce_blocked_waiter_ordinary_cap_delivery`.
+    ///
+    /// Same three answers, meaning the same things, as the broad producer — and, critically, the
+    /// same envelope disposition on each: a payload fault leaves the envelope UNconsumed, while
+    /// a metadata fault happens after the single consume and leaves nothing minted to roll back.
+    /// That ordering is why the plan is two pieces rather than one.
+    ///
+    /// Rank order, each acquisition taken and fully released before the next:
+    /// 1. rank 1 — `current_cpu`, for the drainer flag and the stash;
+    /// 2. rank 2 — consume the blocked state and read the ASID in ONE acquisition;
+    /// 3. rank 2+4 — resolve the waiter's own receive endpoint from its saved `recv_cap`,
+    ///    exactly as the broad producer does;
+    /// 4. no lock — the shared pre-consume plan;
+    /// 5. rank 5 — validate the PAYLOAD range, BEFORE the envelope is touched;
+    /// 6. no lock — the shared metadata contract;
+    /// 7. rank 3 — consume the envelope once (its facts owner), then rank 2+4 to resolve the
+    ///    source capability and rank 2 for the receiver's cnode;
+    /// 8. rank 5 — validate the META range;
+    /// 9. no lock, then per-CPU — assemble the snapshot through the shared owner and stash it.
+    ///
+    /// The receiver-local capability is NOT minted here: `(source_tid, source_cap)` travels only
+    /// as the delegation-link parent edge and the executor's seam mints the receiver's own cap,
+    /// which is the whole reason a producer may run off the capability lock.
+    ///
+    /// One deliberate difference from the broad producer, stated rather than hidden: the broad
+    /// consume compares the envelope's endpoint object for equality, while the facts owner used
+    /// here compares its index. This route establishes the same fact by other means — it checks
+    /// the waiter's receive endpoint IS this endpoint index, and the caller resolved
+    /// `endpoint_idx` from a live, generation-checked endpoint capability during this very send,
+    /// which is also the send that stashed the envelope.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery_split(
+        &self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<bool, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::dispatch_post_work::DispatchPostWork;
+        use crate::kernel::syscall::{
+            SyscallError, blocked_waiter_ordinary_cap_delivery_class_matches,
+            check_blocked_recv_meta_contract, plan_blocked_waiter_ordinary_cap_prelude,
+            plan_blocked_waiter_ordinary_cap_snapshot,
+        };
+
+        // (0) The class question — THE one owner, asked before anything is touched.
+        if !blocked_waiter_ordinary_cap_delivery_class_matches(msg) {
+            return Ok(false);
+        }
+        // (1) rank 1 — no drainer, no snapshot: nothing would ever execute it.
+        let cpu_idx = self.current_cpu_split_read().0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+            || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+
+        // (2) rank 2 — the two waiter facts together; dispositions identical to the broad
+        // producer's (see the plain producer for why the ASID miss consumes).
+        let taken = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == waiter_tid)?;
+            let state = tcb.blocked_recv_state.take()?;
+            Some((state, tcb.asid))
+        });
+        let (blocked_state, waiter_asid) = taken.ok_or(SyscallError::InvalidArgs)?;
+        let waiter_asid = waiter_asid.ok_or(SyscallError::InvalidArgs)?;
+
+        // (3) rank 2+4 — the endpoint the envelope is bound to, read from the waiter's own saved
+        // receive capability, exactly as the broad producer reads it.
+        let recv_endpoint = self
+            .resolve_capability_for_task_split(waiter_tid, blocked_state.recv_cap)
+            .map_err(SyscallError::from)?
+            .object;
+        match recv_endpoint {
+            CapObject::Endpoint { index, .. } if index == endpoint_idx => {}
+            _ => return Err(SyscallError::InvalidCapability),
+        }
+
+        // (4) no lock — the shared pre-consume plan.
+        let prelude = plan_blocked_waiter_ordinary_cap_prelude(&blocked_state, msg)?;
+
+        // (5) rank 5 — the PAYLOAD range, BEFORE the envelope is consumed, so a payload fault
+        // leaves the transfer intact and the source capability recoverable.
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            prelude.payload_writable.0,
+            prelude.payload_writable.1,
+        )
+        .map_err(SyscallError::from)?;
+        // (6) no lock — the shared metadata contract, still before the consume.
+        check_blocked_recv_meta_contract(&blocked_state)?;
+
+        // (7) rank 3 — consume the envelope exactly once through its owner, then resolve the
+        // source capability (rank 2+4) and the receiver's cnode (rank 2). A `pinned_object`
+        // would mean a shared-region envelope reached the ordinary class; that is another
+        // class's message and this producer must not service it, so it refuses rather than
+        // guessing at a pin it does not own.
+        let facts = self
+            .take_transfer_envelope_facts_split(
+                msg.transferred_cap()
+                    .ok_or(SyscallError::InvalidCapability)?
+                    .0,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(waiter_tid),
+            )
+            .ok_or(SyscallError::InvalidCapability)?;
+        if facts.pinned_object.is_some() {
+            return Err(SyscallError::InvalidCapability);
+        }
+        let source_capability = self
+            .resolve_capability_for_task_split(facts.source_tid, facts.source_cap)
+            .map_err(SyscallError::from)?;
+        let receiver_cnode = self
+            .task_cnode_split(waiter_tid)
+            .ok_or(SyscallError::InvalidCapability)?;
+
+        // (8) rank 5 — the META range. The envelope is already consumed; nothing was minted, so
+        // there is nothing to roll back, exactly as in the broad producer.
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            prelude.meta_writable.0,
+            prelude.meta_writable.1,
+        )
+        .map_err(SyscallError::from)?;
+
+        // (9) the shared snapshot assembly, then the stash.
+        let snapshot = plan_blocked_waiter_ordinary_cap_snapshot(
+            waiter_tid,
+            waiter_asid,
+            &blocked_state,
+            endpoint_idx,
+            msg,
+            &prelude,
+            (
+                source_capability.object,
+                source_capability.rights(),
+                facts.source_tid,
+                facts.source_cap,
+                receiver_cnode,
+            ),
+        );
+        // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+        // identical discipline to the broad producer's store.
+        unsafe {
+            crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx]
+                .store(DispatchPostWork::BlockedWaiterOrdinaryCapDelivery(snapshot));
+        }
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid={}",
+            waiter_tid
+        );
+        Ok(true)
+    }
+
     /// 199G-C4 §3 — the OFF-LOCK endpoint-only enqueue: the split entry to THE enqueue policy
     /// the broad `ipc_try_send_queued_plain_endpoint_only` also calls.
     ///

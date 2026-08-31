@@ -533,19 +533,8 @@ pub(crate) fn complete_blocked_recv_for_waiter(
             return Err(SyscallError::InvalidArgs);
         }
     }
-    // Stage 199G-B §1 — the metadata requirement belongs to the recv-v2 VARIANT, not to every
-    // blocked receive. A `LegacyTimeout` waiter has `RecvMetaTarget::None` and therefore a zero
-    // pointer and length by construction, so applying the recv-v2 length check to it would
-    // reject the very receives this class exists to deliver. Its own contract is checked
-    // instead: it must NOT carry a metadata buffer, because writing one would be a metadata
-    // write the variant promises never to perform.
-    if blocked_state.recv_abi.writes_recv_v2_meta() {
-        if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
-            return Err(SyscallError::InvalidArgs);
-        }
-    } else if blocked_state.meta_user_ptr != 0 || blocked_state.meta_user_len != 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
+    // Stage 199G-B §1, one owner since 199G-C4 §3.
+    check_blocked_recv_meta_contract(&blocked_state)?;
     // U9-RX4: the flag half of the ONE receiver-visible cap projection. It is computed here,
     // before materialization, because it depends only on the message; the cap half is taken
     // from the same projection below, once the materialized id exists. This was the
@@ -674,6 +663,30 @@ pub(crate) struct PlainDeliveryPlan {
     pub(crate) writable: DeliveryWritableRanges,
 }
 
+/// 199G-C4 §3 — THE per-variant blocked-receive metadata contract, for every delivery class.
+///
+/// Stage 199G-B §1 established that the metadata requirement belongs to the recv-v2 VARIANT,
+/// not to every blocked receive. Each delivery producer was then checking that separately, in
+/// four copies of the same two branches. It is one question with one answer, so it is asked
+/// here once:
+/// * a `RecvV2` waiter must have room for the whole meta struct, because the delivery will
+///   write one;
+/// * a `LegacyTimeout` waiter must NOT name a metadata buffer at all — writing one would be a
+///   metadata write the variant promises never to perform, and its own buffer is zero by
+///   construction, so a non-zero one means the saved state is not what it claims.
+pub(crate) fn check_blocked_recv_meta_contract(
+    blocked_state: &crate::kernel::task::BlockedRecvState,
+) -> Result<(), SyscallError> {
+    if blocked_state.recv_abi.writes_recv_v2_meta() {
+        if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+            return Err(SyscallError::InvalidArgs);
+        }
+    } else if blocked_state.meta_user_ptr != 0 || blocked_state.meta_user_len != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    Ok(())
+}
+
 /// 199G-C4 §3 — THE plain blocked-waiter delivery CLASS predicate.
 ///
 /// A message belongs to the plain class exactly when it carries no capability of any kind: no
@@ -717,19 +730,8 @@ pub(crate) fn plan_blocked_waiter_plain_delivery(
     if blocked_state.payload_user_len < app_payload.len() {
         return Err(SyscallError::InvalidArgs);
     }
-    // Stage 199G-B §1 — the metadata requirement belongs to the recv-v2 VARIANT, not to every
-    // blocked receive. A `LegacyTimeout` waiter has `RecvMetaTarget::None` and therefore a zero
-    // pointer and length by construction, so applying the recv-v2 length check to it would
-    // reject the very receives this class exists to deliver. Its own contract is checked
-    // instead: it must NOT carry a metadata buffer, because writing one would be a metadata
-    // write the variant promises never to perform.
-    if blocked_state.recv_abi.writes_recv_v2_meta() {
-        if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
-            return Err(SyscallError::InvalidArgs);
-        }
-    } else if blocked_state.meta_user_ptr != 0 || blocked_state.meta_user_len != 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
+    // Stage 199G-B §1, one owner since 199G-C4 §3.
+    check_blocked_recv_meta_contract(blocked_state)?;
 
     // Plain path: no transferred cap materialized (cap_id = NO_TRANSFER_CAP,
     // recv_meta_flags = 0), byte-identical to the plain branch of the legacy
@@ -873,6 +875,105 @@ pub(crate) fn produce_blocked_waiter_plain_delivery(
     Ok(true)
 }
 
+/// 199G-C4 §3 — THE ordinary cap-transfer blocked-waiter delivery CLASS predicate.
+///
+/// Exactly one transferred cap, a transfer flag set, NOT a reply cap, and NOT a shared-region
+/// transfer. Everything else (plain, reply cap, shared region, no cap) belongs to another
+/// class, and the producer must decline it having touched nothing.
+#[must_use]
+pub(crate) fn blocked_waiter_ordinary_cap_delivery_class_matches(msg: &Message) -> bool {
+    let is_reply = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
+    let is_transfer =
+        (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0;
+    is_transfer && !is_reply && msg.transferred_cap().is_some() && msg.opcode != OPCODE_SHARED_MEM
+}
+
+/// 199G-C4 §3 — the ordinary cap-transfer delivery's PRE-CONSUME plan: everything that must be
+/// decided, and the range that must be validated, BEFORE the transfer envelope is consumed.
+///
+/// The split is not cosmetic. The broad producer validates the PAYLOAD buffer before consuming
+/// the envelope, so a payload fault leaves the envelope intact — byte-identical to the legacy
+/// path, whose payload copy precedes materialization — and validates the META buffer after.
+/// Modelling that as one flat plan would let a gatherer validate both at once and silently lose
+/// the envelope on a meta fault, so the ordering is carried in the types.
+pub(crate) struct OrdinaryCapDeliveryPrelude {
+    pub(crate) app_opcode: u16,
+    pub(crate) payload: [u8; Message::MAX_PAYLOAD],
+    pub(crate) payload_len: usize,
+    /// Validate this BEFORE consuming the envelope.
+    pub(crate) payload_writable: (usize, usize),
+    /// Validate this AFTER consuming the envelope.
+    pub(crate) meta_writable: (usize, usize),
+}
+
+/// 199G-C4 §3 — THE ordinary cap-transfer pre-consume plan (pure).
+///
+/// Projection, the payload-length contract, the shared per-variant metadata contract, the
+/// by-value payload capture and both ranges — one implementation for the broad producer and its
+/// off-lock counterpart. The order in which the two ranges are validated stays the caller's,
+/// because it is a rank/ownership decision, not a data one.
+pub(crate) fn plan_blocked_waiter_ordinary_cap_prelude(
+    blocked_state: &crate::kernel::task::BlockedRecvState,
+    msg: &Message,
+) -> Result<OrdinaryCapDeliveryPrelude, SyscallError> {
+    use crate::kernel::dispatch_post_work::DISPATCH_POST_WORK_META_LEN;
+
+    // Canonical receiver-visible projection (single rule, shared with every other
+    // delivery path including the off-lock direct NR6 transaction).
+    let delivery = self::ipc_recv_core::project_recv_delivery(msg);
+    let (app_opcode, app_payload) = (delivery.app_opcode, delivery.app_payload);
+    if blocked_state.payload_user_len < app_payload.len() {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let mut payload = [0u8; Message::MAX_PAYLOAD];
+    payload[..app_payload.len()].copy_from_slice(app_payload);
+    Ok(OrdinaryCapDeliveryPrelude {
+        app_opcode,
+        payload,
+        payload_len: app_payload.len(),
+        payload_writable: (blocked_state.payload_user_ptr, app_payload.len()),
+        meta_writable: (blocked_state.meta_user_ptr, DISPATCH_POST_WORK_META_LEN),
+    })
+}
+
+/// 199G-C4 §3 — THE ordinary cap-transfer snapshot assembly (pure).
+///
+/// The receiver-local capability is NOT minted here and never is by a producer: the source
+/// `(source_tid, source_cap)` is carried only as the delegation-link parent edge, and the
+/// executor's seam mints the receiver's own cap. This function just states that arrangement
+/// once, so neither gatherer can quietly carry a different one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_blocked_waiter_ordinary_cap_snapshot(
+    waiter_tid: u64,
+    waiter_asid: crate::kernel::vm::Asid,
+    blocked_state: &crate::kernel::task::BlockedRecvState,
+    endpoint_idx: usize,
+    msg: &Message,
+    prelude: &OrdinaryCapDeliveryPrelude,
+    transfer: (CapObject, CapRights, u64, CapId, CNodeId),
+) -> crate::kernel::dispatch_post_work::BlockedWaiterOrdinaryCapDeliverySnapshot {
+    let (object, rights, source_tid, source_cap, receiver_cnode) = transfer;
+    crate::kernel::dispatch_post_work::BlockedWaiterOrdinaryCapDeliverySnapshot {
+        // Stage 199G-B §1 — carried from the waiter's own saved state, never re-derived.
+        recv_abi: blocked_state.recv_abi,
+        waiter_tid,
+        waiter_asid,
+        payload_user_ptr: blocked_state.payload_user_ptr,
+        payload_len: prelude.payload_len,
+        payload: prelude.payload,
+        meta_user_ptr: blocked_state.meta_user_ptr,
+        app_opcode: prelude.app_opcode,
+        sender_tid: msg.sender_tid.0,
+        receiver_cnode,
+        object,
+        rights,
+        source_tid,
+        source_cap,
+        endpoint_idx,
+        wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
+    }
+}
+
 /// Stage 188C — Phase A producer for an ORDINARY (non-reply, non-shared-region)
 /// single cap-transfer blocked recv-v2 waiter delivery, wired into the Stage
 /// 188A dispatch-return channel.
@@ -916,20 +1017,10 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
     endpoint_idx: usize,
     msg: &Message,
 ) -> Result<bool, SyscallError> {
-    use crate::kernel::dispatch_post_work::{
-        BlockedWaiterOrdinaryCapDeliverySnapshot, DISPATCH_POST_WORK_META_LEN, DispatchPostWork,
-    };
-    // Ordinary cap transfer only: exactly one transferred cap, the transfer flag
-    // set, NOT a reply cap, and NOT a shared-region transfer. Everything else
-    // (plain, reply cap, shared region, no cap) stays on the legacy path.
-    let is_reply = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
-    let is_transfer =
-        (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0;
-    let ordinary_cap = is_transfer
-        && !is_reply
-        && msg.transferred_cap().is_some()
-        && msg.opcode != OPCODE_SHARED_MEM;
-    if !ordinary_cap {
+    use crate::kernel::dispatch_post_work::DispatchPostWork;
+    // Ordinary cap transfer only. 199G-C4 §3 — the class question has one owner, asked
+    // identically by the off-lock gatherer.
+    if !blocked_waiter_ordinary_cap_delivery_class_matches(msg) {
         return Ok(false);
     }
     // Only produce when a trap-entry drainer will run (mirrors the Stage 117 /
@@ -958,13 +1049,10 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
         .map_err(SyscallError::from)?
         .object;
 
-    // Canonical receiver-visible projection (single rule, shared with every other
-    // delivery path including the off-lock direct NR6 transaction).
-    let delivery = self::ipc_recv_core::project_recv_delivery(msg);
-    let (app_opcode, app_payload) = (delivery.app_opcode, delivery.app_payload);
-    if blocked_state.payload_user_len < app_payload.len() {
-        return Err(SyscallError::InvalidArgs);
-    }
+    // 199G-C4 §3 — the projection, the payload-length contract, the by-value payload capture
+    // and both validation ranges belong to the plan owner the off-lock gatherer also calls.
+    let prelude = plan_blocked_waiter_ordinary_cap_prelude(&blocked_state, msg)?;
+
     // Phase A.2 — pre-validate the PAYLOAD buffer writable (no copy) BEFORE
     // consuming the envelope, so a payload fault leaves the envelope UNconsumed —
     // byte-identical to the legacy path, whose payload copy precedes the
@@ -972,36 +1060,24 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
     kernel
         .validate_user_range_writable_for_asid(
             waiter_asid,
-            blocked_state.payload_user_ptr,
-            app_payload.len(),
+            prelude.payload_writable.0,
+            prelude.payload_writable.1,
         )
         .map_err(SyscallError::from)?;
-    // Stage 199G-B §1 — the metadata requirement belongs to the recv-v2 VARIANT, not to every
-    // blocked receive. A `LegacyTimeout` waiter has `RecvMetaTarget::None` and therefore a zero
-    // pointer and length by construction, so applying the recv-v2 length check to it would
-    // reject the very receives this class exists to deliver. Its own contract is checked
-    // instead: it must NOT carry a metadata buffer, because writing one would be a metadata
-    // write the variant promises never to perform.
-    if blocked_state.recv_abi.writes_recv_v2_meta() {
-        if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
-            return Err(SyscallError::InvalidArgs);
-        }
-    } else if blocked_state.meta_user_ptr != 0 || blocked_state.meta_user_len != 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
+    // Stage 199G-B §1, one owner since 199G-C4 §3.
+    check_blocked_recv_meta_contract(&blocked_state)?;
 
     // Phase A.3 — consume the transfer envelope ONCE and resolve the ordinary
     // object + rights + receiver cnode (NO mint, NO seam). This is the exact
     // envelope-consume + source-resolve the legacy D1 arm does before its mint;
     // the mint itself is deferred to the executor's seam. Same real errors
     // (missing/dead envelope, source-cap resolution) as the legacy arm.
-    let (object, rights, source_tid, source_cap, receiver_cnode) =
-        phase_a_snapshot_ordinary_transfer(
-            kernel,
-            msg.transferred_cap().unwrap().0,
-            recv_endpoint,
-            waiter_tid,
-        )?;
+    let transfer = phase_a_snapshot_ordinary_transfer(
+        kernel,
+        msg.transferred_cap().unwrap().0,
+        recv_endpoint,
+        waiter_tid,
+    )?;
 
     // Phase A.4 — pre-validate the META buffer writable (no copy). On fault the
     // envelope is already consumed (matching the legacy meta-copy fault, which
@@ -1010,33 +1086,20 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
     kernel
         .validate_user_range_writable_for_asid(
             waiter_asid,
-            blocked_state.meta_user_ptr,
-            DISPATCH_POST_WORK_META_LEN,
+            prelude.meta_writable.0,
+            prelude.meta_writable.1,
         )
         .map_err(SyscallError::from)?;
 
-    let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
-    payload_buf[..app_payload.len()].copy_from_slice(app_payload);
-
-    let snapshot = BlockedWaiterOrdinaryCapDeliverySnapshot {
-        // Stage 199G-B §1 — carried from the waiter's own saved state, never re-derived.
-        recv_abi: blocked_state.recv_abi,
+    let snapshot = plan_blocked_waiter_ordinary_cap_snapshot(
         waiter_tid,
         waiter_asid,
-        payload_user_ptr: blocked_state.payload_user_ptr,
-        payload_len: app_payload.len(),
-        payload: payload_buf,
-        meta_user_ptr: blocked_state.meta_user_ptr,
-        app_opcode,
-        sender_tid: msg.sender_tid.0,
-        receiver_cnode,
-        object,
-        rights,
-        source_tid,
-        source_cap,
+        &blocked_state,
         endpoint_idx,
-        wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
-    };
+        msg,
+        &prelude,
+        transfer,
+    );
     // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
     // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` store.
     unsafe {
@@ -1344,19 +1407,8 @@ pub(crate) fn produce_blocked_waiter_reply_cap_delivery(
             app_payload.len(),
         )
         .map_err(SyscallError::from)?;
-    // Stage 199G-B §1 — the metadata requirement belongs to the recv-v2 VARIANT, not to every
-    // blocked receive. A `LegacyTimeout` waiter has `RecvMetaTarget::None` and therefore a zero
-    // pointer and length by construction, so applying the recv-v2 length check to it would
-    // reject the very receives this class exists to deliver. Its own contract is checked
-    // instead: it must NOT carry a metadata buffer, because writing one would be a metadata
-    // write the variant promises never to perform.
-    if blocked_state.recv_abi.writes_recv_v2_meta() {
-        if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
-            return Err(SyscallError::InvalidArgs);
-        }
-    } else if blocked_state.meta_user_ptr != 0 || blocked_state.meta_user_len != 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
+    // Stage 199G-B §1, one owner since 199G-C4 §3.
+    check_blocked_recv_meta_contract(&blocked_state)?;
 
     // Phase A.3 — take the reply-cap transfer envelope ONCE and resolve the reply
     // object registry coordinates + receiver cnode (NO mint, NO IPC record, NO

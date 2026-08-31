@@ -146669,3 +146669,249 @@ mod stage199gc4_plain_delivery_policy {
         );
     }
 }
+
+/// 199G-C4 §3 — THE ordinary cap-transfer blocked-waiter delivery policy, and its two gatherers.
+///
+/// The ordinary-cap class differs from the plain one in a way that is easy to lose: the payload
+/// range must be validated BEFORE the transfer envelope is consumed and the metadata range
+/// after, so that a payload fault leaves the source capability recoverable. The plan is
+/// therefore two pieces, and these tests hold both the sharing and that ordering.
+#[cfg(test)]
+mod stage199gc4_ordinary_cap_delivery_policy {
+    use super::*;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{
+        OPCODE_SHARED_MEM, blocked_waiter_ordinary_cap_delivery_class_matches,
+        check_blocked_recv_meta_contract, plan_blocked_waiter_ordinary_cap_prelude,
+    };
+    use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn v2_state(payload_len: usize) -> BlockedRecvState {
+        BlockedRecvState {
+            recv_cap: CapId(7),
+            payload_user_ptr: 0x4000,
+            payload_user_len: payload_len,
+            meta_user_ptr: 0x5000,
+            meta_user_len: 40,
+            recv_abi: RecvAbiVariant::RecvV2,
+        }
+    }
+
+    #[test]
+    fn the_class_predicate_admits_only_ordinary_single_cap_transfers() {
+        let ordinary =
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER, Some(11), b"x").expect("msg");
+        assert!(blocked_waiter_ordinary_cap_delivery_class_matches(
+            &ordinary
+        ));
+        let plain_transfer =
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER_PLAIN, Some(11), b"x")
+                .expect("msg");
+        assert!(blocked_waiter_ordinary_cap_delivery_class_matches(
+            &plain_transfer
+        ));
+
+        // A reply cap is another class's.
+        let reply =
+            Message::with_header(3, 0, Message::FLAG_REPLY_CAP, Some(11), b"x").expect("msg");
+        assert!(!blocked_waiter_ordinary_cap_delivery_class_matches(&reply));
+        // A shared-region transfer is another class's, identified by its opcode.
+        let shared = Message::with_header(
+            3,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(11),
+            b"x",
+        )
+        .expect("msg");
+        assert!(!blocked_waiter_ordinary_cap_delivery_class_matches(&shared));
+        // A capability-free message is the plain class's.
+        assert!(!blocked_waiter_ordinary_cap_delivery_class_matches(
+            &Message::new(3, b"x").expect("msg")
+        ));
+    }
+
+    #[test]
+    fn the_prelude_names_both_ranges_and_the_payload_it_will_copy() {
+        let msg = Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER, Some(11), b"\x09\x00body")
+            .expect("msg");
+        let state = v2_state(64);
+        let prelude = plan_blocked_waiter_ordinary_cap_prelude(&state, &msg).expect("prelude");
+        let projected = crate::kernel::syscall::ipc_recv_core::project_recv_delivery(&msg);
+
+        assert_eq!(prelude.app_opcode, projected.app_opcode);
+        assert_eq!(prelude.payload_len, projected.app_payload.len());
+        assert_eq!(
+            &prelude.payload[..prelude.payload_len],
+            projected.app_payload
+        );
+        assert_eq!(
+            prelude.payload_writable,
+            (state.payload_user_ptr, projected.app_payload.len())
+        );
+        assert_eq!(
+            prelude.meta_writable,
+            (
+                state.meta_user_ptr,
+                crate::kernel::dispatch_post_work::DISPATCH_POST_WORK_META_LEN
+            )
+        );
+
+        // The payload-length contract is the prelude's, and it refuses before anything is
+        // consumed.
+        assert!(plan_blocked_waiter_ordinary_cap_prelude(&v2_state(1), &msg).is_err());
+    }
+
+    #[test]
+    fn the_metadata_contract_has_one_owner_used_by_every_class() {
+        // The contract itself.
+        assert!(check_blocked_recv_meta_contract(&v2_state(64)).is_ok());
+        let mut short = v2_state(64);
+        short.meta_user_len = 8;
+        assert!(check_blocked_recv_meta_contract(&short).is_err());
+        let legacy = BlockedRecvState::legacy_timeout(CapId(7), 0x4000, 64);
+        assert!(check_blocked_recv_meta_contract(&legacy).is_ok());
+        let mut lying = legacy;
+        lying.meta_user_len = 40;
+        assert!(check_blocked_recv_meta_contract(&lying).is_err());
+
+        // One implementation, and no producer spells the two branches out for itself.
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn check_blocked_recv_meta_contract(")
+                .count(),
+            1,
+            "one metadata-contract owner"
+        );
+        for src in [SYSCALL_SRC, RUNTIME_SRC] {
+            assert_eq!(
+                src.matches("blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN")
+                    .count(),
+                usize::from(core::ptr::eq(src, SYSCALL_SRC)),
+                "the recv-v2 length branch may appear only inside its owner"
+            );
+        }
+    }
+
+    #[test]
+    fn both_ordinary_cap_producers_share_the_plan_and_keep_the_validation_order() {
+        for (src, name, needle) in [
+            (
+                SYSCALL_SRC,
+                "broad",
+                "pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(",
+            ),
+            (
+                RUNTIME_SRC,
+                "split",
+                "pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery_split(",
+            ),
+        ] {
+            let start = src
+                .find(needle)
+                .unwrap_or_else(|| panic!("{name} producer"));
+            let terminator = if name == "broad" {
+                "\n}\n"
+            } else {
+                "\n    }\n"
+            };
+            let end = src[start..]
+                .find(terminator)
+                .unwrap_or_else(|| panic!("{name} producer ends"))
+                + start;
+            let body = &src[start..end];
+
+            // Shared owners, not re-decided policy.
+            assert!(body.contains("blocked_waiter_ordinary_cap_delivery_class_matches(msg)"));
+            assert!(body.contains("plan_blocked_waiter_ordinary_cap_prelude("));
+            assert!(body.contains("check_blocked_recv_meta_contract("));
+            assert!(body.contains("plan_blocked_waiter_ordinary_cap_snapshot("));
+            for redecided in [
+                "project_recv_delivery(",
+                "BlockedWaiterOrdinaryCapDeliverySnapshot {",
+                "writes_recv_v2_meta()",
+            ] {
+                assert!(
+                    !body.contains(redecided),
+                    "the {name} gatherer must not re-decide `{redecided}`"
+                );
+            }
+
+            // THE ordering: payload validated, then the envelope consumed, then meta validated.
+            let payload = body
+                .find("payload_writable.0")
+                .unwrap_or_else(|| panic!("{name}: payload validation"));
+            let meta = body
+                .find("meta_writable.0")
+                .unwrap_or_else(|| panic!("{name}: meta validation"));
+            let consume = if name == "broad" {
+                body.find("phase_a_snapshot_ordinary_transfer(")
+                    .expect("broad consume")
+            } else {
+                body.find("take_transfer_envelope_facts_split(")
+                    .expect("split consume")
+            };
+            assert!(
+                payload < consume,
+                "{name}: a payload fault must leave the envelope unconsumed"
+            );
+            assert!(
+                consume < meta,
+                "{name}: the meta range is validated after the single consume"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_ordinary_cap_producer_mints_nothing_and_ascends_in_rank() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+
+        // The receiver-local capability is the executor's to mint, never a producer's.
+        for minting in ["sr_mint_split(", "materialize_ordinary_cap_split(", "mint("] {
+            assert!(
+                !body.contains(minting),
+                "a producer must not mint the receiver's capability (saw `{minting}`)"
+            );
+        }
+
+        // Rank 1 → 2 → (2+4) → 5 → 3 → 5, each acquisition released before the next; assert the
+        // first four steps' order and that the envelope consume precedes the meta validation.
+        let cpu = body.find("current_cpu_split_read()").expect("rank 1");
+        let task = body.find("with_task_tcbs_split_mut(").expect("rank 2");
+        let cap = body
+            .find("resolve_capability_for_task_split(waiter_tid")
+            .expect("rank 2+4");
+        let payload_vm = body
+            .find("validate_user_range_writable_for_asid_split(")
+            .expect("rank 5");
+        assert!(cpu < task && task < cap && cap < payload_vm);
+
+        // Exactly one rank-2 blocked-state acquisition and exactly one envelope consume.
+        assert_eq!(body.matches("with_task_tcbs_split_mut(").count(), 1);
+        assert_eq!(
+            body.matches("take_transfer_envelope_facts_split(").count(),
+            1,
+            "the envelope is consumed exactly once"
+        );
+
+        // A shared-region envelope carries a pin this class does not own: refuse, never guess.
+        assert!(
+            body.contains("facts.pinned_object.is_some()"),
+            "a pinned envelope belongs to the shared-region class and must be refused"
+        );
+
+        // The class question precedes every acquisition.
+        let class = body
+            .find("blocked_waiter_ordinary_cap_delivery_class_matches(msg)")
+            .expect("class predicate");
+        assert!(class < cpu);
+    }
+}
