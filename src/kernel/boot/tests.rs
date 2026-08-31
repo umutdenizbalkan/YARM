@@ -54763,6 +54763,25 @@ mod stage169_d2_send_genuine {
         f
     }
 
+    /// 203C-XFR — commit a RESUMED task's continuation, exactly as the production capture does
+    /// before an already-running task can be selected. Shared by the tests whose subject is the
+    /// resume itself rather than the classification.
+    fn u3_commit_resumed_context(
+        k: &SharedKernel,
+        asid: Asid,
+    ) -> crate::kernel::task::UserRegisterContext {
+        let mut saved = u3_frame().capture_user_context();
+        saved.instruction_ptr = VirtAddr(0x4_1000);
+        assert!(k.split_return_commit_context_split(
+            crate::runtime::SplitReturnIdentity {
+                tid: U3_INCOMING,
+                asid
+            },
+            saved
+        ));
+        saved
+    }
+
     /// The exact marked incarnation resumes, and the frame receives that task's saved context.
     #[test]
     fn u3_exact_token_identity_resumes_and_restores_context() {
@@ -54849,7 +54868,11 @@ mod stage169_d2_send_genuine {
     /// per-CPU FS-base tracking cell follows it.
     #[test]
     fn u3_tls_request_is_taken_once_and_tracked() {
-        let (k, _asid) = u3_fixture();
+        let (k, asid) = u3_fixture();
+        // 203C-XFR: a RESUMED task is admitted on the strength of its committed continuation, so
+        // the fixture commits one — the same thing every other resume test here does, and the
+        // same thing the production capture does before the task ever reaches this apply.
+        u3_commit_resumed_context(&k, asid);
         k.with(|s| s.set_thread_tls_base(U3_INCOMING, 0x7F00).expect("tls"));
         let token = u3_mark(&k);
         let mut frame = u3_frame();
@@ -118578,7 +118601,7 @@ mod stage199d_wa2b_wake_owner_census {
             "src/kernel/task.rs",
             "new",
             "status:",
-            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, blocked_send_generation: 0, pending_syscall_completion: None, async_preempted: None, async_preempt_generation: 0, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
+            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, first_resume_consumed: false, blocked_send_generation: 0, pending_syscall_completion: None, async_preempted: None, async_preempt_generation: 0, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
             "thread_group_id: ThreadGroupId(tid.0),",
             "asid,",
         ),
@@ -140761,35 +140784,49 @@ mod u9qa_apply_convention {
     /// The resumability screen asks what the CALLER'S convention can actually serve, because the
     /// two conventions serve different sets of tasks — and getting that wrong is refusable only
     /// BEFORE the dequeue.
+    ///
+    /// 203C-XFR moved the screen into ONE classifier that admission and the apply both call. The
+    /// stash arm is unchanged; the exact-token arm now asks about the incoming task's
+    /// CONTINUATION rather than about `kernel_context.initialized`, which is the kernel-thread
+    /// `switch_frames` precondition and which no production user task satisfies.
     #[test]
     fn resumability_is_screened_per_convention_before_the_dequeue() {
         let body = admit_body();
-        // The stash convention requires exactly what the plan builder requires.
+        let classifier = EXEC
+            .split("pub(crate) fn classify_incoming_resume_convention")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the classifier");
+        // The stash convention still requires exactly what the plan builder requires.
         assert!(
-            body.contains(
-                "QueueAdvanceApply::StashedKernelSwitch => tcb.kernel_context.initialized"
-            ),
+            classifier.contains("QueueAdvanceApply::StashedKernelSwitch => tcb")
+                && classifier.contains("kernel_context"),
             "the stash convention must screen on what build_dispatch_switch_plan_locked requires"
         );
-        // The exact-token convention differs by architecture, because its resume owners do:
-        // x86_64/AArch64 refuse an incarnation with no restorable context (a never-run task takes
-        // the first-resume trampoline, which is the STASH path), while the RISC-V write-back
-        // serves the fresh/startup convention from the argument mirror and needs only a
-        // resolvable ASID — the thing its `direct_dispatch_activate_asid_split` refuses on.
-        let exact = body
+        // The exact-token convention screens the continuation the resume owner will install: a
+        // bound address space, and a `rip`/`rsp` that `flush_trap_context_to_iret_frame` will
+        // actually write. A never-run task with a seeded startup snapshot is admitted as the
+        // one-shot first resume; a consumed snapshot is refused.
+        let exact = classifier
             .split("QueueAdvanceApply::ExactTokenResume => {")
             .nth(1)
-            .and_then(|s| s.split("\n                }").next())
             .expect("the exact-token arm");
         assert!(
-            exact.contains("cfg!(target_arch = \"x86_64\")")
-                && exact.contains("tcb.asid.is_some()")
-                && exact.contains("tcb.kernel_context.initialized"),
-            "the exact-token screen must match what each architecture's resume owner accepts"
+            exact.contains("tcb.asid?")
+                && exact.contains("is_restorable()")
+                && exact.contains("is_first_resume_shape()")
+                && exact.contains("tcb.first_resume_consumed")
+                && exact.contains("IncomingResumeConvention::X86FirstResume"),
+            "the exact-token screen must match what the resume owner accepts"
+        );
+        // The screen no longer asks the switch_frames question of an exact-token caller.
+        assert!(
+            !exact.contains("kernel_context.initialized"),
+            "the exact-token arm must not screen on the kernel-thread switch precondition"
         );
         // Whatever the screen, a failure is a refusal raised BEFORE anything is dequeued.
         let screen = body
-            .find("let resumable = self.with_task_tcbs_split_mut")
+            .find("let convention = self.with_task_tcbs_split_mut")
             .expect("the screen");
         let refusal = body
             .find("QueueAdvanceRefusal::IncomingUnavailable")
@@ -140797,6 +140834,41 @@ mod u9qa_apply_convention {
         assert!(
             screen < refusal,
             "a non-resumable candidate is refused before anything is dequeued"
+        );
+    }
+
+    /// 203C-XFR — ONE policy owner. The first-resume predicate exists in exactly one place, and
+    /// both the queue-advance classifier and the x86_64 saved-register writeback call it.
+    #[test]
+    fn the_first_resume_predicate_has_one_owner() {
+        const TASK_SRC: &str = include_str!("../task.rs");
+        const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            TASK_SRC.contains("pub fn is_first_resume_shape(&self) -> bool"),
+            "the predicate must be defined on the continuation value itself"
+        );
+        // Exactly one definition; the arch writeback calls it rather than re-deriving it.
+        assert_eq!(
+            TASK_SRC
+                .matches("self.user_gprs.iter().all(|&g| g == 0) && self.arg0 != 0")
+                .count(),
+            1,
+            "the first-resume shape is derived in exactly one place"
+        );
+        assert!(
+            DESC_SRC.contains("capture_user_context().is_first_resume_shape()"),
+            "the x86_64 writeback must call the shared predicate"
+        );
+        assert!(
+            !DESC_SRC.contains("trap_frame.user_gprs.iter().all(|&g| g == 0)"),
+            "the arch writeback must not keep a second copy of the predicate"
+        );
+        // The apply consumes the one-shot snapshot through the same classifier.
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        assert!(
+            RUNTIME_SRC.contains("classify_incoming_resume_convention(")
+                && RUNTIME_SRC.contains("tcb.first_resume_consumed = true;"),
+            "the apply must revalidate through the classifier and consume the snapshot once"
         );
     }
 

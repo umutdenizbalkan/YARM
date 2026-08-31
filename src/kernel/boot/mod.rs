@@ -17,7 +17,10 @@ mod exec_state;
 // U9-QA §1: the queue-advance apply convention is named by callers outside this module (the
 // pre-lock split route), so it is re-exported alongside the transaction it parameterises.
 #[cfg_attr(feature = "hosted-dev", allow(unused_imports))]
-pub(crate) use exec_state::{QueueAdvanceApply, QueueAdvanceOutcome};
+pub(crate) use exec_state::{
+    IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome,
+    classify_incoming_resume_convention,
+};
 mod fault_endpoint_state;
 mod fault_state;
 // U9-FT2 §2: the ONE PageFault classification evaluator and its named fact types are

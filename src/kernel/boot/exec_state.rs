@@ -237,6 +237,73 @@ pub(crate) enum QueueAdvanceApply {
     ExactTokenResume,
 }
 
+/// 203C-XFR — which convention the queue advance will use to return the SELECTED incoming task
+/// to userspace. THE single policy owner; there is no second classifier.
+///
+/// Both variants converge on the same apply — `x86_post_lock_resume_marked_incoming` applies the
+/// continuation to the live trap frame, `write_task_gprs_to_saved_regs` writes the register file,
+/// `flush_trap_context_to_iret_frame` patches the hardware frame, `iretq` returns to ring 3. The
+/// variant records WHICH continuation the task owns, because that is what admission has to be able
+/// to establish before the outgoing task publishes its terminal transition.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IncomingResumeConvention {
+    /// The incarnation has a committed saved continuation — it has run, trapped, and had its
+    /// register file captured. The saved GPR snapshot is restored verbatim.
+    ExactToken,
+    /// A never-run incarnation with a COMPLETE seeded startup snapshot: an entry point, a startup
+    /// stack, the non-zero task id in `arg0`, a zero GPR file, a bound ASID, and an unconsumed
+    /// one-shot latch. The startup ABI is delivered through the System V argument registers.
+    ///
+    /// This is not a new convention. It is the one `write_task_gprs_to_saved_regs` has always
+    /// selected with its `is_new_task` predicate on every broad-lock task switch; 203C-XFR only
+    /// makes it visible to ADMISSION, which previously had to guess with
+    /// `kernel_context.initialized` — a question about the kernel-thread `switch_frames`
+    /// convention that no production user task has ever satisfied.
+    X86FirstResume,
+}
+
+/// 203C-XFR — classify one candidate's resume convention. Pure: reads only the TCB, mutates
+/// nothing, and is the SAME function admission runs against the peeked candidate and the apply
+/// runs against the task actually dequeued.
+///
+/// `None` is a refusal, and every refusal is a genuinely unreturnable incarnation: no bound
+/// address space, or a continuation `flush_trap_context_to_iret_frame` would decline to install
+/// (a zero `rip` or `rsp` leaves the hardware frame holding the OUTGOING task's), or a startup
+/// snapshot already consumed. Refusing here is what keeps the post-dequeue
+/// `d2_resume_refused_fatal` unreachable.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn classify_incoming_resume_convention(
+    tcb: &crate::kernel::task::ThreadControlBlock,
+    apply: QueueAdvanceApply,
+) -> Option<IncomingResumeConvention> {
+    match apply {
+        // Unchanged: the stash performs `switch_frames` between two KERNEL contexts, so an
+        // initialized kernel context is exactly its precondition and nothing about the user
+        // continuation is relevant to it.
+        QueueAdvanceApply::StashedKernelSwitch => tcb
+            .kernel_context
+            .initialized
+            .then_some(IncomingResumeConvention::ExactToken),
+        QueueAdvanceApply::ExactTokenResume => {
+            // Every architecture's exact-token resume activates the incoming address space
+            // first; without one there is nothing to activate and the apply refuses.
+            tcb.asid?;
+            let context = tcb.user_context;
+            if !context.is_restorable() {
+                return None;
+            }
+            if context.is_first_resume_shape() {
+                if tcb.first_resume_consumed {
+                    return None;
+                }
+                return Some(IncomingResumeConvention::X86FirstResume);
+            }
+            Some(IncomingResumeConvention::ExactToken)
+        }
+    }
+}
+
 /// Why the queue advance declined. EVERY variant is raised before the first mutation, so a refused
 /// caller may safely fall through to the unchanged terminal broad dispatcher.
 // Used by the pre-lock split route, which is `cfg(not(hosted-dev))`; the hosted build
@@ -4355,23 +4422,40 @@ impl crate::runtime::SharedKernel {
         //     three times for the same reason while its in-lock drain switched all three
         //     successfully (`TTBR0_OK` → `FRAME_OK`). What both require is a resolvable ASID,
         //     which is what `direct_dispatch_activate_asid_split` would otherwise refuse on.
-        let resumable = self.with_task_tcbs_split_mut(|tcbs| {
-            let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == candidate) else {
-                return false;
-            };
-            match apply {
-                QueueAdvanceApply::StashedKernelSwitch => tcb.kernel_context.initialized,
-                QueueAdvanceApply::ExactTokenResume => {
-                    if cfg!(target_arch = "x86_64") {
-                        tcb.kernel_context.initialized
-                    } else {
-                        tcb.asid.is_some()
-                    }
-                }
-            }
+        //
+        // 203C-XFR replaces the x86_64 arm. It used to ask `kernel_context.initialized`, and the
+        // comment above recorded the belief that a never-run task "takes the FIRST-RESUME
+        // TRAMPOLINE — which is the stash path, not this one". Both halves were wrong, and the
+        // source says so:
+        //
+        //   * that trampoline (`yarm_kernel_thread_switch_trampoline`, `FIRST_RESUME_STASH`) is
+        //     the KERNEL-THREAD `switch_frames` first resume, and it switches BACK to the
+        //     outgoing task — it is not how any user task enters ring 3;
+        //   * production user tasks never get an initialized kernel context at all. Only
+        //     `BOOTSTRAP_FIRST_USER_TID` and `BOOTSTRAP_SUPERVISOR_TID` do, as a Stage-119 D6
+        //     proof arrangement, which is precisely why `build_dispatch_switch_plan_locked`
+        //     records "context switching for these tasks happens entirely via trap-frame
+        //     restore; switch_frames is not called".
+        //
+        // So the screen refused every service task in the system, and admitted only tid 1 and
+        // tid 2. That is not a conservative approximation of the apply's precondition — it is a
+        // different question. The apply's real precondition is that the incoming task owns a
+        // returnable continuation, which is what the classifier establishes, and which a
+        // never-run task with a seeded startup snapshot satisfies exactly as well as a resumed
+        // one. Refusal is still raised HERE, before any mutation.
+        let convention = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == candidate)?;
+            classify_incoming_resume_convention(tcb, apply)
         });
-        if !resumable {
+        let Some(convention) = convention else {
             return Err(QueueAdvanceRefusal::IncomingUnavailable);
+        };
+        if matches!(convention, IncomingResumeConvention::X86FirstResume) {
+            crate::yarm_log!(
+                "QUEUE_ADVANCE_ADMIT_FIRST_RESUME cpu={} candidate={}",
+                cpu.0,
+                candidate
+            );
         }
         Ok(Some(candidate))
     }

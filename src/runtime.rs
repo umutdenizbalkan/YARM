@@ -2582,6 +2582,43 @@ impl SharedKernel {
     /// the TCB's ASID must still equal the one the mark recorded. If the TCB was replaced by a
     /// different incarnation that reused the numeric TID, this returns `None` and the caller
     /// takes its fatal/rollback path; the replacement's context is never copied into the frame.
+    /// 203C-XFR — revalidate the ACTUALLY selected incarnation's resume convention and, when it
+    /// is the one-shot startup snapshot, CONSUME it. One rank-2 acquisition, so the classify and
+    /// the consume cannot be split by anything.
+    ///
+    /// Admission classified the PEEKED candidate; a higher-priority wake may have displaced it
+    /// between the peek and the authoritative dequeue, so the task about to be returned to
+    /// userspace is re-asked the same question through the same owner
+    /// (`classify_incoming_resume_convention`) rather than inheriting admission's answer.
+    ///
+    /// `None` is a refusal, and the caller must NOT reinterpret it — in particular a failed
+    /// exact-token classification never becomes a first resume here. The consume is what makes
+    /// "a seeded startup snapshot is returned through exactly once" true: a second attempt on the
+    /// same snapshot classifies as `None`.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn direct_dispatch_classify_and_consume_convention_split(
+        &self,
+        token: DispatchMarkToken,
+    ) -> Option<crate::kernel::boot::IncomingResumeConvention> {
+        use crate::kernel::boot::IncomingResumeConvention;
+        let incoming = token.tid();
+        let expected = token.expect_asid()?;
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == incoming && t.asid == Some(expected))?;
+            let convention = crate::kernel::boot::classify_incoming_resume_convention(
+                tcb,
+                crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+            )?;
+            if matches!(convention, IncomingResumeConvention::X86FirstResume) {
+                tcb.first_resume_consumed = true;
+            }
+            Some(convention)
+        })
+    }
+
     pub(crate) fn direct_dispatch_restore_context_split(
         &self,
         token: DispatchMarkToken,

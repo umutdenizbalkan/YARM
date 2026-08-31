@@ -200,6 +200,44 @@ impl Default for UserRegisterContext {
     }
 }
 
+/// 203C-XFR — the ONE classification of a userspace continuation's shape.
+///
+/// The x86_64 return path has always had two conventions and has always chosen between them
+/// here, in `write_task_gprs_to_saved_regs`: a task whose whole GPR file is zero and whose
+/// `arg0` carries the non-zero task id written at spawn has never run, so its startup ABI is
+/// delivered through the System V argument registers; anything else is a resumed task whose
+/// saved GPR snapshot is restored verbatim.
+///
+/// Before 203C-XFR that decision lived only in the arch writeback, which runs AFTER the queue
+/// advance has already dequeued the task and made it current — far too late for admission to
+/// use. Lifting the predicate here, onto the value both sides already hold, is what lets the
+/// queue-advance admission ask the SAME question the apply will answer, instead of the
+/// kernel-thread `switch_frames` question (`kernel_context.initialized`) it used to ask and
+/// which no production user task has ever satisfied.
+impl UserRegisterContext {
+    /// True when this continuation is a never-run task's seeded startup snapshot.
+    ///
+    /// Byte-identical to the `is_new_task` predicate the x86_64 saved-register writeback
+    /// computes; both now call this, so admission and apply cannot disagree about which
+    /// convention a task gets.
+    #[must_use]
+    pub fn is_first_resume_shape(&self) -> bool {
+        self.user_gprs.iter().all(|&g| g == 0) && self.arg0 != 0
+    }
+
+    /// True when this continuation can actually be returned through.
+    ///
+    /// `flush_trap_context_to_iret_frame` leaves the hardware frame's `rip`/`rsp` UNTOUCHED
+    /// when either is zero — which for a selected incoming task would mean `iretq`ing through
+    /// whatever frame the outgoing task left behind. That is the concrete hazard admission has
+    /// to exclude, so it is stated as a property of the continuation rather than inferred from
+    /// an unrelated bit.
+    #[must_use]
+    pub fn is_restorable(&self) -> bool {
+        self.instruction_ptr.0 != 0 && self.stack_ptr.0 != 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RobustFutexState {
     pub head: usize,
@@ -319,6 +357,18 @@ pub struct ThreadControlBlock {
     /// this and a stale timeout completion is refused. Bumped when a fresh blocked
     /// recv is published.
     pub blocked_recv_generation: u64,
+    /// 203C-XFR — the one-shot latch on this incarnation's SEEDED STARTUP SNAPSHOT.
+    ///
+    /// A never-run task's `user_context` is not a saved continuation; it is a startup snapshot
+    /// written once at spawn. Returning through it twice would re-enter the task's entry point
+    /// with its startup ABI a second time, silently restarting a task that was already running.
+    /// The queue-advance apply therefore CONSUMES the snapshot when it selects the first-resume
+    /// convention, and the classifier refuses that convention once this is set — so the same
+    /// startup state can be used exactly once.
+    ///
+    /// It is deliberately not "has ever run": a resumed task is admitted on the strength of its
+    /// saved continuation, which this says nothing about.
+    pub first_resume_consumed: bool,
     /// U6 §2 — a monotonic per-task blocked-SEND generation, the send-side sibling of
     /// [`Self::blocked_recv_generation`] and deliberately a SEPARATE coordinate.
     ///
@@ -892,6 +942,7 @@ impl ThreadControlBlock {
             reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick,
             server_reply_link: None,
             blocked_recv_generation: 0,
+            first_resume_consumed: false,
             blocked_send_generation: 0,
             pending_syscall_completion: None,
             async_preempted: None,
