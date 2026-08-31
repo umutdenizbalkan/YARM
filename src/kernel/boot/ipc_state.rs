@@ -4456,6 +4456,48 @@ impl KernelState {
         Ok(())
     }
 
+    /// 199G-C4 §3 — THE authoritative endpoint enqueue, over `&mut IpcSubsystem` (rank 3 only).
+    ///
+    /// This is the enqueue `ipc_send_routed` reaches when the conservative Stage-4E screen
+    /// declines: unconditional, so a send queues behind existing sender-waiters exactly as
+    /// before, and answering `false` — not an error — when the endpoint is full, because a full
+    /// endpoint is the blocking origin rather than a failure. A missing endpoint IS an error,
+    /// as it always was.
+    ///
+    /// The conservative screen and this are deliberately different questions with different
+    /// answers; extracting this one is what lets an off-lock route reach the same conclusion the
+    /// broad fallback reaches instead of stopping at the screen.
+    pub(crate) fn ipc_endpoint_enqueue_authoritative_locked(
+        ipc: &mut IpcSubsystem,
+        endpoint_idx: usize,
+        msg: Message,
+    ) -> Result<bool, KernelError> {
+        let Some(endpoint_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
+        else {
+            return Err(KernelError::WrongObject);
+        };
+        let endpoint = kernel_mut(endpoint_storage);
+        Ok(endpoint.send(msg).is_ok())
+    }
+
+    /// 199G-C4 §3 — THE recv-v2 blocked-waiter question, over `&[Option<TCB>]` (rank 2 only).
+    ///
+    /// `ipc_send_routed` asks it three times in three spellings; it is one question — does this
+    /// exact thread hold a saved blocked-receive state whose ABI variant is `RecvV2` — and the
+    /// answer decides whether a send delivers directly or enqueues. An off-lock route that asked
+    /// it differently would route the same send differently.
+    #[must_use]
+    pub(crate) fn task_is_recv_v2_blocked_locked(
+        tcbs: &[Option<crate::kernel::task::ThreadControlBlock>],
+        tid: u64,
+    ) -> bool {
+        tcbs.iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .and_then(|tcb| tcb.blocked_recv_state.as_ref())
+            .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
+    }
+
     /// Enqueue `msg` into the endpoint at `endpoint_idx` and wake any waiter.
     ///
     /// This is the canonical "supervisor notify" pattern used by fault reporting,
@@ -5122,13 +5164,9 @@ impl KernelState {
     /// Return true if the task identified by `tid` is blocked on a recv-v2 operation.
     /// Acquires task_state_lock (rank 3). Must be called before ipc_state_lock (rank 4).
     pub(crate) fn is_task_recv_v2_blocked(&self, tid: u64) -> bool {
-        self.with_tcbs(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .and_then(|tcb| tcb.blocked_recv_state.as_ref())
-                .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
-        })
+        // 199G-C4 §3: one owner for the recv-v2 blocked question; this entry supplies the
+        // broad acquisition, the off-lock entry supplies the rank-2 seam.
+        self.with_tcbs(|tcbs| Self::task_is_recv_v2_blocked_locked(tcbs, tid))
     }
 
     /// Stage 4F: plain send to a waiting legacy (non-recv-v2) receiver on a buffered endpoint.
@@ -6066,13 +6104,9 @@ impl KernelState {
             );
             // Phase 2: confirm recv-v2 under task_state_lock (rank 3) before
             // re-acquiring ipc_state_lock (rank 4) in Phase 4.
-            let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                    .and_then(|tcb| tcb.blocked_recv_state.as_ref())
-                    .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
-            });
+            // 199G-C4 §3: one owner for the recv-v2 blocked question.
+            let waiter_recv_v2_blocked =
+                self.with_tcbs(|tcbs| Self::task_is_recv_v2_blocked_locked(tcbs, waiter_tid.0));
             if waiter_recv_v2_blocked {
                 // Stage 188F: dispatch the reply delivery to the blocked recv-v2
                 // caller through the 188B/188C/188D dispatch-return producers
@@ -6666,13 +6700,9 @@ impl KernelState {
                 });
                 // Phase 2: check recv-v2 under task_state_lock (rank 3), outside
                 // ipc_state_lock (rank 4), to preserve lock-rank ordering.
-                let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
-                    tcbs.iter()
-                        .flatten()
-                        .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                        .and_then(|tcb| tcb.blocked_recv_state.as_ref())
-                        .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
-                });
+                // 199G-C4 §3: one owner for the recv-v2 blocked question.
+                let waiter_recv_v2_blocked =
+                    self.with_tcbs(|tcbs| Self::task_is_recv_v2_blocked_locked(tcbs, waiter_tid.0));
                 if waiter_recv_v2_blocked {
                     // Phase 3: complete delivery outside all locks (TrapFrame/user-memory write).
                     crate::yarm_log!(
@@ -6751,13 +6781,9 @@ impl KernelState {
                 msg.len,
                 msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
             );
-            let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                    .and_then(|tcb| tcb.blocked_recv_state.as_ref())
-                    .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
-            });
+            // 199G-C4 §3: one owner for the recv-v2 blocked question.
+            let waiter_recv_v2_blocked =
+                self.with_tcbs(|tcbs| Self::task_is_recv_v2_blocked_locked(tcbs, waiter_tid.0));
             if waiter_recv_v2_blocked {
                 match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
                     Ok(()) => {
@@ -6784,14 +6810,10 @@ impl KernelState {
                 }
             }
         }
+        // 199G-C4 §3: the authoritative enqueue, shared with the off-lock route so both reach
+        // the same conclusion the conservative Stage-4E screen declines to reach.
         let queued = self.with_ipc_state_mut(|ipc| {
-            let Some(endpoint_storage) =
-                ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
-            else {
-                return Err(KernelError::WrongObject);
-            };
-            let endpoint = kernel_mut(endpoint_storage);
-            Ok(endpoint.send(msg).is_ok())
+            Self::ipc_endpoint_enqueue_authoritative_locked(ipc, endpoint_idx, msg)
         })?;
         if !queued {
             crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);

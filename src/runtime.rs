@@ -8790,6 +8790,61 @@ impl SharedKernel {
         Ok(true)
     }
 
+    /// 199G-C4 §3 — the OFF-LOCK authoritative endpoint enqueue: the split entry to THE enqueue
+    /// the broad `ipc_send_routed` performs when the conservative Stage-4E screen declines.
+    ///
+    /// One bounded rank-3 acquisition. `Ok(false)` means the endpoint was full, which is the
+    /// blocking origin rather than a failure; `Err` means the endpoint was missing.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn ipc_endpoint_enqueue_authoritative_split(
+        &self,
+        endpoint_idx: usize,
+        msg: crate::kernel::ipc::Message,
+    ) -> Result<bool, KernelError> {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::ipc_endpoint_enqueue_authoritative_locked(ipc, endpoint_idx, msg)
+        })
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK recv-v2 blocked question: the split entry to THE predicate the
+    /// broad `is_task_recv_v2_blocked` also calls. One bounded rank-2 acquisition.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    #[must_use]
+    pub(crate) fn is_task_recv_v2_blocked_split_read(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| KernelState::task_is_recv_v2_blocked_locked(tcbs, tid))
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK endpoint-waiter read: which thread, if any, is parked on this
+    /// endpoint. One bounded rank-3 acquisition, read-only.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    #[must_use]
+    pub(crate) fn endpoint_waiter_tid_split_read(
+        &self,
+        endpoint_idx: usize,
+    ) -> Option<crate::kernel::ipc::ThreadId> {
+        self.with_ipc_split_mut(|ipc| ipc.endpoint_waiter_tid(endpoint_idx))
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK counterpart of `wake_waiter_for_endpoint`: take the endpoint's
+    /// waiter under rank 3, then wake it under rank 2/1 with rank 3 already released.
+    ///
+    /// The two-step shape is the lock-order requirement the broad owner documents, not a
+    /// convenience: `wake_tid_to_runnable` takes ranks below IPC, so it must never run while the
+    /// IPC lock is held.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn wake_waiter_for_endpoint_split(
+        &self,
+        cpu: CpuId,
+        endpoint_idx: usize,
+    ) -> Result<(), KernelError> {
+        let waiter = self.with_ipc_split_mut(|ipc| ipc.take_endpoint_waiter(endpoint_idx));
+        if let Some(waiter) = waiter {
+            crate::yarm_log!("SCHED_WAKE tid={}", waiter.tid.0);
+            self.wake_tid_to_runnable_split(cpu, waiter.tid)?;
+        }
+        Ok(())
+    }
+
     /// 199G-C4 §3 — the OFF-LOCK waiting-receiver enqueue: the split entry to THE policy the
     /// broad `ipc_try_send_to_plain_receiver_endpoint_only` also calls.
     ///

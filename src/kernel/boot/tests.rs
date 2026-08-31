@@ -126264,8 +126264,23 @@ mod u3_ordinary_cap_sender_wake {
         let code = code_of(RUNTIME);
         assert_eq!(
             code.matches("self.wake_tid_to_runnable_split(").count(),
-            2,
-            "exactly two production callers: the blocked-waiter completion and the sender wake"
+            3,
+            "exactly three production callers: the blocked-waiter completion, the sender wake, \
+             and (199G-C4 §3) the off-lock endpoint-waiter wake — all one body, which is the \
+             property this test exists to hold"
+        );
+        // The third caller is the off-lock counterpart of `wake_waiter_for_endpoint`, and it
+        // wakes only AFTER releasing rank 3, exactly as the broad owner documents it must.
+        let epw = body_of("pub(crate) fn wake_waiter_for_endpoint_split");
+        let take = epw
+            .find("with_ipc_split_mut(|ipc| ipc.take_endpoint_waiter(")
+            .expect("rank-3 take");
+        let wake = epw
+            .find("self.wake_tid_to_runnable_split(")
+            .expect("the shared wake");
+        assert!(
+            take < wake,
+            "the waiter is taken under rank 3, then woken with rank 3 released"
         );
         // The blocked-waiter completion still binds the CPU itself — it must not bind twice.
         let bw = body_of("pub(crate) fn complete_blocked_waiter_delivery_split");
