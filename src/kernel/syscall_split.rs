@@ -751,7 +751,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     use crate::kernel::recv_core::{RecvBlockingPolicy, RecvMetaTarget, RecvRequest};
     use crate::kernel::syscall::{
         SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
-        SYSCALL_ARG_PTR,
+        SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP,
     };
     use crate::kernel::task::BlockedRecvState;
     use SplitDispatchDisposition as D;
@@ -885,19 +885,32 @@ fn try_split_blocking_ipc_recv_into_frame(
             );
             return D::NotHandled;
         };
-        // Structural, not defensive: `from_ipc_recv_timeout` always builds `RecvMetaTarget::None`.
-        // Asserting it here is what makes the zero metadata pointer AND zero length below a
-        // property read off the request rather than a constant someone could drift.
-        let RecvMetaTarget::None = request.meta_target else {
-            crate::yarm_log!(
-                "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=legacy_meta_target",
-                cpu.0,
-                tid
-            );
-            return D::NotHandled;
+        // Which SHAPE the receive owes is the caller's to decide, not the syscall number's.
+        // `RecvRequest::from_ipc_recv_timeout` hard-codes `RecvMetaTarget::None`, but that is a
+        // PLANNING artifact that never reaches a writeback: NR 5's own result owner,
+        // `handle_ipc_recv_result_with_empty_error`, computes `recv_v2_meta_written` from args
+        // 4/5 and writes the 40-byte struct — with `ret0 = 0` — whenever a buffer is supplied,
+        // and the live `yarm-user-rt::ipc_recv_with_deadline` wrapper always supplies one. So
+        // this route reads the SAME predicate that owner reads, and a receive that parks here is
+        // owed exactly what the same arguments would have been owed had a message been waiting.
+        let meta_user_ptr = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1);
+        let meta_user_len = frame.arg(SYSCALL_ARG_TRANSFER_CAP);
+        let state = if meta_user_ptr != 0
+            && meta_user_len >= crate::kernel::syscall::IPC_RECV_META_V2_ENCODED_LEN
+        {
+            BlockedRecvState {
+                recv_cap: cap,
+                payload_user_ptr,
+                payload_user_len,
+                meta_user_ptr,
+                meta_user_len,
+                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            }
+        } else {
+            BlockedRecvState::legacy_timeout(cap, payload_user_ptr, payload_user_len)
         };
         (
-            BlockedRecvState::legacy_timeout(cap, payload_user_ptr, payload_user_len),
+            state,
             Some(absolute),
             // Carried, not re-derived: the adapter marker below prints the policy the canonical
             // builder produced, at the point in the broad entry's order where it prints it.

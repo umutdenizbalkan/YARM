@@ -802,11 +802,22 @@ pub fn handle_riscv_trap_entry_shared(
         //
         // The outgoing user context is captured HERE, before the drain overwrites the live frame
         // with the incoming task's, and keyed on the identity the deferral itself carries.
+        //
+        // Stage 199G-B §2: the identity is read from whichever deferral the route actually
+        // published, not from FutexWait's alone. A blocking receive publishes the D2-RECV
+        // deferral, so asking only `futex_wait_dispatch_outgoing` returned `None` and captured
+        // NOTHING — leaving the parked receiver's saved context still describing the trapping
+        // `ecall` rather than the instruction after it, so the later exact-token resume re-entered
+        // at the wrong pc and took an instruction page fault (`arch_code=0xc`). The two deferrals
+        // are mutually exclusive within one trap (each route reserves its own before publishing),
+        // so taking the first live one is unambiguous. `d2_recv_dispatch_outgoing` is the SAME
+        // accessor this bridge's D2-recv drain reads below; no new state is introduced.
         if matches!(
             disposition,
             crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted
         ) {
-            let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+            let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
+                .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx));
             let captured = outgoing
                 .map(|t| shared.capture_outgoing_user_context_split(t, frame))
                 .unwrap_or(false);

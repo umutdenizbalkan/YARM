@@ -701,20 +701,23 @@ if (( QEMU_SMP >= 2 )); then
   fi
 fi
 
-# Stage 196C + U9-QA §2: the RISC-V split dispatcher may service DebugLog (NR 15), FutexWake
-# (NR 10) and FutexWait (NR 9) ONLY. NR 15 and NR 10 are NON-SWITCHING and return early; NR 9 is
-# the one SWITCHING class — it publishes its block pre-lock and settles through the existing
-# Stage 196E drain, which is why its lines read `result=queue_advance_committed` rather than
-# `result=ok`. Any `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is none of the three
+# Stage 196C + U9-QA §2 + 199G-B §2: the RISC-V split dispatcher may service DebugLog (NR 15),
+# FutexWake (NR 10), FutexWait (NR 9) and IpcRecvTimeout (NR 5) ONLY. NR 15 and NR 10 are
+# NON-SWITCHING and return early; NR 9 and NR 5 are the SWITCHING classes — each publishes its
+# block pre-lock and settles through an existing drain (Stage 196E for NR 9, the homologous
+# D2-recv drain for NR 5), which is why their lines read `result=queue_advance_committed` rather
+# than `result=ok`. Any `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is none of the four
 # means another class was wrongly retired off the global lock.
 riscv_split_total=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=" "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr15=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr10=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=10 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr9=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr5=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_total=${riscv_split_total:-0}
 riscv_split_nr15=${riscv_split_nr15:-0}
 riscv_split_nr10=${riscv_split_nr10:-0}
 riscv_split_nr9=${riscv_split_nr9:-0}
+riscv_split_nr5=${riscv_split_nr5:-0}
 # Every NR 9 line must be a committed queue advance — never an early return, which for a
 # switching class would mean returning through the parked caller's own frame.
 riscv_split_nr9_committed=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 .*result=queue_advance_committed" "$LOGFILE" 2>/dev/null || echo 0)
@@ -723,8 +726,25 @@ if (( riscv_split_nr9 != riscv_split_nr9_committed )); then
   echo "[fail] RISC-V FutexWait split did not commit a queue advance (nr9=${riscv_split_nr9} committed=${riscv_split_nr9_committed})"
   failures=$((failures + 1))
 fi
-if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 )); then
-  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog/FutexWake/FutexWait syscall (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9})"
+# 199G-B §2: the same contract for NR 5, and for the same reason — a blocking receive that parked
+# pre-lock may never return through its own frame.
+riscv_split_nr5_committed=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 .*result=queue_advance_committed" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr5_committed=${riscv_split_nr5_committed:-0}
+if (( riscv_split_nr5 != riscv_split_nr5_committed )); then
+  echo "[fail] RISC-V IpcRecvTimeout split did not commit a queue advance (nr5=${riscv_split_nr5} committed=${riscv_split_nr5_committed})"
+  failures=$((failures + 1))
+fi
+# 199G-B §2: a committed NR 5 must also have captured its outgoing user context. `captured=0`
+# with a real outgoing tid is the exact defect this stage fixed: the parked receiver kept a stale
+# saved pc and faulted on resume.
+riscv_split_nr5_uncaptured=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 .*result=queue_advance_committed.*captured=0" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr5_uncaptured=${riscv_split_nr5_uncaptured:-0}
+if (( riscv_split_nr5_uncaptured != 0 )); then
+  echo "[fail] RISC-V IpcRecvTimeout committed without capturing the outgoing context (n=${riscv_split_nr5_uncaptured})"
+  failures=$((failures + 1))
+fi
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 )); then
+  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog/FutexWake/FutexWait/IpcRecvTimeout syscall (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5})"
   failures=$((failures + 1))
 fi
 

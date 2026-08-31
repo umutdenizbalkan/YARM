@@ -919,11 +919,36 @@ pub(super) fn handle_ipc_recv_timeout(
                 // `LegacyTimeout` carries NO metadata pointer: NR 5's request is built with
                 // `RecvMetaTarget::None`, so writing one would promise a struct this variant
                 // never delivers.
-                let state = crate::kernel::task::BlockedRecvState::legacy_timeout(
-                    cap,
-                    frame.arg(SYSCALL_ARG_PTR),
-                    frame.arg(SYSCALL_ARG_LEN),
-                );
+                //
+                // Stage 199G-B §2 CORRECTION — which shape NR 5 owes is decided by the CALLER's
+                // arguments, not by the syscall number. `handle_ipc_recv_result_with_empty_error`
+                // (this handler's own immediate-success owner) computes
+                // `recv_v2_meta_written = meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN`
+                // from args 4/5 and writes the 40-byte struct — with `ret0 = 0` — whenever it
+                // holds. `RecvRequest::from_ipc_recv_timeout` hard-codes `RecvMetaTarget::None`,
+                // but that is a PLANNING artifact that never reaches a writeback, and the live
+                // `yarm-user-rt::ipc_recv_with_deadline` wrapper always supplies a metadata
+                // buffer. So the blocked contract is derived from the SAME predicate the
+                // immediate contract uses, and a receive that parks is owed exactly what the
+                // same arguments would have been owed had a message been waiting.
+                let meta_user_ptr = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1);
+                let meta_user_len = frame.arg(SYSCALL_ARG_TRANSFER_CAP);
+                let state = if meta_user_ptr != 0 && meta_user_len >= IPC_RECV_META_V2_ENCODED_LEN {
+                    crate::kernel::task::BlockedRecvState {
+                        recv_cap: cap,
+                        payload_user_ptr: frame.arg(SYSCALL_ARG_PTR),
+                        payload_user_len: frame.arg(SYSCALL_ARG_LEN),
+                        meta_user_ptr,
+                        meta_user_len,
+                        recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+                    }
+                } else {
+                    crate::kernel::task::BlockedRecvState::legacy_timeout(
+                        cap,
+                        frame.arg(SYSCALL_ARG_PTR),
+                        frame.arg(SYSCALL_ARG_LEN),
+                    )
+                };
                 kernel.with_tcb_mut(recv_tid, |tcb| {
                     tcb.blocked_recv_state = Some(state);
                 });
