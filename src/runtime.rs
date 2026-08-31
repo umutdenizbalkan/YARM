@@ -8790,6 +8790,33 @@ impl SharedKernel {
         Ok(true)
     }
 
+    /// 199G-C4 §3 — the OFF-LOCK waiting-receiver enqueue: the split entry to THE policy the
+    /// broad `ipc_try_send_to_plain_receiver_endpoint_only` also calls.
+    ///
+    /// One bounded rank-3 acquisition. Every decision belongs to the shared owner — above all
+    /// the re-verification of the receiver slot by COMPLETE identity, so a waiter cleared by a
+    /// timeout, or a replacement task that reused the numeric TID with a different ASID, cannot
+    /// have this send's message delivered to it.
+    ///
+    /// The wake is REPORTED as `EnqueuedWakeReceiver`, not performed: waking is a rank-1 action
+    /// the caller takes after this acquisition is released, exactly as the broad caller does.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only_split(
+        &self,
+        endpoint_idx: usize,
+        expected_receiver: crate::kernel::boot::ReceiverWaiterIdentity,
+        msg: crate::kernel::ipc::Message,
+    ) -> crate::kernel::boot::IpcEndpointSendResult {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::ipc_try_send_to_plain_receiver_endpoint_only_locked(
+                ipc,
+                endpoint_idx,
+                expected_receiver,
+                msg,
+            )
+        })
+    }
+
     /// 199G-C4 §3 — the OFF-LOCK endpoint-only enqueue: the split entry to THE enqueue policy
     /// the broad `ipc_try_send_queued_plain_endpoint_only` also calls.
     ///

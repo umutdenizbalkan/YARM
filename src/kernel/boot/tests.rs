@@ -147413,3 +147413,176 @@ mod stage199gc4_shared_region_delivery_policy {
         assert!(body.contains("snapshot.blocked_endpoint_waiter = true;"));
     }
 }
+
+/// 199G-C4 §3 — the waiting-receiver enqueue owner, and the blocking-send publication owner
+/// the pre-lock route reuses rather than reimplementing.
+#[cfg(test)]
+mod stage199gc4_waiting_receiver_and_blocking_send {
+    use super::*;
+    use crate::kernel::boot::{IpcEndpointSendResult, IpcEndpointSplitRejectReason};
+    use crate::kernel::ipc::Message;
+    use crate::runtime::SharedKernel;
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    #[test]
+    fn the_waiting_receiver_enqueue_policy_has_exactly_one_implementation() {
+        assert_eq!(
+            IPC_SRC
+                .matches("fn ipc_try_send_to_plain_receiver_endpoint_only_locked(")
+                .count(),
+            1,
+            "one waiting-receiver enqueue owner"
+        );
+
+        // The broad entry keeps its acquisition and re-decides nothing.
+        let start = IPC_SRC
+            .find("pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only(")
+            .expect("broad entry");
+        let end = IPC_SRC[start..].find("\n    }\n").expect("body ends") + start;
+        let broad = &IPC_SRC[start..end];
+        assert!(broad.contains("self.with_ipc_state_mut(|ipc| {"));
+        assert!(broad.contains("Self::ipc_try_send_to_plain_receiver_endpoint_only_locked("));
+        for decision in [
+            "endpoint_waiter_identity(endpoint_idx)",
+            "clear_endpoint_waiter_if_identity(",
+            "endpoint.send(msg)",
+            "IpcEndpointSplitRejectReason::SenderWaiterPresent",
+        ] {
+            assert!(
+                !broad.contains(decision),
+                "the broad wrapper must not re-implement `{decision}`"
+            );
+        }
+
+        // The split entry: one bounded rank-3 acquisition, same owner, nothing else taken.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only_split(")
+            .expect("split entry");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert_eq!(split.matches("with_ipc_split_mut").count(), 1);
+        assert!(
+            split.contains("KernelState::ipc_try_send_to_plain_receiver_endpoint_only_locked(")
+        );
+        for forbidden in [
+            "with_task_tcbs_split_mut",
+            "with_scheduler_split_mut",
+            "self.with(",
+        ] {
+            assert!(
+                !split.contains(forbidden),
+                "the split entry takes rank 3 and nothing else (saw `{forbidden}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_identity_re_verification_belongs_to_the_owner_and_is_keyed_on_the_whole_identity() {
+        let start = IPC_SRC
+            .find("pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only_locked(")
+            .expect("owner");
+        let end = IPC_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let owner = &IPC_SRC[start..end];
+
+        // The slot is re-verified against the COMPLETE expected identity, and the clear is keyed
+        // on that same identity — never on a numeric TID.
+        assert!(
+            owner.contains("ipc.endpoint_waiter_identity(endpoint_idx) != Some(expected_receiver)"),
+            "the whole identity must be re-verified under the lock"
+        );
+        assert!(
+            owner.contains("clear_endpoint_waiter_if_identity(endpoint_idx, expected_receiver)"),
+            "the clear is keyed on the re-verified identity"
+        );
+        // The re-verification precedes the send, which precedes the clear.
+        let verify = owner
+            .find("endpoint_waiter_identity(endpoint_idx)")
+            .expect("verify");
+        let send = owner.find("endpoint.send(msg)").expect("send");
+        let clear = owner
+            .find("clear_endpoint_waiter_if_identity(")
+            .expect("clear");
+        assert!(verify < send && send < clear);
+        // The wake is reported, not performed.
+        assert!(
+            owner.contains("IpcEndpointSendResult::EnqueuedWakeReceiver(expected_receiver.tid)")
+        );
+        for waking in [
+            "apply_scheduler_wake_plan",
+            "sr_wake_receiver_split",
+            "wake_tid_to_runnable",
+        ] {
+            assert!(
+                !owner.contains(waking),
+                "waking is rank 1 and must happen outside this acquisition (saw `{waking}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn broad_and_split_waiting_receiver_sends_agree_on_a_stale_identity_refusal() {
+        // With no waiter published at all, the expected identity cannot match, and BOTH routes
+        // must refuse with the same reason and enqueue nothing.
+        let expected = crate::kernel::boot::ReceiverWaiterIdentity {
+            tid: crate::kernel::ipc::ThreadId(9),
+            asid: crate::kernel::vm::Asid(3),
+        };
+        let refusal =
+            IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::ReceiverWaiterPresent);
+        let msg = Message::new(1, b"x").expect("msg");
+
+        let mut broad_state = Bootstrap::init().expect("init");
+        let (eidx, _s, _r) = broad_state.create_endpoint(4).expect("endpoint");
+        let broad = SharedKernel::new(broad_state);
+        let mut split_state = Bootstrap::init().expect("init");
+        let (seidx, _s, _r) = split_state.create_endpoint(4).expect("endpoint");
+        let split = SharedKernel::new(split_state);
+
+        assert_eq!(
+            broad.with(|s| s.ipc_try_send_to_plain_receiver_endpoint_only(eidx, expected, msg)),
+            refusal
+        );
+        assert_eq!(
+            split.ipc_try_send_to_plain_receiver_endpoint_only_split(seidx, expected, msg),
+            refusal
+        );
+        for (k, e) in [(&broad, eidx), (&split, seidx)] {
+            assert_eq!(
+                k.with(|s| s
+                    .with_ipc_state(|ipc| ipc.endpoints[e].as_ref().map_or(0, |ep| ep.queued()))),
+                0,
+                "a refused waiting-receiver send enqueues nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_blocking_send_publication_owner_already_exists_and_is_not_duplicated() {
+        // §3 asks that blocking-send publication go through the EXISTING owner. It does: there
+        // is one, it is off-lock, and the pre-lock route has no second one to drift from.
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("pub(crate) fn commit_blocking_send_split(")
+                .count(),
+            1,
+            "one off-lock blocking-send publication owner"
+        );
+        // Its input is a plain by-value snapshot, so a pre-lock route can propose a block
+        // without holding anything.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn commit_blocking_send_split(")
+            .expect("owner");
+        let head = &RUNTIME_SRC[start..start + 300];
+        assert!(
+            head.contains("snap: &crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot")
+        );
+        // And it refuses rather than mutating when the sender is no longer the authoritative
+        // current task — the property that lets it be proposed off the lock at all.
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+        assert!(body.contains("BlockingSendCommitOutcome::RefusedCpuMismatch"));
+        assert!(body.contains("BlockingSendCommitOutcome::RefusedNotCurrent"));
+    }
+}
