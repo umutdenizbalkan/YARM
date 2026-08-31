@@ -758,10 +758,19 @@ pub fn handle_riscv_trap_entry_shared(
     // completion consumed — which the Stage 196E FutexWait drain below already drives, live, off
     // the broad lock. What was missing was never the restore; it was that admission asked the
     // STASH convention's preconditions of a caller that stashes nothing.
+    // Stage 199G-B §2: IpcRecvTimeout (NR 5) joins the RISC-V whitelist. This is the gate the
+    // directive names — the shared route is architecture-neutral, but on RISC-V it is reachable
+    // only for an NR listed here, so without this line NR 5 would keep its terminal broad edge on
+    // this architecture no matter what the route admits. What the class needs from RISC-V it has:
+    // the homologous D2-recv drain below (`d2_recv_reverify_blocked`,
+    // `d2_recv_dispatch_step_mut`, `direct_dispatch_resume_incoming`), live since U4. NR 2 is
+    // deliberately NOT added — that is a separate class with its own witness, and §2 says not to
+    // disturb its admission.
     let split_eligible = is_syscall
         && (nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
+            || nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -793,11 +802,22 @@ pub fn handle_riscv_trap_entry_shared(
         //
         // The outgoing user context is captured HERE, before the drain overwrites the live frame
         // with the incoming task's, and keyed on the identity the deferral itself carries.
+        //
+        // Stage 199G-B §2: the identity is read from whichever deferral the route actually
+        // published, not from FutexWait's alone. A blocking receive publishes the D2-RECV
+        // deferral, so asking only `futex_wait_dispatch_outgoing` returned `None` and captured
+        // NOTHING — leaving the parked receiver's saved context still describing the trapping
+        // `ecall` rather than the instruction after it, so the later exact-token resume re-entered
+        // at the wrong pc and took an instruction page fault (`arch_code=0xc`). The two deferrals
+        // are mutually exclusive within one trap (each route reserves its own before publishing),
+        // so taking the first live one is unambiguous. `d2_recv_dispatch_outgoing` is the SAME
+        // accessor this bridge's D2-recv drain reads below; no new state is introduced.
         if matches!(
             disposition,
             crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted
         ) {
-            let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+            let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
+                .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx));
             let captured = outgoing
                 .map(|t| shared.capture_outgoing_user_context_split(t, frame))
                 .unwrap_or(false);

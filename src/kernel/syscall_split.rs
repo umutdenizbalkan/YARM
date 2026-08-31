@@ -748,12 +748,12 @@ fn try_split_blocking_ipc_recv_into_frame(
     frame: &mut TrapFrame,
 ) -> SplitDispatchDisposition {
     use crate::kernel::capabilities::{CapId, CapObject};
-    use crate::kernel::recv_core::{RecvMetaTarget, RecvRequest};
+    use crate::kernel::recv_core::{RecvBlockingPolicy, RecvMetaTarget, RecvRequest};
     use crate::kernel::syscall::{
         SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
-        SYSCALL_ARG_PTR,
+        SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP,
     };
-    use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+    use crate::kernel::task::BlockedRecvState;
     use SplitDispatchDisposition as D;
 
     // (1) NR, then architecture. The body is architecture-neutral; the gate names the two that
@@ -761,10 +761,24 @@ fn try_split_blocking_ipc_recv_into_frame(
     // writeback both of them actually REACH it — AArch64's NR 2 ABI import is no longer held
     // back (see `pre_split_import_syscall_abi`). RISC-V is excluded for want of a live witness,
     // not for a structural reason: its D2-recv drain is the same shape.
-    if !matches!(Syscall::decode(frame.syscall_num()), Ok(Syscall::IpcRecv)) {
-        return D::NotHandled;
-    }
-    if !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+    //
+    // Stage 199G-B §2 — NR 5 (`ipc_recv_timeout`) joins NR 2 on THIS route rather than getting a
+    // second one. The two differ in exactly three places, all of them named below: which ABI
+    // builder decodes the request, whether a deadline is armed, and which `RecvAbiVariant` the
+    // saved state carries. Everything between — the would-block read, the admission, the
+    // deferral reservation, Phases A/B/C, the race unwind and the committed disposition — is the
+    // same code servicing both, which is the only way "one delivery lifecycle" stays true.
+    //
+    // NR 5 is admitted on ALL THREE architectures. Its completion is the variant-driven writeback
+    // plus the existing D2-recv drain, both architecture-neutral and all three already reached by
+    // the receive-timeout scan that arms it, so RISC-V's want of an NR-2 witness (the reason the
+    // gate below still excludes it) says nothing about NR 5.
+    let recv_timeout = match Syscall::decode(frame.syscall_num()) {
+        Ok(Syscall::IpcRecvTimeout) => true,
+        Ok(Syscall::IpcRecv) => false,
+        _ => return D::NotHandled,
+    };
+    if !recv_timeout && !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
         return D::NotHandled;
     }
     let cpu_idx = cpu.0 as usize;
@@ -783,7 +797,15 @@ fn try_split_blocking_ipc_recv_into_frame(
     //
     // The shared-region oracle's acknowledgement family is unrelated to those two and still
     // broad-only, so it keeps its yield unconditionally.
-    if cfg!(feature = "shared-region-direct-oracle") {
+    //
+    // Stage 199G-B §2: all three yields below are scoped to NR 2. Every hook they protect lives in
+    // `handle_ipc_recv` — `maybe_publish_shared_region_blocked_recv_ack`,
+    // `maybe_publish_ipccall_direct_blocked_server_ack`,
+    // `maybe_publish_ipcreply_direct_blocked_caller_ack` — and each one additionally refuses any
+    // `RecvAbiVariant` but `RecvV2`. `handle_ipc_recv_timeout` calls none of them, so there is no
+    // broad-arm publication for an NR 5 receive to yield BACK to, and yielding anyway would be
+    // the one thing §4 forbids: an NR 5 edge into the terminal broad dispatcher.
+    if !recv_timeout && cfg!(feature = "shared-region-direct-oracle") {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=shared_region_ack_publication_armed",
             cpu.0
@@ -797,7 +819,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     // work this route does not reproduce, so it keeps yielding exactly as it did at `894cc5a`.
     // Widening it is a separate increment with its own AArch64 witness, not a side effect here.
     #[cfg(not(target_arch = "x86_64"))]
-    if crate::kernel::boot::ipccall_direct_publication_enabled() {
+    if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled() {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=ack_publication_armed",
             cpu.0
@@ -809,7 +831,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     // question, so the split dispatcher's admission logic stays free of proof-gate terms. See
     // that predicate for which blocked-recv work only the broad arm performs.
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    if crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm() {
+    if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm() {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=direct_oracle_selector_armed",
             cpu.0
@@ -827,26 +849,107 @@ fn try_split_blocking_ipc_recv_into_frame(
     // `current_task_has_user_asid` asks, read through the rank-2 seam.
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let is_kernel_task = shared.task_asid_opt_split_read(tid).is_none();
-    let request = RecvRequest::from_legacy_ipc_recv(
-        tid,
-        cap,
-        frame.arg(SYSCALL_ARG_PTR),
-        frame.arg(SYSCALL_ARG_LEN),
-        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
-        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
-        is_kernel_task,
-    );
-    let RecvMetaTarget::V2 {
-        ptr: meta_user_ptr,
-        len: meta_user_len,
-    } = request.meta_target
-    else {
-        crate::yarm_log!(
-            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=not_recv_v2",
-            cpu.0,
-            tid
+    let payload_user_ptr = frame.arg(SYSCALL_ARG_PTR);
+    let payload_user_len = frame.arg(SYSCALL_ARG_LEN);
+    // Stage 199G-B §2 — the ONE place the two receives decode differently, and the point at which
+    // the completion contract is fixed. Both go through their own canonical `RecvRequest`
+    // builder, the same one their broad handler uses, so neither route can invent an ABI the
+    // other would not recognise.
+    //
+    // NR 5 arms a deadline; NR 2 does not, which is exactly what keeps NR 2 out of the
+    // receive-timeout scan and its reply-deadline/oracle arming inert. The deadline formula is
+    // `ipc_recv_with_deadline`'s, read from the SAME rank-1 tick owner the trap entry's staging
+    // block uses, so a receive that parks here expires on the tick it would have expired on had
+    // it parked under the broad lock.
+    let (state, deadline, timed_blocking) = if recv_timeout {
+        let timeout_ticks = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64;
+        let absolute = shared
+            .scheduler_tick_now_split_read()
+            .wrapping_add(timeout_ticks);
+        let request = RecvRequest::from_ipc_recv_timeout(
+            tid,
+            cap,
+            payload_user_ptr,
+            payload_user_len,
+            timeout_ticks,
+            Some(absolute),
+            is_kernel_task,
         );
-        return D::NotHandled;
+        // `timeout_ticks == 0` is NR 5's non-blocking probe: it never parks, so it is not this
+        // route's business and the broad `NoWait` arm keeps servicing it unchanged.
+        let RecvBlockingPolicy::Deadline(_) = request.blocking else {
+            crate::yarm_log!(
+                "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=not_timed_recv",
+                cpu.0,
+                tid
+            );
+            return D::NotHandled;
+        };
+        // Which SHAPE the receive owes is the caller's to decide, not the syscall number's.
+        // `RecvRequest::from_ipc_recv_timeout` hard-codes `RecvMetaTarget::None`, but that is a
+        // PLANNING artifact that never reaches a writeback: NR 5's own result owner,
+        // `handle_ipc_recv_result_with_empty_error`, computes `recv_v2_meta_written` from args
+        // 4/5 and writes the 40-byte struct — with `ret0 = 0` — whenever a buffer is supplied,
+        // and the live `yarm-user-rt::ipc_recv_with_deadline` wrapper always supplies one. So
+        // this route reads the SAME predicate that owner reads, and a receive that parks here is
+        // owed exactly what the same arguments would have been owed had a message been waiting.
+        let meta_user_ptr = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1);
+        let meta_user_len = frame.arg(SYSCALL_ARG_TRANSFER_CAP);
+        let state = if meta_user_ptr != 0
+            && meta_user_len >= crate::kernel::syscall::IPC_RECV_META_V2_ENCODED_LEN
+        {
+            BlockedRecvState {
+                recv_cap: cap,
+                payload_user_ptr,
+                payload_user_len,
+                meta_user_ptr,
+                meta_user_len,
+                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            }
+        } else {
+            BlockedRecvState::legacy_timeout(cap, payload_user_ptr, payload_user_len)
+        };
+        (
+            state,
+            Some(absolute),
+            // Carried, not re-derived: the adapter marker below prints the policy the canonical
+            // builder produced, at the point in the broad entry's order where it prints it.
+            Some(request.blocking),
+        )
+    } else {
+        let request = RecvRequest::from_legacy_ipc_recv(
+            tid,
+            cap,
+            payload_user_ptr,
+            payload_user_len,
+            frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+            frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+            is_kernel_task,
+        );
+        let RecvMetaTarget::V2 {
+            ptr: meta_user_ptr,
+            len: meta_user_len,
+        } = request.meta_target
+        else {
+            crate::yarm_log!(
+                "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=not_recv_v2",
+                cpu.0,
+                tid
+            );
+            return D::NotHandled;
+        };
+        (
+            BlockedRecvState {
+                recv_cap: cap,
+                payload_user_ptr,
+                payload_user_len,
+                meta_user_ptr,
+                meta_user_len,
+                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            },
+            None,
+            None,
+        )
     };
     // (4) Capability: task(2) pid read → capability(4) resolve, both off the broad lock. Every
     // refusal here has a canonical error the broad handler produces, so fall back and let it.
@@ -899,24 +1002,52 @@ fn try_split_blocking_ipc_recv_into_frame(
     // The markers the broad entry emits before it blocks, in the broad entry's order — this route
     // intercepts before the arm that would have printed them, and the stream an observer sees must
     // not change because the owner did.
-    crate::yarm_log!("IPC_RECV_ENTER tid={} cap={}", tid, cap.0);
-    crate::yarm_log!(
-        "YARM_RECV_CORE_ADAPTER kind=legacy_full_path is_kernel_task={}",
-        is_kernel_task
-    );
-    crate::yarm_log!(
-        "IPC_RECV_AFTER_CAP_OK tid={} cap={} endpoint={:?}",
-        tid,
-        cap.0,
-        snapshot.endpoint
-    );
-    if tid == 2 && shared.fault_or_supervisor_endpoint_split_read(endpoint_idx) {
+    //
+    // Stage 199G-B §2: the two entries print DIFFERENT prologues, so this route prints whichever
+    // one it intercepted. `handle_ipc_recv_timeout` emits no `IPC_RECV_ENTER` at all, and it
+    // emits the cap-ok line and the supervisor line BEFORE its adapter line — the reverse of NR
+    // 2's order. Reproducing each order exactly is the point: an observer must not be able to
+    // tell from the marker stream that the owner changed.
+    if let Some(blocking) = timed_blocking {
         crate::yarm_log!(
-            "SUPERVISOR_FAULT_RECV_CAP cap={} endpoint={} generation={}",
+            "IPC_RECV_AFTER_CAP_OK tid={} cap={} endpoint={:?}",
+            tid,
             cap.0,
-            endpoint_idx,
-            generation
+            snapshot.endpoint
         );
+        if tid == 2 && shared.fault_or_supervisor_endpoint_split_read(endpoint_idx) {
+            crate::yarm_log!(
+                "SUPERVISOR_FAULT_RECV_CAP cap={} endpoint={} generation={}",
+                cap.0,
+                endpoint_idx,
+                generation
+            );
+        }
+        crate::yarm_log!(
+            "YARM_RECV_CORE_ADAPTER kind=legacy_timeout is_kernel_task={} blocking={:?}",
+            is_kernel_task,
+            blocking
+        );
+    } else {
+        crate::yarm_log!("IPC_RECV_ENTER tid={} cap={}", tid, cap.0);
+        crate::yarm_log!(
+            "YARM_RECV_CORE_ADAPTER kind=legacy_full_path is_kernel_task={}",
+            is_kernel_task
+        );
+        crate::yarm_log!(
+            "IPC_RECV_AFTER_CAP_OK tid={} cap={} endpoint={:?}",
+            tid,
+            cap.0,
+            snapshot.endpoint
+        );
+        if tid == 2 && shared.fault_or_supervisor_endpoint_split_read(endpoint_idx) {
+            crate::yarm_log!(
+                "SUPERVISOR_FAULT_RECV_CAP cap={} endpoint={} generation={}",
+                cap.0,
+                endpoint_idx,
+                generation
+            );
+        }
     }
     // (7) Reserve the deferral BEFORE any publication.
     if !crate::kernel::boot::d2_recv_dispatch_try_defer(cpu_idx, tid) {
@@ -938,17 +1069,11 @@ fn try_split_blocking_ipc_recv_into_frame(
         );
         return D::NotHandled;
     };
-    // Phase B — task rank 2. `deadline` is `None`: NR 2 carries no timeout, which is also what
-    // keeps the reply-deadline and oracle arming the broad arm performs strict no-ops.
-    let state = BlockedRecvState {
-        recv_cap: cap,
-        payload_user_ptr: frame.arg(SYSCALL_ARG_PTR),
-        payload_user_len: frame.arg(SYSCALL_ARG_LEN),
-        meta_user_ptr,
-        meta_user_len,
-        recv_abi: RecvAbiVariant::RecvV2,
-    };
-    let Some(wait_generation) = shared.recv_block_phase_b_split(tid, cap, None, state) else {
+    // Phase B — task rank 2, with the state and deadline the ABI step decoded. For NR 2 the
+    // deadline is `None` (it carries no timeout, which is what keeps the reply-deadline and oracle
+    // arming the broad arm performs strict no-ops); for NR 5 it is the absolute tick, which is
+    // what puts the parked receiver in front of the existing receive-timeout scan.
+    let Some(wait_generation) = shared.recv_block_phase_b_split(tid, cap, deadline, state) else {
         // The task half refused before it wrote anything; undo Phase A's block and fall back.
         let _ = shared.recv_block_unwind_race_split(cpu, tid);
         crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);

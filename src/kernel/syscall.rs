@@ -533,7 +533,17 @@ pub(crate) fn complete_blocked_recv_for_waiter(
             return Err(SyscallError::InvalidArgs);
         }
     }
-    if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+    // Stage 199G-B §1 — the metadata requirement belongs to the recv-v2 VARIANT, not to every
+    // blocked receive. A `LegacyTimeout` waiter has `RecvMetaTarget::None` and therefore a zero
+    // pointer and length by construction, so applying the recv-v2 length check to it would
+    // reject the very receives this class exists to deliver. Its own contract is checked
+    // instead: it must NOT carry a metadata buffer, because writing one would be a metadata
+    // write the variant promises never to perform.
+    if blocked_state.recv_abi.writes_recv_v2_meta() {
+        if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+            return Err(SyscallError::InvalidArgs);
+        }
+    } else if blocked_state.meta_user_ptr != 0 || blocked_state.meta_user_len != 0 {
         return Err(SyscallError::InvalidArgs);
     }
     // U9-RX4: the flag half of the ONE receiver-visible cap projection. It is computed here,
@@ -713,7 +723,17 @@ pub(crate) fn produce_blocked_waiter_plain_delivery(
     if blocked_state.payload_user_len < app_payload.len() {
         return Err(SyscallError::InvalidArgs);
     }
-    if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+    // Stage 199G-B §1 — the metadata requirement belongs to the recv-v2 VARIANT, not to every
+    // blocked receive. A `LegacyTimeout` waiter has `RecvMetaTarget::None` and therefore a zero
+    // pointer and length by construction, so applying the recv-v2 length check to it would
+    // reject the very receives this class exists to deliver. Its own contract is checked
+    // instead: it must NOT carry a metadata buffer, because writing one would be a metadata
+    // write the variant promises never to perform.
+    if blocked_state.recv_abi.writes_recv_v2_meta() {
+        if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+            return Err(SyscallError::InvalidArgs);
+        }
+    } else if blocked_state.meta_user_ptr != 0 || blocked_state.meta_user_len != 0 {
         return Err(SyscallError::InvalidArgs);
     }
 
@@ -753,6 +773,8 @@ pub(crate) fn produce_blocked_waiter_plain_delivery(
     payload_buf[..app_payload.len()].copy_from_slice(app_payload);
 
     let snapshot = BlockedWaiterPlainDeliverySnapshot {
+        // Stage 199G-B §1 — carried from the waiter's own saved state, never re-derived.
+        recv_abi: blocked_state.recv_abi,
         waiter_tid,
         waiter_asid,
         payload_user_ptr: blocked_state.payload_user_ptr,
@@ -760,6 +782,7 @@ pub(crate) fn produce_blocked_waiter_plain_delivery(
         payload: payload_buf,
         meta_user_ptr: blocked_state.meta_user_ptr,
         meta,
+        sender_tid: msg.sender_tid.0,
         endpoint_idx,
         wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
     };
@@ -879,7 +902,17 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
             app_payload.len(),
         )
         .map_err(SyscallError::from)?;
-    if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+    // Stage 199G-B §1 — the metadata requirement belongs to the recv-v2 VARIANT, not to every
+    // blocked receive. A `LegacyTimeout` waiter has `RecvMetaTarget::None` and therefore a zero
+    // pointer and length by construction, so applying the recv-v2 length check to it would
+    // reject the very receives this class exists to deliver. Its own contract is checked
+    // instead: it must NOT carry a metadata buffer, because writing one would be a metadata
+    // write the variant promises never to perform.
+    if blocked_state.recv_abi.writes_recv_v2_meta() {
+        if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+            return Err(SyscallError::InvalidArgs);
+        }
+    } else if blocked_state.meta_user_ptr != 0 || blocked_state.meta_user_len != 0 {
         return Err(SyscallError::InvalidArgs);
     }
 
@@ -912,6 +945,8 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
     payload_buf[..app_payload.len()].copy_from_slice(app_payload);
 
     let snapshot = BlockedWaiterOrdinaryCapDeliverySnapshot {
+        // Stage 199G-B §1 — carried from the waiter's own saved state, never re-derived.
+        recv_abi: blocked_state.recv_abi,
         waiter_tid,
         waiter_asid,
         payload_user_ptr: blocked_state.payload_user_ptr,
@@ -1045,6 +1080,9 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
         .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
         .flatten()
         .ok_or(SyscallError::InvalidArgs)?;
+    // Stage 199G-B §1 — the waiter's own receive ABI, captured here with the rest of its saved
+    // state and carried into the snapshot. It selects the final projection only.
+    let recv_abi = blocked_state.recv_abi;
     let recv_endpoint = kernel
         .resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
         .map_err(SyscallError::from)?
@@ -1064,6 +1102,7 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
             blocked_state.meta_user_ptr as u64,
             *msg,
             true,
+            recv_abi,
         )
         .map_err(SyscallError::from)?;
     // The receiver was consumed as a BLOCKED ENDPOINT WAITER: finalization must clear its
@@ -1131,6 +1170,12 @@ pub(crate) fn produce_queued_shared_region_delivery(
             meta_ptr,
             *msg,
             false,
+            // Stage 199G-B §1: the QUEUED origin is not a blocked-waiter delivery — the receiver
+            // is running and dequeuing, so it is not owed a parked completion at all. It reaches
+            // this producer only through a recv-v2 request (the caller supplies the `meta_ptr`
+            // this transaction maps into), so the recv-v2 projection is the correct and only
+            // shape here.
+            crate::kernel::task::RecvAbiVariant::RecvV2,
         )
         .map_err(SyscallError::from)?;
     stash_shared_region_delivery(
@@ -1225,7 +1270,17 @@ pub(crate) fn produce_blocked_waiter_reply_cap_delivery(
             app_payload.len(),
         )
         .map_err(SyscallError::from)?;
-    if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+    // Stage 199G-B §1 — the metadata requirement belongs to the recv-v2 VARIANT, not to every
+    // blocked receive. A `LegacyTimeout` waiter has `RecvMetaTarget::None` and therefore a zero
+    // pointer and length by construction, so applying the recv-v2 length check to it would
+    // reject the very receives this class exists to deliver. Its own contract is checked
+    // instead: it must NOT carry a metadata buffer, because writing one would be a metadata
+    // write the variant promises never to perform.
+    if blocked_state.recv_abi.writes_recv_v2_meta() {
+        if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+            return Err(SyscallError::InvalidArgs);
+        }
+    } else if blocked_state.meta_user_ptr != 0 || blocked_state.meta_user_len != 0 {
         return Err(SyscallError::InvalidArgs);
     }
 
@@ -1261,6 +1316,8 @@ pub(crate) fn produce_blocked_waiter_reply_cap_delivery(
     payload_buf[..app_payload.len()].copy_from_slice(app_payload);
 
     let snapshot = BlockedWaiterReplyCapDeliverySnapshot {
+        // Stage 199G-B §1 — carried from the waiter's own saved state, never re-derived.
+        recv_abi: blocked_state.recv_abi,
         waiter_tid,
         waiter_asid,
         payload_user_ptr: blocked_state.payload_user_ptr,

@@ -49779,6 +49779,8 @@ mod stage188a_dispatch_return_delivery_channel {
             *b = i as u8;
         }
         let snap = BlockedWaiterPlainDeliverySnapshot {
+            recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            sender_tid: 0,
             waiter_tid: 1,
             waiter_asid: asid,
             payload_user_ptr: 0x4000,
@@ -54761,6 +54763,25 @@ mod stage169_d2_send_genuine {
         f
     }
 
+    /// 203C-XFR — commit a RESUMED task's continuation, exactly as the production capture does
+    /// before an already-running task can be selected. Shared by the tests whose subject is the
+    /// resume itself rather than the classification.
+    fn u3_commit_resumed_context(
+        k: &SharedKernel,
+        asid: Asid,
+    ) -> crate::kernel::task::UserRegisterContext {
+        let mut saved = u3_frame().capture_user_context();
+        saved.instruction_ptr = VirtAddr(0x4_1000);
+        assert!(k.split_return_commit_context_split(
+            crate::runtime::SplitReturnIdentity {
+                tid: U3_INCOMING,
+                asid
+            },
+            saved
+        ));
+        saved
+    }
+
     /// The exact marked incarnation resumes, and the frame receives that task's saved context.
     #[test]
     fn u3_exact_token_identity_resumes_and_restores_context() {
@@ -54847,7 +54868,11 @@ mod stage169_d2_send_genuine {
     /// per-CPU FS-base tracking cell follows it.
     #[test]
     fn u3_tls_request_is_taken_once_and_tracked() {
-        let (k, _asid) = u3_fixture();
+        let (k, asid) = u3_fixture();
+        // 203C-XFR: a RESUMED task is admitted on the strength of its committed continuation, so
+        // the fixture commits one — the same thing every other resume test here does, and the
+        // same thing the production capture does before the task ever reaches this apply.
+        u3_commit_resumed_context(&k, asid);
         k.with(|s| s.set_thread_tls_base(U3_INCOMING, 0x7F00).expect("tls"));
         let token = u3_mark(&k);
         let mut frame = u3_frame();
@@ -65791,7 +65816,17 @@ mod stage198e2a_shared_region_direct {
         )
         .expect("msg");
         state
-            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg, true)
+            .shared_region_phase_a(
+                handle,
+                endpoint,
+                2,
+                MAP_VA,
+                map_write,
+                META_PTR,
+                msg,
+                true,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A")
     }
 
@@ -66211,7 +66246,17 @@ mod stage198e2a_shared_region_direct {
         .expect("m");
         assert!(
             state
-                .shared_region_phase_a(rh, endpoint, 2, MAP_VA, false, META_PTR, rmsg, true)
+                .shared_region_phase_a(
+                    rh,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    rmsg,
+                    true,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err()
         );
         // Ordinary (non-shared) MemoryObject envelope → Phase A rejects (no shared_region descriptor).
@@ -66229,7 +66274,17 @@ mod stage198e2a_shared_region_direct {
         .expect("m");
         assert!(
             state
-                .shared_region_phase_a(oh, endpoint, 2, MAP_VA, false, META_PTR, omsg, true)
+                .shared_region_phase_a(
+                    oh,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    omsg,
+                    true,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err()
         );
     }
@@ -66285,7 +66340,17 @@ mod stage198e2a_shared_region_direct {
         )
         .expect("m");
         let snap = state
-            .shared_region_phase_a(handle, endpoint, 2, MAP_VA + 1, false, META_PTR, msg, true)
+            .shared_region_phase_a(
+                handle,
+                endpoint,
+                2,
+                MAP_VA + 1,
+                false,
+                META_PTR,
+                msg,
+                true,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A");
         assert_eq!(
             state.shared_region_execute(snap),
@@ -66392,7 +66457,17 @@ mod stage198e2a1_shared_region_txn_race {
         )
         .expect("msg");
         state
-            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, false, META_PTR, msg, true)
+            .shared_region_phase_a(
+                handle,
+                endpoint,
+                2,
+                MAP_VA,
+                false,
+                META_PTR,
+                msg,
+                true,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A")
     }
 
@@ -66855,6 +66930,7 @@ mod stage198e2b_shared_region_enqueue {
             META_PTR,
             msg,
             false,
+            crate::kernel::task::RecvAbiVariant::RecvV2,
         )
     }
 
@@ -66961,7 +67037,17 @@ mod stage198e2b_shared_region_enqueue {
         let h = msg.transferred_cap().expect("h").0;
         assert!(
             state
-                .shared_region_phase_a(h, endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .shared_region_phase_a(
+                    h,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    msg,
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err(),
             "non-shared object must be rejected at dequeue"
         );
@@ -66989,7 +67075,17 @@ mod stage198e2b_shared_region_enqueue {
         let h = msg.transferred_cap().expect("h").0;
         assert!(
             state
-                .shared_region_phase_a(h, endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .shared_region_phase_a(
+                    h,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    msg,
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err(),
             "reply object excluded from queued shared-region path"
         );
@@ -67028,7 +67124,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(fx.handle),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "envelope not re-consumable"
@@ -67190,7 +67287,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(fx.handle),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "second receiver cannot consume the same envelope"
@@ -67216,7 +67314,17 @@ mod stage198e2b_shared_region_enqueue {
         );
         let h = msg.transferred_cap().expect("h").0;
         let snap = state
-            .shared_region_phase_a(h, fx.endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+            .shared_region_phase_a(
+                h,
+                fx.endpoint,
+                2,
+                MAP_VA,
+                false,
+                META_PTR,
+                msg,
+                false,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A");
         assert_eq!(shared_envelope_count(&state), 0, "envelope consumed once");
         assert!(
@@ -67229,7 +67337,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(h),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "envelope not re-consumable"
@@ -67259,7 +67368,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(stale),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "stale handle must fail closed"
@@ -67401,7 +67511,17 @@ mod stage198e2b_shared_region_enqueue {
         let h = msg.transferred_cap().expect("h").0;
         assert!(
             state
-                .shared_region_phase_a(h, endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .shared_region_phase_a(
+                    h,
+                    endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    msg,
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err(),
             "inert queued message cannot produce a transaction"
         );
@@ -67427,7 +67547,17 @@ mod stage198e2b_shared_region_enqueue {
         let h = msg.transferred_cap().expect("h").0;
         assert!(
             state
-                .shared_region_phase_a(h, fx.endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .shared_region_phase_a(
+                    h,
+                    fx.endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    msg,
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2
+                )
                 .is_err(),
             "no transaction after the receiver association is removed"
         );
@@ -67489,7 +67619,8 @@ mod stage198e2b_shared_region_enqueue {
                     false,
                     META_PTR,
                     stale_msg(fx.handle),
-                    false
+                    false,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
                 )
                 .is_err(),
             "no transaction survives endpoint teardown"
@@ -68438,7 +68569,17 @@ mod stage198e3b2a_offlock_ctx {
         )
         .expect("msg");
         let snap = s
-            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg, true)
+            .shared_region_phase_a(
+                handle,
+                endpoint,
+                2,
+                MAP_VA,
+                map_write,
+                META_PTR,
+                msg,
+                true,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
             .expect("phase A");
         Fx {
             shared: SharedKernel::new(s),
@@ -69413,7 +69554,11 @@ mod stage198e3b2b_drain_switch {
             k.with_tcb_mut(2, |tcb| tcb.status = TaskStatus::Exited(0));
         });
         assert_eq!(
-            d.shared.sr_commit_blocked_receiver_split(2, d.asid),
+            d.shared.sr_commit_blocked_receiver_split(
+                2,
+                d.asid,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             ReceiverCommit::GoneDead,
             "an exited receiver commits as GoneDead"
         );
@@ -69460,7 +69605,11 @@ mod stage198e3b2b_drain_switch {
             k.bind_task_asid(2, new_asid).expect("rebind");
         });
         assert_eq!(
-            d.shared.sr_commit_blocked_receiver_split(2, orig_asid),
+            d.shared.sr_commit_blocked_receiver_split(
+                2,
+                orig_asid,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             ReceiverCommit::Replaced
         );
         assert_eq!(ret_reg(&d), 0xDEAD, "no register cleared on Replaced");
@@ -74296,14 +74445,28 @@ mod stage196a_riscv_shared_trap_foundation {
         // stronger companion check that every NR 9 line COMMITTED a queue advance rather than
         // returning early — which for a switching class would mean returning through the parked
         // caller's own frame.
+        //
+        // Stage 199G-B §2 widened it again, to IpcRecvTimeout (NR 5) — the SECOND switching
+        // class — with the same committed-only companion check, plus one more that pins the
+        // defect that stage fixed: a committed NR 5 line whose outgoing user context was never
+        // captured left the parked receiver with a stale saved pc and faulted on resume.
         assert!(
             RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15")
-                && RISCV_SMOKE.contains("non-DebugLog/FutexWake/FutexWait syscall"),
-            "smoke must assert DebugLog+FutexWake+FutexWait-only split dispatch"
+                && RISCV_SMOKE.contains("non-DebugLog/FutexWake/FutexWait/IpcRecvTimeout syscall"),
+            "smoke must assert DebugLog+FutexWake+FutexWait+IpcRecvTimeout-only split dispatch"
         );
         assert!(
             RISCV_SMOKE.contains("RISC-V FutexWait split did not commit a queue advance"),
             "smoke must assert every NR 9 split line committed a queue advance"
+        );
+        assert!(
+            RISCV_SMOKE.contains("RISC-V IpcRecvTimeout split did not commit a queue advance"),
+            "smoke must assert every NR 5 split line committed a queue advance"
+        );
+        assert!(
+            RISCV_SMOKE
+                .contains("RISC-V IpcRecvTimeout committed without capturing the outgoing context"),
+            "smoke must reject a committed NR 5 line that captured no outgoing context"
         );
     }
 
@@ -82765,8 +82928,11 @@ mod stage199a2d1_races {
         fx.k.with(|s| s.mark_task_dead(1).expect("caller exits"));
 
         // (A) attempt to commit the caller wake — GoneDead: no register mutated, no wake.
-        let commit =
-            fx.k.sr_commit_blocked_receiver_split(fx.caller.tid.0, fx.caller.asid);
+        let commit = fx.k.sr_commit_blocked_receiver_split(
+            fx.caller.tid.0,
+            fx.caller.asid,
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             commit,
             ReceiverCommit::GoneDead,
@@ -82929,8 +83095,11 @@ mod stage199a2d1_races {
         fx.k.with(|s| s.mark_task_dead(2).expect("server exits"));
 
         // Delivery commit → GoneDead (no register mutated, no wake).
-        let commit =
-            fx.k.sr_commit_blocked_receiver_split(fx.server.tid.0, fx.server.asid);
+        let commit = fx.k.sr_commit_blocked_receiver_split(
+            fx.server.tid.0,
+            fx.server.asid,
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             commit,
             ReceiverCommit::GoneDead,
@@ -83017,8 +83186,11 @@ mod stage199a2d1_races {
                         ) {
                             Some(_claim) => {
                                 cl.fetch_add(1, O::Relaxed);
-                                match k.sr_commit_blocked_receiver_split(server.tid.0, server.asid)
-                                {
+                                match k.sr_commit_blocked_receiver_split(
+                                    server.tid.0,
+                                    server.asid,
+                                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                                ) {
                                     ReceiverCommit::Committed(affinity) => {
                                         rn.fetch_add(1, O::Relaxed);
                                         k.sr_enqueue_committed_receiver_split(
@@ -88281,10 +88453,14 @@ mod stage199a2d2c2b2_guards {
     }
 
     // (6) recv-v2 result registers are cleared/completed BEFORE the receiver is set Runnable.
+    //
+    // Stage 199G-B §1: `clear_blocked_recv_return_regs_locked` became the recv-v2 SPELLING of the
+    // one variant-driven writeback owner, and this commit publishes through the owner directly
+    // (NR6/NR7 pass `RECV_V2`, which is byte-identical to the old clear). Same site, same order.
     #[test]
     fn recv_v2_result_completed_before_runnable() {
         let clear = RUNTIME
-            .find("clear_blocked_recv_return_regs_locked(tcbs, tid)")
+            .find("publish_blocked_recv_delivery_result_locked(tcbs, tid, result)")
             .unwrap();
         // The relevant Runnable transition is the one in the same commit, AFTER the register clear.
         let runnable = clear
@@ -88550,7 +88726,10 @@ mod stage199a2d2c2b3_guards {
     // Runnable, and BlockedUnfinalized is never selectable (so no fresh re-entry frame is used).
     #[test]
     fn recv_result_not_overwritten_by_fresh_entry() {
-        assert!(RUNTIME.contains("clear_blocked_recv_return_regs_locked(tcbs, tid)"));
+        // Stage 199G-B §1: the commit publishes through the ONE variant-driven writeback owner;
+        // for the NR6/NR7 direct paths the projection passed in is `RECV_V2`, byte-identical to
+        // the clear this assertion used to pin.
+        assert!(RUNTIME.contains("publish_blocked_recv_delivery_result_locked(tcbs, tid, result)"));
         use crate::arch::x86_64::ap_sched::{
             DispatchReject, TaskDispatchState, select_return_source,
         };
@@ -91706,9 +91885,11 @@ mod stage200c_reply_timeout_transaction {
             )
             .is_some()
         {
-            if let ReceiverCommit::Committed(aff) =
-                fx.k.sr_commit_blocked_receiver_split(1, fx.caller_asid)
-            {
+            if let ReceiverCommit::Committed(aff) = fx.k.sr_commit_blocked_receiver_split(
+                1,
+                fx.caller_asid,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+            ) {
                 fx.k.sr_enqueue_committed_receiver_split(1, aff);
                 return true;
             }
@@ -92347,7 +92528,7 @@ mod stage200c_reply_timeout_transaction {
                                 .is_some()
                                 {
                                     if let ReceiverCommit::Committed(aff) =
-                                        k.sr_commit_blocked_receiver_split(1, asid)
+                                        k.sr_commit_blocked_receiver_split(1, asid, crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2)
                                     {
                                         k.sr_enqueue_committed_receiver_split(1, aff);
                                         reply_won.fetch_add(1, O::Relaxed);
@@ -95013,13 +95194,33 @@ mod stage200c2c2c_r2a_riscv_publication {
     // never dispatch a task whose stored result is still stale.
     #[test]
     fn p06_publication_precedes_runnable_and_enqueue() {
+        // Stage 199G-B §A: the publication BODY moved into
+        // `publish_blocked_recv_timeout_result_with_identity`, the one owner the ordinary
+        // receive-timeout drain now shares. The ordering therefore spans two functions, and
+        // both halves are pinned: the owner writes the RISC-V lanes and NEVER flips status,
+        // and its caller calls it strictly before doing so.
+        let owner = IPC_STATE_SRC
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
+            .nth(1)
+            .expect("publication owner")
+            .split("\n/// ")
+            .next()
+            .expect("owner bounded");
+        assert!(
+            owner.contains("publish_riscv_user_return"),
+            "the owner publishes the RISC-V lanes"
+        );
+        assert!(
+            !owner.contains("tcb.status = TaskStatus::Runnable"),
+            "the publication owner must not flip status — its caller owns the transition"
+        );
         let body = IPC_STATE_SRC
             .split("fn rt_commit_receiver_runnable")
             .nth(1)
             .expect("commit body");
         let body = body.split("\npub(crate) fn ").next().unwrap();
         let publish = body
-            .find("publish_riscv_user_return")
+            .find("publish_blocked_recv_timeout_result_with_identity(")
             .expect("publication call");
         let runnable = body
             .find("tcb.status = TaskStatus::Runnable")
@@ -95048,12 +95249,13 @@ mod stage200c2c2c_r2a_riscv_publication {
             2,
             "one riscv64 definition + one hosted mirror, no third"
         );
-        // The completion boundary uses the helper, not paired ad-hoc writes.
+        // The completion boundary uses the helper, not paired ad-hoc writes. Stage 199G-B §A:
+        // that boundary is now the shared publication owner.
         let body = IPC_STATE_SRC
-            .split("fn rt_commit_receiver_runnable")
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
             .nth(1)
-            .expect("commit body");
-        let body = body.split("\npub(crate) fn ").next().unwrap();
+            .expect("publication owner");
+        let body = body.split("\n/// ").next().unwrap();
         assert!(body.contains("tcb.publish_riscv_user_return(0, 0, timed_out as usize);"));
         // No RISC-V a0/a1 lane is written directly at this boundary. Stage 200C2C2C-R2C:
         // the stored-lane attestation READS both lanes to report them, so the guard targets
@@ -96725,11 +96927,13 @@ mod stage200d1_publication_and_guards {
         assert_eq!(tcb.user_context.user_gprs[11], 0, "secondary result lane");
         assert_eq!(tcb.user_context.arg1, 0, "secondary mirror");
         // The completion helper publishes RISC-V lanes ONLY through the canonical helper.
+        // Stage 199G-B §A: that helper is the shared publication owner.
         let body = IPC_STATE_SRC
-            .split("fn rt_commit_receiver_runnable")
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
             .nth(1)
             .expect("body");
-        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        // Bound to the owner's OWN body: the next item's doc comment starts the sibling.
+        let body = body.split("\n/// ").next().unwrap_or(body);
         assert!(body.contains("tcb.publish_riscv_user_return(0, 0, timed_out as usize);"));
         let direct =
             body.matches("user_gprs[10] =").count() + body.matches("user_gprs[11] =").count();
@@ -96737,9 +96941,21 @@ mod stage200d1_publication_and_guards {
             direct, 0,
             "no direct single-mirror RISC-V write is permitted"
         );
-        // Publication happens BEFORE the task becomes Runnable and before any enqueue.
-        let pub_at = body.find("publish_riscv_user_return").expect("publish");
-        let runnable_at = body
+        // Publication happens BEFORE the task becomes Runnable and before any enqueue. The
+        // owner itself never flips status; its caller calls it strictly before doing so.
+        assert!(
+            !body.contains("tcb.status = TaskStatus::Runnable"),
+            "the publication owner must not flip status"
+        );
+        let caller = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let caller = caller.split("\npub(crate) fn ").next().unwrap();
+        let pub_at = caller
+            .find("publish_blocked_recv_timeout_result_with_identity(")
+            .expect("publish");
+        let runnable_at = caller
             .find("tcb.status = TaskStatus::Runnable")
             .expect("runnable");
         assert!(pub_at < runnable_at, "publication precedes Runnable");
@@ -96750,10 +96966,11 @@ mod stage200d1_publication_and_guards {
     #[test]
     fn g04_aarch64_parked_completion_contract() {
         const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+        // Stage 199G-B §A: the parked completion is written by the shared publication owner.
         let body = IPC_STATE_SRC
-            .split("fn rt_commit_receiver_runnable")
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
             .nth(1)
-            .expect("body");
+            .expect("publication owner");
         // The parked completion carries the parameterized code, so ServerDied uses it too.
         assert!(body.contains("result: timed_out,"));
         assert!(body.contains("pending_syscall_completion = Some("));
@@ -96776,11 +96993,15 @@ mod stage200d1_publication_and_guards {
     /// written by the completion that could override it.
     #[test]
     fn g05_x86_saved_frame_contract() {
+        // Stage 199G-B §A: the x86_64 saved-frame install lives in the shared publication owner.
         let body = IPC_STATE_SRC
-            .split("fn rt_commit_receiver_runnable")
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
             .nth(1)
-            .expect("body");
-        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+            .expect("publication owner");
+        let body = body
+            .split("\n/// Stage 199G-B §A — [`publish_blocked")
+            .next()
+            .unwrap_or(body);
         assert!(body.contains("#[cfg(target_arch = \"x86_64\")]"));
         assert!(
             body.contains("tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error")
@@ -97643,20 +97864,28 @@ mod stage200d2a_deferred_death {
     // ── (19)(20)(21)(22) publication ordering + no late overwrite ───────────────────
     #[test]
     fn f19_result_publication_precedes_runnable() {
-        // Source contract: the publication write happens before the status flip, inside
-        // the single completion helper both timeout and death share.
+        // Source contract: the publication write happens before the status flip. Stage 199G-B §A
+        // moved the write into `publish_blocked_recv_timeout_result_with_identity` — the single
+        // completion owner timeout, death AND the ordinary receive-timeout drain now share — so
+        // the ordering is the CALL preceding the status flip in the committing function.
         let body = IPC_STATE_SRC
             .split("fn rt_commit_receiver_runnable")
             .nth(1)
             .expect("body");
-        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        let body = body.split("\npub(crate) fn ").next().unwrap_or(body);
         let publish = body
-            .find("tcb.pending_syscall_completion = Some(")
+            .find("publish_blocked_recv_timeout_result_with_identity(")
             .expect("publish");
         let runnable = body
             .find("tcb.status = TaskStatus::Runnable")
             .expect("runnable");
         assert!(publish < runnable, "result publication precedes Runnable");
+        // …and the owner it calls is the one that actually parks the record.
+        let owner = IPC_STATE_SRC
+            .split("fn publish_blocked_recv_timeout_result_with_identity")
+            .nth(1)
+            .expect("publication owner");
+        assert!(owner.contains("tcb.pending_syscall_completion = Some("));
     }
 
     #[test]
@@ -112811,12 +113040,16 @@ mod stage199d_riscv_canonical_admission {
         let at = w
             .find("let split_eligible = is_syscall")
             .expect("the whitelist");
-        let whitelist = &w[at..at + 420];
+        let whitelist = &w[at..at + 500];
         for nr in [
             "SYSCALL_DEBUG_LOG_NR",
             "SYSCALL_FUTEX_WAKE_NR",
             // U9-QA §2: the one SWITCHING member.
             "SYSCALL_FUTEX_WAIT_NR",
+            // Stage 199G-B §2: the SECOND switching member — IpcRecvTimeout (NR 5), whose
+            // pre-lock route is NR 2's route and whose completion is the shared D2-recv drain
+            // this bridge has driven since U4.
+            "SYSCALL_IPC_RECV_TIMEOUT_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -112824,11 +113057,16 @@ mod stage199d_riscv_canonical_admission {
                 "the whitelist must still admit `{nr}`"
             );
         }
-        // Nothing else was added to the whitelist.
+        // Nothing else was added to the whitelist. NR 2 in particular is NOT here: 199G-B §2
+        // admits NR 5 without disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            3,
-            "exactly three literal NRs plus the gated direct-IPC term"
+            4,
+            "exactly four literal NRs plus the gated direct-IPC term"
+        );
+        assert!(
+            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "NR 2 admission on RISC-V is a separate class with its own witness"
         );
         // The arch-tagged NR6/NR7 markers are emitted by the kernel drain, not by this gate.
         assert!(
@@ -115546,6 +115784,7 @@ mod stage199d_shared_region_enqueue_rejection {
             .expect("resolve recv endpoint")
             .endpoint;
         let snap = RecvBoundarySharedRegionSnapshot {
+            recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
             receiver_cnode: k.with(|s| s.task_cnode(2)).expect("cnode"),
             object: endpoint,
             object_generation: 0,
@@ -115621,7 +115860,10 @@ mod stage199d_shared_region_enqueue_rejection {
             s.set_task_home_cpu(2, CpuId(1)).expect("pin");
         });
         assert_eq!(
-            fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+            fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                &fx.snap,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+            ),
             None,
             "a refused placement is NOT a wake — Some(true) would be a lie"
         );
@@ -115643,7 +115885,10 @@ mod stage199d_shared_region_enqueue_rejection {
             let _ = fx.k.sr_enqueue_committed_receiver_split(tid, Some(here));
         }
         assert_eq!(
-            fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+            fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                &fx.snap,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+            ),
             None
         );
         assert_no_wake_and_restored(&fx, "queue full");
@@ -115667,7 +115912,10 @@ mod stage199d_shared_region_enqueue_rejection {
                 ReceiverEnqueue::Enqueued { .. }
             ));
             assert_eq!(
-                fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+                fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                    &fx.snap,
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                ),
                 None,
                 "an unreconciled collision is not a wake"
             );
@@ -115689,7 +115937,10 @@ mod stage199d_shared_region_enqueue_rejection {
                 s.dispatch_next_on_cpu(here).expect("make current");
             });
             assert_eq!(
-                fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+                fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                    &fx.snap,
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                ),
                 None
             );
             assert_eq!(
@@ -115712,7 +115963,10 @@ mod stage199d_shared_region_enqueue_rejection {
                 ReceiverEnqueue::Enqueued { .. }
             ));
             assert_eq!(
-                fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+                fx.k.sr_finalize_blocked_receiver_and_wake_split(
+                    &fx.snap,
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                ),
                 None
             );
             assert_eq!(
@@ -118185,12 +118439,17 @@ mod stage199d_wa2b_wake_owner_census {
             "tcb.asid = Some(client_asid);",
             "tcb.user_context.instruction_ptr = VirtAddr(CLIENT_CODE_VA);",
         ),
+        // Stage 199G-B §A: RE-DERIVED, not re-pinned. The publication body moved into
+        // `publish_blocked_recv_timeout_result_with_identity` — the one owner the ordinary
+        // receive-timeout drain now shares — so the line immediately preceding this status
+        // write is the CALL to that owner. The status write itself is unchanged, and the
+        // ordering it encodes (publish, then Runnable) is exactly what moved with it.
         (
             "src/kernel/boot/ipc_state.rs",
             "rt_commit_receiver_runnable",
             "tcb.status",
             "TaskStatus::Runnable",
-            "let _ = timed_out;",
+            "publish_blocked_recv_timeout_result_with_identity(tcb, timed_out, tid, asid);",
             "Some(tcb.cpu_affinity)",
         ),
         (
@@ -118342,7 +118601,7 @@ mod stage199d_wa2b_wake_owner_census {
             "src/kernel/task.rs",
             "new",
             "status:",
-            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, blocked_send_generation: 0, pending_syscall_completion: None, async_preempted: None, async_preempt_generation: 0, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
+            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, first_resume_consumed: false, blocked_send_generation: 0, pending_syscall_completion: None, async_preempted: None, async_preempt_generation: 0, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
             "thread_group_id: ThreadGroupId(tid.0),",
             "asid,",
         ),
@@ -118434,12 +118693,16 @@ mod stage199d_wa2b_wake_owner_census {
         // Canonical 199E: the ordinary RECEIVE timeout wake, moved off the broad lock. Its
         // neighbourhood is the close of the exact-claim guards and the deadline clear that
         // publishes the `TimedOut` fact in the same rank-2 acquisition.
+        // Stage 199G-B §A: RE-DERIVED. The drain now publishes the completion RESULT through
+        // the shared owner in this same rank-2 acquisition, immediately before the status
+        // write, so the preceding line is that call's closing `);` rather than the closing `}`
+        // of the last refusal guard. The status write and its ordering are unchanged.
         (
             "src/runtime.rs",
             "drain_recv_timeout_post_work",
             "tcb.status",
             "TaskStatus::Runnable",
-            "}",
+            ");",
             "tcb.ipc_timeout_deadline = None;",
         ),
         (
@@ -123393,7 +123656,13 @@ mod u3_blocked_waiter_completion_transaction {
 
         let (b, eb) = fixture(wake_status, wake_asid);
         let b_census = waiters_linked();
-        let _ = b.complete_blocked_waiter_delivery_split(cpu, WAITER, eb, wake.map(ThreadId));
+        let _ = b.complete_blocked_waiter_delivery_split(
+            cpu,
+            WAITER,
+            eb,
+            wake.map(ThreadId),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         let obs_b = observe(&b, eb);
         let b_delta = waiters_linked() as i64 - b_census as i64;
 
@@ -123484,7 +123753,13 @@ mod u3_blocked_waiter_completion_transaction {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(1), WAITER, eidx, None),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(1),
+                WAITER,
+                eidx,
+                None,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Ok(())
         );
         assert_eq!(
@@ -123501,7 +123776,13 @@ mod u3_blocked_waiter_completion_transaction {
             k.with(|s| s.set_current_cpu(CpuId(0)).expect("cpu0"));
             let before = observe(&k, eidx);
             let err = k
-                .complete_blocked_waiter_delivery_split(bad, WAITER, eidx, Some(ThreadId(WAKE)))
+                .complete_blocked_waiter_delivery_split(
+                    bad,
+                    WAITER,
+                    eidx,
+                    Some(ThreadId(WAKE)),
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+                )
                 .expect_err("refused");
             assert_eq!(
                 err,
@@ -123518,7 +123799,13 @@ mod u3_blocked_waiter_completion_transaction {
     fn u3_bw_wake_none_clears_registers_only() {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, None),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(0),
+                WAITER,
+                eidx,
+                None,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Ok(())
         );
         let (regs, slot, status, deadline, fired, ..) = observe(&k, eidx);
@@ -123537,7 +123824,13 @@ mod u3_blocked_waiter_completion_transaction {
     fn u3_bw_absent_waiter_tcb_is_not_an_error() {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(0), 9_999, eidx, None),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(0),
+                9_999,
+                eidx,
+                None,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Ok(()),
             "an absent waiter TCB mutates nothing and raises no new error"
         );
@@ -123567,8 +123860,13 @@ mod u3_blocked_waiter_completion_transaction {
             eidx
         });
         let linked = waiters_linked();
-        let _ =
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        let _ = k.complete_blocked_waiter_delivery_split(
+            CpuId(0),
+            WAITER,
+            eidx,
+            Some(ThreadId(WAKE)),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx))),
             Some(ThreadId(WAKE)),
@@ -123581,8 +123879,13 @@ mod u3_blocked_waiter_completion_transaction {
     fn u3_bw_identity_match_removes_through_the_central_path_exactly_once() {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         let linked = waiters_linked();
-        let _ =
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        let _ = k.complete_blocked_waiter_delivery_split(
+            CpuId(0),
+            WAITER,
+            eidx,
+            Some(ThreadId(WAKE)),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx))),
             None,
@@ -123590,8 +123893,13 @@ mod u3_blocked_waiter_completion_transaction {
         );
         assert_eq!(waiters_linked(), linked - 1, "unlinked exactly once");
         // A second completion is a no-op and must not double-unlink.
-        let _ =
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        let _ = k.complete_blocked_waiter_delivery_split(
+            CpuId(0),
+            WAITER,
+            eidx,
+            Some(ThreadId(WAKE)),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(waiters_linked(), linked - 1, "no double unlink");
     }
 
@@ -123605,8 +123913,13 @@ mod u3_blocked_waiter_completion_transaction {
                 ipc.set_endpoint_waiter(eidx, EndpointWaiterRecord::new(ident(WAKE, ASID), 77));
             })
         });
-        let _ =
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE)));
+        let _ = k.complete_blocked_waiter_delivery_split(
+            CpuId(0),
+            WAITER,
+            eidx,
+            Some(ThreadId(WAKE)),
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
         assert_eq!(
             k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eidx))),
             None,
@@ -123637,6 +123950,7 @@ mod u3_blocked_waiter_completion_transaction {
                 WAITER,
                 eb,
                 Some(ThreadId(WAKE)),
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
             );
             assert_eq!(
                 observe(&a, ea),
@@ -123651,7 +123965,13 @@ mod u3_blocked_waiter_completion_transaction {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         let before = k.with(|s| s.runnable_count_on_cpu(CpuId(0)));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(WAKE))),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(0),
+                WAITER,
+                eidx,
+                Some(ThreadId(WAKE)),
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Ok(())
         );
         let (_, _, status, deadline, fired, q0, ..) = observe(&k, eidx);
@@ -123676,6 +123996,7 @@ mod u3_blocked_waiter_completion_transaction {
                     WAITER,
                     eidx,
                     Some(ThreadId(WAKE)),
+                    crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
                 )
                 .expect_err("refused");
             assert_eq!(err, KernelError::WouldBlock, "{bad:?}: same refusal");
@@ -123686,7 +124007,13 @@ mod u3_blocked_waiter_completion_transaction {
     fn u3_bw_missing_wake_task_is_task_missing() {
         let (k, eidx) = fixture(TaskStatus::Blocked(WaitReason::Poll), Some(ASID));
         assert_eq!(
-            k.complete_blocked_waiter_delivery_split(CpuId(0), WAITER, eidx, Some(ThreadId(4_242))),
+            k.complete_blocked_waiter_delivery_split(
+                CpuId(0),
+                WAITER,
+                eidx,
+                Some(ThreadId(4_242)),
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2
+            ),
             Err(KernelError::TaskMissing)
         );
     }
@@ -140457,35 +140784,49 @@ mod u9qa_apply_convention {
     /// The resumability screen asks what the CALLER'S convention can actually serve, because the
     /// two conventions serve different sets of tasks — and getting that wrong is refusable only
     /// BEFORE the dequeue.
+    ///
+    /// 203C-XFR moved the screen into ONE classifier that admission and the apply both call. The
+    /// stash arm is unchanged; the exact-token arm now asks about the incoming task's
+    /// CONTINUATION rather than about `kernel_context.initialized`, which is the kernel-thread
+    /// `switch_frames` precondition and which no production user task satisfies.
     #[test]
     fn resumability_is_screened_per_convention_before_the_dequeue() {
         let body = admit_body();
-        // The stash convention requires exactly what the plan builder requires.
+        let classifier = EXEC
+            .split("pub(crate) fn classify_incoming_resume_convention")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the classifier");
+        // The stash convention still requires exactly what the plan builder requires.
         assert!(
-            body.contains(
-                "QueueAdvanceApply::StashedKernelSwitch => tcb.kernel_context.initialized"
-            ),
+            classifier.contains("QueueAdvanceApply::StashedKernelSwitch => tcb")
+                && classifier.contains("kernel_context"),
             "the stash convention must screen on what build_dispatch_switch_plan_locked requires"
         );
-        // The exact-token convention differs by architecture, because its resume owners do:
-        // x86_64/AArch64 refuse an incarnation with no restorable context (a never-run task takes
-        // the first-resume trampoline, which is the STASH path), while the RISC-V write-back
-        // serves the fresh/startup convention from the argument mirror and needs only a
-        // resolvable ASID — the thing its `direct_dispatch_activate_asid_split` refuses on.
-        let exact = body
+        // The exact-token convention screens the continuation the resume owner will install: a
+        // bound address space, and a `rip`/`rsp` that `flush_trap_context_to_iret_frame` will
+        // actually write. A never-run task with a seeded startup snapshot is admitted as the
+        // one-shot first resume; a consumed snapshot is refused.
+        let exact = classifier
             .split("QueueAdvanceApply::ExactTokenResume => {")
             .nth(1)
-            .and_then(|s| s.split("\n                }").next())
             .expect("the exact-token arm");
         assert!(
-            exact.contains("cfg!(target_arch = \"x86_64\")")
-                && exact.contains("tcb.asid.is_some()")
-                && exact.contains("tcb.kernel_context.initialized"),
-            "the exact-token screen must match what each architecture's resume owner accepts"
+            exact.contains("tcb.asid?")
+                && exact.contains("is_restorable()")
+                && exact.contains("is_first_resume_shape()")
+                && exact.contains("tcb.first_resume_consumed")
+                && exact.contains("IncomingResumeConvention::X86FirstResume"),
+            "the exact-token screen must match what the resume owner accepts"
+        );
+        // The screen no longer asks the switch_frames question of an exact-token caller.
+        assert!(
+            !exact.contains("kernel_context.initialized"),
+            "the exact-token arm must not screen on the kernel-thread switch precondition"
         );
         // Whatever the screen, a failure is a refusal raised BEFORE anything is dequeued.
         let screen = body
-            .find("let resumable = self.with_task_tcbs_split_mut")
+            .find("let convention = self.with_task_tcbs_split_mut")
             .expect("the screen");
         let refusal = body
             .find("QueueAdvanceRefusal::IncomingUnavailable")
@@ -140493,6 +140834,409 @@ mod u9qa_apply_convention {
         assert!(
             screen < refusal,
             "a non-resumable candidate is refused before anything is dequeued"
+        );
+    }
+
+    /// 203C-XFR — ONE policy owner. The first-resume predicate exists in exactly one place, and
+    /// both the queue-advance classifier and the x86_64 saved-register writeback call it.
+    #[test]
+    fn the_first_resume_predicate_has_one_owner() {
+        const TASK_SRC: &str = include_str!("../task.rs");
+        const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            TASK_SRC.contains("pub fn is_first_resume_shape(&self) -> bool"),
+            "the predicate must be defined on the continuation value itself"
+        );
+        // Exactly one definition; the arch writeback calls it rather than re-deriving it.
+        assert_eq!(
+            TASK_SRC
+                .matches("self.user_gprs.iter().all(|&g| g == 0) && self.arg0 != 0")
+                .count(),
+            1,
+            "the first-resume shape is derived in exactly one place"
+        );
+        assert!(
+            DESC_SRC.contains("capture_user_context().is_first_resume_shape()"),
+            "the x86_64 writeback must call the shared predicate"
+        );
+        assert!(
+            !DESC_SRC.contains("trap_frame.user_gprs.iter().all(|&g| g == 0)"),
+            "the arch writeback must not keep a second copy of the predicate"
+        );
+        // The apply consumes the one-shot snapshot through the same classifier.
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        assert!(
+            RUNTIME_SRC.contains("classify_incoming_resume_convention(")
+                && RUNTIME_SRC.contains("tcb.first_resume_consumed = true;"),
+            "the apply must revalidate through the classifier and consume the snapshot once"
+        );
+    }
+
+    // ── 203C-XFR §5 — the mechanical gates, recomputed from source ──────────────────────────
+
+    /// NR 5 terminal edges: 3 → 0.
+    ///
+    /// An "edge" here is an ARCHITECTURE on which `ipc_recv_timeout` has no pre-lock owner at
+    /// all, so every NR 5 trap necessarily reaches the terminal broad dispatcher. Before 199G-B
+    /// that was all three; this recomputes it, and each architecture's gate is named explicitly
+    /// rather than assumed from the shared route.
+    #[test]
+    fn nr5_terminal_edges_are_zero_on_all_three_architectures() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+
+        // The shared route admits NR 5 and does NOT exclude any architecture for it. NR 2 keeps
+        // its own two-architecture gate, which is what "do not disturb NR2 admission" means.
+        assert!(
+            SPLIT_SRC.contains("Ok(Syscall::IpcRecvTimeout) => true,"),
+            "the pre-lock receive route must admit NR 5"
+        );
+        assert!(
+            SPLIT_SRC.contains(
+                "if !recv_timeout && !cfg!(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))"
+            ),
+            "the architecture exclusion must apply to NR 2 only"
+        );
+        // x86_64 needs no import gate: its ABI is already in the frame.
+        // AArch64: the pre-split ABI import must admit NR 5, or the dispatcher sees nr=0.
+        assert!(
+            TRAP_ENTRY.contains("raw_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR"),
+            "AArch64 must import the NR 5 ABI before the split dispatch inspects it"
+        );
+        // RISC-V: the whitelist must admit NR 5, and must still NOT admit NR 2.
+        let whitelist = RISCV
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("the RISC-V whitelist");
+        assert!(
+            whitelist.contains("SYSCALL_IPC_RECV_TIMEOUT_NR"),
+            "RISC-V must admit NR 5 into the split dispatcher"
+        );
+        assert!(
+            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "NR 2's RISC-V admission is a separate class and stays untouched"
+        );
+        // And nothing in the route yields NR 5 back to the broad arm: all three publication
+        // yields are scoped to NR 2, whose handler owns the hooks they protect.
+        for yielded in [
+            "if !recv_timeout && cfg!(feature = \"shared-region-direct-oracle\")",
+            "if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled()",
+            "if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm()",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(yielded),
+                "every broad-arm yield must be scoped to NR 2: {yielded}"
+            );
+        }
+    }
+
+    /// `X86FirstResume` has ONE policy owner and ONE apply owner, and neither is duplicated in
+    /// the trap entry.
+    #[test]
+    fn first_resume_has_one_policy_owner_and_one_apply_owner() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
+
+        // One policy owner: the classifier is defined once and is the only producer of the
+        // convention value.
+        assert_eq!(
+            EXEC.matches("pub(crate) fn classify_incoming_resume_convention")
+                .count(),
+            1,
+            "the classifier is defined exactly once"
+        );
+        assert_eq!(
+            EXEC.matches("IncomingResumeConvention::X86FirstResume =>")
+                .count()
+                + EXEC
+                    .matches("Some(IncomingResumeConvention::X86FirstResume)")
+                    .count(),
+            1,
+            "the convention is produced in exactly one place"
+        );
+        // One apply owner: the x86_64 exact-token resume, which revalidates and consumes.
+        assert_eq!(
+            X86_TRAP
+                .matches("direct_dispatch_classify_and_consume_convention_split")
+                .count(),
+            1,
+            "exactly one apply site revalidates the convention"
+        );
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("tcb.first_resume_consumed = true;")
+                .count(),
+            1,
+            "the one-shot snapshot is consumed in exactly one place"
+        );
+        // No first-resume logic in the trap entry, and no fabricated identity or token: the
+        // convention is always derived from the token's exact incarnation.
+        assert!(
+            !TRAP_ENTRY.contains("IncomingResumeConvention"),
+            "the shared trap entry must not carry first-resume policy"
+        );
+        assert!(
+            !TRAP_ENTRY.contains("first_resume_consumed"),
+            "the shared trap entry must not touch the one-shot latch"
+        );
+        assert!(
+            RUNTIME_SRC.contains("let expected = token.expect_asid()?;")
+                && RUNTIME_SRC.contains("t.tid.0 == incoming && t.asid == Some(expected)"),
+            "the convention is resolved by the token's exact tid+asid, never a fabricated one"
+        );
+    }
+
+    /// No post-dequeue refusal path is introduced: the classifier's refusal is raised at
+    /// admission, before any mutation, and the apply's revalidation reuses the EXISTING
+    /// `Context` refusal with its existing exact rollback.
+    #[test]
+    fn the_classification_adds_no_post_dequeue_refusal_path() {
+        const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
+        let apply = X86_TRAP
+            .split("pub(crate) fn x86_post_lock_resume_marked_incoming")
+            .nth(1)
+            .and_then(|s| s.split("\n/// ").next())
+            .expect("the apply body");
+        // The revalidation maps onto the refusal that already existed, not a new variant.
+        assert!(
+            apply.contains(
+                "direct_dispatch_classify_and_consume_convention_split(token)\n        .ok_or(X86ResumeRefusal::Context)?"
+            ),
+            "revalidation must reuse the existing Context refusal"
+        );
+        // No new refusal variant was added.
+        assert_eq!(
+            X86_TRAP.matches("pub(crate) enum X86ResumeRefusal").count(),
+            1
+        );
+        let refusals = X86_TRAP
+            .split("pub(crate) enum X86ResumeRefusal {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("the refusal enum");
+        for v in ["SchedulerCurrent,", "Asid,", "Context,"] {
+            assert!(refusals.contains(v), "{v} must remain");
+        }
+        assert_eq!(
+            refusals.matches(",\n").count(),
+            3,
+            "no refusal variant was added or removed"
+        );
+    }
+
+    /// AArch64 and RISC-V resume owners are untouched, and NR 2 / FutexWait still route through
+    /// the same U9-QA selection owner.
+    #[test]
+    fn other_architectures_and_classes_are_unchanged() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        // The classifier's non-stash arm is architecture-neutral: it asks for a bound ASID and a
+        // restorable continuation, which is exactly what AArch64/RISC-V already required
+        // (`tcb.asid.is_some()`), so their admitted set is unchanged.
+        let classifier = EXEC
+            .split("pub(crate) fn classify_incoming_resume_convention")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the classifier");
+        assert!(
+            !classifier.contains("target_arch"),
+            "the classifier must not fork by architecture"
+        );
+        // Both switching classes still admit through the one selection owner.
+        assert!(
+            SPLIT_SRC.contains("QueueAdvanceApply::ExactTokenResume"),
+            "the pre-lock routes still admit as exact-token resumes"
+        );
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("fn queue_advance_select_step_split")
+                .count(),
+            1,
+            "there is one selection owner"
+        );
+    }
+
+    // ── 203C-XFR §6 — behaviour of the classification itself ────────────────────────────────
+
+    use crate::kernel::boot::{
+        IncomingResumeConvention, QueueAdvanceApply, classify_incoming_resume_convention,
+    };
+    use crate::kernel::ipc::ThreadId as XfrTid;
+    use crate::kernel::task::ThreadControlBlock as XfrTcb;
+    use crate::kernel::vm::{Asid as XfrAsid, VirtAddr as XfrVa};
+
+    /// A task that has run: a bound ASID and a committed continuation with a real RIP/RSP and a
+    /// non-zero GPR file.
+    fn xfr_resumed_tcb() -> XfrTcb {
+        let mut tcb = XfrTcb::new(XfrTid(41), Some(XfrAsid(4)));
+        tcb.user_context.instruction_ptr = XfrVa(0x40_1000);
+        tcb.user_context.stack_ptr = XfrVa(0x7fff_0000);
+        tcb.user_context.user_gprs[0] = 0xDEAD;
+        tcb.user_context.arg0 = 41;
+        tcb
+    }
+
+    /// A never-run task with the snapshot `spawn_user_task_from_image` seeds: entry, startup
+    /// stack, the task id in `arg0`, and a zero GPR file.
+    fn xfr_fresh_tcb() -> XfrTcb {
+        let mut tcb = XfrTcb::new(XfrTid(42), Some(XfrAsid(5)));
+        tcb.user_context.instruction_ptr = XfrVa(0x40_20f0);
+        tcb.user_context.stack_ptr = XfrVa(0x7fff_ff68);
+        tcb.user_context.arg0 = 42;
+        tcb
+    }
+
+    /// An initialized incarnation classifies as the exact-token resume.
+    #[test]
+    fn xfr_a_resumed_task_classifies_as_exact_token() {
+        assert_eq!(
+            classify_incoming_resume_convention(
+                &xfr_resumed_tcb(),
+                QueueAdvanceApply::ExactTokenResume
+            ),
+            Some(IncomingResumeConvention::ExactToken)
+        );
+    }
+
+    /// A valid never-run task classifies as the one-shot first resume — the case the old
+    /// `kernel_context.initialized` screen refused for every production service task.
+    #[test]
+    fn xfr_a_valid_never_run_task_classifies_as_first_resume() {
+        let fresh = xfr_fresh_tcb();
+        assert!(
+            !fresh.kernel_context.initialized,
+            "a production user task never has an initialized kernel context"
+        );
+        assert_eq!(
+            classify_incoming_resume_convention(&fresh, QueueAdvanceApply::ExactTokenResume),
+            Some(IncomingResumeConvention::X86FirstResume),
+            "the screen the old one applied would have refused exactly this task"
+        );
+    }
+
+    /// An INCOMPLETE or stale startup snapshot is refused — and refused by the classifier, which
+    /// admission runs before anything is dequeued.
+    #[test]
+    fn xfr_an_incomplete_snapshot_is_refused() {
+        // No bound address space: nothing for the resume owner to activate.
+        let mut no_asid = xfr_fresh_tcb();
+        no_asid.asid = None;
+        assert_eq!(
+            classify_incoming_resume_convention(&no_asid, QueueAdvanceApply::ExactTokenResume),
+            None
+        );
+        // Zero entry point: `flush_trap_context_to_iret_frame` would leave the OUTGOING task's
+        // rip in the hardware frame.
+        let mut no_entry = xfr_fresh_tcb();
+        no_entry.user_context.instruction_ptr = XfrVa(0);
+        assert_eq!(
+            classify_incoming_resume_convention(&no_entry, QueueAdvanceApply::ExactTokenResume),
+            None
+        );
+        // Zero stack: same hazard on the rsp lane.
+        let mut no_stack = xfr_fresh_tcb();
+        no_stack.user_context.stack_ptr = XfrVa(0);
+        assert_eq!(
+            classify_incoming_resume_convention(&no_stack, QueueAdvanceApply::ExactTokenResume),
+            None
+        );
+        // A wholly default TCB — the shape a reserved-but-unspawned slot has.
+        let bare = XfrTcb::new(XfrTid(43), Some(XfrAsid(6)));
+        assert_eq!(
+            classify_incoming_resume_convention(&bare, QueueAdvanceApply::ExactTokenResume),
+            None
+        );
+    }
+
+    /// The startup snapshot is returned through EXACTLY ONCE: a consumed latch refuses the
+    /// first-resume convention rather than silently restarting the task at its entry point.
+    #[test]
+    fn xfr_a_startup_snapshot_is_consumed_once() {
+        let mut tcb = xfr_fresh_tcb();
+        assert_eq!(
+            classify_incoming_resume_convention(&tcb, QueueAdvanceApply::ExactTokenResume),
+            Some(IncomingResumeConvention::X86FirstResume)
+        );
+        tcb.first_resume_consumed = true;
+        assert_eq!(
+            classify_incoming_resume_convention(&tcb, QueueAdvanceApply::ExactTokenResume),
+            None,
+            "the same startup state must not be returned through twice"
+        );
+        // Consuming the latch does NOT affect a task with a real saved continuation: a resumed
+        // task is admitted on the strength of that continuation, which the latch says nothing
+        // about.
+        let mut resumed = xfr_resumed_tcb();
+        resumed.first_resume_consumed = true;
+        assert_eq!(
+            classify_incoming_resume_convention(&resumed, QueueAdvanceApply::ExactTokenResume),
+            Some(IncomingResumeConvention::ExactToken)
+        );
+    }
+
+    /// The stash convention is untouched: it still asks exactly what the plan builder requires,
+    /// and a never-run user task is still not stash-resumable.
+    #[test]
+    fn xfr_the_stash_convention_is_unchanged() {
+        assert_eq!(
+            classify_incoming_resume_convention(
+                &xfr_fresh_tcb(),
+                QueueAdvanceApply::StashedKernelSwitch
+            ),
+            None,
+            "a task with no kernel switch frame cannot be switch_frames-resumed"
+        );
+        let mut kernel_thread = xfr_fresh_tcb();
+        kernel_thread.kernel_context.initialized = true;
+        assert_eq!(
+            classify_incoming_resume_convention(
+                &kernel_thread,
+                QueueAdvanceApply::StashedKernelSwitch
+            ),
+            Some(IncomingResumeConvention::ExactToken)
+        );
+    }
+
+    /// Both projections of the receive ABI stay live and stay distinct. 203C-XFR §1: the shape is
+    /// selected from the caller's own metadata contract, never from the syscall number, so "NR 5"
+    /// and "register-only" are not synonyms.
+    #[test]
+    fn xfr_both_receive_projections_are_covered() {
+        use crate::kernel::capabilities::CapId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        // Register-only: no metadata target at all.
+        let legacy = BlockedRecvState::legacy_timeout(CapId(7), 0x1000, 128);
+        assert_eq!(legacy.recv_abi, RecvAbiVariant::LegacyTimeout);
+        assert!(!legacy.recv_abi.writes_recv_v2_meta());
+        assert_eq!(legacy.meta_user_ptr, 0);
+        assert_eq!(legacy.meta_user_len, 0);
+        // Metadata-carrying: the shape every live `yarm-user-rt` NR 5 caller actually uses.
+        let v2 = BlockedRecvState {
+            recv_cap: CapId(7),
+            payload_user_ptr: 0x1000,
+            payload_user_len: 128,
+            meta_user_ptr: 0x2000,
+            meta_user_len: 40,
+            recv_abi: RecvAbiVariant::RecvV2,
+        };
+        assert!(v2.recv_abi.writes_recv_v2_meta());
+        assert_ne!(legacy.recv_abi, v2.recv_abi);
+        // The NR 5 handler and the pre-lock route both derive the shape from args 4/5, using the
+        // same predicate the immediate-success owner uses — not from the syscall number.
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        for src in [IPC_SRC, SPLIT_SRC] {
+            assert!(
+                src.contains("meta_user_ptr != 0") && src.contains("IPC_RECV_META_V2_ENCODED_LEN"),
+                "the projection must be derived from the caller's metadata contract"
+            );
+        }
+        assert!(
+            IPC_SRC.contains("let recv_v2_meta_written = meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN;"),
+            "and it must be the SAME predicate the immediate-success owner computes"
         );
     }
 

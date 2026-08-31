@@ -14149,6 +14149,94 @@ kernel lock; no CNode capacity increase; NR 27 absent; reply-cap / shared-region
 Full record in `doc/SECOND_COHORT_ORDINARY_CAP_SEAL.md`.
 
 
+### 203C-XFR / 199G-B3 — x86_64 queue-advance first resume, and NR 5 off the terminal dispatcher. DELIVERED. CENSUS-DELTA 0.
+
+**`IpcRecvTimeout` (NR 5) now blocks, switches and resumes off the broad lock on all three
+architectures. NR 5 terminal edges 3 → 0. The census remains 2 / 0 / 2, so this is CENSUS-DELTA 0
+— the prerequisite 199G/U9 named.**
+
+**The receive ABI model is corrected by live evidence.** NR 5 is not inherently register-only.
+`handle_ipc_recv_result_with_empty_error` — NR 5's own immediate-success owner — computes
+`recv_v2_meta_written = meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN` from syscall
+arguments 4/5 and writes the 40-byte metadata struct, with `ret0 = 0`, whenever a buffer is
+supplied. `RecvRequest::from_ipc_recv_timeout` hard-codes `RecvMetaTarget::None`, but that is a
+planning artifact that never reaches a writeback, and the live `yarm-user-rt::ipc_recv_with_deadline`
+wrapper always supplies a metadata buffer and reads the struct back. The blocked contract now reads
+the SAME predicate the immediate contract reads, in the broad handler and in the pre-lock route
+alike, so a receive that parks is owed exactly what the same arguments would have been owed had a
+message been waiting. `RecvAbiVariant` therefore names a PROJECTION SHAPE, not a syscall number:
+`RecvV2` is the metadata-carrying projection and `LegacyTimeout` the register-only one, and NR 5
+selects between them from its caller's own contract. Both projections are tested; live evidence
+truthfully reports `recv_v2 > 0` and `register_only = 0`, because every current userspace caller
+supplies a metadata buffer.
+
+**The x86_64 blocker was an admission screen asking the wrong question.** `queue_advance_admit_split`
+screened an `ExactTokenResume` candidate on `kernel_context.initialized`, with a comment asserting
+that a never-run task "takes the FIRST-RESUME TRAMPOLINE — which is the stash path". Both halves are
+contradicted by the source. That trampoline (`yarm_kernel_thread_switch_trampoline`,
+`FIRST_RESUME_STASH`) is the KERNEL-THREAD `switch_frames` first resume and switches back to the
+outgoing task; it is not how any user task enters ring 3. And production user tasks never get an
+initialized kernel context at all — only `BOOTSTRAP_FIRST_USER_TID` and `BOOTSTRAP_SUPERVISOR_TID`
+do, as a Stage-119 D6 proof arrangement, which is exactly why `build_dispatch_switch_plan_locked`
+records "context switching for these tasks happens entirely via trap-frame restore; switch_frames is
+not called". The screen therefore refused every service task in the system and admitted only tid 1
+and tid 2. Measured: NR 5 was refused `IncomingUnavailable` 2/2 on the core profile and 38/38 on the
+reply-timeout and fat-block profiles, while NR 2 committed 61 times in the same boot because its
+candidate happened to be tid 1 or tid 2.
+
+**No new startup convention was built.** x86_64 has owned a first-resume convention since long
+before this stage: `write_task_gprs_to_saved_regs` selects between delivering a never-run task's
+startup ABI through the System V argument registers (rdi, rsi, rdx, rcx, r8, r9) and restoring a
+resumed task's GPR snapshot verbatim, on every broad-lock task switch, and
+`flush_trap_context_to_iret_frame` then patches rip/rsp/rflags before `iretq`. 203C-XFR lifts the
+predicate that owner already used onto `UserRegisterContext::is_first_resume_shape`, so ADMISSION can
+ask the same question; the arch writeback now calls it rather than keeping a second copy.
+
+**One policy owner, one apply owner.** `classify_incoming_resume_convention` returns `ExactToken`
+for a committed continuation, `X86FirstResume` for a never-run task with a complete seeded startup
+snapshot — bound ASID, non-zero entry and stack, task id in `arg0`, zero GPR file, unconsumed
+one-shot latch — and a refusal otherwise. Every refusal is raised at admission, before any mutation,
+which is what keeps the post-dequeue `d2_resume_refused_fatal` unreachable. The
+`StashedKernelSwitch` arm is untouched, and the classifier does not fork by architecture, so AArch64
+and RISC-V keep the admitted set `asid.is_some()` gave them. Admission classifies the peeked
+candidate; because a higher-priority wake can displace it before the authoritative dequeue,
+`x86_post_lock_resume_marked_incoming` re-asks the same owner about the task actually selected and
+consumes the one-shot startup latch in the same rank-2 acquisition. A refusal there is the existing
+`Context` refusal with its existing exact rollback — never reinterpreted as a first resume. No new
+refusal variant, no fabricated identity or dispatch token, and no first-resume logic in trap entry.
+
+**A second live defect, on RISC-V.** The bridge captured the outgoing user context for a committed
+queue advance from `futex_wait_dispatch_outgoing` alone, which is empty when the route published the
+D2-RECV deferral — so a committed NR 5 logged `outgoing=<none> captured=0`, the parked receiver kept
+a saved context still describing its trapping `ecall`, and the later exact-token resume re-entered at
+the wrong pc and took an instruction page fault (`arch_code=0xc`), hanging the boot. It now takes the
+identity from whichever deferral the route actually published; the two are mutually exclusive within
+one trap, and `d2_recv_dispatch_outgoing` is the same accessor the bridge's own D2-recv drain reads.
+x86_64 and AArch64 need no such capture and did not get one: `syscall` saves the address of the
+instruction AFTER the trap in RCX, so their saved `rip` is already past the syscall.
+
+**Live evidence, all three architectures green.** x86_64 core: `IncomingUnavailable` 2 → **0**,
+`IPC_RECV_BLOCK_SPLIT_DONE` 3 → **5**, and two never-run tasks entered ring 3 through the new
+classification (`X86_QUEUE_ADVANCE_FIRST_RESUME tid=3 entry=0x4020f0 sp=0x7fffff7fff68 arg0=3`,
+`tid=1 entry=0x4023d0 arg0=1`), with the blocked receiver later resumed by the D2-recv drain and
+issuing its next receive. x86_64 reply-timeout: `IncomingUnavailable` 38 → **0**, split commits
+61 → **99**, 38 first resumes. x86_64 fat-block: green. Zero refused resumes, zero panics, zero
+double faults, zero unknown traps, zero fail-closed settlements, zero page faults, zero syscall
+refaults. AArch64 core: green, NR 5 commits, 2 first-resume admissions. RISC-V core: green, 75 NR 5
+split commits all `captured=1`, 75 `U8_RECV_TIMEOUT_SETTLED arch=riscv64 broad_lock=0`.
+
+**Pre-existing, exact-base-deferred.** `qemu-ipc-reply-timeout-x86_64-retirement-smoke.sh` remains
+red with the already-established **byte-identical 5/5 signature**, compared line-for-line against an
+isolated `612339b` worktree. It is not target evidence and is neither caused nor repaired here.
+
+**Unchanged.** Lock-rank order, the D3 unmap-before-ACK-before-reclaim fence, terminal-fault routing,
+COW, demand PageFault, Spawn/Fork/Exit, endpoint creation, the futex features, RPi5 and WA3C2 waiter
+ownership are untouched. No new syscall, ABI lane, cap slot, script, workload, selector, marker
+family or generic seam file. NR 2 and FutexWait keep their admission semantics and still route
+through the one `queue_advance_select_step_split` selection owner; NR 2 is deliberately still not on
+the RISC-V whitelist. NR 1 (`IpcSend`) is untouched. **The census remains 2 / 0 / 2** — both terminal
+acquisition sites keep residual classes, so neither is retired, and ***U9 remains OPEN.***
+
 ### U9-QA — the off-lock queue-advancing dispatch prerequisite. DELIVERED. CENSUS-DELTA 0.
 
 **U9-QA prerequisite DELIVERED. U9-QA — CENSUS-DELTA 0 prerequisite.** U9-QA builds the

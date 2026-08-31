@@ -511,7 +511,16 @@ impl SharedKernel {
 
         // (10) commit the blocked server (Runnable + wake plan). Registers are cleared
         // ONLY here, strictly after the claim.
-        match self.sr_commit_blocked_receiver_split(ack.server.tid.0, ack.server.asid) {
+        // Stage 199G-B §1: the NR6 direct request is admitted ONLY for a recv-v2 blocked server —
+        // `publish_ipccall_direct_blocked_server_ack_with` refuses any other `RecvAbiVariant`
+        // before an ack exists, and this transaction runs only against such an ack. So the
+        // recv-v2 projection (the zeroed success shape; every field travels in the 40-byte meta
+        // this transaction already copied) is the correct and only shape here.
+        match self.sr_commit_blocked_receiver_split(
+            ack.server.tid.0,
+            ack.server.asid,
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        ) {
             ReceiverCommit::Committed(affinity) => {
                 // (11) record Reserved → Available — INFALLIBLE for our exact live
                 // reservation. Runs before the rank-1 enqueue, so the record is
@@ -904,7 +913,15 @@ impl SharedKernel {
         let caller_recv_cap = self.blocked_recv_cap_split_read(ack.caller.tid.0, ack.caller.asid);
 
         // (6) commit the blocked caller (Runnable + wake plan) strictly after the claim.
-        match self.sr_commit_blocked_receiver_split(ack.caller.tid.0, ack.caller.asid) {
+        // Stage 199G-B §1: as for the NR6 request above — the NR7 direct reply is admitted only
+        // for a recv-v2 blocked caller (`publish_ipcreply_direct_blocked_caller_ack_with` refuses
+        // any other `RecvAbiVariant`), and the reply metadata was already copied, so the recv-v2
+        // projection is the correct and only shape here.
+        match self.sr_commit_blocked_receiver_split(
+            ack.caller.tid.0,
+            ack.caller.asid,
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        ) {
             ReceiverCommit::Committed(affinity) => {
                 // (7) record Reserved → Consumed — the authoritative one-shot barrier,
                 // BEFORE the rank-1 enqueue. Infallible for our exact reservation.

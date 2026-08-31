@@ -852,7 +852,11 @@ fn write_task_gprs_to_saved_regs(
     // Step 2: new task detection — all user_gprs are zero AND arg(0) is the
     // non-zero task_id written at spawn time.  Deliver startup args through
     // the x86-64 System V function-call ABI registers.
-    let is_new_task = trap_frame.user_gprs.iter().all(|&g| g == 0) && trap_frame.arg(0) != 0;
+    // 203C-XFR: the predicate now lives in ONE place — `UserRegisterContext::is_first_resume_shape`
+    // — because the queue-advance admission has to be able to ask the same question BEFORE the
+    // outgoing task publishes its terminal transition. Inlining a second copy here is exactly how
+    // admission and apply would come to disagree about which convention a task gets.
+    let is_new_task = trap_frame.capture_user_context().is_first_resume_shape();
     if is_new_task {
         regs.rdi = trap_frame.arg(0) as u64; // rdi = arg0 (task_id)
         regs.rsi = trap_frame.arg(1) as u64; // rsi = arg1 (pm_send cap)

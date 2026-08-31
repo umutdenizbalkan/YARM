@@ -373,10 +373,36 @@ pub(crate) fn x86_post_lock_resume_marked_incoming(
     let Some(frame) = frame else {
         return Ok(());
     };
+    // 203C-XFR — revalidate the ACTUALLY selected incarnation and consume a one-shot startup
+    // snapshot, through the ONE classifier admission used. Admission classified the peeked
+    // candidate; a higher-priority wake can displace it before the authoritative dequeue, so the
+    // task about to be returned is re-asked rather than assumed. A refusal here is NOT
+    // reinterpreted as a first resume — it is the same `Context` refusal the caller already
+    // rolls back and fails closed on.
+    let convention = shared
+        .direct_dispatch_classify_and_consume_convention_split(token)
+        .ok_or(X86ResumeRefusal::Context)?;
     let (context, tls) = shared
         .direct_dispatch_restore_context_split(token)
         .ok_or(X86ResumeRefusal::Context)?;
     frame.apply_user_context(context);
+    // The apply itself is convention-neutral: `apply_user_context` installs the continuation, and
+    // the vector epilogue's `write_task_gprs_to_saved_regs` selects the System V startup-argument
+    // delivery or the verbatim GPR restore from the SAME predicate this classification used. The
+    // marker records which one this advance committed to.
+    if matches!(
+        convention,
+        crate::kernel::boot::IncomingResumeConvention::X86FirstResume
+    ) {
+        crate::yarm_log!(
+            "X86_QUEUE_ADVANCE_FIRST_RESUME tid={} cpu={} entry=0x{:x} sp=0x{:x} arg0={} result=ok",
+            incoming,
+            cpu.0,
+            context.instruction_ptr.0,
+            context.stack_ptr.0,
+            context.arg0
+        );
+    }
     // U6 §8 — the BLOCKED-SEND completion boundary on x86_64.
     //
     // Placed immediately after `apply_user_context`, which reloads the sender's pre-block

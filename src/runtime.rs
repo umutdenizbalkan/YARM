@@ -2582,6 +2582,43 @@ impl SharedKernel {
     /// the TCB's ASID must still equal the one the mark recorded. If the TCB was replaced by a
     /// different incarnation that reused the numeric TID, this returns `None` and the caller
     /// takes its fatal/rollback path; the replacement's context is never copied into the frame.
+    /// 203C-XFR — revalidate the ACTUALLY selected incarnation's resume convention and, when it
+    /// is the one-shot startup snapshot, CONSUME it. One rank-2 acquisition, so the classify and
+    /// the consume cannot be split by anything.
+    ///
+    /// Admission classified the PEEKED candidate; a higher-priority wake may have displaced it
+    /// between the peek and the authoritative dequeue, so the task about to be returned to
+    /// userspace is re-asked the same question through the same owner
+    /// (`classify_incoming_resume_convention`) rather than inheriting admission's answer.
+    ///
+    /// `None` is a refusal, and the caller must NOT reinterpret it — in particular a failed
+    /// exact-token classification never becomes a first resume here. The consume is what makes
+    /// "a seeded startup snapshot is returned through exactly once" true: a second attempt on the
+    /// same snapshot classifies as `None`.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn direct_dispatch_classify_and_consume_convention_split(
+        &self,
+        token: DispatchMarkToken,
+    ) -> Option<crate::kernel::boot::IncomingResumeConvention> {
+        use crate::kernel::boot::IncomingResumeConvention;
+        let incoming = token.tid();
+        let expected = token.expect_asid()?;
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == incoming && t.asid == Some(expected))?;
+            let convention = crate::kernel::boot::classify_incoming_resume_convention(
+                tcb,
+                crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+            )?;
+            if matches!(convention, IncomingResumeConvention::X86FirstResume) {
+                tcb.first_resume_consumed = true;
+            }
+            Some(convention)
+        })
+    }
+
     pub(crate) fn direct_dispatch_restore_context_split(
         &self,
         token: DispatchMarkToken,
@@ -3046,6 +3083,7 @@ impl SharedKernel {
         waiter_tid: u64,
         endpoint_idx: usize,
         wake_tid: Option<crate::kernel::ipc::ThreadId>,
+        result: crate::kernel::boot::BlockedRecvDeliveryResult,
     ) -> Result<(), KernelError> {
         use crate::kernel::boot::{ReceiverWaiterIdentity, map_scheduler_error};
         use crate::kernel::vm::Asid;
@@ -3061,8 +3099,12 @@ impl SharedKernel {
 
         // (2) rank 2 — return-register clear, then the wake TID's current ASID. An absent waiter
         // TCB mutates nothing and is not an error, exactly as the locked helper behaves.
+        // Stage 199G-B §1 — the ONE variant-driven projection, in the SAME rank-2 acquisition
+        // the pre-199G-B clear occupied. Publishing here keeps the result visible strictly
+        // before the rank-3 waiter clear and the rank-1 wake below, so a woken receiver can
+        // never observe its own stale pre-block frame.
         let wake_asid = self.with_task_tcbs_split_mut(|tcbs| {
-            KernelState::clear_blocked_recv_return_regs_locked(tcbs, waiter_tid);
+            KernelState::publish_blocked_recv_delivery_result_locked(tcbs, waiter_tid, result);
             wake_tid.map(|w| {
                 tcbs.iter()
                     .flatten()
@@ -4321,13 +4363,14 @@ impl SharedKernel {
             wait_gen
         );
         crate::yarm_log!(
-            "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={}",
+            "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={} abi={}",
             tid,
             recv_cap.0,
             state.payload_user_ptr,
             state.payload_user_len,
             state.meta_user_ptr,
-            state.meta_user_len
+            state.meta_user_len,
+            state.recv_abi.slug()
         );
         Some(wait_gen)
     }
@@ -6898,13 +6941,18 @@ impl SharedKernel {
                         crate::kernel::syscall::SyscallError::InvalidArgs,
                     ));
                 }
-                if self
-                    .copy_to_user_split(
-                        snap.waiter_asid,
-                        crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
-                        &snap.meta,
-                    )
-                    .is_err()
+                // Stage 199G-B §1 — the metadata copy is the ONE step that varies by variant.
+                // A `LegacyTimeout` waiter provided no metadata buffer (its request carries
+                // `RecvMetaTarget::None`), so writing one would be a copy into address 0. The
+                // payload copy above, and every step below, are shared unchanged.
+                if snap.recv_abi.writes_recv_v2_meta()
+                    && self
+                        .copy_to_user_split(
+                            snap.waiter_asid,
+                            crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
+                            &snap.meta,
+                        )
+                        .is_err()
                 {
                     return Err(TrapHandleError::Syscall(
                         crate::kernel::syscall::SyscallError::InvalidArgs,
@@ -6934,11 +6982,20 @@ impl SharedKernel {
                 // U3 (canonical 203C): the class-neutral rank-ordered completion transaction
                 // replaces this broad re-entry. Same order, same identity, same wake; the
                 // result stays ignored exactly as `let _ = self.with_cpu(...)` ignored it.
+                // Stage 199G-B §1 — the final register projection, selected by the waiter's own
+                // saved variant. A plain delivery carries no transferred cap, so the legacy
+                // `ret2` lane is the canonical no-transfer sentinel.
                 let _ = self.complete_blocked_waiter_delivery_split(
                     cpu,
                     snap.waiter_tid,
                     snap.endpoint_idx,
                     snap.wake_tid,
+                    crate::kernel::boot::BlockedRecvDeliveryResult {
+                        recv_abi: snap.recv_abi,
+                        sender_tid: snap.sender_tid,
+                        payload_len: snap.payload_len,
+                        transfer_cap: None,
+                    },
                 );
                 crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_plain");
                 // Stage 193A: for an IpcSend-origin plain delivery, emit the IpcSend boundary
@@ -7235,13 +7292,14 @@ impl SharedKernel {
                 &snap.payload[..snap.payload_len],
             )
             .is_ok()
-            && self
-                .copy_to_user_split(
-                    snap.waiter_asid,
-                    crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
-                    &meta,
-                )
-                .is_ok();
+            && (!snap.recv_abi.writes_recv_v2_meta()
+                || self
+                    .copy_to_user_split(
+                        snap.waiter_asid,
+                        crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
+                        &meta,
+                    )
+                    .is_ok());
         if !copy_ok {
             self.clear_reply_waiter_cap_split(snap.reply_index, snap.reply_generation);
             self.rollback_minted_cap_split(snap.receiver_cnode, CapId(local_cap), reply_object);
@@ -7284,6 +7342,12 @@ impl SharedKernel {
             snap.waiter_tid,
             snap.endpoint_idx,
             snap.wake_tid,
+            crate::kernel::boot::BlockedRecvDeliveryResult {
+                recv_abi: snap.recv_abi,
+                sender_tid: snap.sender_tid,
+                payload_len: snap.payload_len,
+                transfer_cap: Some(CapId(local_cap)),
+            },
         );
         crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_reply_cap");
         // Stage 193D: for an IpcSend-origin reply-cap delivery, emit the IpcSend-reply-cap
@@ -7299,10 +7363,12 @@ impl SharedKernel {
             );
             crate::kernel::boot::maybe_log_ipc_send_reply_cap_retired();
         }
-        crate::yarm_log!(
-            "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
-            snap.waiter_tid
-        );
+        if snap.recv_abi.writes_recv_v2_meta() {
+            crate::yarm_log!(
+                "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
+                snap.waiter_tid
+            );
+        }
         crate::yarm_log!("REPLY_CAP_RANK_SEAM_DONE result=ok");
         crate::yarm_log!("DISPATCH_POST_WORK_DONE kind=blocked_waiter_reply_cap result=ok");
         Ok(())
@@ -7446,13 +7512,14 @@ impl SharedKernel {
                 &snap.payload[..snap.payload_len],
             )
             .is_ok()
-            && self
-                .copy_to_user_split(
-                    snap.waiter_asid,
-                    crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
-                    &meta,
-                )
-                .is_ok();
+            && (!snap.recv_abi.writes_recv_v2_meta()
+                || self
+                    .copy_to_user_split(
+                        snap.waiter_asid,
+                        crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
+                        &meta,
+                    )
+                    .is_ok());
         if !copy_ok {
             // U9-D3 §6: the phased split composition performs the COMPLETE teardown off the broad
             // lock for every class this site can produce — including the memory-backed cohort,
@@ -7499,6 +7566,12 @@ impl SharedKernel {
             snap.waiter_tid,
             snap.endpoint_idx,
             snap.wake_tid,
+            crate::kernel::boot::BlockedRecvDeliveryResult {
+                recv_abi: snap.recv_abi,
+                sender_tid: snap.sender_tid,
+                payload_len: snap.payload_len,
+                transfer_cap: Some(CapId(local_cap)),
+            },
         );
         crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_ordinary_cap");
         // Stage 193C: for an IpcSend-origin ordinary-cap delivery, emit the IpcSend-cap
@@ -7514,10 +7587,12 @@ impl SharedKernel {
             );
             crate::kernel::boot::maybe_log_ipc_send_ordinary_cap_retired();
         }
-        crate::yarm_log!(
-            "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
-            snap.waiter_tid
-        );
+        if snap.recv_abi.writes_recv_v2_meta() {
+            crate::yarm_log!(
+                "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
+                snap.waiter_tid
+            );
+        }
         crate::yarm_log!("DISPATCH_POST_WORK_DONE kind=blocked_waiter_ordinary_cap result=ok");
         Ok(())
     }
@@ -9109,6 +9184,7 @@ impl SharedKernel {
         &self,
         tid: u64,
         asid: crate::kernel::vm::Asid,
+        result: crate::kernel::boot::BlockedRecvDeliveryResult,
     ) -> ReceiverCommit {
         use crate::kernel::task::{TaskStatus, WaitReason};
         self.with_task_tcbs_split_mut(|tcbs| {
@@ -9135,7 +9211,7 @@ impl SharedKernel {
             }
             // Infallible commit for a still-live matching blocked receiver: clear the blocked-return
             // register state (single-sourced arch-gated helper), then set Runnable + capture affinity.
-            KernelState::clear_blocked_recv_return_regs_locked(tcbs, tid);
+            KernelState::publish_blocked_recv_delivery_result_locked(tcbs, tid, result);
             let tcb = tcbs
                 .iter_mut()
                 .flatten()
@@ -10015,6 +10091,30 @@ impl SharedKernel {
                 if deadline != work.deadline || now < deadline {
                     return false;
                 }
+                // Stage 199G-B §A — PUBLISH `TimedOut` INTO THE SAVED INCOMING CONTEXT, in this
+                // same acquisition, BEFORE the task becomes `Runnable`.
+                //
+                // Before 199G-B this claim published only the FLAG. That was sound while every
+                // ordinary-recv timeout victim was still inside its live trap frame:
+                // `ipc_recv_until_deadline` returns in place and the running handler writes
+                // `err = TimedOut` from `consume_ipc_timeout_fired_for_tid`. A receiver that
+                // LEFT its frame has no such handler, and would resume on whatever its frame
+                // last held — the pre-lock route's `WouldBlock` — reporting "would block" for a
+                // deadline that actually expired.
+                //
+                // The publication owner is the one that already exists and is arch-complete:
+                // x86_64 installs the saved result registers, RISC-V publishes through the
+                // canonical return helper with its mirror lanes, and every port parks the
+                // generation-bearing `BlockedSyscallCompletion` that AArch64's resume boundary
+                // consumes exactly once. It is invoked here rather than reimplemented so the
+                // timeout and the reply/server-death classes keep ONE completion shape.
+                //
+                // Ordering is what makes it safe: the `TimedOut` fact is visible before the
+                // wake, and nothing enqueues until phase (3).
+                crate::kernel::boot::publish_blocked_recv_timeout_result(
+                    tcb,
+                    crate::kernel::syscall::SyscallError::TimedOut.code() as u64,
+                );
                 tcb.status = TaskStatus::Runnable;
                 tcb.ipc_timeout_deadline = None;
                 tcb.ipc_timeout_fired = true;
@@ -10234,6 +10334,7 @@ impl SharedKernel {
     pub(crate) fn sr_finalize_blocked_receiver_and_wake_split(
         &self,
         snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+        result: crate::kernel::boot::BlockedRecvDeliveryResult,
     ) -> Option<bool> {
         if !snap.blocked_endpoint_waiter {
             // Plain wake path: no endpoint-waiter identity to claim (queued dequeue / txn proofs).
@@ -10272,7 +10373,7 @@ impl SharedKernel {
         // placement can restore the exact blocked state.
         let recv_cap = self.blocked_recv_cap_split_read(snap.receiver_tid, snap.receiver_asid);
         // Phase 3 (rank 2): commit — registers cleared ONLY here, strictly after the claim.
-        match self.sr_commit_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
+        match self.sr_commit_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid, result) {
             ReceiverCommit::Committed(affinity) => {
                 // Phase 4 (rank 1): the single enqueue — the last externally visible act.
                 //
@@ -11242,11 +11343,15 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
     ) -> bool {
         self.0.copy_to_user_split(asid, va, bytes).is_ok()
     }
+    // (`ctx_finalize_and_wake` below carries the Stage 199G-B §1 projection; the runner decides
+    // whether a metadata copy happens at all, so this seam stays ABI-agnostic.)
     fn ctx_finalize_and_wake(
         &mut self,
         snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+        result: crate::kernel::boot::BlockedRecvDeliveryResult,
     ) -> Option<bool> {
-        self.0.sr_finalize_blocked_receiver_and_wake_split(snap)
+        self.0
+            .sr_finalize_blocked_receiver_and_wake_split(snap, result)
     }
     fn ctx_release_pin(&mut self, object: CapObject) {
         self.0.sr_release_pin_split(object)

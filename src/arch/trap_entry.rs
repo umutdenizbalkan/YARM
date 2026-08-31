@@ -2545,6 +2545,13 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // `d2_resume_marked_incoming` — has settled AArch64 blocking-recv resumes live since U4
         // widened it here.
         || raw_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_NR
+        // Stage 199G-B §2 — IpcRecvTimeout (NR 5). Its pre-lock route is the SAME route NR 2
+        // already takes here, differing only in which ABI builder decodes the request, whether a
+        // deadline is armed, and which `RecvAbiVariant` the saved state carries; its completion is
+        // the same variant-driven writeback and the same shared D2-recv drain that has settled
+        // AArch64 blocking-recv resumes since U4. Without the import `nr` stays 0, the split
+        // dispatcher declines, and NR 5 would keep its terminal broad edge on this architecture.
+        || raw_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

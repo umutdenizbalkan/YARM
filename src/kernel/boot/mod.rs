@@ -17,7 +17,10 @@ mod exec_state;
 // U9-QA §1: the queue-advance apply convention is named by callers outside this module (the
 // pre-lock split route), so it is re-exported alongside the transaction it parameterises.
 #[cfg_attr(feature = "hosted-dev", allow(unused_imports))]
-pub(crate) use exec_state::{QueueAdvanceApply, QueueAdvanceOutcome};
+pub(crate) use exec_state::{
+    IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome,
+    classify_incoming_resume_convention,
+};
 mod fault_endpoint_state;
 mod fault_state;
 // U9-FT2 §2: the ONE PageFault classification evaluator and its named fact types are
@@ -4619,6 +4622,13 @@ pub(crate) use ipc_state::{
     ipc_try_recv_queued_admitted_locked, ipc_try_recv_queued_plain_endpoint_only_locked,
     ipc_try_recv_queued_with_cap_transfer_locked,
 };
+// Stage 199G-B §A: the ONE blocked-receive completion publication, re-exported so the off-lock
+// ordinary receive-timeout drain in `runtime.rs` writes the identical three-architecture result
+// shape the reply-timeout and server-death classes already write.
+pub(crate) use ipc_state::publish_blocked_recv_timeout_result;
+// Stage 199G-B §1: the delivery projection the ONE blocked-receive writeback owner consumes,
+// re-exported for the post-work drains in `runtime.rs` that gather it.
+pub(crate) use thread_state::BlockedRecvDeliveryResult;
 
 /// Which reverse link a close is entitled to remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

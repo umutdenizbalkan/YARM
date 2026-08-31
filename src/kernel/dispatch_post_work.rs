@@ -39,6 +39,7 @@
 
 use super::capabilities::{CNodeId, CapId, CapObject, CapRights};
 use super::ipc::{Message, ThreadId};
+use super::task::RecvAbiVariant;
 use super::vm::Asid;
 
 /// Encoded recv-v2 metadata length (mirrors `IPC_RECV_META_V2_ENCODED_LEN`).
@@ -224,6 +225,12 @@ pub(crate) enum DispatchPostWorkDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockedWaiterSharedRegionDeliverySnapshot {
     /// The accepted post-lock transaction snapshot (executed by `shared_region_execute`).
+    ///
+    /// Stage 199G-B §1: the waiter's own `RecvAbiVariant` rides INSIDE this snapshot
+    /// (`RecvBoundarySharedRegionSnapshot::recv_abi`), not beside it — the shared-region
+    /// transaction is the thing that performs the metadata copy and the completion, so the
+    /// variant that selects those projections belongs to the same by-value record. One carrier,
+    /// captured from the waiter's saved blocked-receive state in Phase A, never re-derived.
     pub(crate) snapshot: crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
     /// Endpoint index whose receiver-waiter slot the executor clears in Phase C (direct path).
     pub(crate) endpoint_idx: usize,
@@ -239,6 +246,16 @@ pub(crate) struct BlockedWaiterSharedRegionDeliverySnapshot {
 /// (Phase B), then clears the waiter's return registers and wakes it (Phase C).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockedWaiterPlainDeliverySnapshot {
+    /// Stage 199G-B §1 — which receive ABI the WAITER issued, read from its saved
+    /// blocked-receive state in Phase A and never re-derived later.
+    ///
+    /// It selects the final register/meta projection and nothing else: payload copy, cap
+    /// materialization, rollback, waiter claim, completion and wake are shared by both
+    /// variants. Carrying it here rather than inferring it at the drain is what keeps that
+    /// true — the message shape and the syscall number cannot tell you which ABI the *receiver*
+    /// asked for, and guessing from either is how a legacy receiver would get a meta write it
+    /// never provided a buffer for.
+    pub(crate) recv_abi: RecvAbiVariant,
     /// The blocked waiter (delivery target).
     pub(crate) waiter_tid: u64,
     /// The waiter's ASID (resolved in Phase A; the copy target address space).
@@ -253,6 +270,12 @@ pub(crate) struct BlockedWaiterPlainDeliverySnapshot {
     pub(crate) meta_user_ptr: usize,
     /// Pre-encoded 40-byte recv-v2 meta, by value.
     pub(crate) meta: [u8; DISPATCH_POST_WORK_META_LEN],
+    /// Stage 199G-B §1 — the sending thread, for the `LegacyTimeout` projection's `ret0`.
+    ///
+    /// The recv-v2 projection does not use it (its meta status word carries 0 on this class,
+    /// byte-identically to before), but the legacy one returns the sender in `ret0` exactly as
+    /// the broad `handle_ipc_recv_result_with_empty_error` success arm does.
+    pub(crate) sender_tid: u64,
     /// Endpoint index whose receiver-waiter slot the executor clears in Phase C
     /// (the legacy `ipc_clear_plain_receiver_waiter_only` step).
     pub(crate) endpoint_idx: usize,
@@ -278,6 +301,16 @@ pub(crate) struct BlockedWaiterPlainDeliverySnapshot {
 /// `payload_len`, and `sender_tid`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockedWaiterOrdinaryCapDeliverySnapshot {
+    /// Stage 199G-B §1 — which receive ABI the WAITER issued, read from its saved
+    /// blocked-receive state in Phase A and never re-derived later.
+    ///
+    /// It selects the final register/meta projection and nothing else: payload copy, cap
+    /// materialization, rollback, waiter claim, completion and wake are shared by both
+    /// variants. Carrying it here rather than inferring it at the drain is what keeps that
+    /// true — the message shape and the syscall number cannot tell you which ABI the *receiver*
+    /// asked for, and guessing from either is how a legacy receiver would get a meta write it
+    /// never provided a buffer for.
+    pub(crate) recv_abi: RecvAbiVariant,
     /// The blocked waiter (delivery target + delegation child owner).
     pub(crate) waiter_tid: u64,
     /// The waiter's ASID (resolved in Phase A; the copy target address space).
@@ -325,6 +358,16 @@ pub(crate) struct BlockedWaiterOrdinaryCapDeliverySnapshot {
 /// CapId is only known then).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockedWaiterReplyCapDeliverySnapshot {
+    /// Stage 199G-B §1 — which receive ABI the WAITER issued, read from its saved
+    /// blocked-receive state in Phase A and never re-derived later.
+    ///
+    /// It selects the final register/meta projection and nothing else: payload copy, cap
+    /// materialization, rollback, waiter claim, completion and wake are shared by both
+    /// variants. Carrying it here rather than inferring it at the drain is what keeps that
+    /// true — the message shape and the syscall number cannot tell you which ABI the *receiver*
+    /// asked for, and guessing from either is how a legacy receiver would get a meta write it
+    /// never provided a buffer for.
+    pub(crate) recv_abi: RecvAbiVariant,
     /// The blocked waiter (delivery target + reply-cap owner).
     pub(crate) waiter_tid: u64,
     /// The waiter's ASID (resolved in Phase A; the copy target address space).

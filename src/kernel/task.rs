@@ -21,9 +21,52 @@ pub enum WaitReason {
     Poll,
 }
 
+/// Which receive ABI a blocked receiver's completion must be written back in.
+///
+/// **This is an INTERNAL model, not a syscall ABI.** Both variants describe receives whose
+/// register-level contract already exists and is unchanged; the variant only tells the one
+/// completion owner which of the two writeback shapes the parked caller is owed.
+///
+/// Stage 199G-B §A adds `LegacyTimeout`. Before it, this enum had a single variant and
+/// `BlockedRecvState` was stored on exactly one path — `handle_ipc_recv`'s recv-v2 arm — so a
+/// blocked NR 5 receiver had NO completion record at all. That was sound only because every NR 5
+/// victim stayed inside its live trap frame: `ipc_recv_until_deadline` returns in place and the
+/// still-running handler writes the result from locals. A receiver that LEAVES its frame — which
+/// is what a pre-lock route does — has no such handler to return to, so without a record it would
+/// resume on whatever its frame last held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvAbiVariant {
+    /// NR 2 with a metadata buffer: the 40-byte `encode_recv_v2_meta` struct is written to
+    /// `meta_user_ptr`, and `ret0` is 0 because every field travels in the struct.
     RecvV2,
+    /// NR 5 (`ipc_recv_timeout`), and the legacy NR 2 shape it shares: payload only, **no
+    /// metadata write**, `ret0` carries the sender TID. `meta_user_ptr` / `meta_user_len` are
+    /// not part of this variant's contract and are stored as 0.
+    ///
+    /// The empty outcomes are the two `handle_ipc_recv_result_with_empty_error` writes and
+    /// nothing else: `err = TimedOut` (deadline won) or `err = WouldBlock` (non-blocking probe),
+    /// with the transfer-cap return lane cleared.
+    LegacyTimeout,
+}
+
+impl RecvAbiVariant {
+    /// Whether this variant owes the receiver a recv-v2 metadata struct.
+    ///
+    /// The single question every writeback-shape decision asks, so no site re-derives it by
+    /// comparing variants itself.
+    #[must_use]
+    pub const fn writes_recv_v2_meta(self) -> bool {
+        matches!(self, Self::RecvV2)
+    }
+
+    /// Stable slug for markers/telemetry.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::RecvV2 => "recv_v2",
+            Self::LegacyTimeout => "legacy_timeout",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +77,30 @@ pub struct BlockedRecvState {
     pub meta_user_ptr: usize,
     pub meta_user_len: usize,
     pub recv_abi: RecvAbiVariant,
+}
+
+impl BlockedRecvState {
+    /// Stage 199G-B §A — the NR 5 / legacy blocked-receive completion contract.
+    ///
+    /// Constructed where the caller still holds its live trap frame, so the payload destination
+    /// it names is the one the caller actually passed. `meta_user_ptr`/`meta_user_len` are 0 by
+    /// construction: `RecvAbiVariant::LegacyTimeout` writes no metadata, and storing a pointer
+    /// this variant will never honour would be a lie a later reader could act on.
+    #[must_use]
+    pub const fn legacy_timeout(
+        recv_cap: CapId,
+        payload_user_ptr: usize,
+        payload_user_len: usize,
+    ) -> Self {
+        Self {
+            recv_cap,
+            payload_user_ptr,
+            payload_user_len,
+            meta_user_ptr: 0,
+            meta_user_len: 0,
+            recv_abi: RecvAbiVariant::LegacyTimeout,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +197,44 @@ impl Default for UserRegisterContext {
             arg4: 0,
             arg5: 0,
         }
+    }
+}
+
+/// 203C-XFR — the ONE classification of a userspace continuation's shape.
+///
+/// The x86_64 return path has always had two conventions and has always chosen between them
+/// here, in `write_task_gprs_to_saved_regs`: a task whose whole GPR file is zero and whose
+/// `arg0` carries the non-zero task id written at spawn has never run, so its startup ABI is
+/// delivered through the System V argument registers; anything else is a resumed task whose
+/// saved GPR snapshot is restored verbatim.
+///
+/// Before 203C-XFR that decision lived only in the arch writeback, which runs AFTER the queue
+/// advance has already dequeued the task and made it current — far too late for admission to
+/// use. Lifting the predicate here, onto the value both sides already hold, is what lets the
+/// queue-advance admission ask the SAME question the apply will answer, instead of the
+/// kernel-thread `switch_frames` question (`kernel_context.initialized`) it used to ask and
+/// which no production user task has ever satisfied.
+impl UserRegisterContext {
+    /// True when this continuation is a never-run task's seeded startup snapshot.
+    ///
+    /// Byte-identical to the `is_new_task` predicate the x86_64 saved-register writeback
+    /// computes; both now call this, so admission and apply cannot disagree about which
+    /// convention a task gets.
+    #[must_use]
+    pub fn is_first_resume_shape(&self) -> bool {
+        self.user_gprs.iter().all(|&g| g == 0) && self.arg0 != 0
+    }
+
+    /// True when this continuation can actually be returned through.
+    ///
+    /// `flush_trap_context_to_iret_frame` leaves the hardware frame's `rip`/`rsp` UNTOUCHED
+    /// when either is zero — which for a selected incoming task would mean `iretq`ing through
+    /// whatever frame the outgoing task left behind. That is the concrete hazard admission has
+    /// to exclude, so it is stated as a property of the continuation rather than inferred from
+    /// an unrelated bit.
+    #[must_use]
+    pub fn is_restorable(&self) -> bool {
+        self.instruction_ptr.0 != 0 && self.stack_ptr.0 != 0
     }
 }
 
@@ -252,6 +357,18 @@ pub struct ThreadControlBlock {
     /// this and a stale timeout completion is refused. Bumped when a fresh blocked
     /// recv is published.
     pub blocked_recv_generation: u64,
+    /// 203C-XFR — the one-shot latch on this incarnation's SEEDED STARTUP SNAPSHOT.
+    ///
+    /// A never-run task's `user_context` is not a saved continuation; it is a startup snapshot
+    /// written once at spawn. Returning through it twice would re-enter the task's entry point
+    /// with its startup ABI a second time, silently restarting a task that was already running.
+    /// The queue-advance apply therefore CONSUMES the snapshot when it selects the first-resume
+    /// convention, and the classifier refuses that convention once this is set — so the same
+    /// startup state can be used exactly once.
+    ///
+    /// It is deliberately not "has ever run": a resumed task is admitted on the strength of its
+    /// saved continuation, which this says nothing about.
+    pub first_resume_consumed: bool,
     /// U6 §2 — a monotonic per-task blocked-SEND generation, the send-side sibling of
     /// [`Self::blocked_recv_generation`] and deliberately a SEPARATE coordinate.
     ///
@@ -825,6 +942,7 @@ impl ThreadControlBlock {
             reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick,
             server_reply_link: None,
             blocked_recv_generation: 0,
+            first_resume_consumed: false,
             blocked_send_generation: 0,
             pending_syscall_completion: None,
             async_preempted: None,
