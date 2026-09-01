@@ -71379,17 +71379,29 @@ mod stage198e3c1_direct_live_policy {
     // (10) Exactly ONE TransferEnvelope is created on a successful shared-region send.
     #[test]
     fn abi_guard_one_transfer_envelope() {
-        // The large-transfer branch stashes exactly one envelope carrying the region descriptor.
+        // 199G-C4 §1 folded the two shared-region arms (user sender and kernel task) into ONE,
+        // selected by the shape owner, so the property is now structural rather than repeated:
+        // the shared-region arm stashes exactly one envelope, and it carries the descriptor.
         let large = IPC_SYSCALL_SRC
-            .split_once("if len > Message::MAX_PAYLOAD {")
-            .and_then(|(_, r)| r.split_once("} else {").map(|(b, _)| b))
-            .expect("large-transfer branch");
+            .split_once("IpcSendPayloadShape::SharedRegion => {")
+            .and_then(|(_, r)| {
+                r.split_once("IpcSendPayloadShape::Inline => {")
+                    .map(|(b, _)| b)
+            })
+            .expect("shared-region arm");
         assert_eq!(
             large.matches("stash_transfer_handle(").count(),
             1,
-            "exactly one TransferEnvelope stash on the large-transfer path"
+            "exactly one TransferEnvelope stash on the shared-region path"
         );
         assert!(large.contains("Some(TransferSharedRegion {"));
+        // And the inline arm stashes exactly one too, with no region descriptor.
+        let inline = IPC_SYSCALL_SRC
+            .split_once("IpcSendPayloadShape::Inline => {")
+            .and_then(|(_, r)| r.split_once("\n    };\n").map(|(b, _)| b))
+            .expect("inline arm");
+        assert_eq!(inline.matches("stash_transfer_handle(").count(), 1);
+        assert!(!inline.contains("TransferSharedRegion"));
     }
 
     // (11) The contract document and the source constants agree.
@@ -136185,13 +136197,31 @@ mod u6_frame_exact_envelope_preservation {
     #[test]
     fn admission_stamps_sender_tid_from_the_authoritative_sender() {
         let code = code_of(SYSCALL_IPC);
-        // Every kernel-side construction in the send path stamps the resolved `sender_tid`.
-        let constructions = code
-            .matches("Message::with_header(\n                sender_tid,")
-            .count();
+        // 199G-C4 §1 gave the send path ONE framing owner, so instead of four constructions that
+        // each had to remember to stamp the authoritative sender, there is one that cannot
+        // forget — and both admission arms reach it with the resolved `sender_tid`.
+        assert_eq!(
+            code.matches("pub(crate) fn frame_ipc_send_message(")
+                .count(),
+            1,
+            "one send-message framing owner"
+        );
+        let owner = code
+            .split_once("pub(crate) fn frame_ipc_send_message(")
+            .map(|(_, r)| r)
+            .expect("framing owner");
         assert!(
-            constructions >= 4,
-            "every send-admission Message construction must stamp the resolved sender_tid \
+            owner.contains(
+                "Message::with_header(sender_tid, opcode, flags, transfer_handle, payload)"
+            ),
+            "the owner stamps the sender TID it was given"
+        );
+        let constructions = code
+            .matches("frame_ipc_send_message(\n                sender_tid,")
+            .count();
+        assert_eq!(
+            constructions, 2,
+            "both send-admission arms frame through the owner with the resolved sender_tid \
              (found {constructions})"
         );
         assert!(
