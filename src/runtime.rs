@@ -4398,7 +4398,7 @@ impl SharedKernel {
         has_finite_deadline: bool,
     ) -> (
         crate::kernel::recv_waiter_split::PublishWaiterOutcome,
-        Option<Option<crate::kernel::deadline_token::DeadlineTokenHandle>>,
+        crate::kernel::boot::ReplyWaitArm,
     ) {
         let (outcome, armed) = self.with_ipc_split_mut(|ipc| {
             let outcome = crate::kernel::boot::publish_recv_waiter_locked(
@@ -4425,7 +4425,7 @@ impl SharedKernel {
                     has_finite_deadline,
                 )
             } else {
-                None
+                crate::kernel::boot::ReplyWaitArm::NotAReplyWait
             };
             (outcome, armed)
         });
@@ -4434,24 +4434,101 @@ impl SharedKernel {
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
         ) {
             crate::yarm_log!("D2_RECV_WAITER_PUBLISHED tid={}", record.receiver.tid.0);
-            if let Some((identity, _, deadline_ok)) = armed {
-                crate::yarm_log!(
-                    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid={} caller_asid={} record_index={} record_generation={} replier_tid={} blocked_recv_generation={} finite_deadline={} deadline_reserved={} result=ok",
-                    identity.caller_tid.0,
-                    identity.caller_asid.0,
-                    identity.reply_record_index,
-                    identity.reply_record_generation,
-                    identity.replier_tid.0,
-                    identity.blocked_recv_generation,
-                    u8::from(has_finite_deadline),
-                    u8::from(deadline_ok && has_finite_deadline)
-                );
+            match armed {
+                crate::kernel::boot::ReplyWaitArm::Armed { identity, token } => {
+                    crate::yarm_log!(
+                        "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid={} caller_asid={} record_index={} record_generation={} replier_tid={} blocked_recv_generation={} finite_deadline={} deadline_reserved={} result=ok",
+                        identity.caller_tid.0,
+                        identity.caller_asid.0,
+                        identity.reply_record_index,
+                        identity.reply_record_generation,
+                        identity.replier_tid.0,
+                        identity.blocked_recv_generation,
+                        u8::from(has_finite_deadline),
+                        u8::from(token.is_some())
+                    );
+                }
+                crate::kernel::boot::ReplyWaitArm::DeadlineRefused { identity } => {
+                    crate::yarm_log!(
+                        "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid={} caller_asid={} record_index={} record_generation={} replier_tid={} blocked_recv_generation={} finite_deadline=1 deadline_reserved=0 result=refused",
+                        identity.caller_tid.0,
+                        identity.caller_asid.0,
+                        identity.reply_record_index,
+                        identity.reply_record_generation,
+                        identity.replier_tid.0,
+                        identity.blocked_recv_generation
+                    );
+                }
+                crate::kernel::boot::ReplyWaitArm::NotAReplyWait => {}
             }
         }
-        (
-            outcome,
-            armed.and_then(|(_, token, ok)| ok.then_some(token)),
-        )
+        (outcome, armed)
+    }
+
+    /// 199D-SD3 — arm the ServerDies scenario scope from the TERMINAL ARM, not from the
+    /// deadline registration.
+    ///
+    /// The scope decides which reply record the ServerDies transition counters attribute their
+    /// edges to. It used to be armed inside `register_reply_receive_deadline`, which made the
+    /// whole scenario audit depend on the caller having asked for a finite timeout — but server
+    /// death is equally valid for a wait with NO deadline, and on the split route that
+    /// registration was unreachable entirely, so `LinkDetached` stayed 0 while `PeerDeathWinner`
+    /// counted 1 and the audit reported a `RECORD_LEAK` that was a counting asymmetry rather than
+    /// a leaked record.
+    ///
+    /// Arming from the terminal identity fixes both: every reply wait that arms an owner is in
+    /// scope, deadline or not. Observation only — it never installs, removes or repairs a link,
+    /// and it is compiled only under the oracle feature and armed only in ServerDies mode.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn arm_server_dies_link_scope_split(
+        &self,
+        record_index: usize,
+        record_generation: u64,
+    ) {
+        use crate::kernel::boot::server_dies_counters as c;
+        if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            != crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+        {
+            return;
+        }
+        if !c::arm_record(record_index, record_generation) {
+            return;
+        }
+        let bound = self.with_ipc_split_mut(|ipc| {
+            if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+                return None;
+            }
+            ipc.reply_caps
+                .get(record_index)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.responder_tid.zip(r.replier_asid))
+        });
+        let Some((server_tid, server_asid)) = bound else {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} link_present=0 reason=unbound_record result=ok",
+                record_index,
+                record_generation
+            );
+            return;
+        };
+        let present = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid.0 && t.asid == Some(server_asid))
+                .and_then(|t| t.server_reply_link)
+                .is_some_and(|link| link.matches_record(record_index, record_generation))
+        });
+        if present {
+            c::note_armed_link_present(record_index, record_generation);
+        }
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} server_tid={} server_asid={} link_present={} result=ok",
+            record_index,
+            record_generation,
+            server_tid.0,
+            server_asid.0,
+            u32::from(present)
+        );
     }
 
     /// 199E-DL — cancel an EXACT deadline reservation (rank 3), the compensation for a rank-2

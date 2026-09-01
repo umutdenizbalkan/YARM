@@ -1714,7 +1714,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     // of that write and already prints it, so printing it again would double the marker.
     // Phase C — ipc rank 3. The atomic recheck-and-publish, through the ONE policy owner both
     // routes share.
-    let (outcome, reserved_deadline) = shared.recv_block_phase_c_split(
+    let (outcome, reply_wait_arm) = shared.recv_block_phase_c_split(
         endpoint_idx,
         crate::kernel::boot::EndpointWaiterRecord::new(
             crate::kernel::boot::ReceiverWaiterIdentity::new(
@@ -1790,6 +1790,20 @@ fn try_split_blocking_ipc_recv_into_frame(
             )));
         }
     }
+    // (9a) 199D-SD3 — arm the ServerDies scenario scope from the TERMINAL ARM. Deliberately
+    // independent of the deadline half: server death is equally valid for a wait with no finite
+    // deadline, so the audit's scope must not depend on one being registered.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    match reply_wait_arm {
+        crate::kernel::boot::ReplyWaitArm::Armed { identity, .. }
+        | crate::kernel::boot::ReplyWaitArm::DeadlineRefused { identity } => {
+            shared.arm_server_dies_link_scope_split(
+                identity.reply_record_index,
+                identity.reply_record_generation,
+            );
+        }
+        crate::kernel::boot::ReplyWaitArm::NotAReplyWait => {}
+    }
     // (9b) 199E-DL — the COMPENSATED rank-2 half of the finite-deadline registration.
     //
     // Phase C reserved the token under rank 3, in the same scope that armed the terminal and
@@ -1800,10 +1814,34 @@ fn try_split_blocking_ipc_recv_into_frame(
     //
     // Ranks are never held together — rank 3 was released when Phase C returned. On refusal the
     // exact reservation is cancelled, so nothing is left armed for a caller that does not own it.
-    match reserved_deadline {
-        // Not a reply wait, or a wait with no finite deadline: nothing was reserved.
-        None | Some(None) => {}
-        Some(Some(handle)) => {
+    match reply_wait_arm {
+        // Not a reply wait, or a reply wait with no finite deadline: nothing was reserved.
+        crate::kernel::boot::ReplyWaitArm::NotAReplyWait
+        | crate::kernel::boot::ReplyWaitArm::Armed { token: None, .. } => {}
+        // A FINITE wait whose terminal armed but whose deadline could not be reserved. Parking it
+        // would leave a blocked caller with a deadline it cannot identify, so unwind the whole
+        // block exactly as the publish races do and let the broad arm own the outcome.
+        crate::kernel::boot::ReplyWaitArm::DeadlineRefused { .. } => {
+            let unwound = shared.recv_block_unwind_race_split(cpu, tid);
+            crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} endpoint={} reason=deadline_reservation unwound={}",
+                cpu.0,
+                tid,
+                endpoint_idx,
+                u8::from(unwound)
+            );
+            if !unwound {
+                return D::Complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                )));
+            }
+            return D::NotHandled;
+        }
+        crate::kernel::boot::ReplyWaitArm::Armed {
+            token: Some(handle),
+            ..
+        } => {
             let published = shared.publish_reply_timeout_token_split(
                 tid,
                 receiver_asid,

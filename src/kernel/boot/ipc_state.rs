@@ -1101,6 +1101,28 @@ pub(crate) enum BlockingSendProducerOutcome {
 /// off-lock `SharedKernel::publish_recv_waiter_split` runs the identical body under
 /// `with_ipc_split_mut`. Last-receiver-wins replacement is PRESERVED deliberately — whether YARM
 /// should keep replacement at all is WA3C2's question, and this must not answer it by accident.
+/// 199E-DL — the typed outcome of arming a committed reply wait.
+///
+/// Distinguishes the three cases the caller must treat differently, so "not a reply wait" can
+/// never be confused with "a reply wait whose deadline could not be reserved".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyWaitArm {
+    /// Not a reply/call wait at all — an ordinary receive, which owns no reply record. Nothing
+    /// was armed and nothing is owed.
+    NotAReplyWait,
+    /// Armed. `token` is `Some` only for a finite wait that reserved its deadline; the caller
+    /// still owes that token a rank-2 publication.
+    Armed {
+        identity: crate::kernel::terminal_ownership::TerminalIdentity,
+        token: Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
+    },
+    /// A finite reply wait whose terminal armed but whose deadline could not be reserved. The
+    /// caller must unwind the block rather than park with a deadline it cannot own.
+    DeadlineRefused {
+        identity: crate::kernel::terminal_ownership::TerminalIdentity,
+    },
+}
+
 /// 199E-DL — reserve one exact generation-bearing deadline token. Rank 3 only.
 ///
 /// This is THE reservation policy; `KernelState::arm_deadline_token` is a thin broad-lock
@@ -1195,20 +1217,14 @@ pub(crate) fn arm_deadline_token_locked(
 /// epoch, which would invalidate a deadline token keyed on the old epoch. A different identity is
 /// a different record incarnation and is armed normally.
 ///
-/// Returns `(armed identity, reserved deadline token, deadline_ok)`, or `None` when this is not a
-/// reply wait. `deadline_ok` is false only when a FINITE wait could not reserve its token — the
-/// terminal is armed, but the caller must unwind rather than block with a deadline it cannot own.
+/// Returns a typed [`ReplyWaitArm`].
 pub(crate) fn arm_reply_terminal_for_committed_block_locked(
     ipc: &mut IpcSubsystem,
     caller: ReceiverWaiterIdentity,
     reply_eidx: usize,
     wait_generation: u64,
     has_finite_deadline: bool,
-) -> Option<(
-    crate::kernel::terminal_ownership::TerminalIdentity,
-    Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
-    bool,
-)> {
+) -> ReplyWaitArm {
     // (1) The reply record this caller is waiting on, by EXACT incarnation and reply endpoint.
     let mut found = None;
     for idx in 0..super::MAX_REPLY_CAPS {
@@ -1228,7 +1244,9 @@ pub(crate) fn arm_reply_terminal_for_committed_block_locked(
             break;
         }
     }
-    let (record_index, record_generation, record) = found?;
+    let Some((record_index, record_generation, record)) = found else {
+        return ReplyWaitArm::NotAReplyWait;
+    };
 
     // (2) The generation-bearing identity, built from the live record exactly as
     // `reply_terminal_identity` builds it. The deadline-token generation is `Some` only for a
@@ -1238,7 +1256,7 @@ pub(crate) fn arm_reply_terminal_for_committed_block_locked(
         generation: reply_endpoint_generation,
     } = record.reply_endpoint
     else {
-        return None;
+        return ReplyWaitArm::NotAReplyWait;
     };
     let identity = crate::kernel::terminal_ownership::TerminalIdentity {
         reply_record_index: record_index,
@@ -1254,14 +1272,13 @@ pub(crate) fn arm_reply_terminal_for_committed_block_locked(
     };
 
     // (3) Arm, idempotently.
-    let cell = ipc.reply_terminal_ownership.get_mut(record_index)?;
+    let Some(cell) = ipc.reply_terminal_ownership.get_mut(record_index) else {
+        return ReplyWaitArm::NotAReplyWait;
+    };
     if *cell.identity() != identity {
         cell.arm(identity);
     }
-    let terminal_epoch = ipc
-        .reply_terminal_ownership
-        .get(record_index)?
-        .current_epoch();
+    let terminal_epoch = cell.current_epoch();
 
     // (4) 199E-DL — for a FINITE wait, reserve the deadline token in this same rank-3 scope, so
     // the terminal cell and its registration are decided together and cannot disagree. The token
@@ -1278,12 +1295,12 @@ pub(crate) fn arm_reply_terminal_for_committed_block_locked(
             identity,
         ) {
             Ok(handle) => Some(handle),
-            Err(_) => return Some((identity, None, false)),
+            Err(_) => return ReplyWaitArm::DeadlineRefused { identity },
         }
     } else {
         None
     };
-    Some((identity, token, true))
+    ReplyWaitArm::Armed { identity, token }
 }
 
 pub(crate) fn publish_recv_waiter_locked(

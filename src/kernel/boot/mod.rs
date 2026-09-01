@@ -42,7 +42,7 @@ mod ipc_state;
 // body are re-exported so the OFF-LOCK drain in `crate::runtime` can run the SAME body
 // through the `SharedKernel` split-mut seams (no duplicated transaction).
 pub(crate) use ipc_state::{
-    BlockingSendProducerOutcome, DetachOutcome, ReplyTimeoutDomains,
+    BlockingSendProducerOutcome, DetachOutcome, ReplyTimeoutDomains, ReplyWaitArm,
     arm_reply_terminal_for_committed_block_locked, complete_reply_timeout_over,
     complete_server_death_over, publish_recv_waiter_locked,
 };

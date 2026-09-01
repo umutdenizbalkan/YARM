@@ -144501,21 +144501,33 @@ mod u9rx3_route {
         let after = &code[code
             .find("d2_recv_dispatch_try_defer(")
             .expect("the reservation")..];
-        // Four fallbacks sit at or after the reservation call: the reservation FAILING (nothing
-        // was reserved, so it correctly clears nothing), and then phase A, phase B and the race
-        // branch — each of which holds a reservation and must release it. A fifth clear belongs
-        // to the defensive publish arm, which settles as `Complete` rather than falling back.
+        // Fallbacks at or after the reservation call: the reservation FAILING (nothing was
+        // reserved, so it correctly clears nothing), then phase A, phase B and the race branch —
+        // each of which holds a reservation and must release it. Two further clears belong to
+        // arms that settle rather than fall back: the defensive publish arm (`Complete`), and,
+        // since 199E-DL, the deadline-reservation refusal.
+        //
+        // 199E-DL added that fifth clearing arm deliberately. A FINITE reply wait whose terminal
+        // armed but whose deadline could not be reserved must NOT park: that would leave a
+        // blocked caller holding a deadline it cannot identify. It unwinds exactly as the race
+        // branches do — restore the task, clear the reservation, decline — so the broad arm owns
+        // the outcome. Counting it here is what keeps "every post-reservation decline releases
+        // the reservation" true rather than merely re-passing.
         let clears = after.matches("d2_recv_dispatch_clear(").count();
         assert_eq!(
-            clears, 4,
-            "phase A, phase B, the race branch and the defensive publish branch must each clear \
-             the reservation"
+            clears, 5,
+            "phase A, phase B, the race branch, the defensive publish branch and the \
+             deadline-reservation refusal must each clear the reservation"
+        );
+        assert!(
+            after.contains("reason=deadline_reservation"),
+            "the deadline-reservation refusal is one of them, and names itself"
         );
         assert_eq!(
             after.matches("D::NotHandled").count(),
-            4,
+            5,
             "the only fallbacks at or after the reservation are: reservation failed, phase A, \
-             phase B, and the race branch"
+             phase B, the race branch, and the deadline-reservation refusal"
         );
     }
 
