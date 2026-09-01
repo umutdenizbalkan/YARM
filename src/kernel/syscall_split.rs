@@ -1444,7 +1444,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     // armed only by its oracle knob, and that oracle's live round-trip depends on blocked-recv
     // work this route does not reproduce, so it keeps yielding exactly as it did at `894cc5a`.
     // Widening it is a separate increment with its own AArch64 witness, not a side effect here.
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled() {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=ack_publication_armed",
@@ -1456,7 +1456,10 @@ fn try_split_blocking_ipc_recv_into_frame(
     // policy has ONE owner — the `boot` predicate called just below — and it is not an admission
     // question, so the split dispatcher's admission logic stays free of proof-gate terms. See
     // that predicate for which blocked-recv work only the broad arm performs.
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    #[cfg(all(
+        not(feature = "hosted-dev"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm() {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=direct_oracle_selector_armed",

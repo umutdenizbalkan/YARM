@@ -3490,7 +3490,7 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// consulting any oracle endpoint or knob. Ordinary production endpoints are admitted. The
 /// existing selectors still START their workloads; they no longer decide admission.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    cfg!(target_arch = "x86_64")
+    cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.
