@@ -1659,7 +1659,10 @@ mod tests {
     fn aarch64_terminal_fault_oracle_knob_parses_and_defaults_off() {
         // Default-off: an empty cmdline, and a normal boot cmdline, must both leave it unset so
         // the service chain never takes the deliberate fault.
-        assert_eq!(parse_yarm_boot_options(b"").aarch64_terminal_fault_oracle, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"").aarch64_terminal_fault_oracle,
+            None
+        );
         assert_eq!(
             parse_yarm_boot_options(b"console=ttyS0 rdinit=/init").aarch64_terminal_fault_oracle,
             None
