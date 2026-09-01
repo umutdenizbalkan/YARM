@@ -34122,10 +34122,26 @@ mod stage115_d2_d6_seam_analysis {
             !split_src.contains("try_split_cap_grant"),
             "D1/D5: cap grant path must not appear in syscall_split (not split-dispatched)"
         );
+        // 199G-C4 §1 RETIRED the second half of this rule. `IpcSend` now HAS a pre-lock route,
+        // so the honest form of "D1/D5 cap-transfer behaviour is not touched" is that the route
+        // consumes the D1/D5 owners rather than reimplementing them: it mints nothing, and every
+        // cap-carrying class goes to an existing producer.
         assert!(
-            !split_src.contains("try_split_ipc_send"),
-            "D1/D5: ipc send split must not appear in syscall_split"
+            split_src.contains("fn try_split_ipc_send_into_frame("),
+            "NR 1 has a pre-lock route since 199G-C4 §1"
         );
+        for reimplemented in [
+            "mint_capability_in_cnode",
+            "materialize_received_message_cap",
+            "phase_a_snapshot_ordinary_transfer",
+            "phase_a_take_reply_envelope",
+        ] {
+            assert!(
+                !split_src.contains(reimplemented),
+                "D1/D5: the NR 1 route must consume the cap-transfer owners, never reimplement \
+                 `{reimplemented}`"
+            );
+        }
     }
 
     #[test]
@@ -43641,8 +43657,11 @@ mod stage160c_aarch64_trap_abi_bracketing {
             TRAP_ENTRY_SRC
                 .matches("finalize_split_handled_syscall(shared, cpu, entering, frame)")
                 .count(),
-            3,
-            "finalize must run on the Ok, handled-error and queue-advance-committed arms"
+            4,
+            "finalize must run on the Ok, handled-error, queue-advance-committed and \
+             post-work-committed arms — 199G-C4 §2 added the fourth, and it is CONDITIONAL: a \
+             send that delivered or enqueued finished its caller's syscall, while one that is \
+             about to park it must not advance its SVC or export a result on its behalf"
         );
         // Each of the three is reached from its own disposition arm, not from a shared prelude.
         let committed = TRAP_ENTRY_SRC
@@ -49456,9 +49475,15 @@ mod stage187d_blocked_waiter_delivery_hard_stop {
     // waiter split path).
     #[test]
     fn stage187d_no_send_reply_call_pre_dispatch_split() {
-        // The only dedicated pre-dispatch split helpers are recv (NR2) and VmBrk.
+        // 199G-C4 §1 LIFTED this hard stop for `IpcSend` and only for it: blocked-waiter
+        // delivery now has SharedKernel-level owners (the four off-lock producers), which is
+        // exactly the thing Stage 187D recorded as missing. `IpcReply` and `IpcCall` have no
+        // pre-dispatch route and the stop still stands for them.
+        assert!(
+            SPLIT_SRC.contains("fn try_split_ipc_send_into_frame("),
+            "NR 1 has a pre-dispatch route since 199G-C4 §1"
+        );
         for forbidden in [
-            "try_split_ipc_send",
             "try_split_ipc_reply",
             "try_split_ipc_call",
             "try_split_blocked_waiter",
@@ -113062,6 +113087,10 @@ mod stage199d_riscv_canonical_admission {
             // pre-lock route is NR 2's route and whose completion is the shared D2-recv drain
             // this bridge has driven since U4.
             "SYSCALL_IPC_RECV_TIMEOUT_NR",
+            // 199G-C4 §1: the THIRD switching member — IpcSend (NR 1), whose pre-lock route
+            // settles through the post-work drain and, when it parks a sender, through the
+            // homologous D2-SEND drain this bridge has driven since U4/U6.
+            "SYSCALL_IPC_SEND_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -113070,11 +113099,11 @@ mod stage199d_riscv_canonical_admission {
             );
         }
         // Nothing else was added to the whitelist. NR 2 in particular is NOT here: 199G-B §2
-        // admits NR 5 without disturbing NR 2's admission.
+        // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            4,
-            "exactly four literal NRs plus the gated direct-IPC term"
+            5,
+            "exactly five literal NRs plus the gated direct-IPC term"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -142537,8 +142566,14 @@ mod u9tm_proof_gate {
     #[test]
     fn a_non_preempting_tick_uses_its_own_disposition() {
         assert!(
-            SPLIT.contains("PostWorkCommitted,"),
-            "the fourth disposition must exist"
+            SPLIT.contains("PostWorkCommitted { finalize_syscall: bool },"),
+            "the fourth disposition must exist, and since 199G-C4 §2 it carries the route's own \
+             answer to whether the CALLER's syscall is finished"
+        );
+        // A tick has no syscall to finish, so it always answers `false`.
+        assert!(
+            SPLIT.contains("D::PostWorkCommitted {\n        finalize_syscall: false,\n    }"),
+            "a timer tick finalizes no syscall"
         );
         let route = SPLIT
             .split("fn try_split_timer_into_frame(")
@@ -142601,10 +142636,13 @@ mod u9tm_proof_gate {
                 "{name} bridge must skip the broad arm on exactly its enumerated committed \
                  dispositions: `{arms}`"
             );
+            // 199G-C4 §2: TWO declaration sites per bridge now — the timer route and the NR 1
+            // route — and no more. Each is a route reporting its own outcome; neither infers it
+            // from the stash, which is the property this count exists to protect.
             assert_eq!(
                 src.matches("post_work_committed = true;").count(),
-                1,
-                "{name} bridge: exactly one place may declare post-work committed"
+                2,
+                "{name} bridge: exactly the timer and NR 1 routes may declare post-work committed"
             );
             if name == "shared" {
                 assert_eq!(

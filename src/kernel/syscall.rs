@@ -262,6 +262,13 @@ pub(crate) mod debug;
 mod helpers;
 mod initramfs;
 mod ipc;
+
+// 199G-C4 §1: the pre-lock NR 1 route consults the same payload-shape and message-framing
+// owners the broad handler does, so they are reachable from `syscall_split` by name.
+pub(crate) use self::ipc::{
+    IpcSendPayloadShape, classify_ipc_send_payload_shape, frame_ipc_send_message,
+};
+pub(crate) use self::ipc_abi::transfer_cap_arg_present;
 // Stage 198D-S: re-export the authoritative direct-only reply-cap policy switch so
 // the policy guard test can assert it as a compile-time constant.
 pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;

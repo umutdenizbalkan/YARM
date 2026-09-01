@@ -626,7 +626,16 @@ pub(crate) enum SplitDispatchDisposition {
     /// So this is its own outcome: the broad dispatcher is skipped, NO queue selection runs, the
     /// existing post-work drains run exactly once, and the trap then settles through its normal
     /// frame/idle path. It is decided by the ROUTE, never inferred from a non-empty stash.
-    PostWorkCommitted,
+    ///
+    /// 199G-C4 §2 — `finalize_syscall` says whether the CALLER's syscall is finished. A timer
+    /// tick has no syscall to finish and passes `false`. An `IpcSend` that delivered or enqueued
+    /// finished its caller's syscall and passes `true`, so the architecture syscall-return ABI
+    /// runs before the drain. An `IpcSend` that is about to PARK its caller passes `false`: the
+    /// sender's result arrives from the completion its waker publishes, and advancing its PC or
+    /// exporting a result here would hand a blocked task an answer to a send that has not
+    /// happened. Like the disposition itself this is decided by the route, never inferred from
+    /// what is in the stash.
+    PostWorkCommitted { finalize_syscall: bool },
 }
 
 impl SplitDispatchDisposition {
@@ -649,7 +658,7 @@ impl SplitDispatchDisposition {
             Self::QueueAdvanceCommitted => {
                 panic!("a committed queue advance has no pre-U9-QA equivalent")
             }
-            Self::PostWorkCommitted => {
+            Self::PostWorkCommitted { .. } => {
                 panic!("a committed post-work outcome has no pre-U9-QA equivalent")
             }
         }
@@ -697,10 +706,541 @@ pub(crate) fn try_split_dispatch_into_frame(
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
+    // 199G-C4 §2 — the THIRD class that may not be early-returned through the caller's own
+    // frame. `IpcSend` produces all three committed shapes: a completed syscall, a delivery the
+    // post-work drain owes, and a parked sender whose queue advance the drain performs. Like
+    // the two above it, it is tried before the NR-only whitelist, whose whole contract is that
+    // everything on it is non-switching.
+    match try_split_ipc_send_into_frame(shared, cpu, frame) {
+        SplitDispatchDisposition::NotHandled => {}
+        handled => return handled,
+    }
     match try_split_dispatch_nonswitching_into_frame(shared, cpu, frame) {
         None => SplitDispatchDisposition::NotHandled,
         Some(result) => SplitDispatchDisposition::Complete(result),
     }
+}
+
+/// 199G-C4 §1 — service `IpcSend` (NR 1) off the broad lock, on all three architectures.
+///
+/// This is the LAST syscall family that could still reach a terminal broad dispatcher. It adds
+/// no policy: every decision below belongs to an owner §1–§3 extracted, and this function is the
+/// order in which they are consulted.
+///
+/// ## Ordering, and why each step is where it is
+///
+/// `decode/admit → copy/snapshot → acquire pin if owed → rank-3 commit → disposition`
+///
+/// Everything that can refuse comes before anything that can be consumed, so a decline is
+/// always safe to hand back to the broad path. Once the transfer envelope is stashed — which is
+/// also where a shared-region grant's pin is acquired — falling back would re-run the whole
+/// send and stash a SECOND envelope for one syscall, so from that point every exit settles
+/// through the split owners instead.
+///
+/// ## The two impossible classes
+///
+/// A `Kernel` capability and a `Synchronous` endpoint are both production-unreachable (199G-C2
+/// §1, 199D-KR §1). They are refused here BEFORE anything is consumed, with a typed invariant
+/// error rather than a fallback: handing an impossible class to the broad dispatcher would be
+/// the one edge this stage exists to remove, and it would be an edge no production trap can
+/// ever take.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_ipc_send_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    use SplitDispatchDisposition as D;
+    use crate::kernel::capabilities::{CapId, CapObject, CapRights};
+    use crate::kernel::ipc::{EndpointMode, SharedMemoryRegion};
+    use crate::kernel::syscall::{
+        IpcSendPayloadShape, REPLY_CAP_QUEUEING_SUPPORTED, SYSCALL_ARG_CAP,
+        SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
+        SYSCALL_ARG_PTR, SyscallError, classify_ipc_send_payload_shape, frame_ipc_send_message,
+        transfer_cap_arg_present,
+    };
+
+    // ── (1) NR and CPU ──────────────────────────────────────────────────────────────────────
+    if !matches!(
+        Syscall::decode(frame.syscall_num()),
+        Ok(Syscall::IpcSend)
+    ) {
+        return D::NotHandled;
+    }
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return D::NotHandled;
+    }
+    let Some(tid) = shared.current_tid_authoritative(cpu) else {
+        crate::yarm_log!(
+            "IPC_SEND_SPLIT_REFUSED cpu={} reason=no_current_task",
+            cpu.0
+        );
+        return D::NotHandled;
+    };
+
+    // Helper: a completed syscall's frame result, exactly as the broad handler writes it.
+    let complete_ok = |frame: &mut TrapFrame| {
+        frame.set_ok(0, 0, 0);
+        frame.set_ret2(
+            usize::try_from(crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP).unwrap_or(0),
+        );
+    };
+
+    // ── (2) ADMIT: the send capability ──────────────────────────────────────────────────────
+    // The same four questions `validate_endpoint_right` asks, in the same order and with the
+    // same errors: resolvable, live, an endpoint, and carrying SEND.
+    let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let Ok(capability) = shared.resolve_capability_for_task_split(tid, cap) else {
+        return D::Complete(Err(TrapHandleError::Syscall(
+            SyscallError::InvalidCapability,
+        )));
+    };
+    if !shared.sr_object_live_split(capability.object) {
+        return D::Complete(Err(TrapHandleError::Syscall(
+            SyscallError::InvalidCapability,
+        )));
+    }
+    let endpoint = capability.object;
+    if !matches!(endpoint, CapObject::Endpoint { .. }) {
+        // 199G-C4 §4 — this is where a `Kernel` capability would arrive, and it fails closed
+        // here having touched nothing. `handle_ipc_send` refuses it at exactly this question
+        // too, which is why `ipc_send_routed`'s restart-control branch was never reachable
+        // through NR 1 in the first place.
+        if endpoint == CapObject::Kernel {
+            crate::yarm_log!(
+                "IPC_SEND_SPLIT_INVARIANT cpu={} tid={} reason=kernel_cap_send result=failed_closed",
+                cpu.0,
+                tid
+            );
+        }
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)));
+    }
+    if !capability.has_right(CapRights::SEND) {
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::MissingRight)));
+    }
+    let Ok(endpoint_idx) = shared.resolve_endpoint_index_split(endpoint) else {
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)));
+    };
+    let CapObject::Endpoint {
+        generation: endpoint_generation,
+        ..
+    } = endpoint
+    else {
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)));
+    };
+
+    // ── (3) ADMIT: the endpoint mode ────────────────────────────────────────────────────────
+    // Buffered is the only production mode (199G-C2 §1: `Synchronous` has a private field, no
+    // setter, no deserializer, and every constructor that names it is test-only).
+    match shared.endpoint_mode_split_read(endpoint_idx, endpoint_generation) {
+        Some(EndpointMode::Buffered) => {}
+        Some(EndpointMode::Synchronous) => {
+            crate::yarm_log!(
+                "IPC_SEND_SPLIT_INVARIANT cpu={} tid={} endpoint={} reason=synchronous_endpoint result=failed_closed",
+                cpu.0,
+                tid,
+                endpoint_idx
+            );
+            return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)));
+        }
+        None => return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject))),
+    }
+
+    // ── (4) ADMIT: the transfer capability ──────────────────────────────────────────────────
+    let transfer_cap = if transfer_cap_arg_present(frame) {
+        Some(CapId(
+            frame.arg(crate::kernel::syscall::SYSCALL_ARG_TRANSFER_CAP) as u64
+        ))
+    } else {
+        None
+    };
+    let transfer_object = match transfer_cap {
+        None => None,
+        Some(tc) => match shared.resolve_capability_for_task_split(tid, tc) {
+            Ok(c) => Some(c),
+            Err(_) => {
+                return D::Complete(Err(TrapHandleError::Syscall(
+                    SyscallError::InvalidCapability,
+                )));
+            }
+        },
+    };
+
+    // ── (5) ADMIT: reply capabilities are direct-delivery only ──────────────────────────────
+    // Stage 198D-S: a Reply is never stored in an endpoint queue, so with no compatible
+    // receiver ready the send is refused BEFORE any envelope exists.
+    if !REPLY_CAP_QUEUEING_SUPPORTED
+        && matches!(
+            transfer_object.map(|c| c.object),
+            Some(CapObject::Reply { .. })
+        )
+    {
+        let ready = shared
+            .endpoint_waiter_tid_split_read(endpoint_idx)
+            .is_some_and(|rt| shared.is_task_recv_v2_blocked_split_read(rt.0));
+        if !ready {
+            crate::yarm_log!(
+                "IPC_SEND_REPLY_CAP_DIRECT_ONLY tid={} reason=no_blocked_receiver",
+                tid
+            );
+            return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WouldBlock)));
+        }
+    }
+
+    // ── (6) ADMIT: sender class, payload shape and timeout ──────────────────────────────────
+    let sender_asid = shared.task_asid_opt_split_read(tid);
+    let sender_has_user_asid = sender_asid.is_some();
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
+    let send_timeout_ticks = if sender_has_user_asid || len == 0 {
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) as u64
+    } else {
+        0
+    };
+    let Ok(shape) = classify_ipc_send_payload_shape(sender_has_user_asid, len) else {
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    };
+
+    // ── (7) COPY/SNAPSHOT: the payload, still consuming nothing ─────────────────────────────
+    let mut payload_buf = [0u8; crate::kernel::ipc::Message::MAX_PAYLOAD];
+    let shared_region = match shape {
+        IpcSendPayloadShape::SharedRegion => {
+            let Some(grant) = transfer_object else {
+                return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+            };
+            match grant.object {
+                CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
+                _ => return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject))),
+            }
+            if !grant.has_right(CapRights::READ) || !grant.has_right(CapRights::MAP) {
+                return D::Complete(Err(TrapHandleError::Syscall(SyscallError::MissingRight)));
+            }
+            if sender_has_user_asid
+                && crate::kernel::syscall::validate_user_region(
+                    user_ptr_or_offset as u64,
+                    len as u64,
+                )
+                .is_err()
+            {
+                return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+            }
+            let region = SharedMemoryRegion {
+                offset: user_ptr_or_offset as u64,
+                len: len as u64,
+            };
+            let encoded = region.encode();
+            payload_buf[..encoded.len()].copy_from_slice(&encoded);
+            Some((
+                encoded.len(),
+                crate::kernel::boot::TransferSharedRegion {
+                    offset: region.offset,
+                    len: region.len,
+                },
+            ))
+        }
+        IpcSendPayloadShape::Inline => {
+            if let Some(asid) = sender_asid {
+                // A user sender's payload lives in ITS address space; a fault here is the
+                // ordinary user-memory fault the broad handler reports, and nothing is consumed.
+                let Some(bytes) = shared.copy_from_user_asid_split_read(
+                    asid.0 as u64,
+                    user_ptr_or_offset,
+                    len,
+                ) else {
+                    crate::yarm_log!(
+                        "IPC_SEND_SPLIT_REFUSED cpu={} tid={} reason=payload_fault",
+                        cpu.0,
+                        tid
+                    );
+                    return D::NotHandled;
+                };
+                payload_buf[..len].copy_from_slice(&bytes[..len]);
+            } else {
+                // A kernel task's payload rides in the argument registers.
+                let words = [
+                    frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+                    frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+                ];
+                let Some(regs) = crate::kernel::ipc::unpack_register_payload(words, len) else {
+                    return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+                };
+                payload_buf[..len].copy_from_slice(&regs[..len]);
+            }
+            None
+        }
+    };
+    let payload_len = shared_region.map_or(len, |(l, _)| l);
+
+    // ── (8) ACQUIRE: stash the envelope, taking the pin iff the descriptor owes one ─────────
+    // THE first consuming step. From here a decline is no longer safe: re-running the send
+    // would stash a second envelope for one syscall.
+    let (transfer_handle, stashed_pin_owed, stash_bound_receiver) = match transfer_cap {
+        None => (None, false, None),
+        Some(source_cap) => {
+            let bound = shared.endpoint_waiter_tid_split_read(endpoint_idx);
+            match shared.stash_transfer_envelope_split(
+                crate::kernel::ipc::ThreadId(tid),
+                source_cap,
+                endpoint,
+                bound,
+                shared_region.map(|(_, r)| r),
+            ) {
+                Ok(stashed) => (Some(stashed.handle), stashed.pin.is_some(), bound),
+                Err(refusal) => {
+                    crate::yarm_log!(
+                        "IPC_SEND_SPLIT_REFUSED cpu={} tid={} reason=envelope_stash slug={:?}",
+                        cpu.0,
+                        tid,
+                        refusal
+                    );
+                    return D::Complete(Err(TrapHandleError::Syscall(
+                        SyscallError::InvalidCapability,
+                    )));
+                }
+            }
+        }
+    };
+    let _ = stashed_pin_owed;
+    let Ok(msg) = frame_ipc_send_message(
+        tid,
+        shape,
+        &payload_buf[..payload_len],
+        transfer_cap,
+        transfer_handle,
+    ) else {
+        settle_ipc_send_envelope(shared, transfer_handle, endpoint_idx, stash_bound_receiver, tid);
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    };
+
+    // ── (9) COMMIT: the authoritative send sequence ─────────────────────────────────────────
+    // Exactly the order `ipc_send_routed` follows for a buffered endpoint: a recv-v2 blocked
+    // waiter takes a direct delivery, everything else enqueues, and a full endpoint parks the
+    // sender.
+    let waiter = shared.endpoint_waiter_tid_split_read(endpoint_idx);
+    if let Some(waiter_tid) = waiter
+        && shared.is_task_recv_v2_blocked_split_read(waiter_tid.0)
+    {
+        crate::yarm_log!(
+            "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
+            waiter_tid.0,
+            endpoint_idx,
+            msg.len,
+            msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
+        );
+        // The four producers, in the order `try_ipc_send_boundary_split_any_pub` uses, plus the
+        // shared-region class the broad router tries last. Each declines having consumed
+        // nothing, so trying them in order costs nothing.
+        let produced = shared
+            .produce_blocked_waiter_plain_delivery_split(waiter_tid.0, endpoint_idx, &msg)
+            .and_then(|done| {
+                if done {
+                    Ok(true)
+                } else {
+                    shared.produce_blocked_waiter_reply_cap_delivery_split(
+                        waiter_tid.0,
+                        endpoint_idx,
+                        &msg,
+                    )
+                }
+            })
+            .and_then(|done| {
+                if done {
+                    Ok(true)
+                } else {
+                    shared.produce_blocked_waiter_ordinary_cap_delivery_split(
+                        waiter_tid.0,
+                        endpoint_idx,
+                        &msg,
+                    )
+                }
+            })
+            .and_then(|done| {
+                if done {
+                    Ok(true)
+                } else {
+                    shared.produce_blocked_waiter_shared_region_delivery_split(
+                        waiter_tid.0,
+                        endpoint_idx,
+                        &msg,
+                    )
+                }
+            });
+        match produced {
+            Ok(true) => {
+                // The drain completes the copy/materialize, clears the waiter slot and wakes it
+                // exactly once. The SENDER's syscall is finished, so its result goes in now.
+                complete_ok(frame);
+                crate::yarm_log!(
+                    "IPC_SEND_SPLIT_DONE cpu={} tid={} endpoint={} result=direct_delivery",
+                    cpu.0,
+                    tid,
+                    endpoint_idx
+                );
+                return D::PostWorkCommitted {
+                    finalize_syscall: true,
+                };
+            }
+            Ok(false) => {
+                // No producer claimed a recv-v2 blocked waiter. In production this is
+                // unreachable — the four classes are exhaustive over the messages NR 1 can
+                // build, and the trap-entry drainer is active by construction here — so it
+                // fails closed rather than re-running the send under the broad lock.
+                settle_ipc_send_envelope(
+                    shared,
+                    transfer_handle,
+                    endpoint_idx,
+                    stash_bound_receiver,
+                    tid,
+                );
+                crate::yarm_log!(
+                    "IPC_SEND_SPLIT_INVARIANT cpu={} tid={} endpoint={} reason=no_delivery_owner result=failed_closed",
+                    cpu.0,
+                    tid,
+                    endpoint_idx
+                );
+                return D::Complete(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+            }
+            Err(err) => {
+                // A real Phase-A error. The envelope disposition is the producer's; anything it
+                // left stashed is settled here, exactly as the broad error path settles it.
+                settle_ipc_send_envelope(
+                    shared,
+                    transfer_handle,
+                    endpoint_idx,
+                    stash_bound_receiver,
+                    tid,
+                );
+                crate::yarm_log!(
+                    "IPC_SEND_SPLIT_DONE cpu={} tid={} endpoint={} result=delivery_error code={}",
+                    cpu.0,
+                    tid,
+                    endpoint_idx,
+                    err.code()
+                );
+                return D::Complete(Err(TrapHandleError::Syscall(err)));
+            }
+        }
+    }
+
+    // No recv-v2 waiter: the authoritative unconditional enqueue.
+    match shared.ipc_endpoint_enqueue_authoritative_split(endpoint_idx, msg) {
+        Err(_) => {
+            settle_ipc_send_envelope(
+                shared,
+                transfer_handle,
+                endpoint_idx,
+                stash_bound_receiver,
+                tid,
+            );
+            D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)))
+        }
+        Ok(true) => {
+            // Queued. Wake any legacy waiter through the one shared owner, then finish.
+            let _ = shared.wake_waiter_for_endpoint_split(cpu, endpoint_idx);
+            complete_ok(frame);
+            crate::yarm_log!(
+                "IPC_SEND_SPLIT_DONE cpu={} tid={} endpoint={} result=enqueued",
+                cpu.0,
+                tid,
+                endpoint_idx
+            );
+            D::Complete(Ok(()))
+        }
+        Ok(false) => {
+            // The endpoint is full: park the sender through the EXISTING U6 publication owner.
+            // The route stashes the proposal; the post-work drain runs the rank-ordered
+            // transaction, arms the established D2-send deferral on success, and on refusal
+            // settles this same envelope and encodes the canonical error into this frame. No
+            // result is written here: a parked sender's answer comes from its waker.
+            let Some(sender_asid) = sender_asid else {
+                // A kernel task cannot park on a send: it has no incarnation ASID for the
+                // transaction's identity check. Settle and refuse, as the broad path does.
+                settle_ipc_send_envelope(
+                    shared,
+                    transfer_handle,
+                    endpoint_idx,
+                    stash_bound_receiver,
+                    tid,
+                );
+                return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WouldBlock)));
+            };
+            let deadline = if send_timeout_ticks == 0 {
+                None
+            } else {
+                Some(
+                    shared
+                        .scheduler_tick_now_split_read()
+                        .wrapping_add(send_timeout_ticks),
+                )
+            };
+            let snapshot = crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot {
+                cpu,
+                sender_tid: tid,
+                sender_asid,
+                endpoint_idx,
+                endpoint_generation,
+                send_cap: cap,
+                msg,
+                deadline,
+                transfer_envelope: transfer_handle.map(|handle| {
+                    crate::kernel::dispatch_post_work::BlockingSendEnvelopeCleanup {
+                        handle,
+                        endpoint_idx,
+                        cleanup_tid: stash_bound_receiver
+                            .unwrap_or(crate::kernel::ipc::ThreadId(tid)),
+                    }
+                }),
+            };
+            // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+            // identical discipline to every other producer's store.
+            unsafe {
+                crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].store(
+                    crate::kernel::dispatch_post_work::DispatchPostWork::BlockingSendCommit(
+                        snapshot,
+                    ),
+                );
+            }
+            crate::yarm_log!(
+                "IPC_SEND_SPLIT_DONE cpu={} tid={} endpoint={} result=blocking_publication_pending",
+                cpu.0,
+                tid,
+                endpoint_idx
+            );
+            D::PostWorkCommitted {
+                finalize_syscall: false,
+            }
+        }
+    }
+}
+
+/// 199G-C4 §1 — settle a stashed transfer envelope on an NR 1 exit that is not a delivery.
+///
+/// One helper rather than five copies of the same three arguments, and it goes through the
+/// EXISTING settle owner, which for a shared-region envelope also releases the transient pin
+/// exactly once through the sequential rank-3 → rank-6 no-reclaim transaction.
+#[cfg(not(feature = "hosted-dev"))]
+fn settle_ipc_send_envelope(
+    shared: &SharedKernel,
+    handle: Option<u64>,
+    endpoint_idx: usize,
+    bound_receiver: Option<crate::kernel::ipc::ThreadId>,
+    sender_tid: u64,
+) {
+    let Some(handle) = handle else {
+        return;
+    };
+    let cleanup_tid = bound_receiver.unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+    shared.settle_blocked_send_envelope_split(handle, endpoint_idx, cleanup_tid);
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_ipc_send_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
 }
 
 /// U9-RX3 §3 — service a BLOCKING `IpcRecv` (NR 2) off the broad lock.
@@ -1303,7 +1843,9 @@ fn try_split_timer_into_frame(
         tick
     );
     // (5) The architecture tail still owes the production timeout pipeline.
-    D::PostWorkCommitted
+    D::PostWorkCommitted {
+        finalize_syscall: false,
+    }
 }
 
 #[cfg(feature = "hosted-dev")]

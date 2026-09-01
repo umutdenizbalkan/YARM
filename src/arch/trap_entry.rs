@@ -706,7 +706,7 @@ pub fn handle_trap_entry_shared(
         let is_timer = matches!(decode_trap_context(context), TrapEvent::TimerInterrupt);
         match crate::kernel::syscall_split::try_split_timer_dispatch(shared, cpu, is_timer) {
             SplitDispatchDisposition::NotHandled => {}
-            SplitDispatchDisposition::PostWorkCommitted => {
+            SplitDispatchDisposition::PostWorkCommitted { .. } => {
                 // The tick and the re-arm are done and no scheduler state changed. Skip the
                 // broad arm — entering it would tick a SECOND time — and fall through so the
                 // architecture tail still runs the production timeout pipeline.
@@ -767,6 +767,30 @@ pub fn handle_trap_entry_shared(
                     u8::from(captured),
                 );
                 queue_advance_committed = true;
+            }
+            // 199G-C4 §2 — the POST-WORK committed disposition on the SYSCALL path. The route
+            // did its own work and owes the architecture tail's drain, so the broad dispatcher
+            // is skipped exactly as it is for a committed queue advance, and control falls
+            // through — no early return — to `drain_dispatch_post_work` below.
+            //
+            // `finalize_syscall` is the route's own answer to whether the CALLER is finished.
+            // A delivery or an enqueue finished it, so the architecture syscall-return ABI runs
+            // here and the caller returns through its own frame after the drain. A blocking
+            // send has NOT finished it: the sender is about to be parked by the drain, its
+            // result comes from the completion its waker publishes, and advancing its PC here
+            // would hand a blocked task an answer to a send that has not happened.
+            if let SplitDispatchDisposition::PostWorkCommitted { finalize_syscall } = disposition {
+                if finalize_syscall {
+                    finalize_split_handled_syscall(shared, cpu, entering, frame);
+                }
+                crate::yarm_log!(
+                    "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=post_work_committed finalized={}",
+                    SPLIT_DISPATCH_ARCH_TAG,
+                    frame.syscall_num(),
+                    cpu.0,
+                    u8::from(finalize_syscall),
+                );
+                post_work_committed = true;
             }
             if let SplitDispatchDisposition::Complete(result) = disposition {
                 match result {
@@ -896,7 +920,11 @@ pub fn handle_trap_entry_shared(
                 if queue_advance_committed {
                     "publication_committed"
                 } else if post_work_committed {
-                    "timer_post_work_committed"
+                    // Set by the timer route (a tick that changed no scheduler state) or, since
+                    // 199G-C4 §2, by the NR 1 route (a delivery or a blocking publication the
+                    // drain below owes). Both mean the same thing here: this trap's work is
+                    // done and the broad dispatcher has nothing to do.
+                    "post_work_committed"
                 } else {
                     "cow_recovered"
                 }
