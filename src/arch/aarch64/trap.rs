@@ -177,7 +177,12 @@ pub(crate) enum ResumeRefusal {
 ///
 /// `ELR_EL1` is deliberately untouched in both cases — it was advanced exactly once at block
 /// time. The caller mirrors `arg0..arg5` into `x0..x5` immediately after.
-fn encode_blocked_send_completion(frame: &mut TrapFrame, result: u64) {
+///
+/// 199E-A64RC: this is THE AArch64 completion-apply owner, for BOTH blocked classes. The recv
+/// class encoded the identical two writes inline at each of the two resume boundaries; those
+/// copies now call here, so there is exactly one place that decides what a consumed completion
+/// does to the frame.
+fn encode_blocked_completion_result(frame: &mut TrapFrame, result: u64) {
     frame.set_arg(0, result as usize);
     for lane in 1..=5 {
         frame.set_arg(lane, 0);
@@ -208,12 +213,23 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
             LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
         }
     }
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    // 199E-A64RC — the BLOCKED-RECEIVE completion boundary, POST-LOCK half. Production-live, no
+    // feature gate, exactly like its blocked-SEND sibling below.
+    //
+    // The producer was never gated: `publish_blocked_recv_timeout_result_with_identity` parks the
+    // generation-bearing record on every port and every build, and its own doc says x86_64 and
+    // RISC-V install an equivalent saved result directly while "AArch64 consumes it at its resume
+    // boundary". Only this consumer was compiled behind the oracle feature, so on a default build
+    // production published a completion the AArch64 return path could never consume: the argument
+    // mirror below then put the receive's own ARGUMENTS back in x0..x5, and user-rt read x0 (the
+    // endpoint cap) with `meta.status` still `u64::MAX` and decoded a spurious error. That is the
+    // `supervisor.srv control recv error: WrongObject` the default AArch64 boot was failing on.
+    //
+    // The take is class-scoped and identity-exact (`{tid, asid, blocked_generation}`), so a stale
+    // or mismatched record is dropped rather than applied, and an absent one leaves the legitimate
+    // argument/startup mirror untouched.
     if let Some(done) = shared.direct_dispatch_take_completion_split(token) {
-        frame.set_arg(0, done.result as usize);
-        for lane in 1..=5 {
-            frame.set_arg(lane, 0);
-        }
+        encode_blocked_completion_result(frame, done.result);
         crate::yarm_log!(
             "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid={} class={:?} result={} blocked_generation={} elr=0x{:016x} result=ok",
             incoming,
@@ -222,6 +238,9 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
             done.blocked_generation,
             frame.saved_pc() as u64
         );
+        // TELEMETRY ONLY, and still oracle-gated: the retirement attestation belongs to the
+        // reply-timeout proof, not to the production completion mechanism above.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
         crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
     }
     // U6 §8 — the BLOCKED-SEND completion boundary (production-live, no feature gate).
@@ -232,7 +251,7 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
     // that can supply the result — without it the sender would return the `WouldBlock` its
     // saved frame still carries for a message the receiver already took.
     if let Some(done) = shared.direct_dispatch_take_send_completion_split(token) {
-        encode_blocked_send_completion(frame, done.result);
+        encode_blocked_completion_result(frame, done.result);
         crate::yarm_log!(
             "AARCH64_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} elr=0x{:016x} result=ok",
             incoming,
@@ -354,7 +373,8 @@ pub(crate) fn restore_arch_thread_state(
             )
         })
         .flatten();
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    // 199E-A64RC: production-live, matching the `IpcSend` take above. Class-scoped, so it can
+    // never consume the send consumer's entry.
     let recv_completion = (!syscall_return)
         .then(|| kernel.take_blocked_syscall_completion(current_tid))
         .flatten();
@@ -366,7 +386,6 @@ pub(crate) fn restore_arch_thread_state(
             context,
             tls,
             send_completion,
-            #[cfg(feature = "ipc-reply-timeout-oracle-core")]
             recv_completion,
         },
         syscall_return,
@@ -426,7 +445,7 @@ pub(crate) fn apply_restored_thread_state(
         // class is production-live on every build, and it is class-scoped so it can never
         // consume the reply-timeout consumer's `IpcRecv` entry below.
         if let Some(done) = facts.send_completion {
-            encode_blocked_send_completion(frame, done.result);
+            encode_blocked_completion_result(frame, done.result);
             crate::yarm_log!(
                 "AARCH64_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} elr=0x{:016x} result=ok",
                 current_tid,
@@ -436,12 +455,13 @@ pub(crate) fn apply_restored_thread_state(
                 frame.saved_pc() as u64
             );
         }
-        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        // 199E-A64RC — the BLOCKED-RECEIVE completion boundary, IN-LOCK half. Ungated for the
+        // same reason as its post-lock twin and as the send class above: the producer is
+        // production-live on every build, and without this the argument mirror immediately below
+        // would put the receive's own arguments back into x0..x5 and userspace would decode them
+        // as a result.
         if let Some(done) = facts.recv_completion {
-            frame.set_arg(0, done.result as usize);
-            for lane in 1..=5 {
-                frame.set_arg(lane, 0);
-            }
+            encode_blocked_completion_result(frame, done.result);
             crate::yarm_log!(
                 "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid={} class={:?} result={} blocked_generation={} elr=0x{:016x} result=ok",
                 current_tid,
@@ -450,8 +470,8 @@ pub(crate) fn apply_restored_thread_state(
                 done.blocked_generation,
                 frame.saved_pc() as u64
             );
-            // The retirement marker is authorized ONLY here — after the resumed caller's exact
-            // completion was consumed and its canonical result encoded (never at production time).
+            // TELEMETRY ONLY, and still oracle-gated.
+            #[cfg(feature = "ipc-reply-timeout-oracle-core")]
             crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
         }
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0));

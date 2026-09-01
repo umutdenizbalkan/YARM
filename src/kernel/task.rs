@@ -814,7 +814,10 @@ pub(crate) struct ThreadRestoreFacts {
     /// The consumed `IpcSend` completion, if one was parked and exact.
     pub(crate) send_completion: Option<BlockedSyscallCompletion>,
     /// The consumed `IpcRecv` completion, if one was parked and exact.
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    ///
+    /// 199E-A64RC: no longer feature-gated. The producer parks this record on every build, and on
+    /// AArch64 it is the ONLY thing that can supply a remotely completed receive's result — that
+    /// port deliberately writes no result register at publication time.
     pub(crate) recv_completion: Option<BlockedSyscallCompletion>,
 }
 
@@ -835,7 +838,6 @@ pub(crate) fn take_thread_restore_facts(
     let (context, tls) = read_user_context_and_take_tls(tcbs, tls_pending, tid, expect_asid)?;
     let send_completion =
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcSend);
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     let recv_completion =
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcRecv);
     Some(ThreadRestoreFacts {
@@ -843,7 +845,6 @@ pub(crate) fn take_thread_restore_facts(
         context,
         tls,
         send_completion,
-        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
         recv_completion,
     })
 }

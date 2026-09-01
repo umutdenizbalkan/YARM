@@ -2653,7 +2653,12 @@ impl SharedKernel {
     /// `{tid, asid, blocked_generation}` match, and an exact take clears the residue that
     /// belongs to that completion alone. Keeping the two identical is what makes the incoming
     /// task's resume lanes the same whether the dispatch ran in-lock or off-lock.
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    ///
+    /// 199E-A64RC: production-live, no feature gate. This is the rank-2 take the AArch64
+    /// POST-LOCK resume boundary uses to consume a remotely completed receive, and on that port
+    /// it is the ONLY thing that can supply the result — the publisher deliberately writes no
+    /// result register for AArch64. Gating it made the parked completion unreachable on a default
+    /// build. Its `IpcSend` sibling was already ungated for exactly this reason.
     ///
     /// Stage 199D-WA3A-R2-SEAL (item F): the task is located by the mark TOKEN's exact
     /// incarnation. A replacement incarnation that reused the numeric TID is not this

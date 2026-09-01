@@ -100852,14 +100852,25 @@ mod stage200d0c1_aarch64_exit_prep {
             .split("\n}\n")
             .next()
             .expect("its body");
-        let send = writer
-            .find("encode_blocked_send_completion(frame, done.result)")
-            .expect("send completion encode");
+        // 199E-A64RC: `encode_blocked_completion_result` is the ONE completion-apply owner, now
+        // shared by the blocked-SEND and blocked-RECEIVE classes. Both are encoded in this writer,
+        // so require the LAST of them to still precede the argument mirror — otherwise a consumed
+        // completion would be overwritten by the receive's own arguments, which is exactly the
+        // defect this guard exists to catch.
+        let encodes: alloc::vec::Vec<usize> = writer
+            .match_indices("encode_blocked_completion_result(frame, done.result)")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            encodes.len(),
+            2,
+            "both blocked classes encode through the one owner in this writer"
+        );
         let mirror = writer
             .find("frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0))")
             .expect("the argument mirror");
         assert!(
-            send < mirror,
+            *encodes.last().expect("an encode") < mirror,
             "completions are encoded BEFORE the argument mirror"
         );
         assert!(
@@ -129294,18 +129305,53 @@ mod u4_cross_arch_queue_advancing_dispatch {
             }
         }
 
-        /// The existing IpcRecv / reply-timeout feature policy is unchanged: its consumers stay
-        /// behind their gate, and U6 neither removes nor widens it.
+        /// The IpcRecv completion policy, re-derived by 199E-A64RC.
+        ///
+        /// This guard used to require BOTH AArch64 and RISC-V to keep the recv consumer behind
+        /// `ipc-reply-timeout-oracle-core`. That was wrong for AArch64 and it hid a real defect.
+        /// The producer, `publish_blocked_recv_timeout_result_with_identity`, parks the
+        /// generation-bearing record on every port and every build; x86_64 and RISC-V additionally
+        /// install an equivalent saved result at publication time and therefore never need to
+        /// consume it, but AArch64 deliberately writes NO result register there and is served
+        /// solely by consuming the record at its resume boundary. Gating that consumer meant a
+        /// default AArch64 build published a completion it could never apply, and the argument
+        /// mirror handed the receive's own arguments back to userspace as a result.
+        ///
+        /// So the policy is now asymmetric BY DERIVATION, and this asserts both halves plus the
+        /// telemetry split — it is strictly more specific than what it replaced.
         #[test]
-        fn the_reply_timeout_feature_policy_is_unchanged() {
-            for (arch, src) in [("aarch64", AARCH64_TRAP), ("riscv64", RISCV_TRAP)] {
-                let idx = src
-                    .find("take_blocked_syscall_completion(current_tid)")
-                    .unwrap_or_else(|| panic!("{arch} keeps its recv consumer"));
-                let before = &src[idx.saturating_sub(200)..idx];
+        fn the_reply_timeout_feature_policy_is_derived_per_architecture() {
+            // AArch64: the consumer is production-live, i.e. NOT gated.
+            let idx = AARCH64_TRAP
+                .find("take_blocked_syscall_completion(current_tid)")
+                .expect("aarch64 keeps its recv consumer");
+            let before = &AARCH64_TRAP[idx.saturating_sub(300)..idx];
+            assert!(
+                !before.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+                "aarch64: the recv consumer must be production-live — it is the only thing that \
+                 can supply a remotely completed receive's result on that port"
+            );
+            // RISC-V: unchanged, still gated — it installs its result in the publisher instead.
+            let idx = RISCV_TRAP
+                .find("take_blocked_syscall_completion(current_tid)")
+                .expect("riscv64 keeps its recv consumer");
+            let before = &RISCV_TRAP[idx.saturating_sub(200)..idx];
+            assert!(
+                before.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+                "riscv64: the recv consumer stays feature-gated"
+            );
+            // The retirement TELEMETRY stays gated everywhere, on both AArch64 boundaries.
+            let attest = "maybe_emit_reply_timeout_class_retired";
+            assert_eq!(
+                AARCH64_TRAP.matches(attest).count(),
+                2,
+                "both AArch64 resume boundaries attest retirement"
+            );
+            for (i, _) in AARCH64_TRAP.match_indices(attest) {
+                let before = &AARCH64_TRAP[i.saturating_sub(160)..i];
                 assert!(
                     before.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
-                    "{arch}: the recv/reply-timeout consumer must stay feature-gated"
+                    "the retirement attestation is telemetry and stays feature-gated"
                 );
             }
         }
