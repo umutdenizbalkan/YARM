@@ -147669,3 +147669,263 @@ mod stage199gc4_waiting_receiver_and_blocking_send {
         assert!(body.contains("BlockingSendCommitOutcome::RefusedNotCurrent"));
     }
 }
+
+/// 199G-C4 §5 — MECHANICAL ACCEPTANCE for the NR 1 pre-lock route.
+///
+/// The headline claim is that production `IpcSend` no longer has an edge into either terminal
+/// broad dispatcher on any architecture. That is a source-derivable property — the route must be
+/// admitted on all three, and nothing in it may yield NR 1 back to the broad arm after it has
+/// consumed anything — and these tests derive it, the way the NR 5 guard derives the same claim
+/// for the receive-timeout class.
+#[cfg(test)]
+mod stage199gc4_nr1_terminal_edges {
+    use super::*;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    fn route_body() -> &'static str {
+        let start = SPLIT_SRC
+            .find("fn try_split_ipc_send_into_frame(\n    shared: &SharedKernel,")
+            .expect("the NR 1 route");
+        let end = SPLIT_SRC[start..]
+            .find("\n/// 199G-C4 §1 — settle a stashed transfer envelope")
+            .expect("the route ends")
+            + start;
+        &SPLIT_SRC[start..end]
+    }
+
+    #[test]
+    fn nr1_is_admitted_on_all_three_architectures() {
+        // The route itself admits NR 1 and excludes no architecture.
+        assert!(
+            route_body().contains("Ok(Syscall::IpcSend)"),
+            "the pre-lock send route must admit NR 1"
+        );
+        assert!(
+            !route_body().contains("cfg!(any(target_arch"),
+            "the NR 1 route excludes no architecture"
+        );
+        // It is reached from the shared dispatcher, before the non-switching whitelist.
+        let dispatcher = SPLIT_SRC
+            .split("pub(crate) fn try_split_dispatch_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the dispatcher");
+        let send = dispatcher
+            .find("try_split_ipc_send_into_frame(")
+            .expect("NR 1 is dispatched");
+        let nonswitching = dispatcher
+            .find("try_split_dispatch_nonswitching_into_frame(")
+            .expect("the whitelist");
+        assert!(
+            send < nonswitching,
+            "NR 1 may not be early-returned through the caller's frame, so it is tried before \
+             the non-switching whitelist"
+        );
+        // AArch64: the pre-split ABI import must admit NR 1, or the dispatcher sees nr=0.
+        assert!(
+            TRAP_ENTRY.contains("raw_nr == crate::kernel::syscall::SYSCALL_IPC_SEND_NR"),
+            "AArch64 must import the NR 1 ABI before the split dispatch inspects it"
+        );
+        // RISC-V: the whitelist must admit NR 1.
+        let whitelist = RISCV
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("the RISC-V whitelist");
+        assert!(
+            whitelist.contains("SYSCALL_IPC_SEND_NR"),
+            "RISC-V must admit NR 1 into the split dispatcher"
+        );
+    }
+
+    #[test]
+    fn no_broad_fallback_exists_after_the_route_consumes_anything() {
+        let body = route_body();
+        // Every `NotHandled` — the ONLY route back to the broad dispatcher — must appear before
+        // the envelope stash, which is the first consuming step.
+        let stash = body
+            .find("stash_transfer_envelope_split(")
+            .expect("the consuming step");
+        let mut searched = 0usize;
+        let mut fallbacks = 0usize;
+        while let Some(rel) = body[searched..].find("D::NotHandled") {
+            let at = searched + rel;
+            assert!(
+                at < stash,
+                "a fallback at byte {at} follows the envelope stash at {stash}: re-running the \
+                 send would stash a SECOND envelope for one syscall"
+            );
+            fallbacks += 1;
+            searched = at + 1;
+        }
+        assert!(
+            fallbacks >= 3,
+            "the pre-mutation declines are still present"
+        );
+        // And after the stash every exit settles the envelope through the ONE settle owner.
+        let after = &body[stash..];
+        assert!(
+            after.matches("settle_ipc_send_envelope(").count() >= 4,
+            "each post-stash exit settles the envelope"
+        );
+    }
+
+    #[test]
+    fn the_two_impossible_classes_fail_closed_before_mutation() {
+        let body = route_body();
+        let stash = body
+            .find("stash_transfer_envelope_split(")
+            .expect("the consuming step");
+        for (needle, what) in [
+            ("reason=kernel_cap_send result=failed_closed", "Kernel cap"),
+            (
+                "reason=synchronous_endpoint result=failed_closed",
+                "Synchronous endpoint",
+            ),
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("{what} refusal"));
+            assert!(
+                at < stash,
+                "{what} must fail closed before anything is consumed"
+            );
+        }
+        // Neither reaches a terminal dispatcher: both return a typed refusal, not `NotHandled`.
+        let kernel_arm = body
+            .split("reason=kernel_cap_send result=failed_closed")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the Kernel arm");
+        assert!(kernel_arm.contains("D::Complete(Err("));
+        assert!(!kernel_arm.contains("D::NotHandled"));
+    }
+
+    #[test]
+    fn every_production_class_reaches_an_authoritative_split_owner() {
+        let body = route_body();
+        for (owner, class) in [
+            (
+                "produce_blocked_waiter_plain_delivery_split(",
+                "plain direct",
+            ),
+            (
+                "produce_blocked_waiter_reply_cap_delivery_split(",
+                "reply-cap direct",
+            ),
+            (
+                "produce_blocked_waiter_ordinary_cap_delivery_split(",
+                "ordinary-cap direct",
+            ),
+            (
+                "produce_blocked_waiter_shared_region_delivery_split(",
+                "shared-region direct",
+            ),
+            (
+                "ipc_endpoint_enqueue_authoritative_split(",
+                "buffered enqueue",
+            ),
+            ("stash_transfer_envelope_split(", "envelope + pin"),
+            ("wake_waiter_for_endpoint_split(", "waiter wake"),
+            ("BlockingSendCommit(", "U6 blocking publication"),
+        ] {
+            assert!(
+                body.contains(owner),
+                "the {class} class must reach its authoritative split owner `{owner}`"
+            );
+        }
+        // The enqueue is the AUTHORITATIVE one, never the conservative Stage-4E screen.
+        assert!(
+            !body.contains("ipc_try_send_queued_plain_endpoint_only_split("),
+            "the route uses the authoritative unconditional enqueue, not the Stage-4E screen"
+        );
+        // No second enqueue, delivery, prelude, wake or post-work implementation appears here:
+        // the route consults owners, it does not contain policy.
+        for reimplemented in [
+            "endpoint.send(",
+            "encode_recv_v2_meta(",
+            "project_recv_delivery(",
+            "blocked_recv_state.take()",
+            "adjust_memory_object_pin_refcount",
+        ] {
+            assert!(
+                !body.contains(reimplemented),
+                "the route must not contain `{reimplemented}` — it belongs to an owner"
+            );
+        }
+    }
+
+    #[test]
+    fn the_route_reports_exactly_the_four_dispositions_and_no_other_channel() {
+        let body = route_body();
+        // Committed outcomes carry the route's own finalize decision.
+        assert!(
+            body.contains("D::PostWorkCommitted {\n                    finalize_syscall: true,\n                }"),
+            "a delivery finishes the caller's syscall"
+        );
+        assert!(
+            body.contains("finalize_syscall: false,"),
+            "a parked sender's syscall is NOT finished by the route"
+        );
+        // No route invents a channel of its own.
+        for forbidden in ["DISPATCH_SWITCH_PLAN_STASH", "queue_advance_admit_split("] {
+            assert!(
+                !body.contains(forbidden),
+                "the NR 1 route must not open a second channel (saw `{forbidden}`)"
+            );
+        }
+        // The blocking arm stashes the EXISTING U6 proposal and lets the existing drain commit
+        // it — the route never blocks a task itself.
+        for blocking_itself in [
+            "commit_blocking_send_split(",
+            "block_current_on_send",
+            "recv_block_phase_a_split(",
+        ] {
+            assert!(
+                !body.contains(blocking_itself),
+                "the route proposes a block; the existing drain commits it (saw `{blocking_itself}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_route_emits_the_existing_marker_families_and_invents_none() {
+        let body = route_body();
+        // Every boundary marker it emits already exists in the broad owner it replaced.
+        const IPC_SRC: &str = include_str!("ipc_state.rs");
+        for marker in [
+            "IPC_SEND_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_BOUNDARY_PLAIN_SNAPSHOT_OK",
+            "IPC_SEND_CAP_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_CAP_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_REPLY_CAP_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_ENQUEUE_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE",
+        ] {
+            assert!(body.contains(marker), "the route emits `{marker}`");
+            assert!(
+                IPC_SRC.contains(marker),
+                "`{marker}` must be an EXISTING family, also emitted by the broad owner"
+            );
+        }
+        // And it tags the per-CPU stash origin per class, which is what makes the drain emit
+        // this class's markers rather than the generic delivery ones.
+        for tag in [
+            "ipc_send_boundary_origin_set(cpu_idx)",
+            "ipc_send_reply_cap_boundary_origin_set(cpu_idx)",
+            "ipc_send_cap_boundary_origin_set(cpu_idx)",
+        ] {
+            assert!(
+                body.contains(tag),
+                "the route tags the stash origin: `{tag}`"
+            );
+        }
+    }
+}

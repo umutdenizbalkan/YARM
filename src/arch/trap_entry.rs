@@ -2580,6 +2580,15 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // AArch64 blocking-recv resumes since U4. Without the import `nr` stays 0, the split
         // dispatcher declines, and NR 5 would keep its terminal broad edge on this architecture.
         || raw_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
+        // 199G-C4 §1 — IpcSend (NR 1). Same reason as the two receives above: without the
+        // import `nr` stays 0, the split dispatcher declines, and NR 1 would keep its terminal
+        // broad edge on this architecture no matter what its route admits. What the class needs
+        // from AArch64 it has — the shared post-work drain that owns the delivery executors and
+        // the U6 blocking-send commit, and the shared D2-SEND drain that settles a parked
+        // sender's resume, both live here since U4/U6. NR 1's six-argument ABI is exactly what
+        // the route reads: the endpoint cap, the payload pointer/length, the inline payload
+        // words and the transfer cap.
+        || raw_nr == crate::kernel::syscall::SYSCALL_IPC_SEND_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

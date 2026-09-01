@@ -697,7 +697,9 @@ pub fn handle_riscv_trap_entry_shared(
     {
         let is_timer = matches!(decode_trap_context(context), TrapEvent::TimerInterrupt);
         match crate::kernel::syscall_split::try_split_timer_dispatch(shared, cpu, is_timer) {
-            crate::kernel::syscall_split::SplitDispatchDisposition::PostWorkCommitted { .. } => {
+            crate::kernel::syscall_split::SplitDispatchDisposition::PostWorkCommitted {
+                ..
+            } => {
                 post_work_committed = true;
             }
             crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
