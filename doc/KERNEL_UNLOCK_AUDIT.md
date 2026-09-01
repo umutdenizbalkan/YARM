@@ -6404,3 +6404,57 @@ multi-domain: the token check and the committed-blocked check read TCBs (task ra
 record lookup, terminal cell and deadline store are IPC rank 3. That is a real rank-ordered
 transaction, not a wrapper, and it was not attempted here rather than risk a half-verified one.
 NR 6 / NR 7 portability to AArch64 and RISC-V was not started. Main is unchanged.
+
+## 199E-ARM — the split receive route now arms the reply terminal; server death settles (WIP; NOT delivered)
+
+**What was wired.** `arm_reply_terminal_for_committed_block_locked` is the arming policy and it is
+rank 3 only — everything it reads and writes lives in `IpcSubsystem`. It runs inside the SAME
+`with_ipc_split_mut` scope that publishes the endpoint waiter, so a committed reply wait and its
+terminal owner become visible together and there is no window in which a committed wait exists
+with no owner to claim it. It arms only on a successful publish (a refused publish unwinds the
+block), only for a genuine reply/call wait (a live `Available` reply record naming this exact
+`{caller_tid, caller_asid}` at this exact reply endpoint, so ordinary receives and NR 2 / NR 5
+timeout semantics are untouched), and regardless of any deadline — the cell is the single
+authority for reply, timeout, peer death, caller exit and endpoint destruction, and only one of
+those is a timeout. An identity already armed exactly is left alone rather than re-armed, because
+`arm` bumps the cell epoch and would invalidate a deadline token keyed on the old one.
+
+**Live result — server death now settles.** The witnessed scenario arms with the exact identity
+and the drain wins:
+
+```
+IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=1 caller_asid=1 record_index=0 record_generation=18
+                               replier_tid=10009 blocked_recv_generation=17 finite_deadline=1
+IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won record_index=0 record_generation=18
+                                caller_tid=1 caller_asid=1 broad_lock=0
+IPC_SERVER_DEATH_COMPLETION_COMMITTED code=10 caller_tid=1 caller_asid=1 runnable=1 result=ok
+IPC_SERVER_DEATH_CALLER_ENQUEUED caller_tid=1 caller_asid=1 enqueues=1 result=ok
+IPC_SERVER_DEATH_OK arch=x86_64 terminal=PeerDeath death_result=ServerDied caller_wakes=1
+                    reply_aliases_invalid=1 reply_copies=0 result=ok
+IPC_SERVER_DEATH_DRAIN outcome=Woken record_index=0 record_generation=18 result=ok
+```
+
+`IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY` and `IPC_SERVER_DEATH_WRONG_RECORD_GENERATION` are gone,
+and the blocked caller receives `ServerGone` exactly once. The profile's failure count falls from
+15 to 3.
+
+**The three that remain, and why they are one cause.** The finite-deadline STORE registration is
+still dead: it additionally writes the caller's TCB (`reply_timeout_token`, `reply_timeout_clock`),
+which is rank 2, so it cannot ride the rank-3 publish scope the way the arm does. That single gap
+explains all three:
+
+* `IPC_SERVER_DEATH_RECORD_LEAK detached=0 peer_death_winners=1` — the audit compares
+  `LinkDetached` against `PeerDeathWinner`, and the `LinkDetached` counter is scoped by
+  `arm_server_dies_link_scope`, which is called from `register_reply_receive_deadline`. With that
+  registration dead the scope is never armed, so the detach is never counted while the winner is.
+  It is a counting asymmetry, not an actual leaked record — the drain reports `outcome=Woken` and
+  `reply_aliases_invalid=1 reply_copies=0`.
+* the two `marker out of order` failures — boot-global ordering stamps observing an unrelated
+  earlier server exit (tid 10000, ~6000 lines before the witnessed scenario), as already recorded.
+
+**Next step, precisely.** The deadline half is a 2 → 3 → 2 sequence with compensation: rank 3
+reserves the token (`arm_deadline_token` is itself IpcState-only), rank 2 publishes the handle into
+the caller's TCB, and a rank-3 release compensates if that publish fails. No two domains are ever
+held together. Until it lands, `IPC_REPLY_TIMEOUT_ARMED` stays 0 and §4's finite-timeout
+requirement is unmet, so this is NOT delivered and NR 6 / NR 7 portability was not started. Main is
+unchanged.
