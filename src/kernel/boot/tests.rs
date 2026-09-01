@@ -91372,12 +91372,41 @@ mod stage200b_memory_ordering {
     #[test]
     fn terminal_rearm_publishes_open_with_release_last() {
         let s = terminal_src();
-        // The re-arm publishes Open with the SAME Release discipline as arm.
+        // EVERY publisher of `Open` — arm, try_rearm and the 199A2D-RR vacate-for-reuse —
+        // writes the identity first and publishes Open LAST with one Release store, so an
+        // Acquire reader that sees Open also sees the whole identity it belongs to. Pinned
+        // per publisher rather than by a bare count: a new publisher that skipped the
+        // discipline would keep any count honest only by accident.
+        for publisher in [
+            "pub fn arm(&mut self, identity: TerminalIdentity) {",
+            "pub fn try_rearm(",
+            "pub fn vacate_for_reuse(&mut self) -> bool {",
+        ] {
+            let body = s.split(publisher).nth(1).unwrap_or_else(|| {
+                panic!("missing terminal publisher: {publisher}");
+            });
+            let end = body.find("\n    /// ").unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                body.contains("store(encode(epoch, 0, PHASE_OPEN), Ordering::Release)"),
+                "{publisher} must publish Open with a Release store"
+            );
+            let ident = body
+                .find("self.identity = ")
+                .unwrap_or_else(|| panic!("{publisher} must write the identity"));
+            let publish = body
+                .find("store(encode(epoch, 0, PHASE_OPEN), Ordering::Release)")
+                .expect("checked above");
+            assert!(
+                ident < publish,
+                "{publisher} must write the identity BEFORE publishing Open"
+            );
+        }
         assert_eq!(
             s.matches("store(encode(epoch, 0, PHASE_OPEN), Ordering::Release)")
                 .count(),
-            2,
-            "both arm and try_rearm publish Open with a Release store"
+            3,
+            "arm, try_rearm and vacate_for_reuse are the ONLY publishers of Open"
         );
         assert!(
             s.contains(".compare_exchange(open, reserved, Ordering::AcqRel, Ordering::Acquire)"),
@@ -149024,5 +149053,278 @@ mod stage199a2drr_reply_record_release {
             !TXN.contains("release_consumed_reply_record_split("),
             "the transaction must leave the release to its caller"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 199A2D-RR §2/§3 — safe TERMINAL-CELL reuse across a recycled reply-record slot.
+//
+// Once a reply-record slot became physically reclaimable, an allocation is normally a
+// REUSE, and the slot's terminal cell still names the incarnation that is gone. The
+// allocation owner therefore vacates the cell atomically with taking the slot. These pin
+// the two halves that make that safe: the new incarnation classifies as genuinely
+// `Unarmed` (so queued mode can be selected again), and a slot whose terminal may still
+// be decided is never taken at all.
+mod stage199a2drr_terminal_reuse {
+    use super::*;
+    use crate::kernel::direct_eligibility::DirectReplyTerminal as T;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::runtime::SharedKernel;
+
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    struct Fx {
+        k: SharedKernel,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    }
+
+    fn fixture() -> Fx {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (caller, replier) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("bind1");
+            s.bind_task_asid(2, sasid).expect("bind2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            (
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid),
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid),
+            )
+        });
+        Fx { k, caller, replier }
+    }
+
+    impl Fx {
+        fn allocate(&self) -> Result<(usize, u64), KernelError> {
+            self.k.with(|s| {
+                s.reserve_direct_reply_record(
+                    self.caller,
+                    self.replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+            })
+        }
+
+        /// The identity the receive route would arm this incarnation's terminal with.
+        fn identity(&self, index: usize, generation: u64) -> TerminalIdentity {
+            TerminalIdentity {
+                reply_record_index: index,
+                reply_record_generation: generation,
+                caller_tid: self.caller.tid,
+                caller_asid: self.caller.asid,
+                replier_tid: self.replier.tid,
+                replier_asid: self.replier.asid,
+                reply_endpoint_index: 0,
+                reply_endpoint_generation: 1,
+                blocked_recv_generation: 1,
+                deadline_token_generation: Some(1),
+            }
+        }
+
+        fn arm(&self, index: usize, generation: u64) {
+            let id = self.identity(index, generation);
+            self.k.with(|s| s.arm_reply_terminal(index, id));
+        }
+
+        fn classify(&self, index: usize, generation: u64) -> T {
+            self.k
+                .classify_direct_reply_terminal_split_read(index, generation, self.replier, 0, 1)
+        }
+
+        /// Drive the whole reply lifecycle of one incarnation to its settled terminal and
+        /// release the slot, exactly as the NR7 split route does.
+        fn settle_and_release(&self, index: usize, generation: u64) {
+            let id = self.identity(index, generation);
+            let owner = self
+                .k
+                .with(|s| s.try_claim_reply_terminal_slot(index, TerminalClaimant::Reply, &id))
+                .expect("the reply claims its own armed terminal");
+            assert!(self.k.with(|s| s.commit_reply_terminal_slot(index, &owner)));
+            // The request path commits `Reserved → Available` before the record is
+            // externally invokable; only such a record can be re-reserved by a reply.
+            assert!(
+                self.k
+                    .with(|s| s.commit_direct_reply_record(index, generation))
+            );
+            assert!(
+                self.k
+                    .reserve_existing_reply_record_split(index, generation, self.replier)
+            );
+            assert!(self.k.consume_reply_record_split(index, generation));
+            self.k
+                .release_consumed_reply_record_split(index, generation);
+        }
+    }
+
+    /// THE §2 REPAIR. A recycled slot's new incarnation is `Unarmed` — not the
+    /// `IdentityMismatch` a cell left naming its predecessor would report. This is what
+    /// makes the queued (unblocked-caller) reply mode selectable on a reused slot; without
+    /// it the mode goes permanently dormant the first time a slot is recycled.
+    #[test]
+    fn a_recycled_slot_classifies_as_unarmed_not_as_a_mismatch() {
+        let fx = fixture();
+        let (index, generation) = fx.allocate().expect("first incarnation");
+        fx.arm(index, generation);
+        assert_eq!(fx.classify(index, generation), T::AvailableExact);
+        fx.settle_and_release(index, generation);
+
+        let (new_index, new_generation) = fx.allocate().expect("recycled incarnation");
+        assert_eq!(new_index, index, "the freed slot is the one reused");
+        assert!(
+            new_generation > generation,
+            "the generation strictly advances"
+        );
+
+        assert_eq!(
+            fx.classify(new_index, new_generation),
+            T::Unarmed,
+            "the allocation owner must have ENDED the previous incarnation's naming"
+        );
+    }
+
+    /// The epoch is bumped, never reset. Vacancy is a property of the identity, so the ABA
+    /// nonce that every stale owner and deadline token is keyed on stays monotonic across
+    /// the recycle — an old token fails on the epoch before it reaches the identity.
+    #[test]
+    fn the_recycle_advances_the_terminal_epoch_rather_than_resetting_it() {
+        let fx = fixture();
+        let (index, generation) = fx.allocate().expect("first incarnation");
+        fx.arm(index, generation);
+        let armed_epoch = fx.k.with(|s| s.reply_terminal_epoch(index)).expect("epoch");
+        assert!(armed_epoch > 0);
+        fx.settle_and_release(index, generation);
+
+        let (_, new_generation) = fx.allocate().expect("recycled incarnation");
+        let vacated_epoch = fx.k.with(|s| s.reply_terminal_epoch(index)).expect("epoch");
+        assert!(
+            vacated_epoch > armed_epoch,
+            "vacating must ADVANCE the epoch ({vacated_epoch} vs {armed_epoch})"
+        );
+
+        // And the old incarnation's identity can no longer claim the cell, at any phase.
+        fx.arm(index, new_generation);
+        let stale = fx.identity(index, generation);
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                index,
+                TerminalClaimant::Timeout,
+                &stale
+            ))
+            .is_none(),
+            "a deadline token from the previous incarnation must never win the reused cell"
+        );
+    }
+
+    /// A cell that may still be decided is never recycled. An armed, UNSETTLED terminal
+    /// still belongs to a live deadline / peer-death / caller-exit claimant, so the
+    /// allocator skips the slot instead of discarding that outcome.
+    #[test]
+    fn a_slot_whose_terminal_is_still_live_is_skipped_not_stolen() {
+        let fx = fixture();
+        let (index, generation) = fx.allocate().expect("first incarnation");
+        // Armed and OPEN: the caller is blocked and its deadline can still fire.
+        fx.arm(index, generation);
+        // The record itself goes away without the terminal ever being settled — the shape
+        // the caller-exit and server-death sweeps leave behind.
+        assert!(fx.k.with(|s| s.cancel_direct_reply_record(index, generation)));
+
+        let (next_index, _next_generation) = fx.allocate().expect("a later allocation");
+        assert_ne!(
+            next_index, index,
+            "the slot with a live unsettled terminal must be SKIPPED, not reused"
+        );
+        // The evidence that it really was still live: the deadline still wins it.
+        let id = fx.identity(index, generation);
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(index, TerminalClaimant::Timeout, &id))
+                .is_some(),
+            "the outcome the skip preserved is still claimable"
+        );
+    }
+
+    /// Vacancy must NOT be inferred from a mismatch. A cell naming a different, live
+    /// incarnation is still `IdentityMismatch` — the classifier gained no license to treat
+    /// a mismatch as an absent terminal.
+    #[test]
+    fn a_cell_naming_another_incarnation_is_still_a_mismatch() {
+        let fx = fixture();
+        let (index, generation) = fx.allocate().expect("incarnation");
+        // Arm the cell for a DIFFERENT record generation than the live record's.
+        let mut wrong = fx.identity(index, generation);
+        wrong.reply_record_generation = generation + 7;
+        fx.k.with(|s| s.arm_reply_terminal(index, wrong));
+
+        assert_eq!(
+            fx.classify(index, generation),
+            T::IdentityMismatch,
+            "a mismatch must never be reported as Unarmed"
+        );
+        assert!(
+            !matches!(fx.classify(index, generation), T::Unarmed),
+            "and therefore must never admit a direct reply"
+        );
+    }
+
+    /// Both allocation routes drive the SAME owner, so the prepare-for-reuse step cannot
+    /// be present on one and missing on the other.
+    #[test]
+    fn both_allocation_routes_delegate_to_the_one_owner() {
+        let owner = IPC_STATE
+            .split("pub(crate) fn reserve_direct_reply_record_locked(")
+            .nth(1)
+            .expect("the allocation owner");
+        let end = owner.find("\npub(crate) fn ").unwrap_or(owner.len());
+        let owner = &owner[..end];
+        assert!(
+            owner.contains("vacate_for_reuse()"),
+            "the allocation owner must prepare the slot's terminal cell for reuse"
+        );
+        let vacate = owner.find("vacate_for_reuse()").expect("checked above");
+        let install = owner
+            .find("ipc.reply_caps[idx] = Some(ReplyCapRecord {")
+            .expect("the record install");
+        assert!(
+            vacate < install,
+            "the cell must stop naming its predecessor BEFORE the new record exists"
+        );
+        assert!(
+            owner.contains("continue;"),
+            "a cell that refuses to vacate must skip the slot, not take it anyway"
+        );
+
+        // Neither route may keep a private copy of the scan.
+        for (name, src) in [
+            (
+                "broad",
+                IPC_STATE
+                    .split("pub(crate) fn reserve_direct_reply_record(")
+                    .nth(1),
+            ),
+            (
+                "split",
+                RUNTIME
+                    .split("pub(crate) fn reserve_direct_reply_record_split(")
+                    .nth(1),
+            ),
+        ] {
+            let body = src.expect("route present");
+            let end = body.find("\n    /// ").unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                body.contains("reserve_direct_reply_record_locked("),
+                "the {name} route must delegate to the one allocation owner"
+            );
+            assert!(
+                !body.contains("ReplyCapRecord {"),
+                "the {name} route must not keep a private copy of the record install"
+            );
+        }
     }
 }

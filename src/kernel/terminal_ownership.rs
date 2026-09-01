@@ -309,6 +309,63 @@ impl TerminalCell {
         Some(epoch)
     }
 
+    /// 199A2D-RR — VACATE the cell so its reply-record slot may be recycled.
+    ///
+    /// A released reply-record slot goes back to the allocator, but its terminal cell
+    /// still carries the previous incarnation's armed identity. Left alone the cell keeps
+    /// naming a record that no longer exists, so the slot's NEXT occupant classifies as an
+    /// identity mismatch forever. Vacating is the explicit transition that ends that
+    /// naming — the cell afterwards names no record at all.
+    ///
+    /// It BUMPS the epoch rather than resetting it, so epoch monotonicity — the ABA nonce
+    /// every [`TerminalOwner`] and every deadline token is keyed on — is preserved across
+    /// the recycle. A token minted against the previous incarnation therefore fails on the
+    /// epoch before it even reaches the identity. The identity is then zeroed and `Open` is
+    /// published LAST with a single `Release` store, the same publication discipline as
+    /// [`arm`](Self::arm) and [`try_rearm`](Self::try_rearm).
+    ///
+    /// Refuses, mutating NOTHING, whenever the cell may still be legitimately decided:
+    ///
+    /// * `Reserved` — a live `TerminalOwner` exists; vacating would strand its claim.
+    /// * `Open` naming a record — the cell is armed for an incarnation whose terminal has
+    ///   NOT been settled, so a deadline, peer-death or caller-exit claimant may still win
+    ///   it. The slot must not be recycled underneath a live claimant or deadline.
+    ///
+    /// `Completed` — the settled terminal of a delivered reply — and a cell that already
+    /// names no record are the two states a recyclable slot may legitimately be in.
+    pub fn vacate_for_reuse(&mut self) -> bool {
+        let cur = self.state.load(Ordering::Relaxed);
+        if phase_of(cur) != PHASE_COMPLETED {
+            // Not settled: the only other vacatable state is a cell that already names
+            // nothing (never armed, or vacated by an earlier recycle). Anything else —
+            // `Reserved`, or `Open` still naming a record — keeps the slot.
+            return phase_of(cur) == PHASE_OPEN && self.identity.reply_record_generation == 0;
+        }
+        let mut epoch = epoch_of(cur).wrapping_add(1);
+        if epoch == 0 {
+            epoch = 1;
+        }
+        self.identity = TerminalIdentity::ZERO;
+        // Release publication: the zeroed identity is visible to any Acquire reader that
+        // observes this Open state, exactly as for an arming.
+        self.state
+            .store(encode(epoch, 0, PHASE_OPEN), Ordering::Release);
+        true
+    }
+
+    /// `true` when the cell is armed for no record at all — never armed for any
+    /// incarnation, or explicitly vacated when its slot was recycled. Record generations
+    /// start at 1, so generation 0 names nothing.
+    ///
+    /// This, not `current_epoch() == 0`, is the vacancy question: a vacated cell keeps a
+    /// non-zero epoch on purpose. It is a strictly narrower test than an identity
+    /// comparison — a cell naming a DIFFERENT record is not vacant, and must still be
+    /// reported as the mismatch it is.
+    #[inline]
+    pub fn names_no_record(&self) -> bool {
+        self.identity.reply_record_generation == 0
+    }
+
     /// The generation-bearing identity this cell is armed for.
     #[inline]
     pub fn identity(&self) -> &TerminalIdentity {
@@ -696,5 +753,133 @@ mod tests {
         assert!(c.try_claim_reply_terminal(&reused_tid).is_none());
         // The exact new identity is accepted.
         assert!(c.try_claim_reply_terminal(&ident(2)).is_some());
+    }
+
+    // ── 199A2D-RR: vacate-for-reuse ────────────────────────────────────────────
+    //
+    // Releasing a reply-record slot back to the allocator leaves its terminal cell
+    // naming the incarnation that is gone. Vacating ends that naming; these pin that it
+    // ends it SAFELY — the epoch stays monotonic, every stale token still loses, and a
+    // cell that may still be decided is never vacated at all.
+
+    #[test]
+    fn a_settled_cell_vacates_and_names_no_record() {
+        let mut c = armed(1);
+        let owner = c.try_claim_reply_terminal(&ident(1)).expect("claim");
+        assert!(c.commit_terminal(&owner));
+        let before = c.current_epoch();
+        assert!(
+            !c.names_no_record(),
+            "a settled cell still names its record"
+        );
+
+        assert!(c.vacate_for_reuse());
+
+        assert!(
+            c.names_no_record(),
+            "the cell must name nothing after vacating"
+        );
+        assert!(
+            c.is_open(),
+            "and be claimable again for the next incarnation"
+        );
+        assert!(
+            c.current_epoch() > before,
+            "the epoch must ADVANCE, not reset: it is the ABA nonce every owner and \
+             deadline token is keyed on"
+        );
+        assert_ne!(
+            c.current_epoch(),
+            0,
+            "epoch 0 would alias the never-armed cell and break monotonicity"
+        );
+    }
+
+    #[test]
+    fn a_reserved_cell_refuses_to_vacate_and_its_owner_survives() {
+        let mut c = armed(1);
+        let owner = c.try_claim_reply_terminal(&ident(1)).expect("claim");
+        let before = c.current_epoch();
+
+        assert!(
+            !c.vacate_for_reuse(),
+            "a live TerminalOwner must never be discarded by a recycle"
+        );
+
+        assert_eq!(c.current_epoch(), before, "a refusal mutates nothing");
+        assert_eq!(c.identity().reply_record_generation, 1);
+        assert_eq!(c.reserved_claimant(), Some(TerminalClaimant::Reply));
+        // The claim the recycle did not steal is still commitable.
+        assert!(c.commit_terminal(&owner));
+    }
+
+    #[test]
+    fn an_open_cell_still_naming_a_record_refuses_to_vacate() {
+        let mut c = armed(1);
+        let before = c.current_epoch();
+
+        assert!(
+            !c.vacate_for_reuse(),
+            "an armed-but-unsettled cell may still be won by a deadline, peer-death or \
+             caller-exit claimant; recycling under it would discard that outcome"
+        );
+
+        assert_eq!(c.current_epoch(), before);
+        assert_eq!(c.identity().reply_record_generation, 1);
+        // Proof that the outcome really was still live: the timeout claimant still wins.
+        assert!(c.try_claim_timeout_terminal(&ident(1)).is_some());
+    }
+
+    #[test]
+    fn an_already_vacant_cell_vacates_without_epoch_churn() {
+        let mut c = TerminalCell::vacant();
+        assert!(c.names_no_record());
+        assert!(c.vacate_for_reuse());
+        assert_eq!(c.current_epoch(), 0, "nothing to end, so no epoch is spent");
+        // And repeatedly: a slot may cycle through the allocator many times unused.
+        for _ in 0..4 {
+            assert!(c.vacate_for_reuse());
+            assert_eq!(c.current_epoch(), 0);
+        }
+    }
+
+    #[test]
+    fn every_stale_token_loses_against_a_vacated_then_rearmed_cell() {
+        let mut c = armed(1);
+        let stale_owner = c.try_claim_reply_terminal(&ident(1)).expect("claim");
+        assert!(c.commit_terminal(&stale_owner));
+        assert!(c.vacate_for_reuse());
+
+        // The slot is recycled: a NEW incarnation arms the vacated cell.
+        c.arm(ident(2));
+
+        // A TerminalOwner minted before the vacate can neither commit nor reopen.
+        assert!(!c.commit_terminal(&stale_owner));
+        assert!(!c.release_terminal_if_retryable(&stale_owner));
+        // A deadline/death token carrying the OLD identity cannot claim.
+        assert!(c.try_claim_timeout_terminal(&ident(1)).is_none());
+        assert!(c.try_claim_peer_death_terminal(&ident(1)).is_none());
+        assert!(c.try_claim_caller_exit_terminal(&ident(1)).is_none());
+        assert!(c.try_claim_endpoint_gone_terminal(&ident(1)).is_none());
+        // Only the new incarnation's exact identity wins.
+        assert!(c.try_claim_reply_terminal(&ident(2)).is_some());
+    }
+
+    #[test]
+    fn a_vacated_cell_is_unarmed_but_a_cell_naming_another_record_is_not() {
+        let mut c = armed(1);
+        // Naming a DIFFERENT record is a mismatch, never vacancy — the distinction the
+        // whole reuse repair rests on.
+        assert!(!c.names_no_record());
+
+        let owner = c.try_claim_reply_terminal(&ident(1)).expect("claim");
+        assert!(c.commit_terminal(&owner));
+        assert!(c.vacate_for_reuse());
+        assert!(c.names_no_record());
+
+        // A vacated cell authorizes nobody until it is armed again: vacancy means "no
+        // terminal exists", not "anyone may claim".
+        assert!(c.try_claim_reply_terminal(&ident(1)).is_none());
+        assert!(c.try_claim_reply_terminal(&ident(2)).is_none());
     }
 }

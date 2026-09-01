@@ -9215,29 +9215,15 @@ impl SharedKernel {
         replier: crate::kernel::boot::ReceiverWaiterIdentity,
         reply_endpoint: CapObject,
     ) -> Result<(usize, u64), KernelError> {
-        use crate::kernel::boot::{ReplyCapRecord, ReplyRecordReservation};
+        // 199A2D-RR: the SAME owner the broad route drives, so the terminal-cell
+        // prepare-for-reuse step cannot exist on one allocation route and not the other.
         self.with_ipc_split_mut(|ipc| {
-            for idx in 0..crate::kernel::boot::MAX_REPLY_CAPS {
-                if ipc.reply_caps[idx].is_none() {
-                    let mut generation = ipc.reply_cap_generations[idx].wrapping_add(1);
-                    if generation == 0 {
-                        generation = 1;
-                    }
-                    ipc.reply_cap_generations[idx] = generation;
-                    ipc.reply_caps[idx] = Some(ReplyCapRecord {
-                        reservation: ReplyRecordReservation::Reserved,
-                        caller_tid: caller.tid,
-                        caller_asid: caller.asid,
-                        reply_endpoint,
-                        responder_tid: Some(replier.tid),
-                        replier_asid: Some(replier.asid),
-                        caller_cap_id: CapId(0),
-                        waiter_cap_id: None,
-                    });
-                    return Ok((idx, generation));
-                }
-            }
-            Err(KernelError::CapabilityFull)
+            crate::kernel::boot::reserve_direct_reply_record_locked(
+                ipc,
+                caller,
+                replier,
+                reply_endpoint,
+            )
         })
     }
 

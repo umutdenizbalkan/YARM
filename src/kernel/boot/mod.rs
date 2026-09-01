@@ -48,7 +48,7 @@ pub(crate) use ipc_state::{
     classify_direct_reply_terminal_locked, commit_queued_reply_locked,
     commit_reply_terminal_locked, complete_reply_timeout_over, complete_server_death_over,
     enqueue_reply_into_endpoint_locked, publish_recv_waiter_locked, reclaim_reply_authority_with,
-    release_reply_terminal_locked,
+    release_reply_terminal_locked, reserve_direct_reply_record_locked,
 };
 mod memory_lifecycle_state;
 mod memory_state;

@@ -1326,6 +1326,61 @@ pub(crate) fn arm_reply_terminal_for_committed_block_locked(
 /// and `deadline_token_generation` are the cell's own and are carried forward into the claim
 /// rather than re-derived, so a claim can never be authorized by a reconstructed approximation.
 /// An armed cell is never sufficient on its own.
+/// 199A2D-RR — rank 3: PREPARE a vacant reply-record slot for reuse, then allocate it.
+///
+/// The single owner of reply-record allocation, driven by both the broad
+/// `KernelState::reserve_direct_reply_record` and the split
+/// `SharedKernel::reserve_direct_reply_record_split`. One implementation, two owners: the
+/// terminal-cell preparation below cannot be present on one route and missing on the other.
+///
+/// Since the reply-record slot became physically reclaimable, an allocation is usually a
+/// REUSE. The slot's terminal cell still names the previous incarnation, so preparing it is
+/// not optional — without it every recycled slot's next occupant is an identity mismatch
+/// forever, and the queued (unblocked-caller) reply mode, which requires an unarmed
+/// terminal, can never be selected again.
+///
+/// The preparation happens ATOMICALLY with the allocation: same rank-3 claim, before the new
+/// record is installed, so no observer ever sees a live record whose cell still names its
+/// predecessor. A cell that refuses to vacate still holds a live claimant or an unsettled
+/// arming; that slot is SKIPPED rather than taken, because recycling it would discard a
+/// claim or deadline that may still legitimately win.
+pub(crate) fn reserve_direct_reply_record_locked(
+    ipc: &mut IpcSubsystem,
+    caller: ReceiverWaiterIdentity,
+    replier: ReceiverWaiterIdentity,
+    reply_endpoint: CapObject,
+) -> Result<(usize, u64), KernelError> {
+    for idx in 0..super::MAX_REPLY_CAPS {
+        if ipc.reply_caps[idx].is_some() {
+            continue;
+        }
+        if !ipc
+            .reply_terminal_ownership
+            .get_mut(idx)
+            .is_some_and(|cell| cell.vacate_for_reuse())
+        {
+            continue;
+        }
+        let mut generation = ipc.reply_cap_generations[idx].wrapping_add(1);
+        if generation == 0 {
+            generation = 1;
+        }
+        ipc.reply_cap_generations[idx] = generation;
+        ipc.reply_caps[idx] = Some(ReplyCapRecord {
+            reservation: super::ReplyRecordReservation::Reserved,
+            caller_tid: caller.tid,
+            caller_asid: caller.asid,
+            reply_endpoint,
+            responder_tid: Some(replier.tid),
+            replier_asid: Some(replier.asid),
+            caller_cap_id: CapId(0),
+            waiter_cap_id: None,
+        });
+        return Ok((idx, generation));
+    }
+    Err(KernelError::CapabilityFull)
+}
+
 pub(crate) fn classify_direct_reply_terminal_locked(
     ipc: &IpcSubsystem,
     record_index: usize,
@@ -1342,10 +1397,16 @@ pub(crate) fn classify_direct_reply_terminal_locked(
     let Some(cell) = ipc.reply_terminal_ownership.get(record_index) else {
         return T::IdentityMismatch;
     };
-    // Epoch 0 is the vacant cell: never armed for any incarnation. Nothing can be racing this
-    // reply, because a timeout claimant reaches a record only through a deadline token and a
-    // token can only be reserved against an armed, open cell.
-    if cell.current_epoch() == 0 {
+    // A cell that names NO record is unarmed: never armed for any incarnation (epoch 0), or
+    // explicitly vacated by the allocation owner when this slot was recycled. Nothing can be
+    // racing this reply in either case, because a timeout, peer-death or caller-exit claimant
+    // reaches a record only through a token minted against an armed, open cell NAMING it.
+    //
+    // This is deliberately not `current_epoch() == 0`: vacating keeps the epoch monotonic on
+    // purpose, so that stale tokens fail on the epoch. Nor does it weaken the mismatch arm —
+    // a cell naming a DIFFERENT record still falls through to the exact comparison below and
+    // is still reported as `IdentityMismatch`.
+    if cell.names_no_record() {
         return T::Unarmed;
     }
     let Some(Some(record)) = ipc.reply_caps.get(record_index) else {
@@ -2198,27 +2259,7 @@ impl KernelState {
         reply_endpoint: CapObject,
     ) -> Result<(usize, u64), KernelError> {
         self.with_ipc_state_mut(|ipc| {
-            for idx in 0..super::MAX_REPLY_CAPS {
-                if ipc.reply_caps[idx].is_none() {
-                    let mut generation = ipc.reply_cap_generations[idx].wrapping_add(1);
-                    if generation == 0 {
-                        generation = 1;
-                    }
-                    ipc.reply_cap_generations[idx] = generation;
-                    ipc.reply_caps[idx] = Some(ReplyCapRecord {
-                        reservation: super::ReplyRecordReservation::Reserved,
-                        caller_tid: caller.tid,
-                        caller_asid: caller.asid,
-                        reply_endpoint,
-                        responder_tid: Some(replier.tid),
-                        replier_asid: Some(replier.asid),
-                        caller_cap_id: CapId(0),
-                        waiter_cap_id: None,
-                    });
-                    return Ok((idx, generation));
-                }
-            }
-            Err(KernelError::CapabilityFull)
+            reserve_direct_reply_record_locked(ipc, caller, replier, reply_endpoint)
         })
     }
 
