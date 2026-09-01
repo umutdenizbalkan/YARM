@@ -701,6 +701,31 @@ pub fn handle_trap_entry_shared(
             }
         }
     }
+    // 199D-DW2 — SAVE THE ENTERING TASK'S REGISTER CONTEXT, before anything can block it.
+    //
+    // `arch/x86_64/trap.rs` does exactly this on the raw path and documents it as essential:
+    // "the IPC blocking path does not call sync_current_thread_from_frame; without this, a
+    // blocked task's TCB retains its spawn-time PC and would restart from scratch on every
+    // resume." This SHARED bridge — the one x86_64 and AArch64 actually run — never did it, so a
+    // task that blocked through the broad handler kept whatever context some earlier trap had
+    // left in its TCB.
+    //
+    // The consequence was silent and only visible to a delivery that RETURNS a value through the
+    // blocked syscall: PM blocked in `ipc_recv`, the direct NR 6 request wrote its payload and
+    // metadata into PM's buffers and woke it, and PM resumed at the return address of its
+    // PREVIOUS `ipc_reply` instead — re-executing the receive against an endpoint whose queue was
+    // empty, because a direct delivery enqueues nothing. A legacy send survived this only by
+    // accident: it leaves the message in the endpoint queue, so the re-executed receive finds it.
+    //
+    // Captured through the EXISTING off-lock owner (rank 2 only), before the split dispatch so a
+    // route that publishes its own result into the TCB overwrites this, never the other way
+    // round. tid 0 is skipped for the same reason the raw path skips it: the kernel never
+    // returns to user mode for it.
+    if let (Some(f), Some(tid)) = (frame.as_deref(), shared.current_tid_authoritative(cpu))
+        && tid != 0
+    {
+        let _ = shared.capture_outgoing_user_context_split(tid, f);
+    }
     let mut post_work_committed = false;
     {
         let is_timer = matches!(decode_trap_context(context), TrapEvent::TimerInterrupt);
@@ -754,7 +779,17 @@ pub fn handle_trap_entry_shared(
             // is about to overwrite the live frame with the INCOMING task's context.
             if matches!(disposition, SplitDispatchDisposition::QueueAdvanceCommitted) {
                 finalize_split_handled_syscall(shared, cpu, entering, frame);
-                let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+                // 199D-DW2: read the identity from whichever deferral the route ACTUALLY
+                // published, not from FutexWait's alone. A blocking receive (NR 2/NR 5) and a
+                // blocking send publish the D2-RECV / D2-SEND deferrals, so asking only
+                // `futex_wait_dispatch_outgoing` returned `None` and captured NOTHING — leaving
+                // the parked task's saved context stale. The RISC-V bridge took this same fix in
+                // 199G-B §2; this is the shared x86_64/AArch64 cell of it. The deferrals are
+                // mutually exclusive within one trap (each route reserves its own before
+                // publishing), so taking the first live one is unambiguous.
+                let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
+                    .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx))
+                    .or_else(|| crate::kernel::boot::d2_send_dispatch_outgoing(cpu_idx));
                 let captured = outgoing
                     .map(|t| shared.capture_outgoing_user_context_split(t, frame))
                     .unwrap_or(false);
