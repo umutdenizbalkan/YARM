@@ -6357,3 +6357,50 @@ byte-identical to `7e240e5`, i.e. it predates this pass and traces to the 199D-D
 context capture making the scenario reachable at all. It is a real signal about the server-death
 path, it is outside this pass's owner set, and it needs its own increment; it is recorded here
 rather than excluded or explained away.
+
+## 199D-SD §1 — the server-death "wrong identity/generation" is not an arbitration race: the terminal cell is never armed in production (WIP; NOT delivered)
+
+**What the failure actually is.** The x86_64 server-death profile reports
+`IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY armed_tid=0 armed_asid=0 item_tid=10009 item_asid=1
+record_index=41` and `IPC_SERVER_DEATH_WRONG_RECORD_GENERATION armed_generation=0
+item_generation=1`, then `outcome=stale_identity caller_wakes=0`. The armed side is **all zeros**,
+which is the DEFAULT identity of an unarmed `reply_terminal_ownership` cell — not a competing
+owner. The published item is not stale: the drain's own generation pre-check passed
+(`reply_cap_generations[41] == Some(1)`, so it never reported `stale_record`) and the exiting
+incarnation `{tid 10009, asid 1}` is exactly the one `take_server_reply_link` detached the link
+from. Nothing raced. There was simply nothing armed to claim against, so the blocked caller is
+never woken with `ServerGone`: `caller_wakes=0`, `PeerDeath winners=0`.
+
+**Why nothing is armed.** `arm_reply_terminal` has exactly one production caller,
+`arm_production_reply_deadline`, and that function has exactly one call site —
+`block_current_on_receive_with_deadline` in `kernel/boot/ipc_state.rs`, the **in-lock** blocking
+receive. But NR 2 / NR 5 blocking receives are serviced by the **pre-lock split route**,
+`try_split_blocking_ipc_recv_into_frame` in `kernel/syscall_split.rs`, which publishes its own
+`IPC_RECV_BLOCK_REGISTER` and never arms anything. Both markers appear 118 times in one boot
+because the two are paired per receive, which is what made the in-lock owner look reachable.
+Temporary instrumentation inside `arm_production_reply_deadline` settled it: **0 invocations**
+across an entire boot with 118 blocking receives.
+
+**A second consequence of the same root cause.** The same dead function also owns production
+reply-deadline registration, so `IPC_REPLY_TIMEOUT_ARMED` is **0** for a whole boot. Production
+reply/call timeout registration is not running either — the terminal arming and the deadline
+registration were both stranded when the blocking receive moved to the pre-lock route. The
+`doc/KERNEL_UNLOCKING.md` 199E claim that "reply/call timeout registration is now ORDINARY
+production code (`arm_production_reply_deadline`, ungated)" is true of the code but not of its
+reachability on any port that takes the split route.
+
+**Also recorded, and NOT a defect.** `IPC_SERVER_DEATH_DUPLICATE_TRANSITION class=deferred_reserved
+count=2` and the two "marker out of order" failures come from the boot-global transition counter
+and ordering stamps seeing an unrelated earlier server exit (tid 10000, ~6000 lines before the
+witnessed scenario). They became visible only because the service chain now spawns and exits more
+servers. The audit is boot-scoped where the witness is scenario-scoped.
+
+**State.** One checkpoint is on WIP: `arm_production_reply_deadline` now separates ARMING from
+DEADLINE REGISTRATION, so a caller that blocks on a reply receive without a finite timeout still
+arms its terminal cell. That is necessary and correct, and it is **inert until the split route
+calls it** — the in-lock owner it lives in is unreachable in production. Completing the repair
+means giving the pre-lock route the same transaction through split seams, which is genuinely
+multi-domain: the token check and the committed-blocked check read TCBs (task rank 2) while the
+record lookup, terminal cell and deadline store are IPC rank 3. That is a real rank-ordered
+transaction, not a wrapper, and it was not attempted here rather than risk a half-verified one.
+NR 6 / NR 7 portability to AArch64 and RISC-V was not started. Main is unchanged.
