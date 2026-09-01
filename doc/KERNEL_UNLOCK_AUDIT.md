@@ -6169,3 +6169,65 @@ remains rank-3 co-located with module-private methods reachable only through the
 acquisition sites keep residual classes, so neither is retired. ***U9 remains OPEN.*** WA3C2 is
 CENSUS-DELTA 0, so the canonical stage arithmetic is unchanged; it is the prerequisite 199G/U9
 named, and it is now met.
+
+## 199D-DW2 / 199G-C5C — the shared trap bridge never saved the entering task's context (WIP; NOT delivered)
+
+**The defect.** `arch/trap_entry.rs::handle_trap_entry_shared` — the bridge x86_64 and AArch64
+actually run — never saved the entering task's register context to its TCB before dispatching,
+although the raw x86_64 bridge in `arch/x86_64/trap.rs:714` does exactly that and documents it as
+essential: the IPC blocking path does not call `sync_current_thread_from_frame`, so without it a
+task that blocks through the broad handler keeps whatever context an earlier trap left behind. A
+second cell of the same defect sat on the `QueueAdvanceCommitted` arm, which read the parked
+identity from `futex_wait_dispatch_outgoing` alone; a blocking receive or send publishes the
+D2-RECV / D2-SEND deferrals instead, so that call returned `None` and captured nothing. The RISC-V
+bridge took the second fix in 199G-B §2; this is the shared x86_64/AArch64 cell of both.
+
+**Why it was silent.** Only a delivery that RETURNS a value through the blocked syscall can see it.
+PM blocked in `ipc_recv` with a TCB context stale from its previous `ipc_reply` trap
+(`g0=7 arg0=65538` — the IpcReply syscall number and the reply cap). The direct NR 6 request wrote
+its payload and metadata into PM's buffers and woke it; PM resumed at the return address of that
+earlier reply and re-executed the receive against an empty endpoint queue, because a direct
+delivery enqueues nothing. A legacy send survived only by accident — it leaves the message in the
+queue for the re-executed receive to find. Proven pre-existing at `5680287` with byte-identical
+last `USER_LOG` and counters `attempts=2 eligible=2 declined_pre_txn=1 completed=1
+legacy_fallback=0`.
+
+**Causality, measured.** After the two-part repair, x86_64 PM receives the request
+(`PM_RECV_GOT_MSG opcode=11 len=48 reply_cap=Some(131074) sender_tid=1`), spawns
+(`PM_SPAWN_CAP_RESULT ok=1`, ×3), replies (`PM_SPAWN_V5_CAP_REPLY`), init decodes
+(`INIT_SPAWN_V5_REPLY_RECV_OK`, ×8), service-entry MISSING is 0 and the NR 1 route reports
+`IPC_SEND_SPLIT_DONE … result=direct_delivery`. Three consecutive runs of each of four x86_64
+cells (default, recv-proof, send-plain oracle, send-enqueue oracle) are byte-identical in every
+counter, with zero panics and zero faults. The `blocked_recv_state` residue noted earlier is a
+real, separate divergence from the legacy path's contract, but it was NOT shown causal and was
+NOT changed.
+
+**NR 1 status.** x86_64 and RISC-V positively exercise NR 1 live — x86_64 shows plain delivery,
+ordinary-cap direct delivery and buffered enqueue all reaching the split route
+(`result=direct_delivery` ×2, `result=enqueued` ×3 across the cells); RISC-V shows one
+`result=direct_delivery`. All six `stage199gc4_nr1_terminal_edges` guards pass, hosted is
+5037/0/2, the census is unchanged at **2 / 0 / 2**, and all three freestanding builds are clean.
+
+**Why this is NOT delivered.** AArch64 still has no NR 1 witness, and the blocker is neither NR 1
+nor a profile-composition question. Its core smoke's own U9-FT4 witness *requires* the terminal
+fault it asserts, so the "fault proof" and the "service chain" are not separable by any existing
+knob: the fault IS the service chain failing. init's `IpcCall` to PM enters
+(`IPC_CALL_BEGIN tid=1`), performs the split delivery and wakes PM, and then never completes —
+no `IPC_CALL_SENT_OR_QUEUED tid=1` is ever emitted — and init faults reading 0x0 at `rip=0x4030e4`
+inside `spawn_v5_cap`, before its first `INIT_SPAWN_V5_REPLY_RECV_BEGIN`. This is byte-identical at
+`c399e13`: `IPC_CALL_BEGIN`=2, `IPC_CALL_SENT_OR_QUEUED`=1 (tid 2 only), one
+`PAGE_FAULT_ENTRY tid=1 addr=0x0`. The repair advances the chain (PM messages 1 → 2, spawns
+0 → 1) but does not reach it. Repairing it is a separate owner and a separate qualification, so
+per the standing rule the WIP is retained and **main is unchanged**.
+
+**Two other pre-existing red cells, newly diagnosable.** The send-ordinary-cap and
+send-reply-cap oracles previously never ran at all on x86_64 (only their `_SET`/`_COORD_OK`
+markers appeared). With the chain alive they now run and fail at `Fork`:
+`FORK_COW_FAIL reason=cap_full kernel_error=CapabilityFull syscall_code=255`, at `step=register`,
+with `reserved_cnode_slots=6664` against `max_total_cnode_slots=262144` — so not the aggregate
+slot budget but the child cspace-slot `Vec`, whose backing PT frame pool has drained from 186 free
+frames to 5 because the service chain now legitimately populates 13 live tasks each reserving a
+512-slot cnode. The first fork in the boot succeeds; the second does not. This is a capacity
+consequence of the system working, not a defect in Fork or in NR 1, and it is outside this
+change's owner set. The x86_64 ordinary-cap NR 1 class is witnessed anyway, through the production
+service chain rather than through its oracle.
