@@ -2586,6 +2586,11 @@ impl KernelState {
             );
             return;
         };
+        // 199D-SD3 (§4): the record's bound replier IS the scenario's dying server, resolved
+        // from live state here. Arming it is what lets the deferred RESERVATION — which has
+        // no record identity of its own — be attributed to this transaction instead of to
+        // whichever task happened to exit first in the boot.
+        let _ = c::arm_scenario_server(server_tid.0, server_asid.0);
         let present = self
             .server_reply_link_for(server_tid.0, server_asid)
             .is_some_and(|link| link.matches_record(record_index, record_generation));

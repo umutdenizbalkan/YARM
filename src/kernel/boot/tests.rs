@@ -97543,6 +97543,13 @@ mod stage200d2a_deferred_death {
             Some(r) => r,
             None => return false,
         };
+        // 199D-SD3 (§4): mirror `exit_task` — the held reservation is attributed by the
+        // dying server's identity, at the point that identity is known.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        crate::kernel::boot::server_dies_counters::note_deferred_reserved(
+            fx.replier.tid.0,
+            fx.replier.asid.0,
+        );
         match fx
             .k
             .with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
@@ -102558,29 +102565,66 @@ mod stage200d2b1bi_counters {
                 .count(),
             1
         );
-        // 3/4/5 deferred queue operations.
+        // 4/5 deferred queue operations, each attributed AT the real operation and scoped by
+        // the identity that operation actually carries — the item's own reply record.
         for (f, class, must) in [
             (
-                "pub(crate) fn server_death_work_reserve(",
-                "Transition::DeferredReserved",
-                "Some(ServerDeathWorkReservation { cpu_idx, slot })",
-            ),
-            (
                 "pub(crate) fn server_death_work_publish(",
-                "Transition::DeferredPublished",
+                "note_deferred_published(",
                 "q[reservation.slot] = Some(work);",
             ),
             (
                 "pub(crate) fn server_death_work_drain_next(",
-                "Transition::DeferredConsumed",
-                "if taken.is_some() {",
+                "note_deferred_consumed(",
+                "if let Some(work) = taken {",
             ),
         ] {
             let body = MOD_SRC.split(f).nth(1).expect(f);
             let body = body.split("\n}\n").next().unwrap();
             assert!(body.contains(class), "{f} records {class}");
             assert!(body.contains(must), "{f} performs the real operation");
+            assert!(
+                body.contains("work.reply_record_index")
+                    && body.contains("work.reply_record_generation"),
+                "{f} attributes by the item's own record identity"
+            );
         }
+        // 3 — the RESERVATION. 199D-SD3 (§4): the queue operation carries no record identity
+        // (the reverse link has not been read yet), so it counts nothing at all and the exit
+        // path attributes the reservation it holds, by the dying server's identity. The
+        // reserve function must therefore perform its real operation and reach NO class.
+        let reserve = MOD_SRC
+            .split("pub(crate) fn server_death_work_reserve(")
+            .nth(1)
+            .expect("reserve")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(
+            reserve.contains("Some(ServerDeathWorkReservation { cpu_idx, slot })"),
+            "the reserve still performs the real operation"
+        );
+        assert!(
+            !reserve.contains("Transition::") && !reserve.contains("note_deferred_reserved("),
+            "an identity-less reservation must not attribute itself"
+        );
+        // The exit path attributes it, inside the arm that HOLDS a reservation, after the
+        // scope is armed and before the irreversible detach.
+        let held = RESTART_SRC
+            .split("let death_link = match crate::kernel::boot::server_death_work_reserve(cpu_idx)")
+            .nth(1)
+            .expect("exit block");
+        let armed = held
+            .find("arm_server_dies_link_scope(")
+            .expect("the scope is armed first");
+        let noted = held
+            .find("note_deferred_reserved(")
+            .expect("the exit path attributes the reservation it holds");
+        let detach = held
+            .find("take_server_reply_link(tid, exit_identity.asid)")
+            .expect("the detach");
+        assert!(armed < noted, "attributed only once the scope is armed");
+        assert!(noted < detach, "attributed before the irreversible detach");
         // 6/7/8/9 in the completion transaction, each after its real operation.
         let comp = IPC_SRC
             .split("pub(crate) fn complete_server_death_over")
@@ -102618,19 +102662,39 @@ mod stage200d2b1bi_counters {
         // Every production transition entry point lives in one of the four kernel files
         // that own the real operations.
         //
-        // Stage 199D: seven classes are still recorded by a direct qualified
-        // `server_dies_counters::record(...)` at their real operation. The two LINK classes
-        // go through the scoped helpers instead — `note_link_created` / `note_link_closed`
-        // (which also feed the system-wide leak totals) and `note_armed_link_present` — so
-        // a transition can be attributed to the ONE armed transaction rather than counted
-        // for every call in the system. Nine classes, nine real operations, still no
-        // synthesized transition.
+        // Stage 199D: the classes that CAN attribute themselves at their real operation are
+        // still recorded by a direct qualified `server_dies_counters::record(...)` there. The
+        // rest go through scoped helpers — `note_link_created` / `note_link_closed` (which
+        // also feed the system-wide leak totals), `note_armed_link_present`, and, since
+        // 199D-SD3 (§4), `note_deferred_reserved` / `note_deferred_published` /
+        // `note_deferred_consumed` — so a transition is attributed to the ONE armed
+        // transaction rather than counted for every call in the system. Nine classes, nine
+        // real operations, still no synthesized transition.
         let files = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC];
         let direct: usize = files
             .iter()
             .map(|s| s.matches("server_dies_counters::record(").count())
             .sum();
-        assert_eq!(direct, 7, "seven directly-recorded classes");
+        assert_eq!(direct, 4, "four directly-recorded classes");
+        let deferred: usize = files
+            .iter()
+            .map(|s| {
+                s.matches("server_dies_counters::note_deferred_reserved(")
+                    .count()
+                    + s.matches("server_dies_counters::note_deferred_published(")
+                        .count()
+                    + s.matches("server_dies_counters::note_deferred_consumed(")
+                        .count()
+            })
+            .sum();
+        assert_eq!(deferred, 3, "three scoped deferred edges, one per class");
+        // The scoped helpers are the ONLY way the deferred classes are reached.
+        for f in files {
+            assert!(
+                !f.contains("record(server_dies_counters::Transition::Deferred"),
+                "no unscoped deferred count may reappear"
+            );
+        }
         let created: usize = files
             .iter()
             .map(|s| {
@@ -102851,6 +102915,13 @@ mod stage200d2b1bii_races {
             c::arm_record(fx.record_index, fx.record_generation),
             "the fixture's record arms the counter scope"
         );
+        // 199D-SD3 (§4): the deferred RESERVATION has no record identity, so the scope also
+        // names the SERVER incarnation the transaction is about — exactly as
+        // `arm_server_dies_link_scope` does live, from the record's bound replier.
+        assert!(
+            c::arm_scenario_server(fx.replier.tid.0, fx.replier.asid.0),
+            "the fixture's replier arms the server half of the counter scope"
+        );
         (g, fx)
     }
 
@@ -102889,6 +102960,13 @@ mod stage200d2b1bii_races {
             Some(r) => r,
             None => return false,
         };
+        // 199D-SD3 (§4): mirror `exit_task` — the held reservation is attributed by the
+        // dying server's identity, at the point that identity is known.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        crate::kernel::boot::server_dies_counters::note_deferred_reserved(
+            fx.replier.tid.0,
+            fx.replier.asid.0,
+        );
         match fx
             .k
             .with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
@@ -103284,8 +103362,12 @@ mod stage200d2b1bii_races {
         let id = arm(&fx);
         assert!(link(&fx));
         assert!(broad_lock_exit_phase(&fx));
-        // A second publication for the SAME record/generation is refused.
+        // A second publication for the SAME record/generation is refused. The second attempt
+        // is a repeated exit of the ARMED server, so it attributes its reservation exactly as
+        // the exit path does — 199D-SD3 (§4) narrows WHICH reservations are attributed, and
+        // deliberately keeps a genuine repeat of the scenario's own attempt visible.
         let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        c::note_deferred_reserved(fx.replier.tid.0, fx.replier.asid.0);
         let dup = crate::kernel::boot::server_death_work_publish(
             res,
             DeferredServerDeathCompletion {
@@ -103319,13 +103401,21 @@ mod stage200d2b1bii_races {
         while let Some(r) = crate::kernel::boot::server_death_work_reserve(0) {
             held.push(r);
         }
-        // Each successful fill reservation is itself a real class-2 transition; the exit
-        // phase then adds none, because its own reservation never succeeds.
-        let filled = v()[T::DeferredReserved as usize];
-        assert_eq!(filled as usize, held.len(), "every fill was counted");
+        assert!(!held.is_empty(), "the queue really filled");
+        // 199D-SD3 (§4): a raw capacity fill is not an exit of the ARMED server, so it is not
+        // attributed. The reserve class describes the scenario's transaction, not whoever
+        // happens to take a slot — which is exactly the defect this narrowing repairs: an
+        // unrelated task exiting earlier in the boot used to move this class and fail the
+        // scenario's audit with `count=2 expected=1`.
+        assert_eq!(
+            v()[T::DeferredReserved as usize],
+            0,
+            "a foreign reservation is not attributed to the scenario"
+        );
+        // The exit phase then adds none either, because its own reservation never succeeds.
         assert!(!broad_lock_exit_phase(&fx), "the exit phase declines");
         assert_eq!(live_links(&fx), 1, "the link is retained");
-        assert_race(&fx, &id, [1, 0, filled, 0, 0, 0, 0, 0, 0], None);
+        assert_race(&fx, &id, [1, 0, 0, 0, 0, 0, 0, 0, 0], None);
         for r in held {
             crate::kernel::boot::server_death_work_release(r);
         }
@@ -103347,10 +103437,14 @@ mod stage200d2b1bii_races {
                 reply_record_generation: fx.record_generation.wrapping_add(1),
             }
         ));
-        assert_eq!(drain(&fx), 1);
+        assert_eq!(queued(0), 1, "the stale item really queued");
+        assert_eq!(drain(&fx), 1, "and really drained");
         assert_eq!(caller_result(&fx), None, "nothing was published");
-        // The link was never detached: only reserve → publish → consume ran.
-        assert_race(&fx, &id, [1, 0, 1, 1, 1, 0, 0, 0, 0], None);
+        // The link was never detached, and 199D-SD3 (§4) attributes the deferred classes by
+        // the item's OWN record identity — this item names a generation the armed scenario
+        // does not own, so its publication and consumption are reported and not counted. The
+        // flow itself is still proven, by the queue depth and the drain above.
+        assert_race(&fx, &id, [1, 0, 0, 0, 0, 0, 0, 0, 0], None);
         teardown();
     }
 
@@ -103376,7 +103470,9 @@ mod stage200d2b1bii_races {
         assert_eq!(drain(&fx), 1);
         assert_eq!(caller_result(&fx), None, "a stale server wakes nobody");
         assert_eq!(live_links(&fx), 1, "the real link is untouched");
-        assert_race(&fx, &id, [1, 0, 1, 1, 1, 0, 0, 0, 0], None);
+        // The item names the ARMED record, so publication and consumption are attributed; the
+        // raw reservation is not, because it is not an exit of the armed server.
+        assert_race(&fx, &id, [1, 0, 0, 1, 1, 0, 0, 0, 0], None);
         teardown();
     }
 

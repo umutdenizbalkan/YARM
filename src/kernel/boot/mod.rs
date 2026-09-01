@@ -4836,6 +4836,24 @@ pub mod server_dies_counters {
     static ARMED_RECORD_INDEX: AtomicU64 = AtomicU64::new(0);
     static ARMED_RECORD_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+    /// Stage 199D-SD3 (§4) — the armed transaction's SERVER incarnation `{tid, asid}`.
+    ///
+    /// The record identity above answers "is this event about the scenario's reply record?".
+    /// One transition cannot be asked that question at all: the deferred RESERVATION is a
+    /// per-CPU queue-slot operation that happens BEFORE the reverse link is read, so it has
+    /// no record identity to carry. What it does have is the identity of the server that is
+    /// dying, and that is what attributes it here.
+    ///
+    /// Without this, a completely unrelated task exiting earlier in the same boot — one that
+    /// owns no reverse link and takes no part in the scenario — still reserved a slot and
+    /// still incremented `DeferredReserved`, and the scenario's own audit then failed with
+    /// `count=2 expected=1`. That is precisely a boot-global event failing a scenario it has
+    /// nothing to do with.
+    static ARMED_SERVER_TID: AtomicU64 = AtomicU64::new(0);
+    static ARMED_SERVER_ASID: AtomicU64 = AtomicU64::new(0);
+    static ARMED_SERVER_PRESENT: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     /// Tier-1 unscoped link-lifecycle totals.
     static LINKS_CREATED_TOTAL: AtomicU32 = AtomicU32::new(0);
     static LINKS_CLOSED_TOTAL: AtomicU32 = AtomicU32::new(0);
@@ -4851,6 +4869,9 @@ pub mod server_dies_counters {
         SEQ.store(0, Ordering::Release);
         ARMED_RECORD_INDEX.store(0, Ordering::Release);
         ARMED_RECORD_GENERATION.store(0, Ordering::Release);
+        ARMED_SERVER_TID.store(0, Ordering::Release);
+        ARMED_SERVER_ASID.store(0, Ordering::Release);
+        ARMED_SERVER_PRESENT.store(false, Ordering::Release);
         LINKS_CREATED_TOTAL.store(0, Ordering::Release);
         LINKS_CLOSED_TOTAL.store(0, Ordering::Release);
         INSTANCE.fetch_add(1, Ordering::AcqRel) + 1
@@ -4896,6 +4917,103 @@ pub mod server_dies_counters {
     #[must_use]
     pub fn matches_armed(index: usize, generation: u64) -> bool {
         armed_record() == Some((index, generation))
+    }
+
+    /// Arm this instance to the SERVER incarnation the transaction is about. One-shot with
+    /// the same discipline as `arm_record`: the first identity stands, an identical re-arm
+    /// is idempotent, and a different one is refused and reported.
+    ///
+    /// Returns `true` when the instance is armed to `{tid, asid}` afterwards.
+    pub fn arm_scenario_server(tid: u64, asid: u16) -> bool {
+        match armed_server() {
+            None => {
+                ARMED_SERVER_TID.store(tid, Ordering::Release);
+                ARMED_SERVER_ASID.store(u64::from(asid), Ordering::Release);
+                ARMED_SERVER_PRESENT.store(true, Ordering::Release);
+                true
+            }
+            Some((t, a)) if t == tid && a == asid => true,
+            Some((t, a)) => {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_SCOPE_CONFLICT armed_server_tid={} armed_server_asid={} offered_server_tid={} offered_server_asid={} result=fail",
+                    t,
+                    a,
+                    tid,
+                    asid
+                );
+                false
+            }
+        }
+    }
+
+    /// The armed server incarnation, or `None` while no server identity is armed.
+    #[must_use]
+    pub fn armed_server() -> Option<(u64, u16)> {
+        ARMED_SERVER_PRESENT.load(Ordering::Acquire).then(|| {
+            (
+                ARMED_SERVER_TID.load(Ordering::Acquire),
+                ARMED_SERVER_ASID.load(Ordering::Acquire) as u16,
+            )
+        })
+    }
+
+    /// Whether `{tid, asid}` is the armed transaction's server incarnation.
+    #[must_use]
+    pub fn matches_armed_server(tid: u64, asid: u16) -> bool {
+        armed_server() == Some((tid, asid))
+    }
+
+    /// Attribute one record-identified transition to the armed transaction.
+    ///
+    /// The same shape as `note_link_closed`: the armed record's own event is counted; an
+    /// event carrying a DIFFERENT record while armed is reported and deliberately not
+    /// counted; and an event that happens while nothing is armed at all is neither counted
+    /// nor reported, because there is no scenario for it to belong to or to disturb.
+    fn note_scoped_by_record(t: Transition, index: usize, generation: u64) {
+        if matches_armed(index, generation) {
+            record(t);
+        } else if let Some((ai, ag)) = armed_record() {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_FOREIGN_TRANSITION class={} armed_index={} armed_generation={} event_index={} event_generation={} counted=0 result=ok",
+                t.name(),
+                ai,
+                ag,
+                index,
+                generation
+            );
+        }
+    }
+
+    /// A deferred slot was really reserved by the exiting server `{tid, asid}`.
+    ///
+    /// Attributed by SERVER identity rather than record identity, because a reservation has
+    /// no record identity yet — see `ARMED_SERVER_TID`. Called from the exit path while it
+    /// holds a live `ServerDeathWorkReservation`, so a reservation that never succeeded is
+    /// never attributed; and a REPEATED exit attempt for the armed server is attributed
+    /// again, which is what keeps a genuine duplicate reservation detectable.
+    pub fn note_deferred_reserved(tid: u64, asid: u16) {
+        if matches_armed_server(tid, asid) {
+            record(Transition::DeferredReserved);
+        } else if let Some((at, aa)) = armed_server() {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_FOREIGN_TRANSITION class={} armed_server_tid={} armed_server_asid={} event_server_tid={} event_server_asid={} counted=0 result=ok",
+                Transition::DeferredReserved.name(),
+                at,
+                aa,
+                tid,
+                asid
+            );
+        }
+    }
+
+    /// An item for `{index, generation}` was really queued.
+    pub fn note_deferred_published(index: usize, generation: u64) {
+        note_scoped_by_record(Transition::DeferredPublished, index, generation);
+    }
+
+    /// An item for `{index, generation}` really left the queue.
+    pub fn note_deferred_consumed(index: usize, generation: u64) {
+        note_scoped_by_record(Transition::DeferredConsumed, index, generation);
     }
 
     /// Tier-1 totals: `(created, closed)` across every reverse link in the system.
@@ -5309,10 +5427,14 @@ pub(crate) fn server_death_work_reserve(cpu_idx: usize) -> Option<ServerDeathWor
         reply_record_index: usize::MAX,
         reply_record_generation: 0,
     });
-    // Stage 200D-2B1B-i (class 3): a slot was really taken. Recorded here and NOT at the
-    // call site, so a reservation that fails (queue full) records nothing.
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-    server_dies_counters::record(server_dies_counters::Transition::DeferredReserved);
+    // Stage 200D-2B1B-i (class 3): a slot was really taken.
+    //
+    // 199D-SD3 (§4): this operation is per-CPU and carries NO record identity — the reverse
+    // link has not been read yet — so it cannot attribute itself to one transaction. It
+    // therefore counts nothing at all, and the exit path attributes the reservation it is
+    // holding, by the dying server's identity, through
+    // `server_dies_counters::note_deferred_reserved`. A reservation that fails still records
+    // nothing, because the caller only attributes inside its `Some(reservation)` arm.
     Some(ServerDeathWorkReservation { cpu_idx, slot })
 }
 
@@ -5341,8 +5463,14 @@ pub(crate) fn server_death_work_publish(
     SERVER_DEATH_WORK_PUBLISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // Stage 200D-2B1B-i (class 4): the item is now queued. The duplicate branch above
     // returned early, so a collapsed duplicate never reaches this counter.
+    //
+    // 199D-SD3 (§4): scoped by the item's OWN record identity, so an unrelated server's
+    // deferred publication is reported and not counted rather than moving this vector.
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-    server_dies_counters::record(server_dies_counters::Transition::DeferredPublished);
+    server_dies_counters::note_deferred_published(
+        work.reply_record_index,
+        work.reply_record_generation,
+    );
     true
 }
 
@@ -5364,12 +5492,19 @@ pub(crate) fn server_death_work_drain_next(
         .iter()
         .position(|s| s.is_some_and(|w| w.reply_record_index != usize::MAX))?;
     let taken = q[idx].take();
-    if taken.is_some() {
+    if let Some(work) = taken {
         SERVER_DEATH_WORK_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Stage 200D-2B1B-i (class 5): one item left the queue. A second drain of the same
         // record finds nothing here, so consumption cannot be double-counted.
+        //
+        // 199D-SD3 (§4): scoped by the drained item's OWN record identity, for the same
+        // reason as the publication above.
         #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-        server_dies_counters::record(server_dies_counters::Transition::DeferredConsumed);
+        server_dies_counters::note_deferred_consumed(
+            work.reply_record_index,
+            work.reply_record_generation,
+        );
+        let _ = work;
     }
     taken
 }
