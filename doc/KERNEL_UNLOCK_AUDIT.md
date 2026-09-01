@@ -6231,3 +6231,68 @@ frames to 5 because the service chain now legitimately populates 13 live tasks e
 consequence of the system working, not a defect in Fork or in NR 1, and it is outside this
 change's owner set. The x86_64 ordinary-cap NR 1 class is witnessed anyway, through the production
 service chain rather than through its oracle.
+
+## 199E-A64CALL / 199G-C5D — the AArch64 TLS lane addressed x15, and NR 1 is now live on all three architectures (WIP; NOT delivered)
+
+**The defect.** `REG_X18_TLS` was `15`. The AArch64 vector glue fills `user_gprs` with a straight
+`for idx in 0..31 { lane[idx] = frame.gprs[idx] }` over x0..x30, so lane N *is* xN: a lane of 15
+addressed **x15**, not x18. Every return to EL0 therefore wrote `tls.unwrap_or(0)` over the user's
+live x15 — and TLS is unset for these tasks, so that meant zeroing it — while x18, the register
+the constant is named for and the one the whole TLS design targets, was never written at all.
+
+**Why it was silent.** It only bites when userspace keeps a live value in x15 across a syscall.
+init's `spawn_v5_cap` does: LLVM parks a pointer in x15 across the `svc`, and the very next
+instruction, `ldr x8, [x15]`, faulted reading 0x0 at `rip=0x4030e4`. Measured at the boundary:
+the entering vector frame carried `x15=0x4648a8` into the IpcCall and the departing frame carried
+`x15=0x0` back out, with x14 and ELR intact — the snapshot was correct and only the AArch64
+writeback was wrong, so the repair is confined to that owner. Writing lane 18 is sound only
+because the AArch64 **userspace** target now builds with `+reserve-x18`; the rebuilt init went
+from 124 x18 references to 0. The kernel target is deliberately untouched — its own register
+allocation has no bearing on the user context it restores.
+
+**Correcting an earlier record.** The 199D-DW2 entry above states that init's `IpcCall` "never
+completes — no `IPC_CALL_SENT_OR_QUEUED tid=1` is ever emitted". That inference was wrong. The
+`Ok(true)` split-delivery arm of `handle_ipc_call` returns success *without* emitting that marker,
+so the call did complete; the fault came after a correct return, on the clobbered x15. The
+observation was accurate, the conclusion drawn from it was not.
+
+**Result.** The AArch64 service chain runs for the first time and now matches x86_64 exactly:
+`PM_RECV_GOT_MSG` 9, `PM_SPAWN_CAP_RESULT` 3, `INIT_SPAWN_V5_REPLY_RECV_OK` 8, service-entry
+MISSING 0, zero faults — identical across three consecutive runs. **NR 1 is now positively
+exercised on all three architectures**: AArch64 shows `IPC_SEND_SPLIT_DONE … result=direct_delivery`
+in the default cell, and its plain-send and enqueue-send oracle cells produce the same shape as
+x86_64's (plain: 2 direct + 2 enqueued; enqueue: 1 direct + 3 enqueued), both cells exiting 0 with
+zero blockers. x86_64 and RISC-V core smokes are green with one `direct_delivery` each. Hosted is
+5039/0/2, the census is unchanged at **2 / 0 / 2**, and all six `stage199gc4_nr1_terminal_edges`
+guards pass.
+
+**U9-FT4 got a real trigger.** The fault that witness observed was never armed by anything — it
+*was* the defect above. Repairing it removed the only terminal fault any AArch64 profile produced.
+Rather than weaken or drop the witness, and with explicit authorization to override the
+no-new-selector rule, it was given a deliberate trigger: default-off
+`yarm.aarch64_terminal_fault_oracle=1`, init startup slot-5 selector 21 (1–8 and 20 were taken,
+and it is written only when slot 5 is still free), and one init arm that takes a single
+intentional unhandled read at 0x0, placed before the SpawnV5 chain so the replacement the queue
+advance selects is still the supervisor (tid 2). The smoke's U9-FT4 block is unchanged byte for
+byte and still fully positive; it is gated behind `TERMINAL_FAULT_ORACLE=1` so it runs in its own
+cell. All 17 assertions pass there, three consecutive runs. The old init fault is NOT service-chain
+behaviour and is not described as such anywhere.
+
+**Why this is NOT delivered.** The AArch64 *default* cell still exits 1, on one newly reachable
+line: `supervisor.srv control recv error: WrongObject`, four times, after which the supervisor
+logs and continues (five `SUPERVISOR_EVENT_LOOP_TICK` follow) and the boot reaches clean terminal
+idle. It is localized: the supervisor's `ipc_recv_with_deadline` BLOCKS, and on resume nothing
+encodes its completion, because on AArch64 `recv_completion` is consumed only under
+`#[cfg(feature = "ipc-reply-timeout-oracle-core")]`. With no completion consumed the restore path
+falls through to the argument mirror, so x0 comes back holding the endpoint cap (65539) with
+`meta.status` still `u64::MAX`, and the aarch64/riscv64 user-rt rule
+`if ret.ret0 != 0 && meta.status == u64::MAX` decodes that as `WrongObject`. A timed receive that
+returns *without* blocking is unaffected — the error convention encodes `TimedOut` correctly and
+user-rt maps it to `Ok(None)` — which is why both oracle cells, where the receive never blocks,
+are clean, and why x86_64 (0 occurrences) and RISC-V (0 occurrences, and no `WrongObject` in its
+blocker list at all) never show it. This is NOT the benign cross-arch lifecycle self-query the
+`BLOCKER_EXCLUDE_REGEX` already tolerates: that one is `SUPERVISOR_LIFECYCLE_QUERY_ERR` and occurs
+zero times here. Repairing it means promoting a feature-gated reply-timeout path into production —
+the consumer also calls `maybe_emit_reply_timeout_class_retired()` — which is a separate promotion
+with its own qualification and exactly the broadening this pass is told not to do. It is therefore
+recorded, not excluded and not guessed at, and main is unchanged.
