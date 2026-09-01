@@ -1790,20 +1790,6 @@ fn try_split_blocking_ipc_recv_into_frame(
             )));
         }
     }
-    // (9a) 199D-SD3 — arm the ServerDies scenario scope from the TERMINAL ARM. Deliberately
-    // independent of the deadline half: server death is equally valid for a wait with no finite
-    // deadline, so the audit's scope must not depend on one being registered.
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-    match reply_wait_arm {
-        crate::kernel::boot::ReplyWaitArm::Armed { identity, .. }
-        | crate::kernel::boot::ReplyWaitArm::DeadlineRefused { identity } => {
-            shared.arm_server_dies_link_scope_split(
-                identity.reply_record_index,
-                identity.reply_record_generation,
-            );
-        }
-        crate::kernel::boot::ReplyWaitArm::NotAReplyWait => {}
-    }
     // (9b) 199E-DL — the COMPENSATED rank-2 half of the finite-deadline registration.
     //
     // Phase C reserved the token under rank 3, in the same scope that armed the terminal and

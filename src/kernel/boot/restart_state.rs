@@ -167,6 +167,21 @@ impl KernelState {
                     exit_identity.asid.0,
                     cpu_idx
                 );
+                // 199D-SD3 — arm the ServerDies scenario scope from the DEATH identity, here,
+                // where `{record index, generation}` is exactly the scenario's and the link is
+                // still attached to observe. It used to be armed at reply-deadline registration
+                // time, which tied the whole audit to the caller having asked for a finite
+                // timeout; arming it from the terminal arm instead was no better, because the
+                // one-shot latch then claimed whichever reply wait happened to be FIRST in the
+                // boot (record generation 1) rather than the one that dies (generation 18), and
+                // the real detach was counted as a foreign close.
+                #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                if let Some(link) = self.server_reply_link_for(tid, exit_identity.asid) {
+                    self.arm_server_dies_link_scope(
+                        link.reply_record_index,
+                        link.reply_record_generation,
+                    );
+                }
                 match self.take_server_reply_link(tid, exit_identity.asid) {
                     Some(link) => {
                         // The EXACT link this server owned, detached by full incarnation
