@@ -815,9 +815,14 @@ pub(crate) struct ThreadRestoreFacts {
     pub(crate) send_completion: Option<BlockedSyscallCompletion>,
     /// The consumed `IpcRecv` completion, if one was parked and exact.
     ///
-    /// 199E-A64RC: no longer feature-gated. The producer parks this record on every build, and on
-    /// AArch64 it is the ONLY thing that can supply a remotely completed receive's result — that
-    /// port deliberately writes no result register at publication time.
+    /// 199E-A64RC: taken whenever the oracle feature is on (as before) OR the build is AArch64
+    /// (new, and the point of this change). The producer parks this record on every build, but
+    /// only AArch64 needs to consume it: x86_64 and RISC-V install an equivalent saved result at
+    /// publication time, so for them the take is a pure side effect — it clears the record,
+    /// `ipc_timeout_fired` and `blocked_recv_state`. Widening it to those ports unconditionally
+    /// changed their server-death sequencing, so the scope is exactly AArch64 plus the pre-existing
+    /// feature build and nothing else.
+    #[cfg(any(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
     pub(crate) recv_completion: Option<BlockedSyscallCompletion>,
 }
 
@@ -838,6 +843,7 @@ pub(crate) fn take_thread_restore_facts(
     let (context, tls) = read_user_context_and_take_tls(tcbs, tls_pending, tid, expect_asid)?;
     let send_completion =
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcSend);
+    #[cfg(any(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
     let recv_completion =
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcRecv);
     Some(ThreadRestoreFacts {
@@ -845,6 +851,7 @@ pub(crate) fn take_thread_restore_facts(
         context,
         tls,
         send_completion,
+        #[cfg(any(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
         recv_completion,
     })
 }

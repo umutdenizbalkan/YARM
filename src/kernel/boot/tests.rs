@@ -147802,6 +147802,19 @@ mod stage199e_a64_return_contract {
                 "the recv completion mechanism is production-live: {needle}"
             );
         }
+        // The SHARED take is scoped to AArch64 (plus the pre-existing feature build) and never
+        // widened to x86_64/RISC-V feature-off. Those ports install their result at publication
+        // time, so for them the take is a pure side effect - it clears the record,
+        // `ipc_timeout_fired` and `blocked_recv_state` - and widening it unconditionally changed
+        // their server-death sequencing.
+        const TASK_SRC: &str = include_str!("../task.rs");
+        let scope =
+            "#[cfg(any(feature = \"ipc-reply-timeout-oracle-core\", target_arch = \"aarch64\"))]";
+        assert_eq!(
+            TASK_SRC.matches(scope).count(),
+            3,
+            "the shared recv take is scoped at its field, its take and its initializer"
+        );
         // No new ABI lane and no timeout POLICY was introduced: the apply only writes the
         // existing arg lanes, and the canonical result comes from the parked record.
         let owner = A64_TRAP
