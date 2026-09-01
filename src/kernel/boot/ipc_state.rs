@@ -1101,6 +1101,68 @@ pub(crate) enum BlockingSendProducerOutcome {
 /// off-lock `SharedKernel::publish_recv_waiter_split` runs the identical body under
 /// `with_ipc_split_mut`. Last-receiver-wins replacement is PRESERVED deliberately — whether YARM
 /// should keep replacement at all is WA3C2's question, and this must not answer it by accident.
+/// 199E-DL — reserve one exact generation-bearing deadline token. Rank 3 only.
+///
+/// This is THE reservation policy; `KernelState::arm_deadline_token` is a thin broad-lock
+/// adapter over it, so the split route and the broad route cannot drift.
+///
+/// A reservation is NOT yet claimable. The timeout collector reaches a token only through the
+/// caller's TCB — it scans TCBs, requires `ipc_timeout_deadline`, and then follows
+/// `tcb.reply_timeout_token` — and every other touch of `reply_deadline_tokens` is keyed by a
+/// handle already read from a TCB. There is no free scan of the store. So the interval between
+/// this reservation and the TCB publication is one in which nothing can find the token, which is
+/// exactly the window a `Pending` state would otherwise have to close.
+pub(crate) fn arm_deadline_token_locked(
+    ipc: &mut IpcSubsystem,
+    record_index: usize,
+    record_generation: u64,
+    token_generation: u64,
+    terminal_epoch: u64,
+    terminal_identity: crate::kernel::terminal_ownership::TerminalIdentity,
+) -> Result<
+    crate::kernel::deadline_token::DeadlineTokenHandle,
+    crate::kernel::deadline_token::DeadlineArmError,
+> {
+    use crate::kernel::deadline_token::{DeadlineArmError, DeadlineTokenIdentity};
+    // Part 5 — validate the CURRENT terminal identity/epoch (Open, exact).
+    let terminal_ok = ipc
+        .reply_terminal_ownership
+        .get(record_index)
+        .is_some_and(|cell| {
+            cell.is_open()
+                && *cell.identity() == terminal_identity
+                && cell.current_epoch() == terminal_epoch
+                && terminal_identity.reply_record_index == record_index
+                && terminal_identity.reply_record_generation == record_generation
+        });
+    if !terminal_ok {
+        return Err(DeadlineArmError::TerminalNotOpen);
+    }
+    // One active registration per reply record (no silent overwrite).
+    let already = ipc.reply_deadline_tokens.iter().any(|t| {
+        (t.is_armed() || t.is_fire_claimed())
+            && t.identity().terminal_identity.reply_record_index == record_index
+            && t.identity().terminal_identity.reply_record_generation == record_generation
+    });
+    if already {
+        return Err(DeadlineArmError::AlreadyArmed);
+    }
+    // Reserve a free slot; bounded failure when the store is full.
+    let free = ipc.reply_deadline_tokens.iter().position(|t| t.is_free());
+    let Some(slot) = free else {
+        return Err(DeadlineArmError::StoreFull);
+    };
+    let identity = DeadlineTokenIdentity {
+        token_index: slot,
+        token_generation,
+        terminal_epoch,
+        terminal_identity,
+    };
+    ipc.reply_deadline_tokens[slot]
+        .arm(identity)
+        .ok_or(DeadlineArmError::AlreadyArmed)
+}
+
 /// 199E-ARM — arm the reply-terminal ownership cell for a COMMITTED blocking receive.
 ///
 /// This is THE arming policy, and it is rank 3 only: everything it reads and writes lives in
@@ -1133,14 +1195,20 @@ pub(crate) enum BlockingSendProducerOutcome {
 /// epoch, which would invalidate a deadline token keyed on the old epoch. A different identity is
 /// a different record incarnation and is armed normally.
 ///
-/// Returns the armed identity, or `None` when this is not a reply wait.
+/// Returns `(armed identity, reserved deadline token, deadline_ok)`, or `None` when this is not a
+/// reply wait. `deadline_ok` is false only when a FINITE wait could not reserve its token — the
+/// terminal is armed, but the caller must unwind rather than block with a deadline it cannot own.
 pub(crate) fn arm_reply_terminal_for_committed_block_locked(
     ipc: &mut IpcSubsystem,
     caller: ReceiverWaiterIdentity,
     reply_eidx: usize,
     wait_generation: u64,
     has_finite_deadline: bool,
-) -> Option<crate::kernel::terminal_ownership::TerminalIdentity> {
+) -> Option<(
+    crate::kernel::terminal_ownership::TerminalIdentity,
+    Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
+    bool,
+)> {
     // (1) The reply record this caller is waiting on, by EXACT incarnation and reply endpoint.
     let mut found = None;
     for idx in 0..super::MAX_REPLY_CAPS {
@@ -1187,11 +1255,35 @@ pub(crate) fn arm_reply_terminal_for_committed_block_locked(
 
     // (3) Arm, idempotently.
     let cell = ipc.reply_terminal_ownership.get_mut(record_index)?;
-    if *cell.identity() == identity {
-        return Some(identity);
+    if *cell.identity() != identity {
+        cell.arm(identity);
     }
-    cell.arm(identity);
-    Some(identity)
+    let terminal_epoch = ipc
+        .reply_terminal_ownership
+        .get(record_index)?
+        .current_epoch();
+
+    // (4) 199E-DL — for a FINITE wait, reserve the deadline token in this same rank-3 scope, so
+    // the terminal cell and its registration are decided together and cannot disagree. The token
+    // is not claimable yet: the collector reaches a token only through the caller's TCB, which
+    // the caller publishes next under rank 2. A refused reservation leaves the terminal armed and
+    // is reported to the caller, which unwinds the whole block.
+    let token = if has_finite_deadline {
+        match arm_deadline_token_locked(
+            ipc,
+            record_index,
+            record_generation,
+            wait_generation,
+            terminal_epoch,
+            identity,
+        ) {
+            Ok(handle) => Some(handle),
+            Err(_) => return Some((identity, None, false)),
+        }
+    } else {
+        None
+    };
+    Some((identity, token, true))
 }
 
 pub(crate) fn publish_recv_waiter_locked(
@@ -2174,45 +2266,15 @@ impl KernelState {
         crate::kernel::deadline_token::DeadlineTokenHandle,
         crate::kernel::deadline_token::DeadlineArmError,
     > {
-        use crate::kernel::deadline_token::{DeadlineArmError, DeadlineTokenIdentity};
         self.with_ipc_state_mut(|ipc| {
-            // Part 5 — validate the CURRENT terminal identity/epoch (Open, exact).
-            let terminal_ok = ipc
-                .reply_terminal_ownership
-                .get(record_index)
-                .is_some_and(|cell| {
-                    cell.is_open()
-                        && *cell.identity() == terminal_identity
-                        && cell.current_epoch() == terminal_epoch
-                        && terminal_identity.reply_record_index == record_index
-                        && terminal_identity.reply_record_generation == record_generation
-                });
-            if !terminal_ok {
-                return Err(DeadlineArmError::TerminalNotOpen);
-            }
-            // One active registration per reply record (no silent overwrite).
-            let already = ipc.reply_deadline_tokens.iter().any(|t| {
-                (t.is_armed() || t.is_fire_claimed())
-                    && t.identity().terminal_identity.reply_record_index == record_index
-                    && t.identity().terminal_identity.reply_record_generation == record_generation
-            });
-            if already {
-                return Err(DeadlineArmError::AlreadyArmed);
-            }
-            // Reserve a free slot; bounded failure when the store is full.
-            let free = ipc.reply_deadline_tokens.iter().position(|t| t.is_free());
-            let Some(slot) = free else {
-                return Err(DeadlineArmError::StoreFull);
-            };
-            let identity = DeadlineTokenIdentity {
-                token_index: slot,
+            arm_deadline_token_locked(
+                ipc,
+                record_index,
+                record_generation,
                 token_generation,
                 terminal_epoch,
                 terminal_identity,
-            };
-            ipc.reply_deadline_tokens[slot]
-                .arm(identity)
-                .ok_or(DeadlineArmError::AlreadyArmed)
+            )
         })
     }
 

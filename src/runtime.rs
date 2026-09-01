@@ -4396,7 +4396,10 @@ impl SharedKernel {
         record: crate::kernel::boot::EndpointWaiterRecord,
         recv_cap: crate::kernel::capabilities::CapId,
         has_finite_deadline: bool,
-    ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
+    ) -> (
+        crate::kernel::recv_waiter_split::PublishWaiterOutcome,
+        Option<Option<crate::kernel::deadline_token::DeadlineTokenHandle>>,
+    ) {
         let (outcome, armed) = self.with_ipc_split_mut(|ipc| {
             let outcome = crate::kernel::boot::publish_recv_waiter_locked(
                 ipc,
@@ -4431,20 +4434,75 @@ impl SharedKernel {
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
         ) {
             crate::yarm_log!("D2_RECV_WAITER_PUBLISHED tid={}", record.receiver.tid.0);
-            if let Some(identity) = armed {
+            if let Some((identity, _, deadline_ok)) = armed {
                 crate::yarm_log!(
-                    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid={} caller_asid={} record_index={} record_generation={} replier_tid={} blocked_recv_generation={} finite_deadline={} result=ok",
+                    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid={} caller_asid={} record_index={} record_generation={} replier_tid={} blocked_recv_generation={} finite_deadline={} deadline_reserved={} result=ok",
                     identity.caller_tid.0,
                     identity.caller_asid.0,
                     identity.reply_record_index,
                     identity.reply_record_generation,
                     identity.replier_tid.0,
                     identity.blocked_recv_generation,
-                    u8::from(has_finite_deadline)
+                    u8::from(has_finite_deadline),
+                    u8::from(deadline_ok && has_finite_deadline)
                 );
             }
         }
-        outcome
+        (
+            outcome,
+            armed.and_then(|(_, token, ok)| ok.then_some(token)),
+        )
+    }
+
+    /// 199E-DL — cancel an EXACT deadline reservation (rank 3), the compensation for a rank-2
+    /// publication that could not find its caller incarnation.
+    ///
+    /// Exactness is the whole safety property: `cancel_exact` requires the slot, generation and
+    /// epoch the handle names, so a stale compensation can never cancel a newer registration.
+    pub(crate) fn cancel_deadline_exact_split(
+        &self,
+        handle: &crate::kernel::deadline_token::DeadlineTokenHandle,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            ipc.reply_deadline_tokens
+                .get(handle.token_index())
+                .is_some_and(|t| t.cancel_exact(handle))
+        })
+    }
+
+    /// 199E-DL — publish a reserved deadline token into the EXACT caller incarnation (rank 2).
+    ///
+    /// This is the step that makes the token claimable: the timeout collector scans TCBs and
+    /// reaches a token only through `tcb.reply_timeout_token`, so until this write lands nothing
+    /// can find the reservation. The incarnation is matched on `{tid, asid, blocked_recv
+    /// generation}` — a replacement that reused the numeric TID, or the same task having blocked
+    /// again, is not this registration's caller and is refused so the caller can compensate.
+    ///
+    /// `ipc_timeout_deadline` is NOT written here: the split route's rank-2 block phase already
+    /// published it for this exact block, and rewriting it would let this step invent a deadline.
+    pub(crate) fn publish_reply_timeout_token_split(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+        wait_generation: u64,
+        handle: crate::kernel::deadline_token::DeadlineTokenHandle,
+        clock: crate::kernel::deadline_token::ReplyDeadlineClock,
+    ) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs.iter_mut().flatten().find(|t| {
+                t.tid.0 == tid
+                    && t.asid == Some(asid)
+                    && t.blocked_recv_generation == wait_generation
+            }) else {
+                return false;
+            };
+            if tcb.reply_timeout_token.is_some() {
+                return false;
+            }
+            tcb.reply_timeout_token = Some(handle);
+            tcb.reply_timeout_clock = clock;
+            true
+        })
     }
 
     /// U9-RX3 — the EXACT inverse of Phase B then Phase A, for the `QueueNonEmpty` race.
@@ -12521,7 +12579,7 @@ mod tests {
         );
 
         // Phase C (rank 3) — the atomic recheck loses, exactly as the route expects.
-        let outcome = kernel.recv_block_phase_c_split(
+        let (outcome, _reserved) = kernel.recv_block_phase_c_split(
             endpoint_idx,
             EndpointWaiterRecord::new(
                 ReceiverWaiterIdentity::new(ThreadId(0), receiver_asid),

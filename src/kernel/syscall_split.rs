@@ -1714,7 +1714,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     // of that write and already prints it, so printing it again would double the marker.
     // Phase C — ipc rank 3. The atomic recheck-and-publish, through the ONE policy owner both
     // routes share.
-    let outcome = shared.recv_block_phase_c_split(
+    let (outcome, reserved_deadline) = shared.recv_block_phase_c_split(
         endpoint_idx,
         crate::kernel::boot::EndpointWaiterRecord::new(
             crate::kernel::boot::ReceiverWaiterIdentity::new(
@@ -1788,6 +1788,58 @@ fn try_split_blocking_ipc_recv_into_frame(
             return D::Complete(Err(TrapHandleError::Syscall(
                 crate::kernel::syscall::SyscallError::WrongObject,
             )));
+        }
+    }
+    // (9b) 199E-DL — the COMPENSATED rank-2 half of the finite-deadline registration.
+    //
+    // Phase C reserved the token under rank 3, in the same scope that armed the terminal and
+    // published the waiter. A reservation is not claimable: the timeout collector scans TCBs and
+    // reaches a token only through `tcb.reply_timeout_token`, and every other touch of the store
+    // is keyed by a handle already read from a TCB. So this write is what activates it, and no
+    // interval exists in which timeout can win using a token the caller does not yet own.
+    //
+    // Ranks are never held together — rank 3 was released when Phase C returned. On refusal the
+    // exact reservation is cancelled, so nothing is left armed for a caller that does not own it.
+    match reserved_deadline {
+        // Not a reply wait, or a wait with no finite deadline: nothing was reserved.
+        None | Some(None) => {}
+        Some(Some(handle)) => {
+            let published = shared.publish_reply_timeout_token_split(
+                tid,
+                receiver_asid,
+                wait_generation,
+                handle,
+                crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick,
+            );
+            if published {
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_ARMED arch={} caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                    tid,
+                    receiver_asid.0,
+                    handle.identity().terminal_identity.reply_record_index,
+                    handle.identity().terminal_identity.reply_record_generation,
+                    handle.identity().terminal_epoch,
+                    handle.identity().token_index,
+                    handle.identity().token_generation,
+                    deadline.unwrap_or(0)
+                );
+            } else {
+                // The caller incarnation moved under us between rank 3 and rank 2. Cancel the
+                // EXACT reservation — a stale cancel mutates nothing — and leave the block
+                // otherwise intact: the wait is still armed for reply/death/caller-exit, and its
+                // deadline stays on the ordinary receive-timeout class exactly as an
+                // unregistered wait's does. Nothing is left claimable that the caller cannot own.
+                let cancelled = shared.cancel_deadline_exact_split(&handle);
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_ARM_COMPENSATED caller_tid={} caller_asid={} token_slot={} token_generation={} cancelled={} result=ok",
+                    tid,
+                    receiver_asid.0,
+                    handle.identity().token_index,
+                    handle.identity().token_generation,
+                    u8::from(cancelled)
+                );
+            }
         }
     }
     // (10) Stage 199D-WA3C2 — publish the NR6/NR7 blocked-waiter acknowledgements from the
