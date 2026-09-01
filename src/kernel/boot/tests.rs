@@ -149057,6 +149057,113 @@ mod stage199a2drr_reply_record_release {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 199A2D-RR §1 — the enumerated visibility order is documented on the NR7 helper. These
+// hold the DOCUMENT to the code: every ordering the enumeration claims is re-derived from
+// source here, so the two cannot drift apart.
+mod stage199a2drr_visibility_order {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    /// The transaction's body, from the reply transaction's signature to its end.
+    fn txn_body() -> &'static str {
+        let b = TXN
+            .split("pub(crate) fn ipc_reply_direct_txn(")
+            .nth(1)
+            .expect("the reply transaction");
+        &b[..b.find("\n    pub(crate) fn ").unwrap_or(b.len())]
+    }
+
+    fn at(hay: &str, needle: &str) -> usize {
+        hay.find(needle)
+            .unwrap_or_else(|| panic!("missing step: {needle}"))
+    }
+
+    /// THE BARRIER is `Reserved → Consumed`, and it precedes BOTH the authority revoke and
+    /// the wake. No window may exist where the caller runs while the record would still
+    /// authorize a second reply.
+    #[test]
+    fn the_barrier_precedes_the_authority_revoke_and_the_single_wake() {
+        let b = txn_body();
+        let barrier = at(b, "self.consume_reply_record_split(idx, rgen)");
+        let reclaim = at(b, "self.reclaim_reply_authority_split(");
+        let wake = at(b, "self.sr_enqueue_committed_receiver_reconciled_split(");
+        assert!(
+            barrier < reclaim,
+            "the one-shot is spent in the record before its CNode slots are reclaimed"
+        );
+        assert!(
+            barrier < wake,
+            "and before the caller is woken, so a woken caller can never be replied to twice"
+        );
+    }
+
+    /// Everything fallible-and-retryable is ordered ahead of the barrier: the caller's
+    /// copies and the waiter claim all precede it, so a copy fault still rolls back.
+    #[test]
+    fn every_retryable_step_precedes_the_barrier() {
+        let b = txn_body();
+        let barrier = at(b, "self.consume_reply_record_split(idx, rgen)");
+        for step in [
+            "self.reserve_existing_reply_record_split(idx, rgen, snapshot.replier)",
+            "copy_slice_to_user_asid_split_write(",
+            "self.sr_claim_endpoint_waiter_split(",
+            "self.sr_commit_blocked_receiver_split(",
+        ] {
+            assert!(
+                at(b, step) < barrier,
+                "a refusal at `{step}` must still be able to roll back, so it precedes the barrier"
+            );
+        }
+    }
+
+    /// The blocked route's tail: terminal claim → transaction → terminal resolution →
+    /// record release. The release is last because a slot handed back while its cell is
+    /// still `Reserved(Reply)` could be re-armed over a live claim.
+    #[test]
+    fn the_route_resolves_the_terminal_before_it_releases_the_slot() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
+        let claim = at(body, "shared.claim_direct_reply_terminal_split(");
+        let drain = at(body, "shared.drain_direct_reply_post_work(");
+        let commit = at(body, "shared.commit_direct_reply_terminal_split(");
+        let release = at(body, "shared.release_consumed_reply_record_split(");
+        assert!(
+            claim < drain,
+            "the exclusive claim precedes the transaction"
+        );
+        assert!(
+            drain < commit,
+            "the terminal is resolved by what the transaction did"
+        );
+        assert!(
+            commit < release,
+            "and the slot is released only after that resolution"
+        );
+    }
+
+    /// The enumeration is not decoration: the doc block naming the barrier and both
+    /// load-bearing orderings must stay attached to the helper it describes.
+    #[test]
+    fn the_enumeration_is_documented_on_the_helper_it_describes() {
+        let doc = SPLIT
+            .split("/// # 199A2D-RR §1 — the one-shot barrier and the enumerated visibility order")
+            .nth(1)
+            .expect("the §1 enumeration");
+        let doc = &doc[..at(doc, "#[cfg(not(feature = \"hosted-dev\"))]")];
+        for claim in [
+            "THE BARRIER",
+            "Reserved → Consumed",
+            "record slot released",
+            "no artificial wake",
+        ] {
+            assert!(doc.contains(claim), "the enumeration must state: {claim}");
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 199A2D-RR §5 — the QUEUED (unblocked-caller) reply settles its record in the order the
 // reverse link needs.
 //

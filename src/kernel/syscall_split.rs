@@ -2797,6 +2797,67 @@ fn try_split_ipccall_direct_into_frame(
 ///   `SharedKernel::ipc_reply_direct_txn`. No userspace payload pointer survives the
 ///   snapshot. On invalid length / copy fault / no committed ack, returns `None` (the
 ///   ack is never claimed, nothing is mutated) so NR7 stays on its existing path.
+///
+/// # 199A2D-RR §1 — the one-shot barrier and the enumerated visibility order
+///
+/// THE BARRIER is the reply record's `Reserved → Consumed` transition, taken under the
+/// rank-3 IPC claim. After it, a stale or aliased reply capability that still resolves to
+/// the same `(record index, generation)` fails through the `Consumed` record — before its
+/// physical CNode slots are reclaimed, and before the caller is woken. The record state,
+/// not the capability slot, is what makes the reply one-shot; slot reclamation is only
+/// storage recovery behind it.
+///
+/// Everything fallible and still-retryable is ordered AHEAD of the barrier, and everything
+/// past it is irrevocable. The full order, blocked (`DeliverBlocked`) mode:
+///
+/// ```text
+///   pre-barrier — a refusal here mutates nothing and may still decline or fall back
+///     1  facts + eligibility verdict (replier probe resolved first)
+///     2  SMP pre-ack, then the reply payload copied IN from the replier
+///     3  owned snapshot built (no user pointer survives it)
+///     4  MODE chosen: claimable acknowledgement → blocked; else unarmed terminal → queued
+///     5  EXCLUSIVE rank-3 terminal claim  ── Open → Reserved(Reply)
+///     6  acknowledgement claimed, at most once, keyed by reply-endpoint incarnation
+///     7  record reserved            ── Available → Reserved  (exact replier)
+///     8  reply payload copied OUT to the caller's buffer
+///     9  recv-v2 meta copied OUT to the caller
+///    10  endpoint waiter claimed (removable, and restorable on a later refusal)
+///    11  blocked receiver committed ── the caller becomes Runnable
+///   ── THE BARRIER ────────────────────────────────────────────────────────────────
+///    12  record consumed             ── Reserved → Consumed
+///   post-barrier — the one-shot is spent; no other claimant may win
+///    13  reply authority reclaimed   ── both CNode slots revoked through one owner
+///    14  caller enqueued             ── the SINGLE wake, LAST and non-fallible
+///    15  endpoint-waiter claim consumed
+///    16  terminal claim resolved     ── Reserved(Reply) → Completed
+///    17  record slot released        ── only on success, only AFTER (16)
+/// ```
+///
+/// Two orderings in that list are load-bearing rather than incidental:
+///
+/// * (12) before (13) and (14). The barrier precedes both the authority revoke and the
+///   wake, so no window exists in which the caller is running while the record would still
+///   authorize a second reply.
+/// * (17) after (16). The slot is handed back to the allocator only once the terminal cell
+///   is `Completed`; releasing it while the cell is still `Reserved(Reply)` would let a
+///   reallocation of this slot arm over a live claim.
+///
+/// The queued (`QueueUnblocked`) mode reaches the same barrier through one rank-3
+/// acquisition, and settles in the order its reverse link requires:
+///
+/// ```text
+///     1..4 as above (the caller is NOT blocked, so there is no ack and no terminal)
+///     5' revalidate record generation, `Available`, exact replier, endpoint incarnation
+///     6' enqueue into the reply endpoint — admission decided FIRST; a refusal here leaves
+///        the record `Available` and the reply exactly re-sendable
+///   ── THE BARRIER ────────────────────────────────────────────────────────────────
+///     7' record consumed          ── Available → Consumed, record left PRESENT
+///     8' reverse link closed      ── resolves the responder FROM the still-present record
+///     9' record slot released     ── through the same release owner as (17)
+///    10' reply authority reclaimed
+///    11' a receiver is woken ONLY if the commit actually removed one from the waiter
+///        table; a polling receiver with no published waiter gets no artificial wake
+/// ```
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_ipcreply_direct_into_frame(
     shared: &SharedKernel,
