@@ -374,10 +374,19 @@ pub fn phase_b_prime_record_reply_cap(
     snapshot: &ReplyCapRecvSnapshot,
     minted: CapId,
 ) -> Result<CapId, SyscallError> {
+    // DIRECT3 §1: bind the responder on the same edge as the canonical arm — the two must
+    // agree, or a reply's eligibility would depend on which recv path materialized its cap.
+    let responder_identity = kernel.task_asid(snapshot.receiver_tid).map(|asid| {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(snapshot.receiver_tid),
+            asid,
+        )
+    });
     let outcome = kernel.try_set_reply_cap_waiter_cap(
         snapshot.reply_index,
         snapshot.reply_generation,
         minted,
+        responder_identity,
     );
     match outcome {
         ReplyRecordSetOutcome::Set => {

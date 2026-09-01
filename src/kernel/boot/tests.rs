@@ -20758,7 +20758,7 @@ fn stage20_rollback_materialized_reply_cap_clears_slot_and_waiter_id() {
             // Simulate materialization: record the caller-local cap as the waiter cap
             // (set_reply_cap_waiter_cap is what the recv path calls).
             let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
-            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
+            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap, None);
             assert_eq!(
                 state.reply_cap_record_waiter_cap(reply_index),
                 Some(reply_cap),
@@ -20832,7 +20832,7 @@ fn stage20_clear_reply_cap_waiter_cap_generation_guard() {
                 .expect("create reply cap");
             let reply_index = 0usize;
             let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
-            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
+            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap, None);
             assert_eq!(
                 state.reply_cap_record_waiter_cap(reply_index),
                 Some(reply_cap)
@@ -22252,7 +22252,7 @@ fn stage25c_stale_waiter_cap_id_cleared_on_replier_teardown() {
                 .expect("create reply cap");
             let reply_index = 0usize;
             let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
-            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
+            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap, None);
             assert_eq!(
                 state.reply_cap_record_waiter_cap(reply_index),
                 Some(reply_cap),
@@ -51737,7 +51737,7 @@ mod stage188d_reply_cap_rank_inversion_seam {
                 k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].is_none()),
                 "the consumed record slot must be empty (one-shot consume point)"
             );
-            let reprime = k.try_set_reply_cap_waiter_cap(reply_index, reply_generation, receiver_cap);
+            let reprime = k.try_set_reply_cap_waiter_cap(reply_index, reply_generation, receiver_cap, None);
             assert!(
                 !matches!(reprime, crate::kernel::boot::ReplyRecordSetOutcome::Set),
                 "re-priming a consumed record must fail — the record is the one-shot arbiter"
@@ -65060,7 +65060,7 @@ mod stage198d1_queued_reply_cap_lifetime {
         let minted = state
             .mint_capability_in_cnode(cnode, Capability::new(reply_obj, CapRights::SEND))
             .expect("provisional receiver mint");
-        state.set_reply_cap_waiter_cap(index, generation, minted);
+        state.set_reply_cap_waiter_cap(index, generation, minted, None);
         assert_eq!(state.reply_cap_record_waiter_cap(index), Some(minted));
 
         // A subsequent copy/CNode failure rolls the provisional mint back.
@@ -137319,11 +137319,21 @@ mod u9c_reply_cap_ordered_transaction {
             body.contains("reply_object_live_split(reply_index, reply_generation)"),
             "liveness is checked against the exact generation"
         );
+        // DIRECT3 §1: the call now also carries the responder identity, so the argument list is
+        // matched on its generation-guarding head rather than as one literal.
         assert!(
-            body.contains(
-                "try_record_reply_waiter_cap_split(reply_index, reply_generation, minted)"
-            ),
+            body.contains("try_record_reply_waiter_cap_split(")
+                && body.contains("reply_index,")
+                && body.contains("reply_generation,")
+                && body.contains("minted,"),
             "the record write is generation-guarded again, closing the mint->record window"
+        );
+        // And the responder it binds is the EXACT receiver incarnation, resolved by tid, never
+        // the ambient current task.
+        assert!(
+            body.contains("task_asid_opt_split_read(receiver_tid)")
+                && body.contains("responder_identity,"),
+            "the responder binding is keyed by the receiver's exact tid and asid"
         );
         assert!(
             !body.contains("current_tid"),

@@ -5911,7 +5911,21 @@ impl SharedKernel {
             .map_err(SyscallError::from)?;
 
         // ── Phase E (rank 3): record the exact CapId as the record's waiter alias ──────────
-        match self.try_record_reply_waiter_cap_split(reply_index, reply_generation, minted) {
+        // DIRECT3 §1: the receiver taking the one-shot cap IS the responder. Bind it on this
+        // same edge so a QUEUED request's record reaches the replier bound exactly as a direct
+        // request's does. Bind-once; an already-bound record is never re-bound.
+        let responder_identity = self.task_asid_opt_split_read(receiver_tid).map(|asid| {
+            crate::kernel::boot::ReceiverWaiterIdentity::new(
+                crate::kernel::ipc::ThreadId(receiver_tid),
+                asid,
+            )
+        });
+        match self.try_record_reply_waiter_cap_split(
+            reply_index,
+            reply_generation,
+            minted,
+            responder_identity,
+        ) {
             crate::kernel::boot::ReplyRecordSetOutcome::Set => {
                 crate::yarm_log!(
                     "YARM_D5_SPLIT_RECORD reply_index={} reply_gen={} cap={}",
@@ -7315,10 +7329,20 @@ impl SharedKernel {
 
         // Phase C.1 (rank 3, IPC seam only — disjoint from the rank-4 mint):
         // record the receiver-local CapId. A stale record rolls the mint back.
+        // DIRECT3 §1: same edge, same binding — the waiter receiving the one-shot cap is the
+        // responder. Both split projections bind, so a reply's eligibility can never depend on
+        // which seam materialized its capability.
+        let responder_identity = self.task_asid_opt_split_read(snap.waiter_tid).map(|asid| {
+            crate::kernel::boot::ReceiverWaiterIdentity::new(
+                crate::kernel::ipc::ThreadId(snap.waiter_tid),
+                asid,
+            )
+        });
         match self.try_record_reply_waiter_cap_split(
             snap.reply_index,
             snap.reply_generation,
             CapId(local_cap),
+            responder_identity,
         ) {
             ReplyRecordSetOutcome::Set => {
                 crate::yarm_log!(

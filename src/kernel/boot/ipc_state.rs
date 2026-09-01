@@ -1363,12 +1363,30 @@ pub(crate) fn classify_direct_reply_terminal_locked(
         return T::IdentityMismatch;
     }
     let id = cell.identity();
+    // DIRECT3 §1 — the replier fields of an armed identity are a SNAPSHOT of the record as it
+    // stood when the caller blocked, not a live view of it. For a QUEUED request the record is
+    // still unbound at that moment (the message was buffered before any receiver existed), so
+    // the arm records the unbound sentinel `{tid 0, asid 0}`; the responder is bound later, when
+    // the receiver materializes the one-shot cap. That `None → Some` step is the record's ONE
+    // legitimate identity advance, and comparing a snapshot taken before it against the record
+    // after it would reject the very reply the binding exists to enable.
+    //
+    // It is admitted here and nowhere else, and it weakens no authorization: whether this
+    // replier may claim at all is decided independently below, against the record's CURRENT
+    // binding. Any other difference — a different bound replier, a different caller, a different
+    // endpoint incarnation — is still an exact mismatch.
+    let replier_snapshot_ok = match (record.responder_tid, record.replier_asid) {
+        (Some(tid), Some(asid)) => {
+            (id.replier_tid == tid && id.replier_asid == asid)
+                || (id.replier_tid == ThreadId(0) && id.replier_asid == Asid(0))
+        }
+        _ => id.replier_tid == ThreadId(0) && id.replier_asid == Asid(0),
+    };
     let exact = id.reply_record_index == record_index
         && id.reply_record_generation == record_generation
         && id.caller_tid == record.caller_tid
         && id.caller_asid == record.caller_asid
-        && id.replier_tid == record.responder_tid.unwrap_or(ThreadId(0))
-        && id.replier_asid == record.replier_asid.unwrap_or(Asid(0))
+        && replier_snapshot_ok
         && id.reply_endpoint_index == bound_eidx
         && id.reply_endpoint_generation == bound_egen;
     if !exact {
@@ -1468,6 +1486,84 @@ pub(crate) fn commit_reply_terminal_locked(
     ipc.reply_terminal_ownership
         .get(record_index)
         .is_some_and(|cell| cell.commit_terminal(owner))
+}
+
+/// DIRECT3 §1 — THE reply-record waiter-cap/responder priming policy, rank 3 only.
+///
+/// There used to be two copies of this: `KernelState::try_set_reply_cap_waiter_cap` for the
+/// broad path and `SharedKernel::try_record_reply_waiter_cap_split` for the rank-3 seam, each
+/// re-implementing the same range, generation and slot checks. Both now delegate here, so the
+/// responder binding below cannot exist on one path and not the other — which is exactly how
+/// the live gap arose: production takes the split seam, and a repair applied only to the broad
+/// copies changed nothing.
+///
+/// ## The responder binding
+///
+/// A reply record minted for a QUEUED request carries no responder: the message is buffered
+/// before any receiver exists, so `create_reply_cap_for_caller` is called with `None`. The
+/// direct request transaction binds its receiver because it delivers straight into one; the
+/// queued path had no equivalent, so such a record reached the replier still unbound and
+/// `reserve_existing_reply_record_split` refused it — `responder_tid=None` fails
+/// `== Some(replier.tid)`. The direct reply then released its terminal claim and the legacy
+/// broad path completed the reply.
+///
+/// The receiver materializing the one-shot capability IS the responder: this is the moment the
+/// authority becomes exercisable, and by whom. Nothing is invented — it is the same fact
+/// `create_reply_cap_for_caller_in_cnode` records when the responder is known up front.
+///
+/// BIND-ONCE. An already-bound record is never re-bound: a second binding would be a different
+/// task acquiring an authority the first already holds, which is a defect to report rather than
+/// a state to overwrite.
+pub(crate) fn record_reply_waiter_cap_locked(
+    ipc: &mut IpcSubsystem,
+    reply_index: usize,
+    reply_generation: u64,
+    cap: CapId,
+    responder: Option<ReceiverWaiterIdentity>,
+) -> ReplyRecordSetOutcome {
+    if reply_index >= super::MAX_REPLY_CAPS {
+        return ReplyRecordSetOutcome::IndexOutOfRange;
+    }
+    if ipc.reply_cap_generations[reply_index] != reply_generation {
+        return ReplyRecordSetOutcome::GenerationMismatch;
+    }
+    let Some(record) = &mut ipc.reply_caps[reply_index] else {
+        return ReplyRecordSetOutcome::SlotEmpty;
+    };
+    record.waiter_cap_id = Some(cap);
+    if let Some(responder) = responder {
+        match (record.responder_tid, record.replier_asid) {
+            (None, None) => {
+                record.responder_tid = Some(responder.tid);
+                record.replier_asid = Some(responder.asid);
+                crate::yarm_log!(
+                    "IPC_RECV_REPLY_CAP_RESPONDER_BOUND reply_index={} reply_gen={} responder_tid={} responder_asid={} result=ok",
+                    reply_index,
+                    reply_generation,
+                    responder.tid.0,
+                    responder.asid.0
+                );
+            }
+            (Some(tid), _) if tid == responder.tid => {}
+            (tid, asid) => {
+                crate::yarm_log!(
+                    "IPC_RECV_REPLY_CAP_RESPONDER_CONFLICT reply_index={} reply_gen={} bound_tid={:?} bound_asid={:?} offered_tid={} result=fail",
+                    reply_index,
+                    reply_generation,
+                    tid.map(|t| t.0),
+                    asid.map(|a| a.0),
+                    responder.tid.0
+                );
+            }
+        }
+    }
+    crate::yarm_log!(
+        "IPC_RECV_REPLY_CAP_WAITER_CAP_SET reply_index={} reply_gen={} cap={}",
+        reply_index,
+        reply_generation,
+        cap.0
+    );
+    ReplyRecordSetOutcome::Set
 }
 
 /// Release a reply-record terminal claim back to `Open` after a PRE-DELIVERY failure.
@@ -1613,6 +1709,7 @@ impl KernelState {
         reply_index: usize,
         reply_generation: u64,
         cap: CapId,
+        responder: Option<ReceiverWaiterIdentity>,
     ) {
         // Stage 105 / D5: thin wrapper over try_set_reply_cap_waiter_cap that
         // discards the stale signal. The canonical reply arm of
@@ -1620,7 +1717,7 @@ impl KernelState {
         // duration of the reply materialization, so a stale outcome here is
         // unreachable on that path. The D5 split path uses the fallible form
         // directly to drive its mint rollback.
-        let _ = self.try_set_reply_cap_waiter_cap(reply_index, reply_generation, cap);
+        let _ = self.try_set_reply_cap_waiter_cap(reply_index, reply_generation, cap, responder);
     }
 
     /// Stage 105 / D5: fallible variant of [`set_reply_cap_waiter_cap`].
@@ -1642,26 +1739,10 @@ impl KernelState {
         reply_index: usize,
         reply_generation: u64,
         cap: CapId,
+        responder: Option<ReceiverWaiterIdentity>,
     ) -> ReplyRecordSetOutcome {
         let outcome = self.with_ipc_state_mut(|ipc| {
-            if reply_index >= super::MAX_REPLY_CAPS {
-                return ReplyRecordSetOutcome::IndexOutOfRange;
-            }
-            if ipc.reply_cap_generations[reply_index] != reply_generation {
-                return ReplyRecordSetOutcome::GenerationMismatch;
-            }
-            if let Some(record) = &mut ipc.reply_caps[reply_index] {
-                record.waiter_cap_id = Some(cap);
-                crate::yarm_log!(
-                    "IPC_RECV_REPLY_CAP_WAITER_CAP_SET reply_index={} reply_gen={} cap={}",
-                    reply_index,
-                    reply_generation,
-                    cap.0
-                );
-                ReplyRecordSetOutcome::Set
-            } else {
-                ReplyRecordSetOutcome::SlotEmpty
-            }
+            record_reply_waiter_cap_locked(ipc, reply_index, reply_generation, cap, responder)
         });
         if !matches!(outcome, ReplyRecordSetOutcome::Set) {
             let reason = match outcome {
