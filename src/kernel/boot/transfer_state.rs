@@ -36,7 +36,10 @@ impl KernelState {
                 .resolve_capability_for_task(source_tid.0, source_cap)
                 .ok()?
                 .object;
-            if shared_region.is_some() {
+            // 199G-C §2: the SHARED pin policy. An envelope owes exactly one object pin iff it
+            // carries a shared-region descriptor — not because it carries a transfer capability.
+            // The split envelope stash asks the same predicate, so the two stashes cannot drift.
+            if Self::transfer_envelope_owes_pin(shared_region) {
                 self.adjust_memory_object_pin_refcount(source_object, 1);
             }
             self.with_ipc_state_mut(|ipc| {
@@ -86,7 +89,9 @@ impl KernelState {
             }
         }
         envelope = envelope.transition(TransferState::Released)?;
-        if envelope.shared_region.is_some() {
+        // 199G-C §2: the same shared policy the stash used, so acquire and release are one
+        // decision read twice rather than two spellings that could diverge.
+        if Self::transfer_envelope_owes_pin(envelope.shared_region) {
             self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
         }
         self.with_ipc_state_mut(|ipc| {
@@ -299,36 +304,26 @@ impl KernelState {
             .offset
             .checked_add(region.len)
             .ok_or(KernelError::WrongObject)?;
-        match capability.object {
-            CapObject::MemoryObject { id } => {
-                let mem = self
-                    .with_memory_state(|memory| {
-                        memory
-                            .memory_objects
-                            .iter()
-                            .flatten()
-                            .find(|entry| entry.id == id)
-                            .copied()
-                    })
-                    .ok_or(KernelError::MemoryObjectMissing)?;
-                let max_len = u64::try_from(mem.len).map_err(|_| KernelError::WrongObject)?;
-                if region.len > max_len || end < region.offset {
-                    return Err(KernelError::WrongObject);
-                }
-            }
-            CapObject::DmaRegion {
-                offset: base,
-                len: span,
-                ..
-            } => {
-                let cap_end = base.checked_add(span).ok_or(KernelError::WrongObject)?;
-                if region.offset < base || end > cap_end {
-                    return Err(KernelError::WrongObject);
-                }
-            }
-            _ => return Err(KernelError::WrongObject),
-        }
-        Ok(())
+        // 199G-C4 §2: the bound check itself is THE shared policy — the split envelope stash asks
+        // the same function with the same inputs, so the two stashes cannot drift on what a
+        // shared-region descriptor is allowed to name. Only the LOOKUP of a `MemoryObject`'s
+        // length differs between them (broad `with_memory_state` here, the rank-6 split seam
+        // there), which is why it is passed in rather than performed inside.
+        let memory_object_len = match capability.object {
+            CapObject::MemoryObject { id } => Some(
+                self.with_memory_state(|memory| {
+                    memory
+                        .memory_objects
+                        .iter()
+                        .flatten()
+                        .find(|entry| entry.id == id)
+                        .map(|entry| entry.len)
+                })
+                .ok_or(KernelError::MemoryObjectMissing)?,
+            ),
+            _ => None,
+        };
+        transfer_shared_region_bounds_ok(capability.object, region, memory_object_len)
     }
 
     pub fn endpoint_waiter_tid(&self, endpoint: CapObject) -> Option<ThreadId> {
@@ -497,4 +492,50 @@ impl KernelState {
                 .map(|mapping| (mapping.base, mapping.len))
         })
     }
+}
+
+/// 199G-C4 §2 — THE shared-region bound policy, shared by the broad and split envelope stashes.
+///
+/// Given the resolved source object, the descriptor the sender named, and (for a `MemoryObject`)
+/// that object's length as read by whichever rank-6 owner the caller had available, decide whether
+/// the descriptor is admissible. Pure: it reads no kernel state, so both callers reach the same
+/// verdict from the same facts.
+///
+/// The rules are exactly the ones `validate_transfer_record_metadata` has always applied:
+/// a zero length is refused, `offset + len` may not overflow, a `MemoryObject` descriptor may not
+/// exceed the object's length, a `DmaRegion` descriptor must lie inside the capability's own
+/// `[offset, offset + len)` window, and no other object class may carry a shared region at all.
+pub(crate) fn transfer_shared_region_bounds_ok(
+    object: CapObject,
+    region: TransferSharedRegion,
+    memory_object_len: Option<usize>,
+) -> Result<(), KernelError> {
+    if region.len == 0 {
+        return Err(KernelError::WrongObject);
+    }
+    let end = region
+        .offset
+        .checked_add(region.len)
+        .ok_or(KernelError::WrongObject)?;
+    match object {
+        CapObject::MemoryObject { .. } => {
+            let len = memory_object_len.ok_or(KernelError::MemoryObjectMissing)?;
+            let max_len = u64::try_from(len).map_err(|_| KernelError::WrongObject)?;
+            if region.len > max_len || end < region.offset {
+                return Err(KernelError::WrongObject);
+            }
+        }
+        CapObject::DmaRegion {
+            offset: base,
+            len: span,
+            ..
+        } => {
+            let cap_end = base.checked_add(span).ok_or(KernelError::WrongObject)?;
+            if region.offset < base || end > cap_end {
+                return Err(KernelError::WrongObject);
+            }
+        }
+        _ => return Err(KernelError::WrongObject),
+    }
+    Ok(())
 }

@@ -34122,10 +34122,26 @@ mod stage115_d2_d6_seam_analysis {
             !split_src.contains("try_split_cap_grant"),
             "D1/D5: cap grant path must not appear in syscall_split (not split-dispatched)"
         );
+        // 199G-C4 §1 RETIRED the second half of this rule. `IpcSend` now HAS a pre-lock route,
+        // so the honest form of "D1/D5 cap-transfer behaviour is not touched" is that the route
+        // consumes the D1/D5 owners rather than reimplementing them: it mints nothing, and every
+        // cap-carrying class goes to an existing producer.
         assert!(
-            !split_src.contains("try_split_ipc_send"),
-            "D1/D5: ipc send split must not appear in syscall_split"
+            split_src.contains("fn try_split_ipc_send_into_frame("),
+            "NR 1 has a pre-lock route since 199G-C4 §1"
         );
+        for reimplemented in [
+            "mint_capability_in_cnode",
+            "materialize_received_message_cap",
+            "phase_a_snapshot_ordinary_transfer",
+            "phase_a_take_reply_envelope",
+        ] {
+            assert!(
+                !split_src.contains(reimplemented),
+                "D1/D5: the NR 1 route must consume the cap-transfer owners, never reimplement \
+                 `{reimplemented}`"
+            );
+        }
     }
 
     #[test]
@@ -43641,8 +43657,11 @@ mod stage160c_aarch64_trap_abi_bracketing {
             TRAP_ENTRY_SRC
                 .matches("finalize_split_handled_syscall(shared, cpu, entering, frame)")
                 .count(),
-            3,
-            "finalize must run on the Ok, handled-error and queue-advance-committed arms"
+            4,
+            "finalize must run on the Ok, handled-error, queue-advance-committed and \
+             post-work-committed arms — 199G-C4 §2 added the fourth, and it is CONDITIONAL: a \
+             send that delivered or enqueued finished its caller's syscall, while one that is \
+             about to park it must not advance its SVC or export a result on its behalf"
         );
         // Each of the three is reached from its own disposition arm, not from a shared prelude.
         let committed = TRAP_ENTRY_SRC
@@ -49456,9 +49475,15 @@ mod stage187d_blocked_waiter_delivery_hard_stop {
     // waiter split path).
     #[test]
     fn stage187d_no_send_reply_call_pre_dispatch_split() {
-        // The only dedicated pre-dispatch split helpers are recv (NR2) and VmBrk.
+        // 199G-C4 §1 LIFTED this hard stop for `IpcSend` and only for it: blocked-waiter
+        // delivery now has SharedKernel-level owners (the four off-lock producers), which is
+        // exactly the thing Stage 187D recorded as missing. `IpcReply` and `IpcCall` have no
+        // pre-dispatch route and the stop still stands for them.
+        assert!(
+            SPLIT_SRC.contains("fn try_split_ipc_send_into_frame("),
+            "NR 1 has a pre-dispatch route since 199G-C4 §1"
+        );
         for forbidden in [
-            "try_split_ipc_send",
             "try_split_ipc_reply",
             "try_split_ipc_call",
             "try_split_blocked_waiter",
@@ -71379,17 +71404,29 @@ mod stage198e3c1_direct_live_policy {
     // (10) Exactly ONE TransferEnvelope is created on a successful shared-region send.
     #[test]
     fn abi_guard_one_transfer_envelope() {
-        // The large-transfer branch stashes exactly one envelope carrying the region descriptor.
+        // 199G-C4 §1 folded the two shared-region arms (user sender and kernel task) into ONE,
+        // selected by the shape owner, so the property is now structural rather than repeated:
+        // the shared-region arm stashes exactly one envelope, and it carries the descriptor.
         let large = IPC_SYSCALL_SRC
-            .split_once("if len > Message::MAX_PAYLOAD {")
-            .and_then(|(_, r)| r.split_once("} else {").map(|(b, _)| b))
-            .expect("large-transfer branch");
+            .split_once("IpcSendPayloadShape::SharedRegion => {")
+            .and_then(|(_, r)| {
+                r.split_once("IpcSendPayloadShape::Inline => {")
+                    .map(|(b, _)| b)
+            })
+            .expect("shared-region arm");
         assert_eq!(
             large.matches("stash_transfer_handle(").count(),
             1,
-            "exactly one TransferEnvelope stash on the large-transfer path"
+            "exactly one TransferEnvelope stash on the shared-region path"
         );
         assert!(large.contains("Some(TransferSharedRegion {"));
+        // And the inline arm stashes exactly one too, with no region descriptor.
+        let inline = IPC_SYSCALL_SRC
+            .split_once("IpcSendPayloadShape::Inline => {")
+            .and_then(|(_, r)| r.split_once("\n    };\n").map(|(b, _)| b))
+            .expect("inline arm");
+        assert_eq!(inline.matches("stash_transfer_handle(").count(), 1);
+        assert!(!inline.contains("TransferSharedRegion"));
     }
 
     // (11) The contract document and the source constants agree.
@@ -100815,14 +100852,25 @@ mod stage200d0c1_aarch64_exit_prep {
             .split("\n}\n")
             .next()
             .expect("its body");
-        let send = writer
-            .find("encode_blocked_send_completion(frame, done.result)")
-            .expect("send completion encode");
+        // 199E-A64RC: `encode_blocked_completion_result` is the ONE completion-apply owner, now
+        // shared by the blocked-SEND and blocked-RECEIVE classes. Both are encoded in this writer,
+        // so require the LAST of them to still precede the argument mirror — otherwise a consumed
+        // completion would be overwritten by the receive's own arguments, which is exactly the
+        // defect this guard exists to catch.
+        let encodes: alloc::vec::Vec<usize> = writer
+            .match_indices("encode_blocked_completion_result(frame, done.result)")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            encodes.len(),
+            2,
+            "both blocked classes encode through the one owner in this writer"
+        );
         let mirror = writer
             .find("frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0))")
             .expect("the argument mirror");
         assert!(
-            send < mirror,
+            *encodes.last().expect("an encode") < mirror,
             "completions are encoded BEFORE the argument mirror"
         );
         assert!(
@@ -113050,6 +113098,10 @@ mod stage199d_riscv_canonical_admission {
             // pre-lock route is NR 2's route and whose completion is the shared D2-recv drain
             // this bridge has driven since U4.
             "SYSCALL_IPC_RECV_TIMEOUT_NR",
+            // 199G-C4 §1: the THIRD switching member — IpcSend (NR 1), whose pre-lock route
+            // settles through the post-work drain and, when it parks a sender, through the
+            // homologous D2-SEND drain this bridge has driven since U4/U6.
+            "SYSCALL_IPC_SEND_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -113058,11 +113110,11 @@ mod stage199d_riscv_canonical_admission {
             );
         }
         // Nothing else was added to the whitelist. NR 2 in particular is NOT here: 199G-B §2
-        // admits NR 5 without disturbing NR 2's admission.
+        // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            4,
-            "exactly four literal NRs plus the gated direct-IPC term"
+            5,
+            "exactly five literal NRs plus the gated direct-IPC term"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -126264,8 +126316,23 @@ mod u3_ordinary_cap_sender_wake {
         let code = code_of(RUNTIME);
         assert_eq!(
             code.matches("self.wake_tid_to_runnable_split(").count(),
-            2,
-            "exactly two production callers: the blocked-waiter completion and the sender wake"
+            3,
+            "exactly three production callers: the blocked-waiter completion, the sender wake, \
+             and (199G-C4 §3) the off-lock endpoint-waiter wake — all one body, which is the \
+             property this test exists to hold"
+        );
+        // The third caller is the off-lock counterpart of `wake_waiter_for_endpoint`, and it
+        // wakes only AFTER releasing rank 3, exactly as the broad owner documents it must.
+        let epw = body_of("pub(crate) fn wake_waiter_for_endpoint_split");
+        let take = epw
+            .find("with_ipc_split_mut(|ipc| ipc.take_endpoint_waiter(")
+            .expect("rank-3 take");
+        let wake = epw
+            .find("self.wake_tid_to_runnable_split(")
+            .expect("the shared wake");
+        assert!(
+            take < wake,
+            "the waiter is taken under rank 3, then woken with rank 3 released"
         );
         // The blocked-waiter completion still binds the CPU itself — it must not bind twice.
         let bw = body_of("pub(crate) fn complete_blocked_waiter_delivery_split");
@@ -129238,18 +129305,53 @@ mod u4_cross_arch_queue_advancing_dispatch {
             }
         }
 
-        /// The existing IpcRecv / reply-timeout feature policy is unchanged: its consumers stay
-        /// behind their gate, and U6 neither removes nor widens it.
+        /// The IpcRecv completion policy, re-derived by 199E-A64RC.
+        ///
+        /// This guard used to require BOTH AArch64 and RISC-V to keep the recv consumer behind
+        /// `ipc-reply-timeout-oracle-core`. That was wrong for AArch64 and it hid a real defect.
+        /// The producer, `publish_blocked_recv_timeout_result_with_identity`, parks the
+        /// generation-bearing record on every port and every build; x86_64 and RISC-V additionally
+        /// install an equivalent saved result at publication time and therefore never need to
+        /// consume it, but AArch64 deliberately writes NO result register there and is served
+        /// solely by consuming the record at its resume boundary. Gating that consumer meant a
+        /// default AArch64 build published a completion it could never apply, and the argument
+        /// mirror handed the receive's own arguments back to userspace as a result.
+        ///
+        /// So the policy is now asymmetric BY DERIVATION, and this asserts both halves plus the
+        /// telemetry split — it is strictly more specific than what it replaced.
         #[test]
-        fn the_reply_timeout_feature_policy_is_unchanged() {
-            for (arch, src) in [("aarch64", AARCH64_TRAP), ("riscv64", RISCV_TRAP)] {
-                let idx = src
-                    .find("take_blocked_syscall_completion(current_tid)")
-                    .unwrap_or_else(|| panic!("{arch} keeps its recv consumer"));
-                let before = &src[idx.saturating_sub(200)..idx];
+        fn the_reply_timeout_feature_policy_is_derived_per_architecture() {
+            // AArch64: the consumer is production-live, i.e. NOT gated.
+            let idx = AARCH64_TRAP
+                .find("take_blocked_syscall_completion(current_tid)")
+                .expect("aarch64 keeps its recv consumer");
+            let before = &AARCH64_TRAP[idx.saturating_sub(300)..idx];
+            assert!(
+                !before.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+                "aarch64: the recv consumer must be production-live — it is the only thing that \
+                 can supply a remotely completed receive's result on that port"
+            );
+            // RISC-V: unchanged, still gated — it installs its result in the publisher instead.
+            let idx = RISCV_TRAP
+                .find("take_blocked_syscall_completion(current_tid)")
+                .expect("riscv64 keeps its recv consumer");
+            let before = &RISCV_TRAP[idx.saturating_sub(200)..idx];
+            assert!(
+                before.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+                "riscv64: the recv consumer stays feature-gated"
+            );
+            // The retirement TELEMETRY stays gated everywhere, on both AArch64 boundaries.
+            let attest = "maybe_emit_reply_timeout_class_retired";
+            assert_eq!(
+                AARCH64_TRAP.matches(attest).count(),
+                2,
+                "both AArch64 resume boundaries attest retirement"
+            );
+            for (i, _) in AARCH64_TRAP.match_indices(attest) {
+                let before = &AARCH64_TRAP[i.saturating_sub(160)..i];
                 assert!(
                     before.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
-                    "{arch}: the recv/reply-timeout consumer must stay feature-gated"
+                    "the retirement attestation is telemetry and stays feature-gated"
                 );
             }
         }
@@ -136170,13 +136272,31 @@ mod u6_frame_exact_envelope_preservation {
     #[test]
     fn admission_stamps_sender_tid_from_the_authoritative_sender() {
         let code = code_of(SYSCALL_IPC);
-        // Every kernel-side construction in the send path stamps the resolved `sender_tid`.
-        let constructions = code
-            .matches("Message::with_header(\n                sender_tid,")
-            .count();
+        // 199G-C4 §1 gave the send path ONE framing owner, so instead of four constructions that
+        // each had to remember to stamp the authoritative sender, there is one that cannot
+        // forget — and both admission arms reach it with the resolved `sender_tid`.
+        assert_eq!(
+            code.matches("pub(crate) fn frame_ipc_send_message(")
+                .count(),
+            1,
+            "one send-message framing owner"
+        );
+        let owner = code
+            .split_once("pub(crate) fn frame_ipc_send_message(")
+            .map(|(_, r)| r)
+            .expect("framing owner");
         assert!(
-            constructions >= 4,
-            "every send-admission Message construction must stamp the resolved sender_tid \
+            owner.contains(
+                "Message::with_header(sender_tid, opcode, flags, transfer_handle, payload)"
+            ),
+            "the owner stamps the sender TID it was given"
+        );
+        let constructions = code
+            .matches("frame_ipc_send_message(\n                sender_tid,")
+            .count();
+        assert_eq!(
+            constructions, 2,
+            "both send-admission arms frame through the owner with the resolved sender_tid \
              (found {constructions})"
         );
         assert!(
@@ -142492,8 +142612,14 @@ mod u9tm_proof_gate {
     #[test]
     fn a_non_preempting_tick_uses_its_own_disposition() {
         assert!(
-            SPLIT.contains("PostWorkCommitted,"),
-            "the fourth disposition must exist"
+            SPLIT.contains("PostWorkCommitted { finalize_syscall: bool },"),
+            "the fourth disposition must exist, and since 199G-C4 §2 it carries the route's own \
+             answer to whether the CALLER's syscall is finished"
+        );
+        // A tick has no syscall to finish, so it always answers `false`.
+        assert!(
+            SPLIT.contains("D::PostWorkCommitted {\n        finalize_syscall: false,\n    }"),
+            "a timer tick finalizes no syscall"
         );
         let route = SPLIT
             .split("fn try_split_timer_into_frame(")
@@ -142556,10 +142682,13 @@ mod u9tm_proof_gate {
                 "{name} bridge must skip the broad arm on exactly its enumerated committed \
                  dispositions: `{arms}`"
             );
+            // 199G-C4 §2: TWO declaration sites per bridge now — the timer route and the NR 1
+            // route — and no more. Each is a route reporting its own outcome; neither infers it
+            // from the stash, which is the property this count exists to protect.
             assert_eq!(
                 src.matches("post_work_committed = true;").count(),
-                1,
-                "{name} bridge: exactly one place may declare post-work committed"
+                2,
+                "{name} bridge: exactly the timer and NR 1 routes may declare post-work committed"
             );
             if name == "shared" {
                 assert_eq!(
@@ -145348,5 +145477,2608 @@ mod stage199d_wa3c2_ownership_wiring {
             state.with_ipc_state_mut(|ipc| ipc.clear_endpoint_waiters_for_identity(ident(2, 9)));
             assert_eq!(occupied(state), 0, "and the tree quiesces to zero");
         });
+    }
+}
+
+/// 199G-C §2/§6 — the exact rank-6 transfer-pin acquire owner, and the one pin policy shared by
+/// the broad and split envelope stashes.
+mod stage199gc_transfer_pin_owner {
+    use super::*;
+    use crate::kernel::boot::{TransferPinRefusal, TransferPinToken};
+    use crate::kernel::capabilities::CapObject;
+    use crate::kernel::vm::PhysAddr;
+
+    fn pin_of(state: &KernelState, id: u64) -> u32 {
+        state.with_memory_state(|m| {
+            m.memory_objects
+                .iter()
+                .flatten()
+                .find(|e| e.id == id)
+                .map(|e| e.pin_refcount)
+                .expect("the object exists")
+        })
+    }
+
+    /// A MemoryObject acquires exactly one pin, and the token names that exact object.
+    #[test]
+    fn acquire_increments_exactly_once_and_mints_the_release_authority() {
+        let mut state = Bootstrap::init().expect("init");
+        let (id, _cap) = state
+            .create_memory_object(PhysAddr(0x20_0000))
+            .expect("memory object");
+        let object = CapObject::MemoryObject { id };
+        let before = pin_of(&state, id);
+        let token = state
+            .with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(m, object))
+            .expect("a live object is pinnable");
+        assert_eq!(token.object(), object, "the token names the pinned object");
+        assert_eq!(pin_of(&state, id), before + 1, "exactly one pin");
+        // And the token-driven release is the exact inverse.
+        state.with_memory_state_mut(|m| KernelState::release_transfer_pin_locked(m, token));
+        assert_eq!(pin_of(&state, id), before, "the pair balances to zero");
+    }
+
+    /// A DmaRegion is the other pinnable class, and it is pinned by its object id.
+    #[test]
+    fn a_dma_region_is_pinnable_by_id() {
+        let mut state = Bootstrap::init().expect("init");
+        let (id, _cap) = state
+            .create_memory_object(PhysAddr(0x21_0000))
+            .expect("memory object");
+        let object = CapObject::DmaRegion {
+            id,
+            offset: 0x1000,
+            len: 0x1000,
+        };
+        let token = state
+            .with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(m, object))
+            .expect("a DmaRegion over a live object is pinnable");
+        assert_eq!(pin_of(&state, id), 1, "the pin lands on the backing object");
+        state.with_memory_state_mut(|m| KernelState::release_transfer_pin_locked(m, token));
+        assert_eq!(pin_of(&state, id), 0);
+    }
+
+    /// Every OTHER capability class is not pinnable, and says so rather than silently succeeding.
+    /// This is the §1 finding: the pin is not a property of "has a transfer cap".
+    #[test]
+    fn non_pinnable_classes_refuse_without_mutation() {
+        let mut state = Bootstrap::init().expect("init");
+        for object in [
+            CapObject::Endpoint {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Notification {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Reply {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Kernel,
+        ] {
+            assert_eq!(
+                state
+                    .with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(m, object)),
+                Err(TransferPinRefusal::NotPinnable),
+                "{object:?} carries no pin_refcount"
+            );
+        }
+    }
+
+    /// A stale object id — one no live memory object carries — refuses before any mutation.
+    #[test]
+    fn a_stale_object_refuses() {
+        let mut state = Bootstrap::init().expect("init");
+        assert_eq!(
+            state.with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(
+                m,
+                CapObject::MemoryObject { id: 0xDEAD_BEEF }
+            )),
+            Err(TransferPinRefusal::Stale)
+        );
+    }
+
+    /// Overflow refuses BEFORE the store, leaving the counter untouched. The broad `+1`
+    /// saturates here, which would hand back a pin the matching `-1` then under-drops.
+    #[test]
+    fn overflow_refuses_before_mutation() {
+        let mut state = Bootstrap::init().expect("init");
+        let (id, _cap) = state
+            .create_memory_object(PhysAddr(0x22_0000))
+            .expect("memory object");
+        let object = CapObject::MemoryObject { id };
+        state.with_memory_state_mut(|m| {
+            let slot = m
+                .memory_objects
+                .iter()
+                .position(|e| e.is_some_and(|o| o.id == id))
+                .expect("slot");
+            m.memory_objects[slot].as_mut().expect("obj").pin_refcount = u32::MAX;
+        });
+        assert_eq!(
+            state.with_memory_state_mut(|m| KernelState::acquire_transfer_pin_locked(m, object)),
+            Err(TransferPinRefusal::Overflow)
+        );
+        assert_eq!(
+            pin_of(&state, id),
+            u32::MAX,
+            "a refused acquire leaves the counter exactly as it was"
+        );
+        // The broad path's saturating `+1` is what this diverges from, deliberately.
+        state.adjust_memory_object_pin_refcount(object, 1);
+        assert_eq!(pin_of(&state, id), u32::MAX, "the broad path saturates");
+    }
+
+    /// THE pin policy: an envelope owes a pin iff it carries a shared-region descriptor.
+    #[test]
+    fn the_pin_policy_is_the_shared_region_descriptor_not_the_transfer_cap() {
+        use crate::kernel::boot::TransferSharedRegion;
+        assert!(!KernelState::transfer_envelope_owes_pin(None));
+        assert!(KernelState::transfer_envelope_owes_pin(Some(
+            TransferSharedRegion { offset: 0, len: 8 }
+        )));
+    }
+
+    /// One policy, read by every stash and every release — broad and split alike.
+    #[test]
+    fn every_stash_and_release_reads_the_one_policy() {
+        const TRANSFER_SRC: &str = include_str!("transfer_state.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const MEM_SRC: &str = include_str!("memory_lifecycle_state.rs");
+        // Defined once.
+        assert_eq!(
+            MEM_SRC
+                .matches("pub(crate) const fn transfer_envelope_owes_pin")
+                .count(),
+            1
+        );
+        // The broad stash and the broad release both call it, and neither keeps its own spelling.
+        assert_eq!(
+            TRANSFER_SRC.matches("transfer_envelope_owes_pin(").count(),
+            2,
+            "the broad stash and the broad release each ask the policy exactly once"
+        );
+        assert!(
+            !TRANSFER_SRC.contains("if shared_region.is_some() {")
+                && !TRANSFER_SRC.contains("if envelope.shared_region.is_some() {"),
+            "no second spelling of the policy survives in the broad envelope owner"
+        );
+        // The split release reports its pin through the same policy.
+        assert!(
+            RUNTIME_SRC.contains("KernelState::transfer_envelope_owes_pin(envelope.shared_region)"),
+            "the split release asks the same policy"
+        );
+        // Exactly one acquire owner and one token-release owner.
+        assert_eq!(
+            MEM_SRC
+                .matches("pub(crate) fn acquire_transfer_pin_locked")
+                .count(),
+            1
+        );
+        assert_eq!(
+            RUNTIME_SRC.matches("fn sr_acquire_pin_split").count(),
+            1,
+            "one rank-6 acquire seam"
+        );
+    }
+
+    /// The acquire performs no forbidden rank-6 work — the AI_AGENT_RULES §14.4 boundary is
+    /// stated as a property of the source, not an assertion in prose.
+    #[test]
+    fn the_acquire_owner_touches_only_the_pin_counter() {
+        const MEM_SRC: &str = include_str!("memory_lifecycle_state.rs");
+        let body = MEM_SRC
+            .split("pub(crate) fn acquire_transfer_pin_locked")
+            .nth(1)
+            .and_then(|s| {
+                s.split(
+                    "
+    /// ",
+                )
+                .next()
+            })
+            .expect("the acquire body");
+        for forbidden in [
+            "map_page",
+            "unmap",
+            "shootdown",
+            "flush_tlb",
+            "invlpg",
+            "alloc_frame",
+            "free_frame",
+            "reclaim",
+            "page_table",
+            "with_vm",
+            "with_scheduler",
+            "with_ipc",
+            "with_task",
+            "user_spaces",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the rank-6 acquire must not reach `{forbidden}`"
+            );
+        }
+        // What it DOES touch: the pin counter, checked.
+        assert!(body.contains("pin_refcount"));
+        assert!(
+            body.contains("checked_add(1)"),
+            "the increment must be checked, not saturating"
+        );
+    }
+
+    /// A `TransferPinToken` cannot be fabricated: its field is private, so the only way to hold
+    /// one is to have actually acquired a pin.
+    #[test]
+    fn the_token_is_unforgeable() {
+        const MEM_SRC: &str = include_str!("memory_lifecycle_state.rs");
+        let decl = MEM_SRC
+            .split("pub(crate) struct TransferPinToken {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("the token declaration");
+        assert!(
+            !decl.contains("pub"),
+            "every field must be private so the token cannot be constructed elsewhere"
+        );
+        let _assert_copy: fn(TransferPinToken) -> TransferPinToken = |t| t;
+    }
+}
+
+/// 199G-C2 §1 — Synchronous endpoints are mechanically PRODUCTION-UNREACHABLE.
+///
+/// This is a source-recomputed negative guard, not a claim about behaviour. It fails the moment a
+/// production constructor, mutation or restore path can put an endpoint into
+/// `EndpointMode::Synchronous`, which is the precondition the NR1 pre-lock route needs before its
+/// cooperative-handoff branch can be treated as impossible rather than serviced.
+mod stage199gc2_synchronous_is_production_unreachable {
+    const IPC: &str = include_str!("../ipc.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const TESTS: &str = include_str!("tests.rs");
+
+    /// Every source file that could name the mode, minus the test corpora.
+    fn production_sources() -> alloc::vec::Vec<(&'static str, &'static str)> {
+        alloc::vec![
+            ("kernel/ipc.rs", IPC),
+            ("kernel/boot/ipc_state.rs", IPC_STATE),
+            ("kernel/syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+            (
+                "kernel/syscall/process.rs",
+                include_str!("../syscall/process.rs")
+            ),
+            ("kernel/boot/exec_state.rs", include_str!("exec_state.rs")),
+            (
+                "kernel/boot/orchestrator_state.rs",
+                include_str!("orchestrator_state.rs")
+            ),
+            (
+                "kernel/boot/bootstrap_state.rs",
+                include_str!("bootstrap_state.rs")
+            ),
+            (
+                "kernel/boot/restart_state.rs",
+                include_str!("restart_state.rs")
+            ),
+            ("runtime.rs", include_str!("../../runtime.rs")),
+        ]
+    }
+
+    /// (1) The mode field is private and has no setter: an endpoint's mode is fixed at
+    /// construction and cannot be mutated or restored into `Synchronous` later.
+    #[test]
+    fn the_mode_is_immutable_after_construction() {
+        let decl = IPC
+            .split("pub struct Endpoint {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("the Endpoint declaration");
+        assert!(
+            decl.contains("mode: EndpointMode") && !decl.contains("pub mode"),
+            "the mode field must stay private"
+        );
+        for setter in ["fn set_mode", ".mode =", "mode: &mut EndpointMode"] {
+            assert!(
+                !IPC.contains(setter),
+                "no mode mutation may exist: found `{setter}`"
+            );
+        }
+        // And no deserializer / restore constructor exists for Endpoint.
+        for ctor in [
+            "impl Deserialize for Endpoint",
+            "fn from_bytes",
+            "fn decode_endpoint",
+        ] {
+            assert!(
+                !IPC.contains(ctor),
+                "no restore path may reconstruct an Endpoint: `{ctor}`"
+            );
+        }
+    }
+
+    /// (2) `Endpoint::new_with_mode` — the ONLY way to choose a mode — has exactly one caller in
+    /// the whole tree, and it is `create_endpoint_with_mode`.
+    #[test]
+    fn the_only_mode_choosing_constructor_has_one_caller() {
+        let callers: usize = production_sources()
+            .iter()
+            .map(|(_, src)| src.matches("Endpoint::new_with_mode(").count())
+            .sum();
+        assert_eq!(
+            callers, 1,
+            "exactly one production caller of the mode-choosing constructor"
+        );
+        assert!(
+            IPC_STATE.contains("Endpoint::new_with_mode(max_depth, mode)"),
+            "and it is `create_endpoint_with_mode`, which forwards its caller's mode"
+        );
+    }
+
+    /// (3) THE GUARD. No production source may construct a `Synchronous` endpoint. Every
+    /// occurrence of the variant in production must be a comparison, never a constructor
+    /// argument.
+    #[test]
+    fn no_production_source_constructs_a_synchronous_endpoint() {
+        for (name, src) in production_sources() {
+            assert!(
+                !src.contains("create_endpoint_with_mode(") || name == "kernel/boot/ipc_state.rs",
+                "{name}: only the endpoint owner may call the mode-choosing constructor"
+            );
+            for forbidden in [
+                "create_endpoint_with_mode(max_depth, EndpointMode::Synchronous)",
+                "new_with_mode(max_depth, EndpointMode::Synchronous)",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "{name}: constructs Synchronous: {forbidden}"
+                );
+            }
+        }
+        // The one production call of the mode-choosing constructor passes Buffered.
+        assert!(
+            IPC_STATE.contains("self.create_endpoint_with_mode(max_depth, EndpointMode::Buffered)"),
+            "the production endpoint constructor is Buffered"
+        );
+        // Belt and braces: in production sources, `EndpointMode::Synchronous` may appear only in
+        // comparisons (`== `, `!= `, or a match arm), never as a constructor argument.
+        for (name, src) in production_sources() {
+            for (i, _) in src.match_indices("EndpointMode::Synchronous") {
+                let before = &src[i.saturating_sub(40)..i];
+                assert!(
+                    before.contains("==")
+                        || before.contains("!=")
+                        || before.trim_end().ends_with('>')
+                        || before.contains("Some(")
+                        || before.trim_end().ends_with("=>")
+                        || before.trim_end().ends_with('|'),
+                    "{name}: `EndpointMode::Synchronous` reached in a non-comparison position:                      ...{before}"
+                );
+            }
+        }
+    }
+
+    /// (4) Every `Synchronous` constructor in the tree is test-only, and the test corpus is where
+    /// they all live — so the mode's behaviour stays covered without being reachable in production.
+    #[test]
+    fn every_synchronous_constructor_is_test_only() {
+        let in_tests = TESTS
+            .matches("create_endpoint_with_mode(1, EndpointMode::Synchronous)")
+            .count();
+        assert!(
+            in_tests > 0,
+            "the test corpus must keep exercising Synchronous behaviour"
+        );
+    }
+}
+
+/// 199D-KR §1 — the restart-control KERNEL-cap IPC path is PRODUCTION-UNREACHABLE.
+///
+/// `ipc_send_routed` reaches `handle_restart_control_kernel_ipc` only for a capability whose
+/// object is `CapObject::Kernel` AND which carries `CapRights::SEND`. This guard recomputes, from
+/// source, that no production build can mint, delegate or hold such a capability — so the branch
+/// cannot execute, and the typed kernel reply authority it would need has no production request to
+/// represent.
+///
+/// It fails the moment a production Kernel-capability minter appears, which is exactly when that
+/// conclusion would stop being true.
+mod stage199dkr_kernel_control_cap_is_production_unreachable {
+    const CAPS: &str = include_str!("../capabilities.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const INIT_CORE: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/core/mod.rs"
+    );
+
+    /// Text of a file with its `#[cfg(test)] mod tests { .. }` tail removed, so "production
+    /// source" means what a non-test build actually compiles.
+    fn production_prefix(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// (1) The branch's precondition is a Kernel object WITH the SEND right — stated here so the
+    /// guard is pinned to the real gate rather than to the object class alone.
+    #[test]
+    fn the_branch_requires_a_kernel_object_with_send() {
+        let routed = IPC_STATE
+            .split("fn ipc_send_routed")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("ipc_send_routed");
+        let send_gate = routed
+            .find("if !capability.has_right(CapRights::SEND)")
+            .expect("the SEND gate");
+        let kernel_branch = routed
+            .find("if capability.object == CapObject::Kernel")
+            .expect("the Kernel branch");
+        assert!(
+            send_gate < kernel_branch,
+            "the SEND right is required before the Kernel branch is reachable"
+        );
+    }
+
+    /// (2) `src/kernel/capabilities.rs` mints Kernel capabilities only inside its test module.
+    #[test]
+    fn the_capability_module_mints_kernel_caps_only_in_tests() {
+        let production = production_prefix(CAPS);
+        assert_eq!(
+            production.matches("CapObject::Kernel").count(),
+            0,
+            "no production code in capabilities.rs may name the Kernel object"
+        );
+        assert!(
+            CAPS.matches("CapObject::Kernel").count() > 0,
+            "the test corpus still exercises Kernel capabilities"
+        );
+    }
+
+    /// (3) THE GUARD. The only `CapRights::SEND` Kernel mint in the tree — the delegation that
+    /// would give the process manager restart-control authority — is `#[cfg(test)]`, and so is its
+    /// only caller. A production build therefore delegates no such capability.
+    #[test]
+    fn the_only_kernel_send_delegation_is_test_gated() {
+        let at = INIT_CORE
+            .find("fn delegate_process_manager_restart_control_cap")
+            .expect("the delegation");
+        let before = &INIT_CORE[at.saturating_sub(120)..at];
+        assert!(
+            before.contains("#[cfg(test)]"),
+            "the Kernel-SEND delegation must be test-gated"
+        );
+        // Exactly one definition and exactly one call site.
+        assert_eq!(
+            INIT_CORE
+                .matches("delegate_process_manager_restart_control_cap")
+                .count(),
+            2,
+            "one definition, one caller"
+        );
+        // And that caller is itself test-gated.
+        let call = INIT_CORE
+            .rfind("Self::delegate_process_manager_restart_control_cap")
+            .expect("the call site");
+        let enclosing = INIT_CORE[..call]
+            .rfind("    pub fn ")
+            .expect("the enclosing function");
+        let head = &INIT_CORE[enclosing.saturating_sub(60)..enclosing];
+        assert!(
+            head.contains("#[cfg(test)]"),
+            "the caller of the Kernel-SEND delegation must itself be test-gated"
+        );
+    }
+
+    /// (4) No OTHER production source anywhere mints a Kernel capability.
+    #[test]
+    fn no_production_source_mints_a_kernel_capability() {
+        for (name, src) in [
+            ("kernel/capabilities.rs", CAPS),
+            ("kernel/boot/ipc_state.rs", IPC_STATE),
+            (
+                "kernel/boot/thread_state.rs",
+                include_str!("thread_state.rs"),
+            ),
+            ("kernel/boot/exec_state.rs", include_str!("exec_state.rs")),
+            (
+                "kernel/boot/bootstrap_state.rs",
+                include_str!("bootstrap_state.rs"),
+            ),
+            (
+                "kernel/boot/orchestrator_state.rs",
+                include_str!("orchestrator_state.rs"),
+            ),
+            (
+                "kernel/boot/capability_state.rs",
+                include_str!("capability_state.rs"),
+            ),
+            (
+                "kernel/syscall/process.rs",
+                include_str!("../syscall/process.rs"),
+            ),
+            ("kernel/syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+        ] {
+            let production = production_prefix(src);
+            assert!(
+                !production.contains("Capability::new(CapObject::Kernel"),
+                "{name}: production source must not mint a Kernel capability"
+            );
+        }
+        // The init crate's only such mint is the test-gated delegation asserted above.
+        assert_eq!(
+            INIT_CORE
+                .matches("Capability::new(\n            CapObject::Kernel,")
+                .count()
+                + INIT_CORE
+                    .matches("Capability::new(CapObject::Kernel")
+                    .count(),
+            1,
+            "the init crate holds exactly one Kernel mint, and it is the test-gated delegation"
+        );
+    }
+
+    /// (5) Every remaining production mention of the Kernel object is a REJECT or DENY arm — a
+    /// fork-inheritance denial and an endpoint-resolution rejection — never a construction.
+    #[test]
+    fn remaining_production_mentions_are_refusals() {
+        let thread_state = include_str!("thread_state.rs");
+        assert!(
+            production_prefix(thread_state).contains("CapObject::Kernel"),
+            "fork inheritance still names the class"
+        );
+        // In the fork policy it sits in the `=> false` (do not inherit) group.
+        let policy = thread_state
+            .split("fn fork_should_inherit_capability")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("the fork policy");
+        let kernel_at = policy.find("CapObject::Kernel").expect("the arm");
+        assert!(
+            policy[kernel_at..].contains("=> false"),
+            "a Kernel capability is never inherited across fork"
+        );
+    }
+}
+
+/// 199G-C4 §2/§6 — the off-lock transfer-envelope stash, and the pin balance it must keep on
+/// every exit.
+mod stage199gc4_split_envelope_stash {
+    use super::*;
+    use crate::kernel::boot::TransferSharedRegion;
+    use crate::kernel::capabilities::{CapId, CapObject};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::vm::PhysAddr;
+    use crate::runtime::{SharedKernel, TransferStashRefusal};
+
+    struct Fx {
+        k: SharedKernel,
+        endpoint: CapObject,
+        mem_id: u64,
+        mem_cap: CapId,
+        ep_send_cap: CapId,
+    }
+
+    fn fixture() -> Fx {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("sender");
+        let (eidx, ep_send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = CapObject::Endpoint {
+            index: eidx,
+            generation: state.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]),
+        };
+        let (mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0x30_0000))
+            .expect("memory object");
+        // Give the sender the caps in its own cspace.
+        let mem_cap = state
+            .grant_capability_task_to_task(0, mem_cap, 1)
+            .expect("grant mem");
+        let ep_send_cap = state
+            .grant_capability_task_to_task(0, ep_send_cap, 1)
+            .expect("grant ep");
+        Fx {
+            k: SharedKernel::new(state),
+            endpoint,
+            mem_id,
+            mem_cap,
+            ep_send_cap,
+        }
+    }
+
+    fn pin_of(fx: &Fx) -> u32 {
+        fx.k.with(|s| {
+            s.with_memory_state(|m| {
+                m.memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|e| e.id == fx.mem_id)
+                    .map(|e| e.pin_refcount)
+                    .expect("object")
+            })
+        })
+    }
+
+    fn envelopes_live(fx: &Fx) -> usize {
+        fx.k.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.transfer_envelopes
+                    .iter()
+                    .filter(|e| e.is_some())
+                    .count()
+            })
+        })
+    }
+
+    /// A NON-shared envelope — an ordinary endpoint capability — publishes with NO pin.
+    #[test]
+    fn an_ordinary_cap_envelope_owes_no_pin() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        let stashed = fx
+            .k
+            .stash_transfer_envelope_split(ThreadId(1), fx.ep_send_cap, fx.endpoint, None, None)
+            .expect("an ordinary cap stashes");
+        assert!(stashed.pin.is_none(), "an ordinary cap owes no pin");
+        assert_eq!(pin_of(&fx), before, "and takes none");
+        assert_eq!(envelopes_live(&fx), 1);
+    }
+
+    /// A MemoryObject cap sent WITHOUT a shared-region descriptor — the inline-transfer class —
+    /// also owes no pin. This is the §1 finding: the pin is the descriptor's, not the object's.
+    #[test]
+    fn an_inline_memory_object_transfer_owes_no_pin() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        let stashed =
+            fx.k.stash_transfer_envelope_split(ThreadId(1), fx.mem_cap, fx.endpoint, None, None)
+                .expect("an inline MemoryObject transfer stashes");
+        assert!(
+            stashed.pin.is_none(),
+            "a MemoryObject cap with no descriptor owes no pin"
+        );
+        assert_eq!(pin_of(&fx), before);
+    }
+
+    /// A shared-region grant acquires EXACTLY one pin, and the token names the object.
+    #[test]
+    fn a_shared_region_grant_acquires_exactly_one_pin() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        let stashed =
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                fx.mem_cap,
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion { offset: 0, len: 8 }),
+            )
+            .expect("a shared-region grant stashes");
+        let token = stashed.pin.expect("it owes a pin");
+        assert_eq!(token.object(), CapObject::MemoryObject { id: fx.mem_id });
+        assert_eq!(pin_of(&fx), before + 1, "exactly one");
+        // And the settlement releases exactly one.
+        fx.k.sr_release_pin_token_split(token);
+        assert_eq!(pin_of(&fx), before, "balanced");
+    }
+
+    /// A stale source capability refuses before anything is pinned or published.
+    #[test]
+    fn a_stale_source_cap_refuses_without_mutation() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        assert_eq!(
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                CapId(0xDEAD),
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion { offset: 0, len: 8 })
+            ),
+            Err(TransferStashRefusal::SourceCapUnresolved)
+        );
+        assert_eq!(pin_of(&fx), before, "nothing pinned");
+        assert_eq!(envelopes_live(&fx), 0, "nothing published");
+    }
+
+    /// An inadmissible descriptor refuses BEFORE the pin is taken — the bound policy runs first.
+    #[test]
+    fn an_inadmissible_descriptor_refuses_before_the_pin() {
+        let fx = fixture();
+        let before = pin_of(&fx);
+        // Zero length is refused by the shared bound policy.
+        assert_eq!(
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                fx.mem_cap,
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion { offset: 0, len: 0 })
+            ),
+            Err(TransferStashRefusal::DescriptorRejected)
+        );
+        assert_eq!(pin_of(&fx), before, "the pin is never taken");
+        assert_eq!(envelopes_live(&fx), 0);
+        // A descriptor larger than the object is refused the same way.
+        assert_eq!(
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                fx.mem_cap,
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion {
+                    offset: 0,
+                    len: u64::MAX
+                })
+            ),
+            Err(TransferStashRefusal::DescriptorRejected)
+        );
+        assert_eq!(pin_of(&fx), before);
+    }
+
+    /// A REFUSED publication releases the pin exactly once: filling the envelope table and then
+    /// attempting a shared-region stash must leave the refcount exactly as it was.
+    #[test]
+    fn a_refused_publication_releases_the_pin_exactly_once() {
+        let fx = fixture();
+        // Fill every envelope slot with pin-free ordinary-cap envelopes.
+        let mut filled = 0usize;
+        while fx
+            .k
+            .stash_transfer_envelope_split(ThreadId(1), fx.ep_send_cap, fx.endpoint, None, None)
+            .is_ok()
+        {
+            filled += 1;
+            assert!(
+                filled <= crate::kernel::boot::MAX_TRANSFER_ENVELOPES + 1,
+                "bounded"
+            );
+        }
+        assert_eq!(filled, crate::kernel::boot::MAX_TRANSFER_ENVELOPES);
+        let before = pin_of(&fx);
+        assert_eq!(
+            fx.k.stash_transfer_envelope_split(
+                ThreadId(1),
+                fx.mem_cap,
+                fx.endpoint,
+                None,
+                Some(TransferSharedRegion { offset: 0, len: 8 })
+            ),
+            Err(TransferStashRefusal::TableFull)
+        );
+        assert_eq!(
+            pin_of(&fx),
+            before,
+            "a refused publication leaves the pin balance untouched"
+        );
+    }
+
+    /// The broad and split stashes read the SAME descriptor policy and the SAME pin policy.
+    #[test]
+    fn both_stashes_share_one_policy() {
+        const TRANSFER_SRC: &str = include_str!("transfer_state.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        assert_eq!(
+            TRANSFER_SRC
+                .matches("pub(crate) fn transfer_shared_region_bounds_ok")
+                .count(),
+            1,
+            "the descriptor policy is defined once"
+        );
+        assert!(
+            TRANSFER_SRC.contains("transfer_shared_region_bounds_ok(capability.object, region,"),
+            "the broad stash asks it"
+        );
+        assert!(
+            RUNTIME_SRC.contains("crate::kernel::boot::transfer_shared_region_bounds_ok("),
+            "the split stash asks the same one"
+        );
+        assert!(
+            RUNTIME_SRC.contains("KernelState::transfer_envelope_owes_pin(shared_region)"),
+            "and the split stash asks the one pin policy"
+        );
+    }
+}
+
+/// 199G-C4 §3 — the authoritative rank-3 IPC mutation owners.
+///
+/// The directive requires that each policy have exactly ONE implementation, with broad and
+/// split entry points supplying only different acquisition wrappers over the same core owner.
+/// These tests hold the endpoint-only enqueue policy to that: structurally (one body, two thin
+/// wrappers) and behaviourally (identical result and identical resulting queue state for the
+/// same input on two identically-built kernels).
+#[cfg(test)]
+mod stage199gc4_ipc_mutation_owners {
+    use super::*;
+    use crate::kernel::boot::{IpcEndpointSendResult, IpcEndpointSplitRejectReason};
+    use crate::kernel::ipc::Message;
+    use crate::runtime::SharedKernel;
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn plain_msg(word: u8) -> Message {
+        Message::new(1, &[word]).expect("plain message")
+    }
+
+    /// Two kernels built by the same recipe, so a broad run and a split run are comparable.
+    fn fixture() -> (SharedKernel, usize) {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("sender");
+        let (eidx, _send, _recv) = state.create_endpoint(4).expect("endpoint");
+        (SharedKernel::new(state), eidx)
+    }
+
+    /// Non-destructive FIFO snapshot: drain the endpoint, recording word 0 in order, then
+    /// refill it in the same order so the endpoint is left exactly as it was found.
+    fn queue_words(k: &SharedKernel, eidx: usize) -> alloc::vec::Vec<u8> {
+        k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                let mut out = alloc::vec::Vec::new();
+                let Some(endpoint) = ipc.endpoints[eidx].as_mut() else {
+                    return out;
+                };
+                let mut drained = alloc::vec::Vec::new();
+                while let Some(msg) = endpoint.recv() {
+                    out.push(msg.payload[0]);
+                    drained.push(msg);
+                }
+                for msg in drained {
+                    endpoint.send(msg).expect("refill what we drained");
+                }
+                out
+            })
+        })
+    }
+
+    #[test]
+    fn the_endpoint_enqueue_policy_has_exactly_one_implementation() {
+        // The policy body lives in exactly one function.
+        assert_eq!(
+            IPC_SRC
+                .matches("fn ipc_try_send_queued_plain_endpoint_only_locked(")
+                .count(),
+            1,
+            "one and only one endpoint-only enqueue owner"
+        );
+
+        // The broad entry is a thin acquisition wrapper: it delegates, and it no longer carries
+        // the classification/refusal decisions itself.
+        let broad_start = IPC_SRC
+            .find("pub(crate) fn ipc_try_send_queued_plain_endpoint_only(")
+            .expect("broad entry");
+        let broad_end = IPC_SRC[broad_start..]
+            .find("\n    }\n")
+            .expect("broad entry body ends")
+            + broad_start;
+        let broad_body = &IPC_SRC[broad_start..broad_end];
+        assert!(
+            broad_body.contains("self.with_ipc_state_mut(|ipc| {")
+                || broad_body.contains("self.with_ipc_state_mut(|ipc| Self::"),
+            "the broad entry still owns its rank-3 acquisition"
+        );
+        assert!(
+            broad_body.contains("Self::ipc_try_send_queued_plain_endpoint_only_locked("),
+            "and delegates the policy to the one owner"
+        );
+        for decision in [
+            "IpcEndpointSplitRejectReason::EndpointIndexOutOfRange",
+            "IpcEndpointSplitRejectReason::SenderWaiterPresent",
+            "IpcEndpointSplitRejectReason::TransferOrReplyCapMessage",
+            "IpcEndpointSplitRejectReason::EndpointMissing",
+            "IpcEndpointSplitRejectReason::NonBufferedEndpoint",
+            "IpcEndpointSplitRejectReason::EndpointQueueFull",
+            "endpoint.send(msg)",
+        ] {
+            assert!(
+                !broad_body.contains(decision),
+                "the broad wrapper must not re-implement `{decision}` — it belongs to the owner"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_entry_is_the_same_owner_under_a_different_acquisition() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn ipc_try_send_queued_plain_endpoint_only_split(")
+            .expect("split entry exists");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("body ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+        assert!(
+            body.contains("self.with_ipc_split_mut(|ipc| {"),
+            "the split entry acquires rank 3 through the split seam"
+        );
+        assert!(
+            body.contains("KernelState::ipc_try_send_queued_plain_endpoint_only_locked("),
+            "and calls the same policy owner as the broad entry"
+        );
+        // Exactly one lock acquisition: nothing else may be taken inside this entry.
+        assert_eq!(
+            body.matches("with_ipc_split_mut").count(),
+            1,
+            "one bounded rank-3 acquisition"
+        );
+        for forbidden in [
+            "with_task_split_mut",
+            "with_memory_split_mut",
+            "with_scheduler_split_mut",
+            "with_capability_split_mut",
+            "self.with(",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the split enqueue entry must take rank 3 and nothing else (saw `{forbidden}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn broad_and_split_enqueue_agree_on_the_success_path_and_on_queue_state() {
+        let (broad_k, broad_e) = fixture();
+        let (split_k, split_e) = fixture();
+        assert_eq!(broad_e, split_e, "same fixture recipe, same endpoint index");
+
+        for word in [11_u8, 22, 33] {
+            let via_broad = broad_k
+                .with(|s| s.ipc_try_send_queued_plain_endpoint_only(broad_e, plain_msg(word)));
+            let via_split =
+                split_k.ipc_try_send_queued_plain_endpoint_only_split(split_e, plain_msg(word));
+            assert_eq!(via_broad, IpcEndpointSendResult::Enqueued);
+            assert_eq!(via_broad, via_split, "one policy, one outcome");
+        }
+
+        // FIFO order and framing are the endpoint primitive's, identical on both routes.
+        assert_eq!(queue_words(&broad_k, broad_e), [11_u8, 22, 33]);
+        assert_eq!(
+            queue_words(&broad_k, broad_e),
+            queue_words(&split_k, split_e),
+            "identical resulting queue state"
+        );
+    }
+
+    #[test]
+    fn broad_and_split_agree_on_the_queue_full_refusal_without_mutating() {
+        let (broad_k, broad_e) = fixture();
+        let (split_k, split_e) = fixture();
+        for word in 0..4_u8 {
+            assert_eq!(
+                broad_k
+                    .with(|s| s.ipc_try_send_queued_plain_endpoint_only(broad_e, plain_msg(word))),
+                IpcEndpointSendResult::Enqueued
+            );
+            assert_eq!(
+                split_k.ipc_try_send_queued_plain_endpoint_only_split(split_e, plain_msg(word)),
+                IpcEndpointSendResult::Enqueued
+            );
+        }
+        let before_broad = queue_words(&broad_k, broad_e);
+        let before_split = queue_words(&split_k, split_e);
+
+        let full =
+            IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::EndpointQueueFull);
+        assert_eq!(
+            broad_k.with(|s| s.ipc_try_send_queued_plain_endpoint_only(broad_e, plain_msg(99))),
+            full
+        );
+        assert_eq!(
+            split_k.ipc_try_send_queued_plain_endpoint_only_split(split_e, plain_msg(99)),
+            full
+        );
+        assert_eq!(
+            queue_words(&broad_k, broad_e),
+            before_broad,
+            "refusal does not mutate"
+        );
+        assert_eq!(
+            queue_words(&split_k, split_e),
+            before_split,
+            "refusal does not mutate"
+        );
+    }
+
+    #[test]
+    fn broad_and_split_agree_on_the_structural_refusals() {
+        let (broad_k, broad_e) = fixture();
+        let (split_k, split_e) = fixture();
+
+        let oor = IpcEndpointSendResult::Ineligible(
+            IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+        );
+        let bad = broad_k.with(|s| s.with_ipc_state(|ipc| ipc.endpoints.len()));
+        assert_eq!(
+            broad_k.with(|s| s.ipc_try_send_queued_plain_endpoint_only(bad, plain_msg(1))),
+            oor
+        );
+        assert_eq!(
+            split_k.ipc_try_send_queued_plain_endpoint_only_split(bad, plain_msg(1)),
+            oor
+        );
+
+        // A reply-cap message is excluded on both routes, for the same reason, without enqueue.
+        let reply = Message::with_header(1, 0, Message::FLAG_REPLY_CAP, Some(9), b"r")
+            .expect("reply-cap message");
+        let excluded = IpcEndpointSendResult::Ineligible(
+            IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+        );
+        assert_eq!(
+            broad_k.with(|s| s.ipc_try_send_queued_plain_endpoint_only(broad_e, reply)),
+            excluded
+        );
+        assert_eq!(
+            split_k.ipc_try_send_queued_plain_endpoint_only_split(split_e, reply),
+            excluded
+        );
+        assert!(queue_words(&broad_k, broad_e).is_empty());
+        assert!(queue_words(&split_k, split_e).is_empty());
+    }
+}
+
+/// 199G-C4 §3 — THE plain blocked-waiter delivery policy, and its two gatherers.
+///
+/// The delivery decisions that need no lock — the receiver-visible projection, the payload
+/// length contract, the per-variant metadata contract, the meta encoding, the by-value payload
+/// capture and the choice of which user ranges must be proven writable — live in one plan
+/// owner. The broad producer and the off-lock producer differ only in how they gather the two
+/// facts that do need locks (the consumed blocked state and the waiter ASID) and in which seam
+/// they validate through. These tests hold that line from both ends.
+#[cfg(test)]
+mod stage199gc4_plain_delivery_policy {
+    use super::*;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{
+        blocked_waiter_plain_delivery_class_matches, plan_blocked_waiter_plain_delivery,
+    };
+    use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+    use crate::kernel::vm::Asid;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const USER_MEM_SRC: &str = include_str!("user_memory_state.rs");
+
+    fn v2_state(payload_len: usize) -> BlockedRecvState {
+        BlockedRecvState {
+            recv_cap: CapId(7),
+            payload_user_ptr: 0x4000,
+            payload_user_len: payload_len,
+            meta_user_ptr: 0x5000,
+            meta_user_len: 40,
+            recv_abi: RecvAbiVariant::RecvV2,
+        }
+    }
+
+    #[test]
+    fn the_class_predicate_admits_only_capability_free_messages() {
+        assert!(blocked_waiter_plain_delivery_class_matches(
+            &Message::new(3, b"plain").expect("msg")
+        ));
+        for flags in [
+            Message::FLAG_CAP_TRANSFER,
+            Message::FLAG_CAP_TRANSFER_PLAIN,
+            Message::FLAG_REPLY_CAP,
+        ] {
+            let carrying = Message::with_header(3, 0, flags, Some(11), b"x").expect("msg");
+            assert!(
+                !blocked_waiter_plain_delivery_class_matches(&carrying),
+                "a message carrying a cap under flags {flags:#x} is another class's"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_owner_names_exactly_the_ranges_the_snapshot_will_write() {
+        let msg = Message::new(3, b"hello").expect("msg");
+        let state = v2_state(64);
+        let plan = plan_blocked_waiter_plain_delivery(9, Asid(2), &state, 4, &msg).expect("plan");
+
+        // The payload range is the PROJECTED length, not the raw message length, and it is the
+        // same length the snapshot will copy.
+        assert_eq!(plan.writable.payload_ptr, state.payload_user_ptr);
+        assert_eq!(plan.writable.payload_len, plan.snapshot.payload_len);
+        assert_eq!(plan.snapshot.payload_user_ptr, state.payload_user_ptr);
+        // The meta range is the encoded meta length the drain writes, at the waiter's pointer.
+        assert_eq!(plan.writable.meta_ptr, state.meta_user_ptr);
+        assert_eq!(
+            plan.writable.meta_len,
+            crate::kernel::dispatch_post_work::DISPATCH_POST_WORK_META_LEN
+        );
+        assert_eq!(plan.snapshot.meta_user_ptr, state.meta_user_ptr);
+        // Identity is carried, never re-derived.
+        assert_eq!(plan.snapshot.waiter_tid, 9);
+        assert_eq!(plan.snapshot.waiter_asid, Asid(2));
+        assert_eq!(plan.snapshot.recv_abi, state.recv_abi);
+        assert_eq!(plan.snapshot.endpoint_idx, 4);
+        assert_eq!(plan.snapshot.sender_tid, 3);
+        assert_eq!(
+            plan.snapshot.wake_tid,
+            Some(crate::kernel::ipc::ThreadId(9))
+        );
+    }
+
+    #[test]
+    fn the_plan_owner_enforces_both_length_contracts() {
+        let msg = Message::new(3, b"0123456789").expect("msg");
+        // Payload buffer too small for the projected payload.
+        assert!(
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &v2_state(2), 4, &msg).is_err(),
+            "an undersized payload buffer is a real delivery error"
+        );
+
+        // recv-v2 waiter with an undersized metadata buffer.
+        let mut short_meta = v2_state(64);
+        short_meta.meta_user_len = 8;
+        assert!(
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &short_meta, 4, &msg).is_err(),
+            "a recv-v2 waiter must have room for the whole meta struct"
+        );
+
+        // A LegacyTimeout waiter carries no metadata buffer and must be delivered, not rejected.
+        let legacy = BlockedRecvState::legacy_timeout(CapId(7), 0x4000, 64);
+        let plan =
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &legacy, 4, &msg).expect("legacy plan");
+        assert_eq!(plan.snapshot.recv_abi, RecvAbiVariant::LegacyTimeout);
+        assert_eq!(plan.writable.meta_ptr, 0);
+
+        // ...but one that somehow carries a metadata buffer is refused: writing it would be a
+        // metadata write this variant promises never to perform.
+        let mut lying = legacy;
+        lying.meta_user_ptr = 0x5000;
+        assert!(
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &lying, 4, &msg).is_err(),
+            "a LegacyTimeout waiter must not name a metadata buffer"
+        );
+    }
+
+    #[test]
+    fn the_projection_is_applied_once_by_the_plan_owner() {
+        // The projected payload is what the snapshot carries, byte for byte.
+        let msg = Message::new(3, b"\x07\x00payload-bytes").expect("msg");
+        let projected = crate::kernel::syscall::ipc_recv_core::project_recv_delivery(&msg);
+        let plan =
+            plan_blocked_waiter_plain_delivery(9, Asid(2), &v2_state(64), 4, &msg).expect("plan");
+        assert_eq!(plan.snapshot.payload_len, projected.app_payload.len());
+        assert_eq!(
+            &plan.snapshot.payload[..plan.snapshot.payload_len],
+            projected.app_payload
+        );
+    }
+
+    #[test]
+    fn both_producers_call_the_one_plan_owner_and_neither_re_decides() {
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn plan_blocked_waiter_plain_delivery(")
+                .count(),
+            1,
+            "one plan owner"
+        );
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn blocked_waiter_plain_delivery_class_matches(")
+                .count(),
+            1,
+            "one class predicate"
+        );
+
+        // The broad producer is now a gatherer: it calls both owners and re-decides nothing.
+        let broad_start = SYSCALL_SRC
+            .find("pub(crate) fn produce_blocked_waiter_plain_delivery(")
+            .expect("broad producer");
+        let broad_end = SYSCALL_SRC[broad_start..]
+            .find("\n}\n")
+            .expect("broad producer ends")
+            + broad_start;
+        let broad = &SYSCALL_SRC[broad_start..broad_end];
+        assert!(broad.contains("blocked_waiter_plain_delivery_class_matches(msg)"));
+        assert!(broad.contains("plan_blocked_waiter_plain_delivery("));
+        for redecided in [
+            "encode_recv_v2_meta(",
+            "project_recv_delivery(",
+            "writes_recv_v2_meta()",
+            "BlockedWaiterPlainDeliverySnapshot {",
+        ] {
+            assert!(
+                !broad.contains(redecided),
+                "the broad gatherer must not re-decide `{redecided}`"
+            );
+        }
+
+        // The off-lock producer is the same shape.
+        let split_start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_plain_delivery_split(")
+            .expect("split producer");
+        let split_end = RUNTIME_SRC[split_start..]
+            .find("\n    }\n")
+            .expect("split producer ends")
+            + split_start;
+        let split = &RUNTIME_SRC[split_start..split_end];
+        assert!(split.contains("blocked_waiter_plain_delivery_class_matches(msg)"));
+        assert!(split.contains("plan_blocked_waiter_plain_delivery("));
+        for redecided in [
+            "encode_recv_v2_meta(",
+            "project_recv_delivery(",
+            "writes_recv_v2_meta()",
+            "BlockedWaiterPlainDeliverySnapshot {",
+        ] {
+            assert!(
+                !split.contains(redecided),
+                "the off-lock gatherer must not re-decide `{redecided}`"
+            );
+        }
+        // And it never forms a broad borrow.
+        for forbidden in ["self.with(", "&mut KernelState"] {
+            assert!(
+                !split.contains(forbidden),
+                "the off-lock producer must not reach for the broad lock (saw `{forbidden}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_producer_validates_the_planned_ranges_through_the_shared_page_walk() {
+        // One page-walk owner, used by both the broad validator and its off-lock mirror.
+        assert_eq!(
+            USER_MEM_SRC
+                .matches("pub(crate) fn walk_user_range_by_page(")
+                .count(),
+            1,
+            "one writable-range walk"
+        );
+        for validator in [
+            "pub(crate) fn validate_user_range_writable_for_asid(",
+            "pub(crate) fn validate_user_range_writable_for_asid_split(",
+        ] {
+            let start = USER_MEM_SRC.find(validator).expect(validator);
+            let end = USER_MEM_SRC[start..].find("\n    }\n").expect("body ends") + start;
+            assert!(
+                USER_MEM_SRC[start..end].contains("walk_user_range_by_page("),
+                "`{validator}` must use the one walk, not its own"
+            );
+        }
+
+        // The split producer validates exactly the two ranges the plan named — no more, no
+        // fewer, and never a range it computed itself.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_plain_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert_eq!(
+            split
+                .matches("validate_user_range_writable_for_asid_split(")
+                .count(),
+            2,
+            "exactly the payload range and the meta range"
+        );
+        assert!(split.contains("plan.writable.payload_ptr"));
+        assert!(split.contains("plan.writable.payload_len"));
+        assert!(split.contains("plan.writable.meta_ptr"));
+        assert!(split.contains("plan.writable.meta_len"));
+    }
+
+    #[test]
+    fn the_split_producer_takes_its_locks_in_rank_order_and_holds_none_across_another() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_plain_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+
+        // Rank 1 (current CPU) → rank 2 (blocked state + ASID) → rank 5 (validation).
+        let cpu = split.find("current_cpu_split_read()").expect("rank 1");
+        let task = split.find("with_task_tcbs_split_mut(").expect("rank 2");
+        let vm = split
+            .find("validate_user_range_writable_for_asid_split(")
+            .expect("rank 5");
+        assert!(cpu < task && task < vm, "acquisitions must ascend in rank");
+
+        // Exactly one rank-2 acquisition: the take and the ASID read are one step, so no
+        // holder can observe a waiter whose state is taken but whose ASID is unread.
+        assert_eq!(split.matches("with_task_tcbs_split_mut(").count(), 1);
+
+        // No rank-3 or rank-4 acquisition belongs to this producer at all.
+        for forbidden in [
+            "with_ipc_split_mut",
+            "with_capability_state_split_mut",
+            "resolve_capability_for_task_split",
+        ] {
+            assert!(
+                !split.contains(forbidden),
+                "a plain delivery touches no IPC or capability state (saw `{forbidden}`)"
+            );
+        }
+
+        // The class question is asked before any acquisition, so a foreign class is refused
+        // having touched nothing.
+        let class = split
+            .find("blocked_waiter_plain_delivery_class_matches(msg)")
+            .expect("class predicate");
+        assert!(
+            class < cpu,
+            "the class question must precede every acquisition"
+        );
+    }
+}
+
+/// 199G-C4 §3 — THE ordinary cap-transfer blocked-waiter delivery policy, and its two gatherers.
+///
+/// The ordinary-cap class differs from the plain one in a way that is easy to lose: the payload
+/// range must be validated BEFORE the transfer envelope is consumed and the metadata range
+/// after, so that a payload fault leaves the source capability recoverable. The plan is
+/// therefore two pieces, and these tests hold both the sharing and that ordering.
+#[cfg(test)]
+mod stage199gc4_ordinary_cap_delivery_policy {
+    use super::*;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{
+        OPCODE_SHARED_MEM, blocked_waiter_ordinary_cap_delivery_class_matches,
+        check_blocked_recv_meta_contract, plan_blocked_waiter_delivery_prelude,
+    };
+    use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn v2_state(payload_len: usize) -> BlockedRecvState {
+        BlockedRecvState {
+            recv_cap: CapId(7),
+            payload_user_ptr: 0x4000,
+            payload_user_len: payload_len,
+            meta_user_ptr: 0x5000,
+            meta_user_len: 40,
+            recv_abi: RecvAbiVariant::RecvV2,
+        }
+    }
+
+    #[test]
+    fn the_class_predicate_admits_only_ordinary_single_cap_transfers() {
+        let ordinary =
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER, Some(11), b"x").expect("msg");
+        assert!(blocked_waiter_ordinary_cap_delivery_class_matches(
+            &ordinary
+        ));
+        let plain_transfer =
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER_PLAIN, Some(11), b"x")
+                .expect("msg");
+        assert!(blocked_waiter_ordinary_cap_delivery_class_matches(
+            &plain_transfer
+        ));
+
+        // A reply cap is another class's.
+        let reply =
+            Message::with_header(3, 0, Message::FLAG_REPLY_CAP, Some(11), b"x").expect("msg");
+        assert!(!blocked_waiter_ordinary_cap_delivery_class_matches(&reply));
+        // A shared-region transfer is another class's, identified by its opcode.
+        let shared = Message::with_header(
+            3,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(11),
+            b"x",
+        )
+        .expect("msg");
+        assert!(!blocked_waiter_ordinary_cap_delivery_class_matches(&shared));
+        // A capability-free message is the plain class's.
+        assert!(!blocked_waiter_ordinary_cap_delivery_class_matches(
+            &Message::new(3, b"x").expect("msg")
+        ));
+    }
+
+    #[test]
+    fn the_prelude_names_both_ranges_and_the_payload_it_will_copy() {
+        let msg = Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER, Some(11), b"\x09\x00body")
+            .expect("msg");
+        let state = v2_state(64);
+        let prelude = plan_blocked_waiter_delivery_prelude(&state, &msg).expect("prelude");
+        let projected = crate::kernel::syscall::ipc_recv_core::project_recv_delivery(&msg);
+
+        assert_eq!(prelude.app_opcode, projected.app_opcode);
+        assert_eq!(prelude.payload_len, projected.app_payload.len());
+        assert_eq!(
+            &prelude.payload[..prelude.payload_len],
+            projected.app_payload
+        );
+        assert_eq!(
+            prelude.payload_writable,
+            (state.payload_user_ptr, projected.app_payload.len())
+        );
+        assert_eq!(
+            prelude.meta_writable,
+            (
+                state.meta_user_ptr,
+                crate::kernel::dispatch_post_work::DISPATCH_POST_WORK_META_LEN
+            )
+        );
+
+        // The payload-length contract is the prelude's, and it refuses before anything is
+        // consumed.
+        assert!(plan_blocked_waiter_delivery_prelude(&v2_state(1), &msg).is_err());
+    }
+
+    #[test]
+    fn the_metadata_contract_has_one_owner_used_by_every_class() {
+        // The contract itself.
+        assert!(check_blocked_recv_meta_contract(&v2_state(64)).is_ok());
+        let mut short = v2_state(64);
+        short.meta_user_len = 8;
+        assert!(check_blocked_recv_meta_contract(&short).is_err());
+        let legacy = BlockedRecvState::legacy_timeout(CapId(7), 0x4000, 64);
+        assert!(check_blocked_recv_meta_contract(&legacy).is_ok());
+        let mut lying = legacy;
+        lying.meta_user_len = 40;
+        assert!(check_blocked_recv_meta_contract(&lying).is_err());
+
+        // One implementation, and no producer spells the two branches out for itself.
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn check_blocked_recv_meta_contract(")
+                .count(),
+            1,
+            "one metadata-contract owner"
+        );
+        for src in [SYSCALL_SRC, RUNTIME_SRC] {
+            assert_eq!(
+                src.matches("blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN")
+                    .count(),
+                usize::from(core::ptr::eq(src, SYSCALL_SRC)),
+                "the recv-v2 length branch may appear only inside its owner"
+            );
+        }
+    }
+
+    #[test]
+    fn both_ordinary_cap_producers_share_the_plan_and_keep_the_validation_order() {
+        for (src, name, needle) in [
+            (
+                SYSCALL_SRC,
+                "broad",
+                "pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(",
+            ),
+            (
+                RUNTIME_SRC,
+                "split",
+                "pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery_split(",
+            ),
+        ] {
+            let start = src
+                .find(needle)
+                .unwrap_or_else(|| panic!("{name} producer"));
+            let terminator = if name == "broad" {
+                "\n}\n"
+            } else {
+                "\n    }\n"
+            };
+            let end = src[start..]
+                .find(terminator)
+                .unwrap_or_else(|| panic!("{name} producer ends"))
+                + start;
+            let body = &src[start..end];
+
+            // Shared owners, not re-decided policy.
+            assert!(body.contains("blocked_waiter_ordinary_cap_delivery_class_matches(msg)"));
+            assert!(body.contains("plan_blocked_waiter_delivery_prelude("));
+            assert!(body.contains("check_blocked_recv_meta_contract("));
+            assert!(body.contains("plan_blocked_waiter_ordinary_cap_snapshot("));
+            for redecided in [
+                "project_recv_delivery(",
+                "BlockedWaiterOrdinaryCapDeliverySnapshot {",
+                "writes_recv_v2_meta()",
+            ] {
+                assert!(
+                    !body.contains(redecided),
+                    "the {name} gatherer must not re-decide `{redecided}`"
+                );
+            }
+
+            // THE ordering: payload validated, then the envelope consumed, then meta validated.
+            let payload = body
+                .find("payload_writable.0")
+                .unwrap_or_else(|| panic!("{name}: payload validation"));
+            let meta = body
+                .find("meta_writable.0")
+                .unwrap_or_else(|| panic!("{name}: meta validation"));
+            let consume = if name == "broad" {
+                body.find("phase_a_snapshot_ordinary_transfer(")
+                    .expect("broad consume")
+            } else {
+                body.find("take_transfer_envelope_facts_split(")
+                    .expect("split consume")
+            };
+            assert!(
+                payload < consume,
+                "{name}: a payload fault must leave the envelope unconsumed"
+            );
+            assert!(
+                consume < meta,
+                "{name}: the meta range is validated after the single consume"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_ordinary_cap_producer_mints_nothing_and_ascends_in_rank() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+
+        // The receiver-local capability is the executor's to mint, never a producer's.
+        for minting in ["sr_mint_split(", "materialize_ordinary_cap_split(", "mint("] {
+            assert!(
+                !body.contains(minting),
+                "a producer must not mint the receiver's capability (saw `{minting}`)"
+            );
+        }
+
+        // Rank 1 → 2 → (2+4) → 5 → 3 → 5, each acquisition released before the next; assert the
+        // first four steps' order and that the envelope consume precedes the meta validation.
+        let cpu = body.find("current_cpu_split_read()").expect("rank 1");
+        let task = body.find("with_task_tcbs_split_mut(").expect("rank 2");
+        let cap = body
+            .find("resolve_capability_for_task_split(waiter_tid")
+            .expect("rank 2+4");
+        let payload_vm = body
+            .find("validate_user_range_writable_for_asid_split(")
+            .expect("rank 5");
+        assert!(cpu < task && task < cap && cap < payload_vm);
+
+        // Exactly one rank-2 blocked-state acquisition and exactly one envelope consume.
+        assert_eq!(body.matches("with_task_tcbs_split_mut(").count(), 1);
+        assert_eq!(
+            body.matches("take_transfer_envelope_facts_split(").count(),
+            1,
+            "the envelope is consumed exactly once"
+        );
+
+        // A shared-region envelope carries a pin this class does not own: refuse, never guess.
+        assert!(
+            body.contains("facts.pinned_object.is_some()"),
+            "a pinned envelope belongs to the shared-region class and must be refused"
+        );
+
+        // The class question precedes every acquisition.
+        let class = body
+            .find("blocked_waiter_ordinary_cap_delivery_class_matches(msg)")
+            .expect("class predicate");
+        assert!(class < cpu);
+    }
+}
+
+/// 199G-C4 §3 — THE reply-cap blocked-waiter delivery policy, and its two gatherers.
+///
+/// The reply class is the ordinary-cap class plus two obligations of its own: the transferred
+/// object must still be a live `Reply`, and the receiver's cspace must be provisioned by the
+/// producer, because the executor's mint does not provision and would fail on a growable one.
+/// These tests hold the sharing, the two obligations, and the validate/consume ordering.
+#[cfg(test)]
+mod stage199gc4_reply_cap_delivery_policy {
+    use super::*;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::blocked_waiter_reply_cap_delivery_class_matches;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const CAP_LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+
+    #[test]
+    fn the_class_predicate_admits_only_flagged_reply_cap_transfers() {
+        let reply =
+            Message::with_header(3, 0, Message::FLAG_REPLY_CAP, Some(11), b"x").expect("msg");
+        assert!(blocked_waiter_reply_cap_delivery_class_matches(&reply));
+
+        // An ordinary transfer, a plain-transfer, and a capability-free message are all other
+        // classes' — the reply flag alone decides, and only with a handle present.
+        for other in [
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER, Some(11), b"x").expect("msg"),
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER_PLAIN, Some(11), b"x")
+                .expect("msg"),
+            Message::new(3, b"x").expect("msg"),
+        ] {
+            assert!(!blocked_waiter_reply_cap_delivery_class_matches(&other));
+        }
+    }
+
+    #[test]
+    fn one_prelude_serves_every_delivery_class() {
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn plan_blocked_waiter_delivery_prelude(")
+                .count(),
+            1,
+            "one pre-consume plan owner"
+        );
+        // All three class plans/producers go through it rather than projecting for themselves.
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("plan_blocked_waiter_delivery_prelude(")
+                .count(),
+            4,
+            "the owner plus its three broad callers (plain plan, ordinary-cap, reply-cap)"
+        );
+        // Across the whole module the projection is applied in exactly two places: the shared
+        // prelude, and the legacy in-lock `complete_blocked_recv_for_waiter` that still serves
+        // the classes no producer claims. No producer projects for itself.
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("let delivery = self::ipc_recv_core::project_recv_delivery(msg);")
+                .count(),
+            2,
+            "the prelude and the legacy in-lock helper, and nothing else"
+        );
+        for producer in [
+            "pub(crate) fn produce_blocked_waiter_plain_delivery(",
+            "pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(",
+            "pub(crate) fn produce_blocked_waiter_reply_cap_delivery(",
+        ] {
+            let start = SYSCALL_SRC.find(producer).expect(producer);
+            let end = SYSCALL_SRC[start..].find("\n}\n").expect("ends") + start;
+            assert!(
+                !SYSCALL_SRC[start..end].contains("project_recv_delivery("),
+                "`{producer}` must take its projection from the prelude"
+            );
+        }
+    }
+
+    #[test]
+    fn both_reply_cap_producers_share_the_owners_and_keep_the_validation_order() {
+        for (src, name, needle) in [
+            (
+                SYSCALL_SRC,
+                "broad",
+                "pub(crate) fn produce_blocked_waiter_reply_cap_delivery(",
+            ),
+            (
+                RUNTIME_SRC,
+                "split",
+                "pub(crate) fn produce_blocked_waiter_reply_cap_delivery_split(",
+            ),
+        ] {
+            let start = src
+                .find(needle)
+                .unwrap_or_else(|| panic!("{name} producer"));
+            let terminator = if name == "broad" {
+                "\n}\n"
+            } else {
+                "\n    }\n"
+            };
+            let end = src[start..]
+                .find(terminator)
+                .unwrap_or_else(|| panic!("{name} producer ends"))
+                + start;
+            let body = &src[start..end];
+
+            assert!(body.contains("blocked_waiter_reply_cap_delivery_class_matches(msg)"));
+            assert!(body.contains("plan_blocked_waiter_delivery_prelude("));
+            assert!(body.contains("plan_blocked_waiter_reply_cap_snapshot("));
+            for redecided in [
+                "project_recv_delivery(",
+                "BlockedWaiterReplyCapDeliverySnapshot {",
+                "writes_recv_v2_meta()",
+            ] {
+                assert!(
+                    !body.contains(redecided),
+                    "the {name} gatherer must not re-decide `{redecided}`"
+                );
+            }
+
+            // Payload validated, then the envelope consumed, then meta validated.
+            let payload = body
+                .find("payload_writable.0")
+                .unwrap_or_else(|| panic!("{name}: payload validation"));
+            let meta = body
+                .find("meta_writable.0")
+                .unwrap_or_else(|| panic!("{name}: meta validation"));
+            let consume = if name == "broad" {
+                body.find("phase_a_take_reply_envelope(")
+                    .expect("broad consume")
+            } else {
+                body.find("take_transfer_envelope_facts_split(")
+                    .expect("split consume")
+            };
+            assert!(
+                payload < consume,
+                "{name}: a payload fault must leave the envelope unconsumed"
+            );
+            assert!(
+                consume < meta,
+                "{name}: the meta range is validated after the single consume"
+            );
+
+            // The cspace is provisioned before the snapshot is published, in both.
+            let provision = if name == "broad" {
+                body.find("ensure_cnode_space(")
+                    .expect("broad provisioning")
+            } else {
+                body.find("ensure_cnode_space_split(")
+                    .expect("split provisioning")
+            };
+            assert!(
+                provision < body.find("DISPATCH_POST_WORK_STASH").unwrap_or(body.len()),
+                "{name}: provisioning must precede publication"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cnode_provisioning_policy_has_one_implementation() {
+        assert_eq!(
+            CAP_LIFECYCLE_SRC
+                .matches("pub(crate) fn ensure_cnode_space_locked(")
+                .count(),
+            1,
+            "one provisioning owner"
+        );
+        // The broad entry keeps its acquisition and delegates the policy.
+        let start = CAP_LIFECYCLE_SRC
+            .find("pub(crate) fn ensure_cnode_space_with_slots(")
+            .expect("broad entry");
+        let end = CAP_LIFECYCLE_SRC[start..]
+            .find("\n    }\n")
+            .expect("body ends")
+            + start;
+        let broad = &CAP_LIFECYCLE_SRC[start..end];
+        assert!(broad.contains("self.with_capability_state_mut(|capability| {"));
+        assert!(broad.contains("Self::ensure_cnode_space_locked("));
+        assert!(
+            !broad.contains("CapabilitySpace::try_with_slots("),
+            "the broad wrapper must not re-implement the allocation"
+        );
+
+        // The split entry: one bounded rank-4 acquisition, same owner, and nothing else taken.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn ensure_cnode_space_split(")
+            .expect("split entry");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert_eq!(split.matches("with_capability_state_split_mut").count(), 1);
+        assert!(split.contains("KernelState::ensure_cnode_space_locked("));
+        for forbidden in [
+            "with_ipc_split_mut",
+            "with_task_tcbs_split_mut",
+            "self.with(",
+        ] {
+            assert!(
+                !split.contains(forbidden),
+                "the split provisioning entry takes rank 4 and nothing else (saw `{forbidden}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_reply_cap_producer_mints_nothing_and_requires_a_live_reply_object() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_reply_cap_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+
+        // A producer never mints, and never touches the reply record.
+        for minting in [
+            "sr_mint_split(",
+            "materialize_reply_cap_split(",
+            "reserve_existing_reply_record_split(",
+            "consume_reply_record_split(",
+        ] {
+            assert!(
+                !body.contains(minting),
+                "a producer must not mint or bind the reply record (saw `{minting}`)"
+            );
+        }
+
+        // The transferred object must be a Reply whose generation is still live.
+        assert!(body.contains("CapObject::Reply { index, generation }"));
+        assert!(body.contains("reply_object_live_split(reply_index, reply_generation)"));
+        // A pinned envelope belongs to the shared-region class.
+        assert!(body.contains("facts.pinned_object.is_some()"));
+        // Exactly one blocked-state acquisition and one envelope consume.
+        assert_eq!(body.matches("with_task_tcbs_split_mut(").count(), 1);
+        assert_eq!(
+            body.matches("take_transfer_envelope_facts_split(").count(),
+            1
+        );
+        // The class question precedes every acquisition.
+        let class = body
+            .find("blocked_waiter_reply_cap_delivery_class_matches(msg)")
+            .expect("class predicate");
+        assert!(class < body.find("current_cpu_split_read()").expect("rank 1"));
+    }
+}
+
+/// 199G-C4 §3 — THE shared-region blocked-waiter delivery policy, and its two Phase As.
+///
+/// The shared-region class is the one direct delivery that carries an object pin, and its
+/// correctness rests on that pin never lapsing: Phase A takes it over from the consumed envelope
+/// rather than releasing and re-acquiring it. These tests hold the shared decisions, the pin
+/// discipline, and the arming rule that keeps the class inert on a normal boot.
+#[cfg(test)]
+mod stage199gc4_shared_region_delivery_policy {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        shared_region_admit_source_object, shared_region_destination_rights,
+    };
+    use crate::kernel::capabilities::{CapObject, CapRights};
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{
+        OPCODE_SHARED_MEM, blocked_waiter_shared_region_delivery_class_matches,
+    };
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TXN_SRC: &str = include_str!("shared_region_txn.rs");
+
+    #[test]
+    fn the_class_predicate_admits_only_shared_memory_transfers() {
+        let shared = Message::with_header(
+            3,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(11),
+            b"x",
+        )
+        .expect("msg");
+        assert!(blocked_waiter_shared_region_delivery_class_matches(&shared));
+
+        // The opcode alone distinguishes it from an ordinary transfer of the same shape.
+        let ordinary =
+            Message::with_header(3, 0, Message::FLAG_CAP_TRANSFER, Some(11), b"x").expect("msg");
+        assert!(!blocked_waiter_shared_region_delivery_class_matches(
+            &ordinary
+        ));
+        // And a shared-memory opcode with no cap is not a transfer at all.
+        assert!(!blocked_waiter_shared_region_delivery_class_matches(
+            &Message::new(3, b"x").expect("msg")
+        ));
+    }
+
+    #[test]
+    fn only_physically_backed_objects_are_admitted_as_a_shared_region_source() {
+        for admitted in [
+            CapObject::MemoryObject { id: 7 },
+            CapObject::DmaRegion {
+                id: 7,
+                offset: 0,
+                len: 0x1000,
+            },
+        ] {
+            let (object, generation) =
+                shared_region_admit_source_object(admitted).expect("admitted");
+            assert_eq!(object, admitted, "the frozen identity is the object itself");
+            assert_eq!(generation, 0, "these classes carry no object generation");
+        }
+        for refused in [
+            CapObject::Endpoint {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Reply {
+                index: 0,
+                generation: 1,
+            },
+            CapObject::Kernel,
+        ] {
+            assert!(
+                shared_region_admit_source_object(refused).is_none(),
+                "{refused:?} names no physically-backed region"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_transfer_attenuates_to_an_allow_list_not_a_subtraction() {
+        let source = CapRights::READ | CapRights::WRITE | CapRights::MAP | CapRights::SEND;
+        // A writable mapping carries the source rights unchanged.
+        assert_eq!(
+            shared_region_destination_rights(source, true),
+            source,
+            "a writable transfer is not attenuated"
+        );
+        // A read-only mapping keeps exactly READ|MAP — GRANT does not ride along.
+        let attenuated = shared_region_destination_rights(source, false);
+        assert!(attenuated.contains(CapRights::READ));
+        assert!(attenuated.contains(CapRights::MAP));
+        assert!(!attenuated.contains(CapRights::WRITE));
+        assert!(
+            !attenuated.contains(CapRights::SEND),
+            "an allow-list drops every right it does not name"
+        );
+        // And the receiver never gains a right the sender lacked.
+        let narrow = CapRights::READ;
+        assert_eq!(shared_region_destination_rights(narrow, false), narrow);
+        assert_eq!(shared_region_destination_rights(narrow, true), narrow);
+    }
+
+    #[test]
+    fn both_phase_as_share_the_admission_and_attenuation_owners() {
+        for owner in [
+            "pub(crate) fn shared_region_admit_source_object(",
+            "pub(crate) fn shared_region_destination_rights(",
+        ] {
+            assert_eq!(TXN_SRC.matches(owner).count(), 1, "one owner for `{owner}`");
+        }
+        // The broad Phase A delegates both decisions.
+        let start = TXN_SRC
+            .find("pub(crate) fn shared_region_phase_a(")
+            .expect("broad phase A");
+        let end = TXN_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let broad = &TXN_SRC[start..end];
+        assert!(broad.contains("shared_region_admit_source_object("));
+        assert!(broad.contains("shared_region_destination_rights("));
+        assert!(
+            !broad.contains("CapRights::READ | CapRights::MAP"),
+            "the broad Phase A must not re-spell the attenuation"
+        );
+
+        // The split Phase A calls the same two owners and forms no broad borrow.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn shared_region_phase_a_split(")
+            .expect("split phase A");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert!(split.contains("shared_region_admit_source_object("));
+        assert!(split.contains("shared_region_destination_rights("));
+        assert!(!split.contains("CapRights::READ | CapRights::MAP"));
+        assert!(!split.contains("self.with("));
+    }
+
+    #[test]
+    fn the_split_phase_a_takes_over_the_pin_and_releases_it_on_exactly_one_path() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn shared_region_phase_a_split(")
+            .expect("split phase A");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+
+        // The snapshot owns the pin.
+        assert!(
+            body.contains("pin_owned: true"),
+            "the snapshot takes over the pin's lifetime"
+        );
+        // Exactly one release, and it is the abandon-the-transfer path.
+        assert_eq!(
+            body.matches("sr_release_pin_split(").count(),
+            1,
+            "the pin is released on exactly one path"
+        );
+        // Never re-acquired: a release-then-acquire would let the refcount reach zero.
+        assert!(
+            !body.contains("sr_acquire_pin_split("),
+            "taking the pin over means never re-acquiring it"
+        );
+        // Exactly one consume.
+        assert_eq!(
+            body.matches("take_transfer_envelope_facts_split(").count(),
+            1
+        );
+        // The consume precedes the release, which precedes the source-capability resolve.
+        let consume = body
+            .find("take_transfer_envelope_facts_split(")
+            .expect("consume");
+        let release = body.find("sr_release_pin_split(").expect("release");
+        let resolve = body
+            .find("resolve_capability_for_task_split(facts.source_tid")
+            .expect("resolve");
+        assert!(consume < release && release < resolve, "rank 3 → 6 → 2+4");
+    }
+
+    #[test]
+    fn the_arming_rule_has_one_owner_and_keeps_the_class_inert_on_a_normal_boot() {
+        assert_eq!(
+            SYSCALL_SRC
+                .matches("pub(crate) fn shared_region_live_armed(")
+                .count(),
+            1,
+            "one arming owner"
+        );
+        // A normal boot leaves the oracle-proof knob off, so the live path is not armed and the
+        // producers decline before touching anything.
+        assert!(
+            !crate::kernel::boot::ipc_recv_oracle_proof_enabled(),
+            "the oracle-proof knob is off by default"
+        );
+        assert!(
+            !crate::kernel::syscall::shared_region_live_armed(0),
+            "with the knob off the live shared-region path is inert on every CPU"
+        );
+
+        // Both gatherers ask the same owner rather than re-reading the knob.
+        let start = SYSCALL_SRC
+            .find("fn shared_region_live_eligible(")
+            .expect("broad eligibility");
+        let end = SYSCALL_SRC[start..].find("\n}\n").expect("ends") + start;
+        assert!(SYSCALL_SRC[start..end].contains("shared_region_live_armed(cpu_idx)"));
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_shared_region_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert!(split.contains("shared_region_live_armed(cpu_idx)"));
+        assert!(
+            !split.contains("ipc_recv_oracle_proof_enabled()"),
+            "the gatherer must not re-read the knob behind the owner's back"
+        );
+    }
+
+    #[test]
+    fn the_split_producer_checks_the_ack_before_mutating_and_consumes_it_after_publishing() {
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn produce_blocked_waiter_shared_region_delivery_split(")
+            .expect("split producer");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+
+        let check = body
+            .find("matches_for_delivery(")
+            .expect("non-destructive ack check");
+        let take = body
+            .find("blocked_recv_state.take()")
+            .expect("first mutation");
+        let publish = body
+            .find("stash_shared_region_delivery(")
+            .expect("publication");
+        let consume = body.find("consume_for_delivery(").expect("ack consume");
+        assert!(
+            check < take,
+            "the ack is checked before the first mutation, so a refusal strands nothing"
+        );
+        assert!(
+            publish < consume,
+            "the ack is consumed only after the delivery is committed to the drain"
+        );
+
+        // Nothing is mapped, minted or copied by the producer.
+        for executor_work in [
+            "map_user_page_in_asid_split(",
+            "sr_mint_split(",
+            "copy_slice_to_user_asid_split_write(",
+            "sr_wake_receiver_split(",
+        ] {
+            assert!(
+                !body.contains(executor_work),
+                "a producer must leave `{executor_work}` to the drain"
+            );
+        }
+        // The receiver is marked as what it is: a consumed blocked endpoint waiter.
+        assert!(body.contains("snapshot.blocked_endpoint_waiter = true;"));
+    }
+}
+
+/// 199G-C4 §3 — the waiting-receiver enqueue owner, and the blocking-send publication owner
+/// the pre-lock route reuses rather than reimplementing.
+#[cfg(test)]
+mod stage199gc4_waiting_receiver_and_blocking_send {
+    use super::*;
+    use crate::kernel::boot::{IpcEndpointSendResult, IpcEndpointSplitRejectReason};
+    use crate::kernel::ipc::Message;
+    use crate::runtime::SharedKernel;
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    #[test]
+    fn the_waiting_receiver_enqueue_policy_has_exactly_one_implementation() {
+        assert_eq!(
+            IPC_SRC
+                .matches("fn ipc_try_send_to_plain_receiver_endpoint_only_locked(")
+                .count(),
+            1,
+            "one waiting-receiver enqueue owner"
+        );
+
+        // The broad entry keeps its acquisition and re-decides nothing.
+        let start = IPC_SRC
+            .find("pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only(")
+            .expect("broad entry");
+        let end = IPC_SRC[start..].find("\n    }\n").expect("body ends") + start;
+        let broad = &IPC_SRC[start..end];
+        assert!(broad.contains("self.with_ipc_state_mut(|ipc| {"));
+        assert!(broad.contains("Self::ipc_try_send_to_plain_receiver_endpoint_only_locked("));
+        for decision in [
+            "endpoint_waiter_identity(endpoint_idx)",
+            "clear_endpoint_waiter_if_identity(",
+            "endpoint.send(msg)",
+            "IpcEndpointSplitRejectReason::SenderWaiterPresent",
+        ] {
+            assert!(
+                !broad.contains(decision),
+                "the broad wrapper must not re-implement `{decision}`"
+            );
+        }
+
+        // The split entry: one bounded rank-3 acquisition, same owner, nothing else taken.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only_split(")
+            .expect("split entry");
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let split = &RUNTIME_SRC[start..end];
+        assert_eq!(split.matches("with_ipc_split_mut").count(), 1);
+        assert!(
+            split.contains("KernelState::ipc_try_send_to_plain_receiver_endpoint_only_locked(")
+        );
+        for forbidden in [
+            "with_task_tcbs_split_mut",
+            "with_scheduler_split_mut",
+            "self.with(",
+        ] {
+            assert!(
+                !split.contains(forbidden),
+                "the split entry takes rank 3 and nothing else (saw `{forbidden}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_identity_re_verification_belongs_to_the_owner_and_is_keyed_on_the_whole_identity() {
+        let start = IPC_SRC
+            .find("pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only_locked(")
+            .expect("owner");
+        let end = IPC_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let owner = &IPC_SRC[start..end];
+
+        // The slot is re-verified against the COMPLETE expected identity, and the clear is keyed
+        // on that same identity — never on a numeric TID.
+        assert!(
+            owner.contains("ipc.endpoint_waiter_identity(endpoint_idx) != Some(expected_receiver)"),
+            "the whole identity must be re-verified under the lock"
+        );
+        assert!(
+            owner.contains("clear_endpoint_waiter_if_identity(endpoint_idx, expected_receiver)"),
+            "the clear is keyed on the re-verified identity"
+        );
+        // The re-verification precedes the send, which precedes the clear.
+        let verify = owner
+            .find("endpoint_waiter_identity(endpoint_idx)")
+            .expect("verify");
+        let send = owner.find("endpoint.send(msg)").expect("send");
+        let clear = owner
+            .find("clear_endpoint_waiter_if_identity(")
+            .expect("clear");
+        assert!(verify < send && send < clear);
+        // The wake is reported, not performed.
+        assert!(
+            owner.contains("IpcEndpointSendResult::EnqueuedWakeReceiver(expected_receiver.tid)")
+        );
+        for waking in [
+            "apply_scheduler_wake_plan",
+            "sr_wake_receiver_split",
+            "wake_tid_to_runnable",
+        ] {
+            assert!(
+                !owner.contains(waking),
+                "waking is rank 1 and must happen outside this acquisition (saw `{waking}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn broad_and_split_waiting_receiver_sends_agree_on_a_stale_identity_refusal() {
+        // With no waiter published at all, the expected identity cannot match, and BOTH routes
+        // must refuse with the same reason and enqueue nothing.
+        let expected = crate::kernel::boot::ReceiverWaiterIdentity {
+            tid: crate::kernel::ipc::ThreadId(9),
+            asid: crate::kernel::vm::Asid(3),
+        };
+        let refusal =
+            IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::ReceiverWaiterPresent);
+        let msg = Message::new(1, b"x").expect("msg");
+
+        let mut broad_state = Bootstrap::init().expect("init");
+        let (eidx, _s, _r) = broad_state.create_endpoint(4).expect("endpoint");
+        let broad = SharedKernel::new(broad_state);
+        let mut split_state = Bootstrap::init().expect("init");
+        let (seidx, _s, _r) = split_state.create_endpoint(4).expect("endpoint");
+        let split = SharedKernel::new(split_state);
+
+        assert_eq!(
+            broad.with(|s| s.ipc_try_send_to_plain_receiver_endpoint_only(eidx, expected, msg)),
+            refusal
+        );
+        assert_eq!(
+            split.ipc_try_send_to_plain_receiver_endpoint_only_split(seidx, expected, msg),
+            refusal
+        );
+        for (k, e) in [(&broad, eidx), (&split, seidx)] {
+            assert_eq!(
+                k.with(|s| s
+                    .with_ipc_state(|ipc| ipc.endpoints[e].as_ref().map_or(0, |ep| ep.queued()))),
+                0,
+                "a refused waiting-receiver send enqueues nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_blocking_send_publication_owner_already_exists_and_is_not_duplicated() {
+        // §3 asks that blocking-send publication go through the EXISTING owner. It does: there
+        // is one, it is off-lock, and the pre-lock route has no second one to drift from.
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("pub(crate) fn commit_blocking_send_split(")
+                .count(),
+            1,
+            "one off-lock blocking-send publication owner"
+        );
+        // Its input is a plain by-value snapshot, so a pre-lock route can propose a block
+        // without holding anything.
+        let start = RUNTIME_SRC
+            .find("pub(crate) fn commit_blocking_send_split(")
+            .expect("owner");
+        let head = &RUNTIME_SRC[start..start + 300];
+        assert!(
+            head.contains("snap: &crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot")
+        );
+        // And it refuses rather than mutating when the sender is no longer the authoritative
+        // current task — the property that lets it be proposed off the lock at all.
+        let end = RUNTIME_SRC[start..].find("\n    }\n").expect("ends") + start;
+        let body = &RUNTIME_SRC[start..end];
+        assert!(body.contains("BlockingSendCommitOutcome::RefusedCpuMismatch"));
+        assert!(body.contains("BlockingSendCommitOutcome::RefusedNotCurrent"));
+    }
+}
+
+/// 199G-C4 §5 — MECHANICAL ACCEPTANCE for the NR 1 pre-lock route.
+///
+/// The headline claim is that production `IpcSend` no longer has an edge into either terminal
+/// broad dispatcher on any architecture. That is a source-derivable property — the route must be
+/// admitted on all three, and nothing in it may yield NR 1 back to the broad arm after it has
+/// consumed anything — and these tests derive it, the way the NR 5 guard derives the same claim
+/// for the receive-timeout class.
+#[cfg(test)]
+/// 199E-A64RC / 199E-A64CALL — the AArch64 return-path contract, guarded from source.
+///
+/// `src/arch/aarch64/trap.rs` is behind `#[cfg(target_arch = "aarch64")]`, so its own unit tests
+/// never run in the hosted suite. These are the structural equivalents, in the pattern the tree
+/// already uses for arch-specific code.
+mod stage199e_a64_return_contract {
+    const A64_ABI: &str = include_str!("../../arch/aarch64/syscall_abi.rs");
+    const A64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+    const USER_TARGET: &str = include_str!("../../../targets/aarch64-yarm-user-none.json");
+    const KERNEL_TARGET: &str = include_str!("../../../targets/aarch64-yarm-none.json");
+
+    /// The TLS lane is x18, and x15 is nobody's business.
+    ///
+    /// The vector glue fills `user_gprs` with `for idx in 0..31 { lane[idx] = frame.gprs[idx] }`
+    /// over x0..x30, so lane N IS xN. `REG_X18_TLS` was 15, which meant every return to EL0 wrote
+    /// `tls.unwrap_or(0)` over the user's live x15 while x18 was never written at all.
+    #[test]
+    fn the_tls_lane_is_x18_and_nothing_writes_x15() {
+        assert!(
+            A64_ABI.contains("pub const REG_X18_TLS: usize = 18;"),
+            "the TLS lane must be 18 — lane N is xN"
+        );
+        assert!(
+            !A64_ABI.contains("pub const REG_X18_TLS: usize = 15;"),
+            "the x15 lane regression must not come back"
+        );
+        // Nothing in the AArch64 trap path may name lane 15, by constant or by literal.
+        assert!(
+            !A64_TRAP.contains("REG_X15"),
+            "there is no x15 lane constant to write through"
+        );
+        for lit in ["set_user_gpr(15,", "set_user_gpr(15 ,", "user_gprs[15]"] {
+            assert!(
+                !A64_TRAP.contains(lit),
+                "nothing writes x15 directly: {lit}"
+            );
+        }
+    }
+
+    /// Writing lane 18 is only sound because userspace keeps nothing live there.
+    #[test]
+    fn the_userspace_target_reserves_x18_for_the_kernel() {
+        assert!(
+            USER_TARGET.contains("+reserve-x18"),
+            "AArch64 userspace must reserve x18 — the kernel restores TLS into it on every return"
+        );
+        // The kernel's own allocation has no bearing on the user context it restores, so it is
+        // deliberately NOT reserved there; asserting that keeps the two decisions distinct.
+        assert!(
+            !KERNEL_TARGET.contains("+reserve-x18"),
+            "the kernel target is deliberately untouched"
+        );
+    }
+
+    /// The completion MECHANISM is production code; only the retirement attestation is gated.
+    #[test]
+    fn the_completion_apply_is_ungated_and_has_one_owner() {
+        assert_eq!(
+            A64_TRAP
+                .matches("fn encode_blocked_completion_result(")
+                .count(),
+            1,
+            "one completion-apply owner for both blocked classes"
+        );
+        // Both resume boundaries consume a recv completion, and neither take is feature-gated.
+        for needle in [
+            "take_blocked_syscall_completion(current_tid)",
+            "direct_dispatch_take_completion_split(token)",
+        ] {
+            let at = A64_TRAP
+                .find(needle)
+                .unwrap_or_else(|| panic!("the recv take: {needle}"));
+            let before = &A64_TRAP[at.saturating_sub(300)..at];
+            assert!(
+                !before.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+                "the recv completion mechanism is production-live: {needle}"
+            );
+        }
+        // The SHARED take is scoped to AArch64 (plus the pre-existing feature build) and never
+        // widened to x86_64/RISC-V feature-off. Those ports install their result at publication
+        // time, so for them the take is a pure side effect - it clears the record,
+        // `ipc_timeout_fired` and `blocked_recv_state` - and widening it unconditionally changed
+        // their server-death sequencing.
+        const TASK_SRC: &str = include_str!("../task.rs");
+        let scope =
+            "#[cfg(any(feature = \"ipc-reply-timeout-oracle-core\", target_arch = \"aarch64\"))]";
+        assert_eq!(
+            TASK_SRC.matches(scope).count(),
+            3,
+            "the shared recv take is scoped at its field, its take and its initializer"
+        );
+        // No new ABI lane and no timeout POLICY was introduced: the apply only writes the
+        // existing arg lanes, and the canonical result comes from the parked record.
+        let owner = A64_TRAP
+            .split("fn encode_blocked_completion_result(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the owner body");
+        assert!(owner.contains("frame.set_arg(0, result as usize)"));
+        assert!(owner.contains("for lane in 1..=5"));
+        assert!(
+            !owner.contains("TimedOut") && !owner.contains("deadline"),
+            "the apply encodes a result; it does not decide timeout policy"
+        );
+    }
+}
+
+mod stage199gc4_nr1_terminal_edges {
+    use super::*;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    fn route_body() -> &'static str {
+        let start = SPLIT_SRC
+            .find("fn try_split_ipc_send_into_frame(\n    shared: &SharedKernel,")
+            .expect("the NR 1 route");
+        let end = SPLIT_SRC[start..]
+            .find("\n/// 199G-C4 §1 — settle a stashed transfer envelope")
+            .expect("the route ends")
+            + start;
+        &SPLIT_SRC[start..end]
+    }
+
+    #[test]
+    fn nr1_is_admitted_on_all_three_architectures() {
+        // The route itself admits NR 1 and excludes no architecture.
+        assert!(
+            route_body().contains("Ok(Syscall::IpcSend)"),
+            "the pre-lock send route must admit NR 1"
+        );
+        assert!(
+            !route_body().contains("cfg!(any(target_arch"),
+            "the NR 1 route excludes no architecture"
+        );
+        // It is reached from the shared dispatcher, before the non-switching whitelist.
+        let dispatcher = SPLIT_SRC
+            .split("pub(crate) fn try_split_dispatch_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the dispatcher");
+        let send = dispatcher
+            .find("try_split_ipc_send_into_frame(")
+            .expect("NR 1 is dispatched");
+        let nonswitching = dispatcher
+            .find("try_split_dispatch_nonswitching_into_frame(")
+            .expect("the whitelist");
+        assert!(
+            send < nonswitching,
+            "NR 1 may not be early-returned through the caller's frame, so it is tried before \
+             the non-switching whitelist"
+        );
+        // AArch64: the pre-split ABI import must admit NR 1, or the dispatcher sees nr=0.
+        assert!(
+            TRAP_ENTRY.contains("raw_nr == crate::kernel::syscall::SYSCALL_IPC_SEND_NR"),
+            "AArch64 must import the NR 1 ABI before the split dispatch inspects it"
+        );
+        // RISC-V: the whitelist must admit NR 1.
+        let whitelist = RISCV
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("the RISC-V whitelist");
+        assert!(
+            whitelist.contains("SYSCALL_IPC_SEND_NR"),
+            "RISC-V must admit NR 1 into the split dispatcher"
+        );
+    }
+
+    #[test]
+    fn no_broad_fallback_exists_after_the_route_consumes_anything() {
+        let body = route_body();
+        // Every `NotHandled` — the ONLY route back to the broad dispatcher — must appear before
+        // the envelope stash, which is the first consuming step.
+        let stash = body
+            .find("stash_transfer_envelope_split(")
+            .expect("the consuming step");
+        let mut searched = 0usize;
+        let mut fallbacks = 0usize;
+        while let Some(rel) = body[searched..].find("D::NotHandled") {
+            let at = searched + rel;
+            assert!(
+                at < stash,
+                "a fallback at byte {at} follows the envelope stash at {stash}: re-running the \
+                 send would stash a SECOND envelope for one syscall"
+            );
+            fallbacks += 1;
+            searched = at + 1;
+        }
+        assert!(
+            fallbacks >= 3,
+            "the pre-mutation declines are still present"
+        );
+        // And after the stash every exit settles the envelope through the ONE settle owner.
+        let after = &body[stash..];
+        assert!(
+            after.matches("settle_ipc_send_envelope(").count() >= 4,
+            "each post-stash exit settles the envelope"
+        );
+    }
+
+    #[test]
+    fn the_two_impossible_classes_fail_closed_before_mutation() {
+        let body = route_body();
+        let stash = body
+            .find("stash_transfer_envelope_split(")
+            .expect("the consuming step");
+        for (needle, what) in [
+            ("reason=kernel_cap_send result=failed_closed", "Kernel cap"),
+            (
+                "reason=synchronous_endpoint result=failed_closed",
+                "Synchronous endpoint",
+            ),
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("{what} refusal"));
+            assert!(
+                at < stash,
+                "{what} must fail closed before anything is consumed"
+            );
+        }
+        // Neither reaches a terminal dispatcher: both return a typed refusal, not `NotHandled`.
+        let kernel_arm = body
+            .split("reason=kernel_cap_send result=failed_closed")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the Kernel arm");
+        assert!(kernel_arm.contains("D::Complete(Err("));
+        assert!(!kernel_arm.contains("D::NotHandled"));
+    }
+
+    #[test]
+    fn every_production_class_reaches_an_authoritative_split_owner() {
+        let body = route_body();
+        for (owner, class) in [
+            (
+                "produce_blocked_waiter_plain_delivery_split(",
+                "plain direct",
+            ),
+            (
+                "produce_blocked_waiter_reply_cap_delivery_split(",
+                "reply-cap direct",
+            ),
+            (
+                "produce_blocked_waiter_ordinary_cap_delivery_split(",
+                "ordinary-cap direct",
+            ),
+            (
+                "produce_blocked_waiter_shared_region_delivery_split(",
+                "shared-region direct",
+            ),
+            (
+                "ipc_endpoint_enqueue_authoritative_split(",
+                "buffered enqueue",
+            ),
+            ("stash_transfer_envelope_split(", "envelope + pin"),
+            ("wake_waiter_for_endpoint_split(", "waiter wake"),
+            ("BlockingSendCommit(", "U6 blocking publication"),
+        ] {
+            assert!(
+                body.contains(owner),
+                "the {class} class must reach its authoritative split owner `{owner}`"
+            );
+        }
+        // The enqueue is the AUTHORITATIVE one, never the conservative Stage-4E screen.
+        assert!(
+            !body.contains("ipc_try_send_queued_plain_endpoint_only_split("),
+            "the route uses the authoritative unconditional enqueue, not the Stage-4E screen"
+        );
+        // No second enqueue, delivery, prelude, wake or post-work implementation appears here:
+        // the route consults owners, it does not contain policy.
+        for reimplemented in [
+            "endpoint.send(",
+            "encode_recv_v2_meta(",
+            "project_recv_delivery(",
+            "blocked_recv_state.take()",
+            "adjust_memory_object_pin_refcount",
+        ] {
+            assert!(
+                !body.contains(reimplemented),
+                "the route must not contain `{reimplemented}` — it belongs to an owner"
+            );
+        }
+    }
+
+    #[test]
+    fn the_route_reports_exactly_the_four_dispositions_and_no_other_channel() {
+        let body = route_body();
+        // Committed outcomes carry the route's own finalize decision.
+        assert!(
+            body.contains("D::PostWorkCommitted {\n                    finalize_syscall: true,\n                }"),
+            "a delivery finishes the caller's syscall"
+        );
+        assert!(
+            body.contains("finalize_syscall: false,"),
+            "a parked sender's syscall is NOT finished by the route"
+        );
+        // No route invents a channel of its own.
+        for forbidden in ["DISPATCH_SWITCH_PLAN_STASH", "queue_advance_admit_split("] {
+            assert!(
+                !body.contains(forbidden),
+                "the NR 1 route must not open a second channel (saw `{forbidden}`)"
+            );
+        }
+        // The blocking arm stashes the EXISTING U6 proposal and lets the existing drain commit
+        // it — the route never blocks a task itself.
+        for blocking_itself in [
+            "commit_blocking_send_split(",
+            "block_current_on_send",
+            "recv_block_phase_a_split(",
+        ] {
+            assert!(
+                !body.contains(blocking_itself),
+                "the route proposes a block; the existing drain commits it (saw `{blocking_itself}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_route_emits_the_existing_marker_families_and_invents_none() {
+        let body = route_body();
+        // Every boundary marker it emits already exists in the broad owner it replaced.
+        const IPC_SRC: &str = include_str!("ipc_state.rs");
+        for marker in [
+            "IPC_SEND_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_BOUNDARY_PLAIN_SNAPSHOT_OK",
+            "IPC_SEND_CAP_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_CAP_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_REPLY_CAP_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_ENQUEUE_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE",
+        ] {
+            assert!(body.contains(marker), "the route emits `{marker}`");
+            assert!(
+                IPC_SRC.contains(marker),
+                "`{marker}` must be an EXISTING family, also emitted by the broad owner"
+            );
+        }
+        // And it tags the per-CPU stash origin per class, which is what makes the drain emit
+        // this class's markers rather than the generic delivery ones.
+        for tag in [
+            "ipc_send_boundary_origin_set(cpu_idx)",
+            "ipc_send_reply_cap_boundary_origin_set(cpu_idx)",
+            "ipc_send_cap_boundary_origin_set(cpu_idx)",
+        ] {
+            assert!(
+                body.contains(tag),
+                "the route tags the stash origin: `{tag}`"
+            );
+        }
     }
 }

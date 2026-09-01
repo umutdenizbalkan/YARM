@@ -336,24 +336,12 @@ impl KernelState {
         user_ptr: usize,
         len: usize,
     ) -> Result<(), KernelError> {
-        if len == 0 {
-            return Ok(());
-        }
-        let page_size = crate::kernel::vm::PAGE_SIZE;
-        let mut probe = user_ptr;
-        let end = user_ptr
-            .checked_add(len)
-            .ok_or(KernelError::UserMemoryFault)?;
-        while probe < end {
-            self.validate_user_access_for_asid(asid, probe, true)?;
-            // Advance to the next page boundary (or the end).
-            let next_page = (probe & !(page_size - 1)).checked_add(page_size);
-            probe = match next_page {
-                Some(p) => p,
-                None => return Err(KernelError::UserMemoryFault),
-            };
-        }
-        Ok(())
+        // 199G-C4 §3: the walk itself is shared with the off-lock mirror below; only the leaf
+        // page check differs (broad `&self` here, rank-5 seam there).
+        walk_user_range_by_page(user_ptr, len, |probe| {
+            self.validate_user_access_for_asid(asid, probe, true)
+                .map(|_| ())
+        })
     }
 
     pub fn copy_to_current_user(
@@ -511,6 +499,38 @@ impl KernelState {
     }
 }
 
+/// 199G-C4 §3 — THE page walk a "is this whole user range writable?" question performs.
+///
+/// One page-stepping rule — the empty range is vacuously fine, the end is computed with an
+/// overflow check, each covered page is offered to `validate_page` exactly once, and stepping
+/// past the address space is a `UserMemoryFault` rather than a wrap — shared by the broad
+/// `KernelState` validator and its off-lock `SharedKernel` mirror. Only the leaf differs; the
+/// set of pages examined, and therefore what "validated" means, cannot drift between them.
+pub(crate) fn walk_user_range_by_page(
+    user_ptr: usize,
+    len: usize,
+    mut validate_page: impl FnMut(usize) -> Result<(), KernelError>,
+) -> Result<(), KernelError> {
+    if len == 0 {
+        return Ok(());
+    }
+    let page_size = crate::kernel::vm::PAGE_SIZE;
+    let mut probe = user_ptr;
+    let end = user_ptr
+        .checked_add(len)
+        .ok_or(KernelError::UserMemoryFault)?;
+    while probe < end {
+        validate_page(probe)?;
+        // Advance to the next page boundary (or the end).
+        let next_page = (probe & !(page_size - 1)).checked_add(page_size);
+        probe = match next_page {
+            Some(p) => p,
+            None => return Err(KernelError::UserMemoryFault),
+        };
+    }
+    Ok(())
+}
+
 // ── Stage 186E-prereq: VM/user-copy split-mut seam ─────────────────────────────
 //
 // Seam-based mirrors of `KernelState::copy_to_user` / `copy_from_user` /
@@ -610,6 +630,27 @@ impl crate::runtime::SharedKernel {
                 .checked_add(page_off)
                 .ok_or(KernelError::UserMemoryFault)
         }
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK mirror of
+    /// `KernelState::validate_user_range_writable_for_asid`.
+    ///
+    /// Same page walk (`walk_user_range_by_page`, the one owner), same leaf question, same
+    /// errors — only the acquisition differs: the rank-5 VM seam instead of a broad `&self`.
+    /// This is what lets an off-lock delivery producer pre-validate exactly the ranges the
+    /// broad producer pre-validates, so a deferred copy planned off the broad lock is
+    /// infallible for the same reason the broad one is.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn validate_user_range_writable_for_asid_split(
+        &self,
+        asid: Asid,
+        user_ptr: usize,
+        len: usize,
+    ) -> Result<(), KernelError> {
+        walk_user_range_by_page(user_ptr, len, |probe| {
+            self.validate_user_access_for_asid_split(asid, probe, true)
+                .map(|_| ())
+        })
     }
 
     #[cfg(feature = "hosted-dev")]

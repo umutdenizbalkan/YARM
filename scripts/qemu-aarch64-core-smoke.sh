@@ -123,6 +123,17 @@ if [[ "$YIELD_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_yield_oracle
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_yield_oracle=1"
 fi
 YIELD_LONE_ORACLE=${YIELD_LONE_ORACLE:-0}
+# 199E-A64CALL: default-off TERMINAL-FAULT oracle cell. Arms
+# `yarm.aarch64_terminal_fault_oracle=1`, which makes init take ONE deliberate unhandled read at
+# 0x0 so the U9-FT4 terminal-PageFault witness has a trigger of its own. Until 199E-A64CALL that
+# witness observed a DEFECT — init's `spawn_v5_cap` dereferencing a pointer the kernel had zeroed
+# out of x15 on every syscall return — and repairing that removed the only terminal fault any
+# AArch64 profile produced. The default cell now boots its service chain clean; U9-FT4 asserts,
+# unchanged and still fully positive, only in this cell.
+TERMINAL_FAULT_ORACLE=${TERMINAL_FAULT_ORACLE:-0}
+if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_terminal_fault_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.aarch64_terminal_fault_oracle=1"
+fi
 if [[ "$YIELD_LONE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_yield_lone_oracle="* ]]; then
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_yield_lone_oracle=1"
 fi
@@ -289,6 +300,18 @@ fi
 # U9-FT4: the AArch64 terminal PageFault route is now SPLIT. Assert the witness chain
 # POSITIVELY -- fatal-pattern absence is insufficient, and demonstrably so: the FT3 attempt
 # exited 0 while the faulting PC resumed. Every line below must hold exactly.
+# 199E-A64CALL: this witness now runs in its OWN CELL (`TERMINAL_FAULT_ORACLE=1`), not in the
+# default profile. NOTHING below is weakened — every assertion is byte-identical and still
+# positive. What changed is the TRIGGER. This chain used to be driven by a DEFECT: init's
+# `spawn_v5_cap` dereferenced a pointer the kernel had zeroed out of x15 on every syscall return
+# (the `REG_X18_TLS` lane addressed x15 instead of x18). That was never an armed proof, and it
+# also meant the AArch64 service chain could never run at all. Repairing it removed the only
+# terminal fault any AArch64 profile produced, so the witness was given a deliberate trigger —
+# `yarm.aarch64_terminal_fault_oracle=1`, one intentional unhandled read at 0x0 — and the default
+# cell now boots the service chain clean instead of dying inside init.
+if [[ "$TERMINAL_FAULT_ORACLE" != "1" ]]; then
+  echo "[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell"
+else
 u9ft4_fail=0
 u9ft4_log="$(tr '\r' '\n' <"$LOGFILE")"
 # `rg -c` prints nothing and exits non-zero when there are no matches, so normalise to 0.
@@ -363,6 +386,7 @@ if [[ "$u9ft4_fail" -eq 1 ]]; then
   exit 1
 fi
 echo "[ok] U9-FT4: AArch64 terminal PageFault route witness chain complete"
+fi
 
 # U9-RX4: the Stage-32B queued-plain split receive must deliver EXACTLY what the broad receive
 # delivers. Asserted POSITIVELY, because the defect this replaced was invisible to
@@ -374,6 +398,23 @@ u9rx4_count() {
   local n
   n="$(printf '%s\n' "$u9rx4_log" | rg -a -F -c -- "$1" || true)"
   printf '%s' "${n:-0}"
+}
+# Stage 199D-DW2 (COMPOSITION): regex counterpart of `u9rx4_count`, for the one assertion
+# whose anchor contains a field that is an ALLOCATION DETAIL rather than part of its subject.
+u9rx4_count_re() {
+  local n
+  n="$(printf '%s\n' "$u9rx4_log" | rg -a -c -e "$1" || true)"
+  printf '%s' "${n:-0}"
+}
+u9rx4_require_one_re() {
+  local want_desc="$1" pat="$2" n
+  n="$(u9rx4_count_re "$pat")"
+  if [[ "$n" != "1" ]]; then
+    echo "[error] U9-RX4: $want_desc -- expected exactly 1, got ${n:-0}: /$pat/"
+    u9rx4_fail=1
+  else
+    echo "[ok] U9-RX4: $want_desc"
+  fi
 }
 u9rx4_require_one() {
   local want_desc="$1" pat="$2" n
@@ -415,8 +456,15 @@ u9rx4_require_one "the reply cap is materialized exactly once" \
 # PM can now decode and answer.
 u9rx4_require_one "PM decodes the lifecycle query" 'PM_LIFECYCLE_QUERY_RECV tid=2'
 u9rx4_require_one "PM replies successfully" 'PM_LIFECYCLE_QUERY_REPLY tid=2 found=1'
-u9rx4_require_one "the reply resolves against the live one-shot object" \
-  'IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=0 generation=1'
+# Stage 199D-DW2 (COMPOSITION): the subject here is that PM's reply RESOLVES against the LIVE
+# one-shot object -- witnessed caller (tid=3), witnessed cap (65538), live generation (1). The
+# `reply_index` is the slot the allocator happened to hand out, not part of that subject, and any
+# co-armed proof that provisions an extra reply cap first (the 193D send-reply-cap oracle does
+# exactly that) shifts it. Anchoring on it made this assertion satisfiable only in the default
+# cell; matching tid + cap + generation and tolerating the slot keeps every part of the subject
+# and holds in every cell.
+u9rx4_require_one_re "the reply resolves against the live one-shot object" \
+  '^IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=[0-9]+ generation=1'
 # The one-shot is CONSUMED exactly once, on both sides, and the caller resumes once.
 u9rx4_require_one "the replier side of the one-shot is revoked once" \
   'IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538'
@@ -427,18 +475,51 @@ u9rx4_require_one "the caller side of the one-shot is revoked once" \
 # ACCEPT, and the wake moves from the legacy in-lock `IPC_REPLY_WAKE_CALLER` to the deferred
 # plain-delivery executor's own single wake. Both are the same event — the caller resuming exactly
 # once — so the witness accepts whichever owner performed it, and still requires exactly one.
+#
+# Stage 199D-DW2 (COMPOSITION): the previous split counter was
+# `DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_plain`, which carries NO tid and so counted
+# EVERY plain delivery in the boot, not just U9-RX4's caller. That was only ever satisfiable
+# because the co-armed proof workloads (`yarm.ipc_recv_proof=1` and the send oracles layered on
+# it) were dead on this bridge; once they run, each of them legitimately wakes its OWN blocked
+# waiter and the global count exceeds 1 without anything being wrong with U9-RX4.
+#
+# `IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2` is the exact, subject-scoped replacement and is
+# STRICTLY STRONGER than the pair it replaces: it names the witnessed caller, it is emitted once
+# per completed blocked-waiter delivery, and it is emitted by BOTH owners — the legacy in-lock
+# completion in `kernel/syscall.rs` and all three off-lock producers in `runtime.rs` — so
+# "whichever owner performed it" is still accepted with no owner enumerated. The legacy
+# `IPC_REPLY_WAKE_CALLER tid=2` count is kept alongside it purely as a reported breakdown.
 u9rx4_caller_wake_legacy="$(u9rx4_count 'IPC_REPLY_WAKE_CALLER tid=2')"
-u9rx4_caller_wake_split="$(u9rx4_count 'DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_plain')"
-if (( u9rx4_caller_wake_legacy + u9rx4_caller_wake_split != 1 )); then
-  echo "[error] U9-RX4: the blocked caller resumes exactly once -- expected exactly 1, got legacy=${u9rx4_caller_wake_legacy} split=${u9rx4_caller_wake_split}"
+u9rx4_caller_resume="$(u9rx4_count 'IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 ')"
+if (( u9rx4_caller_resume != 1 )); then
+  echo "[error] U9-RX4: the blocked caller resumes exactly once -- expected exactly 1, got resume=${u9rx4_caller_resume} (legacy_wake=${u9rx4_caller_wake_legacy})"
   u9rx4_fail=1
 else
-  echo "[ok] U9-RX4: the blocked caller resumes exactly once (legacy=${u9rx4_caller_wake_legacy} split=${u9rx4_caller_wake_split})"
+  echo "[ok] U9-RX4: the blocked caller resumes exactly once (resume=${u9rx4_caller_resume} legacy_wake=${u9rx4_caller_wake_legacy})"
 fi
 # The defect's own signatures must be gone.
 u9rx4_require_zero "no reply cap is lost to the u32::MAX sentinel" 'reply_cap=4294967295'
 u9rx4_require_zero "PM never fails to decode" 'PM_RECV_DECODE_FAIL'
-u9rx4_require_zero "no writeback rollback on the witnessed path" 'IPC_RECV_V2_ROLLBACK_OK'
+# Stage 199D-DW2 (COMPOSITION): "on the witnessed path" is the operative phrase. When
+# `yarm.ipc_recv_proof=1` is armed, the recv-v2 proof workload DELIBERATELY drives an undersized
+# receive buffer to prove the writeback rolls back and the materialized cap is restored — that is
+# the entire subject of `qemu-ipc-recv-v2-oracle-smoke.sh`, which REQUIRES the same marker. It
+# lands at `site=queued_split_undersize`, on the proof's own path, never on U9-RX4's. So the
+# armed cell excludes exactly that one deliberate site and keeps every other rollback site
+# (reply_split, blocked_meta, blocked_ordinary_cap, immediate_meta, queued_split_meta) at zero;
+# the unarmed default cell keeps the original unrestricted zero.
+if [[ "${IPC_RECV_PROOF:-0}" == "1" ]]; then
+  u9rx4_rollback_all="$(u9rx4_count 'IPC_RECV_V2_ROLLBACK_OK')"
+  u9rx4_rollback_probe="$(u9rx4_count 'IPC_RECV_V2_ROLLBACK_OK site=queued_split_undersize')"
+  if (( u9rx4_rollback_all - u9rx4_rollback_probe != 0 )); then
+    echo "[error] U9-RX4: no writeback rollback on the witnessed path -- expected 0, got $(( u9rx4_rollback_all - u9rx4_rollback_probe )) (total=${u9rx4_rollback_all} deliberate_proof_probe=${u9rx4_rollback_probe})"
+    u9rx4_fail=1
+  else
+    echo "[ok] U9-RX4: no writeback rollback on the witnessed path (deliberate recv-proof probe=${u9rx4_rollback_probe} excluded)"
+  fi
+else
+  u9rx4_require_zero "no writeback rollback on the witnessed path" 'IPC_RECV_V2_ROLLBACK_OK'
+fi
 u9rx4_require_zero "the reply cap is never used twice" 'IPC_REPLY_FAST_REVOKE_FAIL'
 u9rx4_require_zero "no cap materialization failure" 'IPC_RECV_CAP_MATERIALIZE_FAILED'
 # The U9-RX3 blocking-recv route runs here, on the deferral the class already owned.

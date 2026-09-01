@@ -864,12 +864,18 @@ pub(crate) struct ReplyCapMaterialization {
 /// `pinned_object` is `Some` exactly when the consumed envelope was a shared-region one and
 /// therefore still owes ONE rank-6 pin release. The reply-cap and ordinary-cap classes never
 /// carry one, so a `Some` is the caller's signal that it took a class it must not service.
+///
+/// 199G-C4 §3: `shared_region` carries the envelope's descriptor for the ONE class that does
+/// service a pinned envelope. That class does not release the reported pin — it takes over the
+/// pin's lifetime, so the refcount never transiently reaches zero — which is exactly why this
+/// consume reports the obligation instead of discharging it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TakenTransferEnvelopeFacts {
     pub(crate) source_object: CapObject,
     pub(crate) source_tid: u64,
     pub(crate) source_cap: CapId,
     pub(crate) pinned_object: Option<CapObject>,
+    pub(crate) shared_region: Option<crate::kernel::boot::TransferSharedRegion>,
 }
 
 /// U9-FT2 §2 — a typed refusal from the off-lock PageFault classifier.
@@ -2647,7 +2653,12 @@ impl SharedKernel {
     /// `{tid, asid, blocked_generation}` match, and an exact take clears the residue that
     /// belongs to that completion alone. Keeping the two identical is what makes the incoming
     /// task's resume lanes the same whether the dispatch ran in-lock or off-lock.
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    ///
+    /// 199E-A64RC: production-live, no feature gate. This is the rank-2 take the AArch64
+    /// POST-LOCK resume boundary uses to consume a remotely completed receive, and on that port
+    /// it is the ONLY thing that can supply the result — the publisher deliberately writes no
+    /// result register for AArch64. Gating it made the parked completion unreachable on a default
+    /// build. Its `IpcSend` sibling was already ungated for exactly this reason.
     ///
     /// Stage 199D-WA3A-R2-SEAL (item F): the task is located by the mark TOKEN's exact
     /// incarnation. A replacement incarnation that reused the numeric TID is not this
@@ -3314,11 +3325,12 @@ impl SharedKernel {
             // A shared-region envelope owes exactly ONE rank-6 pin release, which the caller
             // performs after this lock is dropped. Reporting it here — rather than releasing it
             // here — is what keeps the two domains strictly sequential instead of nested.
+            //
+            // 199G-C §2: the predicate is the SHARED pin policy, so this split release, the
+            // broad release and the (broad and split) stashes all read one decision.
             (
                 true,
-                envelope
-                    .shared_region
-                    .is_some()
+                KernelState::transfer_envelope_owes_pin(envelope.shared_region)
                     .then_some(envelope.source_object),
             )
         })
@@ -6042,6 +6054,7 @@ impl SharedKernel {
                     .shared_region
                     .is_some()
                     .then_some(envelope.source_object),
+                shared_region: envelope.shared_region,
             })
         })
     }
@@ -8094,6 +8107,918 @@ impl SharedKernel {
         self.with_memory_split_mut(|m| {
             KernelState::adjust_memory_object_pin_refcount_locked(m, object, -1)
         })
+    }
+
+    /// 199G-C §2 — rank 6: ACQUIRE the transferred object pin (once). The exact counterpart of
+    /// [`Self::sr_release_pin_split`], and deliberately placed beside it so the pair is one
+    /// readable policy rather than two seams discovered separately.
+    ///
+    /// One bounded `with_memory_split_mut` acquisition, no other rank held across it. Returns
+    /// the authority to release exactly this pin, or a typed refusal raised before any counter
+    /// moves. See `KernelState::acquire_transfer_pin_locked` for why this is outside the
+    /// AI_AGENT_RULES §14.4 D3 fence: it performs no PTE, map/unmap, TLB, frame-reclaim or
+    /// address-space work, so it owes no shootdown.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn sr_acquire_pin_split(
+        &self,
+        object: CapObject,
+    ) -> Result<crate::kernel::boot::TransferPinToken, crate::kernel::boot::TransferPinRefusal>
+    {
+        self.with_memory_split_mut(|m| KernelState::acquire_transfer_pin_locked(m, object))
+    }
+
+    /// 199G-C §2 — rank 6: release through the token, so the object released is provably the
+    /// object acquired. Same counter update as [`Self::sr_release_pin_split`].
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn sr_release_pin_token_split(&self, token: crate::kernel::boot::TransferPinToken) {
+        self.with_memory_split_mut(|m| KernelState::release_transfer_pin_locked(m, token))
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK PLAIN blocked-waiter delivery producer: the split counterpart
+    /// of `produce_blocked_waiter_plain_delivery`, and the direct-delivery step NR1's pre-lock
+    /// route needs when a send finds a recv-v2 blocked receiver.
+    ///
+    /// Same three answers as the broad producer, meaning the same things:
+    /// * `Ok(true)` — the post-work is stashed; the caller must NOT clear the waiter slot or
+    ///   wake inline, because the trap-entry drain does both.
+    /// * `Ok(false)` — not this class, or no drainer will run. **Nothing was consumed**, so the
+    ///   caller may still route the message any other way.
+    /// * `Err(_)` — a real Phase-A error raised AFTER the blocked state was consumed, exactly
+    ///   as the broad producer (and the legacy in-lock helper) behave.
+    ///
+    /// Rank order, each acquisition taken and fully released before the next:
+    /// 1. rank 1 — read `current_cpu` to address the per-CPU drainer flag and stash;
+    /// 2. rank 2 — consume the waiter's blocked state and read its ASID, in ONE acquisition, so
+    ///    no other holder can observe a waiter whose state is taken but whose ASID is unread;
+    /// 3. no lock — the shared plan owner decides projection, both length contracts, the meta
+    ///    encoding, the payload capture and the ranges to validate;
+    /// 4. rank 5 — pre-validate exactly those ranges, through the same page walk the broad
+    ///    producer uses, so the deferred copy is infallible for the same reason;
+    /// 5. per-CPU — stash the snapshot the drain will execute.
+    ///
+    /// The class predicate is asked FIRST and touches nothing, so a message belonging to
+    /// another class leaves the waiter exactly as it was found.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn produce_blocked_waiter_plain_delivery_split(
+        &self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<bool, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::dispatch_post_work::DispatchPostWork;
+        use crate::kernel::syscall::{
+            SyscallError, blocked_waiter_plain_delivery_class_matches,
+            plan_blocked_waiter_plain_delivery,
+        };
+
+        // (0) The class question — THE one owner, asked before anything is touched.
+        if !blocked_waiter_plain_delivery_class_matches(msg) {
+            return Ok(false);
+        }
+        // (1) rank 1 — only produce when a trap-entry drainer will run, exactly as the broad
+        // producer decides. Without a drainer the snapshot would never be executed.
+        let cpu_idx = self.current_cpu_split_read().0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+            || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+
+        // (2) rank 2 — consume the blocked state and read the ASID. The broad producer takes
+        // two separate rank-2 acquisitions for these two facts; one acquisition here is the
+        // only difference, and it is strictly tighter — nothing can run between the take and
+        // the read. The dispositions are deliberately identical to the broad producer's: a
+        // missing TCB or missing blocked state is `InvalidArgs` having consumed nothing, and a
+        // missing ASID is `InvalidArgs` with the state already consumed (the broad producer's
+        // `take` likewise precedes its `task_asid`). Changing that would be a delivery-policy
+        // change, which is not this pass's.
+        let taken = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == waiter_tid)?;
+            let state = tcb.blocked_recv_state.take()?;
+            Some((state, tcb.asid))
+        });
+        let (blocked_state, waiter_asid) = taken.ok_or(SyscallError::InvalidArgs)?;
+        let waiter_asid = waiter_asid.ok_or(SyscallError::InvalidArgs)?;
+
+        // (3) no lock — the shared plan.
+        let plan = plan_blocked_waiter_plain_delivery(
+            waiter_tid,
+            waiter_asid,
+            &blocked_state,
+            endpoint_idx,
+            msg,
+        )?;
+
+        // (4) rank 5 — pre-validate the planned ranges (no copy, no fault-in).
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            plan.writable.payload_ptr,
+            plan.writable.payload_len,
+        )
+        .map_err(SyscallError::from)?;
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            plan.writable.meta_ptr,
+            plan.writable.meta_len,
+        )
+        .map_err(SyscallError::from)?;
+
+        // (5) per-CPU stash — the drain executes it after this route returns.
+        // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+        // identical discipline to the broad producer's store.
+        unsafe {
+            crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx]
+                .store(DispatchPostWork::BlockedWaiterPlainDelivery(plan.snapshot));
+        }
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_plain waiter_tid={}",
+            waiter_tid
+        );
+        Ok(true)
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK ORDINARY cap-transfer blocked-waiter delivery producer: the
+    /// split counterpart of `produce_blocked_waiter_ordinary_cap_delivery`.
+    ///
+    /// Same three answers, meaning the same things, as the broad producer — and, critically, the
+    /// same envelope disposition on each: a payload fault leaves the envelope UNconsumed, while
+    /// a metadata fault happens after the single consume and leaves nothing minted to roll back.
+    /// That ordering is why the plan is two pieces rather than one.
+    ///
+    /// Rank order, each acquisition taken and fully released before the next:
+    /// 1. rank 1 — `current_cpu`, for the drainer flag and the stash;
+    /// 2. rank 2 — consume the blocked state and read the ASID in ONE acquisition;
+    /// 3. rank 2+4 — resolve the waiter's own receive endpoint from its saved `recv_cap`,
+    ///    exactly as the broad producer does;
+    /// 4. no lock — the shared pre-consume plan;
+    /// 5. rank 5 — validate the PAYLOAD range, BEFORE the envelope is touched;
+    /// 6. no lock — the shared metadata contract;
+    /// 7. rank 3 — consume the envelope once (its facts owner), then rank 2+4 to resolve the
+    ///    source capability and rank 2 for the receiver's cnode;
+    /// 8. rank 5 — validate the META range;
+    /// 9. no lock, then per-CPU — assemble the snapshot through the shared owner and stash it.
+    ///
+    /// The receiver-local capability is NOT minted here: `(source_tid, source_cap)` travels only
+    /// as the delegation-link parent edge and the executor's seam mints the receiver's own cap,
+    /// which is the whole reason a producer may run off the capability lock.
+    ///
+    /// One deliberate difference from the broad producer, stated rather than hidden: the broad
+    /// consume compares the envelope's endpoint object for equality, while the facts owner used
+    /// here compares its index. This route establishes the same fact by other means — it checks
+    /// the waiter's receive endpoint IS this endpoint index, and the caller resolved
+    /// `endpoint_idx` from a live, generation-checked endpoint capability during this very send,
+    /// which is also the send that stashed the envelope.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery_split(
+        &self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<bool, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::dispatch_post_work::DispatchPostWork;
+        use crate::kernel::syscall::{
+            SyscallError, blocked_waiter_ordinary_cap_delivery_class_matches,
+            check_blocked_recv_meta_contract, plan_blocked_waiter_delivery_prelude,
+            plan_blocked_waiter_ordinary_cap_snapshot,
+        };
+
+        // (0) The class question — THE one owner, asked before anything is touched.
+        if !blocked_waiter_ordinary_cap_delivery_class_matches(msg) {
+            return Ok(false);
+        }
+        // (1) rank 1 — no drainer, no snapshot: nothing would ever execute it.
+        let cpu_idx = self.current_cpu_split_read().0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+            || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+
+        // (2) rank 2 — the two waiter facts together; dispositions identical to the broad
+        // producer's (see the plain producer for why the ASID miss consumes).
+        let taken = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == waiter_tid)?;
+            let state = tcb.blocked_recv_state.take()?;
+            Some((state, tcb.asid))
+        });
+        let (blocked_state, waiter_asid) = taken.ok_or(SyscallError::InvalidArgs)?;
+        let waiter_asid = waiter_asid.ok_or(SyscallError::InvalidArgs)?;
+
+        // (3) rank 2+4 — the endpoint the envelope is bound to, read from the waiter's own saved
+        // receive capability, exactly as the broad producer reads it.
+        let recv_endpoint = self
+            .resolve_capability_for_task_split(waiter_tid, blocked_state.recv_cap)
+            .map_err(SyscallError::from)?
+            .object;
+        match recv_endpoint {
+            CapObject::Endpoint { index, .. } if index == endpoint_idx => {}
+            _ => return Err(SyscallError::InvalidCapability),
+        }
+
+        // (4) no lock — the shared pre-consume plan.
+        let prelude = plan_blocked_waiter_delivery_prelude(&blocked_state, msg)?;
+
+        // (5) rank 5 — the PAYLOAD range, BEFORE the envelope is consumed, so a payload fault
+        // leaves the transfer intact and the source capability recoverable.
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            prelude.payload_writable.0,
+            prelude.payload_writable.1,
+        )
+        .map_err(SyscallError::from)?;
+        // (6) no lock — the shared metadata contract, still before the consume.
+        check_blocked_recv_meta_contract(&blocked_state)?;
+
+        // (7) rank 3 — consume the envelope exactly once through its owner, then resolve the
+        // source capability (rank 2+4) and the receiver's cnode (rank 2). A `pinned_object`
+        // would mean a shared-region envelope reached the ordinary class; that is another
+        // class's message and this producer must not service it, so it refuses rather than
+        // guessing at a pin it does not own.
+        let facts = self
+            .take_transfer_envelope_facts_split(
+                msg.transferred_cap()
+                    .ok_or(SyscallError::InvalidCapability)?
+                    .0,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(waiter_tid),
+            )
+            .ok_or(SyscallError::InvalidCapability)?;
+        if facts.pinned_object.is_some() {
+            return Err(SyscallError::InvalidCapability);
+        }
+        let source_capability = self
+            .resolve_capability_for_task_split(facts.source_tid, facts.source_cap)
+            .map_err(SyscallError::from)?;
+        let receiver_cnode = self
+            .task_cnode_split(waiter_tid)
+            .ok_or(SyscallError::InvalidCapability)?;
+
+        // (8) rank 5 — the META range. The envelope is already consumed; nothing was minted, so
+        // there is nothing to roll back, exactly as in the broad producer.
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            prelude.meta_writable.0,
+            prelude.meta_writable.1,
+        )
+        .map_err(SyscallError::from)?;
+
+        // (9) the shared snapshot assembly, then the stash.
+        let snapshot = plan_blocked_waiter_ordinary_cap_snapshot(
+            waiter_tid,
+            waiter_asid,
+            &blocked_state,
+            endpoint_idx,
+            msg,
+            &prelude,
+            (
+                source_capability.object,
+                source_capability.rights(),
+                facts.source_tid,
+                facts.source_cap,
+                receiver_cnode,
+            ),
+        );
+        // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+        // identical discipline to the broad producer's store.
+        unsafe {
+            crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx]
+                .store(DispatchPostWork::BlockedWaiterOrdinaryCapDelivery(snapshot));
+        }
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid={}",
+            waiter_tid
+        );
+        Ok(true)
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK shared-region Phase A: the split counterpart of
+    /// `KernelState::shared_region_phase_a`.
+    ///
+    /// It consumes the shared-region envelope ONCE and TAKES OVER its object pin — the pin is
+    /// never released and re-acquired, so its refcount cannot transiently reach zero and the
+    /// region cannot be reclaimed underneath a transfer in flight. That is why the rank-3
+    /// consume reports the pin obligation rather than discharging it, and why the only rank-6
+    /// touch here is the release on the one rejection path that abandons the transfer.
+    ///
+    /// Rank order, each acquisition taken and fully released before the next:
+    /// 1. rank 3 — consume the envelope, receiving its descriptor and the pin obligation;
+    /// 2. no lock — the shared admission rule for the source object class;
+    /// 3. rank 6 — ONLY on rejection: release the pin this snapshot will not own;
+    /// 4. rank 2+4 — resolve the source capability ONCE, for its rights;
+    /// 5. no lock — the shared destination-rights attenuation;
+    /// 6. rank 2 — the receiver's cnode, ASID and process id.
+    ///
+    /// The result is the SAME `RecvBoundarySharedRegionSnapshot` the broad Phase A produces,
+    /// executed by the same origin-neutral transaction: this is one mechanism reached two ways,
+    /// not a second shared-region transfer.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn shared_region_phase_a_split(
+        &self,
+        handle: u64,
+        endpoint: CapObject,
+        endpoint_idx: usize,
+        receiver_tid: u64,
+        map_va: u64,
+        map_write: bool,
+        meta_ptr: u64,
+        msg: crate::kernel::ipc::Message,
+        origin_direct: bool,
+        recv_abi: crate::kernel::task::RecvAbiVariant,
+    ) -> Result<crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot, KernelError>
+    {
+        use crate::kernel::boot::shared_region_txn::{
+            RecvBoundarySharedRegionSnapshot, shared_region_admit_source_object,
+            shared_region_destination_rights,
+        };
+
+        // (1) rank 3 — the single consume. A pin, if any, is REPORTED and not released: this
+        // snapshot is about to own it.
+        let facts = self
+            .take_transfer_envelope_facts_split(
+                handle,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(receiver_tid),
+            )
+            .ok_or(KernelError::InvalidCapability)?;
+        let Some(descriptor) = facts.shared_region else {
+            // Not a shared-region envelope: it owed no pin, so there is nothing to release.
+            return Err(KernelError::WrongObject);
+        };
+        // (2)/(3) the shared admission rule; a rejected object's kept pin is released here, and
+        // here only.
+        let Some((object, object_generation)) =
+            shared_region_admit_source_object(facts.source_object)
+        else {
+            if let Some(pinned) = facts.pinned_object {
+                self.sr_release_pin_split(pinned);
+            }
+            return Err(KernelError::WrongObject);
+        };
+        // (4)/(5) source rights resolved ONCE, then the shared attenuation.
+        let source_capability =
+            self.resolve_capability_for_task_split(facts.source_tid, facts.source_cap)?;
+        let rights = shared_region_destination_rights(source_capability.rights(), map_write);
+        // (6) rank 2 — the receiver's generation-bearing authority.
+        let receiver_cnode = self
+            .task_cnode_split(receiver_tid)
+            .ok_or(KernelError::InvalidCapability)?;
+        let receiver_asid = self
+            .task_asid_opt_split_read(receiver_tid)
+            .ok_or(KernelError::UserMemoryFault)?;
+        let receiver_pid = self
+            .process_id_split_read(receiver_tid)
+            .unwrap_or(receiver_tid);
+        Ok(RecvBoundarySharedRegionSnapshot {
+            recv_abi,
+            receiver_cnode,
+            object,
+            object_generation,
+            rights,
+            descriptor,
+            source_tid: facts.source_tid,
+            source_cap: facts.source_cap,
+            receiver_tid,
+            receiver_pid,
+            receiver_asid,
+            endpoint,
+            map_va,
+            meta_ptr,
+            map_write,
+            pin_owned: true,
+            // Default: NOT a blocked endpoint waiter. The direct blocked-receiver producer sets
+            // this true after Phase A, exactly as it does on the broad path.
+            blocked_endpoint_waiter: false,
+            origin_direct,
+            msg,
+        })
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK SHARED-REGION blocked-waiter delivery producer: the split
+    /// counterpart of `produce_blocked_waiter_shared_region_delivery`.
+    ///
+    /// The shared-region class is the one direct delivery that carries an object pin, and its
+    /// correctness rests on that pin never lapsing: Phase A takes it over from the consumed
+    /// envelope rather than releasing and re-acquiring it. Nothing is mapped, minted or copied
+    /// here — the drain's origin-neutral `shared_region_execute` does all of it after this route
+    /// returns and the broad borrow would have been dropped.
+    ///
+    /// The authoritative acknowledgement is checked NON-destructively before any mutation and
+    /// consumed only after the post-work is published, exactly as in the broad producer: a
+    /// too-early or duplicate send is refused with the canonical retryable `WouldBlock` having
+    /// taken no blocked state, mapped and minted nothing, and left the transfer envelope for the
+    /// outer path to release so the sender can retry.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn produce_blocked_waiter_shared_region_delivery_split(
+        &self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<bool, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::syscall::{
+            SyscallError, blocked_waiter_shared_region_delivery_class_matches,
+            shared_region_live_armed, stash_shared_region_delivery,
+        };
+
+        // (0) The class question and the arming question — the same two owners the broad
+        // producer asks, in the same order, before anything is touched.
+        if !blocked_waiter_shared_region_delivery_class_matches(msg) {
+            return Ok(false);
+        }
+        let cpu_idx = self.current_cpu_split_read().0 as usize;
+        if !shared_region_live_armed(cpu_idx) {
+            return Ok(false);
+        }
+
+        // (1) Stage 198E3C1C — the AUTHORITATIVE ack gate, FAIL CLOSED before any mutation and
+        // checked non-destructively; the consume happens only after publication below.
+        #[cfg(feature = "shared-region-direct-oracle")]
+        if crate::kernel::boot::shared_region_direct_oracle_enabled()
+            && !crate::kernel::boot::shared_region_blocked_recv::matches_for_delivery(
+                waiter_tid,
+                endpoint_idx,
+            )
+        {
+            crate::yarm_log!(
+                "SHARED_REGION_DIRECT_DECLINE_NO_ACK tid={} endpoint={} result=retry",
+                waiter_tid,
+                endpoint_idx
+            );
+            return Err(SyscallError::WouldBlock);
+        }
+
+        // (2) rank 2 — consume the waiter's blocked state; its ABI travels into the snapshot and
+        // selects the final projection only.
+        let blocked_state = self
+            .with_task_tcbs_split_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == waiter_tid)
+                    .and_then(|tcb| tcb.blocked_recv_state.take())
+            })
+            .ok_or(SyscallError::InvalidArgs)?;
+        let recv_abi = blocked_state.recv_abi;
+
+        // (3) rank 2+4 — the endpoint the envelope is bound to, from the waiter's saved cap.
+        let recv_endpoint = self
+            .resolve_capability_for_task_split(waiter_tid, blocked_state.recv_cap)
+            .map_err(SyscallError::from)?
+            .object;
+        match recv_endpoint {
+            CapObject::Endpoint { index, .. } if index == endpoint_idx => {}
+            _ => return Err(SyscallError::InvalidCapability),
+        }
+
+        // (4) the shared Phase A: one consume, the pin taken over, rights attenuated once. The
+        // receiver's recv buffers supply the map VA and the metadata target; read-only for the
+        // primary live seal, matching the broad producer.
+        let mut snapshot = self
+            .shared_region_phase_a_split(
+                msg.transferred_cap()
+                    .ok_or(SyscallError::InvalidCapability)?
+                    .0,
+                recv_endpoint,
+                endpoint_idx,
+                waiter_tid,
+                blocked_state.payload_user_ptr as u64,
+                false,
+                blocked_state.meta_user_ptr as u64,
+                *msg,
+                true,
+                recv_abi,
+            )
+            .map_err(SyscallError::from)?;
+        // The receiver was consumed as a BLOCKED ENDPOINT WAITER: finalization must clear its
+        // blocked-return state + the endpoint waiter slot before waking (structural, not the
+        // origin marker).
+        snapshot.blocked_endpoint_waiter = true;
+        stash_shared_region_delivery(
+            cpu_idx,
+            snapshot,
+            endpoint_idx,
+            crate::kernel::boot::SharedRegionLiveOrigin::Direct,
+        );
+
+        // (5) the delivery is now committed to the drain — CONSUME the ack exactly once, so a
+        // duplicate send finds it consumed and fails closed above, and no pre-publication
+        // failure could have consumed it.
+        #[cfg(feature = "shared-region-direct-oracle")]
+        if crate::kernel::boot::shared_region_direct_oracle_enabled()
+            && !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(
+                waiter_tid,
+                endpoint_idx,
+            )
+        {
+            crate::yarm_log!(
+                "SHARED_REGION_DIRECT_ACK_CONSUME_RACE tid={} endpoint={}",
+                waiter_tid,
+                endpoint_idx
+            );
+        }
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_shared_region waiter_tid={}",
+            waiter_tid
+        );
+        Ok(true)
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK cnode-space provisioning: the split entry to THE provisioning
+    /// policy the broad `ensure_cnode_space` also calls.
+    ///
+    /// One bounded rank-4 acquisition. The capacity limits are read first, off that lock,
+    /// exactly as the broad entry reads them before taking it.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn ensure_cnode_space_split(
+        &self,
+        cnode: crate::kernel::capabilities::CNodeId,
+    ) -> Result<(), KernelError> {
+        let limits = self.runtime_capacity_config_split_read();
+        let max_total_cnode_slots = limits.max_total_cnode_slots;
+        let bounded = KernelState::normalize_requested_cnode_slots(
+            crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+            limits,
+        )?;
+        self.with_capability_state_split_mut(|capability| {
+            KernelState::ensure_cnode_space_locked(
+                capability,
+                cnode,
+                bounded,
+                max_total_cnode_slots,
+            )
+        })
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK REPLY-CAP blocked-waiter delivery producer: the split
+    /// counterpart of `produce_blocked_waiter_reply_cap_delivery`.
+    ///
+    /// The same shape and the same envelope disposition as the ordinary-cap producer — payload
+    /// range before the single consume, metadata range after — plus the two things the reply
+    /// class carries of its own: the transferred object must still be a LIVE `Reply`, and the
+    /// receiver's cspace must be provisioned here, because the executor's rank-4 mint does not
+    /// provision and would otherwise fail on a growable cspace.
+    ///
+    /// Nothing is minted and no reply record is touched: only the reply object's registry
+    /// coordinates and the receiver cnode travel in the snapshot, and the executor's seam does
+    /// the mint and the record binding together.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn produce_blocked_waiter_reply_cap_delivery_split(
+        &self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<bool, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::dispatch_post_work::DispatchPostWork;
+        use crate::kernel::syscall::{
+            SyscallError, blocked_waiter_reply_cap_delivery_class_matches,
+            check_blocked_recv_meta_contract, plan_blocked_waiter_delivery_prelude,
+            plan_blocked_waiter_reply_cap_snapshot,
+        };
+
+        // (0) The class question — THE one owner, asked before anything is touched.
+        if !blocked_waiter_reply_cap_delivery_class_matches(msg) {
+            return Ok(false);
+        }
+        // (1) rank 1 — no drainer, no snapshot: nothing would ever execute it.
+        let cpu_idx = self.current_cpu_split_read().0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+            || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+
+        // (2) rank 2 — the two waiter facts together; dispositions identical to the broad
+        // producer's, including that a missing ASID fails with the state already consumed.
+        let taken = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == waiter_tid)?;
+            let state = tcb.blocked_recv_state.take()?;
+            Some((state, tcb.asid))
+        });
+        let (blocked_state, waiter_asid) = taken.ok_or(SyscallError::InvalidArgs)?;
+        let waiter_asid = waiter_asid.ok_or(SyscallError::InvalidArgs)?;
+
+        // (3) rank 2+4 — the endpoint the envelope is bound to, from the waiter's saved cap.
+        let recv_endpoint = self
+            .resolve_capability_for_task_split(waiter_tid, blocked_state.recv_cap)
+            .map_err(SyscallError::from)?
+            .object;
+        match recv_endpoint {
+            CapObject::Endpoint { index, .. } if index == endpoint_idx => {}
+            _ => return Err(SyscallError::InvalidCapability),
+        }
+
+        // (4) no lock — the shared prelude.
+        let prelude = plan_blocked_waiter_delivery_prelude(&blocked_state, msg)?;
+
+        // (5) rank 5 — the PAYLOAD range, BEFORE the envelope is consumed.
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            prelude.payload_writable.0,
+            prelude.payload_writable.1,
+        )
+        .map_err(SyscallError::from)?;
+        // (6) no lock — the shared metadata contract, still before the consume.
+        check_blocked_recv_meta_contract(&blocked_state)?;
+
+        // (7) rank 3 — consume the envelope exactly once, then require the transferred object to
+        // be a `Reply` whose generation is still live. A `pinned_object` would mean a
+        // shared-region envelope reached this class; refuse rather than take a pin this producer
+        // does not own.
+        let facts = self
+            .take_transfer_envelope_facts_split(
+                msg.transferred_cap()
+                    .ok_or(SyscallError::InvalidCapability)?
+                    .0,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(waiter_tid),
+            )
+            .ok_or(SyscallError::InvalidCapability)?;
+        if facts.pinned_object.is_some() {
+            return Err(SyscallError::InvalidCapability);
+        }
+        let (reply_index, reply_generation) = match facts.source_object {
+            CapObject::Reply { index, generation } => (index, generation),
+            _ => return Err(SyscallError::WrongObject),
+        };
+        if !self.reply_object_live_split(reply_index, reply_generation) {
+            return Err(SyscallError::InvalidCapability);
+        }
+        // (8) rank 2 then rank 4 — the receiver's cnode, and its provisioning, so the
+        // executor's mint cannot fail on an unprovisioned growable cspace.
+        let receiver_cnode = self
+            .task_cnode_split(waiter_tid)
+            .ok_or(SyscallError::InvalidCapability)?;
+        self.ensure_cnode_space_split(receiver_cnode)
+            .map_err(SyscallError::from)?;
+
+        // (9) rank 5 — the META range. The envelope is consumed; nothing was minted, so there is
+        // nothing to roll back.
+        self.validate_user_range_writable_for_asid_split(
+            waiter_asid,
+            prelude.meta_writable.0,
+            prelude.meta_writable.1,
+        )
+        .map_err(SyscallError::from)?;
+
+        // (10) the shared snapshot assembly, then the stash.
+        let snapshot = plan_blocked_waiter_reply_cap_snapshot(
+            waiter_tid,
+            waiter_asid,
+            &blocked_state,
+            endpoint_idx,
+            msg,
+            &prelude,
+            &crate::kernel::cap_transfer_split::ReplyCapRecvSnapshot {
+                handle: msg.transferred_cap().map_or(0, |c| c.0),
+                endpoint: recv_endpoint,
+                reply_index,
+                reply_generation,
+                receiver_tid: waiter_tid,
+                receiver_cnode,
+            },
+        );
+        // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+        // identical discipline to the broad producer's store.
+        unsafe {
+            crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx]
+                .store(DispatchPostWork::BlockedWaiterReplyCapDelivery(snapshot));
+        }
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_reply_cap waiter_tid={}",
+            waiter_tid
+        );
+        Ok(true)
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK authoritative endpoint enqueue: the split entry to THE enqueue
+    /// the broad `ipc_send_routed` performs when the conservative Stage-4E screen declines.
+    ///
+    /// One bounded rank-3 acquisition. `Ok(false)` means the endpoint was full, which is the
+    /// blocking origin rather than a failure; `Err` means the endpoint was missing.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn ipc_endpoint_enqueue_authoritative_split(
+        &self,
+        endpoint_idx: usize,
+        msg: crate::kernel::ipc::Message,
+    ) -> Result<bool, KernelError> {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::ipc_endpoint_enqueue_authoritative_locked(ipc, endpoint_idx, msg)
+        })
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK recv-v2 blocked question: the split entry to THE predicate the
+    /// broad `is_task_recv_v2_blocked` also calls. One bounded rank-2 acquisition.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    #[must_use]
+    pub(crate) fn is_task_recv_v2_blocked_split_read(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| KernelState::task_is_recv_v2_blocked_locked(tcbs, tid))
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK endpoint-waiter read: which thread, if any, is parked on this
+    /// endpoint. One bounded rank-3 acquisition, read-only.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    #[must_use]
+    pub(crate) fn endpoint_waiter_tid_split_read(
+        &self,
+        endpoint_idx: usize,
+    ) -> Option<crate::kernel::ipc::ThreadId> {
+        self.with_ipc_split_mut(|ipc| ipc.endpoint_waiter_tid(endpoint_idx))
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK counterpart of `wake_waiter_for_endpoint`: take the endpoint's
+    /// waiter under rank 3, then wake it under rank 2/1 with rank 3 already released.
+    ///
+    /// The two-step shape is the lock-order requirement the broad owner documents, not a
+    /// convenience: `wake_tid_to_runnable` takes ranks below IPC, so it must never run while the
+    /// IPC lock is held.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn wake_waiter_for_endpoint_split(
+        &self,
+        cpu: CpuId,
+        endpoint_idx: usize,
+    ) -> Result<(), KernelError> {
+        let waiter = self.with_ipc_split_mut(|ipc| ipc.take_endpoint_waiter(endpoint_idx));
+        if let Some(waiter) = waiter {
+            crate::yarm_log!("SCHED_WAKE tid={}", waiter.tid.0);
+            self.wake_tid_to_runnable_split(cpu, waiter.tid)?;
+        }
+        Ok(())
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK waiting-receiver enqueue: the split entry to THE policy the
+    /// broad `ipc_try_send_to_plain_receiver_endpoint_only` also calls.
+    ///
+    /// One bounded rank-3 acquisition. Every decision belongs to the shared owner — above all
+    /// the re-verification of the receiver slot by COMPLETE identity, so a waiter cleared by a
+    /// timeout, or a replacement task that reused the numeric TID with a different ASID, cannot
+    /// have this send's message delivered to it.
+    ///
+    /// The wake is REPORTED as `EnqueuedWakeReceiver`, not performed: waking is a rank-1 action
+    /// the caller takes after this acquisition is released, exactly as the broad caller does.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only_split(
+        &self,
+        endpoint_idx: usize,
+        expected_receiver: crate::kernel::boot::ReceiverWaiterIdentity,
+        msg: crate::kernel::ipc::Message,
+    ) -> crate::kernel::boot::IpcEndpointSendResult {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::ipc_try_send_to_plain_receiver_endpoint_only_locked(
+                ipc,
+                endpoint_idx,
+                expected_receiver,
+                msg,
+            )
+        })
+    }
+
+    /// 199G-C4 §3 — the OFF-LOCK endpoint-only enqueue: the split entry to THE enqueue policy
+    /// the broad `ipc_try_send_queued_plain_endpoint_only` also calls.
+    ///
+    /// One bounded rank-3 acquisition and nothing else. Every decision — the waiter and
+    /// sender-waiter classification, the reply-cap exclusion, the endpoint-missing and
+    /// non-`Buffered` refusals, the bounded `endpoint.send(msg)` and its queue-full refusal —
+    /// belongs to the shared owner, so this cannot drift from the broad path: FIFO order, sparse
+    /// slots, framing and every `Ineligible` reason are identical by construction.
+    ///
+    /// `ReceiverWaiterFound` is returned, not acted on: whether that receiver can take a direct
+    /// delivery is a rank-2 question the caller must ask outside this acquisition, exactly as the
+    /// broad caller does.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn ipc_try_send_queued_plain_endpoint_only_split(
+        &self,
+        endpoint_idx: usize,
+        msg: crate::kernel::ipc::Message,
+    ) -> crate::kernel::boot::IpcEndpointSendResult {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::ipc_try_send_queued_plain_endpoint_only_locked(ipc, endpoint_idx, msg)
+        })
+    }
+
+    /// 199G-C4 §2 — the OFF-LOCK transfer-envelope stash: the split counterpart of
+    /// `KernelState::stash_transfer_envelope`, and the transaction NR1's pre-lock route needs
+    /// before it can carry a capability transfer.
+    ///
+    /// Rank order is strictly SEQUENTIAL, never nested — each domain is released before the next
+    /// is taken:
+    ///
+    /// 1. **rank 2 → 4** — resolve the sender's source capability, giving the frozen
+    ///    `source_object` the envelope will carry. A stale or missing capability refuses here,
+    ///    before anything is pinned or published.
+    /// 2. **rank 6 (read)** — for a `MemoryObject`, its length, which is the only fact the bound
+    ///    policy needs that the caller cannot compute.
+    /// 3. **pure** — `transfer_shared_region_bounds_ok`, THE shared descriptor policy, identical
+    ///    to the one the broad stash applies.
+    /// 4. **rank 6 (write)** — acquire the pin, and ONLY when `transfer_envelope_owes_pin` says
+    ///    this envelope owes one. Ordinary caps, reply caps, inline `MemoryObject`/`DmaRegion`
+    ///    sends and no-cap sends acquire nothing.
+    /// 5. **rank 3** — publish the envelope into the same table, with the same generation
+    ///    discipline, the broad stash uses.
+    ///
+    /// The rank-6 acquisition is released before rank 3 is taken, so the two domains are never
+    /// held together. If the publication then fails — no free slot — the pin is released exactly
+    /// once through the token, so a refused publication can never leave a pin behind.
+    ///
+    /// On success the caller owns the returned token and must transfer it to the settlement path:
+    /// `settle_blocked_send_envelope_split` already releases the owed pin on every terminal
+    /// outcome, and the shared-region transaction takes it over with no reference gap.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn stash_transfer_envelope_split(
+        &self,
+        source_tid: crate::kernel::ipc::ThreadId,
+        source_cap: CapId,
+        endpoint: CapObject,
+        receiver_tid: Option<crate::kernel::ipc::ThreadId>,
+        shared_region: Option<crate::kernel::boot::TransferSharedRegion>,
+    ) -> Result<StashedTransferEnvelope, TransferStashRefusal> {
+        use crate::kernel::boot::{MAX_TRANSFER_ENVELOPES, TransferEnvelope, TransferState};
+
+        // (1) rank 2 → 4: the frozen source object. Released before anything else is taken.
+        let source_object = self
+            .resolve_capability_for_task_split(source_tid.0, source_cap)
+            .map_err(|_| TransferStashRefusal::SourceCapUnresolved)?
+            .object;
+
+        // (2)+(3) the descriptor policy, for a shared-region envelope only.
+        if let Some(region) = shared_region {
+            // rank 6 read, released immediately.
+            let memory_object_len = match source_object {
+                CapObject::MemoryObject { id } => Some(
+                    self.with_memory_split_mut(|m| {
+                        m.memory_objects
+                            .iter()
+                            .flatten()
+                            .find(|entry| entry.id == id)
+                            .map(|entry| entry.len)
+                    })
+                    .ok_or(TransferStashRefusal::ObjectStale)?,
+                ),
+                _ => None,
+            };
+            crate::kernel::boot::transfer_shared_region_bounds_ok(
+                source_object,
+                region,
+                memory_object_len,
+            )
+            .map_err(|_| TransferStashRefusal::DescriptorRejected)?;
+        }
+
+        // (4) rank 6 write: acquire the pin, and only when the ONE policy says this envelope owes
+        // one. Released before rank 3 is taken below.
+        let pin = if KernelState::transfer_envelope_owes_pin(shared_region) {
+            Some(
+                self.sr_acquire_pin_split(source_object)
+                    .map_err(TransferStashRefusal::Pin)?,
+            )
+        } else {
+            None
+        };
+
+        // (5) rank 3: publish, with the broad stash's exact slot search and generation discipline
+        // — first free slot, generation incremented and never zero.
+        let published = self.with_ipc_split_mut(|ipc| {
+            for idx in 0..MAX_TRANSFER_ENVELOPES {
+                if ipc.transfer_envelopes[idx].is_some() {
+                    continue;
+                }
+                let mut generation = ipc.transfer_envelope_generations[idx].wrapping_add(1);
+                if generation == 0 {
+                    generation = 1;
+                }
+                ipc.transfer_envelope_generations[idx] = generation;
+                ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
+                    source_tid,
+                    source_cap,
+                    source_object,
+                    endpoint,
+                    receiver_tid,
+                    state: TransferState::Created,
+                    shared_region,
+                    generation,
+                });
+                ipc.telemetry.transfer_records_created =
+                    ipc.telemetry.transfer_records_created.saturating_add(1);
+                return u64::try_from(idx).ok().map(|i| (generation << 16) | i);
+            }
+            None
+        });
+
+        match published {
+            Some(handle) => Ok(StashedTransferEnvelope { handle, pin }),
+            None => {
+                // The envelope table is full. Release the pin EXACTLY once, through the token, so
+                // a refused publication leaves the refcount exactly as it was.
+                if let Some(token) = pin {
+                    self.sr_release_pin_token_split(token);
+                }
+                Err(TransferStashRefusal::TableFull)
+            }
+        }
     }
     /// Equivalent to `capability_object_live`: MemoryObject/DmaRegion are unconditionally live;
     /// Endpoint/Notification/Reply are generation-checked under the IPC lock (rank 3).
@@ -11282,6 +12207,42 @@ pub(crate) enum ReplyTimeoutOutcome {
     LostToTerminal,
     /// The token fire claim failed (stale/duplicate/cancelled): nothing was mutated.
     StaleToken,
+}
+
+/// 199G-C4 §2 — a published off-lock transfer envelope and, when the envelope owes one, the
+/// authority to release its object pin.
+///
+/// The token is `Option` for a reason the §1 derivation makes exact: an envelope owes a pin **iff
+/// it carries a shared-region descriptor**. An ordinary capability, a reply capability, an inline
+/// `MemoryObject`/`DmaRegion` send and a no-cap send all publish an envelope with `pin: None`, and
+/// a settlement that finds `None` must not release anything.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StashedTransferEnvelope {
+    /// The `(generation << 16) | index` handle the message carries as its transferred cap.
+    pub(crate) handle: u64,
+    /// Release authority for this envelope's pin, or `None` when it owes none.
+    pub(crate) pin: Option<crate::kernel::boot::TransferPinToken>,
+}
+
+/// 199G-C4 §2 — why an off-lock envelope stash refused. Every variant is raised with the pin
+/// balance exactly as it was on entry.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferStashRefusal {
+    /// The sender's source capability no longer resolves — a stale or revoked cap. Nothing was
+    /// pinned or published.
+    SourceCapUnresolved,
+    /// A `MemoryObject` descriptor named an object the memory table no longer carries.
+    ObjectStale,
+    /// The shared-region descriptor is not admissible for this object (zero length, overflow, or
+    /// outside the object's or the capability's window).
+    DescriptorRejected,
+    /// The rank-6 acquire refused — not pinnable, stale, or at the refcount ceiling.
+    Pin(crate::kernel::boot::TransferPinRefusal),
+    /// No free envelope slot. Any pin taken for this attempt was released exactly once before
+    /// this was returned, so the refcount is unchanged.
+    TableFull,
 }
 
 /// Stage 198E3B2A: the OFF-LOCK shared-region execution context. Implements the single

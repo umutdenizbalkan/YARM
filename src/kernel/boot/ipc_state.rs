@@ -4456,6 +4456,48 @@ impl KernelState {
         Ok(())
     }
 
+    /// 199G-C4 §3 — THE authoritative endpoint enqueue, over `&mut IpcSubsystem` (rank 3 only).
+    ///
+    /// This is the enqueue `ipc_send_routed` reaches when the conservative Stage-4E screen
+    /// declines: unconditional, so a send queues behind existing sender-waiters exactly as
+    /// before, and answering `false` — not an error — when the endpoint is full, because a full
+    /// endpoint is the blocking origin rather than a failure. A missing endpoint IS an error,
+    /// as it always was.
+    ///
+    /// The conservative screen and this are deliberately different questions with different
+    /// answers; extracting this one is what lets an off-lock route reach the same conclusion the
+    /// broad fallback reaches instead of stopping at the screen.
+    pub(crate) fn ipc_endpoint_enqueue_authoritative_locked(
+        ipc: &mut IpcSubsystem,
+        endpoint_idx: usize,
+        msg: Message,
+    ) -> Result<bool, KernelError> {
+        let Some(endpoint_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
+        else {
+            return Err(KernelError::WrongObject);
+        };
+        let endpoint = kernel_mut(endpoint_storage);
+        Ok(endpoint.send(msg).is_ok())
+    }
+
+    /// 199G-C4 §3 — THE recv-v2 blocked-waiter question, over `&[Option<TCB>]` (rank 2 only).
+    ///
+    /// `ipc_send_routed` asks it three times in three spellings; it is one question — does this
+    /// exact thread hold a saved blocked-receive state whose ABI variant is `RecvV2` — and the
+    /// answer decides whether a send delivers directly or enqueues. An off-lock route that asked
+    /// it differently would route the same send differently.
+    #[must_use]
+    pub(crate) fn task_is_recv_v2_blocked_locked(
+        tcbs: &[Option<crate::kernel::task::ThreadControlBlock>],
+        tid: u64,
+    ) -> bool {
+        tcbs.iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .and_then(|tcb| tcb.blocked_recv_state.as_ref())
+            .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
+    }
+
     /// Enqueue `msg` into the endpoint at `endpoint_idx` and wake any waiter.
     ///
     /// This is the canonical "supervisor notify" pattern used by fault reporting,
@@ -4826,81 +4868,99 @@ impl KernelState {
         endpoint_idx: usize,
         msg: Message,
     ) -> IpcEndpointSendResult {
+        // 199G-C4 §3: the body is THE endpoint-only enqueue policy, extracted so the broad entry
+        // here and the off-lock `SharedKernel` entry call one implementation. Only the
+        // acquisition wrapper differs — `with_ipc_state_mut` here, `with_ipc_split_mut` there.
         self.with_ipc_state_mut(|ipc| {
-            if endpoint_idx >= ipc.endpoints.len() {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
-                );
-            }
-            let receiver_waiter = ipc.endpoint_waiter_identity(endpoint_idx);
-            let has_sender_waiters = ipc.endpoint_sender_waiters[endpoint_idx]
-                .iter()
-                .any(Option::is_some);
-
-            match (receiver_waiter, has_sender_waiters) {
-                (Some(_), true) => {
-                    // Both receiver and sender waiters present: complex ordering state.
-                    // Fall back to the full IPC send path which handles this correctly.
-                    return IpcEndpointSendResult::Ineligible(
-                        IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                    );
-                }
-                (Some(receiver), false) => {
-                    // Receiver waiter present, no sender waiters.
-                    // TID comes from a locked ipc_state_lock read — no unlocked access needed.
-                    // Caller must check is_task_recv_v2_blocked (task_state_lock rank 3) before
-                    // calling ipc_try_send_to_plain_receiver_endpoint_only (ipc_state_lock rank 4).
-                    return IpcEndpointSendResult::ReceiverWaiterFound(receiver);
-                }
-                (None, true) => {
-                    return IpcEndpointSendResult::Ineligible(
-                        IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                    );
-                }
-                (None, false) => {
-                    // No waiters: fall through to Stage 4E queue-enqueue logic below.
-                }
-            }
-
-            // Stage 4E: FLAG_REPLY_CAP messages carry a kernel reply-cap handle and
-            // must use the full send path (reply-cap semantics require endpoint-side
-            // tracking not present here).
-            //
-            // FLAG_CAP_TRANSFER and FLAG_CAP_TRANSFER_PLAIN are safe for Stage 4E:
-            // stash_transfer_handle already moved the cap into the transfer-envelope
-            // table before this call, so the message's transferred_cap field is merely
-            // a numeric envelope handle.  For the no-receiver buffered-enqueue case,
-            // ipc_send_with_optional_deadline does an identical endpoint.send(msg),
-            // making Stage 4E a strict behavioural subset of the full path.
-            // The receiver's ipc_recv (or ipc_recv_timeout) falls through to the full
-            // path to materialise the cap, since Stage 4C/4D still rejects cap-transfer
-            // messages on the recv side.
-            if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
-                );
-            }
-
-            let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointMissing,
-                );
-            };
-            let endpoint = kernel_mut(endpoint_storage);
-            if endpoint.mode() != EndpointMode::Buffered {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::NonBufferedEndpoint,
-                );
-            }
-
-            if endpoint.send(msg).is_err() {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointQueueFull,
-                );
-            }
-
-            IpcEndpointSendResult::Enqueued
+            Self::ipc_try_send_queued_plain_endpoint_only_locked(ipc, endpoint_idx, msg)
         })
+    }
+
+    /// 199G-C4 §3 — THE endpoint-only enqueue policy, over `&mut IpcSubsystem` (rank 3 only).
+    ///
+    /// Extracted verbatim from the broad entry above so there is one implementation of: the
+    /// waiter/sender-waiter classification and its `Ineligible` reasons, the reply-cap exclusion,
+    /// the endpoint-missing and non-`Buffered` refusals, and the bounded `endpoint.send(msg)`
+    /// with its queue-full refusal. FIFO order, sparse-slot behaviour, message framing and every
+    /// refusal code are the endpoint primitive's, unchanged.
+    pub(crate) fn ipc_try_send_queued_plain_endpoint_only_locked(
+        ipc: &mut IpcSubsystem,
+        endpoint_idx: usize,
+        msg: Message,
+    ) -> IpcEndpointSendResult {
+        if endpoint_idx >= ipc.endpoints.len() {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+            );
+        }
+        let receiver_waiter = ipc.endpoint_waiter_identity(endpoint_idx);
+        let has_sender_waiters = ipc.endpoint_sender_waiters[endpoint_idx]
+            .iter()
+            .any(Option::is_some);
+
+        match (receiver_waiter, has_sender_waiters) {
+            (Some(_), true) => {
+                // Both receiver and sender waiters present: complex ordering state.
+                // Fall back to the full IPC send path which handles this correctly.
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
+                );
+            }
+            (Some(receiver), false) => {
+                // Receiver waiter present, no sender waiters.
+                // TID comes from a locked ipc_state_lock read — no unlocked access needed.
+                // Caller must check is_task_recv_v2_blocked (task_state_lock rank 3) before
+                // calling ipc_try_send_to_plain_receiver_endpoint_only (ipc_state_lock rank 4).
+                return IpcEndpointSendResult::ReceiverWaiterFound(receiver);
+            }
+            (None, true) => {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
+                );
+            }
+            (None, false) => {
+                // No waiters: fall through to Stage 4E queue-enqueue logic below.
+            }
+        }
+
+        // Stage 4E: FLAG_REPLY_CAP messages carry a kernel reply-cap handle and
+        // must use the full send path (reply-cap semantics require endpoint-side
+        // tracking not present here).
+        //
+        // FLAG_CAP_TRANSFER and FLAG_CAP_TRANSFER_PLAIN are safe for Stage 4E:
+        // stash_transfer_handle already moved the cap into the transfer-envelope
+        // table before this call, so the message's transferred_cap field is merely
+        // a numeric envelope handle.  For the no-receiver buffered-enqueue case,
+        // ipc_send_with_optional_deadline does an identical endpoint.send(msg),
+        // making Stage 4E a strict behavioural subset of the full path.
+        // The receiver's ipc_recv (or ipc_recv_timeout) falls through to the full
+        // path to materialise the cap, since Stage 4C/4D still rejects cap-transfer
+        // messages on the recv side.
+        if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+            );
+        }
+
+        let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointMissing,
+            );
+        };
+        let endpoint = kernel_mut(endpoint_storage);
+        if endpoint.mode() != EndpointMode::Buffered {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+            );
+        }
+
+        if endpoint.send(msg).is_err() {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointQueueFull,
+            );
+        }
+
+        IpcEndpointSendResult::Enqueued
     }
 
     /// Stage 193E (BROAD-IPC DECOMPOSITION): the IpcSend PLAIN no-waiter enqueue boundary
@@ -5104,13 +5164,9 @@ impl KernelState {
     /// Return true if the task identified by `tid` is blocked on a recv-v2 operation.
     /// Acquires task_state_lock (rank 3). Must be called before ipc_state_lock (rank 4).
     pub(crate) fn is_task_recv_v2_blocked(&self, tid: u64) -> bool {
-        self.with_tcbs(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .and_then(|tcb| tcb.blocked_recv_state.as_ref())
-                .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
-        })
+        // 199G-C4 §3: one owner for the recv-v2 blocked question; this entry supplies the
+        // broad acquisition, the off-lock entry supplies the rank-2 seam.
+        self.with_tcbs(|tcbs| Self::task_is_recv_v2_blocked_locked(tcbs, tid))
     }
 
     /// Stage 4F: plain send to a waiting legacy (non-recv-v2) receiver on a buffered endpoint.
@@ -5132,63 +5188,90 @@ impl KernelState {
         expected_receiver: ReceiverWaiterIdentity,
         msg: Message,
     ) -> IpcEndpointSendResult {
+        // 199G-C4 §3: the body is THE waiting-receiver enqueue policy, extracted so the broad
+        // entry here and the off-lock `SharedKernel` entry call one implementation. Only the
+        // acquisition wrapper differs.
         self.with_ipc_state_mut(|ipc| {
-            if endpoint_idx >= ipc.endpoints.len() {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
-                );
-            }
-            // Re-verify receiver slot by COMPLETE identity (Stage 198E3B2B2): a timeout may have
-            // cleared it, or a replacement task may have reused the numeric TID with a different ASID,
-            // between the pre-check and this lock — numeric TID alone must not authorize the clear.
-            if ipc.endpoint_waiter_identity(endpoint_idx) != Some(expected_receiver) {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
-                );
-            }
-            // Defense-in-depth: sender waiters should have been screened out by
-            // ipc_try_send_queued_plain_endpoint_only returning ReceiverWaiterFound only when
-            // no sender waiters are present. Re-check under lock for safety.
-            if ipc.endpoint_sender_waiters[endpoint_idx]
-                .iter()
-                .any(Option::is_some)
-            {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                );
-            }
-            let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
-                | Message::FLAG_CAP_TRANSFER_PLAIN
-                | Message::FLAG_REPLY_CAP;
-            if (msg.flags & split_unsafe_flags) != 0 || msg.transferred_cap().is_some() {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
-                );
-            }
-            let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointMissing,
-                );
-            };
-            let endpoint = kernel_mut(endpoint_storage);
-            if endpoint.mode() != EndpointMode::Buffered {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::NonBufferedEndpoint,
-                );
-            }
-            if endpoint.send(msg).is_err() {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointQueueFull,
-                );
-            }
-            // Clear receiver from waiters by the EXACT identity re-verified above; wake outside lock.
-            ipc.clear_endpoint_waiter_if_identity(endpoint_idx, expected_receiver);
-            crate::yarm_log!(
-                "IPC_SEND_SPLIT_ENQUEUED_WAKE_RECEIVER receiver_tid={}",
-                expected_receiver.tid.0
-            );
-            IpcEndpointSendResult::EnqueuedWakeReceiver(expected_receiver.tid)
+            Self::ipc_try_send_to_plain_receiver_endpoint_only_locked(
+                ipc,
+                endpoint_idx,
+                expected_receiver,
+                msg,
+            )
         })
+    }
+
+    /// 199G-C4 §3 — THE waiting-receiver enqueue policy, over `&mut IpcSubsystem` (rank 3 only).
+    ///
+    /// Extracted so there is one implementation of the decisions that make this send safe: the
+    /// re-verification of the receiver slot by COMPLETE identity (a timeout may have cleared it,
+    /// or a replacement task may have reused the numeric TID with a different ASID, since the
+    /// pre-check — numeric TID alone must never authorize the clear), the defence-in-depth
+    /// sender-waiter re-check, the split-unsafe flag exclusion, the endpoint refusals, the
+    /// bounded send, and the slot clear keyed on that same re-verified identity.
+    ///
+    /// The wake is REPORTED, not performed: it is a rank-1 action the caller takes outside this
+    /// acquisition.
+    pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only_locked(
+        ipc: &mut IpcSubsystem,
+        endpoint_idx: usize,
+        expected_receiver: ReceiverWaiterIdentity,
+        msg: Message,
+    ) -> IpcEndpointSendResult {
+        if endpoint_idx >= ipc.endpoints.len() {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+            );
+        }
+        // Re-verify receiver slot by COMPLETE identity (Stage 198E3B2B2): a timeout may have
+        // cleared it, or a replacement task may have reused the numeric TID with a different ASID,
+        // between the pre-check and this lock — numeric TID alone must not authorize the clear.
+        if ipc.endpoint_waiter_identity(endpoint_idx) != Some(expected_receiver) {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
+            );
+        }
+        // Defense-in-depth: sender waiters should have been screened out by
+        // ipc_try_send_queued_plain_endpoint_only returning ReceiverWaiterFound only when
+        // no sender waiters are present. Re-check under lock for safety.
+        if ipc.endpoint_sender_waiters[endpoint_idx]
+            .iter()
+            .any(Option::is_some)
+        {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::SenderWaiterPresent,
+            );
+        }
+        let split_unsafe_flags =
+            Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN | Message::FLAG_REPLY_CAP;
+        if (msg.flags & split_unsafe_flags) != 0 || msg.transferred_cap().is_some() {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+            );
+        }
+        let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointMissing,
+            );
+        };
+        let endpoint = kernel_mut(endpoint_storage);
+        if endpoint.mode() != EndpointMode::Buffered {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+            );
+        }
+        if endpoint.send(msg).is_err() {
+            return IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::EndpointQueueFull,
+            );
+        }
+        // Clear receiver from waiters by the EXACT identity re-verified above; wake outside lock.
+        ipc.clear_endpoint_waiter_if_identity(endpoint_idx, expected_receiver);
+        crate::yarm_log!(
+            "IPC_SEND_SPLIT_ENQUEUED_WAKE_RECEIVER receiver_tid={}",
+            expected_receiver.tid.0
+        );
+        IpcEndpointSendResult::EnqueuedWakeReceiver(expected_receiver.tid)
     }
 
     /// Apply the deferred receiver-wake plan returned by ipc_try_send_to_plain_receiver_endpoint_only.
@@ -6021,13 +6104,9 @@ impl KernelState {
             );
             // Phase 2: confirm recv-v2 under task_state_lock (rank 3) before
             // re-acquiring ipc_state_lock (rank 4) in Phase 4.
-            let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                    .and_then(|tcb| tcb.blocked_recv_state.as_ref())
-                    .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
-            });
+            // 199G-C4 §3: one owner for the recv-v2 blocked question.
+            let waiter_recv_v2_blocked =
+                self.with_tcbs(|tcbs| Self::task_is_recv_v2_blocked_locked(tcbs, waiter_tid.0));
             if waiter_recv_v2_blocked {
                 // Stage 188F: dispatch the reply delivery to the blocked recv-v2
                 // caller through the 188B/188C/188D dispatch-return producers
@@ -6621,13 +6700,9 @@ impl KernelState {
                 });
                 // Phase 2: check recv-v2 under task_state_lock (rank 3), outside
                 // ipc_state_lock (rank 4), to preserve lock-rank ordering.
-                let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
-                    tcbs.iter()
-                        .flatten()
-                        .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                        .and_then(|tcb| tcb.blocked_recv_state.as_ref())
-                        .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
-                });
+                // 199G-C4 §3: one owner for the recv-v2 blocked question.
+                let waiter_recv_v2_blocked =
+                    self.with_tcbs(|tcbs| Self::task_is_recv_v2_blocked_locked(tcbs, waiter_tid.0));
                 if waiter_recv_v2_blocked {
                     // Phase 3: complete delivery outside all locks (TrapFrame/user-memory write).
                     crate::yarm_log!(
@@ -6706,13 +6781,9 @@ impl KernelState {
                 msg.len,
                 msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
             );
-            let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                    .and_then(|tcb| tcb.blocked_recv_state.as_ref())
-                    .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
-            });
+            // 199G-C4 §3: one owner for the recv-v2 blocked question.
+            let waiter_recv_v2_blocked =
+                self.with_tcbs(|tcbs| Self::task_is_recv_v2_blocked_locked(tcbs, waiter_tid.0));
             if waiter_recv_v2_blocked {
                 match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
                     Ok(()) => {
@@ -6739,14 +6810,10 @@ impl KernelState {
                 }
             }
         }
+        // 199G-C4 §3: the authoritative enqueue, shared with the off-lock route so both reach
+        // the same conclusion the conservative Stage-4E screen declines to reach.
         let queued = self.with_ipc_state_mut(|ipc| {
-            let Some(endpoint_storage) =
-                ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
-            else {
-                return Err(KernelError::WrongObject);
-            };
-            let endpoint = kernel_mut(endpoint_storage);
-            Ok(endpoint.send(msg).is_ok())
+            Self::ipc_endpoint_enqueue_authoritative_locked(ipc, endpoint_idx, msg)
         })?;
         if !queued {
             crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);

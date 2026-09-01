@@ -112,42 +112,66 @@ impl KernelState {
         let limits = self.runtime_capacity_config();
         let max_total_cnode_slots = limits.max_total_cnode_slots;
         let bounded_slot_capacity = Self::normalize_requested_cnode_slots(slot_capacity, limits)?;
+        // 199G-C4 §3: the rank-4 half is shared with the off-lock entry; only the acquisition
+        // and the capacity read differ.
         self.with_capability_state_mut(|capability| {
-            if capability
-                .cnode_spaces
-                .iter()
-                .flatten()
-                .any(|space| space.id == cnode)
-            {
-                return Ok(());
-            }
-            let reserved_slots: usize = capability
-                .cnode_spaces
-                .iter()
-                .flatten()
-                .map(|space| space.slot_capacity)
-                .sum();
-            if reserved_slots.saturating_add(bounded_slot_capacity) > max_total_cnode_slots {
-                return Err(KernelError::CapabilityFull);
-            }
-
-            if let Some(slot) = capability
-                .cnode_spaces
-                .iter_mut()
-                .find(|slot| slot.is_none())
-            {
-                let cspace = CapabilitySpace::try_with_slots(bounded_slot_capacity)
-                    .map_err(|_| KernelError::CapabilityFull)?;
-                *slot = Some(CNodeSpace {
-                    id: cnode,
-                    slot_capacity: bounded_slot_capacity,
-                    cspace: store_kernel_value(cspace),
-                });
-                Ok(())
-            } else {
-                Err(KernelError::TaskTableFull)
-            }
+            Self::ensure_cnode_space_locked(
+                capability,
+                cnode,
+                bounded_slot_capacity,
+                max_total_cnode_slots,
+            )
         })
+    }
+
+    /// 199G-C4 §3 — THE cnode-space provisioning policy, over `&mut CapabilitySubsystem`
+    /// (rank 4 only).
+    ///
+    /// Already-provisioned is success; the global slot budget is honoured before any
+    /// allocation; a full space table is `TaskTableFull` rather than a silent no-op. The broad
+    /// entry above and the off-lock `SharedKernel` entry supply different acquisitions and call
+    /// this, so a reply-cap delivery planned off the broad lock cannot provision a receiver's
+    /// cspace by different rules than the broad one would.
+    pub(crate) fn ensure_cnode_space_locked(
+        capability: &mut CapabilitySubsystem,
+        cnode: CNodeId,
+        bounded_slot_capacity: usize,
+        max_total_cnode_slots: usize,
+    ) -> Result<(), KernelError> {
+        if capability
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .any(|space| space.id == cnode)
+        {
+            return Ok(());
+        }
+        let reserved_slots: usize = capability
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .map(|space| space.slot_capacity)
+            .sum();
+        if reserved_slots.saturating_add(bounded_slot_capacity) > max_total_cnode_slots {
+            return Err(KernelError::CapabilityFull);
+        }
+
+        if let Some(slot) = capability
+            .cnode_spaces
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        {
+            let cspace = CapabilitySpace::try_with_slots(bounded_slot_capacity)
+                .map_err(|_| KernelError::CapabilityFull)?;
+            *slot = Some(CNodeSpace {
+                id: cnode,
+                slot_capacity: bounded_slot_capacity,
+                cspace: store_kernel_value(cspace),
+            });
+            Ok(())
+        } else {
+            Err(KernelError::TaskTableFull)
+        }
     }
 
     pub(crate) fn cnode_slot_capacity(&self, cnode: CNodeId) -> Option<usize> {

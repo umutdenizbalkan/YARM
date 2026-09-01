@@ -3,6 +3,46 @@
 
 use super::*;
 
+/// 199G-C §2 — proof that ONE transfer-object pin was acquired, and the authority to release
+/// exactly that one.
+///
+/// Unforgeable: the field is private to this module and the only constructor is
+/// [`KernelState::acquire_transfer_pin_locked`], which mints a token only after it has actually
+/// incremented the refcount. So a token cannot name a pin that was never taken, and a release
+/// driven by a token cannot underflow a counter this acquire never raised.
+///
+/// It is `Copy` for the same reason every other by-value proof in the split transactions is:
+/// the transaction records must be snapshottable. Single-use is enforced by the ENVELOPE
+/// lifecycle — an envelope owes exactly one pin and is consumed exactly once — not by move
+/// semantics, which is the same discipline `take_transfer_envelope`'s `-1` has always relied on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransferPinToken {
+    object: CapObject,
+}
+
+impl TransferPinToken {
+    /// The exact object whose pin this token releases.
+    #[must_use]
+    pub(crate) const fn object(self) -> CapObject {
+        self.object
+    }
+}
+
+/// 199G-C §2 — why an acquire refused. Every variant is raised BEFORE any mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferPinRefusal {
+    /// Not a pinnable class. `MemoryObject` and `DmaRegion` are the only objects that carry a
+    /// `pin_refcount`; every other capability class reaches the pin path as a no-op, which is
+    /// why this is a distinct answer from a failure.
+    NotPinnable,
+    /// No live memory object carries this id any more — a stale or already-reclaimed object.
+    Stale,
+    /// The refcount is at `u32::MAX`. The broad path SATURATES here, silently returning a pin
+    /// the matching release would then under-drop; the split acquire refuses instead, before
+    /// touching the counter.
+    Overflow,
+}
+
 impl KernelState {
     pub(crate) fn memory_object_slot_by_id(&self, id: u64) -> Option<usize> {
         self.with_memory_state(|memory| {
@@ -169,6 +209,82 @@ impl KernelState {
                     memory_object.pin_refcount.saturating_sub((-delta) as u32);
             }
         }
+    }
+
+    /// 199G-C §2 — THE rank-6 pin ACQUIRE, and the exact counterpart of the `-1` that
+    /// `take_transfer_envelope` and `sr_release_pin_split` perform.
+    ///
+    /// Reachable through `SharedKernel::with_memory_split_mut` (rank 6 only), exactly as the
+    /// release already is. What it does, in full:
+    ///
+    /// 1. classify the object — only `MemoryObject` / `DmaRegion` carry a `pin_refcount`;
+    /// 2. revalidate that exact object id against the live memory table;
+    /// 3. CHECKED increment;
+    /// 4. mint the release authority.
+    ///
+    /// What it does NOT do, and what makes the AI_AGENT_RULES §14.4 D3 fence inapplicable: no
+    /// page-table read or write, no map or unmap, no TLB operation, no frame allocation or
+    /// reclaim, no address-space or cross-address-space inspection, and no scheduler / IPC /
+    /// capability mutation while rank 6 is held. It moves one `u32` in `MemorySubsystem` and
+    /// nothing else. The fence governs a seam that must reach a shootdown before reclaiming a
+    /// frame; a pin raises a refcount and reclaims nothing, so there is no shootdown for it to
+    /// owe. (It is also not a §14.5 live-wiring: `with_memory_split_mut` was already live for
+    /// this very counter in the release direction.)
+    ///
+    /// The one deliberate divergence from the broad `+1` is the overflow answer. The broad path
+    /// `saturating_add`s, so at `u32::MAX` it hands back a pin the matching `-1` would then
+    /// under-drop; this refuses before mutation instead. Refusing is the fail-safe direction —
+    /// the send fails and no envelope is created — whereas saturating silently breaks the
+    /// pairing.
+    pub(crate) fn acquire_transfer_pin_locked(
+        memory: &mut MemorySubsystem,
+        object: CapObject,
+    ) -> Result<TransferPinToken, TransferPinRefusal> {
+        let id = match object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return Err(TransferPinRefusal::NotPinnable),
+        };
+        let slot = memory
+            .memory_objects
+            .iter()
+            .position(|entry| entry.is_some_and(|mem| mem.id == id))
+            .ok_or(TransferPinRefusal::Stale)?;
+        let memory_object = memory.memory_objects[slot]
+            .as_mut()
+            .ok_or(TransferPinRefusal::Stale)?;
+        // Checked, and checked BEFORE the store: on refusal the counter is untouched.
+        let next = memory_object
+            .pin_refcount
+            .checked_add(1)
+            .ok_or(TransferPinRefusal::Overflow)?;
+        memory_object.pin_refcount = next;
+        Ok(TransferPinToken { object })
+    }
+
+    /// 199G-C §2 — the release half driven by a token, so a release cannot name an object no
+    /// acquire ever pinned. Delegates to the SAME counter update the broad `-1` uses; the token
+    /// only decides *which* object, never *whether*.
+    pub(crate) fn release_transfer_pin_locked(
+        memory: &mut MemorySubsystem,
+        token: TransferPinToken,
+    ) {
+        Self::adjust_memory_object_pin_refcount_locked(memory, token.object(), -1);
+    }
+
+    /// 199G-C §2 — THE pin policy, shared by the broad and split envelope stashes.
+    ///
+    /// A transfer envelope owes exactly one object pin **iff it carries a shared-region
+    /// descriptor** — not because it carries a transfer capability. Every other transfer class
+    /// (an ordinary Endpoint or Notification cap, a Reply cap, and even a `MemoryObject` /
+    /// `DmaRegion` cap sent with a payload small enough to take an inline arm) creates an
+    /// envelope with no pin at all. `stash_transfer_envelope`'s `+1` and
+    /// `take_transfer_envelope`'s `-1` are both already spelled this way; naming it once is what
+    /// stops the split stash from drifting into pinning "all transfer caps".
+    #[must_use]
+    pub(crate) const fn transfer_envelope_owes_pin(
+        shared_region: Option<TransferSharedRegion>,
+    ) -> bool {
+        shared_region.is_some()
     }
 
     /// Stage 198E3B2A: `&MemorySubsystem` physical-base lookup of a frozen shared-region object for

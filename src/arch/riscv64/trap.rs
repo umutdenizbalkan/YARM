@@ -697,7 +697,9 @@ pub fn handle_riscv_trap_entry_shared(
     {
         let is_timer = matches!(decode_trap_context(context), TrapEvent::TimerInterrupt);
         match crate::kernel::syscall_split::try_split_timer_dispatch(shared, cpu, is_timer) {
-            crate::kernel::syscall_split::SplitDispatchDisposition::PostWorkCommitted => {
+            crate::kernel::syscall_split::SplitDispatchDisposition::PostWorkCommitted {
+                ..
+            } => {
                 post_work_committed = true;
             }
             crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
@@ -766,11 +768,20 @@ pub fn handle_riscv_trap_entry_shared(
     // `d2_recv_dispatch_step_mut`, `direct_dispatch_resume_incoming`), live since U4. NR 2 is
     // deliberately NOT added — that is a separate class with its own witness, and §2 says not to
     // disturb its admission.
+    // 199G-C4 §1: IpcSend (NR 1) joins the RISC-V whitelist. The route is
+    // architecture-neutral, but on RISC-V it is reachable only for an NR listed here, so
+    // without this line NR 1 would keep its terminal broad edge on this architecture no matter
+    // what the route admits. What the class needs from RISC-V it has: the post-work drain below
+    // (which owns the delivery executors and the U6 blocking-send commit) and the homologous
+    // D2-SEND drain after it, both live since U4/U6. And `sepc` is pre-advanced by the bridge
+    // before this point, so a parked sender's captured context already names the instruction
+    // after its `ecall`.
     let split_eligible = is_syscall
         && (nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
             || nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
+            || nr == crate::kernel::syscall::SYSCALL_IPC_SEND_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -833,6 +844,31 @@ pub fn handle_riscv_trap_entry_shared(
                 cpu.0
             );
             queue_advance_committed = true;
+        }
+        // 199G-C4 §2 — the POST-WORK committed disposition, the RISC-V cell of the same
+        // control flow the shared bridge runs: skip the broad dispatcher exactly once and fall
+        // through — no early return — to the post-work drain below, which owns both the
+        // delivery executors and the U6 blocking-send commit.
+        //
+        // `finalize_syscall` is the route's own answer. RISC-V's ret lanes are written by the
+        // canonical return path rather than by an explicit finalize call, so a completed send
+        // needs nothing extra here; a PARKED sender needs the opposite — no result written on
+        // its behalf — and gets it, because this arm writes none either way.
+        if let crate::kernel::syscall_split::SplitDispatchDisposition::PostWorkCommitted {
+            finalize_syscall,
+        } = disposition
+        {
+            crate::yarm_log!(
+                "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu={} result=post_work_committed finalized={}",
+                nr,
+                cpu.0,
+                u8::from(finalize_syscall)
+            );
+            crate::yarm_log!(
+                "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=post_work_committed",
+                cpu.0
+            );
+            post_work_committed = true;
         }
         if let crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) =
             disposition

@@ -6169,3 +6169,191 @@ remains rank-3 co-located with module-private methods reachable only through the
 acquisition sites keep residual classes, so neither is retired. ***U9 remains OPEN.*** WA3C2 is
 CENSUS-DELTA 0, so the canonical stage arithmetic is unchanged; it is the prerequisite 199G/U9
 named, and it is now met.
+
+## 199D-DW2 / 199G-C5C — the shared trap bridge never saved the entering task's context (WIP; NOT delivered)
+
+**The defect.** `arch/trap_entry.rs::handle_trap_entry_shared` — the bridge x86_64 and AArch64
+actually run — never saved the entering task's register context to its TCB before dispatching,
+although the raw x86_64 bridge in `arch/x86_64/trap.rs:714` does exactly that and documents it as
+essential: the IPC blocking path does not call `sync_current_thread_from_frame`, so without it a
+task that blocks through the broad handler keeps whatever context an earlier trap left behind. A
+second cell of the same defect sat on the `QueueAdvanceCommitted` arm, which read the parked
+identity from `futex_wait_dispatch_outgoing` alone; a blocking receive or send publishes the
+D2-RECV / D2-SEND deferrals instead, so that call returned `None` and captured nothing. The RISC-V
+bridge took the second fix in 199G-B §2; this is the shared x86_64/AArch64 cell of both.
+
+**Why it was silent.** Only a delivery that RETURNS a value through the blocked syscall can see it.
+PM blocked in `ipc_recv` with a TCB context stale from its previous `ipc_reply` trap
+(`g0=7 arg0=65538` — the IpcReply syscall number and the reply cap). The direct NR 6 request wrote
+its payload and metadata into PM's buffers and woke it; PM resumed at the return address of that
+earlier reply and re-executed the receive against an empty endpoint queue, because a direct
+delivery enqueues nothing. A legacy send survived only by accident — it leaves the message in the
+queue for the re-executed receive to find. Proven pre-existing at `5680287` with byte-identical
+last `USER_LOG` and counters `attempts=2 eligible=2 declined_pre_txn=1 completed=1
+legacy_fallback=0`.
+
+**Causality, measured.** After the two-part repair, x86_64 PM receives the request
+(`PM_RECV_GOT_MSG opcode=11 len=48 reply_cap=Some(131074) sender_tid=1`), spawns
+(`PM_SPAWN_CAP_RESULT ok=1`, ×3), replies (`PM_SPAWN_V5_CAP_REPLY`), init decodes
+(`INIT_SPAWN_V5_REPLY_RECV_OK`, ×8), service-entry MISSING is 0 and the NR 1 route reports
+`IPC_SEND_SPLIT_DONE … result=direct_delivery`. Three consecutive runs of each of four x86_64
+cells (default, recv-proof, send-plain oracle, send-enqueue oracle) are byte-identical in every
+counter, with zero panics and zero faults. The `blocked_recv_state` residue noted earlier is a
+real, separate divergence from the legacy path's contract, but it was NOT shown causal and was
+NOT changed.
+
+**NR 1 status.** x86_64 and RISC-V positively exercise NR 1 live — x86_64 shows plain delivery,
+ordinary-cap direct delivery and buffered enqueue all reaching the split route
+(`result=direct_delivery` ×2, `result=enqueued` ×3 across the cells); RISC-V shows one
+`result=direct_delivery`. All six `stage199gc4_nr1_terminal_edges` guards pass, hosted is
+5037/0/2, the census is unchanged at **2 / 0 / 2**, and all three freestanding builds are clean.
+
+**Why this is NOT delivered.** AArch64 still has no NR 1 witness, and the blocker is neither NR 1
+nor a profile-composition question. Its core smoke's own U9-FT4 witness *requires* the terminal
+fault it asserts, so the "fault proof" and the "service chain" are not separable by any existing
+knob: the fault IS the service chain failing. init's `IpcCall` to PM enters
+(`IPC_CALL_BEGIN tid=1`), performs the split delivery and wakes PM, and then never completes —
+no `IPC_CALL_SENT_OR_QUEUED tid=1` is ever emitted — and init faults reading 0x0 at `rip=0x4030e4`
+inside `spawn_v5_cap`, before its first `INIT_SPAWN_V5_REPLY_RECV_BEGIN`. This is byte-identical at
+`c399e13`: `IPC_CALL_BEGIN`=2, `IPC_CALL_SENT_OR_QUEUED`=1 (tid 2 only), one
+`PAGE_FAULT_ENTRY tid=1 addr=0x0`. The repair advances the chain (PM messages 1 → 2, spawns
+0 → 1) but does not reach it. Repairing it is a separate owner and a separate qualification, so
+per the standing rule the WIP is retained and **main is unchanged**.
+
+**Two other pre-existing red cells, newly diagnosable.** The send-ordinary-cap and
+send-reply-cap oracles previously never ran at all on x86_64 (only their `_SET`/`_COORD_OK`
+markers appeared). With the chain alive they now run and fail at `Fork`:
+`FORK_COW_FAIL reason=cap_full kernel_error=CapabilityFull syscall_code=255`, at `step=register`,
+with `reserved_cnode_slots=6664` against `max_total_cnode_slots=262144` — so not the aggregate
+slot budget but the child cspace-slot `Vec`, whose backing PT frame pool has drained from 186 free
+frames to 5 because the service chain now legitimately populates 13 live tasks each reserving a
+512-slot cnode. The first fork in the boot succeeds; the second does not. This is a capacity
+consequence of the system working, not a defect in Fork or in NR 1, and it is outside this
+change's owner set. The x86_64 ordinary-cap NR 1 class is witnessed anyway, through the production
+service chain rather than through its oracle.
+
+## 199E-A64CALL / 199G-C5D — the AArch64 TLS lane addressed x15, and NR 1 is now live on all three architectures (WIP; NOT delivered)
+
+**The defect.** `REG_X18_TLS` was `15`. The AArch64 vector glue fills `user_gprs` with a straight
+`for idx in 0..31 { lane[idx] = frame.gprs[idx] }` over x0..x30, so lane N *is* xN: a lane of 15
+addressed **x15**, not x18. Every return to EL0 therefore wrote `tls.unwrap_or(0)` over the user's
+live x15 — and TLS is unset for these tasks, so that meant zeroing it — while x18, the register
+the constant is named for and the one the whole TLS design targets, was never written at all.
+
+**Why it was silent.** It only bites when userspace keeps a live value in x15 across a syscall.
+init's `spawn_v5_cap` does: LLVM parks a pointer in x15 across the `svc`, and the very next
+instruction, `ldr x8, [x15]`, faulted reading 0x0 at `rip=0x4030e4`. Measured at the boundary:
+the entering vector frame carried `x15=0x4648a8` into the IpcCall and the departing frame carried
+`x15=0x0` back out, with x14 and ELR intact — the snapshot was correct and only the AArch64
+writeback was wrong, so the repair is confined to that owner. Writing lane 18 is sound only
+because the AArch64 **userspace** target now builds with `+reserve-x18`; the rebuilt init went
+from 124 x18 references to 0. The kernel target is deliberately untouched — its own register
+allocation has no bearing on the user context it restores.
+
+**Correcting an earlier record.** The 199D-DW2 entry above states that init's `IpcCall` "never
+completes — no `IPC_CALL_SENT_OR_QUEUED tid=1` is ever emitted". That inference was wrong. The
+`Ok(true)` split-delivery arm of `handle_ipc_call` returns success *without* emitting that marker,
+so the call did complete; the fault came after a correct return, on the clobbered x15. The
+observation was accurate, the conclusion drawn from it was not.
+
+**Result.** The AArch64 service chain runs for the first time and now matches x86_64 exactly:
+`PM_RECV_GOT_MSG` 9, `PM_SPAWN_CAP_RESULT` 3, `INIT_SPAWN_V5_REPLY_RECV_OK` 8, service-entry
+MISSING 0, zero faults — identical across three consecutive runs. **NR 1 is now positively
+exercised on all three architectures**: AArch64 shows `IPC_SEND_SPLIT_DONE … result=direct_delivery`
+in the default cell, and its plain-send and enqueue-send oracle cells produce the same shape as
+x86_64's (plain: 2 direct + 2 enqueued; enqueue: 1 direct + 3 enqueued), both cells exiting 0 with
+zero blockers. x86_64 and RISC-V core smokes are green with one `direct_delivery` each. Hosted is
+5039/0/2, the census is unchanged at **2 / 0 / 2**, and all six `stage199gc4_nr1_terminal_edges`
+guards pass.
+
+**U9-FT4 got a real trigger.** The fault that witness observed was never armed by anything — it
+*was* the defect above. Repairing it removed the only terminal fault any AArch64 profile produced.
+Rather than weaken or drop the witness, and with explicit authorization to override the
+no-new-selector rule, it was given a deliberate trigger: default-off
+`yarm.aarch64_terminal_fault_oracle=1`, init startup slot-5 selector 21 (1–8 and 20 were taken,
+and it is written only when slot 5 is still free), and one init arm that takes a single
+intentional unhandled read at 0x0, placed before the SpawnV5 chain so the replacement the queue
+advance selects is still the supervisor (tid 2). The smoke's U9-FT4 block is unchanged byte for
+byte and still fully positive; it is gated behind `TERMINAL_FAULT_ORACLE=1` so it runs in its own
+cell. All 17 assertions pass there, three consecutive runs. The old init fault is NOT service-chain
+behaviour and is not described as such anywhere.
+
+**Why this is NOT delivered.** The AArch64 *default* cell still exits 1, on one newly reachable
+line: `supervisor.srv control recv error: WrongObject`, four times, after which the supervisor
+logs and continues (five `SUPERVISOR_EVENT_LOOP_TICK` follow) and the boot reaches clean terminal
+idle. It is localized: the supervisor's `ipc_recv_with_deadline` BLOCKS, and on resume nothing
+encodes its completion, because on AArch64 `recv_completion` is consumed only under
+`#[cfg(feature = "ipc-reply-timeout-oracle-core")]`. With no completion consumed the restore path
+falls through to the argument mirror, so x0 comes back holding the endpoint cap (65539) with
+`meta.status` still `u64::MAX`, and the aarch64/riscv64 user-rt rule
+`if ret.ret0 != 0 && meta.status == u64::MAX` decodes that as `WrongObject`. A timed receive that
+returns *without* blocking is unaffected — the error convention encodes `TimedOut` correctly and
+user-rt maps it to `Ok(None)` — which is why both oracle cells, where the receive never blocks,
+are clean, and why x86_64 (0 occurrences) and RISC-V (0 occurrences, and no `WrongObject` in its
+blocker list at all) never show it. This is NOT the benign cross-arch lifecycle self-query the
+`BLOCKER_EXCLUDE_REGEX` already tolerates: that one is `SUPERVISOR_LIFECYCLE_QUERY_ERR` and occurs
+zero times here. Repairing it means promoting a feature-gated reply-timeout path into production —
+the consumer also calls `maybe_emit_reply_timeout_class_retired()` — which is a separate promotion
+with its own qualification and exactly the broadening this pass is told not to do. It is therefore
+recorded, not excluded and not guessed at, and main is unchanged.
+
+## 199E-A64RC / 199G-C5E — the AArch64 blocked-receive completion was published but never consumable, and NR 1 is delivered
+
+**The defect.** The producer was never gated. `publish_blocked_recv_timeout_result_with_identity`
+parks a generation-bearing `BlockedSyscallCompletion` on every port and every build, and its own
+doc states the contract: x86_64 and RISC-V additionally install an equivalent saved result at
+publication time and never consume the record, while **AArch64 "must NOT write a result register"**
+there — its resume boundary mirrors `arg0..arg5` into `x0..x5` — and so "consumes it at its resume
+boundary". The drain that feeds it is production-live too: U7 removed the feature gate from
+`run_due_ipc_timeout_work`, which the shared trap entry calls unconditionally.
+
+Only the AArch64 **consumer** was still compiled behind `ipc-reply-timeout-oracle-core`. So a
+default build published a completion that port could never apply: the argument mirror put the
+receive's own arguments back into `x0..x5`, and user-rt read `x0` (the endpoint cap, 65539) with
+`meta.status` still `u64::MAX` and, by the aarch64/riscv64 rule
+`if ret.ret0 != 0 && meta.status == u64::MAX`, decoded a spurious `WrongObject`. That is the
+`supervisor.srv control recv error: WrongObject` the default AArch64 boot failed on — four times
+per boot, on a receive that genuinely blocked. A timed receive that returns *without* blocking was
+never affected, which is why both NR 1 oracle cells were already clean and why x86_64 and RISC-V
+never showed it.
+
+**The repair, mechanism separated from telemetry.** Both AArch64 resume boundaries — the in-lock
+writer and the post-lock `direct_dispatch_resume_incoming_core` — now consume the recv completion
+unconditionally, exactly as their blocked-SEND siblings already did, and
+`direct_dispatch_take_completion_split` is ungated for the same reason.
+`maybe_emit_reply_timeout_class_retired` stays gated at both sites: it is the reply-timeout proof's
+attestation, not the completion mechanism. `encode_blocked_send_completion` became
+`encode_blocked_completion_result` — the recv class had been open-coding the identical two writes
+at each boundary, so there is now one completion-apply owner for both classes.
+
+**Scope, corrected by live evidence.** Ungating `ThreadRestoreFacts::recv_completion` outright was
+too wide: its take runs in `take_thread_restore_facts`, which both callers of the SHARED bridge
+reach, so x86_64 began consuming a record it never had. For x86_64 and RISC-V that take is a pure
+side effect — it clears the record along with `ipc_timeout_fired` and `blocked_recv_state` — and
+the x86_64 server-death profile changed failure sets, gaining the forbidden
+`IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY` and `IPC_SERVER_DEATH_WRONG_RECORD_GENERATION`. The scope
+is now `any(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64")`: AArch64 takes it
+in both feature states, every other port keeps exactly the behaviour it had. RISC-V's own consumer
+is untouched and still gated.
+
+**Live result.** The AArch64 default cell is green, three consecutive runs, with `WrongObject` 0
+(was 4) and 8–9 `AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED` — the consumer applying real
+completions — while the service chain is unchanged at PM 9 messages / 3 spawns, init 8 replies,
+service-entry MISSING 0, zero faults and zero panics. All three core profiles exit 0 with one
+`IPC_SEND_SPLIT_DONE` each; the plain and enqueue NR 1 cells on x86_64 and AArch64 each show 4
+(2 direct + 2 enqueued, and 1 direct + 3 enqueued). The U9-FT4 deliberate-fault cell is
+independently green, all 17 assertions. Hosted 5046/0/2, census **2 / 0 / 2**, all six NR 1
+terminal-edge guards green, clippy 0 errors (647 vs 637 warnings at base, all of kinds already
+present there), and all three freestanding builds clean.
+
+**Pre-existing red, recorded honestly and NOT claimed green.** The three reply-timeout retirement
+profiles fail identically at `5680287`, at `7e240e5` and here — the oracle workload never arms, so
+every marker count is 0 (the script's "consumed more than once" line is a `!= 1` check reporting
+0, not a duplicate). The three server-death profiles are red at base too; RISC-V's failure set is
+byte-identical to base, and **x86_64's failure set changed** — the whole
+`IPC_SERVER_DEATH_*` chain that was "required marker missing" at base now runs, and surfaces the
+two forbidden wrong-identity/wrong-generation markers plus two ordering failures. That change is
+byte-identical to `7e240e5`, i.e. it predates this pass and traces to the 199D-DW2 shared-bridge
+context capture making the scenario reachable at all. It is a real signal about the server-death
+path, it is outside this pass's owner set, and it needs its own increment; it is recorded here
+rather than excluded or explained away.

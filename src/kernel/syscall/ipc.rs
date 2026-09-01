@@ -136,6 +136,61 @@ fn stash_transfer_handle(
     ))
 }
 
+/// 199G-C4 §1 — THE `IpcSend` payload SHAPE, decided from the sender's class and length alone.
+///
+/// Three thresholds live here and nowhere else: a user-ASID sender frames a shared region once
+/// its payload exceeds what a message can carry; a kernel-task sender may not exceed that at
+/// all, and frames a shared region once its payload exceeds what the argument registers carry.
+/// A route that classified differently would frame the same send as a different kind of
+/// message, so the pre-lock route and the broad handler ask exactly this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpcSendPayloadShape {
+    /// The payload IS a shared-region descriptor; a memory/DMA grant capability is required.
+    SharedRegion,
+    /// The payload is carried inline, by user pointer (user sender) or in registers (kernel task).
+    Inline,
+}
+
+pub(crate) fn classify_ipc_send_payload_shape(
+    sender_has_user_asid: bool,
+    len: usize,
+) -> Result<IpcSendPayloadShape, SyscallError> {
+    if sender_has_user_asid {
+        if len > Message::MAX_PAYLOAD {
+            return Ok(IpcSendPayloadShape::SharedRegion);
+        }
+        return Ok(IpcSendPayloadShape::Inline);
+    }
+    if len > Message::MAX_PAYLOAD {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if len > IPC_REGISTER_BYTES {
+        return Ok(IpcSendPayloadShape::SharedRegion);
+    }
+    Ok(IpcSendPayloadShape::Inline)
+}
+
+/// 199G-C4 §1 — THE `IpcSend` message framing.
+///
+/// Opcode, flag bits and payload bytes in one place, so a message built by the pre-lock route is
+/// indistinguishable from one built by the broad handler. The shared-region arm always carries
+/// `FLAG_CAP_TRANSFER` because its payload IS the descriptor and the grant is mandatory; the
+/// inline arm carries the flag only when a capability actually rides along.
+pub(crate) fn frame_ipc_send_message(
+    sender_tid: u64,
+    shape: IpcSendPayloadShape,
+    payload: &[u8],
+    transfer_cap: Option<CapId>,
+    transfer_handle: Option<u64>,
+) -> Result<Message, SyscallError> {
+    let (opcode, flags) = match shape {
+        IpcSendPayloadShape::SharedRegion => (OPCODE_SHARED_MEM, Message::FLAG_CAP_TRANSFER),
+        IpcSendPayloadShape::Inline => (OPCODE_INLINE, transfer_flag_bits(transfer_cap)),
+    };
+    Message::with_header(sender_tid, opcode, flags, transfer_handle, payload)
+        .map_err(|_| SyscallError::InvalidArgs)
+}
+
 fn inline_payload_from_frame(
     frame: &TrapFrame,
     len: usize,
@@ -313,8 +368,10 @@ pub(super) fn handle_ipc_send(
     };
 
     let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
-    let msg_result = if sender_has_user_asid {
-        if len > Message::MAX_PAYLOAD {
+    // 199G-C4 §1 — the payload SHAPE has one owner; the pre-lock route asks it the same way.
+    let shape = classify_ipc_send_payload_shape(sender_has_user_asid, len)?;
+    let msg_result = match shape {
+        IpcSendPayloadShape::SharedRegion => {
             let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
             let grant = kernel
                 .capability_service()
@@ -325,7 +382,12 @@ pub(super) fn handle_ipc_send(
                 _ => return Err(SyscallError::WrongObject),
             }
             validate_shared_mem_transfer_rights(&grant)?;
-            validate_user_region(user_ptr_or_offset as u64, len as u64)?;
+            // The user-region check belongs to a USER sender: a kernel task's `offset` is a
+            // region offset, not a user virtual address, so validating it as one would reject
+            // every kernel-originated shared-region send.
+            if sender_has_user_asid {
+                validate_user_region(user_ptr_or_offset as u64, len as u64)?;
+            }
             let region = SharedMemoryRegion {
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
@@ -340,86 +402,37 @@ pub(super) fn handle_ipc_send(
                 }),
             )?;
             stash_bound_receiver_tid = bound_tid;
-            Message::with_header(
+            frame_ipc_send_message(
                 sender_tid,
-                OPCODE_SHARED_MEM,
-                Message::FLAG_CAP_TRANSFER,
-                transfer_handle,
+                shape,
                 &region.encode(),
+                transfer_cap,
+                transfer_handle,
             )
-            .map_err(|_| SyscallError::InvalidArgs)
-        } else {
-            let payload = match kernel.copy_from_current_user(user_ptr_or_offset, len) {
-                Ok(payload) => payload,
-                Err(KernelError::UserMemoryFault) => {
-                    record_user_fault(kernel, frame, user_ptr_or_offset, FaultAccess::Read);
-                    return Ok(());
+        }
+        IpcSendPayloadShape::Inline => {
+            let payload = if sender_has_user_asid {
+                match kernel.copy_from_current_user(user_ptr_or_offset, len) {
+                    Ok(payload) => payload,
+                    Err(KernelError::UserMemoryFault) => {
+                        record_user_fault(kernel, frame, user_ptr_or_offset, FaultAccess::Read);
+                        return Ok(());
+                    }
+                    Err(other) => return Err(SyscallError::from(other)),
                 }
-                Err(other) => return Err(SyscallError::from(other)),
+            } else {
+                inline_payload_from_frame(frame, len)?
             };
-
             let (transfer_handle, bound_tid) =
                 stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
             stash_bound_receiver_tid = bound_tid;
-            Message::with_header(
+            frame_ipc_send_message(
                 sender_tid,
-                OPCODE_INLINE,
-                transfer_flag_bits(transfer_cap),
-                transfer_handle,
+                shape,
                 &payload[..len],
-            )
-            .map_err(|_| SyscallError::InvalidArgs)
-        }
-    } else {
-        if len > Message::MAX_PAYLOAD {
-            return Err(SyscallError::InvalidArgs);
-        }
-        if len > IPC_REGISTER_BYTES {
-            let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
-            let grant = kernel
-                .capability_service()
-                .resolve_current_task_capability(grant_cap)
-                .ok_or(SyscallError::InvalidCapability)?;
-            match grant.object {
-                CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
-                _ => return Err(SyscallError::WrongObject),
-            }
-            validate_shared_mem_transfer_rights(&grant)?;
-            let region = SharedMemoryRegion {
-                offset: user_ptr_or_offset as u64,
-                len: len as u64,
-            };
-            let (transfer_handle, bound_tid) = stash_transfer_handle(
-                kernel,
                 transfer_cap,
-                endpoint,
-                Some(TransferSharedRegion {
-                    offset: region.offset,
-                    len: region.len,
-                }),
-            )?;
-            stash_bound_receiver_tid = bound_tid;
-            Message::with_header(
-                sender_tid,
-                OPCODE_SHARED_MEM,
-                Message::FLAG_CAP_TRANSFER,
                 transfer_handle,
-                &region.encode(),
             )
-            .map_err(|_| SyscallError::InvalidArgs)
-        } else {
-            let payload = inline_payload_from_frame(frame, len)?;
-            let (transfer_handle, bound_tid) =
-                stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
-            stash_bound_receiver_tid = bound_tid;
-            Message::with_header(
-                sender_tid,
-                OPCODE_INLINE,
-                transfer_flag_bits(transfer_cap),
-                transfer_handle,
-                &payload[..len],
-            )
-            .map_err(|_| SyscallError::InvalidArgs)
         }
     };
     let msg = match msg_result {

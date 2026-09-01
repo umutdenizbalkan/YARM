@@ -376,25 +376,19 @@ impl KernelState {
             // non-shared), just reject. Restore nothing — keep-pin only kept it for shared.
             return Err(KernelError::WrongObject);
         };
-        // Object must be a shared-region variant.
-        let (object, object_generation) = match envelope.source_object {
-            CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => (
-                envelope.source_object,
-                capobject_generation(envelope.source_object),
-            ),
-            _ => {
-                // Release the kept pin before rejecting.
-                self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
-                return Err(KernelError::WrongObject);
-            }
+        // Object must be a shared-region variant. 199G-C4 §3: one admission rule.
+        let Some((object, object_generation)) =
+            shared_region_admit_source_object(envelope.source_object)
+        else {
+            // Release the kept pin before rejecting.
+            self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
+            return Err(KernelError::WrongObject);
         };
         // Source rights (resolved ONCE, here) → attenuated destination rights.
         let source_capability =
             self.resolve_capability_for_task(envelope.source_tid.0, envelope.source_cap)?;
-        let mut rights = source_capability.rights();
-        if !map_write {
-            rights = rights.intersect(CapRights::READ | CapRights::MAP);
-        }
+        // 199G-C4 §3: one attenuation rule.
+        let rights = shared_region_destination_rights(source_capability.rights(), map_write);
         let receiver_cnode = self
             .task_cnode(receiver_tid)
             .ok_or(KernelError::InvalidCapability)?;
@@ -490,6 +484,35 @@ impl KernelState {
 
 fn page_round_up(len: usize) -> usize {
     (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+/// 199G-C4 §3 — THE shared-region source-object admission rule.
+///
+/// A shared-region transfer names a physically-backed region, so only the two object classes
+/// that have one may carry it. Returning the object together with its generation keeps the
+/// snapshot's frozen identity derived here rather than re-derived by each Phase A.
+#[must_use]
+pub(crate) fn shared_region_admit_source_object(object: CapObject) -> Option<(CapObject, u64)> {
+    match object {
+        CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {
+            Some((object, capobject_generation(object)))
+        }
+        _ => None,
+    }
+}
+
+/// 199G-C4 §3 — THE shared-region destination-rights attenuation.
+///
+/// The receiver never gains rights the sender did not hold, and a read-only mapping is
+/// attenuated to exactly READ|MAP — an allow-list, not "source minus WRITE", so a right nobody
+/// thought to subtract cannot ride through a read-only transfer.
+#[must_use]
+pub(crate) fn shared_region_destination_rights(source: CapRights, map_write: bool) -> CapRights {
+    if map_write {
+        source
+    } else {
+        source.intersect(CapRights::READ | CapRights::MAP)
+    }
 }
 
 fn capobject_generation(object: CapObject) -> u64 {
