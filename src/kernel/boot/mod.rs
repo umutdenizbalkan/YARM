@@ -42,11 +42,12 @@ mod ipc_state;
 // body are re-exported so the OFF-LOCK drain in `crate::runtime` can run the SAME body
 // through the `SharedKernel` split-mut seams (no duplicated transaction).
 pub(crate) use ipc_state::{
-    BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ReplyTimeoutDomains,
-    ReplyWaitArm, arm_reply_terminal_for_committed_block_locked,
-    claim_direct_reply_terminal_locked, classify_direct_reply_terminal_locked,
-    commit_reply_terminal_locked, complete_reply_timeout_over, complete_server_death_over,
-    publish_recv_waiter_locked, release_reply_terminal_locked,
+    BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ReplyAuthorityReclaim,
+    ReplyAuthoritySlots, ReplyTimeoutDomains, ReplyWaitArm,
+    arm_reply_terminal_for_committed_block_locked, claim_direct_reply_terminal_locked,
+    classify_direct_reply_terminal_locked, commit_reply_terminal_locked,
+    complete_reply_timeout_over, complete_server_death_over, publish_recv_waiter_locked,
+    reclaim_reply_authority_with, release_reply_terminal_locked,
 };
 mod memory_lifecycle_state;
 mod memory_state;

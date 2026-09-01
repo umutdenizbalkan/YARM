@@ -887,6 +887,15 @@ impl SharedKernel {
             self.settle_reply_after_reserve(ack, idx, rgen, lease, lease_commit_seq);
             return Err(IpcReplyDirectError::MetaCopyFault);
         }
+        // DIRECT3-CAP §2 — the blocked caller's recv-v2 metadata is now in its address space.
+        // This is the FOURTH producer of that event (the legacy in-lock completion and the three
+        // deferred post-work executors are the others) and it attests it with the same marker,
+        // for the same reason they do: the marker names the waiter whose receive completed, not
+        // the route that completed it.
+        crate::yarm_log!(
+            "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
+            ack.caller.tid.0
+        );
 
         // (5) atomically claim the EXACT caller waiter (remove once).
         // Stage 199D-WA3C2: claimed as `DirectReply`, held across the rank-3 release for the
@@ -923,6 +932,20 @@ impl SharedKernel {
             crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
         ) {
             ReceiverCommit::Committed(affinity) => {
+                // The resolved one-shot object, attested exactly as the broad path attests it.
+                crate::yarm_log!(
+                    "IPC_REPLY_OBJECT_OK tid={} cap={} reply_index={} generation={} target_endpoint={}",
+                    snapshot.replier.tid.0,
+                    snapshot.reply_cap.0,
+                    idx,
+                    rgen,
+                    ack.endpoint_index
+                );
+                // DIRECT3-CAP §2 — snapshot the one-shot authority identities BEFORE the
+                // consume, while the record still names this exact incarnation. After the
+                // consume the record is spent and its cap fields must not be re-read to decide
+                // what to revoke.
+                let authority = self.reply_authority_slots_split_read(idx, rgen);
                 // (7) record Reserved → Consumed — the authoritative one-shot barrier,
                 // BEFORE the rank-1 enqueue. Infallible for our exact reservation.
                 if !self.consume_reply_record_split(idx, rgen) {
@@ -934,6 +957,47 @@ impl SharedKernel {
                     // Nothing is restored, so CANCEL — but the slot must not stay wedged.
                     let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
                     return Err(IpcReplyDirectError::RecordConsumeFailed);
+                }
+                // DIRECT3-CAP §2 — reclaim the physical one-shot slots, on the same edge the
+                // legacy path uses: strictly AFTER the record is Consumed (the reply is
+                // irrevocably committed) and BEFORE the wake. `Consumed` revokes the authority
+                // but not the CNode slots; without this the direct route leaked both of them
+                // on every reply. Exact by construction — a recycled slot revokes nothing.
+                if let Some(slots) = authority {
+                    let reclaim = self.reclaim_reply_authority_split(slots, snapshot.replier.tid.0);
+                    // The SAME attestations the broad path emits, because this is the same
+                    // event performed by the same policy on the same two slots. The witness
+                    // accepts whichever owner performed it — the marker names the subject, not
+                    // the route.
+                    if reclaim.replier_attempted {
+                        crate::yarm_log!(
+                            "IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid={} replier_tid={} cap={} waiter_cap={} expected={:?} ok={}",
+                            slots.caller_tid.0,
+                            snapshot.replier.tid.0,
+                            snapshot.reply_cap.0,
+                            slots.replier_cap.map(|c| c.0).unwrap_or(0),
+                            slots.reply_object,
+                            reclaim.replier_revoked
+                        );
+                    }
+                    if reclaim.caller_attempted {
+                        crate::yarm_log!(
+                            "IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid={} cap={} expected={:?} ok={}",
+                            slots.caller_tid.0,
+                            slots.caller_cap.0,
+                            slots.reply_object,
+                            reclaim.caller_revoked
+                        );
+                    }
+                    crate::yarm_log!(
+                        "IPC_REPLY_DIRECT_AUTHORITY_RECLAIMED record_index={} record_generation={} replier_tid={} caller_tid={} replier_ok={} caller_ok={} result=ok",
+                        idx,
+                        rgen,
+                        snapshot.replier.tid.0,
+                        slots.caller_tid.0,
+                        u8::from(reclaim.replier_revoked),
+                        u8::from(reclaim.caller_revoked)
+                    );
                 }
                 // (8) enqueue the caller LAST — the single wake. It reports what it ACTUALLY
                 //     did, and only `Enqueued` may become this success's wake target.

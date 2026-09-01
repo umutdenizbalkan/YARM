@@ -1488,6 +1488,83 @@ pub(crate) fn commit_reply_terminal_locked(
         .is_some_and(|cell| cell.commit_terminal(owner))
 }
 
+/// DIRECT3-CAP §2 — the exact identities of the ONE-SHOT reply authority for one record
+/// incarnation, snapshotted BEFORE any mutation.
+///
+/// The reply authority is exactly two CNode slots: the one-shot the replier holds and the alias
+/// `create_reply_cap_for_caller` minted into the caller's CNode. There is no third, and there
+/// are no delegation links to walk — a Reply cap is never delegated, which is why the legacy
+/// path uses the narrow `fast_revoke_reply_slot` rather than a delegation-tree revoke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplyAuthoritySlots {
+    /// The reply object both slots must still name for a revoke to be authorized.
+    pub(crate) reply_object: CapObject,
+    /// The replier's one-shot slot: the kernel-recorded `waiter_cap_id` when the record has one.
+    pub(crate) replier_cap: Option<CapId>,
+    /// The caller's alias slot. `CapId(0)` is the "never set" sentinel and is not reclaimed.
+    pub(crate) caller_cap: CapId,
+    pub(crate) caller_tid: ThreadId,
+}
+
+/// The outcome of reclaiming one record incarnation's reply authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ReplyAuthorityReclaim {
+    pub(crate) replier_revoked: bool,
+    pub(crate) caller_revoked: bool,
+    pub(crate) replier_attempted: bool,
+    pub(crate) caller_attempted: bool,
+}
+
+/// DIRECT3-CAP §2 — THE one-shot reply-authority reclamation policy.
+///
+/// ## Why this exists
+///
+/// The legacy `ipc_reply` reclaims both authority slots; the direct reply transaction did not.
+/// It relied on the record's `Consumed` barrier, which does revoke the AUTHORITY — a stale cap
+/// resolving to the same `{index, generation}` fails through the consumed record — but leaves
+/// the physical CNode slots occupied. That is a slot leak, and it pre-existed for every reply
+/// already taking the direct route: a boot showed 12 fast-revokes against 42 direct replies.
+/// `Consumed` is NOT physical reclamation and is not treated as such here.
+///
+/// ## One policy, two seams
+///
+/// The DECISION — which two slots, in which CNodes, against which expected object, and which
+/// sentinels mean "nothing to reclaim" — lives here once. Only the revoke SEAM differs: the
+/// broad path reaches `fast_revoke_reply_slot` through
+/// `KernelState::fast_revoke_reply_cap_in_cnode` (rank 4 directly), the direct path through
+/// `SharedKernel::sr_revoke_split` (rank 4 acquired and released on its own, never while an
+/// IPC rank-3 lock is held). Both end in the SAME `fast_revoke_reply_slot`, so there is no
+/// second capability-revocation implementation.
+///
+/// ## Exactness
+///
+/// `fast_revoke_reply_slot` refuses unless the slot's generation equals the CapId's generation
+/// AND the slot's entry names `expected_object`. A recycled slot therefore revokes nothing —
+/// an unrelated capability that happens to occupy the same index can never be destroyed — and a
+/// repeated reclamation is harmless, because the first bumped the slot generation past the
+/// CapId's.
+pub(crate) fn reclaim_reply_authority_with(
+    slots: ReplyAuthoritySlots,
+    replier_cnode: Option<crate::kernel::capabilities::CNodeId>,
+    caller_cnode: Option<crate::kernel::capabilities::CNodeId>,
+    mut revoke: impl FnMut(crate::kernel::capabilities::CNodeId, CapId, CapObject) -> bool,
+) -> ReplyAuthorityReclaim {
+    let mut out = ReplyAuthorityReclaim::default();
+    if let (Some(cap), Some(cnode)) = (slots.replier_cap, replier_cnode) {
+        out.replier_attempted = true;
+        out.replier_revoked = revoke(cnode, cap, slots.reply_object);
+    }
+    // `CapId(0)` is the "not yet set" sentinel `create_reply_cap_for_caller` starts from; it
+    // names no slot, so reclaiming it would be a revoke against an arbitrary index.
+    if slots.caller_cap.0 != 0
+        && let Some(cnode) = caller_cnode
+    {
+        out.caller_attempted = true;
+        out.caller_revoked = revoke(cnode, slots.caller_cap, slots.reply_object);
+    }
+    out
+}
+
 /// DIRECT3 §1 — THE reply-record waiter-cap/responder priming policy, rank 3 only.
 ///
 /// There used to be two copies of this: `KernelState::try_set_reply_cap_waiter_cap` for the

@@ -11815,6 +11815,49 @@ impl SharedKernel {
         })
     }
 
+    /// DIRECT3-CAP §2 — snapshot the one-shot reply authority for an EXACT record incarnation,
+    /// rank 3, before any mutation. `None` when the slot no longer names that incarnation, so a
+    /// recycled record can never hand out another transaction's authority identities.
+    pub(crate) fn reply_authority_slots_split_read(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> Option<crate::kernel::boot::ReplyAuthoritySlots> {
+        self.with_ipc_split_mut(|ipc| {
+            if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
+                return None;
+            }
+            let record = ipc.reply_caps.get(index)?.as_ref()?;
+            Some(crate::kernel::boot::ReplyAuthoritySlots {
+                reply_object: CapObject::Reply { index, generation },
+                replier_cap: record.waiter_cap_id,
+                caller_cap: record.caller_cap_id,
+                caller_tid: record.caller_tid,
+            })
+        })
+    }
+
+    /// DIRECT3-CAP §2 — reclaim both one-shot authority slots through the SHARED policy, using
+    /// the split revoke seam. Rank 4 is acquired and released inside `sr_revoke_split`; no IPC
+    /// rank-3 lock is held across it, and no broad `with_cpu` is taken.
+    ///
+    /// Safe to call more than once for the same record: `fast_revoke_reply_slot` bumps the slot
+    /// generation on success, so a repeat finds a generation mismatch and revokes nothing.
+    pub(crate) fn reclaim_reply_authority_split(
+        &self,
+        slots: crate::kernel::boot::ReplyAuthoritySlots,
+        replier_tid: u64,
+    ) -> crate::kernel::boot::ReplyAuthorityReclaim {
+        let replier_cnode = self.task_cnode_split(replier_tid);
+        let caller_cnode = self.task_cnode_split(slots.caller_tid.0);
+        crate::kernel::boot::reclaim_reply_authority_with(
+            slots,
+            replier_cnode,
+            caller_cnode,
+            |cnode, cap, object| self.revoke_reply_authority_slot_split(cnode, cap, object),
+        )
+    }
+
     /// 199D-TRC — commit this reply's terminal claim after delivery succeeded (rank 3).
     pub(crate) fn commit_direct_reply_terminal_split(
         &self,
