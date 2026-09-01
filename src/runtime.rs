@@ -9508,6 +9508,27 @@ impl SharedKernel {
         })
     }
 
+    /// DIRECT3-QUEUE3 — release a CONSUMED reply-record slot back to the allocator, rank 3.
+    ///
+    /// Legacy `ipc_reply` does this unconditionally (`ipc.reply_caps[slot] = None`); the direct
+    /// paths did not, so each of their replies permanently consumed one of `MAX_REPLY_CAPS`
+    /// slots. Exact: only a slot still at this generation and still `Consumed` is released, so a
+    /// recycled slot or a record mid-transaction is never touched.
+    pub(crate) fn release_consumed_reply_record_split(&self, index: usize, generation: u64) {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| {
+            let releasable = matches!(
+                ipc.reply_caps.get(index),
+                Some(Some(record))
+                    if ipc.reply_cap_generations.get(index).copied() == Some(generation)
+                        && record.reservation == ReplyRecordReservation::Consumed
+            );
+            if releasable {
+                ipc.reply_caps[index] = None;
+            }
+        });
+    }
+
     pub(crate) fn cancel_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
         use crate::kernel::boot::ReplyRecordReservation;
         self.with_ipc_split_mut(|ipc| {
@@ -11830,7 +11851,7 @@ impl SharedKernel {
         reply_endpoint_generation: u64,
         msg: crate::kernel::ipc::Message,
     ) -> Result<Option<crate::kernel::boot::ReceiverWaiterIdentity>, KernelError> {
-        self.with_ipc_split_mut(|ipc| {
+        let out = self.with_ipc_split_mut(|ipc| {
             crate::kernel::boot::commit_queued_reply_locked(
                 ipc,
                 record_index,
@@ -11840,7 +11861,15 @@ impl SharedKernel {
                 reply_endpoint_generation,
                 msg,
             )
-        })
+        });
+        // The reply terminal became irrevocable inside that acquisition, so the reverse link
+        // closes on the same edge legacy closes it — outside the rank-3 section, because the
+        // link lives in the task domain. Exact on both identities; a reused slot is untouched.
+        if out.is_ok() {
+            let _ =
+                self.finalize_server_reply_link_for_record_split(record_index, record_generation);
+        }
+        out
     }
 
     /// DIRECT3-CAP §2 — snapshot the one-shot reply authority for an EXACT record incarnation,

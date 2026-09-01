@@ -1572,9 +1572,19 @@ pub(crate) fn commit_queued_reply_locked(
     }
     // Admission decided first: a refused enqueue must leave the record `Available`.
     let woken = enqueue_reply_into_endpoint_locked(ipc, reply_endpoint_index, msg)?;
-    // The one-shot is spent only now, bound to the enqueue that succeeded.
-    if let Some(Some(record)) = ipc.reply_caps.get_mut(record_index) {
-        record.reservation = super::ReplyRecordReservation::Consumed;
+    // The one-shot is spent only now, bound to the enqueue that succeeded — and the SLOT IS
+    // RELEASED, exactly as legacy `ipc_reply` releases it (`ipc.reply_caps[slot] = None`).
+    //
+    // This is not bookkeeping. `MAX_REPLY_CAPS == MAX_TASKS`, and the record allocator reuses
+    // only `is_none()` slots, so a record left `Consumed` occupies its slot forever. Legacy is
+    // the only path that frees one today; the queued mode must free it too, or every reply it
+    // takes off the legacy path is a slot permanently lost. Live, that difference was the whole
+    // regression: the table sits at its boundary (reference high-water index 41), moving one
+    // reply off legacy pushed it to 42, and the caller's next `ipc_call` failed
+    // `stage=reply_cap_alloc err=CapabilityFull` — so its request, and the server's reply to it,
+    // never happened.
+    if let Some(slot) = ipc.reply_caps.get_mut(record_index) {
+        *slot = None;
     }
     Ok(woken)
 }

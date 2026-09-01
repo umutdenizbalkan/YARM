@@ -1085,6 +1085,23 @@ impl SharedKernel {
                 // `Vacant`, so quiescent occupancy is zero and the caller's next receive on it
                 // can publish.
                 let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);
+                // DIRECT3-QUEUE3 — RELEASE THE REPLY-RECORD SLOT, exactly as legacy
+                // `ipc_reply` releases it (`ipc.reply_caps[slot] = None`).
+                //
+                // `consume_reply_record_split` marks the record `Consumed` but leaves it
+                // occupying its slot, and the allocator reuses only `is_none()` slots — so
+                // every direct reply permanently consumed one. `MAX_REPLY_CAPS == MAX_TASKS`,
+                // and a default boot already sat at the boundary (reference high-water record
+                // index 41 against 42 direct replies): the leak was pre-existing and invisible
+                // only because the twelve legacy replies still freed theirs. Taking one more
+                // reply off the legacy path exhausted the table, and the next `ipc_call` failed
+                // `stage=reply_cap_alloc err=CapabilityFull` — losing a request and its reply.
+                //
+                // Released ONLY here, on the success edge after the caller is enqueued: the
+                // `EnqueueRejected` arm above deliberately restores the authority for a retry,
+                // and freeing the slot before that decision would destroy the record it
+                // restores.
+                self.release_consumed_reply_record_split(idx, rgen);
                 Ok(IpcReplyDirectSuccess {
                     record_index: idx,
                     record_generation: rgen,
