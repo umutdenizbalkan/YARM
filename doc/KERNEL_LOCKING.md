@@ -15394,3 +15394,39 @@ remains rank-3 co-located with module-private methods reachable only through the
 acquisition sites keep residual classes, so neither is retired. ***U9 remains OPEN.*** WA3C2 is
 CENSUS-DELTA 0, so the canonical stage arithmetic is unchanged; it is the prerequisite 199G/U9
 named, and it is now met.
+
+## 199E-A64RC / 199G-C5E — NR 1 delivered on three architectures; AArch64 return path repaired
+
+**NR 1 (IpcSend) is off both terminal broad dispatchers on all three architectures.** Its
+pre-lock route services every production class through an authoritative split owner, reports
+exactly four dispositions, and never falls back after consuming anything; the two mechanically
+production-unreachable classes (Synchronous endpoint, Kernel-cap restart control) fail closed
+before any mutation and return a typed refusal rather than `NotHandled`. NR 1 terminal edges
+3 → 0. Live: one `IPC_SEND_SPLIT_DONE … result=direct_delivery` in each default core profile, and
+the plain / enqueue cells add 4 more each on x86_64 and AArch64 (2 direct + 2 enqueued, and
+1 direct + 3 enqueued). The census remains **2 / 0 / 2** — CENSUS-DELTA 0 — and **U9 remains
+OPEN**; direct production remains ON.
+
+Three AArch64 return-path defects were repaired to get there, each a different owner:
+
+* **The TLS lane addressed x15, not x18.** `REG_X18_TLS` was `15`, but the vector glue fills
+  `user_gprs` with `lane[idx] = frame.gprs[idx]` over x0..x30, so lane N *is* xN. Every return to
+  EL0 wrote `tls.unwrap_or(0)` over the user's live x15 while x18 was never written. init's
+  `spawn_v5_cap` keeps a pointer in x15 across the `svc`, so `ldr x8, [x15]` faulted at 0x0. The
+  AArch64 userspace target now builds with `+reserve-x18`; the kernel target is deliberately
+  untouched.
+* **The blocked-receive completion was published but never consumable.** The producer parks the
+  generation-bearing record on every build and AArch64 alone is served by consuming it, yet that
+  consumer was compiled behind the reply-timeout oracle feature. The mechanism is now production
+  code at both resume boundaries, scoped to AArch64 plus the pre-existing feature build; the
+  retirement attestation stays gated.
+* **The U9-FT4 terminal-fault witness had been observing a defect, not a proof** — the x15 fault
+  above. It now has a deliberate default-off trigger (`yarm.aarch64_terminal_fault_oracle=1`,
+  init slot-5 selector 21) and runs in its own cell with all 17 assertions unchanged and still
+  fully positive.
+
+Not claimed green: the three reply-timeout retirement profiles and the three server-death profiles
+are red at `5680287` and remain red. RISC-V server-death is byte-identical to base; x86_64's
+failure set changed once the service chain began working, surfacing forbidden wrong-identity and
+wrong-generation markers in the server-death path. That is outside this owner set and needs its own
+increment — see `doc/KERNEL_UNLOCK_AUDIT.md`.

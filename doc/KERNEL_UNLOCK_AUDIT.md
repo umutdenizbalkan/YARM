@@ -6296,3 +6296,64 @@ zero times here. Repairing it means promoting a feature-gated reply-timeout path
 the consumer also calls `maybe_emit_reply_timeout_class_retired()` — which is a separate promotion
 with its own qualification and exactly the broadening this pass is told not to do. It is therefore
 recorded, not excluded and not guessed at, and main is unchanged.
+
+## 199E-A64RC / 199G-C5E — the AArch64 blocked-receive completion was published but never consumable, and NR 1 is delivered
+
+**The defect.** The producer was never gated. `publish_blocked_recv_timeout_result_with_identity`
+parks a generation-bearing `BlockedSyscallCompletion` on every port and every build, and its own
+doc states the contract: x86_64 and RISC-V additionally install an equivalent saved result at
+publication time and never consume the record, while **AArch64 "must NOT write a result register"**
+there — its resume boundary mirrors `arg0..arg5` into `x0..x5` — and so "consumes it at its resume
+boundary". The drain that feeds it is production-live too: U7 removed the feature gate from
+`run_due_ipc_timeout_work`, which the shared trap entry calls unconditionally.
+
+Only the AArch64 **consumer** was still compiled behind `ipc-reply-timeout-oracle-core`. So a
+default build published a completion that port could never apply: the argument mirror put the
+receive's own arguments back into `x0..x5`, and user-rt read `x0` (the endpoint cap, 65539) with
+`meta.status` still `u64::MAX` and, by the aarch64/riscv64 rule
+`if ret.ret0 != 0 && meta.status == u64::MAX`, decoded a spurious `WrongObject`. That is the
+`supervisor.srv control recv error: WrongObject` the default AArch64 boot failed on — four times
+per boot, on a receive that genuinely blocked. A timed receive that returns *without* blocking was
+never affected, which is why both NR 1 oracle cells were already clean and why x86_64 and RISC-V
+never showed it.
+
+**The repair, mechanism separated from telemetry.** Both AArch64 resume boundaries — the in-lock
+writer and the post-lock `direct_dispatch_resume_incoming_core` — now consume the recv completion
+unconditionally, exactly as their blocked-SEND siblings already did, and
+`direct_dispatch_take_completion_split` is ungated for the same reason.
+`maybe_emit_reply_timeout_class_retired` stays gated at both sites: it is the reply-timeout proof's
+attestation, not the completion mechanism. `encode_blocked_send_completion` became
+`encode_blocked_completion_result` — the recv class had been open-coding the identical two writes
+at each boundary, so there is now one completion-apply owner for both classes.
+
+**Scope, corrected by live evidence.** Ungating `ThreadRestoreFacts::recv_completion` outright was
+too wide: its take runs in `take_thread_restore_facts`, which both callers of the SHARED bridge
+reach, so x86_64 began consuming a record it never had. For x86_64 and RISC-V that take is a pure
+side effect — it clears the record along with `ipc_timeout_fired` and `blocked_recv_state` — and
+the x86_64 server-death profile changed failure sets, gaining the forbidden
+`IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY` and `IPC_SERVER_DEATH_WRONG_RECORD_GENERATION`. The scope
+is now `any(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64")`: AArch64 takes it
+in both feature states, every other port keeps exactly the behaviour it had. RISC-V's own consumer
+is untouched and still gated.
+
+**Live result.** The AArch64 default cell is green, three consecutive runs, with `WrongObject` 0
+(was 4) and 8–9 `AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED` — the consumer applying real
+completions — while the service chain is unchanged at PM 9 messages / 3 spawns, init 8 replies,
+service-entry MISSING 0, zero faults and zero panics. All three core profiles exit 0 with one
+`IPC_SEND_SPLIT_DONE` each; the plain and enqueue NR 1 cells on x86_64 and AArch64 each show 4
+(2 direct + 2 enqueued, and 1 direct + 3 enqueued). The U9-FT4 deliberate-fault cell is
+independently green, all 17 assertions. Hosted 5046/0/2, census **2 / 0 / 2**, all six NR 1
+terminal-edge guards green, clippy 0 errors (647 vs 637 warnings at base, all of kinds already
+present there), and all three freestanding builds clean.
+
+**Pre-existing red, recorded honestly and NOT claimed green.** The three reply-timeout retirement
+profiles fail identically at `5680287`, at `7e240e5` and here — the oracle workload never arms, so
+every marker count is 0 (the script's "consumed more than once" line is a `!= 1` check reporting
+0, not a duplicate). The three server-death profiles are red at base too; RISC-V's failure set is
+byte-identical to base, and **x86_64's failure set changed** — the whole
+`IPC_SERVER_DEATH_*` chain that was "required marker missing" at base now runs, and surfaces the
+two forbidden wrong-identity/wrong-generation markers plus two ordering failures. That change is
+byte-identical to `7e240e5`, i.e. it predates this pass and traces to the 199D-DW2 shared-bridge
+context capture making the scenario reachable at all. It is a real signal about the server-death
+path, it is outside this pass's owner set, and it needs its own increment; it is recorded here
+rather than excluded or explained away.
