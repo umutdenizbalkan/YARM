@@ -3122,6 +3122,16 @@ fn try_split_ipcreply_direct_into_frame(
             u8::from(settled)
         );
     }
+    // DIRECT3-QUEUE3 — RELEASE THE REPLY-RECORD SLOT, last, and only on success.
+    //
+    // Legacy `ipc_reply` frees the slot (`ipc.reply_caps[slot] = None`); the direct path did
+    // not, so every direct reply permanently consumed one of `MAX_REPLY_CAPS` slots. Ordered
+    // after the terminal commit on purpose: releasing while the cell is still `Reserved(Reply)`
+    // would let a reallocation of this slot `arm` over a live claim. Exact by record generation
+    // and by the `Consumed` state, so a repeat, a stale caller or a recycled slot frees nothing.
+    if matches!(outcome, Ok(_)) {
+        shared.release_consumed_reply_record_split(rec_idx, rec_gen);
+    }
     let disposition = crate::kernel::direct_disposition::classify_direct_reply_outcome(&outcome);
     crate::kernel::direct_ipc_counters::note_disposition(&REPLY_COUNTERS, disposition);
     // Same shared encoder as the NR6 twin: legacy `handle_ipc_reply` ends with the identical

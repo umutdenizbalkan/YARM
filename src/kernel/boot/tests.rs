@@ -148807,3 +148807,222 @@ mod stage199e_dl_registration {
         teardown();
     }
 }
+
+/// 199A2D-RR — the reply-record RELEASE invariants.
+///
+/// Legacy `ipc_reply` frees the record slot (`ipc.reply_caps[slot] = None`); the direct path
+/// did not, and because the allocator reuses only `is_none()` slots, every direct reply
+/// permanently consumed one of `MAX_REPLY_CAPS`. A default boot already sat at the boundary —
+/// high-water record index 41 against 42 direct replies — surviving only because the twelve
+/// legacy replies still freed theirs. Taking one reply off the legacy path exhausted the table
+/// and the next `ipc_call` failed `stage=reply_cap_alloc err=CapabilityFull`, losing a request
+/// and its reply.
+///
+/// The six transaction-level tests still pin the TRANSACTION's post-state, which is unchanged:
+/// the record is `Consumed` when `ipc_reply_direct_txn` returns. The release is the split
+/// route's own step, ordered after the terminal commit, and these cases pin THAT.
+mod stage199a2drr_reply_record_release {
+    use super::*;
+    use crate::kernel::boot::{ReceiverWaiterIdentity, ReplyRecordReservation};
+    use crate::runtime::SharedKernel;
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    struct Fx {
+        k: SharedKernel,
+        index: usize,
+        generation: u64,
+        caller: ReceiverWaiterIdentity,
+        replier: ReceiverWaiterIdentity,
+    }
+
+    /// The identities here are the ones the kernel actually allocated: the record's reserve
+    /// precondition is an EXACT identity match, so a fabricated ASID would refuse for the
+    /// wrong reason and the tests below would pin nothing.
+    fn fixture() -> Fx {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (index, generation, caller, replier) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("bind1");
+            s.bind_task_asid(2, sasid).expect("bind2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            let caller = ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            let (index, generation) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("record");
+            // The NR6 request path commits `Reserved → Available` as its last record
+            // mutation; only an `Available` record is externally invokable, and only such
+            // a record can be re-reserved by a reply. Without this the reply-side reserve
+            // below would refuse for the wrong reason.
+            assert!(s.commit_direct_reply_record(index, generation));
+            (index, generation, caller, replier)
+        });
+        Fx {
+            k,
+            index,
+            generation,
+            caller,
+            replier,
+        }
+    }
+
+    fn present(k: &SharedKernel, index: usize) -> bool {
+        k.with(|s| s.reply_cap_record_reservation(index)).is_some()
+    }
+
+    /// A CONSUMED record at the exact generation is released, and the slot becomes reusable —
+    /// which is the whole point: the allocator only ever reuses an absent slot.
+    #[test]
+    fn an_exact_consumed_record_is_released_and_the_slot_is_reusable() {
+        let Fx {
+            k,
+            index,
+            generation,
+            replier,
+            ..
+        } = fixture();
+        assert!(k.reserve_existing_reply_record_split(index, generation, replier));
+        assert!(k.consume_reply_record_split(index, generation));
+        assert_eq!(
+            k.with(|s| s.reply_cap_record_reservation(index)),
+            Some(ReplyRecordReservation::Consumed)
+        );
+        k.release_consumed_reply_record_split(index, generation);
+        assert!(
+            !present(&k, index),
+            "the slot must be ABSENT, not merely Consumed — a Consumed record still occupies it"
+        );
+    }
+
+    /// A record that is NOT `Consumed` is never released: an in-flight reservation or a live
+    /// `Available` authority must survive.
+    #[test]
+    fn a_record_that_is_not_consumed_is_never_released() {
+        for reserve_first in [false, true] {
+            let Fx {
+                k,
+                index,
+                generation,
+                replier,
+                ..
+            } = fixture();
+            if reserve_first {
+                assert!(k.reserve_existing_reply_record_split(index, generation, replier));
+            }
+            k.release_consumed_reply_record_split(index, generation);
+            assert!(
+                present(&k, index),
+                "reserve_first={reserve_first}: only a Consumed record may be released"
+            );
+        }
+    }
+
+    /// A STALE release cannot clear a REUSED slot. This is the reuse hazard the exactness
+    /// exists for: the same index, a new incarnation, and an old caller still holding the old
+    /// generation.
+    #[test]
+    fn a_stale_release_cannot_clear_a_reused_slot() {
+        let Fx {
+            k,
+            index,
+            generation,
+            caller,
+            replier,
+        } = fixture();
+        assert!(k.reserve_existing_reply_record_split(index, generation, replier));
+        assert!(k.consume_reply_record_split(index, generation));
+        k.release_consumed_reply_record_split(index, generation);
+        assert!(!present(&k, index));
+        // The slot is recycled into a NEW incarnation at an advanced generation.
+        let (new_index, new_generation) = k
+            .with(|s| {
+                s.reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+            })
+            .expect("recycled record");
+        assert_eq!(new_index, index, "the freed slot is the one reused");
+        assert!(
+            new_generation > generation,
+            "the generation strictly advances"
+        );
+        // The OLD holder retries its release with the OLD generation: nothing happens.
+        k.release_consumed_reply_record_split(index, generation);
+        assert!(
+            present(&k, index),
+            "a stale generation must never free a live reused record"
+        );
+        // And a repeat at the new generation still refuses, because it is not Consumed.
+        k.release_consumed_reply_record_split(index, new_generation);
+        assert!(present(&k, index), "a live record is not releasable");
+    }
+
+    /// Repeated release is inert.
+    #[test]
+    fn repeated_release_is_harmless() {
+        let Fx {
+            k,
+            index,
+            generation,
+            replier,
+            ..
+        } = fixture();
+        assert!(k.reserve_existing_reply_record_split(index, generation, replier));
+        assert!(k.consume_reply_record_split(index, generation));
+        for _ in 0..4 {
+            k.release_consumed_reply_record_split(index, generation);
+        }
+        assert!(!present(&k, index));
+    }
+
+    /// ORDER: the split route releases the record only on success, and only AFTER it commits
+    /// the terminal claim. Releasing while the cell is still `Reserved(Reply)` would let a
+    /// reallocation of this slot `arm` over a live claim.
+    #[test]
+    fn the_release_is_ordered_after_the_terminal_commit_and_gated_on_success() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
+        let commit = body
+            .find("commit_direct_reply_terminal_split(")
+            .expect("the terminal commit");
+        let release = body
+            .find("release_consumed_reply_record_split(")
+            .expect("the record release");
+        assert!(
+            commit < release,
+            "the record is released only after the terminal claim is committed"
+        );
+        let gate = body
+            .find("if matches!(outcome, Ok(_)) {")
+            .expect("the success gate");
+        assert!(
+            gate < release && release - gate < 400,
+            "the release is gated on a successful delivery"
+        );
+        // The transaction itself must NOT release: its documented post-state is `Consumed`,
+        // and its `EnqueueRejected` arm restores the authority for a retry.
+        assert!(
+            !TXN.contains("release_consumed_reply_record_split("),
+            "the transaction must leave the release to its caller"
+        );
+    }
+}

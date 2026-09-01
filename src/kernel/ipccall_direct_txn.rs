@@ -1097,11 +1097,12 @@ impl SharedKernel {
                 // reply off the legacy path exhausted the table, and the next `ipc_call` failed
                 // `stage=reply_cap_alloc err=CapabilityFull` — losing a request and its reply.
                 //
-                // Released ONLY here, on the success edge after the caller is enqueued: the
-                // `EnqueueRejected` arm above deliberately restores the authority for a retry,
-                // and freeing the slot before that decision would destroy the record it
-                // restores.
-                self.release_consumed_reply_record_split(idx, rgen);
+                // Released by the CALLER of this transaction, after it commits the terminal
+                // claim — not here. Releasing while the cell is still `Reserved(Reply)` would
+                // leave a window in which a reallocation of this slot could `arm` over a live
+                // claim; ordering the release after the commit closes it. The `EnqueueRejected`
+                // arm above still restores the authority for a retry, and that arm never
+                // reaches the caller's release because it returns `Err`.
                 Ok(IpcReplyDirectSuccess {
                     record_index: idx,
                     record_generation: rgen,
