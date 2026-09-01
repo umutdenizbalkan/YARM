@@ -7996,6 +7996,16 @@ pub fn bootstrap_first_user_task(
         init_args[5] = 1;
         crate::yarm_log!("AARCH64_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1");
     }
+    // 199E-A64CALL: the TERMINAL-FAULT oracle slot-5 write. Mutually exclusive with every
+    // slot-5 oracle above (guarded by `init_args[5] == 0`) and default-off, so a normal boot
+    // leaves slot 5 at 0 and init never takes the deliberate fault.
+    if init_args[5] == 0 && crate::kernel::boot::aarch64_terminal_fault_oracle_enabled() {
+        init_args[5] = crate::kernel::boot::AARCH64_TERMINAL_FAULT_ORACLE_SELECTOR;
+        crate::yarm_log!(
+            "AARCH64_TERMINAL_FAULT_ORACLE_PROVISION_OK slot5={}",
+            init_args[5]
+        );
+    }
     // Stage 200D-0C1: the AArch64 ExitCurrentTask live-oracle slot-5 write. This IS the
     // production activation — without it the feature and the knob arm nothing and init never
     // sees the scenario (the exact defect that produced two dead x86 runs in Stage 200D-0B2,

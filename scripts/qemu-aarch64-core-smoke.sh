@@ -123,6 +123,17 @@ if [[ "$YIELD_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_yield_oracle
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_yield_oracle=1"
 fi
 YIELD_LONE_ORACLE=${YIELD_LONE_ORACLE:-0}
+# 199E-A64CALL: default-off TERMINAL-FAULT oracle cell. Arms
+# `yarm.aarch64_terminal_fault_oracle=1`, which makes init take ONE deliberate unhandled read at
+# 0x0 so the U9-FT4 terminal-PageFault witness has a trigger of its own. Until 199E-A64CALL that
+# witness observed a DEFECT — init's `spawn_v5_cap` dereferencing a pointer the kernel had zeroed
+# out of x15 on every syscall return — and repairing that removed the only terminal fault any
+# AArch64 profile produced. The default cell now boots its service chain clean; U9-FT4 asserts,
+# unchanged and still fully positive, only in this cell.
+TERMINAL_FAULT_ORACLE=${TERMINAL_FAULT_ORACLE:-0}
+if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_terminal_fault_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.aarch64_terminal_fault_oracle=1"
+fi
 if [[ "$YIELD_LONE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_yield_lone_oracle="* ]]; then
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_yield_lone_oracle=1"
 fi
@@ -289,6 +300,18 @@ fi
 # U9-FT4: the AArch64 terminal PageFault route is now SPLIT. Assert the witness chain
 # POSITIVELY -- fatal-pattern absence is insufficient, and demonstrably so: the FT3 attempt
 # exited 0 while the faulting PC resumed. Every line below must hold exactly.
+# 199E-A64CALL: this witness now runs in its OWN CELL (`TERMINAL_FAULT_ORACLE=1`), not in the
+# default profile. NOTHING below is weakened — every assertion is byte-identical and still
+# positive. What changed is the TRIGGER. This chain used to be driven by a DEFECT: init's
+# `spawn_v5_cap` dereferenced a pointer the kernel had zeroed out of x15 on every syscall return
+# (the `REG_X18_TLS` lane addressed x15 instead of x18). That was never an armed proof, and it
+# also meant the AArch64 service chain could never run at all. Repairing it removed the only
+# terminal fault any AArch64 profile produced, so the witness was given a deliberate trigger —
+# `yarm.aarch64_terminal_fault_oracle=1`, one intentional unhandled read at 0x0 — and the default
+# cell now boots the service chain clean instead of dying inside init.
+if [[ "$TERMINAL_FAULT_ORACLE" != "1" ]]; then
+  echo "[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell"
+else
 u9ft4_fail=0
 u9ft4_log="$(tr '\r' '\n' <"$LOGFILE")"
 # `rg -c` prints nothing and exits non-zero when there are no matches, so normalise to 0.
@@ -363,6 +386,7 @@ if [[ "$u9ft4_fail" -eq 1 ]]; then
   exit 1
 fi
 echo "[ok] U9-FT4: AArch64 terminal PageFault route witness chain complete"
+fi
 
 # U9-RX4: the Stage-32B queued-plain split receive must deliver EXACTLY what the broad receive
 # delivers. Asserted POSITIVELY, because the defect this replaced was invisible to

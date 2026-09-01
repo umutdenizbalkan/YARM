@@ -779,6 +779,48 @@ fn dispatch_aarch64_unlocking_oracle_early(ctx: &yarm_user_rt::runtime::StartupC
     if ctx.supervisor_control_recv_ep == Some(7) {
         run_aarch64_ipccall_direct_oracle(ctx.task_id);
     }
+    // 199E-A64CALL: slot-5 selector 21 = the TERMINAL-FAULT oracle. It runs HERE, before the
+    // SpawnV5 service chain, which is where init used to fault by accident — so the replacement
+    // the queue advance selects is still the supervisor (tid 2), exactly as U9-FT4 asserts.
+    if ctx.supervisor_control_recv_ep == Some(21) {
+        run_aarch64_terminal_fault_oracle(ctx.task_id);
+    }
+}
+
+/// 199E-A64CALL — take ONE deliberate unhandled user read at address 0, giving the U9-FT4
+/// terminal-PageFault witness a trigger of its own.
+///
+/// U9-FT4 asserts the AArch64 terminal-fault route POSITIVELY: the fault is entered once,
+/// reported unhandled once, buffered to init's fault endpoint without a wake, the terminal
+/// transition commits once, the broad dispatcher is skipped, and the replacement task is
+/// selected and given its exact address space and frame. Until 199E-A64CALL the fault it watched
+/// was not armed by anything — it was init's `spawn_v5_cap` dereferencing a pointer the kernel
+/// had zeroed out of x15 on every syscall return (the `REG_X18_TLS` lane addressed x15, not
+/// x18). Repairing that removed the last terminal fault from every AArch64 profile, so the
+/// witness needed a real trigger rather than a defect.
+///
+/// This never returns: the read is unhandled by construction, so the kernel takes the task down
+/// and hands the CPU to the replacement. That is the point — the marker chain U9-FT4 greps for
+/// is emitted by the kernel, not by init.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn run_aarch64_terminal_fault_oracle(init_tid: u64) -> ! {
+    yarm_user_rt::user_log!(
+        "AARCH64_TERMINAL_FAULT_ORACLE_BEGIN init_tid={} addr=0x0 access=read",
+        init_tid
+    );
+    // SAFETY: this read is INTENDED to fault. Address 0 is never mapped in a user address space,
+    // so the access raises a translation fault the kernel reports unhandled and turns into a
+    // terminal task transition. `read_volatile` keeps the access from being optimized away.
+    let observed = unsafe { core::ptr::read_volatile(core::ptr::null::<u8>()) };
+    // Not reached. Kept so the read cannot be treated as dead and elided.
+    yarm_user_rt::user_log!(
+        "AARCH64_TERMINAL_FAULT_ORACLE_UNREACHABLE init_tid={} observed={}",
+        init_tid,
+        observed
+    );
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]

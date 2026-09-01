@@ -3215,6 +3215,33 @@ pub fn aarch64_yield_lone_oracle_enabled() -> bool {
     AARCH64_YIELD_LONE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// 199E-A64CALL: default-off AArch64 TERMINAL-FAULT oracle (slot 5 = 21).
+///
+/// The U9-FT4 witness asserts the AArch64 terminal PageFault route positively — an unhandled
+/// user read at 0x0 by init, buffered to its fault endpoint, committing the terminal transition
+/// and handing the CPU to the replacement task. Until 199E-A64CALL the fault it observed was NOT
+/// armed by anything: it was init's `spawn_v5_cap` faulting on a pointer the kernel had zeroed
+/// out of x15 on every syscall return. Repairing that (the `REG_X18_TLS` lane) removed the only
+/// terminal fault any AArch64 profile produced, which would have left U9-FT4 nothing to witness.
+///
+/// This knob gives the witness a DELIBERATE trigger of its own, so the default profile boots its
+/// service chain clean and the fault route keeps a positive live proof in a separate cell. It is
+/// default-off and arms nothing unless `yarm.aarch64_terminal_fault_oracle=1` is passed.
+pub(crate) static AARCH64_TERMINAL_FAULT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_terminal_fault_oracle_enabled(enabled: bool) {
+    AARCH64_TERMINAL_FAULT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_terminal_fault_oracle_enabled() -> bool {
+    AARCH64_TERMINAL_FAULT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The init startup-slot-5 selector for the terminal-fault oracle. Slot-5 values 1-8 and 20 are
+/// already claimed on AArch64, so this takes the next clearly free value.
+pub const AARCH64_TERMINAL_FAULT_ORACLE_SELECTOR: u64 = 21;
+
 /// Stage 196A: default-off RISC-V post-lock-drain FOUNDATION oracle selector.
 /// When enabled, the RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`)
 /// publishes a one-shot post-work token during its broad-lock (`with_cpu`) phase

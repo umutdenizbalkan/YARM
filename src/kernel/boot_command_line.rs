@@ -336,6 +336,13 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_aarch64_yield_lone_oracle_enabled(enabled);
         crate::yarm_log!("YARM_AARCH64_YIELD_LONE_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.aarch64_terminal_fault_oracle {
+        // 199E-A64CALL: default-off AArch64 TERMINAL-FAULT oracle knob (slot 5 = 21). Gives the
+        // U9-FT4 terminal-PageFault witness a deliberate trigger of its own, so the default
+        // profile boots its service chain clean.
+        crate::kernel::boot::set_aarch64_terminal_fault_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_AARCH64_TERMINAL_FAULT_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.riscv64_post_lock_foundation_oracle {
         // Stage 196A: default-off RISC-V post-lock-drain FOUNDATION oracle knob. Arms the shared
         // trap wrapper's one-shot publish/consume drain-ordering proof; enables no retirement.
@@ -771,6 +778,10 @@ pub struct YarmBootOptions<'a> {
     /// Stage 195G: `yarm.aarch64_yield_lone_oracle=1` DEFAULT-OFF knob (slot 5 = 5) — lone-task
     /// Yield oracle (Proof B).
     pub aarch64_yield_lone_oracle: Option<bool>,
+    /// 199E-A64CALL: `yarm.aarch64_terminal_fault_oracle=1` DEFAULT-OFF knob (slot 5 = 21) —
+    /// makes init take one deliberate unhandled read at 0x0, the trigger the U9-FT4 terminal
+    /// PageFault witness needs now that the defect it used to observe is repaired.
+    pub aarch64_terminal_fault_oracle: Option<bool>,
     /// Stage 196A: `yarm.riscv64_post_lock_foundation_oracle=1` DEFAULT-OFF knob. Arms the RISC-V
     /// shared trap wrapper's one-shot post-lock-drain FOUNDATION oracle (publish token in the
     /// broad-lock phase, consume it after the lock drops via a real `with_cpu` re-acquire). It
@@ -1050,6 +1061,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.aarch64_yield_lone_oracle" {
             options.aarch64_yield_lone_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.aarch64_terminal_fault_oracle" {
+            options.aarch64_terminal_fault_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.riscv64_post_lock_foundation_oracle" {
             options.riscv64_post_lock_foundation_oracle = parse_bool_knob(value);
@@ -1641,6 +1655,33 @@ mod tests {
 
     // Stage 195G: the AArch64 Yield two-task + lone-task oracle knobs parse as standard bool
     // knobs, default to None (off), and are independent of each other.
+    #[test]
+    fn aarch64_terminal_fault_oracle_knob_parses_and_defaults_off() {
+        // Default-off: an empty cmdline, and a normal boot cmdline, must both leave it unset so
+        // the service chain never takes the deliberate fault.
+        assert_eq!(parse_yarm_boot_options(b"").aarch64_terminal_fault_oracle, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"console=ttyS0 rdinit=/init").aarch64_terminal_fault_oracle,
+            None
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.aarch64_terminal_fault_oracle=1")
+                .aarch64_terminal_fault_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.aarch64_terminal_fault_oracle=0")
+                .aarch64_terminal_fault_oracle,
+            Some(false)
+        );
+        // No prefix aliasing against the neighbouring AArch64 oracle knobs, in either direction.
+        let tf = parse_yarm_boot_options(b"yarm.aarch64_terminal_fault_oracle=1");
+        assert_eq!(tf.aarch64_yield_oracle, None);
+        assert_eq!(tf.aarch64_yield_lone_oracle, None);
+        let yl = parse_yarm_boot_options(b"yarm.aarch64_yield_lone_oracle=1");
+        assert_eq!(yl.aarch64_terminal_fault_oracle, None);
+    }
+
     #[test]
     fn aarch64_yield_oracle_knobs_parse_and_default_off() {
         assert_eq!(parse_yarm_boot_options(b"").aarch64_yield_oracle, None);
