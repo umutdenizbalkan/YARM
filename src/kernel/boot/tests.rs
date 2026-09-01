@@ -148214,3 +148214,312 @@ mod stage199gc4_nr1_terminal_edges {
         }
     }
 }
+
+/// 199E-DL (§5) — the compensated reply-deadline registration matrix.
+///
+/// The split blocking-receive route arms the reply terminal and reserves its deadline token in
+/// ONE rank-3 scope, then publishes the token into the caller's TCB under rank 2. These cases
+/// drive the two policy owners directly, so each arm of the transaction is decided by the
+/// mechanism rather than by a live boot's timing:
+///
+///   * no deadline               → armed, nothing reserved
+///   * finite deadline           → armed, exactly one reservation, keyed to the live epoch
+///   * the safety window         → a reservation NOTHING can reach until the TCB owns it
+///   * publication               → exact incarnation only, once
+///   * a stale/recycled caller   → refused, and compensated exactly
+///   * a second finite arm       → refused, and the first registration survives
+///   * an ordinary receive       → not a reply wait, nothing armed, nothing reserved
+mod stage199e_dl_registration {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::ReplyWaitArm;
+    use crate::kernel::deadline_token::{DeadlineTokenHandle, ReplyDeadlineClock};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::vm::Asid;
+
+    /// The caller's committed wait generation — the incarnation discriminator every step keys on.
+    fn wait_gen(fx: &CallerFx) -> u64 {
+        fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+            .expect("the fixture's caller is committed-blocked")
+    }
+
+    /// Arm the reply terminal exactly as `recv_block_phase_c_split` does, in one rank-3 scope.
+    fn arm(fx: &CallerFx, finite: bool) -> ReplyWaitArm {
+        let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), fx.caller_asid);
+        let wgen = wait_gen(fx);
+        fx.k.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::arm_reply_terminal_for_committed_block_locked(
+                ipc,
+                caller,
+                fx.reply_eidx,
+                wgen,
+                finite,
+            )
+        })
+    }
+
+    /// Every deadline token the store currently holds as armed or fire-claimed.
+    fn live_tokens(fx: &CallerFx) -> usize {
+        fx.k.with_ipc_split_mut(|ipc| {
+            ipc.reply_deadline_tokens
+                .iter()
+                .filter(|t| t.is_armed() || t.is_fire_claimed())
+                .count()
+        })
+    }
+
+    /// The reply record's terminal-cell epoch.
+    fn epoch(fx: &CallerFx) -> u64 {
+        fx.k.with_ipc_split_mut(|ipc| ipc.reply_terminal_ownership[fx.record_index].current_epoch())
+    }
+
+    /// The token the caller's TCB actually owns — what the timeout collector can reach.
+    fn tcb_token(fx: &CallerFx) -> Option<DeadlineTokenHandle> {
+        fx.k.with(|s| s.reply_timeout_token_for_caller(1, fx.caller_asid))
+    }
+
+    #[test]
+    fn dl01_a_wait_with_no_deadline_arms_and_reserves_nothing() {
+        let fx = caller_fixture();
+        assert_eq!(
+            live_tokens(&fx),
+            0,
+            "the fixture starts with no reservation"
+        );
+        let armed = arm(&fx, false);
+        let ReplyWaitArm::Armed { identity, token } = armed else {
+            panic!("a live reply wait must arm: {armed:?}");
+        };
+        assert!(
+            token.is_none(),
+            "no deadline was asked for, none is reserved"
+        );
+        assert_eq!(
+            identity.deadline_token_generation, None,
+            "the identity must not imply a registration it does not own"
+        );
+        assert_eq!(identity.reply_record_index, fx.record_index);
+        assert_eq!(identity.reply_record_generation, fx.record_generation);
+        assert_eq!(live_tokens(&fx), 0, "nothing was reserved");
+        assert!(tcb_token(&fx).is_none(), "and nothing is reachable");
+        teardown();
+    }
+
+    #[test]
+    fn dl02_a_finite_wait_reserves_exactly_one_token_keyed_to_the_live_epoch() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        let armed = arm(&fx, true);
+        let ReplyWaitArm::Armed {
+            identity,
+            token: Some(handle),
+        } = armed
+        else {
+            panic!("a finite reply wait must arm and reserve: {armed:?}");
+        };
+        assert_eq!(
+            identity.deadline_token_generation,
+            Some(wgen),
+            "the registration is keyed to THIS block, not to a re-derived number"
+        );
+        assert_eq!(live_tokens(&fx), 1, "exactly one reservation");
+        let live_epoch = epoch(&fx);
+        fx.k.with_ipc_split_mut(|ipc| {
+            let t = &ipc.reply_deadline_tokens[handle.token_index()];
+            let id = t.identity();
+            assert_eq!(id.token_generation, wgen, "token generation is the wait's");
+            assert_eq!(
+                id.terminal_epoch, live_epoch,
+                "the reservation names the cell's CURRENT epoch"
+            );
+            assert_eq!(
+                id.terminal_identity, identity,
+                "and the exact identity armed"
+            );
+        });
+        teardown();
+    }
+
+    #[test]
+    fn dl03_a_reservation_is_unreachable_until_the_tcb_owns_it() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        let ReplyWaitArm::Armed {
+            token: Some(handle),
+            ..
+        } = arm(&fx, true)
+        else {
+            panic!("finite wait arms");
+        };
+        // THE hard requirement: the token exists, but the only path to it — the caller's TCB —
+        // does not name it yet, so no timeout claimant can win with a token the caller does not
+        // own. This is a structural property of the store, not a timing assumption.
+        assert_eq!(live_tokens(&fx), 1, "reserved");
+        assert!(
+            tcb_token(&fx).is_none(),
+            "but not yet reachable through the caller"
+        );
+        assert!(
+            fx.k.publish_reply_timeout_token_split(
+                1,
+                fx.caller_asid,
+                wgen,
+                handle,
+                ReplyDeadlineClock::ProductionTick
+            ),
+            "the exact incarnation accepts the publication"
+        );
+        assert_eq!(
+            tcb_token(&fx).map(|h| h.token_index()),
+            Some(handle.token_index()),
+            "and now the caller owns exactly that token"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn dl04_the_token_is_published_once_and_never_overwritten() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        let ReplyWaitArm::Armed {
+            token: Some(handle),
+            ..
+        } = arm(&fx, true)
+        else {
+            panic!("finite wait arms");
+        };
+        assert!(fx.k.publish_reply_timeout_token_split(
+            1,
+            fx.caller_asid,
+            wgen,
+            handle,
+            ReplyDeadlineClock::ProductionTick
+        ));
+        assert!(
+            !fx.k.publish_reply_timeout_token_split(
+                1,
+                fx.caller_asid,
+                wgen,
+                handle,
+                ReplyDeadlineClock::ProductionTick
+            ),
+            "a TCB that already owns a token refuses a second registration"
+        );
+        assert_eq!(live_tokens(&fx), 1, "and no second reservation appeared");
+        teardown();
+    }
+
+    #[test]
+    fn dl05_a_wrong_incarnation_is_refused_and_compensated_exactly() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        let ReplyWaitArm::Armed {
+            token: Some(handle),
+            ..
+        } = arm(&fx, true)
+        else {
+            panic!("finite wait arms");
+        };
+        // Each of the three incarnation fields is refused on its own.
+        for (tid, asid, g, why) in [
+            (7_u64, fx.caller_asid, wgen, "a different task"),
+            (
+                1,
+                Asid(fx.caller_asid.0.wrapping_add(9)),
+                wgen,
+                "a replacement ASID",
+            ),
+            (1, fx.caller_asid, wgen.wrapping_add(1), "a later block"),
+        ] {
+            assert!(
+                !fx.k.publish_reply_timeout_token_split(
+                    tid,
+                    asid,
+                    g,
+                    handle,
+                    ReplyDeadlineClock::ProductionTick
+                ),
+                "{why} is not this registration's caller"
+            );
+            assert!(tcb_token(&fx).is_none(), "{why}: nothing was written");
+        }
+        // The compensation is exact and leaves no leak.
+        assert!(
+            fx.k.cancel_deadline_exact_split(&handle),
+            "the refused reservation is cancelled by the handle that made it"
+        );
+        assert_eq!(live_tokens(&fx), 0, "zero leak after compensation");
+        assert!(
+            !fx.k.cancel_deadline_exact_split(&handle),
+            "a repeated compensation with a now-stale handle cancels nothing"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn dl06_a_second_finite_arm_is_refused_and_the_first_registration_survives() {
+        let fx = caller_fixture();
+        let ReplyWaitArm::Armed {
+            identity: first,
+            token: Some(handle),
+        } = arm(&fx, true)
+        else {
+            panic!("finite wait arms");
+        };
+        let epoch_after_first = epoch(&fx);
+        // The identity is unchanged, so the cell is NOT re-armed — re-arming would bump the epoch
+        // and invalidate the reservation keyed on the old one.
+        let again = arm(&fx, true);
+        assert_eq!(
+            again,
+            ReplyWaitArm::DeadlineRefused { identity: first },
+            "one active registration per reply record, refused rather than overwritten"
+        );
+        assert_eq!(
+            epoch(&fx),
+            epoch_after_first,
+            "an identical arm must not bump the terminal epoch"
+        );
+        assert_eq!(live_tokens(&fx), 1, "the FIRST reservation still stands");
+        fx.k.with_ipc_split_mut(|ipc| {
+            assert_eq!(
+                ipc.reply_deadline_tokens[handle.token_index()]
+                    .identity()
+                    .terminal_epoch,
+                epoch_after_first,
+                "and it is still keyed to the live epoch"
+            );
+        });
+        teardown();
+    }
+
+    #[test]
+    fn dl07_an_ordinary_receive_is_not_a_reply_wait() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        // A caller identity that owns no `Available` reply record at this endpoint.
+        let stranger = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            ThreadId(9),
+            Asid(fx.caller_asid.0.wrapping_add(31)),
+        );
+        let armed = fx.k.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::arm_reply_terminal_for_committed_block_locked(
+                ipc,
+                stranger,
+                fx.reply_eidx,
+                wgen,
+                true,
+            )
+        });
+        assert_eq!(
+            armed,
+            ReplyWaitArm::NotAReplyWait,
+            "an ordinary receive owns no reply record and must arm nothing"
+        );
+        assert_eq!(
+            live_tokens(&fx),
+            0,
+            "and reserve nothing — NR 2 / NR 5 unchanged"
+        );
+        teardown();
+    }
+}
