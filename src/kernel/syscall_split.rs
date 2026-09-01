@@ -750,21 +750,18 @@ fn try_split_ipc_send_into_frame(
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) -> SplitDispatchDisposition {
-    use SplitDispatchDisposition as D;
     use crate::kernel::capabilities::{CapId, CapObject, CapRights};
     use crate::kernel::ipc::{EndpointMode, SharedMemoryRegion};
     use crate::kernel::syscall::{
         IpcSendPayloadShape, REPLY_CAP_QUEUEING_SUPPORTED, SYSCALL_ARG_CAP,
-        SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
-        SYSCALL_ARG_PTR, SyscallError, classify_ipc_send_payload_shape, frame_ipc_send_message,
+        SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR,
+        SyscallError, classify_ipc_send_payload_shape, frame_ipc_send_message,
         transfer_cap_arg_present,
     };
+    use SplitDispatchDisposition as D;
 
     // ── (1) NR and CPU ──────────────────────────────────────────────────────────────────────
-    if !matches!(
-        Syscall::decode(frame.syscall_num()),
-        Ok(Syscall::IpcSend)
-    ) {
+    if !matches!(Syscall::decode(frame.syscall_num()), Ok(Syscall::IpcSend)) {
         return D::NotHandled;
     }
     let cpu_idx = cpu.0 as usize;
@@ -850,7 +847,7 @@ fn try_split_ipc_send_into_frame(
     // ── (4) ADMIT: the transfer capability ──────────────────────────────────────────────────
     let transfer_cap = if transfer_cap_arg_present(frame) {
         Some(CapId(
-            frame.arg(crate::kernel::syscall::SYSCALL_ARG_TRANSFER_CAP) as u64
+            frame.arg(crate::kernel::syscall::SYSCALL_ARG_TRANSFER_CAP) as u64,
         ))
     } else {
         None
@@ -943,11 +940,9 @@ fn try_split_ipc_send_into_frame(
             if let Some(asid) = sender_asid {
                 // A user sender's payload lives in ITS address space; a fault here is the
                 // ordinary user-memory fault the broad handler reports, and nothing is consumed.
-                let Some(bytes) = shared.copy_from_user_asid_split_read(
-                    asid.0 as u64,
-                    user_ptr_or_offset,
-                    len,
-                ) else {
+                let Some(bytes) =
+                    shared.copy_from_user_asid_split_read(asid.0 as u64, user_ptr_or_offset, len)
+                else {
                     crate::yarm_log!(
                         "IPC_SEND_SPLIT_REFUSED cpu={} tid={} reason=payload_fault",
                         cpu.0,
@@ -1009,7 +1004,13 @@ fn try_split_ipc_send_into_frame(
         transfer_cap,
         transfer_handle,
     ) else {
-        settle_ipc_send_envelope(shared, transfer_handle, endpoint_idx, stash_bound_receiver, tid);
+        settle_ipc_send_envelope(
+            shared,
+            transfer_handle,
+            endpoint_idx,
+            stash_bound_receiver,
+            tid,
+        );
         return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
     };
 
@@ -1031,34 +1032,87 @@ fn try_split_ipc_send_into_frame(
         // The four producers, in the order `try_ipc_send_boundary_split_any_pub` uses, plus the
         // shared-region class the broad router tries last. Each declines having consumed
         // nothing, so trying them in order costs nothing.
+        //
+        // Each success TAGS THE STASH ORIGIN, exactly as the broad boundary wrappers do. The
+        // tag is what makes the drain emit this class's `IPC_SEND_BOUNDARY_*` markers instead
+        // of the generic delivery ones — the same existing marker family, from the same drain,
+        // reached by a different route. Without it a delivery that really happened would report
+        // itself as some other class's, and every live IpcSend witness reads those markers.
+        crate::yarm_log!(
+            "IPC_SEND_BOUNDARY_SPLIT_BEGIN waiter_tid={} endpoint={}",
+            waiter_tid.0,
+            endpoint_idx
+        );
         let produced = shared
             .produce_blocked_waiter_plain_delivery_split(waiter_tid.0, endpoint_idx, &msg)
+            .map(|done| {
+                if done {
+                    crate::kernel::boot::ipc_send_boundary_origin_set(cpu_idx);
+                    crate::yarm_log!(
+                        "IPC_SEND_BOUNDARY_PLAIN_SNAPSHOT_OK waiter_tid={}",
+                        waiter_tid.0
+                    );
+                }
+                done
+            })
             .and_then(|done| {
                 if done {
-                    Ok(true)
-                } else {
-                    shared.produce_blocked_waiter_reply_cap_delivery_split(
+                    return Ok(true);
+                }
+                crate::yarm_log!(
+                    "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_BEGIN waiter_tid={} endpoint={}",
+                    waiter_tid.0,
+                    endpoint_idx
+                );
+                shared
+                    .produce_blocked_waiter_reply_cap_delivery_split(
                         waiter_tid.0,
                         endpoint_idx,
                         &msg,
                     )
+                    .map(|done| {
+                        if done {
+                            crate::kernel::boot::ipc_send_reply_cap_boundary_origin_set(cpu_idx);
+                            crate::yarm_log!(
+                                "IPC_SEND_REPLY_CAP_BOUNDARY_SNAPSHOT_OK waiter_tid={}",
+                                waiter_tid.0
+                            );
+                        }
+                        done
+                    })
+            })
+            .and_then(|done| {
+                if done {
+                    return Ok(true);
                 }
+                crate::yarm_log!(
+                    "IPC_SEND_CAP_BOUNDARY_SPLIT_BEGIN waiter_tid={} endpoint={}",
+                    waiter_tid.0,
+                    endpoint_idx
+                );
+                shared
+                    .produce_blocked_waiter_ordinary_cap_delivery_split(
+                        waiter_tid.0,
+                        endpoint_idx,
+                        &msg,
+                    )
+                    .map(|done| {
+                        if done {
+                            crate::kernel::boot::ipc_send_cap_boundary_origin_set(cpu_idx);
+                            crate::yarm_log!(
+                                "IPC_SEND_CAP_BOUNDARY_SNAPSHOT_OK waiter_tid={}",
+                                waiter_tid.0
+                            );
+                        }
+                        done
+                    })
             })
             .and_then(|done| {
                 if done {
                     Ok(true)
                 } else {
-                    shared.produce_blocked_waiter_ordinary_cap_delivery_split(
-                        waiter_tid.0,
-                        endpoint_idx,
-                        &msg,
-                    )
-                }
-            })
-            .and_then(|done| {
-                if done {
-                    Ok(true)
-                } else {
+                    // The shared-region producer tags its own origin through
+                    // `stash_shared_region_delivery(.., SharedRegionLiveOrigin::Direct)`.
                     shared.produce_blocked_waiter_shared_region_delivery_split(
                         waiter_tid.0,
                         endpoint_idx,
@@ -1124,6 +1178,22 @@ fn try_split_ipc_send_into_frame(
     }
 
     // No recv-v2 waiter: the authoritative unconditional enqueue.
+    //
+    // The Stage-193E enqueue boundary's markers are emitted around it, for the same reason the
+    // delivery classes' are: this route now OWNS the boundary, and every live IpcSend witness
+    // reads this family. The wrapper is not called — the directive names the authoritative
+    // unconditional enqueue as the final enqueue policy, and the wrapper wraps the conservative
+    // Stage-4E screen — so the markers come from the route, unchanged in name and meaning.
+    crate::yarm_log!(
+        "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN endpoint={} len={}",
+        endpoint_idx,
+        msg.as_slice().len()
+    );
+    // Phase A: the payload/meta are snapshotted by value — no user copy, no materialization.
+    crate::yarm_log!(
+        "IPC_SEND_ENQUEUE_BOUNDARY_SNAPSHOT_OK endpoint={}",
+        endpoint_idx
+    );
     match shared.ipc_endpoint_enqueue_authoritative_split(endpoint_idx, msg) {
         Err(_) => {
             settle_ipc_send_envelope(
@@ -1136,7 +1206,23 @@ fn try_split_ipc_send_into_frame(
             D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)))
         }
         Ok(true) => {
-            // Queued. Wake any legacy waiter through the one shared owner, then finish.
+            // Enqueued exactly once into the endpoint queue.
+            crate::yarm_log!(
+                "IPC_SEND_ENQUEUE_BOUNDARY_ENQUEUE_OK endpoint={}",
+                endpoint_idx
+            );
+            // Sender state matches legacy: a send that enqueues does NOT block the sender and
+            // is NOT published as a sender-waiter — it returns Ok and continues.
+            crate::yarm_log!(
+                "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK endpoint={} sender_blocked=0",
+                endpoint_idx
+            );
+            crate::yarm_log!(
+                "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok endpoint={}",
+                endpoint_idx
+            );
+            crate::kernel::boot::maybe_log_ipc_send_plain_enqueue_retired();
+            // Wake any legacy waiter through the one shared owner, then finish.
             let _ = shared.wake_waiter_for_endpoint_split(cpu, endpoint_idx);
             complete_ok(frame);
             crate::yarm_log!(
