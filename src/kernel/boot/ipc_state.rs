@@ -2800,23 +2800,44 @@ impl KernelState {
     /// whose registration fails keeps its `ipc_timeout_deadline` and is therefore still served by
     /// the ordinary receive-timeout class; it never loses its timeout, it only loses the exact
     /// reply terminal claim.
+    ///
+    /// ## 199D-SD — ARMING is not the same decision as REGISTERING A DEADLINE
+    ///
+    /// This used to return immediately when the caller supplied no finite `timeout_ticks`, which
+    /// skipped `arm_reply_terminal` as well. But the terminal-ownership cell is documented as
+    /// "the SINGLE authority through which every terminal outcome (reply / timeout / peer death /
+    /// caller exit / endpoint destruction) of the blocked caller funnels", and only ONE of those
+    /// five is a timeout. A caller that blocks on a reply receive without a deadline left its cell
+    /// at the default identity `{tid 0, asid 0, generation 0}`.
+    ///
+    /// Server death then could not settle. `exit_task` captures the exact reverse reply link and
+    /// publishes a generation-bearing work item regardless of any deadline, and the post-lock
+    /// drain revalidates that item against the ARMED identity. Against an unarmed cell the compare
+    /// failed as `IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY armed_tid=0 armed_asid=0` and
+    /// `IPC_SERVER_DEATH_WRONG_RECORD_GENERATION armed_generation=0`, the drain took
+    /// `outcome=stale_identity`, and the blocked caller was never woken with `ServerGone` —
+    /// `caller_wakes=0`, `PeerDeath winners=0`. The item was not stale at all: the record was live
+    /// at the generation it named and the exiting incarnation was exact. The arming was missing.
+    ///
+    /// So the two decisions are now separate. The cell is armed for EVERY genuine reply receive,
+    /// which is what makes death, caller exit and endpoint destruction claimable. A deadline is
+    /// registered only when the caller actually asked for one, exactly as before — and the
+    /// `deadline_token_generation` carried in the armed identity is `Some(brg)` only in that case,
+    /// `None` otherwise, so an unarmed deadline is never implied. The death transaction does not
+    /// read that field (it revalidates endpoint generation, blocked-receive generation and the
+    /// exact waiter), so a `None` there widens nothing.
     pub(crate) fn arm_production_reply_deadline(
         &mut self,
         caller_tid: u64,
         reply_eidx: usize,
         deadline: Option<u64>,
     ) {
-        let Some(deadline_tick) = deadline else {
-            return;
-        };
-        if deadline_tick == 0 {
-            return;
-        }
         let Some(caller_asid) = self.task_asid(caller_tid) else {
             return;
         };
         // One registration per blocked receive. On an oracle boot the confined arm above has
-        // already installed its own token for its own endpoint; this must not double-register.
+        // already installed its own token for its own endpoint AND armed the cell from the same
+        // identity, so this must neither double-register nor re-arm over it.
         if self
             .reply_timeout_token_for_caller(caller_tid, caller_asid)
             .is_some()
@@ -2827,18 +2848,29 @@ impl KernelState {
         let Some((record_index, record_generation)) =
             self.find_reply_record_for_caller_endpoint(caller, reply_eidx)
         else {
-            // Not a reply receive — an ordinary one. Its deadline stays on the ordinary class.
+            // Not a reply receive — an ordinary one. It owns no reply record, so there is nothing
+            // to arm and its deadline stays on the ordinary class.
             return;
         };
         let Some(brg) = self.blocked_recv_generation_for(caller_tid, caller_asid) else {
             return;
         };
-        let Some(identity) =
-            self.reply_terminal_identity(record_index, record_generation, brg, Some(brg))
-        else {
+        // A finite, non-zero deadline is what distinguishes "also register a timeout" from
+        // "arm the terminal only".
+        let finite_deadline = deadline.filter(|tick| *tick != 0);
+        let Some(identity) = self.reply_terminal_identity(
+            record_index,
+            record_generation,
+            brg,
+            finite_deadline.map(|_| brg),
+        ) else {
             return;
         };
         self.arm_reply_terminal(record_index, identity);
+        // Armed. Everything below is the DEADLINE half and runs only for a caller that asked.
+        let Some(deadline_tick) = finite_deadline else {
+            return;
+        };
         match self.register_reply_receive_deadline(
             record_index,
             record_generation,
