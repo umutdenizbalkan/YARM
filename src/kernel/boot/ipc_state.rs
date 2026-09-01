@@ -1101,6 +1101,99 @@ pub(crate) enum BlockingSendProducerOutcome {
 /// off-lock `SharedKernel::publish_recv_waiter_split` runs the identical body under
 /// `with_ipc_split_mut`. Last-receiver-wins replacement is PRESERVED deliberately — whether YARM
 /// should keep replacement at all is WA3C2's question, and this must not answer it by accident.
+/// 199E-ARM — arm the reply-terminal ownership cell for a COMMITTED blocking receive.
+///
+/// This is THE arming policy, and it is rank 3 only: everything it reads and writes lives in
+/// `IpcSubsystem`. It is called from inside the same rank-3 scope that publishes the endpoint
+/// waiter, so the waiter and its terminal owner become visible together and there is no window
+/// in which a committed reply wait exists with no owner to claim.
+///
+/// ## Why this had to move
+///
+/// `arm_reply_terminal` had exactly one production caller, `arm_production_reply_deadline`, and
+/// that had exactly one call site: the IN-LOCK `block_current_on_receive_with_deadline`. Blocking
+/// receives are serviced by the pre-lock split route, which publishes its own waiter and armed
+/// nothing — so in production NOTHING was ever armed. Server death then could not settle: the
+/// post-lock drain revalidates its work item against the ARMED identity and found the cell at its
+/// default `{tid 0, asid 0, generation 0}`, reported
+/// `IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY armed_tid=0 armed_asid=0`, took
+/// `outcome=stale_identity`, and the blocked caller was never woken with `ServerGone`.
+///
+/// ## Exactly which waits arm
+///
+/// Only a genuine reply/call wait: a live reply record whose reservation is `Available` must
+/// already name this exact `{caller_tid, caller_asid}` at this exact reply endpoint. An ordinary
+/// receive owns no such record and is untouched, so NR 2 / NR 5 timeout semantics are unchanged.
+/// A finite deadline is NOT required — the cell is the single authority for reply, timeout, peer
+/// death, caller exit and endpoint destruction, and only one of those five is a timeout.
+///
+/// ## Duplicate arming
+///
+/// An identity already armed EXACTLY is left alone rather than re-armed: `arm` bumps the cell's
+/// epoch, which would invalidate a deadline token keyed on the old epoch. A different identity is
+/// a different record incarnation and is armed normally.
+///
+/// Returns the armed identity, or `None` when this is not a reply wait.
+pub(crate) fn arm_reply_terminal_for_committed_block_locked(
+    ipc: &mut IpcSubsystem,
+    caller: ReceiverWaiterIdentity,
+    reply_eidx: usize,
+    wait_generation: u64,
+    has_finite_deadline: bool,
+) -> Option<crate::kernel::terminal_ownership::TerminalIdentity> {
+    // (1) The reply record this caller is waiting on, by EXACT incarnation and reply endpoint.
+    let mut found = None;
+    for idx in 0..super::MAX_REPLY_CAPS {
+        let Some(Some(record)) = ipc.reply_caps.get(idx) else {
+            continue;
+        };
+        if record.reservation != super::ReplyRecordReservation::Available {
+            continue;
+        }
+        if record.caller_tid != caller.tid || record.caller_asid != caller.asid {
+            continue;
+        }
+        if let CapObject::Endpoint { index, .. } = record.reply_endpoint
+            && index == reply_eidx
+        {
+            found = Some((idx, ipc.reply_cap_generations[idx], *record));
+            break;
+        }
+    }
+    let (record_index, record_generation, record) = found?;
+
+    // (2) The generation-bearing identity, built from the live record exactly as
+    // `reply_terminal_identity` builds it. The deadline-token generation is `Some` only for a
+    // finite wait, so an unregistered deadline is never implied.
+    let CapObject::Endpoint {
+        index: reply_endpoint_index,
+        generation: reply_endpoint_generation,
+    } = record.reply_endpoint
+    else {
+        return None;
+    };
+    let identity = crate::kernel::terminal_ownership::TerminalIdentity {
+        reply_record_index: record_index,
+        reply_record_generation: record_generation,
+        caller_tid: record.caller_tid,
+        caller_asid: record.caller_asid,
+        replier_tid: record.responder_tid.unwrap_or(ThreadId(0)),
+        replier_asid: record.replier_asid.unwrap_or(Asid(0)),
+        reply_endpoint_index,
+        reply_endpoint_generation,
+        blocked_recv_generation: wait_generation,
+        deadline_token_generation: has_finite_deadline.then_some(wait_generation),
+    };
+
+    // (3) Arm, idempotently.
+    let cell = ipc.reply_terminal_ownership.get_mut(record_index)?;
+    if *cell.identity() == identity {
+        return Some(identity);
+    }
+    cell.arm(identity);
+    Some(identity)
+}
+
 pub(crate) fn publish_recv_waiter_locked(
     ipc: &mut IpcSubsystem,
     endpoint_idx: usize,

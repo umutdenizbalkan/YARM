@@ -1724,6 +1724,10 @@ fn try_split_blocking_ipc_recv_into_frame(
             wait_generation,
         ),
         cap,
+        // 199E-ARM: a finite, non-zero deadline is what makes this wait deadline-bearing. The
+        // terminal cell is armed either way; this only decides the identity's
+        // `deadline_token_generation`, so an unregistered deadline is never implied.
+        deadline.is_some_and(|tick| tick != 0),
     );
     match outcome {
         crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published => {}

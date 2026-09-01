@@ -4395,15 +4395,54 @@ impl SharedKernel {
         endpoint_idx: usize,
         record: crate::kernel::boot::EndpointWaiterRecord,
         recv_cap: crate::kernel::capabilities::CapId,
+        has_finite_deadline: bool,
     ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
-        let outcome = self.with_ipc_split_mut(|ipc| {
-            crate::kernel::boot::publish_recv_waiter_locked(ipc, endpoint_idx, record, recv_cap)
+        let (outcome, armed) = self.with_ipc_split_mut(|ipc| {
+            let outcome = crate::kernel::boot::publish_recv_waiter_locked(
+                ipc,
+                endpoint_idx,
+                record,
+                recv_cap,
+            );
+            // 199E-ARM — arm the reply terminal in the SAME rank-3 scope that published the
+            // waiter, so a committed reply wait is never visible without an owner to claim it.
+            // Only on a successful publish: a refused publish unwinds the block, and arming a
+            // wait that is about to be undone would leave a live owner for a task that is
+            // Runnable again. Strictly a no-op for an ordinary receive, which owns no reply
+            // record — NR 2 / NR 5 timeout semantics are unchanged.
+            let armed = if matches!(
+                outcome,
+                crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
+            ) {
+                crate::kernel::boot::arm_reply_terminal_for_committed_block_locked(
+                    ipc,
+                    record.receiver,
+                    endpoint_idx,
+                    record.wait_generation,
+                    has_finite_deadline,
+                )
+            } else {
+                None
+            };
+            (outcome, armed)
         });
         if matches!(
             outcome,
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
         ) {
             crate::yarm_log!("D2_RECV_WAITER_PUBLISHED tid={}", record.receiver.tid.0);
+            if let Some(identity) = armed {
+                crate::yarm_log!(
+                    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid={} caller_asid={} record_index={} record_generation={} replier_tid={} blocked_recv_generation={} finite_deadline={} result=ok",
+                    identity.caller_tid.0,
+                    identity.caller_asid.0,
+                    identity.reply_record_index,
+                    identity.reply_record_generation,
+                    identity.replier_tid.0,
+                    identity.blocked_recv_generation,
+                    u8::from(has_finite_deadline)
+                );
+            }
         }
         outcome
     }
@@ -12489,6 +12528,7 @@ mod tests {
                 wait_generation,
             ),
             recv_cap,
+            false,
         );
         assert_eq!(
             outcome,
