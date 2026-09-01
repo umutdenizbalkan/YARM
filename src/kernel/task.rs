@@ -1039,6 +1039,146 @@ mod tests {
         assert!(tcb.kernel_context.owns_stack);
     }
 
+    // ── 199E-A64RC — the blocked-completion take, now production-live on AArch64 ──────────────
+    //
+    // These exercise the arch-neutral decision the AArch64 resume boundaries depend on. Before
+    // 199E-A64RC only the `IpcSend` class reached it in a default build; the `IpcRecv` consumer
+    // was compiled behind `ipc-reply-timeout-oracle-core`, so production parked a completion the
+    // AArch64 return path could never apply and the argument mirror handed the receive's own
+    // arguments back to userspace as a result.
+
+    fn parked(
+        tid: u64,
+        asid: u16,
+        class: BlockedSyscallClass,
+        generation: u64,
+        result: u64,
+    ) -> ThreadControlBlock {
+        let mut tcb = ThreadControlBlock::new(ThreadId(tid), Some(Asid(asid)));
+        tcb.blocked_recv_generation = generation;
+        tcb.blocked_send_generation = generation;
+        tcb.pending_syscall_completion = Some(BlockedSyscallCompletion {
+            syscall_class: class,
+            result,
+            tid,
+            asid: Asid(asid),
+            blocked_generation: generation,
+        });
+        tcb
+    }
+
+    #[test]
+    fn a64rc_recv_completion_is_returned_once_and_only_once() {
+        let mut tcbs = [Some(parked(2, 1, BlockedSyscallClass::IpcRecv, 4, 5))];
+        let first = take_blocked_syscall_completion_for(
+            &mut tcbs,
+            2,
+            Some(Asid(1)),
+            BlockedSyscallClass::IpcRecv,
+        );
+        assert_eq!(
+            first.map(|c| c.result),
+            Some(5),
+            "the exact completion is returned"
+        );
+        // There is one slot and it was emptied, so a second resume can never re-apply it.
+        let second = take_blocked_syscall_completion_for(
+            &mut tcbs,
+            2,
+            Some(Asid(1)),
+            BlockedSyscallClass::IpcRecv,
+        );
+        assert!(second.is_none(), "consumed exactly once");
+    }
+
+    #[test]
+    fn a64rc_a_replacement_incarnation_never_sees_the_completion() {
+        // Wrong ASID: a replacement that reused the numeric TID is a DIFFERENT incarnation, so
+        // the lookup itself refuses and the entry stays parked for the task it actually belongs
+        // to. Nothing of another incarnation's result can reach this resume.
+        let mut tcbs = [Some(parked(2, 1, BlockedSyscallClass::IpcRecv, 4, 5))];
+        let got = take_blocked_syscall_completion_for(
+            &mut tcbs,
+            2,
+            Some(Asid(9)),
+            BlockedSyscallClass::IpcRecv,
+        );
+        assert!(got.is_none(), "a mismatched incarnation is refused");
+        assert!(
+            tcbs[0]
+                .as_ref()
+                .expect("tcb")
+                .pending_syscall_completion
+                .is_some(),
+            "the entry stays parked — it belongs to the real incarnation, not this lookup"
+        );
+    }
+
+    #[test]
+    fn a64rc_a_stale_generation_is_taken_and_refused_never_applied() {
+        // Same incarnation, but the task blocked AGAIN since publication, so the parked result
+        // describes an earlier block. It must not be applied — and it must not linger either, or
+        // the next block would trip over it.
+        let mut tcbs = [Some(parked(2, 1, BlockedSyscallClass::IpcRecv, 4, 5))];
+        tcbs[0].as_mut().expect("tcb").blocked_recv_generation = 7;
+        let got = take_blocked_syscall_completion_for(
+            &mut tcbs,
+            2,
+            Some(Asid(1)),
+            BlockedSyscallClass::IpcRecv,
+        );
+        assert!(
+            got.is_none(),
+            "a stale generation is refused, not downgraded"
+        );
+        assert!(
+            tcbs[0]
+                .as_ref()
+                .expect("tcb")
+                .pending_syscall_completion
+                .is_none(),
+            "a refused stale entry is still taken, never left to linger"
+        );
+    }
+
+    #[test]
+    fn a64rc_the_two_classes_never_consume_each_other() {
+        // Both AArch64 boundaries run the send take and the recv take back to back. A parked
+        // entry of one class must be invisible to the other's take, or whichever ran first would
+        // discard the other's completion.
+        let mut tcbs = [Some(parked(2, 1, BlockedSyscallClass::IpcRecv, 4, 5))];
+        let wrong = take_blocked_syscall_completion_for(
+            &mut tcbs,
+            2,
+            Some(Asid(1)),
+            BlockedSyscallClass::IpcSend,
+        );
+        assert!(wrong.is_none(), "the send take does not see a recv entry");
+        let right = take_blocked_syscall_completion_for(
+            &mut tcbs,
+            2,
+            Some(Asid(1)),
+            BlockedSyscallClass::IpcRecv,
+        );
+        assert_eq!(
+            right.map(|c| c.result),
+            Some(5),
+            "the recv entry survived the other class's take"
+        );
+    }
+
+    #[test]
+    fn a64rc_absent_completion_leaves_the_argument_mirror_alone() {
+        // No parked entry: the take reports nothing, so the resume boundary falls through to the
+        // legitimate argument/startup mirror rather than encoding a fabricated result.
+        let mut tcbs = [Some(ThreadControlBlock::new(ThreadId(2), Some(Asid(1))))];
+        for class in [BlockedSyscallClass::IpcRecv, BlockedSyscallClass::IpcSend] {
+            assert!(
+                take_blocked_syscall_completion_for(&mut tcbs, 2, Some(Asid(1)), class).is_none()
+            );
+        }
+    }
+
     #[test]
     fn tcb_constructor_preserves_large_tid_for_thread_group() {
         let tid = ThreadId(70_000);

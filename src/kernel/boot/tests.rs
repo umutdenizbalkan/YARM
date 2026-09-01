@@ -147724,6 +147724,100 @@ mod stage199gc4_waiting_receiver_and_blocking_send {
 /// consumed anything — and these tests derive it, the way the NR 5 guard derives the same claim
 /// for the receive-timeout class.
 #[cfg(test)]
+/// 199E-A64RC / 199E-A64CALL — the AArch64 return-path contract, guarded from source.
+///
+/// `src/arch/aarch64/trap.rs` is behind `#[cfg(target_arch = "aarch64")]`, so its own unit tests
+/// never run in the hosted suite. These are the structural equivalents, in the pattern the tree
+/// already uses for arch-specific code.
+mod stage199e_a64_return_contract {
+    const A64_ABI: &str = include_str!("../../arch/aarch64/syscall_abi.rs");
+    const A64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+    const USER_TARGET: &str = include_str!("../../../targets/aarch64-yarm-user-none.json");
+    const KERNEL_TARGET: &str = include_str!("../../../targets/aarch64-yarm-none.json");
+
+    /// The TLS lane is x18, and x15 is nobody's business.
+    ///
+    /// The vector glue fills `user_gprs` with `for idx in 0..31 { lane[idx] = frame.gprs[idx] }`
+    /// over x0..x30, so lane N IS xN. `REG_X18_TLS` was 15, which meant every return to EL0 wrote
+    /// `tls.unwrap_or(0)` over the user's live x15 while x18 was never written at all.
+    #[test]
+    fn the_tls_lane_is_x18_and_nothing_writes_x15() {
+        assert!(
+            A64_ABI.contains("pub const REG_X18_TLS: usize = 18;"),
+            "the TLS lane must be 18 — lane N is xN"
+        );
+        assert!(
+            !A64_ABI.contains("pub const REG_X18_TLS: usize = 15;"),
+            "the x15 lane regression must not come back"
+        );
+        // Nothing in the AArch64 trap path may name lane 15, by constant or by literal.
+        assert!(
+            !A64_TRAP.contains("REG_X15"),
+            "there is no x15 lane constant to write through"
+        );
+        for lit in ["set_user_gpr(15,", "set_user_gpr(15 ,", "user_gprs[15]"] {
+            assert!(
+                !A64_TRAP.contains(lit),
+                "nothing writes x15 directly: {lit}"
+            );
+        }
+    }
+
+    /// Writing lane 18 is only sound because userspace keeps nothing live there.
+    #[test]
+    fn the_userspace_target_reserves_x18_for_the_kernel() {
+        assert!(
+            USER_TARGET.contains("+reserve-x18"),
+            "AArch64 userspace must reserve x18 — the kernel restores TLS into it on every return"
+        );
+        // The kernel's own allocation has no bearing on the user context it restores, so it is
+        // deliberately NOT reserved there; asserting that keeps the two decisions distinct.
+        assert!(
+            !KERNEL_TARGET.contains("+reserve-x18"),
+            "the kernel target is deliberately untouched"
+        );
+    }
+
+    /// The completion MECHANISM is production code; only the retirement attestation is gated.
+    #[test]
+    fn the_completion_apply_is_ungated_and_has_one_owner() {
+        assert_eq!(
+            A64_TRAP
+                .matches("fn encode_blocked_completion_result(")
+                .count(),
+            1,
+            "one completion-apply owner for both blocked classes"
+        );
+        // Both resume boundaries consume a recv completion, and neither take is feature-gated.
+        for needle in [
+            "take_blocked_syscall_completion(current_tid)",
+            "direct_dispatch_take_completion_split(token)",
+        ] {
+            let at = A64_TRAP
+                .find(needle)
+                .unwrap_or_else(|| panic!("the recv take: {needle}"));
+            let before = &A64_TRAP[at.saturating_sub(300)..at];
+            assert!(
+                !before.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+                "the recv completion mechanism is production-live: {needle}"
+            );
+        }
+        // No new ABI lane and no timeout POLICY was introduced: the apply only writes the
+        // existing arg lanes, and the canonical result comes from the parked record.
+        let owner = A64_TRAP
+            .split("fn encode_blocked_completion_result(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the owner body");
+        assert!(owner.contains("frame.set_arg(0, result as usize)"));
+        assert!(owner.contains("for lane in 1..=5"));
+        assert!(
+            !owner.contains("TimedOut") && !owner.contains("deadline"),
+            "the apply encodes a result; it does not decide timeout policy"
+        );
+    }
+}
+
 mod stage199gc4_nr1_terminal_edges {
     use super::*;
 
