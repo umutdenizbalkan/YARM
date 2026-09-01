@@ -85211,10 +85211,11 @@ mod stage199d_delivery_projection_differential {
                 split
                     .matches("COUNTERS.note_declined_pre_transaction();")
                     .count(),
-                9,
+                11,
                 "NR6 has three (copy, snapshot, ack claim); 199D-TRC gave NR7 three more — the \
-                 unresolved-record fail-close, the non-consuming acknowledgement probe, and the \
-                 lost terminal claim"
+                 unresolved-record fail-close, the mode-indeterminate refusal and the lost \
+                 terminal claim; DIRECT3-QUEUECAP gave it two more on the queued mode — the \
+                 message-framing refusal and the pre-mutation queue refusal"
             );
             for (direction, sites, what) in [
                 (
@@ -85224,9 +85225,9 @@ mod stage199d_delivery_projection_differential {
                 ),
                 (
                     "REPLY_COUNTERS",
-                    6,
-                    "copy, snapshot, ack-claim, unresolved-record, ack-probe and lost-claim \
-                     declines are all counted",
+                    8,
+                    "copy, snapshot, ack-claim, unresolved-record, mode-indeterminate, \
+                     lost-claim, queued-framing and queued-refusal declines are all counted",
                 ),
             ] {
                 assert_eq!(

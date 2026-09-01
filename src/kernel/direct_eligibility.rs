@@ -197,6 +197,27 @@ impl DirectReplyTerminal {
     }
 }
 
+/// DIRECT3-QUEUECAP §3 — WHICH of the two production reply modes this reply is.
+///
+/// A reply has always had two delivery shapes, and the direct route only ever implemented one.
+/// Treating the other's signature — no claimable blocked-caller acknowledgement — as a generic
+/// "decline, let the broad path have it" is what left a permanent legacy population.
+///
+/// The mode is decided BEFORE any mutation, from live state, and each mode then commits through
+/// its own owner with no fallback between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectReplyMode {
+    /// The caller is committed-blocked on its reply endpoint: there is a claimable
+    /// acknowledgement and an exact armed terminal. The reply claims that terminal and delivers
+    /// straight into the caller's address space.
+    DeliverBlocked,
+    /// No caller is blocked on the reply endpoint: no acknowledgement to claim, and no terminal
+    /// armed for the record. The reply is enqueued into the exact reply-endpoint incarnation
+    /// for a later receive. No terminal claim is required — and none is possible, because a
+    /// terminal is armed only by the commit that also publishes the acknowledgement.
+    QueueUnblocked,
+}
+
 /// The exhaustive NR7 eligibility verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectReplyEligibility {

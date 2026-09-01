@@ -2940,9 +2940,89 @@ fn try_split_ipcreply_direct_into_frame(
     // 199D-TRC: probe the acknowledgement WITHOUT consuming it, so the ordinary
     // "caller has not blocked yet" decline still happens BEFORE any terminal claim and can
     // still fall back. Everything fallible-and-fallback-worthy is ordered ahead of the claim.
-    if !crate::kernel::boot::ipcreply_direct_ack::is_claimable(reply_eidx, reply_egen) {
+    // DIRECT3-QUEUECAP §3 — CHOOSE THE MODE, before any mutation.
+    //
+    // A reply has two production shapes and the direct route only ever implemented one.
+    // "No claimable acknowledgement" is not a generic decline: together with an unarmed
+    // terminal it is the positive signature of the QUEUED mode — the caller is not blocked on
+    // its reply endpoint, so there is nothing to deliver into and the reply is enqueued for a
+    // later receive. Treating that signature as "let the broad path have it" is what left a
+    // permanent legacy population.
+    //
+    // `Unarmed` alone is never sufficient: the acknowledgement store is consulted too, and the
+    // queued commit re-validates the record, its binding and the endpoint incarnation against
+    // live state in the same acquisition that mutates.
+    let mode = if crate::kernel::boot::ipcreply_direct_ack::is_claimable(reply_eidx, reply_egen) {
+        crate::kernel::direct_eligibility::DirectReplyMode::DeliverBlocked
+    } else if matches!(
+        facts.terminal,
+        crate::kernel::direct_eligibility::DirectReplyTerminal::Unarmed
+    ) {
+        crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked
+    } else {
+        // An armed terminal with no claimable acknowledgement is neither mode: the record is
+        // mid-transaction or settling. Refuse pre-mutation rather than guess.
         REPLY_COUNTERS.note_declined_pre_transaction();
         return None;
+    };
+    if mode == crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked {
+        // The queued mode carries no capability today: a cap-bearing reply declined at the
+        // transfer-cap fact above, before the mode was chosen, so the envelope-bearing message
+        // shape cannot reach here. Plain framing, exactly as the broad path builds it when it
+        // has no transfer handle.
+        let Ok(msg) = crate::kernel::ipc::Message::new(tid, &payload[..len]) else {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        let authority = shared.reply_authority_slots_split_read(rec_idx, rec_gen);
+        return match shared
+            .commit_queued_reply_split(rec_idx, rec_gen, replier, reply_eidx, reply_egen, msg)
+        {
+            Ok(woken) => {
+                // The one-shot is spent, so its authority slots are reclaimed through the same
+                // owner the blocked mode uses. The transferred payload carries no capability
+                // here, so nothing else is owed.
+                if let Some(slots) = authority {
+                    let reclaim = shared.reclaim_reply_authority_split(slots, tid);
+                    crate::yarm_log!(
+                        "IPC_REPLY_QUEUED_AUTHORITY_RECLAIMED record_index={} record_generation={} replier_tid={} replier_ok={} caller_ok={} result=ok",
+                        rec_idx,
+                        rec_gen,
+                        tid,
+                        u8::from(reclaim.replier_revoked),
+                        u8::from(reclaim.caller_revoked)
+                    );
+                }
+                crate::yarm_log!(
+                    "IPC_REPLY_QUEUED_SPLIT_OK record_index={} record_generation={} replier_tid={} endpoint={} endpoint_generation={} len={} woken={} result=ok",
+                    rec_idx,
+                    rec_gen,
+                    tid,
+                    reply_eidx,
+                    reply_egen,
+                    len,
+                    woken.map(|w| w.tid.0).unwrap_or(0)
+                );
+                // A receiver that blocked between classification and commit was taken out of
+                // the waiter table by the commit, so waking it is this transaction's to do —
+                // the same contract the broad path's `SchedulerWakePlain::Wake` carries.
+                if let Some(w) = woken {
+                    shared.sr_enqueue_committed_receiver_split(w.tid.0, None);
+                }
+                crate::kernel::direct_disposition::apply_direct_disposition(
+                    frame,
+                    crate::kernel::direct_disposition::DirectDisposition::Completed,
+                )
+                .map(|()| Ok(()))
+            }
+            Err(_) => {
+                // Nothing was mutated: the record is still `Available` and the reply is exactly
+                // re-sendable. This is the one refusal the broad path cannot offer, because it
+                // consumes the record before it ever reaches the queue.
+                REPLY_COUNTERS.note_declined_pre_transaction();
+                None
+            }
+        };
     }
     // 199D-TRC — THE EXCLUSIVE CLAIM. Classify and compare-exchange in one rank-3 acquisition,
     // through the same single-authority `TerminalCell` that timeout, peer death, caller exit and

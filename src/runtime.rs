@@ -11815,6 +11815,34 @@ impl SharedKernel {
         })
     }
 
+    /// DIRECT3-QUEUECAP §2 — commit the QUEUED reply mode in ONE rank-3 acquisition, through
+    /// the shared owner the broad `ipc_reply` also uses.
+    ///
+    /// Returns the receiver that must be woken, if one blocked on the endpoint between the mode
+    /// classification and this commit — the race is closed by taking the waiter inside the same
+    /// acquisition that enqueues, exactly as the broad path does.
+    pub(crate) fn commit_queued_reply_split(
+        &self,
+        record_index: usize,
+        record_generation: u64,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+        reply_endpoint_index: usize,
+        reply_endpoint_generation: u64,
+        msg: crate::kernel::ipc::Message,
+    ) -> Result<Option<crate::kernel::boot::ReceiverWaiterIdentity>, KernelError> {
+        self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::commit_queued_reply_locked(
+                ipc,
+                record_index,
+                record_generation,
+                replier,
+                reply_endpoint_index,
+                reply_endpoint_generation,
+                msg,
+            )
+        })
+    }
+
     /// DIRECT3-CAP §2 — snapshot the one-shot reply authority for an EXACT record incarnation,
     /// rank 3, before any mutation. `None` when the slot no longer names that incarnation, so a
     /// recycled record can never hand out another transaction's authority identities.

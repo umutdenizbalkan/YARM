@@ -1488,6 +1488,97 @@ pub(crate) fn commit_reply_terminal_locked(
         .is_some_and(|cell| cell.commit_terminal(owner))
 }
 
+/// DIRECT3-QUEUECAP §2 — THE endpoint-queue mutation for a reply whose caller is NOT blocked.
+///
+/// This is legacy `ipc_reply`'s Phase 3, extracted verbatim so the broad and split routes share
+/// one owner rather than growing a second reply implementation. Rank 3 only.
+///
+/// Three things happen together, under one acquisition, because they are one decision:
+/// the endpoint incarnation must still be live, the message must be admitted by the queue's own
+/// capacity rule, and any receiver that has appeared in the meantime is taken so the caller
+/// resuming becomes this transaction's responsibility. A queue refusal mutates nothing.
+///
+/// The returned identity is the waiter to wake, if any — the wake itself is the caller's, and
+/// happens outside every lock.
+pub(crate) fn enqueue_reply_into_endpoint_locked(
+    ipc: &mut IpcSubsystem,
+    endpoint_idx: usize,
+    msg: Message,
+) -> Result<Option<ReceiverWaiterIdentity>, KernelError> {
+    let ep_storage = ipc.endpoints[endpoint_idx]
+        .as_mut()
+        .ok_or(KernelError::WrongObject)?;
+    kernel_mut(ep_storage)
+        .send(msg)
+        .map_err(|_| KernelError::EndpointQueueFull)?;
+    Ok(ipc.take_endpoint_waiter(endpoint_idx))
+}
+
+/// DIRECT3-QUEUECAP §2 — the atomic QUEUED-REPLY commit, rank 3 only.
+///
+/// The split route reaches the queued mode having consumed nothing, so it can be strictly safer
+/// than the legacy ordering: legacy consumes the reply record and revokes both authority slots
+/// BEFORE its Phase 3, which means an `EndpointQueueFull` there leaves the reply unsendable.
+/// Here every refusal happens before any mutation, and the consume is bound to the enqueue in
+/// one acquisition — so a full queue leaves the reply exactly re-sendable.
+///
+/// `Unarmed` alone never authorizes this mode. The full precondition is checked here, against
+/// live state, in the same acquisition that mutates:
+///
+///   * the reply record still names this exact `{index, generation}` and is `Available`;
+///   * it is bound to THIS replier incarnation;
+///   * the reply endpoint it names is the one being serviced, at the same generation;
+///   * the endpoint incarnation is live and admits the message.
+///
+/// The absence of a claimable blocked-caller acknowledgement is the caller's to check before
+/// entering this owner — it lives in a different store — and the endpoint-waiter take inside
+/// `enqueue_reply_into_endpoint_locked` closes the race in the other direction: a caller that
+/// blocks between classification and commit is returned here as the waiter to wake.
+pub(crate) fn commit_queued_reply_locked(
+    ipc: &mut IpcSubsystem,
+    record_index: usize,
+    record_generation: u64,
+    replier: ReceiverWaiterIdentity,
+    reply_endpoint_index: usize,
+    reply_endpoint_generation: u64,
+    msg: Message,
+) -> Result<Option<ReceiverWaiterIdentity>, KernelError> {
+    if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+        return Err(KernelError::WrongObject);
+    }
+    let Some(Some(record)) = ipc.reply_caps.get(record_index) else {
+        return Err(KernelError::WrongObject);
+    };
+    if record.reservation != super::ReplyRecordReservation::Available {
+        return Err(KernelError::WrongObject);
+    }
+    if record.responder_tid != Some(replier.tid) || record.replier_asid != Some(replier.asid) {
+        return Err(KernelError::WrongObject);
+    }
+    let CapObject::Endpoint {
+        index: bound_eidx,
+        generation: bound_egen,
+    } = record.reply_endpoint
+    else {
+        return Err(KernelError::WrongObject);
+    };
+    if bound_eidx != reply_endpoint_index || bound_egen != reply_endpoint_generation {
+        return Err(KernelError::WrongObject);
+    }
+    if ipc.endpoint_generations.get(reply_endpoint_index).copied()
+        != Some(reply_endpoint_generation)
+    {
+        return Err(KernelError::WrongObject);
+    }
+    // Admission decided first: a refused enqueue must leave the record `Available`.
+    let woken = enqueue_reply_into_endpoint_locked(ipc, reply_endpoint_index, msg)?;
+    // The one-shot is spent only now, bound to the enqueue that succeeded.
+    if let Some(Some(record)) = ipc.reply_caps.get_mut(record_index) {
+        record.reservation = super::ReplyRecordReservation::Consumed;
+    }
+    Ok(woken)
+}
+
 /// DIRECT3-CAP §2 — the exact identities of the ONE-SHOT reply authority for one record
 /// incarnation, snapshotted BEFORE any mutation.
 ///
@@ -6701,18 +6792,14 @@ impl KernelState {
         }
         // Phase 3: enqueue reply and atomically snapshot receiver waiter under
         // ipc_state_lock (rank 3).  Lock released before Phase 4 scheduler mutation.
+        // DIRECT3-QUEUECAP §2: delegate to the ONE queued-reply mutation owner, so the broad
+        // and split routes cannot drift on what enqueueing a reply means.
         let wake_plan = self.with_ipc_state_mut(|ipc| {
-            let ep_storage = ipc.endpoints[endpoint_idx]
-                .as_mut()
-                .ok_or(KernelError::WrongObject)?;
-            kernel_mut(ep_storage)
-                .send(msg)
-                .map_err(|_| KernelError::EndpointQueueFull)?;
-            Ok::<_, KernelError>(
-                ipc.take_endpoint_waiter(endpoint_idx)
+            enqueue_reply_into_endpoint_locked(ipc, endpoint_idx, msg).map(|woken| {
+                woken
                     .map(|w| super::SchedulerWakePlan::Wake(w.tid))
-                    .unwrap_or(super::SchedulerWakePlan::None),
-            )
+                    .unwrap_or(super::SchedulerWakePlan::None)
+            })
         })?;
         // Phase 4: wake receiver outside all locks.
         self.apply_scheduler_wake_plan(wake_plan)?;
