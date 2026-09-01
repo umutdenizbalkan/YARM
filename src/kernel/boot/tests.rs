@@ -98228,10 +98228,34 @@ mod stage200df0_feature_gating {
         let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
         let exit = exit.split("\n    pub fn ").next().unwrap();
         assert!(exit.contains("server_death_work_reserve(cpu_idx)"));
-        assert!(
-            !exit.contains(ORACLE_FEATURE),
-            "the teardown handoff must not be oracle-gated"
-        );
+        // 199D-SD3: this used to require that the oracle feature appear NOWHERE in `exit_task`,
+        // which conflated two different claims. The load-bearing one is that the production
+        // HANDOFF - reserve, detach, publish - is ungated. `exit_task` now also arms the
+        // ServerDies audit SCOPE from the death identity, and that is observation only and
+        // correctly oracle-gated. So assert the real property instead of the proxy: every gated
+        // region in `exit_task` is the scope arming, and each production handoff step is outside
+        // any of them.
+        for step in [
+            "server_death_work_reserve(cpu_idx)",
+            "take_server_reply_link(tid, exit_identity.asid)",
+            "server_death_work_publish(reservation, work)",
+        ] {
+            let at = exit
+                .find(step)
+                .unwrap_or_else(|| panic!("the handoff step {step}"));
+            let cfgs = preceding_cfgs(exit, step);
+            assert!(
+                !cfgs.contains(ORACLE_FEATURE),
+                "handoff step {step} must not be oracle-gated: {cfgs} (at {at})"
+            );
+        }
+        for (i, _) in exit.match_indices(ORACLE_FEATURE) {
+            let window = &exit[i..exit.len().min(i + 260)];
+            assert!(
+                window.contains("arm_server_dies_link_scope"),
+                "the only oracle-gated region in exit_task is the audit scope arming"
+            );
+        }
     }
 
     /// (2) the ORACLE's own scaffolding stays gated — the repair widened nothing.
