@@ -11851,9 +11851,15 @@ impl SharedKernel {
         // The reply terminal became irrevocable inside that acquisition, so the reverse link
         // closes on the same edge legacy closes it — outside the rank-3 section, because the
         // link lives in the task domain. Exact on both identities; a reused slot is untouched.
+        //
+        // ORDER: the close runs while the record is still PRESENT (`Consumed`), because it
+        // resolves the bound responder from that record. Only then is the slot released. The
+        // reverse order leaves the server holding a link it does not owe, and its next inbound
+        // call fails allocation — see `commit_queued_reply_locked`.
         if out.is_ok() {
             let _ =
                 self.finalize_server_reply_link_for_record_split(record_index, record_generation);
+            self.release_consumed_reply_record_split(record_index, record_generation);
         }
         out
     }

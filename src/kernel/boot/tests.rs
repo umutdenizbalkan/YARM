@@ -149057,6 +149057,218 @@ mod stage199a2drr_reply_record_release {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 199A2D-RR §5 — the QUEUED (unblocked-caller) reply settles its record in the order the
+// reverse link needs.
+//
+// The reverse link on the server TCB is closed by resolving the bound responder FROM the
+// reply record. The queued commit used to free the record inside its own rank-3 section, so
+// that resolution found nothing, the link was never detached, and the server kept a link it
+// no longer owed. Its next inbound `ipc_call` then failed `install_server_reply_link`,
+// rolled the record allocation back, and lost a request and its reply.
+mod stage199a2drr_queued_reply_settlement {
+    use super::*;
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+
+    struct Fx {
+        k: SharedKernel,
+        index: usize,
+        generation: u64,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    }
+
+    /// A committed, externally-invokable reply record whose server holds the reverse link,
+    /// with the caller NOT blocked — the queued mode's shape.
+    fn fixture() -> Fx {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (index, generation, replier) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("bind1");
+            s.bind_task_asid(2, sasid).expect("bind2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            let (index, generation) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("record");
+            assert!(s.commit_direct_reply_record(index, generation));
+            assert!(
+                s.register_server_reply_link(replier.tid.0, replier.asid, index, generation),
+                "the server owes this reply"
+            );
+            (index, generation, replier)
+        });
+        Fx {
+            k,
+            index,
+            generation,
+            replier,
+        }
+    }
+
+    impl Fx {
+        fn link(&self) -> Option<crate::kernel::task::ServerReplyLink> {
+            self.k
+                .with(|s| s.server_reply_link_for(self.replier.tid.0, self.replier.asid))
+        }
+        fn reservation(&self) -> Option<ReplyRecordReservation> {
+            self.k.with(|s| s.reply_cap_record_reservation(self.index))
+        }
+        fn commit(
+            &self,
+        ) -> Result<Option<crate::kernel::boot::ReceiverWaiterIdentity>, KernelError> {
+            self.k.commit_queued_reply_split(
+                self.index,
+                self.generation,
+                self.replier,
+                0,
+                1,
+                Message::new(9, b"ok").expect("reply"),
+            )
+        }
+    }
+
+    /// THE §5 REPAIR, end to end: a queued reply closes the server's reverse link AND frees
+    /// the record slot. Closing the link is what lets the server take its next call.
+    #[test]
+    fn a_queued_reply_closes_the_reverse_link_and_frees_the_slot() {
+        let fx = fixture();
+        assert!(fx.link().is_some(), "precondition: the link is live");
+
+        fx.commit().expect("the queued reply commits");
+
+        assert_eq!(
+            fx.link(),
+            None,
+            "the server must not keep a link for a reply it has delivered — the next \
+             ipc_call to it would fail install_server_reply_link and lose the request"
+        );
+        assert_eq!(
+            fx.reservation(),
+            None,
+            "and the slot must be absent, not merely Consumed: the allocator reuses only \
+             absent slots and MAX_REPLY_CAPS == MAX_TASKS"
+        );
+    }
+
+    /// The record is still PRESENT when the commit returns from its rank-3 section — that
+    /// presence is exactly what the link close needs to resolve the responder.
+    #[test]
+    fn the_rank3_commit_leaves_the_record_consumed_not_freed() {
+        let fx = fixture();
+        let woken = fx.k.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::commit_queued_reply_locked(
+                ipc,
+                fx.index,
+                fx.generation,
+                fx.replier,
+                0,
+                1,
+                Message::new(9, b"ok").expect("reply"),
+            )
+        });
+        assert!(woken.is_ok());
+        assert_eq!(
+            fx.reservation(),
+            Some(ReplyRecordReservation::Consumed),
+            "the rank-3 owner spends the one-shot but must leave the record resolvable"
+        );
+        assert!(
+            fx.link().is_some(),
+            "and it must not close the link itself: the link lives in the task domain"
+        );
+    }
+
+    /// A pre-mutation refusal leaves everything untouched — the record stays invokable and
+    /// the server keeps the link it still owes.
+    #[test]
+    fn a_refused_queued_commit_mutates_nothing() {
+        for name in [
+            "stale generation",
+            "wrong replier",
+            "wrong endpoint generation",
+        ] {
+            let fx = fixture();
+            let (record_generation, replier, endpoint_generation) = match name {
+                "stale generation" => (fx.generation.wrapping_add(9), fx.replier, 1),
+                "wrong replier" => (
+                    fx.generation,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), fx.replier.asid),
+                    1,
+                ),
+                _ => (fx.generation, fx.replier, 99),
+            };
+            let out = fx.k.commit_queued_reply_split(
+                fx.index,
+                record_generation,
+                replier,
+                0,
+                endpoint_generation,
+                Message::new(9, b"ok").expect("reply"),
+            );
+            assert!(out.is_err(), "{name}: must refuse");
+            assert_eq!(
+                fx.reservation(),
+                Some(ReplyRecordReservation::Available),
+                "{name}: the reply authority stays invokable"
+            );
+            assert!(fx.link().is_some(), "{name}: the link still stands");
+        }
+    }
+
+    /// ORDER, from source: the link close runs BEFORE the release, and both only on success.
+    #[test]
+    fn the_link_close_is_ordered_before_the_record_release() {
+        let body = RUNTIME
+            .split("pub(crate) fn commit_queued_reply_split(")
+            .nth(1)
+            .expect("the queued split seam");
+        let end = body.find("\n    /// ").unwrap_or(body.len());
+        let body = &body[..end];
+        let gate = body.find("if out.is_ok() {").expect("the success gate");
+        let close = body
+            .find("finalize_server_reply_link_for_record_split(")
+            .expect("the link close");
+        let release = body
+            .find("release_consumed_reply_record_split(")
+            .expect("the record release");
+        assert!(
+            gate < close && close < release,
+            "close the link, then release"
+        );
+
+        // And the rank-3 owner must not free the slot itself, which would make the close
+        // above resolve nothing.
+        let owner = IPC_STATE
+            .split("pub(crate) fn commit_queued_reply_locked(")
+            .nth(1)
+            .expect("the rank-3 owner");
+        let owner = &owner[..owner.find("\n}\n").unwrap_or(owner.len())];
+        assert!(
+            !owner.contains("*slot = None"),
+            "the rank-3 owner must leave the record present for the link close"
+        );
+        assert!(
+            owner.contains("record.reservation = super::ReplyRecordReservation::Consumed;"),
+            "it marks the one-shot spent instead"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 199A2D-RR §2/§3 — safe TERMINAL-CELL reuse across a recycled reply-record slot.
 //
 // Once a reply-record slot became physically reclaimable, an allocation is normally a

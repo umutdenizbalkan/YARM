@@ -1633,19 +1633,23 @@ pub(crate) fn commit_queued_reply_locked(
     }
     // Admission decided first: a refused enqueue must leave the record `Available`.
     let woken = enqueue_reply_into_endpoint_locked(ipc, reply_endpoint_index, msg)?;
-    // The one-shot is spent only now, bound to the enqueue that succeeded — and the SLOT IS
-    // RELEASED, exactly as legacy `ipc_reply` releases it (`ipc.reply_caps[slot] = None`).
+    // The one-shot is spent only now, bound to the enqueue that succeeded. The record is left
+    // `Consumed` — PRESENT, not freed — which is the same post-state the blocked transaction
+    // leaves, so both reply modes end in one shape and share one release owner.
     //
-    // This is not bookkeeping. `MAX_REPLY_CAPS == MAX_TASKS`, and the record allocator reuses
-    // only `is_none()` slots, so a record left `Consumed` occupies its slot forever. Legacy is
-    // the only path that frees one today; the queued mode must free it too, or every reply it
-    // takes off the legacy path is a slot permanently lost. Live, that difference was the whole
-    // regression: the table sits at its boundary (reference high-water index 41), moving one
-    // reply off legacy pushed it to 42, and the caller's next `ipc_call` failed
-    // `stage=reply_cap_alloc err=CapabilityFull` — so its request, and the server's reply to it,
-    // never happened.
-    if let Some(slot) = ipc.reply_caps.get_mut(record_index) {
-        *slot = None;
+    // The slot must still be freed: `MAX_REPLY_CAPS == MAX_TASKS` and the allocator reuses only
+    // absent slots, so a record left `Consumed` forever occupies its slot forever. But freeing
+    // it HERE is too early. The reverse link on the server TCB is closed by resolving the bound
+    // responder FROM this record; clearing the slot first makes that resolution find nothing,
+    // the link is never detached, and the server keeps a live link it does not owe. The very
+    // next `ipc_call` to that server then fails `install_server_reply_link` with a different
+    // live link, rolls the record allocation back, and surfaces as
+    // `IPC_CALL_FAIL stage=reply_cap_alloc err=CapabilityFull` — losing a request and its reply.
+    //
+    // So the caller closes the link while the record still resolves its replier, and only then
+    // releases the `Consumed` record through `release_consumed_reply_record_split`.
+    if let Some(Some(record)) = ipc.reply_caps.get_mut(record_index) {
+        record.reservation = super::ReplyRecordReservation::Consumed;
     }
     Ok(woken)
 }
