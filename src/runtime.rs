@@ -11740,25 +11740,77 @@ impl SharedKernel {
     ///    acknowledgement. So a cell cannot transition unarmed → armed for this incarnation
     ///    between this read and the transaction: the arming already happened, or the reply is
     ///    not deliverable yet at all.
-    pub(crate) fn reply_record_terminal_arbitrated_split_read(
+    /// 199D-TRC — classify the reply-record's terminal cell relative to ONE exact direct reply.
+    ///
+    /// Advisory: this is the preflight read, and the cell may change phase before the claim.
+    /// It replaced a boolean that answered "is this terminal arbitrated at all" and therefore
+    /// declined every direct reply once production reply waits began arming their terminals.
+    /// The decision lives in ONE rank-3 policy owner, shared with the claim below.
+    pub(crate) fn classify_direct_reply_terminal_split_read(
         &self,
         index: usize,
         generation: u64,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+        reply_endpoint_index: usize,
+        reply_endpoint_generation: u64,
+    ) -> crate::kernel::direct_eligibility::DirectReplyTerminal {
+        self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::classify_direct_reply_terminal_locked(
+                ipc,
+                index,
+                generation,
+                replier,
+                reply_endpoint_index,
+                reply_endpoint_generation,
+            )
+        })
+    }
+
+    /// 199D-TRC — classify and CLAIM the exact terminal in ONE rank-3 acquisition.
+    ///
+    /// This is the authoritative step: the direct reply competes for the same single-authority
+    /// cell that timeout, peer death, caller exit and endpoint destruction claim, through the
+    /// same compare-exchange. A loser mutates nothing.
+    pub(crate) fn claim_direct_reply_terminal_split(
+        &self,
+        index: usize,
+        generation: u64,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+        reply_endpoint_index: usize,
+        reply_endpoint_generation: u64,
+    ) -> crate::kernel::boot::DirectReplyTerminalClaim {
+        self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::claim_direct_reply_terminal_locked(
+                ipc,
+                index,
+                generation,
+                replier,
+                reply_endpoint_index,
+                reply_endpoint_generation,
+            )
+        })
+    }
+
+    /// 199D-TRC — commit this reply's terminal claim after delivery succeeded (rank 3).
+    pub(crate) fn commit_direct_reply_terminal_split(
+        &self,
+        index: usize,
+        owner: &crate::kernel::terminal_ownership::TerminalOwner,
     ) -> bool {
         self.with_ipc_split_mut(|ipc| {
-            // One acquisition covers both reads, so the record incarnation and the cell armed
-            // for it are observed together.
-            if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
-                return false;
-            }
-            let Some(cell) = ipc.reply_terminal_ownership.get(index) else {
-                return false;
-            };
-            if cell.current_epoch() == 0 {
-                return false; // vacant: never armed
-            }
-            let identity = cell.identity();
-            identity.reply_record_index == index && identity.reply_record_generation == generation
+            crate::kernel::boot::commit_reply_terminal_locked(ipc, index, owner)
+        })
+    }
+
+    /// 199D-TRC — release this reply's terminal claim after a PRE-DELIVERY failure (rank 3).
+    /// Exact by owner token: a stale release mutates nothing.
+    pub(crate) fn release_direct_reply_terminal_split(
+        &self,
+        index: usize,
+        owner: &crate::kernel::terminal_ownership::TerminalOwner,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::release_reply_terminal_locked(ipc, index, owner)
         })
     }
 

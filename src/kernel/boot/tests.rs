@@ -81032,10 +81032,13 @@ mod stage199a2b3_direct_reply_txn {
     /// **A terminal-arbitrated reply still declines before EVERY mutation.** The direct path is
     /// only reachable for untimed replies — which is exactly why route A (restore the authority)
     /// is required rather than leaning on a timeout that is not armed.
+    /// 199D-TRC — an UNCLAIMABLE terminal declines before every mutation; an armed-and-
+    /// available one does not decline at all.
     #[test]
     fn a_terminal_arbitrated_reply_declines_before_every_mutation() {
         use crate::kernel::direct_eligibility::{
-            DirectReplyEligibility, DirectReplyFacts, classify_direct_reply_eligibility,
+            DirectReplyEligibility, DirectReplyFacts, DirectReplyTerminal,
+            classify_direct_reply_eligibility,
         };
         let facts = DirectReplyFacts {
             payload_len: 8,
@@ -81044,25 +81047,26 @@ mod stage199a2b3_direct_reply_txn {
             reply_endpoint: Some((4, 9)),
             endpoint_admitted: true,
             transfer_cap_present: false,
-            terminal_arbitrated: true,
+            terminal: DirectReplyTerminal::OwnedByCompetitor,
         };
         assert_eq!(
             classify_direct_reply_eligibility(&facts),
-            DirectReplyEligibility::TerminalArbitrationUnsupported,
-            "an armed reply timeout keeps the reply on the legacy path"
+            DirectReplyEligibility::TerminalUnavailable(DirectReplyTerminal::OwnedByCompetitor),
+            "a terminal a competitor owns keeps the reply off the direct path"
         );
-        // Sanity: the SAME facts with the flag clear ARE eligible, so the decline is caused by
-        // arbitration alone and this test cannot pass vacuously.
-        let mut untimed = facts;
-        untimed.terminal_arbitrated = false;
+        // Sanity: the SAME facts with an ARMED-AND-AVAILABLE terminal ARE eligible, so the
+        // decline is caused by unclaimability alone and this test cannot pass vacuously. This
+        // is the exact assertion the pre-199D-TRC version got backwards.
+        let mut available = facts;
+        available.terminal = DirectReplyTerminal::AvailableExact;
         assert!(matches!(
-            classify_direct_reply_eligibility(&untimed),
+            classify_direct_reply_eligibility(&available),
             DirectReplyEligibility::Eligible { .. }
         ));
         // …and the decline is ahead of every mutating step in the classifier's source order.
         const ELIG: &str = include_str!("../direct_eligibility.rs");
         let at = ELIG
-            .find("if facts.terminal_arbitrated {")
+            .find("if !facts.terminal.admits_direct_reply() {")
             .expect("the arbitration gate");
         let tail = &ELIG[at..];
         for mutating in [
@@ -85207,18 +85211,32 @@ mod stage199d_delivery_projection_differential {
                 split
                     .matches("COUNTERS.note_declined_pre_transaction();")
                     .count(),
-                6,
-                "three pre-transaction decline sites per direction: copy, snapshot, ack claim"
+                9,
+                "NR6 has three (copy, snapshot, ack claim); 199D-TRC gave NR7 three more — the \
+                 unresolved-record fail-close, the non-consuming acknowledgement probe, and the \
+                 lost terminal claim"
             );
-            for direction in ["REQUEST_COUNTERS", "REPLY_COUNTERS"] {
+            for (direction, sites, what) in [
+                (
+                    "REQUEST_COUNTERS",
+                    3,
+                    "copy, snapshot and ack-claim declines are all counted",
+                ),
+                (
+                    "REPLY_COUNTERS",
+                    6,
+                    "copy, snapshot, ack-claim, unresolved-record, ack-probe and lost-claim \
+                     declines are all counted",
+                ),
+            ] {
                 assert_eq!(
                     split
                         .matches(&alloc::format!(
                             "{direction}.note_declined_pre_transaction();"
                         ))
                         .count(),
-                    3,
-                    "{direction}: copy, snapshot and ack-claim declines are all counted"
+                    sites,
+                    "{direction}: {what}"
                 );
             }
             assert_eq!(
@@ -108060,23 +108078,26 @@ mod stage199d_link_creation_parity {
     }
 }
 
-/// Stage 199D — **terminal-arbitration safety on the direct reply path.**
+/// 199D-TRC — **exact terminal claiming on the direct reply path.**
 ///
-/// A reply whose record is arbitrated by an armed terminal-ownership / reply-timeout race must
-/// reserve the terminal before its caller copy and commit it after, so a concurrent timeout
-/// claimant provably loses. That lease — `reserve_reply_win_before_copy` → delivery →
-/// `commit_reply_win_after_delivery`, with `rollback_reply_win` on a retryable fault — lives
-/// only on the legacy reply path. Servicing an arbitrated reply off-lock lost the race the
-/// caller was promised: live, the reply reserved, rolled back, and the timeout's deferred path
-/// completed instead (`IPC_REPLY_WIN_ROLLBACK` + `IPC_REPLY_TIMEOUT_DEFERRED`, with
-/// `IPC_REPLY_BEATS_TIMEOUT_OK` absent).
+/// A reply whose record has an armed terminal used to be declined outright: the eligibility
+/// fact was a boolean, "is this record arbitrated at all", and any `true` sent the reply to the
+/// legacy path. While production armed nothing that decline never fired. Once 199E-ARM made
+/// production reply waits arm their terminals, it fired for EVERY reply and 41 direct NR7
+/// transactions per x86_64 boot fell back onto the terminal broad dispatcher.
 ///
-/// Porting the lease into the direct transaction is future canonical 199E work. This increment
-/// makes the arbitrated population explicitly ineligible instead.
+/// The repair is not to ignore the terminal — it is to COMPETE for it. A direct reply is one of
+/// the cell's five legitimate claimants, alongside timeout, peer death, caller exit and
+/// endpoint destruction. It classifies the cell against its own exact identities, claims it
+/// exclusively at the rank-3 mutation point through the same compare-exchange every other
+/// claimant uses, delivers, and then commits — or, on any pre-delivery failure, restores the
+/// exact claim so the record is left precisely as it was found.
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]
 mod stage199d_terminal_arbitration_safety {
     use super::*;
-    use crate::kernel::terminal_ownership::TerminalIdentity;
+    use crate::kernel::boot::DirectReplyTerminalClaim;
+    use crate::kernel::direct_eligibility::DirectReplyTerminal as T;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
     use crate::kernel::vm::Asid;
     use crate::runtime::SharedKernel;
 
@@ -108123,272 +108144,517 @@ mod stage199d_terminal_arbitration_safety {
         }
     }
 
-    /// An UNARMED record is not arbitrated — the ordinary case, and the one that stays
-    /// direct-eligible.
-    #[test]
-    fn an_unarmed_record_is_not_arbitrated() {
-        let (k, index, generation) = fixture();
+    /// The replier incarnation the fixture's record binds.
+    fn replier() -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(2))
+    }
+
+    fn classify(k: &SharedKernel, index: usize, generation: u64) -> T {
+        k.classify_direct_reply_terminal_split_read(index, generation, replier(), 0, 1)
+    }
+
+    fn claim(k: &SharedKernel, index: usize, generation: u64) -> DirectReplyTerminalClaim {
+        k.claim_direct_reply_terminal_split(index, generation, replier(), 0, 1)
+    }
+
+    /// A competitor taking the cell for real, through the same single authority.
+    fn competitor_claims(
+        k: &SharedKernel,
+        index: usize,
+        kind: TerminalClaimant,
+        id: &TerminalIdentity,
+    ) {
+        let owner = k
+            .with(|s| s.try_claim_reply_terminal_slot(index, kind, id))
+            .expect("the competitor claims the open cell");
         assert!(
-            !k.reply_record_terminal_arbitrated_split_read(index, generation),
-            "a vacant terminal cell arbitrates nothing"
+            k.with(|s| s.commit_reply_terminal_slot(index, &owner)),
+            "and commits it"
         );
     }
 
-    /// An ARMED record IS arbitrated, and the predicate reads it from the authoritative cell.
+    // ── Classification ──────────────────────────────────────────────────────────────────
+
+    /// An UNARMED record has no arbitration to join: nothing can be racing it, because a
+    /// timeout claimant reaches a record only through a deadline token and a token can only be
+    /// reserved against an armed, open cell.
     #[test]
-    fn an_armed_record_is_arbitrated() {
+    fn an_unarmed_record_is_unarmed_and_admits_the_reply() {
+        let (k, index, generation) = fixture();
+        assert_eq!(classify(&k, index, generation), T::Unarmed);
+        assert!(T::Unarmed.admits_direct_reply());
+        assert!(!T::Unarmed.requires_claim());
+        assert_eq!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::NotArmed
+        );
+    }
+
+    /// **The headline case.** An ARMED, OPEN cell whose identity names this exact reply admits
+    /// the direct reply — this is the classification the pre-199D-TRC boolean got backwards.
+    #[test]
+    fn an_exact_armed_terminal_admits_the_direct_reply() {
         let (k, index, generation) = fixture();
         k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
-        assert!(
-            k.reply_record_terminal_arbitrated_split_read(index, generation),
-            "an armed terminal cell arbitrates this record"
-        );
+        assert_eq!(classify(&k, index, generation), T::AvailableExact);
+        assert!(T::AvailableExact.admits_direct_reply());
+        assert!(T::AvailableExact.requires_claim());
     }
 
     /// EXACTNESS: a cell armed for another record incarnation — the previous occupant of a
-    /// recycled slot, or a different slot entirely — arbitrates nothing here.
+    /// recycled slot, or a different slot entirely — never authorizes this reply.
     #[test]
-    fn arbitration_is_exact_in_record_index_and_generation() {
+    fn a_wrong_record_generation_or_slot_refuses() {
         let (k, index, generation) = fixture();
-        // Armed for a DIFFERENT generation of this slot: not this incarnation's race.
         k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation.wrapping_add(1))));
-        assert!(
-            !k.reply_record_terminal_arbitrated_split_read(index, generation),
-            "a cell armed for a stale generation arbitrates nothing"
-        );
-        // Armed for a different SLOT.
+        assert_eq!(classify(&k, index, generation), T::IdentityMismatch);
         k.with(|s| s.arm_reply_terminal(index, identity_for(index + 1, generation)));
-        assert!(!k.reply_record_terminal_arbitrated_split_read(index, generation));
-        // And a stale/foreign query against the real armed cell mutates nothing and reads
-        // false.
+        assert_eq!(classify(&k, index, generation), T::IdentityMismatch);
+        // A stale query against the REAL armed cell is refused too, and mutates nothing.
         k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
-        assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
-        assert!(
-            !k.reply_record_terminal_arbitrated_split_read(index, generation.wrapping_add(1)),
-            "a stale generation query reads false"
+        assert_eq!(classify(&k, index, generation), T::AvailableExact);
+        assert_eq!(
+            classify(&k, index, generation.wrapping_add(1)),
+            T::IdentityMismatch
         );
-        assert!(
-            !k.reply_record_terminal_arbitrated_split_read(usize::MAX, generation),
-            "an out-of-range index reads false"
-        );
-        // The cell is untouched by any of those reads.
-        assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+        assert_eq!(classify(&k, usize::MAX, generation), T::IdentityMismatch);
+        assert_eq!(classify(&k, index, generation), T::AvailableExact);
     }
 
-    /// The predicate is read-only: repeated reads never mutate the cell or the record.
+    /// EXACTNESS: a wrong caller or replier identity in the armed cell refuses. The cell is
+    /// armed with a foreign caller/replier while the live record still names the fixture's, so
+    /// the field-by-field comparison is what rejects it.
     #[test]
-    fn the_predicate_mutates_nothing() {
+    fn a_wrong_caller_or_replier_identity_refuses() {
+        for mutate in [
+            (|id: &mut TerminalIdentity| id.caller_tid = ThreadId(77)) as fn(&mut TerminalIdentity),
+            |id: &mut TerminalIdentity| id.caller_asid = Asid(33),
+            |id: &mut TerminalIdentity| id.replier_tid = ThreadId(88),
+            |id: &mut TerminalIdentity| id.replier_asid = Asid(44),
+            |id: &mut TerminalIdentity| id.reply_endpoint_index = 9,
+            |id: &mut TerminalIdentity| id.reply_endpoint_generation = 7,
+        ] {
+            let (k, index, generation) = fixture();
+            let mut id = identity_for(index, generation);
+            mutate(&mut id);
+            k.with(|s| s.arm_reply_terminal(index, id));
+            assert_eq!(
+                classify(&k, index, generation),
+                T::IdentityMismatch,
+                "a foreign identity never authorizes a claim: {id:?}"
+            );
+            assert!(matches!(
+                claim(&k, index, generation),
+                DirectReplyTerminalClaim::Lost(T::IdentityMismatch)
+            ));
+        }
+    }
+
+    /// The classification is read-only: repeated reads never disturb the cell.
+    #[test]
+    fn classification_mutates_nothing() {
         let (k, index, generation) = fixture();
         k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
         let epoch_before = k.with(|s| s.reply_terminal_epoch(index));
         for _ in 0..8 {
-            assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+            assert_eq!(classify(&k, index, generation), T::AvailableExact);
         }
         assert_eq!(
             k.with(|s| s.reply_terminal_epoch(index)),
             epoch_before,
-            "reading the arbitration fact never re-arms or disturbs the cell"
+            "classifying never re-arms or disturbs the cell"
         );
     }
 
-    /// **An armed record can never enter the direct transaction.** The fact feeds the
-    /// eligibility contract, whose decline arm returns before anything mutates.
+    // ── The exclusive claim ─────────────────────────────────────────────────────────────
+
+    /// The reply WINS an exact open terminal, and holds it exclusively: a competitor that
+    /// arrives afterwards cannot claim the same cell.
     #[test]
-    fn an_armed_record_never_reaches_the_direct_transaction() {
-        use crate::kernel::direct_eligibility::{
-            DirectReplyEligibility, DirectReplyFacts, classify_direct_reply_eligibility,
-        };
+    fn the_reply_wins_the_exact_terminal_and_holds_it_exclusively() {
         let (k, index, generation) = fixture();
-        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
-        let facts = DirectReplyFacts {
-            payload_len: 8,
-            requester_available: true,
-            reply_object: Ok((index, generation)),
-            reply_endpoint: Some((0, 1)),
-            endpoint_admitted: true,
-            transfer_cap_present: false,
-            terminal_arbitrated: k.reply_record_terminal_arbitrated_split_read(index, generation),
+        let id = identity_for(index, generation);
+        k.with(|s| s.arm_reply_terminal(index, id));
+        let DirectReplyTerminalClaim::Won(owner) = claim(&k, index, generation) else {
+            panic!("an exact open terminal must be claimable by the reply");
         };
-        let verdict = classify_direct_reply_eligibility(&facts);
-        assert_eq!(
-            verdict,
-            DirectReplyEligibility::TerminalArbitrationUnsupported
-        );
-        assert_eq!(
-            verdict.endpoint(),
-            None,
-            "no endpoint is yielded, so no acknowledgement can be claimed"
-        );
-        // Disarming the same record makes it eligible again — the fact is the only thing
-        // standing between this reply and the direct path.
-        let mut unarmed = facts;
-        unarmed.terminal_arbitrated = false;
-        assert_eq!(
-            classify_direct_reply_eligibility(&unarmed),
-            DirectReplyEligibility::Eligible {
-                endpoint_index: 0,
-                endpoint_generation: 1,
-            }
-        );
-    }
-
-    /// The fact is derived from the CANONICAL predicate — never from an oracle selector, a
-    /// marker or a counter.
-    #[test]
-    fn the_fact_comes_from_the_authoritative_state_only() {
-        assert!(
-            SPLIT.contains("shared.reply_record_terminal_arbitrated_split_read(rec_idx, rec_gen)"),
-            "the call site asks the canonical predicate with the exact record incarnation"
-        );
-        let predicate = include_str!("../../runtime.rs")
-            .split("pub(crate) fn reply_record_terminal_arbitrated_split_read(")
-            .nth(1)
-            .expect("predicate present")
-            .split("\n    }\n")
-            .next()
-            .expect("body bounded");
-        // Reads the authoritative store, exact in index AND generation.
-        assert!(
-            predicate.contains("ipc.reply_terminal_ownership.get(index)")
-                && predicate.contains("ipc.reply_cap_generations.get(index)")
-                && predicate.contains("identity.reply_record_index == index")
-                && predicate.contains("identity.reply_record_generation == generation"),
-            "the predicate is the authoritative cell, exact in index and generation"
-        );
-        // A vacant cell (epoch 0) is not arbitration.
-        assert!(predicate.contains("cell.current_epoch() == 0"));
-        // NOT inferred from selectors, markers or counters.
-        for forbidden in [
-            "oracle",
-            "yarm_log",
-            "note_",
-            "_COUNTERS",
-            "IPC_REPLY_TIMEOUT_MODE",
-            "selector",
+        assert_eq!(owner.claimant(), TerminalClaimant::Reply);
+        for kind in [
+            TerminalClaimant::Timeout,
+            TerminalClaimant::PeerDeath,
+            TerminalClaimant::CallerExit,
+            TerminalClaimant::EndpointGone,
         ] {
             assert!(
-                !predicate.contains(forbidden),
-                "the predicate must not infer arbitration from {forbidden}"
+                k.with(|s| s.try_claim_reply_terminal_slot(index, kind, &id))
+                    .is_none(),
+                "{kind:?} must not claim a terminal the reply already holds"
             );
         }
-        // ONE rank-3 acquisition covers both reads, so the pair cannot be torn.
+        // A second direct reply cannot claim it either.
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Lost(T::OwnedByCompetitor)
+        ));
+        assert!(k.commit_direct_reply_terminal_split(index, &owner));
         assert_eq!(
-            predicate.matches("self.with_ipc_split_mut(").count(),
-            1,
-            "the record generation and the terminal cell are read together"
+            k.with(|s| s.reply_terminal_committed_winner(index)),
+            Some(TerminalClaimant::Reply)
         );
     }
 
-    /// The decline precedes every mutation in the NR7 helper — ack claim, payload copy,
-    /// snapshot build and the transaction call all come after the preflight decline arm.
+    /// Each of the four competitors, winning BEFORE the reply: the reply loses, reports the
+    /// settled cell, and mutates nothing.
     #[test]
-    fn the_decline_precedes_every_mutation() {
+    fn timeout_server_death_caller_exit_or_endpoint_loss_beats_a_later_reply() {
+        for kind in [
+            TerminalClaimant::Timeout,
+            TerminalClaimant::PeerDeath,
+            TerminalClaimant::CallerExit,
+            TerminalClaimant::EndpointGone,
+        ] {
+            let (k, index, generation) = fixture();
+            let id = identity_for(index, generation);
+            k.with(|s| s.arm_reply_terminal(index, id));
+            competitor_claims(&k, index, kind, &id);
+            assert_eq!(
+                classify(&k, index, generation),
+                T::Settled,
+                "{kind:?} settled the cell"
+            );
+            assert!(matches!(
+                claim(&k, index, generation),
+                DirectReplyTerminalClaim::Lost(T::Settled)
+            ));
+            assert_eq!(
+                k.with(|s| s.reply_terminal_committed_winner(index)),
+                Some(kind),
+                "{kind:?} remains the winner: a losing reply mutates nothing"
+            );
+        }
+    }
+
+    /// A competitor holding a RESERVED (not yet committed) claim also refuses the reply, and
+    /// is reported as owned rather than settled.
+    #[test]
+    fn a_reserved_competitor_refuses_the_reply() {
+        let (k, index, generation) = fixture();
+        let id = identity_for(index, generation);
+        k.with(|s| s.arm_reply_terminal(index, id));
+        let _owner = k
+            .with(|s| s.try_claim_reply_terminal_slot(index, TerminalClaimant::Timeout, &id))
+            .expect("timeout reserves");
+        assert_eq!(classify(&k, index, generation), T::OwnedByCompetitor);
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Lost(T::OwnedByCompetitor)
+        ));
+    }
+
+    /// A DUPLICATE reply after the first one committed is refused — the one-shot is spent.
+    #[test]
+    fn a_duplicate_reply_after_consume_refuses() {
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let DirectReplyTerminalClaim::Won(owner) = claim(&k, index, generation) else {
+            panic!("first reply wins");
+        };
+        assert!(k.commit_direct_reply_terminal_split(index, &owner));
+        assert_eq!(classify(&k, index, generation), T::Settled);
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Lost(T::Settled)
+        ));
+        // And committing again with the spent owner is refused.
+        assert!(!k.commit_direct_reply_terminal_split(index, &owner));
+    }
+
+    /// A STALE terminal epoch refuses: re-arming bumps the epoch, so an owner token minted
+    /// against the previous epoch can neither commit nor release.
+    #[test]
+    fn a_stale_terminal_epoch_refuses_and_restores_nothing() {
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let DirectReplyTerminalClaim::Won(stale) = claim(&k, index, generation) else {
+            panic!("first claim wins");
+        };
+        // Re-arm the same record: a fresh epoch, a fresh Open cell.
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let epoch_now = k.with(|s| s.reply_terminal_epoch(index));
+        assert!(!k.commit_direct_reply_terminal_split(index, &stale));
+        assert!(!k.release_direct_reply_terminal_split(index, &stale));
+        assert_eq!(
+            k.with(|s| s.reply_terminal_epoch(index)),
+            epoch_now,
+            "a stale owner token mutates nothing"
+        );
+        // The cell is still claimable by the reply at the CURRENT epoch.
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Won(_)
+        ));
+    }
+
+    /// The claim is RESTORED exactly on a pre-delivery failure: the cell returns to `Open` at
+    /// the same epoch, and any claimant — including a competitor — may then win it.
+    #[test]
+    fn a_pre_delivery_failure_restores_the_exact_claim() {
+        let (k, index, generation) = fixture();
+        let id = identity_for(index, generation);
+        k.with(|s| s.arm_reply_terminal(index, id));
+        let epoch = k.with(|s| s.reply_terminal_epoch(index));
+        let DirectReplyTerminalClaim::Won(owner) = claim(&k, index, generation) else {
+            panic!("the reply wins");
+        };
+        assert!(k.release_direct_reply_terminal_split(index, &owner));
+        assert_eq!(
+            k.with(|s| s.reply_terminal_epoch(index)),
+            epoch,
+            "a release restores the SAME epoch, it does not re-arm"
+        );
+        assert_eq!(classify(&k, index, generation), T::AvailableExact);
+        assert_eq!(
+            k.with(|s| s.reply_terminal_committed_winner(index)),
+            None,
+            "nothing was settled"
+        );
+        // Both a retried reply and a competitor can now win the restored cell.
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Won(_)
+        ));
+    }
+
+    /// Exactly ONE claimant wins across a full field of contenders — the property the whole
+    /// arbitration exists for.
+    #[test]
+    fn exactly_one_claimant_wins() {
+        let (k, index, generation) = fixture();
+        let id = identity_for(index, generation);
+        k.with(|s| s.arm_reply_terminal(index, id));
+        let mut wins = 0;
+        if matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Won(_)
+        ) {
+            wins += 1;
+        }
+        for kind in [
+            TerminalClaimant::Timeout,
+            TerminalClaimant::PeerDeath,
+            TerminalClaimant::CallerExit,
+            TerminalClaimant::EndpointGone,
+        ] {
+            if k.with(|s| s.try_claim_reply_terminal_slot(index, kind, &id))
+                .is_some()
+            {
+                wins += 1;
+            }
+        }
+        assert_eq!(wins, 1, "the terminal cell admits exactly one claimant");
+    }
+
+    // ── Source contract ─────────────────────────────────────────────────────────────────
+
+    /// The claim is taken at the mutation point, AFTER the snapshot and the acknowledgement
+    /// probe, and BEFORE the acknowledgement is consumed and the transaction runs.
+    #[test]
+    fn the_claim_is_ordered_between_the_snapshot_and_the_delivery() {
         let body = SPLIT
             .split("fn try_split_ipcreply_direct_into_frame(")
             .nth(1)
-            .expect("NR7 helper present")
-            .split("\n#[cfg(feature = \"hosted-dev\")]")
-            .next()
-            .expect("body bounded");
-        let flat = body
-            .split_whitespace()
-            .collect::<alloc::vec::Vec<_>>()
-            .join(" ");
-        let fact_at = flat
-            .find("terminal_arbitrated:")
-            .expect("the fact is gathered");
-        let decline_at = flat
-            .find("REPLY_COUNTERS.note_declined_preflight_reply(")
-            .expect("the preflight decline is reported");
+            .expect("the NR7 helper");
+        let snapshot = body
+            .find("IpcReplyDirectSnapshot::build(")
+            .expect("snapshot");
+        // `is_claimable` also appears in the earlier SMP duplicate-refusal branch, so the probe
+        // is located from the snapshot forward — the one this ordering is about.
+        let probe = snapshot
+            + body[snapshot..]
+                .find("ipcreply_direct_ack::is_claimable(")
+                .expect("ack probe");
+        let claim = body
+            .find("claim_direct_reply_terminal_split(")
+            .expect("the exclusive claim");
+        let consume = body
+            .find("ipcreply_direct_ack::claim(")
+            .expect("ack consume");
+        let deliver = body
+            .find("drain_direct_reply_post_work(")
+            .expect("the delivery");
+        let commit = body
+            .find("commit_direct_reply_terminal_split(")
+            .expect("the commit");
         assert!(
-            fact_at < decline_at,
-            "the fact is gathered before the verdict"
+            snapshot < probe,
+            "snapshot before the acknowledgement probe"
         );
-        for later in [
-            "ipcreply_direct_ack::claim(",
-            "copy_from_user_asid_split_read(",
-            "IpcReplyDirectSnapshot::build(",
-            "drain_direct_reply_post_work(",
-        ] {
-            let at = flat
-                .find(later)
-                .unwrap_or_else(|| panic!("{later} present in the NR7 helper"));
-            assert!(
-                decline_at < at,
-                "the terminal-arbitration decline must precede {later}"
-            );
-        }
+        assert!(
+            probe < claim,
+            "the fallback-eligible probe precedes the claim"
+        );
+        assert!(claim < consume, "the claim precedes consuming the ack");
+        assert!(consume < deliver, "the ack is consumed before delivery");
+        assert!(deliver < commit, "the claim is committed after delivery");
     }
 
-    /// The decline has its OWN counter, as a breakdown of the preflight declines rather than a
-    /// new terminal bucket, so the balance invariant is untouched and a live boot can show how
-    /// much of the reply population is arbitrated.
+    /// A LOST claim never falls back to the broad dispatcher: it returns a typed result.
     #[test]
-    fn the_decline_is_counted_separately_without_disturbing_the_balance() {
-        use crate::kernel::direct_ipc_counters::DirectPathCounters;
-        let c = DirectPathCounters::new();
-        c.note_attempt();
-        c.note_declined_preflight_reply(false, false, true);
-        assert_eq!(c.declined_terminal_arbitration(), 1);
-        assert_eq!(c.declined_preflight(), 1, "it IS a preflight decline");
+    fn a_lost_claim_returns_a_typed_result_and_never_falls_back() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
+        let lost = body
+            .find("DirectReplyTerminalClaim::Lost(class)")
+            .expect("the lost arm");
+        // The arm ends where the match does; bound it there rather than by a character count.
+        let arm_end = body[lost..].find("\n    };").expect("the match ends");
+        let arm = &body[lost..lost + arm_end];
+        assert!(
+            arm.contains("frame.set_err(") && arm.contains("return Some(Ok(()))"),
+            "a lost claim encodes a canonical error and completes the syscall"
+        );
+        assert!(
+            !arm.contains("return None"),
+            "a lost claim must never fall back to the terminal broad dispatcher"
+        );
+        assert!(
+            arm.contains("reply_copies=0") && arm.contains("caller_wakes=0"),
+            "and attests that it mutated nothing"
+        );
+    }
+
+    /// Every claim exit resolves the claim — commit or release, never silently dropped.
+    #[test]
+    fn every_claim_exit_commits_or_releases() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
         assert_eq!(
-            c.declined_transfer_cap(),
-            0,
-            "not confused with transfer-cap"
+            body.matches("release_direct_reply_terminal_split(").count(),
+            2,
+            "two pre-delivery restore sites: the ack race and the outcome resolution"
         );
-        assert_eq!(c.declined_ineligible_mode(), 0);
-        assert_eq!(c.declined_not_admitted(), 0);
-        assert!(c.terminals_balance(), "still exactly one terminal");
-        assert!(c.eligibility_balances());
-        // The two NR7 breakdowns are independent.
-        let c2 = DirectPathCounters::new();
-        c2.note_attempt();
-        c2.note_declined_preflight_reply(false, true, false);
-        assert_eq!(c2.declined_terminal_arbitration(), 0);
-        assert_eq!(c2.declined_transfer_cap(), 1);
-        assert!(c2.terminals_balance());
-    }
-
-    /// The legacy reply path still owns the terminal lease, and the direct transaction still
-    /// does not — which is exactly why the arbitrated population is declined. Pinned so that
-    /// porting the lease (future canonical 199E work) has to update this guard deliberately.
-    #[test]
-    fn the_terminal_lease_remains_legacy_only() {
-        let legacy = include_str!("../syscall/ipc.rs");
-        for lease in [
-            "reserve_reply_win_before_copy",
-            "commit_reply_win_after_delivery",
-            "rollback_reply_win",
+        assert_eq!(
+            body.matches("commit_direct_reply_terminal_split(").count(),
+            1,
+            "one commit site"
+        );
+        // The outcome resolution is exhaustive over the transaction's own error type — no
+        // wildcard may decide whether a claim is committed or restored.
+        let resolve = body
+            .split("let commit = match &outcome {")
+            .nth(1)
+            .expect("the resolution")
+            .split("};")
+            .next()
+            .expect("bounded");
+        assert!(
+            !resolve.contains("_ =>"),
+            "the claim resolution has no wildcard arm"
+        );
+        for variant in [
+            "E::WouldBlock",
+            "E::ReplyCapResolve(_)",
+            "E::ReservePreconditionFailed",
+            "E::WaiterLost",
+            "E::LeaseNotClaimed",
+            "E::PayloadCopyFault",
+            "E::MetaCopyFault",
+            "E::EnqueueRejected(_)",
+            "E::WaiterLostAfterCopy",
+            "E::CallerGone",
+            "E::RecordConsumeFailed",
+            "E::EnqueueRejectedUnreconciled(_)",
+            "E::ReceiverMembershipViolation",
         ] {
             assert!(
-                legacy.contains(lease),
-                "the legacy reply path takes the terminal lease ({lease})"
+                resolve.contains(variant),
+                "resolution must decide {variant}"
             );
         }
-        for (name, src) in [
-            ("syscall_split.rs", SPLIT),
-            (
-                "ipccall_direct_txn.rs",
-                include_str!("../ipccall_direct_txn.rs"),
-            ),
-            ("ipccall_direct.rs", include_str!("../ipccall_direct.rs")),
+    }
+
+    /// ONE terminal policy: the broad reply path delegates to the same locked owners the split
+    /// route uses, so the two can never disagree about what claiming, committing or releasing
+    /// means.
+    #[test]
+    fn the_broad_and_split_paths_share_one_terminal_policy() {
+        const IPC: &str = include_str!("ipc_state.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for owner in [
+            "pub(crate) fn classify_direct_reply_terminal_locked(",
+            "pub(crate) fn claim_direct_reply_terminal_locked(",
+            "pub(crate) fn commit_reply_terminal_locked(",
+            "pub(crate) fn release_reply_terminal_locked(",
         ] {
-            for lease in [
-                "reserve_reply_win_before_copy",
-                "commit_reply_win_after_delivery",
-                "rollback_reply_win",
-            ] {
-                let code: alloc::string::String = src
-                    .lines()
-                    .filter(|l| !l.trim_start().starts_with("//"))
-                    .collect::<alloc::vec::Vec<_>>()
-                    .join("\n");
-                assert!(
-                    !code.contains(lease),
-                    "{name}: the direct path does not take the terminal lease ({lease}) — \
-                     which is why an arbitrated reply must decline to legacy"
-                );
-            }
+            assert_eq!(IPC.matches(owner).count(), 1, "one owner: {owner}");
+        }
+        // The broad adapters delegate rather than re-implementing the cell protocol.
+        for (adapter, delegate) in [
+            (
+                "pub(crate) fn commit_reply_terminal_slot(",
+                "commit_reply_terminal_locked(ipc, index, owner)",
+            ),
+            (
+                "pub(crate) fn release_reply_terminal_slot_if_retryable(",
+                "release_reply_terminal_locked(ipc, index, owner)",
+            ),
+        ] {
+            let body = IPC
+                .split(adapter)
+                .nth(1)
+                .expect("adapter present")
+                .split("\n    }\n")
+                .next()
+                .expect("bounded");
+            assert!(body.contains(delegate), "{adapter} must delegate");
+            assert!(
+                !body.contains("cell.commit_terminal(") && !body.contains("cell.release_"),
+                "{adapter} must not re-implement the cell protocol"
+            );
+        }
+        // And the split adapters delegate to the very same owners.
+        for delegate in [
+            "crate::kernel::boot::classify_direct_reply_terminal_locked(",
+            "crate::kernel::boot::claim_direct_reply_terminal_locked(",
+            "crate::kernel::boot::commit_reply_terminal_locked(",
+            "crate::kernel::boot::release_reply_terminal_locked(",
+        ] {
+            assert!(
+                RUNTIME_SRC.contains(delegate),
+                "split must delegate: {delegate}"
+            );
+        }
+    }
+
+    /// No boolean "any arbitration means decline" decision survives anywhere.
+    #[test]
+    fn no_boolean_arbitration_decision_remains() {
+        const IPC: &str = include_str!("ipc_state.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const ELIG: &str = include_str!("../direct_eligibility.rs");
+        for (what, src) in [
+            ("split helper", SPLIT),
+            ("ipc state", IPC),
+            ("runtime", RUNTIME_SRC),
+            ("eligibility", ELIG),
+        ] {
+            // The names may survive in prose that records WHY the boolean was wrong; what may
+            // not survive is any USE of them — a field read or a call.
+            assert!(
+                !src.contains("facts.terminal_arbitrated")
+                    && !src.contains("terminal_arbitrated:")
+                    && !src.contains("terminal_arbitrated ="),
+                "{what}: the boolean arbitration fact must no longer be used"
+            );
+            assert!(
+                !src.contains(".reply_record_terminal_arbitrated_split_read(")
+                    && !src.contains("fn reply_record_terminal_arbitrated_split_read"),
+                "{what}: the boolean arbitration read must no longer exist or be called"
+            );
         }
     }
 }
@@ -110771,11 +111037,11 @@ mod stage199d_closure_matrix {
         // recording the arbitrated decline. Not a transfer-cap counter.
         Coordinate {
             id: 13,
-            name: "Terminal-arbitrated NR7 declines before mutation; legacy wins the causal \
+            name: "NR7 claims its own exact terminal and competes in the causal \
                    reply-vs-timeout race",
             status: Complete,
             blocker: None,
-            seam: "fn reply_record_terminal_arbitrated_split_read",
+            seam: "fn claim_direct_reply_terminal_locked",
             test: "stage199d_terminal_arbitration_safety",
             evidence: &[
                 Evidence {
@@ -112410,18 +112676,25 @@ mod stage199d_riscv_production_readiness_audit {
             );
         }
         assert!(
-            RUNTIME.contains("fn reply_record_terminal_arbitrated_split_read"),
-            "the terminal-arbitration read is a shared split seam"
+            RUNTIME.contains("fn classify_direct_reply_terminal_split_read"),
+            "the terminal classification is a shared split seam"
+        );
+        // 199D-TRC: the claim is a shared split seam too, so RISC-V inherits the exclusive
+        // arbitration with no copy — the classification alone would only inherit the decision.
+        assert!(
+            RUNTIME.contains("fn claim_direct_reply_terminal_split"),
+            "the exclusive terminal claim is a shared split seam"
         );
         // The decline lives in the PURE eligibility classifier, so it is reached before any
         // mutation by construction — not by ordering discipline inside the transaction.
         assert!(
-            ELIGIBILITY.contains("if facts.terminal_arbitrated {"),
-            "a terminal-arbitrated reply is declined by the pure classifier"
+            ELIGIBILITY.contains("if !facts.terminal.admits_direct_reply() {"),
+            "an unclaimable terminal is declined by the pure classifier"
         );
         assert!(
-            ELIGIBILITY.contains("pub(crate) terminal_arbitrated: bool,"),
-            "the fact is carried into the classifier, not re-derived per architecture"
+            ELIGIBILITY.contains("pub(crate) terminal: DirectReplyTerminal,"),
+            "the typed classification is carried into the classifier, not re-derived per \
+             architecture"
         );
     }
 

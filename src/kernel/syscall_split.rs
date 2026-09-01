@@ -1444,7 +1444,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     // armed only by its oracle knob, and that oracle's live round-trip depends on blocked-recv
     // work this route does not reproduce, so it keeps yielding exactly as it did at `894cc5a`.
     // Widening it is a separate increment with its own AArch64 witness, not a side effect here.
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled() {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=ack_publication_armed",
@@ -1456,10 +1456,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     // policy has ONE owner — the `boot` predicate called just below — and it is not an admission
     // question, so the split dispatcher's admission logic stays free of proof-gate terms. See
     // that predicate for which blocked-recv work only the broad arm performs.
-    #[cfg(all(
-        not(feature = "hosted-dev"),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm() {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=direct_oracle_selector_armed",
@@ -2840,6 +2837,14 @@ fn try_split_ipcreply_direct_into_frame(
         Some((eidx, _)) => crate::kernel::boot::ipccall_direct_reply_endpoint_admitted(eidx),
         None => false,
     };
+    // 199D-TRC: the replier's exact incarnation is needed by the terminal classification, so it
+    // is resolved here rather than after the verdict. Both reads; nothing is mutated.
+    let replier_probe = tid.map(|t| {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(t),
+            crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(t) as u16),
+        )
+    });
     let facts = DirectReplyFacts {
         payload_len: len,
         requester_available: tid.is_some(),
@@ -2851,15 +2856,18 @@ fn try_split_ipcreply_direct_into_frame(
         // transaction cannot transfer a capability, so a cap-bearing reply must decline
         // before any mutation rather than deliver the payload and drop the capability.
         transfer_cap_present: crate::kernel::syscall::ipc_abi::transfer_cap_arg_present(frame),
-        // Read from the authoritative terminal-ownership cell, exact in record index AND
-        // generation. An arbitrated reply must reserve its terminal before the caller copy
-        // and commit it after so a concurrent timeout provably loses; that lease lives only
-        // on the legacy path, so this reply declines before any mutation.
-        terminal_arbitrated: match reply_object {
-            Ok((rec_idx, rec_gen)) => {
-                shared.reply_record_terminal_arbitrated_split_read(rec_idx, rec_gen)
-            }
-            Err(_) => false,
+        // 199D-TRC: the ADVISORY terminal classification, exact in record incarnation, caller,
+        // replier and reply-endpoint incarnation. An armed-and-available cell ADMITS this
+        // reply — it is one of the cell's five legitimate claimants — and the exclusive claim
+        // is taken at the mutation point below. Only a competitor-owned, already-settled or
+        // identity-mismatched cell declines, and each declines before any mutation.
+        terminal: match (reply_object, reply_endpoint, replier_probe) {
+            (Ok((rec_idx, rec_gen)), Some((eidx, egen)), Some(replier)) => shared
+                .classify_direct_reply_terminal_split_read(rec_idx, rec_gen, replier, eidx, egen),
+            // Without a resolved record, endpoint incarnation or replier there is no identity to
+            // be exact about. Those cases are declined by their own facts above; naming the
+            // terminal `IdentityMismatch` here keeps the field from ever reading as permissive.
+            _ => crate::kernel::direct_eligibility::DirectReplyTerminal::IdentityMismatch,
         },
     };
     let verdict = classify_direct_reply_eligibility(&facts);
@@ -2905,10 +2913,19 @@ fn try_split_ipcreply_direct_into_frame(
         }
     }
     let asid_raw = shared.task_asid_for_tid_split_read(tid);
+    // The same incarnation the terminal classification was keyed on.
     let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(
         crate::kernel::ipc::ThreadId(tid),
         crate::kernel::vm::Asid(asid_raw as u16),
     );
+    let (rec_idx, rec_gen) = match reply_object {
+        Ok(pair) => pair,
+        // Unreachable: eligibility required a resolved record. Fail closed rather than assume.
+        Err(_) => {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        }
+    };
     // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing. As on the
     // NR6 twin, every decline from here to the ack claim is eligible-but-pre-transaction and
     // is counted as such — the oracle server's bounded pre-acknowledgement retries live here.
@@ -2920,11 +2937,59 @@ fn try_split_ipcreply_direct_into_frame(
         REPLY_COUNTERS.note_declined_pre_transaction();
         return None;
     };
+    // 199D-TRC: probe the acknowledgement WITHOUT consuming it, so the ordinary
+    // "caller has not blocked yet" decline still happens BEFORE any terminal claim and can
+    // still fall back. Everything fallible-and-fallback-worthy is ordered ahead of the claim.
+    if !crate::kernel::boot::ipcreply_direct_ack::is_claimable(reply_eidx, reply_egen) {
+        REPLY_COUNTERS.note_declined_pre_transaction();
+        return None;
+    }
+    // 199D-TRC — THE EXCLUSIVE CLAIM. Classify and compare-exchange in one rank-3 acquisition,
+    // through the same single-authority `TerminalCell` that timeout, peer death, caller exit and
+    // endpoint destruction claim. The preflight classification above was advisory; this is the
+    // step that decides. A loser mutates nothing and does NOT fall back to the broad
+    // dispatcher — the record has a terminal owner, and that owner will complete it.
+    let terminal_claim =
+        shared.claim_direct_reply_terminal_split(rec_idx, rec_gen, replier, reply_eidx, reply_egen);
+    let terminal_owner = match terminal_claim {
+        crate::kernel::boot::DirectReplyTerminalClaim::NotArmed => None,
+        crate::kernel::boot::DirectReplyTerminalClaim::Won(owner) => Some(owner),
+        crate::kernel::boot::DirectReplyTerminalClaim::Lost(class) => {
+            // Eligible, but the exclusive claim was lost — counted where every other
+            // eligible-but-pre-transaction refusal is counted. It is deliberately NOT a
+            // preflight decline: preflight passed, and the arbitration outcome is reported
+            // by the marker below rather than folded into the preflight subset.
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            crate::yarm_log!(
+                "IPCREPLY_DIRECT_TERMINAL_LOST record_index={} record_generation={} replier_tid={} reason={:?} reply_copies=0 caller_wakes=0 result=ok",
+                rec_idx,
+                rec_gen,
+                tid,
+                class
+            );
+            // A typed terminal result, never a fallback: the reply authority this replier held
+            // has been settled by another claimant, so the canonical answer is the same one a
+            // duplicate reply gets. Zero copies, zero wakes, zero mutation.
+            frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
+            return Some(Ok(()));
+        }
+    };
     // Consume the acknowledgement published for EXACTLY this reply-endpoint incarnation,
     // at most once (Stage 199D endpoint-keyed, generation-bearing store).
     let Some((ack, ack_seq)) =
         crate::kernel::boot::ipcreply_direct_ack::claim(reply_eidx, reply_egen)
     else {
+        // Enumerated post-claim failure #1: the acknowledgement was claimable a moment ago and
+        // is not now. Restore the exact claim so the record is left precisely as it was found,
+        // then decline pre-mutation. A stale restore mutates nothing.
+        if let Some(owner) = terminal_owner.as_ref()
+            && !shared.release_direct_reply_terminal_split(rec_idx, owner)
+        {
+            // Unreachable while we hold `Reserved`; fail closed rather than fall back with an
+            // unresolved claim.
+            frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
+            return Some(Ok(()));
+        }
         REPLY_COUNTERS.note_declined_pre_transaction();
         return None;
     };
@@ -2935,6 +3000,48 @@ fn try_split_ipcreply_direct_into_frame(
     };
     // Stage 199D HARD-STOP B: classified, never discarded — see the NR6 twin.
     let outcome = shared.drain_direct_reply_post_work(cpu, &work);
+    // 199D-TRC — enumerated post-claim failure #2..n: resolve the claim against what the
+    // transaction actually did, exhaustively and by the transaction's OWN documented
+    // post-states. `Release` is used for every outcome that left the reply authority
+    // re-sendable (nothing delivered, a retryable copy fault, or an enqueue refusal that the
+    // transaction explicitly restores); `Commit` for every outcome past the publication line,
+    // where the one-shot is spent and no other claimant may win.
+    if let Some(owner) = terminal_owner.as_ref() {
+        use crate::kernel::ipccall_direct_txn::IpcReplyDirectError as E;
+        let commit = match &outcome {
+            Ok(_) => true,
+            Err(
+                E::WouldBlock
+                | E::ReplyCapResolve(_)
+                | E::ReservePreconditionFailed
+                | E::WaiterLost
+                | E::LeaseNotClaimed
+                | E::PayloadCopyFault
+                | E::MetaCopyFault
+                | E::EnqueueRejected(_),
+            ) => false,
+            Err(
+                E::WaiterLostAfterCopy
+                | E::CallerGone
+                | E::RecordConsumeFailed
+                | E::EnqueueRejectedUnreconciled(_)
+                | E::ReceiverMembershipViolation,
+            ) => true,
+        };
+        let settled = if commit {
+            shared.commit_direct_reply_terminal_split(rec_idx, owner)
+        } else {
+            shared.release_direct_reply_terminal_split(rec_idx, owner)
+        };
+        crate::yarm_log!(
+            "IPCREPLY_DIRECT_TERMINAL_CLAIM record_index={} record_generation={} replier_tid={} terminal=Reply resolution={} settled={} result=ok",
+            rec_idx,
+            rec_gen,
+            tid,
+            if commit { "commit" } else { "release" },
+            u8::from(settled)
+        );
+    }
     let disposition = crate::kernel::direct_disposition::classify_direct_reply_outcome(&outcome);
     crate::kernel::direct_ipc_counters::note_disposition(&REPLY_COUNTERS, disposition);
     // Same shared encoder as the NR6 twin: legacy `handle_ipc_reply` ends with the identical

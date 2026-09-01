@@ -42,9 +42,11 @@ mod ipc_state;
 // body are re-exported so the OFF-LOCK drain in `crate::runtime` can run the SAME body
 // through the `SharedKernel` split-mut seams (no duplicated transaction).
 pub(crate) use ipc_state::{
-    BlockingSendProducerOutcome, DetachOutcome, ReplyTimeoutDomains, ReplyWaitArm,
-    arm_reply_terminal_for_committed_block_locked, complete_reply_timeout_over,
-    complete_server_death_over, publish_recv_waiter_locked,
+    BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ReplyTimeoutDomains,
+    ReplyWaitArm, arm_reply_terminal_for_committed_block_locked,
+    claim_direct_reply_terminal_locked, classify_direct_reply_terminal_locked,
+    commit_reply_terminal_locked, complete_reply_timeout_over, complete_server_death_over,
+    publish_recv_waiter_locked, release_reply_terminal_locked,
 };
 mod memory_lifecycle_state;
 mod memory_state;
@@ -3490,7 +3492,7 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// consulting any oracle endpoint or knob. Ordinary production endpoints are admitted. The
 /// existing selectors still START their workloads; they no longer decide admission.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+    cfg!(target_arch = "x86_64")
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.

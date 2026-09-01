@@ -1303,6 +1303,191 @@ pub(crate) fn arm_reply_terminal_for_committed_block_locked(
     ReplyWaitArm::Armed { identity, token }
 }
 
+/// 199D-TRC — the ONE terminal-arbitration policy for a direct (NR7) reply, rank 3 only.
+///
+/// ## Why this exists
+///
+/// Production reply waits now arm their terminal cell (199E-ARM). Before that, nothing in a
+/// production boot was ever armed, so the direct reply route could ask a boolean — "is this
+/// record's terminal arbitrated at all?" — and treat any `true` as "the legacy path owns this".
+/// Once arming became live that boolean answered `true` for every reply, and 41 direct NR7
+/// transactions per x86_64 boot silently fell back onto the terminal broad dispatcher.
+///
+/// Being armed is the NORMAL state of a live reply wait, and the reply is one of the cell's five
+/// legitimate claimants — alongside timeout, peer death, caller exit and endpoint destruction.
+/// So a direct reply neither declines because the cell is armed nor proceeds without claiming
+/// it: it competes, exclusively, through the same `TerminalCell` every other claimant uses.
+///
+/// ## Exactness
+///
+/// The cell's published identity is compared field-by-field against the LIVE record — the same
+/// construction `arm_reply_terminal_for_committed_block_locked` used to build it — plus the
+/// reply-endpoint incarnation this transaction is actually servicing. `blocked_recv_generation`
+/// and `deadline_token_generation` are the cell's own and are carried forward into the claim
+/// rather than re-derived, so a claim can never be authorized by a reconstructed approximation.
+/// An armed cell is never sufficient on its own.
+pub(crate) fn classify_direct_reply_terminal_locked(
+    ipc: &IpcSubsystem,
+    record_index: usize,
+    record_generation: u64,
+    replier: ReceiverWaiterIdentity,
+    reply_endpoint_index: usize,
+    reply_endpoint_generation: u64,
+) -> crate::kernel::direct_eligibility::DirectReplyTerminal {
+    use crate::kernel::direct_eligibility::DirectReplyTerminal as T;
+    // The record incarnation must be current: a recycled slot is a different reply entirely.
+    if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+        return T::IdentityMismatch;
+    }
+    let Some(cell) = ipc.reply_terminal_ownership.get(record_index) else {
+        return T::IdentityMismatch;
+    };
+    // Epoch 0 is the vacant cell: never armed for any incarnation. Nothing can be racing this
+    // reply, because a timeout claimant reaches a record only through a deadline token and a
+    // token can only be reserved against an armed, open cell.
+    if cell.current_epoch() == 0 {
+        return T::Unarmed;
+    }
+    let Some(Some(record)) = ipc.reply_caps.get(record_index) else {
+        return T::IdentityMismatch;
+    };
+    let CapObject::Endpoint {
+        index: bound_eidx,
+        generation: bound_egen,
+    } = record.reply_endpoint
+    else {
+        return T::IdentityMismatch;
+    };
+    // The transaction must be servicing the very endpoint incarnation the record binds.
+    if bound_eidx != reply_endpoint_index || bound_egen != reply_endpoint_generation {
+        return T::IdentityMismatch;
+    }
+    let id = cell.identity();
+    let exact = id.reply_record_index == record_index
+        && id.reply_record_generation == record_generation
+        && id.caller_tid == record.caller_tid
+        && id.caller_asid == record.caller_asid
+        && id.replier_tid == record.responder_tid.unwrap_or(ThreadId(0))
+        && id.replier_asid == record.replier_asid.unwrap_or(Asid(0))
+        && id.reply_endpoint_index == bound_eidx
+        && id.reply_endpoint_generation == bound_egen;
+    if !exact {
+        return T::IdentityMismatch;
+    }
+    // The record must additionally authorize THIS replier where it binds one. An unbound
+    // record is authorized by the one-shot capability the caller already resolved, which is
+    // why an absent binding is not a mismatch.
+    if let Some(bound) = record.responder_tid
+        && bound != replier.tid
+    {
+        return T::IdentityMismatch;
+    }
+    if cell.is_open() {
+        T::AvailableExact
+    } else if cell.committed_winner().is_some() {
+        T::Settled
+    } else if cell.reserved_claimant().is_some() {
+        T::OwnedByCompetitor
+    } else {
+        // No other phase exists; fail closed rather than assume claimability.
+        T::Settled
+    }
+}
+
+/// The outcome of a direct reply's exclusive terminal claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectReplyTerminalClaim {
+    /// No terminal was armed for this record: there is nothing to claim and nothing racing.
+    NotArmed,
+    /// This reply now holds the exclusive `Reserved(Reply)` claim at the cell's exact epoch.
+    Won(crate::kernel::terminal_ownership::TerminalOwner),
+    /// The claim was refused. The classification says why, re-read after the attempt so a
+    /// competitor that won between the advisory read and the compare-exchange is reported as
+    /// what it is rather than as the state we hoped for.
+    Lost(crate::kernel::direct_eligibility::DirectReplyTerminal),
+}
+
+/// 199D-TRC — classify and CLAIM in ONE rank-3 acquisition.
+///
+/// The preflight classification is advisory by construction: the cell can change phase between
+/// the read and the attempt. That is exactly why the attempt is a compare-exchange on the
+/// published `{epoch, phase}` word and not a re-check — a competitor that wins in between makes
+/// this CAS fail, and a losing claimant mutates nothing.
+pub(crate) fn claim_direct_reply_terminal_locked(
+    ipc: &IpcSubsystem,
+    record_index: usize,
+    record_generation: u64,
+    replier: ReceiverWaiterIdentity,
+    reply_endpoint_index: usize,
+    reply_endpoint_generation: u64,
+) -> DirectReplyTerminalClaim {
+    use crate::kernel::direct_eligibility::DirectReplyTerminal as T;
+    let class = classify_direct_reply_terminal_locked(
+        ipc,
+        record_index,
+        record_generation,
+        replier,
+        reply_endpoint_index,
+        reply_endpoint_generation,
+    );
+    match class {
+        T::Unarmed => DirectReplyTerminalClaim::NotArmed,
+        T::AvailableExact => {
+            let Some(cell) = ipc.reply_terminal_ownership.get(record_index) else {
+                return DirectReplyTerminalClaim::Lost(T::IdentityMismatch);
+            };
+            // The identity was just verified against the live record above, in this same
+            // acquisition. Claim with that verified identity — `try_claim` re-compares it and
+            // then CASes `Open → Reserved(Reply)` at the epoch it read, so neither a changed
+            // identity nor a changed epoch can be claimed through.
+            let expect = *cell.identity();
+            match cell.try_claim_reply_terminal(&expect) {
+                Some(owner) => DirectReplyTerminalClaim::Won(owner),
+                None => DirectReplyTerminalClaim::Lost(classify_direct_reply_terminal_locked(
+                    ipc,
+                    record_index,
+                    record_generation,
+                    replier,
+                    reply_endpoint_index,
+                    reply_endpoint_generation,
+                )),
+            }
+        }
+        other => DirectReplyTerminalClaim::Lost(other),
+    }
+}
+
+/// Commit a reply-record terminal claim after delivery succeeded. Only the exact owner
+/// wins. THE commit policy: the broad `KernelState::commit_reply_terminal_slot` delegates here
+/// too, so the split and broad reply paths cannot drift into contradictory arbitration rules.
+pub(crate) fn commit_reply_terminal_locked(
+    ipc: &IpcSubsystem,
+    record_index: usize,
+    owner: &crate::kernel::terminal_ownership::TerminalOwner,
+) -> bool {
+    ipc.reply_terminal_ownership
+        .get(record_index)
+        .is_some_and(|cell| cell.commit_terminal(owner))
+}
+
+/// Release a reply-record terminal claim back to `Open` after a PRE-DELIVERY failure.
+///
+/// THE release policy; the broad `KernelState::release_reply_terminal_slot_if_retryable`
+/// delegates here too.
+///
+/// Exact by the owner token, so a stale release mutates nothing: `release_terminal_if_retryable`
+/// compares the full `{epoch, claimant, Reserved}` word, and a cell some competitor has since
+/// won is left exactly as it is.
+pub(crate) fn release_reply_terminal_locked(
+    ipc: &IpcSubsystem,
+    record_index: usize,
+    owner: &crate::kernel::terminal_ownership::TerminalOwner,
+) -> bool {
+    ipc.reply_terminal_ownership
+        .get(record_index)
+        .is_some_and(|cell| cell.release_terminal_if_retryable(owner))
+}
+
 pub(crate) fn publish_recv_waiter_locked(
     ipc: &mut IpcSubsystem,
     endpoint_idx: usize,
@@ -2200,11 +2385,9 @@ impl KernelState {
         index: usize,
         owner: &crate::kernel::terminal_ownership::TerminalOwner,
     ) -> bool {
-        self.with_ipc_state(|ipc| {
-            ipc.reply_terminal_ownership
-                .get(index)
-                .is_some_and(|cell| cell.commit_terminal(owner))
-        })
+        // 199D-TRC: a thin broad adapter over the ONE commit policy, so the broad reply path
+        // and the split direct-reply route can never disagree about what committing means.
+        self.with_ipc_state(|ipc| commit_reply_terminal_locked(ipc, index, owner))
     }
 
     /// Release the owner's claim on slot `index` back to `Open` for a retryable
@@ -2214,11 +2397,8 @@ impl KernelState {
         index: usize,
         owner: &crate::kernel::terminal_ownership::TerminalOwner,
     ) -> bool {
-        self.with_ipc_state(|ipc| {
-            ipc.reply_terminal_ownership
-                .get(index)
-                .is_some_and(|cell| cell.release_terminal_if_retryable(owner))
-        })
+        // 199D-TRC: a thin broad adapter over the ONE release policy — see the commit twin.
+        self.with_ipc_state(|ipc| release_reply_terminal_locked(ipc, index, owner))
     }
 
     /// The committed terminal winner of slot `index`, if any (for assertions).
