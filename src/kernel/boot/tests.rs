@@ -153275,9 +153275,10 @@ mod u9spawn2_process_cnode_txn {
         assert_eq!(association_for(&k, 50_005), Some(victim_grant.cnode));
     }
 
-    /// The broad and split entries share ONE rank-4 body — neither carries its own policy.
+    /// The acquisition wrapper and the rank-4 body are separate, and the body carries the policy
+    /// — so an off-lock entry, when a route needs one, is a wrapper and not a second copy.
     #[test]
-    fn broad_and_split_share_one_policy() {
+    fn the_policy_lives_in_the_acquisition_agnostic_body() {
         assert_eq!(
             TXN_SRC
                 .matches("pub(crate) fn provision_process_cnode_locked(")
@@ -153286,24 +153287,27 @@ mod u9spawn2_process_cnode_txn {
             "one rank-4 provisioning body"
         );
         assert!(
-            TXN_SRC.contains("fn provision_process_cnode(")
-                && RUNTIME_SRC.contains("fn provision_process_cnode_split("),
-            "both acquisitions must exist"
+            TXN_SRC.contains("fn provision_process_cnode("),
+            "the broad acquisition wrapper must exist"
         );
-        for entry in [
-            "provision_process_cnode_locked(",
-            "release_process_cnode_grant_locked(",
-        ] {
-            assert!(
-                RUNTIME_SRC.contains(entry),
-                "the split entry must call the shared rank-4 owner {entry}, not reimplement it"
-            );
-        }
-        // The split entry adds no second capacity policy.
+        // The rank-4 body is ACQUISITION-AGNOSTIC: it takes `&mut CapabilitySubsystem`, not
+        // `&mut self`. That is what keeps a future off-lock entry a wrapper rather than a
+        // reimplementation — and it is deliberately not accompanied by such an entry today,
+        // because U9-SPAWN2 §3 hard-stopped, and a split wrapper with no caller is banked
+        // dormant API.
         assert!(
-            RUNTIME_SRC
-                .contains("requested_cnode_slot_capacity_for_class(request.class, limits, None)"),
-            "the split entry must use the same class capacity policy as the broad one"
+            TXN_SRC.contains("capability: &mut CapabilitySubsystem"),
+            "the shared body must take the subsystem, so either acquisition can drive it"
+        );
+        assert!(
+            !RUNTIME_SRC.contains("provision_process_cnode_split"),
+            "no dormant split wrapper may be banked while the route that would call it does not \
+             exist"
+        );
+        // And the one capacity policy is the class policy, stated once.
+        assert!(
+            TXN_SRC.contains("requested_cnode_slot_capacity_for_class("),
+            "the transaction must use the existing class capacity policy"
         );
     }
 
@@ -153363,6 +153367,83 @@ mod u9spawn2_process_cnode_txn {
                 !code.contains(foreign),
                 "{foreign} belongs to the capability lifecycle; the CNode transaction must not \
                  grow a second copy of it"
+            );
+        }
+    }
+}
+
+/// U9-SPAWN2 §3 — the live NR 23/NR 29 split route is NOT built, and this pins why.
+///
+/// §2 removed one of the blockers SP-4 named. The recomputed phase table is what decides the
+/// rest, and it says four subsystems remain, not one — so the route is not started rather than
+/// half-started, and no wrapper is left behind waiting for it.
+#[cfg(test)]
+mod u9spawn2_nr23_route_blockers {
+    use super::*;
+
+    /// Every phase the NR 23 / NR 29 transaction still needs off the broad lock, and the fact
+    /// that none of them has a rank-local owner today.
+    ///
+    /// A rank-local owner is one that takes its subsystem (`&mut XSubsystem`) rather than
+    /// `&mut self`, so an acquisition wrapper can drive it from either side — the shape §2's
+    /// `provision_process_cnode_locked` has. When one of these grows that shape, this test fails
+    /// and the phase table gets recomputed instead of the note going stale.
+    #[test]
+    fn every_remaining_spawn_phase_still_lacks_a_rank_local_owner() {
+        const PHASES: &[(&str, &str)] = &[
+            ("create_user_address_space", "VM rank 5 + capability rank 4"),
+            ("load_elf_pt_load_segments", "VM rank 5 + memory rank 6"),
+            ("load_elf_with_mo_zero_copy", "VM rank 5 + memory rank 6"),
+            ("allocate_user_stack_with_guard", "VM rank 5"),
+            ("create_endpoint", "IPC rank 3 + capability rank 4"),
+            (
+                "grant_capability_task_to_task_with_rights",
+                "capability rank 4",
+            ),
+            ("provision_default_kernel_context", "task rank 2"),
+        ];
+        let sources = stage199d_wa2a_ownership_boundary::production_sources();
+        for (phase, ranks) in PHASES {
+            let locked = alloc::format!("fn {phase}_locked(");
+            let has_rank_local = sources.iter().any(|(_, src)| src.contains(&locked));
+            assert!(
+                !has_rank_local,
+                "{phase} ({ranks}) grew a rank-local owner — recompute the NR 23 phase table \
+                 before trusting the hard-stop note"
+            );
+        }
+    }
+
+    /// §2's transaction, by contrast, HAS that shape — which is how the difference between a
+    /// bounded extraction and a new subsystem was decided.
+    #[test]
+    fn the_cnode_phase_is_the_one_that_was_a_bounded_extraction() {
+        const TXN_SRC: &str = include_str!("process_cnode_txn.rs");
+        assert!(
+            TXN_SRC.contains("pub(crate) fn provision_process_cnode_locked(")
+                && TXN_SRC.contains("capability: &mut CapabilitySubsystem"),
+            "the CNode phase must have the rank-local shape the others lack"
+        );
+        // And the half SP-4 mistakenly reported as absent really did already exist.
+        const CAP_SRC: &str = include_str!("capability_lifecycle_state.rs");
+        assert!(
+            CAP_SRC.contains("pub(crate) fn ensure_cnode_space_locked("),
+            "ensure_cnode_space_locked predates this work; SP-4's blocker note was half wrong"
+        );
+    }
+
+    /// Nothing dormant was banked for the route that was not built.
+    #[test]
+    fn no_dormant_spawn_route_api_was_left_behind() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for dormant in [
+            "provision_process_cnode_split",
+            "release_process_cnode_grant_split",
+        ] {
+            assert!(
+                !RUNTIME_SRC.contains(dormant),
+                "{dormant} has no caller — a split wrapper built for a route that hard-stopped is \
+                 banked dormant API"
             );
         }
     }
