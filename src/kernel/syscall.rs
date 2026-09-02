@@ -58,15 +58,20 @@ pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
 /// refuse them without ever reaching the broad dispatcher, and a guard refuses to let one
 /// re-enter the live table.
 pub const RETIRED_SYSCALL_NUMBERS: &[(usize, &str)] = &[
-    // A Phase-2 bulk-copy byte-copy bridge, retired once the MemoryObject zero-copy grant loader
-    // (`CreateInitramfsFileSliceMo` NR 28 + `SpawnFromMemoryObject` NR 29) became the sole,
-    // mandatory ELF-load path on every architecture.
-    (27, "InitramfsReadChunk, removed in Stage 197A"),
-    // The kernel-side CPIO spawn. Its userspace wrapper was never called: PM reaches the same
-    // images through the MemoryObject grant path (NR 29) and falls back to
-    // `SpawnProcessFromUserBuf` (NR 24), so nothing ever issued NR 26.
-    (26, "SpawnFromInitramfsFile, removed in U9-ASPACE1 §2"),
+    // NR 27 was `InitramfsReadChunk`, a Phase-2 bulk-copy byte-copy bridge, retired once the
+    // MemoryObject zero-copy grant loader (`CreateInitramfsFileSliceMo` NR 28 +
+    // `SpawnFromMemoryObject` NR 29) became the sole, mandatory ELF-load path everywhere.
+    (27, "retired in Stage 197A"),
+    // NR 26 was `SpawnFromInitramfsFile`, the kernel-side CPIO spawn. Its userspace wrapper was
+    // never called: PM reaches the same images through the MemoryObject grant path (NR 29) and
+    // falls back to `SpawnProcessFromUserBuf` (NR 24), so nothing ever issued NR 26.
+    (26, "retired in U9-ASPACE1 §2"),
 ];
+
+// The retired CLASS NAMES live in the comments above and deliberately NOT in these strings. The
+// artifact integrity gate greps a freshly built kernel for the names of removed classes and
+// treats a hit as a stale binary; embedding them as runtime reasons would defeat that check for
+// exactly the classes it exists to catch. The number and the stage are what the log line needs.
 
 /// The reason a syscall number is retired, or `None` if it was never assigned or is still live.
 #[must_use]
