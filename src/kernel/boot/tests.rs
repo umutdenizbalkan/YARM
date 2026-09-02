@@ -85220,7 +85220,9 @@ mod stage199d_delivery_projection_differential {
                  nothing it cannot undo — absent transfer cap, unreadable caller, unreadable \
                  authority slots, refused record reservation, an unarmed terminal, a LOST \
                  terminal claim, a refused envelope stash, a refused message framing, and a \
-                 producer that declined or failed"
+                 producer that declined or failed. §7's pre-lock refusal of a spent reply \
+                 authority is NOT among them: it is a PREFLIGHT decline, counted through \
+                 `note_declined_preflight_reply` with every other ineligibility"
             );
             for (direction, sites, what) in [
                 (
@@ -85814,7 +85816,7 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "the whole condition is the target architecture: x86_64 is production-default, \
              every other architecture is not"
         );
@@ -85897,7 +85899,7 @@ mod stage199d_production_default_guards {
         // state the scope explicitly rather than merely assert it.
         assert!(
             doc.contains("never as a knob or a selector, and never ahead of")
-                && doc.contains("RISC-V keeps the legacy path until its own profiles qualify"),
+                && doc.contains("DIRECT3-CAP-FINAL §6 adds RISC-V on the same evidentiary"),
             "the record states which architectures are production-default and which are not"
         );
         assert!(
@@ -85906,7 +85908,9 @@ mod stage199d_production_default_guards {
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64")
         );
         // Where production is off, admission and publication are EXACTLY the proof gate: the
         // ordinary configuration reaches neither, and the explicit selector reaches both. Where
@@ -107498,16 +107502,38 @@ mod stage199d_transfer_cap_safety {
                 "the transfer-cap decline must precede {later}"
             );
         }
-        // The decline arm itself returns — it does not fall through.
+        // The decline arm itself EXITS — it never falls through into the transaction — and it
+        // mutates nothing on the way out.
+        //
+        // DIRECT3-CAP-FINAL §7 gave the arm a second exit: a reply whose authority is already
+        // spent is refused here with the typed `WrongObject` the legacy path would have
+        // produced, rather than entering the broad dispatcher purely to be refused there. So
+        // the assertion is no longer "the arm is exactly this text" but the property that text
+        // was standing in for — both exits are returns, and neither touches any mutating or
+        // user-memory step.
+        let arm = &flat[decline_at..];
+        let arm_end = arm
+            .find("return None;")
+            .expect("the decline arm still ends in a return to the legacy path");
+        let arm = &arm[..arm_end + "return None;".len()];
         assert!(
-            flat[decline_at..].starts_with(
-                "REPLY_COUNTERS.note_declined_preflight_reply( verdict == \
-                 crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted, \
-                 verdict.is_transfer_cap_decline(), \
-                 verdict.is_terminal_arbitration_decline(), ); return None;"
-            ),
-            "the preflight decline returns None so the legacy path runs"
+            arm.contains("frame.set_err( crate::kernel::syscall::SyscallError::WrongObject.code(), ); return Some(Ok(()));")
+                || arm.contains("frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code()); return Some(Ok(()));"),
+            "the spent-authority refusal returns the typed error rather than falling through"
         );
+        for mutating in [
+            "ipcreply_direct_ack::claim(",
+            "reserve_existing_reply_record_split(",
+            "claim_direct_reply_terminal_split(",
+            "stash_transfer_envelope_split(",
+            "copy_from_user_asid_split_read(",
+            "drain_direct_reply_post_work(",
+        ] {
+            assert!(
+                !arm.contains(mutating),
+                "the preflight decline arm must not `{mutating}` — it declines before any mutation"
+            );
+        }
     }
 
     /// The transfer-cap decline is observable on a live boot, as a breakdown of the preflight
@@ -108965,7 +108991,7 @@ mod stage199d_aarch64_readiness_audit {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "AArch64 stays off until its blockers are closed — the predicate names x86_64 and \
              nothing else, so no AArch64 term can hide in it"
         );
@@ -109421,7 +109447,7 @@ mod stage199d_split_return_without_broad_lock {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
         );
     }
 }
@@ -110171,11 +110197,13 @@ mod stage199d_aarch64_offlock_dispatch {
         // disabled one, and it still pins every OTHER architecture off.
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
         assert_eq!(
@@ -111750,7 +111778,7 @@ mod stage199d_closure_matrix {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "x86_64 ON, every other architecture OFF"
         );
     }
@@ -113287,11 +113315,13 @@ mod stage199d_riscv_narrow_trap_snapshots {
         // disabled one, and it still pins every OTHER architecture off.
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -113481,7 +113511,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "production is x86_64-only, so it is compile-time false on RISC-V"
         );
         assert!(
@@ -113525,7 +113555,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "production is x86_64-only, so on RISC-V admission adds no term beyond proof"
         );
     }
@@ -113666,11 +113696,13 @@ mod stage199d_riscv_canonical_admission {
         // disabled one, and it still pins every OTHER architecture off.
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
         let admission = MOD_SRC
@@ -114218,11 +114250,13 @@ mod stage199d_riscv_remote_wake_readiness {
         // disabled one, and it still pins every OTHER architecture off.
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -114899,11 +114933,13 @@ mod stage199d_riscv_link2_wake_only_online {
         // disabled one, and it still pins every OTHER architecture off.
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -115343,11 +115379,13 @@ mod stage199d_runqueue_withdrawal_foundation {
         // disabled one, and it still pins every OTHER architecture off.
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -115668,11 +115706,13 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
         // disabled one, and it still pins every OTHER architecture off.
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -116917,7 +116957,9 @@ mod stage199d_wa1_gate {
         use crate::kernel::boot::*;
         assert_eq!(
             ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64")
         );
         set_ipccall_direct_proof_enabled(false);
         assert_eq!(
@@ -116963,7 +117005,7 @@ mod stage199d_wa1_gate {
             .expect("the predicate");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "the whole body is the architecture test"
         );
         // Stage 199D-WA3C2: `target_arch` / `cfg!` ARE the body now, so they leave the
@@ -117000,9 +117042,14 @@ mod stage199d_wa1_gate {
         // RISC-V is still off, and the predicate must not name it. AArch64 IS named now, so
         // the check is scoped to the architecture that has not qualified rather than to "any
         // architecture but x86_64" — which is what it always meant.
+        // Every architecture the tree builds for is now production-default, each admitted on
+        // its own enumerated evidence. The guard that named the not-yet-qualified architecture
+        // has nothing left to name, so what remains is the property it always protected: the
+        // predicate is nothing but compile-time architecture tests, which the operand walk
+        // above enforces exactly.
         assert!(
-            !body.contains("riscv"),
-            "RISC-V keeps the legacy path until its own profiles qualify"
+            body.matches("target_arch").count() >= 1,
+            "the predicate is still expressed as architecture tests"
         );
         // Admission keeps its form: production OR proof, with production now true on x86_64.
         let adm = MODRS
@@ -118415,7 +118462,7 @@ mod stage199d_wa2a_ownership_boundary {
             .expect("the predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
@@ -126872,7 +126919,7 @@ mod u3_ordinary_cap_sender_wake {
         let mod_rs = include_str!("mod.rs");
         assert!(
             mod_rs.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")\n}"
             ),
             "direct production is the target architecture and nothing else"
         );
@@ -126999,11 +127046,13 @@ mod u4_cross_arch_queue_advancing_dispatch {
     fn direct_production_cannot_affect_the_predicate() {
         assert_eq!(
             ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64")
         );
         assert!(
             MOD_SRC.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")\n}"
             ),
             "direct production is the target architecture and nothing else"
         );
@@ -129778,7 +129827,7 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 }
                 assert!(
                     MOD_SRC.contains(
-                        "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")\n}"
+                        "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")\n}"
                     ),
                     "direct production is the target architecture and nothing else"
                 );
@@ -141319,13 +141368,15 @@ mod u9qa_not_retired {
     fn direct_production_remains_a_compile_time_architecture_constant() {
         assert!(
             MOD_SRC.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")\n}"
             ),
             "direct-IpcCall production must remain a compile-time architecture constant"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "and must evaluate to the target architecture"
         );
     }
@@ -150138,5 +150189,150 @@ mod direct3_cap_final_reply_lane {
             0,
             "the split producer must not build the snapshot itself"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DIRECT3-CAP-FINAL §7 — the deterministic-refusal terminal edge.
+//
+// A reply whose authority is already spent has one possible outcome, and the split route knows
+// it: the record the capability names is gone, generation-stale or no longer invokable, so the
+// legacy path's only remaining act is to refuse. Entering the broad dispatcher purely to be
+// refused is a terminal edge that buys nothing, so the refusal is given pre-lock — with the
+// same typed error, and having mutated nothing.
+mod direct3_cap_final_prelock_refusal {
+    use super::*;
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::kernel::capabilities::CapObject;
+    use crate::runtime::SharedKernel;
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+
+    fn fixture() -> (
+        SharedKernel,
+        usize,
+        u64,
+        crate::kernel::boot::ReceiverWaiterIdentity,
+    ) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (i, g, r) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("b1");
+            s.bind_task_asid(2, sasid).expect("b2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            let (i, g) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("record");
+            assert!(s.commit_direct_reply_record(i, g));
+            (i, g, replier)
+        });
+        (k, i, g, r)
+    }
+
+    /// THE predicate: it mirrors `resolve_reply_index`'s refusal one-for-one, which is what
+    /// makes the pre-lock answer byte-identical rather than merely similar.
+    #[test]
+    fn the_invokability_predicate_matches_the_legacy_one_state_for_state() {
+        let (k, i, g, replier) = fixture();
+        // Available — externally invokable, so NOT refused here.
+        assert!(k.reply_record_externally_invokable_split_read(i, g));
+        // A stale generation names no live authority.
+        assert!(!k.reply_record_externally_invokable_split_read(i, g.wrapping_add(7)));
+        // Reserved by an in-flight transaction is not externally invokable.
+        assert!(k.reserve_existing_reply_record_split(i, g, replier));
+        assert_eq!(
+            k.with(|s| s.reply_cap_record_reservation(i)),
+            Some(ReplyRecordReservation::Reserved)
+        );
+        assert!(!k.reply_record_externally_invokable_split_read(i, g));
+        // Consumed — the one-shot is spent.
+        assert!(k.consume_reply_record_split(i, g));
+        assert!(!k.reply_record_externally_invokable_split_read(i, g));
+        // Released — the slot is gone entirely.
+        k.release_consumed_reply_record_split(i, g);
+        assert!(!k.reply_record_externally_invokable_split_read(i, g));
+        // And it reads only: the slot is still absent, nothing was resurrected.
+        assert_eq!(k.with(|s| s.reply_cap_record_reservation(i)), None);
+    }
+
+    /// The legacy refusal it stands in for really is this error. `resolve_reply_index` returns
+    /// `StaleCapability` for exactly the states above, and the syscall wrapper maps that to the
+    /// user-visible `WrongObject` — which is the code the pre-lock arm writes.
+    #[test]
+    fn the_pre_lock_error_is_the_one_the_legacy_path_would_have_produced() {
+        let resolver = IPC_STATE
+            .split("fn resolve_reply_index(")
+            .nth(1)
+            .expect("the legacy resolver");
+        let resolver = &resolver[..resolver.find("\n    pub").unwrap_or(resolver.len())];
+        assert!(
+            resolver.contains("ipc.reply_cap_generations[index] == generation")
+                && resolver.contains("record.reservation.is_invokable()")
+                && resolver.contains("_ => Err(KernelError::StaleCapability)"),
+            "the legacy refusal is: slot present, generation exact, reservation invokable"
+        );
+        assert_eq!(
+            crate::kernel::syscall::SyscallError::from(
+                crate::kernel::boot::KernelError::StaleCapability
+            ),
+            crate::kernel::syscall::SyscallError::WrongObject,
+            "and StaleCapability is what the user sees as WrongObject"
+        );
+    }
+
+    /// The refusal is given at the PREFLIGHT decline — before the acknowledgement claim, the
+    /// record reservation, the terminal claim and the envelope stash — and only when the route
+    /// actually resolved a record to be exact about.
+    #[test]
+    fn the_refusal_is_pre_mutation_and_only_with_a_resolved_record() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
+        let arm = body
+            .split("REPLY_COUNTERS.note_declined_preflight_reply(")
+            .nth(1)
+            .expect("the preflight decline arm");
+        let arm = &arm[..arm.find("return None;").expect("the arm still falls back")];
+        assert!(
+            arm.contains("if let Ok((rec_idx, rec_gen)) = reply_object"),
+            "an unresolved capability still declines to legacy — no record to be exact about"
+        );
+        assert!(
+            arm.contains("!shared.reply_record_externally_invokable_split_read(rec_idx, rec_gen)"),
+            "the decision is made on the RECORD, not re-derived from the classification"
+        );
+        assert!(
+            arm.contains("SyscallError::WrongObject.code()"),
+            "and answered with the typed error the legacy path produces"
+        );
+        // It precedes every consuming step in the helper.
+        let refusal = body
+            .find("IPCREPLY_DIRECT_REFUSED_PRE_LOCK")
+            .expect("the refusal marker");
+        for consuming in [
+            "ipcreply_direct_ack::claim(",
+            "reserve_existing_reply_record_split(",
+            "claim_direct_reply_terminal_split(",
+            "stash_transfer_envelope_split(",
+        ] {
+            let at = body
+                .find(consuming)
+                .unwrap_or_else(|| panic!("{consuming} present"));
+            assert!(refusal < at, "the refusal precedes {consuming}");
+        }
     }
 }

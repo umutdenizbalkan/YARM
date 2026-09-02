@@ -9867,6 +9867,59 @@ impl SharedKernel {
     /// requires the exact endpoint INCARNATION — index alone cannot distinguish a recycled
     /// endpoint slot from the one the acknowledgement was published for.
     /// `None` when absent or generation-mismatched.
+    /// DIRECT3-CAP-FINAL §7 — rank 3 read: is the record this reply capability names still
+    /// EXTERNALLY INVOKABLE?
+    ///
+    /// This mirrors `KernelState::resolve_reply_index`'s refusal predicate one-for-one — slot
+    /// present, generation exact, reservation invokable — because that is the check whose
+    /// failure the legacy path answers with `KernelError::StaleCapability`, which maps to the
+    /// user-visible `SyscallError::WrongObject`. Mirroring it is what makes a pre-lock refusal
+    /// byte-identical rather than merely similar.
+    ///
+    /// `false` means the authority is spent or gone: a competitor settled the terminal, or the
+    /// record was recycled. Reads only; mutates nothing.
+    pub(crate) fn reply_record_externally_invokable_split_read(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            matches!(
+                ipc.reply_caps.get(index),
+                Some(Some(record))
+                    if ipc.reply_cap_generations.get(index).copied() == Some(generation)
+                        && record.reservation.is_invokable()
+            )
+        })
+    }
+
+    /// DIRECT3-CAP-FINAL §7 — rank 3 read: has this reply record's terminal already been
+    /// SETTLED, and by whom?
+    ///
+    /// A reply arriving after its terminal was won — by a deadline, a peer death, a caller exit
+    /// or an endpoint destruction — is refused. The refusal is deterministic and its answer is
+    /// `WrongObject`, so entering the broad dispatcher only to be told that is a terminal edge
+    /// with no purpose: the split route already holds every identity fact the decision needs.
+    /// This read is what lets it answer pre-lock, mutating nothing.
+    ///
+    /// Exact on the record incarnation, and it reports the WINNER rather than merely "settled":
+    /// the classifier's `Settled` also covers its fail-closed arm, and a fail-closed cell must
+    /// keep declining to the legacy path rather than being answered from a guess.
+    pub(crate) fn reply_terminal_committed_winner_split_read(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> Option<crate::kernel::terminal_ownership::TerminalClaimant> {
+        self.with_ipc_split_mut(|ipc| {
+            if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
+                return None;
+            }
+            ipc.reply_terminal_ownership
+                .get(index)
+                .and_then(|cell| cell.committed_winner())
+        })
+    }
+
     /// DIRECT3-CAP-FINAL — rank 3 read: the exact caller incarnation a reply record binds.
     ///
     /// The cap-bearing lane delivers into this caller and carries it through the drain, so it

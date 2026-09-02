@@ -3501,14 +3501,25 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// resume consumer, materialization owner, queue owner or terminal policy that is not already
 /// shared — which is why this is a scope extension backed by profiles rather than a gate flip.
 ///
-/// RISC-V keeps the legacy path until its own profiles qualify.
+/// DIRECT3-CAP-FINAL §6 adds RISC-V on the same evidentiary footing, after a mechanical gap
+/// enumeration found every owner it needs already present and reachable: the bridge imports
+/// a7→nr and a0..a5→args unconditionally, admission runs through THIS predicate (deliberately,
+/// so that turning it on could never be a silent no-op), `sepc` is pre-advanced before the split
+/// point so a parked context names the instruction after its `ecall`, the same
+/// `DispatchPostWork` drain owns the ordinary-cap executor and the reply continuation,
+/// `direct_dispatch_resume_incoming` applies the exact `{tid, asid, generation}` token with SATP
+/// activation (`sfence.vma` inside `write_satp`) before user return, `classify_and_take_async_resume`
+/// remains the single async-tag consumer, and the D2 recv/send drains settle parked resumes.
+/// RISC-V does not admit NR 2, so a caller's recv-v2 block publishes its reply acknowledgement
+/// from the broad arm's `maybe_publish_ipcreply_direct_blocked_caller_ack`, which is not
+/// architecture-gated — the acknowledgement the direct reply claims is published either way.
 ///
 /// Where the term is `true` the default is **unconfined**: every consumer below (`admission`,
 /// `publication`, and both endpoint-admission predicates) short-circuits before consulting any
 /// oracle endpoint or knob. Ordinary production endpoints are admitted. The existing selectors
 /// still START their workloads; they no longer decide admission.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
+    cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64") || cfg!(target_arch = "riscv64")
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.

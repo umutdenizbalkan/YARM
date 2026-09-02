@@ -2942,6 +2942,39 @@ fn try_split_ipcreply_direct_into_frame(
             verdict.is_transfer_cap_decline(),
             verdict.is_terminal_arbitration_decline(),
         );
+        // DIRECT3-CAP-FINAL §7 — CLOSE THE DETERMINISTIC-REFUSAL EDGE.
+        //
+        // One shape of ineligibility is not an "ask the broad path instead": it is a refusal
+        // whose answer is already known here. When the capability resolves to a `Reply` object
+        // but the record it names is gone, generation-stale or no longer invokable — because a
+        // deadline, a peer death, a caller exit or an endpoint destruction settled the terminal
+        // — the legacy path's ONLY remaining act is to fail. `resolve_reply_index` refuses with
+        // `StaleCapability`, which the syscall wrapper maps to `SyscallError::WrongObject`.
+        //
+        // Entering the broad dispatcher purely to be told that is a terminal edge that buys
+        // nothing. The refusal is given here instead, from the SAME typed error written the
+        // same way, so the user-visible result is byte-identical — and given having mutated
+        // NOTHING, because this is before the record reservation, the terminal claim, the
+        // envelope stash and the acknowledgement claim.
+        //
+        // The predicate is the legacy one mirrored exactly, not a re-derivation from the
+        // terminal classification: a classification can be `IdentityMismatch` for reasons whose
+        // legacy answer is NOT this error, so the decision is made on the record itself. An
+        // unresolved capability still declines to legacy, because then this route has no record
+        // identity to be exact about.
+        if let Ok((rec_idx, rec_gen)) = reply_object
+            && !shared.reply_record_externally_invokable_split_read(rec_idx, rec_gen)
+        {
+            crate::yarm_log!(
+                "IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index={} record_generation={} replier_tid={} terminal={:?} reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok",
+                rec_idx,
+                rec_gen,
+                tid.unwrap_or(0),
+                facts.terminal
+            );
+            frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
+            return Some(Ok(()));
+        }
         return None; // ineligible: no ack claim, no copy, no mutation — legacy path
     };
     REPLY_COUNTERS.note_eligible();
@@ -3037,8 +3070,8 @@ fn try_split_ipcreply_direct_into_frame(
         // with a capability nothing would materialize.
         crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked
     } else {
-        // An armed terminal with no claimable acknowledgement is neither mode: the record is
-        // mid-transaction or settling. Refuse pre-mutation rather than guess.
+        // An armed terminal with no claimable acknowledgement is neither delivery mode: the
+        // record is mid-transaction or settling. Refuse pre-mutation rather than guess.
         REPLY_COUNTERS.note_declined_pre_transaction();
         return None;
     };
