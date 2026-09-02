@@ -337,7 +337,8 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::yarm_log!("YARM_AARCH64_YIELD_LONE_ORACLE_SET enabled={}", enabled);
     }
     if let Some(enabled) = parsed.aarch64_terminal_fault_oracle {
-        // 199E-A64CALL: default-off AArch64 TERMINAL-FAULT oracle knob (slot 5 = 21). Gives the
+        // 199E-A64CALL: default-off AArch64 TERMINAL-FAULT oracle knob (slot 5 = 23, A64-DEPTH; it
+        // was 21 until that collided with the reserved AArch64 ExitCurrentTask selector). Gives the
         // U9-FT4 terminal-PageFault witness a deliberate trigger of its own, so the default
         // profile boots its service chain clean.
         crate::kernel::boot::set_aarch64_terminal_fault_oracle_enabled(enabled);
@@ -778,7 +779,7 @@ pub struct YarmBootOptions<'a> {
     /// Stage 195G: `yarm.aarch64_yield_lone_oracle=1` DEFAULT-OFF knob (slot 5 = 5) — lone-task
     /// Yield oracle (Proof B).
     pub aarch64_yield_lone_oracle: Option<bool>,
-    /// 199E-A64CALL: `yarm.aarch64_terminal_fault_oracle=1` DEFAULT-OFF knob (slot 5 = 21) —
+    /// 199E-A64CALL: `yarm.aarch64_terminal_fault_oracle=1` DEFAULT-OFF knob (slot 5 = 23) —
     /// makes init take one deliberate unhandled read at 0x0, the trigger the U9-FT4 terminal
     /// PageFault witness needs now that the defect it used to observe is repaired.
     pub aarch64_terminal_fault_oracle: Option<bool>,

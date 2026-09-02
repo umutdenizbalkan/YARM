@@ -31,6 +31,8 @@ pub mod spawn_reservation;
 pub mod syscall;
 pub mod syscall_split;
 pub mod task;
+/// U9-SPAWN1 SP-1: THE task-enqueue policy and its rank-1 commit.
+pub(crate) mod task_enqueue;
 pub(crate) mod task_transition;
 pub mod terminal_ownership;
 pub mod time;

@@ -778,7 +778,13 @@ pub fn handle_trap_entry_shared(
             // deferral carries rather than on any ambient "current" lookup, because the drain
             // is about to overwrite the live frame with the INCOMING task's context.
             if matches!(disposition, SplitDispatchDisposition::QueueAdvanceCommitted) {
-                finalize_split_handled_syscall(shared, cpu, entering, frame);
+                finalize_split_handled_syscall(
+                    shared,
+                    cpu,
+                    entering,
+                    frame,
+                    SplitFinalizeReason::PublishedTransition,
+                );
                 // 199D-DW2: read the identity from whichever deferral the route ACTUALLY
                 // published, not from FutexWait's alone. A blocking receive (NR 2/NR 5) and a
                 // blocking send publish the D2-RECV / D2-SEND deferrals, so asking only
@@ -816,7 +822,13 @@ pub fn handle_trap_entry_shared(
             // would hand a blocked task an answer to a send that has not happened.
             if let SplitDispatchDisposition::PostWorkCommitted { finalize_syscall } = disposition {
                 if finalize_syscall {
-                    finalize_split_handled_syscall(shared, cpu, entering, frame);
+                    finalize_split_handled_syscall(
+                        shared,
+                        cpu,
+                        entering,
+                        frame,
+                        SplitFinalizeReason::PublishedTransition,
+                    );
                 }
                 crate::yarm_log!(
                     "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=post_work_committed finalized={}",
@@ -835,7 +847,13 @@ pub fn handle_trap_entry_shared(
                         // + advance past the trap instruction). AArch64-only;
                         // no-op on x86_64/riscv64, whose trap return already does
                         // this from the ret lanes.
-                        finalize_split_handled_syscall(shared, cpu, entering, frame);
+                        finalize_split_handled_syscall(
+                            shared,
+                            cpu,
+                            entering,
+                            frame,
+                            SplitFinalizeReason::CompletedInThisTrap,
+                        );
                         crate::yarm_log!(
                             "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=ok",
                             SPLIT_DISPATCH_ARCH_TAG,
@@ -867,7 +885,13 @@ pub fn handle_trap_entry_shared(
                         // arm — the error code must reach userspace (AArch64 via the
                         // user GPR lanes) and the SVC must advance (this is a
                         // completed syscall, not a WouldBlock retry).
-                        finalize_split_handled_syscall(shared, cpu, entering, frame);
+                        finalize_split_handled_syscall(
+                            shared,
+                            cpu,
+                            entering,
+                            frame,
+                            SplitFinalizeReason::CompletedInThisTrap,
+                        );
                         crate::yarm_log!(
                             "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=handled_err code={}",
                             SPLIT_DISPATCH_ARCH_TAG,
@@ -2631,6 +2655,12 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // result in the same frame, exactly as DebugLog does. Its three arguments (name pointer,
         // name length, flags) are the first three the ABI import already carries.
         || raw_nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
+        // U9-SPAWN1 SP-2 — SpawnThread (NR 11). Without the import `nr` stays 0, the split
+        // dispatcher declines, and NR 11 keeps its terminal broad edge on this architecture no
+        // matter what its route admits. Its three arguments (TLS base, user stack top, user
+        // entry) are the first three the ABI import already carries, and its route neither
+        // blocks nor switches — it returns the child TID in the same frame.
+        || raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply
@@ -2675,13 +2705,55 @@ fn split_return_identity(
     }
 }
 
+/// A64-DEPTH — WHY the AArch64 syscall-return ABI is being committed.
+///
+/// This distinction is the whole content of the gate below, and it is not "which syscall is
+/// this". A syscall that produced its final result IN THIS TRAP must have that result exported
+/// and its `SVC` advanced before the trap returns, whatever its number. A syscall that merely
+/// PARKED has no result yet; its own drain commits the ABI into the parked incarnation when the
+/// result actually exists, and committing here would export stale lanes over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+enum SplitFinalizeReason {
+    /// `Complete(_)` — the split route produced this syscall's final result in this trap.
+    CompletedInThisTrap,
+    /// `QueueAdvanceCommitted` / `PostWorkCommitted` — the route published a transition instead
+    /// of a result. Only a class whose caller will NOT trap again to collect its result needs
+    /// the commit now.
+    PublishedTransition,
+}
+
 #[cfg(target_arch = "aarch64")]
 fn finalize_split_handled_syscall(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
     entering: crate::runtime::SplitReturnIdentity,
     frame: &mut TrapFrame,
+    reason: SplitFinalizeReason,
 ) {
+    // A64-DEPTH — the gate below USED to be a hand-maintained list of syscall numbers, while its
+    // own doc claimed "finalize is reached ONLY when the split dispatcher HANDLED the syscall".
+    // Those two statements disagreed, and the list was the one that ran: a class admitted to the
+    // pre-lock route and to the ABI IMPORT list, but forgotten here, had its kernel-side work
+    // performed and its result silently DISCARDED — no export, no `SVC` advance. Userspace then
+    // resumed at the `svc` with x0 still holding its own arg0 and read that as the return value.
+    //
+    // U9-MO2 §4 admitted NR 28 to the import list and not to this one. The kernel logged
+    // `CREATE_INITRAMFS_FILE_SLICE_MO_SPLIT_OK ... result=ok` while the initramfs server saw
+    // `Err(Internal)` decoded from its own name pointer, failed the GRANT_RO reply, and the whole
+    // AArch64 service chain below driver_manager never started. Two live profiles were red for
+    // that one reason.
+    //
+    // The gate is now the distinction that actually matters, stated once. `CompletedInThisTrap`
+    // always commits, because a completed syscall's result exists NOW and no later drain will
+    // deliver it. A published transition keeps the explicit per-class list, because for those the
+    // question is genuinely class-specific: FutexWait's caller will not trap again, so its
+    // `set_ok` and advanced `SVC` must land in this incarnation; a blocking recv/send caller is
+    // completed by its own D2 drain, which does its own writeback.
+    if matches!(reason, SplitFinalizeReason::CompletedInThisTrap) {
+        super::aarch64::trap::split_finalize_handled_syscall(shared, cpu, entering, frame);
+        return;
+    }
     // Stage 195A / 197A: finalize is reached ONLY when the split dispatcher HANDLED the
     // syscall. In production the newly-eligible AArch64 pre-lock classes are DebugLog
     // (nr=15) and FutexWake (nr=10), plus the oracle-validated classes.
@@ -2713,6 +2785,7 @@ fn finalize_split_handled_syscall(
     _cpu: CpuId,
     _entering: crate::runtime::SplitReturnIdentity,
     _frame: &mut TrapFrame,
+    _reason: SplitFinalizeReason,
 ) {
 }
 

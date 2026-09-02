@@ -6650,9 +6650,22 @@ kind, length and physical base.
 | AArch64 | 1 / 1 / 1 | 1 / 1 / 1 | **0** | 1 / 1 / 1 | 1 / 1 | 0 |
 | RISC-V  | 5 / 5 / 5 | 5 / 5 / 5 | **0** | 5 / 5 / 5 | 5 / 5 | 0 |
 
-AArch64 issues **one** NR 28 rather than five because its boot reaches a shallower spawn depth
-(`sbin/driver_manager` only). That is a boot-depth fact about the workload, not a route fact: the
-one call it does issue is served pre-lock with `broad = 0`, which is what the edge claim is about.
+AArch64 issues **one** NR 28 rather than five. **The explanation originally given here — that
+this was "a boot-depth fact about the workload, not a route fact" — was wrong, and the A64-DEPTH
+work that followed found the real cause.** The AArch64 boot was genuinely shallower, but not
+because of the workload: U9-MO2 §4 added NR 28 to the AArch64 ABI *import* list without adding it
+to the finalize *writeback* gate, so the kernel did the work and discarded the return. Userspace
+resumed with `x0` still holding its own `arg0`, decoded that as an error, and stopped before the
+SpawnV5 chain. Measured at the two commits: `2aab8b7` boots fully (`PM_ELF_ZC_DONE`=5,
+`SPAWN_FROM_MO_ENTER`=5) and `14db9ee` reaches 0/0.
+
+The NR 28 evidence in the table above is still accurate — the one call AArch64 issued was served
+pre-lock with `broad = 0` — but it was not the whole picture, because the evaluator counted only
+kernel-side markers and so scored `result=ok` for a syscall whose *return* never arrived. That is
+the second lesson recorded here: an edge claim needs the return, not just the work. The writeback
+gate is now keyed on WHY finalize was called (`SplitFinalizeReason`) rather than on a syscall-number
+allowlist a future class must remember to join, and both defects are repaired and qualified —
+three consecutive green AArch64 exit-oracle, default-core and FT4 runs.
 
 The AArch64 column is the three consecutive clean boots taken **after** the U9-RX4 witness repair
 below; six were run in total and all six are green, one of which exercised the timeout branch that
@@ -6722,3 +6735,160 @@ OPEN**: this increment empties the NR 28 population that reached them, it does n
 - The mint exemption is one class wide. `SpawnFromMemoryObject`, `VmAnonMap`, `TransferRelease`
   and the endpoint/notification constructors are still broad-lock-only and are guarded as such:
   NR 28's admission rests on its object's backing being borrowed, and nothing else inherits it.
+
+## U9-SPAWN1 — one enqueue owner, NR 11 off the terminal dispatchers, and a spawn compensation ledger
+
+Base `origin/main = 14db9ee`. Census `2 / 0 / 2` before and after. U9 remains OPEN.
+
+### SP-1 — the task-enqueue owner
+
+Eleven separate transcriptions of "put this task on a run queue" existed. They agreed today, which
+is exactly why they were dangerous: nothing made them agree tomorrow. `src/kernel/task_enqueue.rs`
+now states the policy once — reservation refusal, driver-affinity pin, class→priority, affinity
+read, and the `SmpScheduler` primitives that own queue selection and the duplicate-enqueue refusal
+— and the broad and split paths both delegate. Task-domain locks are released before the enqueue
+and rank 1 is strictly last, so the plan is computed under rank 2 and committed under rank 1 with
+neither held across the other.
+
+### SP-2 — NR 11 terminal edges 3 → 0
+
+`src/kernel/boot/spawn_thread_core.rs` owns the thread-incarnation lifecycle: TID allocation delta,
+argument validation, parent facts, registration, initialization, TLS slot claim, and the exact
+`unregister` that undoes a registration. The split route validates, allocates, registers and
+initializes under rank 2, releases it, applies the TID cursor delta at rank 10, enqueues at rank 1
+through SP-1, and returns through the nonswitching disposition. There is no `NotHandled` after any
+mutation: everything that can still decline runs before the first one.
+
+The same owner repaired a pre-existing broad-path leak. `spawn_user_thread` registered the
+incarnation and then called `enqueue_task` with a bare `?`; a failed enqueue left a registered,
+never-scheduled TCB behind for the life of the boot. Both paths now compensate through
+`unregister_thread_incarnation_locked`.
+
+Live witness, three consecutive fresh boots per architecture, scored by
+`scripts/nr11-spawn-thread-oracle-eval.sh`:
+
+| | `split_ok` | `broad` | `split_fail` | `bad_args` | `undone` | `tid_match` |
+|---|---|---|---|---|---|---|
+| x86_64  | 1 | 0 | 0 | 0 | 0 | 1 |
+| AArch64 | 1 | 0 | 0 | 0 | 0 | 1 |
+| RISC-V  | 1 | 0 | 0 | 0 | 0 | 1 |
+
+`broad` is derived rather than observed: userspace saw a spawn succeed, so exactly one of the two
+routes served it, and every success the split route did not claim was served broad.
+
+### A64-DEPTH — the AArch64 witness, and why it did not exist
+
+Two defects, both introduced by earlier work in this programme, both found only when the AArch64
+NR 11 witness refused to appear.
+
+**The writeback gate.** U9-MO2 §4 added NR 28 to the AArch64 ABI *import* list and not to the
+finalize *writeback* gate. The kernel did the work and discarded the return; userspace resumed with
+`x0` still holding its own `arg0` and decoded that as `Internal`. Measured: `2aab8b7` boots fully
+(`PM_ELF_ZC_DONE`=5, `SPAWN_FROM_MO_ENTER`=5), `14db9ee` reaches 0/0. The gate is now keyed on WHY
+finalize was called — a `SplitFinalizeReason` of `CompletedInThisTrap` commits unconditionally; the
+pre-existing NR allowlist survives only for `PublishedTransition`, where it means something. A
+syscall-number allowlist on a writeback path is a second admission surface that every future class
+must remember to join, and forgetting it discards the result in total silence.
+
+**The slot-5 collision.** Startup slot 5 is a mutually exclusive oracle selector: init reads one
+value and runs exactly one scenario. 199E-A64CALL gave the terminal-fault oracle the bare literal
+21; Stage 200D-0C1 gave 21 to the AArch64 `ExitCurrentTask` oracle through `exit_current_task_abi`,
+which documents 20/21/22 as the reserved exit block. Nothing tied the two assignments together. The
+kernel's `init_args[5] == 0` guard prevented a double *write* but could not help init tell them
+apart, and init's terminal-fault arm is checked first and diverges — so the AArch64 exit oracle was
+unreachable from the day it landed, and its profile failed in a way that looked like a hang inside
+`spawn_thread`. `crates/yarm-ipc-abi/src/terminal_fault_oracle_abi.rs` is now the single owner of
+that selector at 23; both ends encode and decode through it, and it asserts it cannot collide with
+the exit block. The terminal-fault oracle moved rather than the exit oracle because the exit block
+is a sealed, documented, three-architecture range whose x86_64 member had already shipped, whereas
+this selector had no owner at all.
+
+The witness counter itself was also wrong, and that is worth recording separately: it required the
+marker name and `disposable_tid=` to be adjacent, which RISC-V's `arch=riscv64` field breaks, so a
+healthy RISC-V boot scored `user_spawn_ok=0 broad=-1`. It is now a committed script whose
+`--self-test` re-derives every marker spelling from the userspace source that emits them.
+
+### SP-3 — the spawn transaction's provisional-resource ledger
+
+All four image-loading spawn syscalls acquired the same resources in the same order and returned
+through a bare `?` at every step. The arms were not equal:
+
+| failing step | leaked |
+|---|---|
+| ELF load | one address space and its partially installed mappings |
+| reservation | + two endpoints, four capabilities, one parent delegation |
+| commit | + the reservation itself |
+
+The last row could not be fixed locally. `spawn_user_task_from_image` is transactional *about the
+reservation* — on failure it restores the same incarnation to `ReservedUnstarted` so the caller's
+token stays valid — and no caller ever used that. The reserved TCB, its class slot, its kernel
+stack and its process CNode stayed occupied for the rest of the boot.
+
+`src/kernel/syscall/spawn_image_txn.rs` is the one place a spawn syscall commits and the one place
+its failure unwinds. Resources are released in reverse acquisition order, each through its actual
+owner:
+
+| resource class | actual owner |
+|---|---|
+| task reservation; task/process records | `cancel_spawn_reservation` |
+| ASID; ELF mappings; their frames; MemoryObject backing | `destroy_user_address_space_by_asid` |
+| endpoints | `destroy_endpoint` |
+| capabilities and their delegations | `revoke_capability_in_cnode`, whose cascade removes the copy delegated into the parent's cspace — so the ledger records only the root |
+
+The reservation moves to the front, ahead of the first provisional address space. Nothing becomes
+reachable by doing so: a reservation is `TaskStatus::Reserved` and cannot be dispatched, enqueued,
+woken, blocked, joined or published as a waiter. The commit stays last, and it is the only step
+that publishes a reachable task.
+
+**Two findings from the failure-injection proofs.** Neither was in the audit that preceded them,
+and both came from running the real owner against real failures rather than from reading it.
+
+1. `create_user_address_space` returns *two* resources, not one: the ASID, and a MAP/READ/WRITE
+   capability over it minted into the caller's cspace. Every handler discarded that as
+   `_aspace_cap`, and `destroy_user_address_space_by_asid` does not own it. A failed spawn leaked a
+   capability on **every** arm, including the earliest. It is now a ledger row; capacity is 9.
+
+2. `destroy_user_address_space_by_asid` reclaims a drained mapping through `note_mapping_removed`
+   and `reclaim_memory_object_for_phys`, both MemoryObject-scoped. A page the ELF loader took
+   straight from the frame allocator has no MemoryObject, so nothing returns it: **one frame is
+   lost per address-space teardown, spawn or not.** This is not the ledger's failure — the ledger
+   calls the correct owner and the owner is incomplete — and it is proved pre-existing by a bare
+   create / load / destroy cycle with no spawn, reservation, endpoint or transaction in it, which
+   loses exactly the same frame three times running. Repairing it means teaching teardown which
+   drained frames are allocator-owned and which are borrowed; the zero-copy initramfs grants are
+   borrowed, and freeing those would hand the boot initrd's own frames to the allocator. That is a
+   backing-ownership repair of its own, and it is the natural successor to U9-MO2.
+
+Two success-path facts were found and deliberately left alone, because changing either would alter
+capability numbering that userspace depends on: the reply endpoint's send capability is minted and
+discarded on every successful spawn, and cspaces never shrink.
+
+Eleven hosted proofs, none of them using a debug hook — each phase is failed by arranging the
+condition that actually makes it fail (an exhausted ASID pool, a malformed image, an entry point of
+zero), so what is proved is the production owner and not a test-only branch through it.
+
+### SP-4 — NR 23 is NOT routed. Hard stop, and the exact boundary
+
+The first blocker is precise: **a process spawn creates a NEW process CNode, and no rank-4 owner
+can do that off the broad lock.** `ensure_cnode_space_with_slots` and `set_process_cnode_for_pid`
+have no split variant and no presence in `src/runtime.rs` at all.
+
+This is the same boundary SP-2 stopped at deliberately, approached from the other side. The NR 11
+route is admissible *because* a thread joins its parent's existing process CNode — its pre-mutation
+gate reads `task_cnode_split(parent_tid)` and declines outright if the CNode is absent, precisely
+so it never has to create one. NR 23 always creates one.
+
+Six of NR 23's seven steps have no rank-local owner today:
+
+| phase | ranks | split owner |
+|---|---|---|
+| reservation | 2 task + 4 capability | none |
+| address space | 5 VM + 4 capability | none |
+| image load | 5 VM + 6 memory | none |
+| endpoints | 3 IPC + 4 capability | none |
+| parent delegation | 4 capability | none |
+| commit | 4 → 2 → 5 → 2 → 1 | only the rank-1 enqueue (SP-1) and `copy_to_user` |
+
+Building the remainder is a subsystem, not a slice, so no NR 23 route was written: nothing was left
+half-built, and no broad fallback after a reservation was introduced. NR 16, NR 23, NR 26, NR 29,
+Fork and ExitCurrentTask all remain broad.

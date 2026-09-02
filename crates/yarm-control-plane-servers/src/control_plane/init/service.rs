@@ -779,10 +779,21 @@ fn dispatch_aarch64_unlocking_oracle_early(ctx: &yarm_user_rt::runtime::StartupC
     if ctx.supervisor_control_recv_ep == Some(7) {
         run_aarch64_ipccall_direct_oracle(ctx.task_id);
     }
-    // 199E-A64CALL: slot-5 selector 21 = the TERMINAL-FAULT oracle. It runs HERE, before the
-    // SpawnV5 service chain, which is where init used to fault by accident — so the replacement
-    // the queue advance selects is still the supervisor (tid 2), exactly as U9-FT4 asserts.
-    if ctx.supervisor_control_recv_ep == Some(21) {
+    // 199E-A64CALL: the TERMINAL-FAULT oracle. It runs HERE, before the SpawnV5 service chain,
+    // which is where init used to fault by accident — so the replacement the queue advance
+    // selects is still the supervisor (tid 2), exactly as U9-FT4 asserts.
+    //
+    // A64-DEPTH: this arm used to compare a bare literal `Some(21)`, and Stage 200D-0C1 assigned
+    // 21 to the AArch64 `ExitCurrentTask` oracle. Slot 5 is mutually exclusive, so the two
+    // scenarios became indistinguishable to init; this arm is checked first and diverges, so the
+    // exit oracle was unreachable from the day it landed. The selector now comes from the single
+    // shared owner, which also asserts it cannot collide with the reserved exit block.
+    if ctx
+        .supervisor_control_recv_ep
+        .map(|v| v as usize)
+        .and_then(yarm_ipc_abi::terminal_fault_oracle_abi::terminal_fault_scenario_for)
+        .is_some()
+    {
         run_aarch64_terminal_fault_oracle(ctx.task_id);
     }
 }

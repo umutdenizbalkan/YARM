@@ -11,6 +11,7 @@ pub mod dhcp_abi;
 pub mod dns_abi;
 pub mod driver_abi;
 pub mod exit_current_task_abi;
+pub mod terminal_fault_oracle_abi;
 pub mod gpio_abi;
 pub mod ipc_reply_liveness_abi;
 pub mod irqmux_abi;

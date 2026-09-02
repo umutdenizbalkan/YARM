@@ -2759,58 +2759,68 @@ impl KernelState {
         user_stack_top: usize,
         user_entry: usize,
     ) -> Result<u64, KernelError> {
-        if tls_base == 0 || user_stack_top == 0 || user_entry == 0 || (user_stack_top & 0xF) != 0 {
-            return Err(KernelError::WrongObject);
-        }
-        let parent = self
-            .with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == parent_tid)
-                    .cloned()
-            })
-            .ok_or(KernelError::TaskMissing)?;
-        let parent_class = self
-            .task_class(parent_tid)
-            .ok_or(KernelError::TaskMissing)?;
+        use super::spawn_thread_core as core_;
+        let args = core_::SpawnThreadArgs::validate(tls_base, user_stack_top, user_entry)?;
+        // Parent identity and class in ONE task-lock acquisition — a parent replaced between the
+        // two reads would give the child one task's group and another's class.
+        let parent = self.with_task_enqueue_policy_mut(|tcbs, classes| {
+            core_::parent_facts_locked(tcbs, classes, parent_tid)
+        })?;
         // Staged brk ownership policy: brk bounds remain leader-owned and
         // per-task keyed; spawned threads do not get independent copied bounds.
         let tid = self.allocate_thread_id()?;
-        self.register_task_with_class_in_process(tid, parent_class, parent.thread_group_id.0)?;
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.thread_group_id = parent.thread_group_id;
-            tcb.asid = parent.asid;
-            tcb.tls_ptr = Some(crate::kernel::vm::VirtAddr(tls_base as u64));
-            tcb.user_entry = Some(crate::kernel::vm::VirtAddr(user_entry as u64));
-            tcb.user_stack_top = Some(crate::kernel::vm::VirtAddr(user_stack_top as u64));
-            tcb.user_context = UserRegisterContext {
-                instruction_ptr: crate::kernel::vm::VirtAddr(user_entry as u64),
-                stack_ptr: crate::kernel::vm::VirtAddr(user_stack_top as u64),
-                user_gprs: [0; 32],
-                arg0: 0,
-                arg1: 0,
-                arg2: 0,
-                arg3: 0,
-                arg4: 0,
-                arg5: 0,
+        // FIRST IRREVERSIBLE MUTATION.
+        self.register_task_with_class_in_process(tid, parent.class, parent.thread_group_id.0)?;
+        let initialized = self.with_task_enqueue_policy_mut(|tcbs, classes| {
+            let Some(idx) = tcbs
+                .iter()
+                .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid))
+            else {
+                return Err(KernelError::TaskMissing);
             };
-            tcb.status = TaskStatus::Runnable;
-            Ok::<_, KernelError>(())
-        })?;
-        if let Some(slot) = self
-            .tls_restore_pending
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == tid) || slot.is_none())
-        {
-            *slot = Some(ThreadId(tid));
+            match core_::initialize_thread_incarnation_locked(tcbs, idx, &parent, &args) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    core_::unregister_thread_incarnation_locked(
+                        tcbs,
+                        classes,
+                        tid,
+                        parent.thread_group_id,
+                    );
+                    Err(err)
+                }
+            }
+        });
+        if let Err(err) = initialized {
+            return Err(err);
         }
-        let _ = self.enqueue_task(tid)?;
-        Ok(tid)
+        core_::claim_tls_restore_slot_locked(
+            super::kernel_mut(&mut self.tls_restore_pending).as_mut_slice(),
+            tid,
+        );
+        // U9-SPAWN1 SP-2: rank 1, last. A failed enqueue used to return here with the task still
+        // registered, `Runnable` and never queued — a live-looking task no run queue owned and
+        // whose TID could not be reallocated. It now undoes the EXACT incarnation it created,
+        // through the same owner the pre-lock route uses, and returns the same error.
+        match self.enqueue_task(tid) {
+            Ok(_) => Ok(tid),
+            Err(err) => {
+                self.with_task_enqueue_policy_mut(|tcbs, classes| {
+                    core_::unregister_thread_incarnation_locked(
+                        tcbs,
+                        classes,
+                        tid,
+                        parent.thread_group_id,
+                    )
+                });
+                crate::yarm_log!(
+                    "SPAWN_THREAD_ENQUEUE_FAILED tid={} err={:?} result=compensated",
+                    tid,
+                    err
+                );
+                Err(err)
+            }
+        }
     }
 
     pub fn fork_user_process_cow(&mut self, parent_tid: u64) -> Result<u64, KernelError> {

@@ -45,6 +45,16 @@ pub(crate) type TaskReturnSplitPtrs = (
 // Names the return type of a projector whose only caller is x86_64-gated; a hosted `lib` build
 // compiles no route to it, exactly like the sibling `*_from_raw` projectors.
 #[allow(dead_code)]
+/// U9-SPAWN1 SP-2: `(task_state_lock, tcbs, task_classes, tid_allocation_cursor,
+/// tls_restore_pending)` — every task-domain storage NR 11's transaction touches.
+pub(crate) type SpawnThreadSplitPtrs = (
+    *const crate::kernel::lock::SpinLockIrq<()>,
+    *mut KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
+    *mut KernelStorage<[Option<TaskClass>; MAX_TASKS]>,
+    *mut super::tid_allocation_policy::TidAllocationCursor,
+    *mut KernelStorage<[Option<crate::kernel::ipc::ThreadId>; MAX_TASKS]>,
+);
+
 pub(crate) type TaskEnqueuePolicySplitPtrs = (
     *const crate::kernel::lock::SpinLockIrq<()>,
     *mut KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
@@ -1489,6 +1499,42 @@ impl KernelState {
         }
     }
 
+    /// U9-SPAWN1 SP-2 — task (rank 2) seam projector for the SPAWN-THREAD transaction.
+    ///
+    /// Returns `(task_state_lock, tcbs, task_classes, tid_allocation_cursor,
+    /// tls_restore_pending)`. NR 11's whole task-domain half — read the parent, allocate the TID,
+    /// register the incarnation, initialise it, claim its TLS-restore slot — is ONE decision
+    /// about one new task, and must not straddle acquisitions: a parent replaced, or a TID
+    /// re-allocated, between two of those steps would produce a child that inherits from one
+    /// task and is registered against another. All four storages are task-domain and are
+    /// serialized by this same lock.
+    pub(crate) unsafe fn spawn_thread_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> SpawnThreadSplitPtrs {
+        // SAFETY: see module pattern note above.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).task_state_lock),
+                core::ptr::addr_of_mut!((*state).tcbs),
+                core::ptr::addr_of_mut!((*state).task_classes),
+                core::ptr::addr_of_mut!((*state).tid_allocation_cursor),
+                core::ptr::addr_of_mut!((*state).tls_restore_pending),
+            )
+        }
+    }
+
+    /// U9-SPAWN1 SP-2: the TID-allocation policy — boot-config state, immutable after bootstrap.
+    ///
+    /// # Safety
+    /// `state` must point at live `KernelState` storage.
+    pub(crate) unsafe fn tid_allocation_policy_from_raw(
+        state: *const KernelState,
+    ) -> super::tid_allocation_policy::TidAllocationPolicy {
+        // SAFETY: see module pattern note above. The policy is written once during bootstrap and
+        // never mutated afterwards, so an unsynchronized read of a `Copy` value is sound.
+        unsafe { core::ptr::addr_of!((*state).tid_allocation_policy).read() }
+    }
+
     /// Stage 108: VM/user-spaces (rank 5) seam projector.
     pub(crate) unsafe fn vm_split_mut_ptrs_from_raw(
         state: *mut KernelState,
@@ -1895,6 +1941,57 @@ impl KernelState {
         Self::debug_lock_order_note("task");
         let _task_guard = self.task_state_lock.lock();
         f(kernel_mut(&mut self.tcbs))
+    }
+
+    /// U9-SPAWN1 SP-1 — the BROAD twin of `SharedKernel::with_task_enqueue_policy_split_mut`:
+    /// the TCB array and the task-class table under ONE acquisition of the task lock.
+    ///
+    /// `task_classes` lives in the task domain alongside `tcbs` — `KernelState::task_class`
+    /// reads it from inside `with_tcbs`, i.e. already under this lock — so exposing both here
+    /// adds no new sharing. The class table is copied out (it is `Copy` and slot-indexed
+    /// identically to `tcbs`) purely so the two disjoint fields can be handed to one closure.
+    pub(crate) fn with_task_enqueue_policy_mut<R>(
+        &mut self,
+        f: impl FnOnce(
+            &mut [Option<ThreadControlBlock>; MAX_TASKS],
+            &mut [Option<TaskClass>; MAX_TASKS],
+        ) -> R,
+    ) -> R {
+        // Lock-order domain: task
+        Self::debug_lock_order_note("task");
+        let _task_guard = self.task_state_lock.lock();
+        let classes = core::ptr::addr_of_mut!(self.task_classes);
+        // SAFETY: `task_classes` and `tcbs` are disjoint fields of the same `KernelState`, both
+        // serialized by `task_state_lock`, which is held for the whole closure.
+        f(
+            kernel_mut(&mut self.tcbs),
+            kernel_mut(unsafe { &mut *classes }),
+        )
+    }
+
+    /// U9-SPAWN1 SP-2 — the TCB array and the dynamic-TID cursor under ONE acquisition of the
+    /// task lock.
+    ///
+    /// The cursor was a bare `KernelState` field, serialized only by the broad lock. Its whole
+    /// correctness rule is "the candidate TID is not currently any task", which is read from
+    /// `tcbs` — already task-domain state — so an allocator that advanced the cursor off-lock
+    /// would have raced the very table it consults. Placing the two behind the same lock is a
+    /// lock-DOMAIN assignment, not a policy change: `allocate_thread_id` is the only production
+    /// reader or writer of the cursor, and it always read `tcbs` in the same breath.
+    pub(crate) fn with_task_tid_alloc_mut<R>(
+        &mut self,
+        f: impl FnOnce(
+            &mut [Option<ThreadControlBlock>; MAX_TASKS],
+            &mut super::tid_allocation_policy::TidAllocationCursor,
+        ) -> R,
+    ) -> R {
+        // Lock-order domain: task
+        Self::debug_lock_order_note("task");
+        let _task_guard = self.task_state_lock.lock();
+        let cursor = core::ptr::addr_of_mut!(self.tid_allocation_cursor);
+        // SAFETY: `cursor` and `tcbs` are disjoint fields of the same `KernelState`, both now
+        // serialized by `task_state_lock`, which is held for the whole closure.
+        f(kernel_mut(&mut self.tcbs), unsafe { &mut *cursor })
     }
 
     pub(crate) fn with_memory_state<R>(&self, f: impl FnOnce(&MemorySubsystem) -> R) -> R {

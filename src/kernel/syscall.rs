@@ -282,6 +282,10 @@ pub(crate) mod ipc_recv_core;
 mod process;
 mod recv_shared_v3;
 mod sched;
+// U9-SPAWN1 SP-3: the ONE compensated image-loading spawn transaction, shared by NR 23, 24, 26
+// and 29. `pub(crate)` so the split route and the hosted failure-injection proofs reach the same
+// owner the broad handlers use.
+pub(crate) mod spawn_image_txn;
 mod vm;
 
 // Stage 149: [S] shared helper re-exports so sibling modules and external

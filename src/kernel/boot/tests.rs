@@ -34229,6 +34229,7 @@ mod stage116_solution1_lock_drop_before_switch {
     const MOD_SRC: &str = include_str!("mod.rs");
     const TESTS_SRC: &str = include_str!("tests.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     // -----------------------------------------------------------------------
     // 1. DispatchSwitchPlan struct shape
@@ -34533,6 +34534,7 @@ mod stage117_global_lock_drop_before_switch {
     const X86_TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
     const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     // -----------------------------------------------------------------------
     // 1. Per-CPU stash infrastructure
@@ -43160,6 +43162,7 @@ mod stage159bcd_ipc_recv_proof_workload {
     #[test]
     fn stage159bcd_target_markers_are_kernel_emitted() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         for emit in &[
             "\"IPC_RECV_V2_META_QUEUED_SPLIT_OK",
             "\"IPC_RECV_V2_ROLLBACK_OK",
@@ -43381,6 +43384,7 @@ mod stage159bcd_ipc_recv_proof_workload {
 // global-lock path — a runtime-layer parity change, NOT an IPC/cap seam move.
 mod stage160_aarch64_split_recv_routing {
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const X86_DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
@@ -43655,13 +43659,53 @@ mod stage160c_aarch64_trap_abi_bracketing {
     fn stage160c_exports_and_advances_on_handled_split() {
         assert_eq!(
             TRAP_ENTRY_SRC
-                .matches("finalize_split_handled_syscall(shared, cpu, entering, frame)")
-                .count(),
+                .matches("finalize_split_handled_syscall(")
+                .count()
+                - TRAP_ENTRY_SRC
+                    .matches("fn finalize_split_handled_syscall(")
+                    .count(),
             4,
             "finalize must run on the Ok, handled-error, queue-advance-committed and \
              post-work-committed arms — 199G-C4 §2 added the fourth, and it is CONDITIONAL: a \
              send that delivered or enqueued finished its caller's syscall, while one that is \
              about to park it must not advance its SVC or export a result on its behalf"
+        );
+        // A64-DEPTH: each arm now states WHY it finalizes, and that is the property that broke.
+        // The AArch64 gate used to be a hand-maintained list of syscall numbers while claiming to
+        // mean "the split dispatcher handled it"; a class admitted to the route and to the ABI
+        // import but forgotten here had its result silently discarded. The two COMPLETED arms
+        // must always commit; the two PUBLISHED-TRANSITION arms keep the per-class question,
+        // because for them a later drain may be the one that delivers the result.
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("SplitFinalizeReason::CompletedInThisTrap,")
+                .count(),
+            2,
+            "the Complete(Ok) and Complete(Err) arms finalize unconditionally — a completed \
+             syscall's result exists now and no later drain will deliver it"
+        );
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("SplitFinalizeReason::PublishedTransition,")
+                .count(),
+            2,
+            "the queue-advance and post-work arms published a transition, not a result"
+        );
+        // And the owner must branch on the REASON before it ever consults a syscall number.
+        let owner = TRAP_ENTRY_SRC
+            .split("fn finalize_split_handled_syscall(\n    shared:")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the aarch64 finalize owner");
+        let reason_gate = owner
+            .find("matches!(reason, SplitFinalizeReason::CompletedInThisTrap)")
+            .expect("the reason gate");
+        let nr_gate = owner
+            .find("frame.syscall_num() ==")
+            .expect("the per-class list");
+        assert!(
+            reason_gate < nr_gate,
+            "a completed syscall must commit its ABI before any syscall-number question is asked"
         );
         // Each of the three is reached from its own disposition arm, not from a shared prelude.
         let committed = TRAP_ENTRY_SRC
@@ -46750,6 +46794,7 @@ mod stage184_riscv_trap_return_provenance {
 #[cfg(test)]
 mod stage185_boot_only_global_borrow_confined {
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     // Boot ELF-load sites — the ONLY permitted callers.
     const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
     const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
@@ -46842,6 +46887,7 @@ mod stage185_boot_only_global_borrow_confined {
 #[cfg(test)]
 mod stage186a_capability_split_mut_infra {
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
 
     // Functional: the seam is callable, holds capability_state_lock, and exposes
@@ -48513,6 +48559,7 @@ mod stage187a_ipc_recv_delivery_boundary_split {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const RECV_CORE_SRC: &str = include_str!("../recv_core.rs");
     const CPU0: CpuId = CpuId(0);
 
@@ -48891,6 +48938,7 @@ mod stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const CPU0: CpuId = CpuId(0);
 
     fn code_only(src: &str) -> alloc::string::String {
@@ -49267,6 +49315,7 @@ mod stage187c_ipc_reply_retry_hard_stop {
     const FAULT_SRC: &str = include_str!("fault_state.rs");
     const CAP_TRANSFER_SPLIT_SRC: &str = include_str!("../cap_transfer_split.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     // ipc_reply still delivers to a blocked caller through the shared
     // blocked-waiter path complete_blocked_recv_for_waiter — the path 187A did
@@ -49403,6 +49452,7 @@ mod stage187d_blocked_waiter_delivery_hard_stop {
     const FAULT_SRC: &str = include_str!("fault_state.rs");
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     // complete_blocked_recv_for_waiter is still a broad &mut KernelState function
     // that performs its user copy + cap materialization under that borrow (NOT
@@ -49562,6 +49612,7 @@ mod stage188a_dispatch_return_delivery_channel {
 
     const POST_WORK_SRC: &str = include_str!("../dispatch_post_work.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const CPU0: CpuId = CpuId(0);
 
@@ -50119,6 +50170,7 @@ mod stage188b_blocked_waiter_plain_delivery_live {
     #[test]
     fn stage188b_executor_phase_c_clears_slot_and_wakes() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         let body = RUNTIME_SRC
             .split("DispatchPostWork::BlockedWaiterPlainDelivery(snap) =>")
             .nth(1)
@@ -50195,6 +50247,7 @@ mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const POST_WORK_SRC: &str = include_str!("../dispatch_post_work.rs");
     const CPU0: CpuId = CpuId(0);
 
@@ -50896,6 +50949,7 @@ mod stage188d_reply_cap_rank_inversion_seam {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const POST_WORK_SRC: &str = include_str!("../dispatch_post_work.rs");
     const SEAM_SRC: &str = include_str!("reply_cap_rank_split.rs");
     const CPU0: CpuId = CpuId(0);
@@ -52148,6 +52202,7 @@ mod stage188f_ipc_reply_boundary_live {
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const CPU0: CpuId = CpuId(0);
 
     fn set_trap_drainer(active: bool) {
@@ -53480,6 +53535,7 @@ mod stage167_d6_genuine {
     const MOD_SRC: &str = include_str!("mod.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const SCHED_SRC: &str = include_str!("scheduler_state.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
@@ -53682,6 +53738,7 @@ mod stage168_d6_genuine_b_and_d2_recv {
     const MOD_SRC: &str = include_str!("mod.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
@@ -54032,6 +54089,7 @@ mod stage168_d6_genuine_b_and_d2_recv {
 mod stage168b_d2_recv_genuine_completion {
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
@@ -54359,6 +54417,7 @@ mod stage168b_d2_recv_genuine_completion {
 mod stage169_d2_send_genuine {
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -56842,6 +56901,9 @@ mod stage175_spawn_lifecycle {
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const EXEC_SRC: &str = include_str!("exec_state.rs");
     const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    /// U9-SPAWN1 SP-3: the phase markers moved with the phases, into the one compensated
+    /// transaction the four spawn syscalls now share.
+    const SPAWN_TXN_SRC: &str = include_str!("../syscall/spawn_image_txn.rs");
     const FAULT_SRC: &str = include_str!("fault_state.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
@@ -56894,22 +56956,37 @@ mod stage175_spawn_lifecycle {
     // The full documented marker set must exist verbatim across the instrumentation.
     #[test]
     fn stage175_all_marker_strings_exist() {
-        // Phase markers live in the syscall handler + spawn path.
+        // Request-shaped markers stay with the handler: they describe what the CALLER asked for
+        // and are emitted before any resource is acquired.
         for m in [
             "SPAWN_LIFECYCLE_REQUEST_BEGIN",
             "SPAWN_LIFECYCLE_IMAGE_RESOLVE_OK",
             "SPAWN_LIFECYCLE_IMAGE_RESOLVE_FAIL",
             "SPAWN_LIFECYCLE_ELF_PARSE_BEGIN",
             "SPAWN_LIFECYCLE_ELF_PARSE_OK",
+            "SPAWN_LIFECYCLE_BAD_IMAGE_ID",
+        ] {
+            assert!(PROCESS_SRC.contains(m), "process.rs must emit marker {m}");
+        }
+        // U9-SPAWN1 SP-3: transaction-phase markers moved WITH their phases into the one
+        // compensated owner. They must live there and nowhere else — a second copy in the
+        // handler would mean a second, uncompensated transcription of the phase itself.
+        for m in [
             "SPAWN_LIFECYCLE_ELF_LOAD_BEGIN",
             "SPAWN_LIFECYCLE_ELF_LOAD_OK",
             "SPAWN_LIFECYCLE_ZC_LOAD_OK",
             "SPAWN_LIFECYCLE_ASPACE_CREATE_OK",
             "SPAWN_LIFECYCLE_SERVICE_READY",
-            "SPAWN_LIFECYCLE_BAD_IMAGE_ID",
             "SPAWN_LIFECYCLE_SERVICE_ORDER_VIOLATION",
         ] {
-            assert!(PROCESS_SRC.contains(m), "process.rs must emit marker {m}");
+            assert!(
+                SPAWN_TXN_SRC.contains(m),
+                "the shared spawn transaction must emit marker {m}"
+            );
+            assert!(
+                !PROCESS_SRC.contains(m),
+                "{m} names a transaction phase; the handler must not emit it a second time"
+            );
         }
         for m in [
             "SPAWN_LIFECYCLE_TCB_ALLOC_OK",
@@ -61208,6 +61285,7 @@ mod stage190a_ap_sched_loop {
     #[test]
     fn return_to_idle_uses_scheduler_block_for_consistency() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         assert!(
             SCHED_STATE_SRC.contains("pub fn block_current_on_cpu(&mut self, cpu: CpuId)")
                 && SCHED_STATE_SRC.contains(".block_current_on(cpu)"),
@@ -61452,6 +61530,7 @@ mod stage190b_controlled_workload {
 mod stage191a_lock_retire_inventory {
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const DOC_SRC: &str = include_str!("../../../doc/KERNEL_LOCKING.md");
 
     // The retirement marker vocabulary exists.
@@ -61488,8 +61567,12 @@ mod stage191a_lock_retire_inventory {
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
             "Syscall::Fork => Some",
-            "Syscall::SpawnThread => Some",
+            // U9-SPAWN1 SP-2 removed NR 11 from this list. It was here because the whole spawn
+            // family was, not because NR 11 shares the family's obstacles: it creates no address
+            // space, loads no ELF, mints nothing, maps nothing and never switches tasks. Its
+            // siblings below still do, and stay.
             "Syscall::SpawnProcess => Some",
+            "Syscall::SpawnFromMemoryObject => Some",
             "Syscall::ReapFaultedTask => Some",
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
@@ -61587,6 +61670,7 @@ mod stage191b_futex_wake_retire {
 
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const EXEC_SRC: &str = include_str!("exec_state.rs");
 
     // INVENTORY / eligibility: FutexWake is whitelisted; FutexWait and Yield are NOT.
@@ -61626,8 +61710,18 @@ mod stage191b_futex_wake_retire {
             RUNTIME_SRC.contains("pub fn futex_wake_split_mut(")
                 && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
                 && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
-                && RUNTIME_SRC.contains("sm.enqueue_on_with_priority(c, ThreadId(tid), priority)")
-                && RUNTIME_SRC.contains("sm.enqueue_balanced(ThreadId(tid), priority)"),
+                // U9-SPAWN1 SP-1: the route no longer reaches the SmpScheduler primitives
+                // itself. It plans under rank 2 and commits through the ONE shared owner, which
+                // is what reaches `enqueue_on_with_priority` / `enqueue_balanced` — the same
+                // methods legacy uses, now reached through one definition instead of a fourth
+                // hand-written transcription. Asserting the direct call would now be asserting
+                // that the drift is still there.
+                && RUNTIME_SRC.contains(
+                    "crate::kernel::task_enqueue::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)"
+                )
+                && RUNTIME_SRC.contains("crate::kernel::task_enqueue::commit_enqueue_locked(")
+                && OWNER_SRC.contains("enqueue_on_with_priority(cpu, ThreadId(plan.tid), plan.priority)")
+                && OWNER_SRC.contains("enqueue_balanced(ThreadId(plan.tid), plan.priority)"),
             "the split wake must use the task + scheduler split-mut seams and the same enqueue"
         );
         // Same wake predicate + Runnable transition as legacy futex_wake_inner.
@@ -61877,13 +61971,14 @@ mod stage191c_split_user_copy_seam {
     fn non_selected_classes_remain_locked() {
         for locked in [
             "Syscall::InitramfsReadChunk => Some",
+            // U9-SPAWN1 SP-2: NR 11 left this list. It never blocked, switched tasks or mutated
+            // a page table — the three things this seam actually cannot serve.
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
             "Syscall::IpcReply => Some",
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
             "Syscall::Fork => Some",
-            "Syscall::SpawnThread => Some",
             "Syscall::SpawnProcess => Some",
             "Syscall::ReapFaultedTask => Some",
             "Syscall::FutexWait => Some",
@@ -61940,6 +62035,7 @@ mod stage191d_futex_wait_block_publish {
 
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const EXEC_SRC: &str = include_str!("exec_state.rs");
 
     // DEFERRED: FutexWait stays FULLY global-lock-only — NOT in the split whitelist and
@@ -62175,6 +62271,7 @@ mod stage191e_dispatch_next_candidate_seam {
 
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SCHED_SRC: &str = include_str!("../../kernel/scheduler.rs");
 
     // INVENTORY: no NEW class became split-eligible this stage; the whitelist is exactly
@@ -62204,7 +62301,8 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::VmAnonMap => Some",
             "Syscall::TransferRelease => Some",
             "Syscall::Fork => Some",
-            "Syscall::SpawnThread => Some",
+            // U9-SPAWN1 SP-2 removed NR 11: the candidate seam never owned the whitelist's
+            // contents, and NR 11's admission came from SP-2 with its own guards.
             "Syscall::SpawnProcess => Some",
             "Syscall::SpawnFromMemoryObject => Some",
             // U9-MO2 §4 removed NR 28 from this list. Stage 191E's claim is that the CANDIDATE
@@ -62348,6 +62446,7 @@ mod stage192a_queue_advancing_dispatch {
     const EXEC_SRC: &str = include_str!("exec_state.rs");
     const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
 
     // INVENTORY: the in-lock futex_wait_current defers the dispatch (mirroring D2 recv),
@@ -62715,6 +62814,7 @@ mod stage192b_yield_queue_advancing_dispatch {
     const EXEC_SRC: &str = include_str!("exec_state.rs");
     const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SCHED_SRC: &str = include_str!("../../kernel/scheduler.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
 
@@ -63068,6 +63168,7 @@ mod stage193a_ipc_send_boundary_plain {
     const IPC_SRC: &str = include_str!("../../kernel/syscall/ipc.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
 
@@ -63591,6 +63692,7 @@ mod stage193b_ipc_send_plain_oracle {
 mod stage198c2b_reply_cap_one_shot_wiring {
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
     const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
     const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
@@ -63845,6 +63947,7 @@ mod stage193c_ipc_send_ordinary_cap {
     const IPC_SRC: &str = include_str!("../../kernel/syscall/ipc.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -64073,6 +64176,7 @@ mod stage193d_ipc_send_reply_cap {
     const IPC_SRC: &str = include_str!("../../kernel/syscall/ipc.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const TRANSFER_SRC: &str = include_str!("transfer_state.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -72844,6 +72948,7 @@ mod stage194_cross_arch_portability_audit {
     const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
     const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const LOCKING_DOC: &str = include_str!("../../../doc/KERNEL_LOCKING.md");
@@ -73465,6 +73570,7 @@ mod stage195e_aarch64_futex_wait_drain {
     const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
     const EXEC_SRC: &str = include_str!("exec_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
@@ -73917,6 +74023,7 @@ mod stage195g_aarch64_yield_dispatch {
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
@@ -75191,6 +75298,7 @@ mod stage196e_riscv_futex_wait_retirement {
     const MOD_SRC: &str = include_str!("mod.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
     const INIT_SRC: &str = include_str!(
@@ -76935,6 +77043,7 @@ mod stage197b_riscv_typed_idle_outcome {
 mod stage198a_second_cohort_plain_parity {
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
     const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
     const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
@@ -77255,6 +77364,7 @@ mod stage198a_second_cohort_plain_parity {
 mod stage198b_second_cohort_ordinary_cap_parity {
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
     const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
     const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
@@ -78593,6 +78703,7 @@ mod stage199a2b2c_offlock_seams {
     use crate::runtime::SharedKernel;
 
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
@@ -88514,6 +88625,7 @@ mod stage199a2d2c2b2_guards {
     const SPLIT: &str = include_str!("../syscall_split.rs");
     const TXN: &str = include_str!("../ipccall_direct_txn.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const CMDLINE: &str = include_str!("../boot_command_line.rs");
     const SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-request-smoke.sh");
 
@@ -88785,6 +88897,7 @@ mod stage199a2d2c2b3_guards {
     const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
     const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SPLIT: &str = include_str!("../syscall_split.rs");
     const USER_SMOKE: &str =
         include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-user-consume-smoke.sh");
@@ -92907,6 +93020,7 @@ mod stage200c2b_guards {
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const DEADLINE_SRC: &str = include_str!("../deadline_token.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -93995,6 +94109,7 @@ mod stage200c2c1b_aarch64_reentry {
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const INIT_SRC: &str = include_str!(
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
@@ -94529,6 +94644,7 @@ mod stage200c2c2_riscv_port {
     const MOD_SRC: &str = include_str!("mod.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
     const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
@@ -95086,6 +95202,7 @@ mod stage200c2c2b_riscv_final_frame {
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const RISCV_SMOKE_SRC: &str =
         include_str!("../../../scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh");
 
@@ -95813,6 +95930,7 @@ mod stage200c2c2c_r2b_reply_authority {
     #[test]
     fn a14_gate_wiring_is_ordered_and_non_vacuous() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         const DEBUG_SRC: &str = include_str!("../syscall/debug.rs");
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
         // Armed strictly before `arm_reply_terminal`.
@@ -96422,6 +96540,7 @@ mod stage200d1_server_death {
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
     const TASK_SRC: &str = include_str!("../task.rs");
 
@@ -97008,6 +97127,7 @@ mod stage200d1_publication_and_guards {
     const MOD_SRC: &str = include_str!("mod.rs");
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
     const TASK_SRC: &str = include_str!("../task.rs");
     const KSYSCALL_SRC: &str = include_str!("../syscall.rs");
@@ -97606,6 +97726,7 @@ mod stage200d2a_deferred_death {
 
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
@@ -98262,6 +98383,7 @@ mod stage200d2a_deferred_death {
 mod stage200df0_feature_gating {
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
 
@@ -99081,6 +99203,7 @@ mod stage200d0b3_x86_exit_corrected {
     );
     const RUNNER: &str = include_str!("../../../scripts/qemu-x86-exit-current-task-smoke.sh");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     /// Comment-stripped consumer body: these guards are about CODE, and the block's own
     /// prose legitimately names `exit_task`, frames and depth while explaining why it
@@ -99916,6 +100039,7 @@ mod stage200d0c1_aarch64_exit_prep {
     );
     const RUNNER: &str = include_str!("../../../scripts/qemu-aarch64-exit-current-task-smoke.sh");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const ROOT_TOML: &str = include_str!("../../../Cargo.toml");
     const CPS_TOML: &str = include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml");
     const FS_TOML: &str = include_str!("../../../crates/yarm-fs-servers/Cargo.toml");
@@ -101200,6 +101324,7 @@ mod stage200d0d1_riscv_exit_prep {
     const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
     const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -101346,6 +101471,7 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(phase3 < consumer, "the consumer is in Phase 3");
         // The lock is genuinely the broad SpinLock<KernelState>.
         const RUNTIME: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         assert!(RUNTIME.contains("let mut guard = self.state.lock();"));
         // The marker states the condition and names the holder.
         assert!(consumer_block().contains(
@@ -102451,6 +102577,7 @@ mod stage200d2b1bi_counters {
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const INIT_SRC: &str = include_str!(
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
@@ -102995,6 +103122,7 @@ mod stage200d2b1bii_races {
     const IPC_SRC: &str = include_str!("ipc_state.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
@@ -104518,6 +104646,7 @@ mod stage200d2b1c_arch_return {
     const SHARED: &str = include_str!("../../arch/trap_entry.rs");
     const RV: &str = include_str!("../../arch/riscv64/trap.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const CMDLINE: &str = include_str!("../boot_command_line.rs");
     const INIT: &str = include_str!(
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
@@ -105101,6 +105230,7 @@ mod stage200d2b1d3_terminal_arming {
     const IPC_SRC: &str = include_str!("ipc_state.rs");
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     /// The body of the one gate that decides whether the scenario arms anything at all.
     fn arm_gate() -> &'static str {
@@ -105436,6 +105566,7 @@ mod stage200d2b1d5a_owner_revalidation {
     use crate::kernel::scheduler::CpuId;
 
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
 
     /// U3 (203C): the seam is no longer one broad closure — it is the composed body plus the
@@ -105783,6 +105914,7 @@ mod stage200d2b1d5b_restore_contract {
     use crate::runtime::{OwnerCommit, OwnerRevalidation, SharedKernel};
 
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
 
     /// U3 (203C): the seam is no longer one broad closure — it is the composed body plus the
@@ -108697,6 +108829,7 @@ mod stage199d_terminal_arbitration_safety {
     fn the_broad_and_split_paths_share_one_terminal_policy() {
         const IPC: &str = include_str!("ipc_state.rs");
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         for owner in [
             "pub(crate) fn classify_direct_reply_terminal_locked(",
             "pub(crate) fn claim_direct_reply_terminal_locked(",
@@ -108748,6 +108881,7 @@ mod stage199d_terminal_arbitration_safety {
     fn no_boolean_arbitration_decision_remains() {
         const IPC: &str = include_str!("ipc_state.rs");
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         const ELIG: &str = include_str!("../direct_eligibility.rs");
         for (what, src) in [
             ("split helper", SPLIT),
@@ -110165,6 +110299,7 @@ mod stage199d_aarch64_offlock_dispatch {
         assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch"));
         // The rollback uses the existing exact inverse of the dequeue, not a new primitive.
         const RUNTIME: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         let rollback = RUNTIME
             .split("pub(crate) fn direct_dispatch_rollback_split(")
             .nth(1)
@@ -110511,6 +110646,7 @@ mod stage199d_remote_wake_authority {
     const TXN: &str = include_str!("../ipccall_direct_txn.rs");
     const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     fn code_only(src: &str) -> alloc::string::String {
         src.lines()
@@ -112316,6 +112452,7 @@ mod stage199d_riscv_production_readiness_audit {
     const RISCV_SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
     const RISCV_ABI: &str = include_str!("../../arch/riscv64/syscall_abi.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TXN: &str = include_str!("../ipccall_direct_txn.rs");
     const SPLIT: &str = include_str!("../syscall_split.rs");
     const IPC_STATE: &str = include_str!("ipc_state.rs");
@@ -113631,6 +113768,9 @@ mod stage199d_riscv_canonical_admission {
             // U9-MO2 §4: the one NON-switching member added since — NR 28 finalizes through the
             // same same-task ecall writeback DebugLog uses.
             "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
+            // U9-SPAWN1 SP-2: the second NON-switching member — NR 11 finalizes through the
+            // same same-task ecall writeback DebugLog and NR 28 use.
+            "SYSCALL_SPAWN_THREAD_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -113642,9 +113782,10 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            6,
-            "exactly six literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
-             FutexWait, IpcRecvTimeout, IpcSend and (U9-MO2 §4) CreateInitramfsFileSliceMo"
+            7,
+            "exactly seven literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+             FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo and \
+             (U9-SPAWN1 SP-2) SpawnThread"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -113824,6 +113965,7 @@ mod stage199d_riscv_remote_wake_readiness {
     const RISCV_SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
     const RISCV_TIMER: &str = include_str!("../../arch/riscv64/timer.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TXN: &str = include_str!("../ipccall_direct_txn.rs");
     const EXEC_STATE: &str = include_str!("exec_state.rs");
     const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
@@ -115464,6 +115606,7 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
 
     const SCHED: &str = include_str!("../../kernel/scheduler.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
 
     // ── The blocker, behaviourally ──────────────────────────────────────────────────────────
@@ -115777,6 +115920,7 @@ mod stage199d_receiver_enqueue_outcome {
     use crate::runtime::{ReceiverEnqueue, SharedKernel};
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TXN: &str = include_str!("../ipccall_direct_txn.rs");
 
     /// The direct-IPC seam: the only one that reconciles. Every membership expectation below
@@ -116334,6 +116478,7 @@ mod stage199d_shared_region_enqueue_rejection {
     use crate::runtime::{ReceiverEnqueue, SharedKernel};
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TXN: &str = include_str!("../ipccall_direct_txn.rs");
 
     /// A kernel with task 2 blocked as an exact endpoint waiter, plus the snapshot the finalizer
@@ -116751,6 +116896,7 @@ mod stage199d_waiter_ownership_exclusivity_audit {
 
     const IPC_STATE: &str = include_str!("ipc_state.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117132,6 +117278,7 @@ mod stage199d_wa1_gate {
     #[test]
     fn already_queued_removed_fails_closed_outside_tests() {
         const RUNTIME: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         let body = RUNTIME
             .split("pub(crate) fn rejection_is_runtime_recoverable(self) -> bool {")
             .nth(1)
@@ -118232,7 +118379,10 @@ mod stage199d_wa2a_ownership_boundary {
             ("src/kernel/boot/ipc_state.rs", 9),
             ("src/kernel/boot/restart_state.rs", 4),
             ("src/kernel/boot/scheduler_state.rs", 1),
-            ("src/kernel/boot/thread_state.rs", 4),
+            // U9-SPAWN1 SP-2: `spawn_user_thread`'s Runnable write moved to the shared
+            // thread-incarnation owner, so thread_state.rs falls 4 -> 3 and the owner gains 1.
+            ("src/kernel/boot/spawn_thread_core.rs", 1),
+            ("src/kernel/boot/thread_state.rs", 3),
             ("src/kernel/spawn_reservation.rs", 2),
             ("src/kernel/task.rs", 2),
             ("src/kernel/task_transition.rs", 1),
@@ -118314,8 +118464,6 @@ mod stage199d_wa2a_ownership_boundary {
                 "&mut t.status",
                 "mem::replace(&mut tcb.status",
                 "mem::swap(&mut tcb.status",
-                "tcbs[idx] = None",
-                "tcbs[i] = None",
             ] {
                 assert!(
                     !src.contains(forbidden),
@@ -118323,17 +118471,64 @@ mod stage199d_wa2a_ownership_boundary {
                 );
             }
         }
-        // The single write into the TCB array only fills a slot proven vacant.
-        let policy = std::fs::read_to_string(
+        // U9-SPAWN1 SP-2: "no production path removes a TCB from the array" was previously
+        // asserted by forbidding three IDENTIFIER SPELLINGS of the write (`tcbs[idx] = None`,
+        // `tcbs[i] = None`). That is not the operation — `spawn_reservation::clear_reservation_slot`
+        // has always written `tcbs[index] = None` and passed. The closure argument is restated
+        // here as what it actually is: clearing a TCB slot has exactly ONE owner, and its callers
+        // are enumerated.
+        for (rel, src) in production_sources() {
+            for (at, _) in src.match_indices("] = None;") {
+                let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let line = &src[line_start..at];
+                if !line.trim_start().starts_with("tcbs[") {
+                    continue;
+                }
+                assert_eq!(
+                    rel, "src/kernel/spawn_reservation.rs",
+                    "clearing a TCB slot has one owner; {rel} must delegate to it"
+                );
+            }
+        }
+        let reservation = std::fs::read_to_string(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/kernel/boot/task_policy_state.rs"),
+                .join("src/kernel/spawn_reservation.rs"),
         )
         .expect("read");
-        let at = policy
+        assert_eq!(
+            reservation.matches("tcbs[index] = None;").count(),
+            1,
+            "and that owner clears exactly one slot, in one place"
+        );
+        // Its callers, enumerated. Each removes a task that CANNOT be Blocked: a reservation has
+        // never been runnable, and a failed thread spawn has never reached a run queue.
+        let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for (rel, src) in production_sources() {
+            if src.contains("clear_reservation_slot(") && rel != "src/kernel/spawn_reservation.rs" {
+                callers.push(rel);
+            }
+        }
+        callers.sort();
+        assert_eq!(
+            callers,
+            alloc::vec![
+                alloc::string::String::from("src/kernel/boot/spawn_thread_core.rs"),
+                alloc::string::String::from("src/kernel/boot/task_policy_state.rs"),
+            ],
+            "the slot-clearing owner's callers must stay enumerated"
+        );
+
+        // The single write INTO the TCB array only fills a slot proven vacant.
+        let core = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/kernel/boot/spawn_thread_core.rs"),
+        )
+        .expect("read");
+        let at = core
             .find("tcbs[idx] = Some(tcb);")
             .expect("the only slot write");
         assert!(
-            policy[..at].contains("position(|slot| slot.is_none())"),
+            core[..at].contains(".position(Option::is_none)"),
             "the only TCB-array write targets a vacant slot, so it can never displace a blocked \
              receiver"
         );
@@ -118545,7 +118740,9 @@ mod stage199d_wa2b_wake_owner_census {
     const FAULT: &str = include_str!("fault_state.rs");
     const THREAD: &str = include_str!("thread_state.rs");
     const POLICY: &str = include_str!("task_policy_state.rs");
+    const SPAWN_CORE: &str = include_str!("spawn_thread_core.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     /// How a site was resolved. `Unproven` exists so the guard can *compute* that none remain,
     /// rather than the census merely omitting the category.
@@ -118738,9 +118935,14 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Cannot,
         ),
+        // U9-SPAWN1 SP-2: `spawn_user_thread`'s status write moved into the shared
+        // thread-incarnation owner, so the site is enumerated at its new home. The verdict is
+        // unchanged and for the same reason: the TCB it writes sits at a slot index that was
+        // EMPTY when registration claimed it, so it can never be some other task's — least of
+        // all a Blocked one's.
         (
-            "src/kernel/boot/thread_state.rs",
-            "spawn_user_thread",
+            "src/kernel/boot/spawn_thread_core.rs",
+            "initialize_thread_incarnation_locked",
             1,
             Verdict::Cannot,
         ),
@@ -119199,6 +119401,14 @@ mod stage199d_wa2b_wake_owner_census {
             "Ok(CrossCpuWakeApplyResult::Applied)",
         ),
         (
+            "src/kernel/boot/spawn_thread_core.rs",
+            "initialize_thread_incarnation_locked",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "};",
+            "Ok(())",
+        ),
+        (
             "src/kernel/boot/thread_state.rs",
             "join_thread",
             "joiner.status",
@@ -119213,14 +119423,6 @@ mod stage199d_wa2b_wake_owner_census {
             "TaskStatus::Runnable",
             "}",
             "if wake_count < wake_tids.len() {",
-        ),
-        (
-            "src/kernel/boot/thread_state.rs",
-            "spawn_user_thread",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            "};",
-            "Ok::<_, KernelError>(())",
         ),
         (
             "src/kernel/boot/thread_state.rs",
@@ -119917,11 +120119,13 @@ mod stage199d_wa2b_wake_owner_census {
                 "for tcb in tcbs.iter_mut().flatten() {",
             ),
             (
-                "thread_state.rs",
-                "spawn_user_thread",
-                "let tid = self.allocate_thread_id()?;",
-                // the signature takes a PARENT tid, never the tid being written
-                "pub fn spawn_user_thread(",
+                "spawn_thread_core.rs",
+                "initialize_thread_incarnation_locked",
+                // it writes ONLY the slot index registration handed it...
+                ".get_mut(idx)",
+                // ...and registration only ever claims a slot that was EMPTY, so the index can
+                // never name a live task, let alone a Blocked one.
+                ".position(Option::is_none)",
             ),
             (
                 "thread_state.rs",
@@ -119974,6 +120178,7 @@ mod stage199d_wa2b_wake_owner_census {
             let src = match *file {
                 "exec_state.rs" => EXEC,
                 "thread_state.rs" => THREAD,
+                "spawn_thread_core.rs" => SPAWN_CORE,
                 "runtime.rs" => RUNTIME,
                 other => panic!("unknown census source {other}"),
             };
@@ -119993,10 +120198,16 @@ mod stage199d_wa2b_wake_owner_census {
 
         // The two spawn CANNOTs additionally depend on the allocator never handing back a live
         // TID. If that stopped being fail-closed, both would become CAN.
+        // U9-SPAWN1 SP-2: the allocation rule moved into the shared owner, so the fail-closed
+        // property is asserted where it now lives. It is the same property, stated the same way:
+        // a candidate is returned only when NO live TCB holds it, and the bounded probe ends in
+        // `TaskTableFull` rather than in a wrap-around that could hand back a live TID.
         assert!(
-            POLICY.contains("if self.task_status(candidate).is_none() {")
-                && POLICY.contains("Err(KernelError::TaskTableFull)"),
-            "allocate_thread_id must only return an unused TID, and fail closed otherwise"
+            SPAWN_CORE
+                .contains("let taken = tcbs.iter().flatten().any(|tcb| tcb.tid.0 == candidate);")
+                && SPAWN_CORE.contains("if !taken {")
+                && SPAWN_CORE.contains("Err(KernelError::TaskTableFull)"),
+            "the TID allocator must only return an unused TID, and fail closed otherwise"
         );
         // Neither spawn function accepts the TID it writes.
         assert!(
@@ -121778,11 +121989,15 @@ mod stage199d_wa3b_spawn_reservation {
     /// through the `_for_test` convenience, so this set is exactly the production closure.
     #[test]
     fn the_production_spawn_caller_closure_is_pinned() {
+        // U9-SPAWN1 SP-3: the four syscall call sites collapsed into ONE. `process.rs` used to
+        // carry a spawn call per syscall, each with its own (absent) compensation; NR 23, 24, 26
+        // and 29 now all commit through `spawn_image_txn`, which is the only place a spawn can
+        // be committed from a syscall and the only place its failure is unwound.
         const EXPECTED: &[(&str, usize)] = &[
             ("src/arch/aarch64/boot.rs", 3),
             ("src/arch/riscv64/boot.rs", 3),
             ("src/arch/x86_64/boot.rs", 3),
-            ("src/kernel/syscall/process.rs", 4),
+            ("src/kernel/syscall/spawn_image_txn.rs", 1),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -121806,8 +122021,14 @@ mod stage199d_wa3b_spawn_reservation {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            13,
-            "13 production callers"
+            10,
+            "10 production callers: three per architecture's bootstrap, plus the one compensated \
+             syscall transaction"
+        );
+        // And no syscall handler may commit a spawn behind the transaction's back.
+        assert!(
+            !include_str!("../syscall/process.rs").contains("spawn_user_task_from_image("),
+            "the spawn syscalls commit through spawn_image_txn, which owns their compensation"
         );
         // None of them authorizes a spawn by TID alone.
         for (rel, src) in production_sources() {
@@ -122535,6 +122756,7 @@ mod u3_ap_saved_context_snapshot {
     // ── lock shape ────────────────────────────────────────────────────────────────────────
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
 
     fn code_of(src: &str) -> alloc::string::String {
@@ -123058,6 +123280,7 @@ mod u3_ap_enqueue_dispatch_transaction {
     // ── lock shape and caller conversion ──────────────────────────────────────────────────
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
     const ORCH: &str = include_str!("orchestrator_state.rs");
 
@@ -123562,6 +123785,7 @@ mod u3_ap_block_current_transaction {
     // ── lock shape and caller conversion ──────────────────────────────────────────────────
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
 
     fn code_of(src: &str) -> alloc::string::String {
@@ -123761,6 +123985,7 @@ mod u3_d6_first_resume_bind_transaction {
     const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
     const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const THREAD_STATE: &str = include_str!("thread_state.rs");
 
     fn code_of(src: &str) -> alloc::string::String {
@@ -124654,6 +124879,7 @@ mod u3_blocked_waiter_completion_transaction {
     // ── lock shape and call-site conversion ───────────────────────────────────────────────
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     fn code_of(src: &str) -> alloc::string::String {
         src.lines()
@@ -125254,6 +125480,7 @@ mod u3_owner_revalidation_transaction {
     // ── source guards ────────────────────────────────────────────────────────────────────
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
 
     fn code_of(src: &str) -> alloc::string::String {
@@ -125412,9 +125639,20 @@ mod u3_owner_revalidation_transaction {
                 "`OwnerRevalidation::{variant}` must survive the conversion"
             );
         }
-        // The rollback reproduces `enqueue_on_cpu`'s own refusal and pin markers.
+        // The rollback reproduces `enqueue_on_cpu`'s own refusal and pin markers. U9-SPAWN1
+        // SP-1 moved the REFUSAL into the shared planner the rollback now calls, so the marker
+        // is emitted by that owner rather than transcribed here — the refusal still happens, at
+        // the same point, with the same typed error. The first-user pin is not part of the
+        // enqueue policy and stays here.
         let rb = body_of(RUNTIME, "fn owner_revalidation_rollback_split");
-        assert!(rb.contains("ENQUEUE_REFUSED"));
+        assert!(
+            rb.contains("plan_pinned_enqueue_locked"),
+            "the rollback must reach the refusal through the shared planner"
+        );
+        assert!(
+            OWNER_SRC.contains("ENQUEUE_REFUSED"),
+            "and that planner is what emits the refusal"
+        );
         assert!(rb.contains("FIRST_USER_PIN_VIOLATION"));
         // The still-live requeue arm is present, guarded by restorability (fact 8), and the
         // reaped short-circuit is present (fact 9).
@@ -125804,6 +126042,7 @@ mod u3_recv_copy_fault_completion {
     // ── source guards ────────────────────────────────────────────────────────────────────
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     fn code_of(src: &str) -> alloc::string::String {
         src.lines()
@@ -126206,6 +126445,7 @@ mod u3_riscv_terminal_idle_snapshot {
     // ── source guards ────────────────────────────────────────────────────────────────────
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
 
     fn code_of(src: &str) -> alloc::string::String {
@@ -126777,6 +127017,7 @@ mod u3_ordinary_cap_sender_wake {
     // ── 9. source and ordering guards ────────────────────────────────────────────────────
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
 
     fn code_of(src: &str) -> alloc::string::String {
@@ -126995,6 +127236,7 @@ mod u4_cross_arch_queue_advancing_dispatch {
     const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
     const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     fn body_of(src: &str, name: &str, close: &str) -> alloc::string::String {
         use alloc::string::ToString;
@@ -129959,6 +130201,7 @@ mod u7_production_timeout_promotion {
     use crate::runtime::SharedKernel;
 
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
     const IPC_SRC: &str = include_str!("ipc_state.rs");
@@ -131616,6 +131859,7 @@ mod u8_live_production_path_arrangement {
     const IPC_SRC: &str = include_str!("ipc_state.rs");
     const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SELECTOR: &str = "x86_ipc_reply_timeout_oracle_enabled()";
 
     /// (1) Provisioning the workload does not require the runtime selector.
@@ -133215,6 +133459,7 @@ mod riscv64_async_preemption {
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const TASK_SRC: &str = include_str!("../task.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SERVICE_SRC: &str = include_str!(
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
@@ -135676,6 +135921,7 @@ mod u3_saved_resume_cpu_authority {
     };
 
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TXN_SRC: &str = include_str!("../../kernel/ipccall_direct_txn.rs");
     const SPLIT_SRC: &str = include_str!("../../kernel/syscall_split.rs");
     const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
@@ -135974,6 +136220,7 @@ mod u3_bsp_saved_resume_retirement {
 
     const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SCHED_STATE: &str = include_str!("scheduler_state.rs");
 
     const A: u64 = 7701;
@@ -136362,6 +136609,7 @@ mod u3_ed2_next_task_retirement {
 
     const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const AP: u8 = 1;
 
     fn code_of(src: &str) -> alloc::string::String {
@@ -136755,6 +137003,7 @@ mod u6_frame_exact_envelope_preservation {
     use crate::runtime::SharedKernel;
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const IPC_STATE: &str = include_str!("ipc_state.rs");
     const BOOT_MOD: &str = include_str!("mod.rs");
     const SYSCALL_IPC: &str = include_str!("../syscall/ipc.rs");
@@ -137356,6 +137605,7 @@ mod u6_frame_exact_envelope_preservation {
 mod u9c_reply_cap_ordered_transaction {
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const IPC_STATE: &str = include_str!("ipc_state.rs");
     const RECV_CORE: &str = include_str!("../recv_core.rs");
     const SYSCALL: &str = include_str!("../syscall.rs");
@@ -137867,6 +138117,7 @@ mod u9f_split_capability_revocation {
     use crate::runtime::SharedKernel;
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const LIFECYCLE: &str = include_str!("capability_lifecycle_state.rs");
 
     /// U9-F introduces NO seam file: the phased composition lives in the existing revocation
@@ -139359,6 +139610,7 @@ mod u9_production_post_switch_restore {
 
     const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
     const EXEC_STATE: &str = include_str!("exec_state.rs");
 
@@ -141087,6 +141339,7 @@ mod u9d3_f1_sole_ack_producer {
 #[cfg(test)]
 mod u9d3_split_unmap_drives_real_d3 {
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const MEMORY: &str = include_str!("memory_state.rs");
 
     fn code(src: &str) -> alloc::string::String {
@@ -141580,6 +141833,7 @@ mod u9qa_apply_convention {
         );
         // The apply consumes the one-shot snapshot through the same classifier.
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         assert!(
             RUNTIME_SRC.contains("classify_incoming_resume_convention(")
                 && RUNTIME_SRC.contains("tcb.first_resume_consumed = true;"),
@@ -141664,6 +141918,7 @@ mod u9qa_apply_convention {
     #[test]
     fn first_resume_has_one_policy_owner_and_one_apply_owner() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         const X86_TRAP: &str = include_str!("../../arch/x86_64/trap.rs");
 
@@ -141760,6 +142015,7 @@ mod u9qa_apply_convention {
     fn other_architectures_and_classes_are_unchanged() {
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         // The classifier's non-stash arm is architecture-neutral: it asks for a bound ASID and a
         // restorable continuation, which is exactly what AArch64/RISC-V already required
         // (`tcb.asid.is_some()`), so their admitted set is unchanged.
@@ -142527,6 +142783,7 @@ mod u9qa_one_queue_advance_owner {
     use crate::kernel::task::TaskClass;
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const EXEC: &str = include_str!("exec_state.rs");
 
     /// A function body, bounded by the start of the next doc-commented item at the same depth.
@@ -142904,6 +143161,7 @@ mod u9tm_timer_entry {
     const SCHED_TIMER: &str = include_str!("../scheduler_timer.rs");
     const SCHED_STATE: &str = include_str!("scheduler_state.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     /// STRUCTURAL: the broad scan short-circuits unconditionally before its preserved body, and
     /// the body below is marked unreachable. This is what makes the function a no-op.
@@ -143073,6 +143331,7 @@ mod u9tm_proof_gate {
     const SPLIT: &str = include_str!("../syscall_split.rs");
     const FAULT: &str = include_str!("fault_state.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TIMER: &str = include_str!("../scheduler_timer.rs");
 
     fn gate_body() -> &'static str {
@@ -143801,6 +144060,7 @@ mod u9ft2_one_evaluator {
 
     const FAULT_SRC: &str = include_str!("fault_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     fn facts(
         access: FaultAccess,
@@ -144092,6 +144352,7 @@ mod u9ft2_policy_twin {
     const FAULT_SRC: &str = include_str!("fault_state.rs");
     const ENDPOINT_SRC: &str = include_str!("fault_endpoint_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     fn shared_body() -> &'static str {
         RUNTIME_SRC
@@ -144283,6 +144544,7 @@ mod u9ft3_buffered {
     use crate::kernel::trap::FaultAccess;
 
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const FAULT_SRC: &str = include_str!("fault_state.rs");
 
     fn admit_body() -> &'static str {
@@ -144505,6 +144767,7 @@ mod u9ft3_buffered {
 /// U9-FT3 §3/§6 — the split terminal task transition.
 mod u9ft3_transition {
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const FAULT_SRC: &str = include_str!("fault_state.rs");
 
     fn body() -> &'static str {
@@ -144587,6 +144850,7 @@ mod u9ft3_transition {
     #[test]
     fn the_advance_uses_the_u9qa_selection_owner() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         let step = RUNTIME_SRC
             .split("pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {")
             .nth(1)
@@ -144705,6 +144969,7 @@ mod u9ft4_route {
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const ARM_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
 
     fn route() -> &'static str {
@@ -144913,6 +145178,7 @@ mod u9ft4_route {
 /// restored here, unchanged in substance.
 mod u9rx_blocked_recv {
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const POST_WORK_SRC: &str = include_str!("../dispatch_post_work.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const FAULT_SRC: &str = include_str!("fault_state.rs");
@@ -145059,6 +145325,7 @@ mod u9rx_blocked_recv {
 mod u9rx3_route {
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
 
     /// The route body, comments stripped — every guard here asks about CODE, so an explanatory
@@ -145310,6 +145577,7 @@ mod u9cow2_route {
     use crate::kernel::boot::{CowRecovery, KernelError};
 
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const MEMORY_SRC: &str = include_str!("memory_state.rs");
@@ -146245,6 +146513,7 @@ mod stage199gc_transfer_pin_owner {
     fn every_stash_and_release_reads_the_one_policy() {
         const TRANSFER_SRC: &str = include_str!("transfer_state.rs");
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         const MEM_SRC: &str = include_str!("memory_lifecycle_state.rs");
         // Defined once.
         assert_eq!(
@@ -146876,6 +147145,7 @@ mod stage199gc4_split_envelope_stash {
     fn both_stashes_share_one_policy() {
         const TRANSFER_SRC: &str = include_str!("transfer_state.rs");
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         assert_eq!(
             TRANSFER_SRC
                 .matches("pub(crate) fn transfer_shared_region_bounds_ok")
@@ -146914,6 +147184,7 @@ mod stage199gc4_ipc_mutation_owners {
 
     const IPC_SRC: &str = include_str!("ipc_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     fn plain_msg(word: u8) -> Message {
         Message::new(1, &[word]).expect("plain message")
@@ -147152,6 +147423,7 @@ mod stage199gc4_plain_delivery_policy {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const USER_MEM_SRC: &str = include_str!("user_memory_state.rs");
 
     fn v2_state(payload_len: usize) -> BlockedRecvState {
@@ -147437,6 +147709,7 @@ mod stage199gc4_ordinary_cap_delivery_policy {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     fn v2_state(payload_len: usize) -> BlockedRecvState {
         BlockedRecvState {
@@ -147678,6 +147951,7 @@ mod stage199gc4_reply_cap_delivery_policy {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const CAP_LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
 
     #[test]
@@ -147924,6 +148198,7 @@ mod stage199gc4_shared_region_delivery_policy {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TXN_SRC: &str = include_str!("shared_region_txn.rs");
 
     #[test]
@@ -148173,6 +148448,7 @@ mod stage199gc4_waiting_receiver_and_blocking_send {
 
     const IPC_SRC: &str = include_str!("ipc_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     #[test]
     fn the_waiting_receiver_enqueue_policy_has_exactly_one_implementation() {
@@ -149352,6 +149628,7 @@ mod stage199a2drr_queued_reply_settlement {
     use crate::runtime::SharedKernel;
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const IPC_STATE: &str = include_str!("ipc_state.rs");
 
     struct Fx {
@@ -149566,6 +149843,7 @@ mod stage199a2drr_terminal_reuse {
 
     const IPC_STATE: &str = include_str!("ipc_state.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
     struct Fx {
         k: SharedKernel,
@@ -149839,6 +150117,7 @@ mod direct3_cap_final_reply_lane {
     use crate::runtime::SharedKernel;
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const SPLIT: &str = include_str!("../syscall_split.rs");
     const POSTWORK: &str = include_str!("../dispatch_post_work.rs");
 
@@ -150697,9 +150976,18 @@ mod u9mo2_nr28_terminal_edges {
             .split("|| raw_nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR")
             .nth(1)
             .expect("the NR 28 import term");
+        // The next non-comment line must be another `||` term — i.e. NR 28's import is its own
+        // unconditional disjunct, not a conjunct of a gate. Comments between terms are ordinary
+        // (each admission records why it exists), so they are skipped rather than tripped over.
+        let next = after
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .expect("a following term");
         assert!(
-            after.trim_start().starts_with("||"),
-            "the NR 28 import must be its own unconditional term, not a conjunct of a gate"
+            next.starts_with("||"),
+            "the NR 28 import must be its own unconditional term, not a conjunct of a gate \
+             (next term: {next})"
         );
     }
 
@@ -150816,6 +151104,7 @@ mod u9mo2_nr28_terminal_edges {
             "one geometry owner"
         );
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
         assert!(
             RUNTIME_SRC.contains(
                 "KS::initramfs_slice_object_geometry(initrd, file_data_offset, file_len)?"
@@ -151140,5 +151429,1060 @@ mod u9mo2_nr28_transaction_failure_injection {
             shape(split_id),
             "same inputs, same object — kind, length and physical base"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// U9-SPAWN1 SP-1 — ONE task-enqueue owner.
+//
+// Before this checkpoint the composition "may this task be enqueued, and with what" existed six
+// times: twice in the broad `KernelState` and four more times transcribed into `SharedKernel`
+// split paths. They had already drifted — the FutexWake copy omitted the spawn-reservation
+// refusal. These pin the collapse, and the two lock disciplines that must both keep working.
+mod u9spawn1_one_enqueue_owner {
+    const OWNER: &str = include_str!("../task_enqueue.rs");
+    const SCHED: &str = include_str!("scheduler_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+
+    /// The class→priority rule is written exactly once in the whole kernel.
+    #[test]
+    fn the_priority_rule_has_one_definition() {
+        let rule = "TaskClass::SystemServer => TaskPriority::High";
+        assert_eq!(
+            OWNER.matches(rule).count(),
+            1,
+            "the owner states the rule once"
+        );
+        for (name, src) in [("scheduler_state.rs", SCHED), ("runtime.rs", RUNTIME)] {
+            assert!(
+                !src.contains(rule),
+                "{name} must not restate the class→priority rule"
+            );
+        }
+    }
+
+    /// The spawn-reservation refusal is written exactly once, and every planner routes through
+    /// it. This is the divergence that actually existed: FutexWake had no refusal at all.
+    #[test]
+    fn the_reservation_refusal_has_one_definition() {
+        let marker = "\"ENQUEUE_REFUSED tid={} reason=spawn_reservation_not_live\"";
+        assert_eq!(
+            OWNER.matches(marker).count(),
+            1,
+            "the owner emits the refusal once"
+        );
+        for (name, src) in [("scheduler_state.rs", SCHED), ("runtime.rs", RUNTIME)] {
+            assert!(
+                !src.contains(marker),
+                "{name} must not restate the reservation refusal"
+            );
+        }
+        // Both planners begin with it — a planner that skipped it could enqueue a reservation.
+        for planner in [
+            "pub(crate) fn plan_pinned_enqueue_locked(",
+            "pub(crate) fn plan_balanced_enqueue_locked(",
+        ] {
+            let body = OWNER
+                .split(planner)
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("{planner} body"));
+            assert!(
+                body.contains("refuse_reservation_locked(tcbs, tid)?"),
+                "{planner} must refuse a reservation before anything else"
+            );
+        }
+    }
+
+    /// The rank-1 queue mutation for a task transition happens in exactly one function, and that
+    /// function delegates to the scheduler's own primitives rather than restating their rules.
+    #[test]
+    fn the_rank_one_commit_has_one_owner_and_adds_no_policy() {
+        let body = OWNER
+            .split("pub(crate) fn commit_enqueue_locked(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the commit owner");
+        assert!(
+            body.contains("enqueue_on_with_priority(cpu, ThreadId(plan.tid), plan.priority)")
+                && body.contains("enqueue_balanced(ThreadId(plan.tid), plan.priority)"),
+            "the commit delegates to the SmpScheduler primitives unchanged"
+        );
+        // It decides nothing itself: no class, no affinity, no reservation, no duplicate check.
+        for forbidden in [
+            "TaskClass",
+            "cpu_affinity",
+            "is_spawn_reservation",
+            "AlreadyQueued",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the rank-1 commit must not re-decide `{forbidden}` — that is rank 2's or the \
+                 scheduler's own"
+            );
+        }
+    }
+
+    /// Every enqueue for a task-lifecycle transition now goes through the owner. No caller may
+    /// reach the raw scheduler primitives for this purpose again.
+    #[test]
+    fn no_transcription_of_the_enqueue_survives() {
+        // The broad twins delegate.
+        for (fname, planner) in [
+            (
+                "pub(crate) fn enqueue_task(",
+                "plan_balanced_enqueue_locked",
+            ),
+            ("pub fn enqueue_on_cpu(", "plan_pinned_enqueue_locked"),
+        ] {
+            let body = SCHED
+                .split(fname)
+                .nth(1)
+                .and_then(|s| s.split("\n    pub").next())
+                .unwrap_or_else(|| panic!("{fname} body"));
+            assert!(
+                body.contains(planner) && body.contains("commit_enqueue_locked"),
+                "{fname} must delegate to the shared planner and committer"
+            );
+        }
+        // And the four split transcriptions are gone: none of them re-derives a priority from a
+        // class, and the FutexWake route no longer hand-rolls its own enqueue.
+        assert!(
+            !RUNTIME.contains("Some(TaskClass::SystemServer) => TaskPriority::High"),
+            "the FutexWake transcription must not come back"
+        );
+        assert!(
+            !RUNTIME.contains("sm.enqueue_on_with_priority(c, ThreadId(tid), priority)"),
+            "no split caller reaches the queue primitive directly for a task transition"
+        );
+    }
+
+    /// The split enqueue takes rank 2 and rank 1 in DISJOINT sections, rank 1 strictly last.
+    ///
+    /// The mechanism is the plan: it is a `Copy` value that borrows no task storage, so the
+    /// rank-2 guard can be — and is — dropped before the rank-1 guard is taken.
+    #[test]
+    fn the_split_enqueue_releases_rank_two_before_taking_rank_one() {
+        let body = RUNTIME
+            .split("pub(crate) fn enqueue_task_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the split enqueue");
+        let rank2 = body
+            .find("with_task_enqueue_policy_split_mut")
+            .expect("the rank-2 section");
+        let rank1 = body
+            .find("with_scheduler_split_mut")
+            .expect("the rank-1 section");
+        assert!(rank2 < rank1, "rank 2 is planned before rank 1 commits");
+        // The two are siblings, not nested: the rank-2 closure ends before the rank-1 call.
+        let rank2_closes = body[rank2..rank1].contains("})?;");
+        assert!(
+            rank2_closes,
+            "the rank-2 guard must be released — `?` on the plan — before rank 1 is taken"
+        );
+        // The plan carries no borrow, which is what makes that possible.
+        assert!(
+            OWNER.contains(
+                "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(crate) struct EnqueuePlan {"
+            ),
+            "the plan must be Copy and borrow nothing"
+        );
+    }
+
+    /// The nested ascending 1 → 2 discipline still exists and still works, because the AP
+    /// enqueue→dispatch transaction genuinely needs its block-and-requeue to be atomic against
+    /// the dispatcher. Same policy owner, different lock discipline — that is the point of the
+    /// owner being free functions over borrowed storage rather than a method with its own locks.
+    #[test]
+    fn the_nested_ascending_discipline_still_uses_the_same_owner() {
+        let body = RUNTIME
+            .split("fn enqueue_then_dispatch_on_cpu_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the AP transaction");
+        assert!(
+            body.contains("with_scheduler_split_mut"),
+            "it holds rank 1 across the whole transaction"
+        );
+        let outer = body.find("with_scheduler_split_mut").expect("rank 1");
+        let inner = body
+            .find("with_task_enqueue_policy_split_mut")
+            .expect("nested rank 2");
+        assert!(
+            outer < inner,
+            "rank 1 is taken first, then rank 2 inside it"
+        );
+        assert!(
+            body.contains("plan_pinned_enqueue_locked"),
+            "and it resolves the policy through the SAME owner"
+        );
+        // The owner imposes no lock discipline of its own — that is what lets both work.
+        assert!(
+            !OWNER.contains("with_scheduler_split_mut") && !OWNER.contains("scheduler_state()"),
+            "the owner must take no locks itself"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// U9-SPAWN1 SP-2 — NR 11 terminal edges 3 → 0, and the compensation that makes it safe.
+mod u9spawn1_nr11_terminal_edges {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const CORE: &str = include_str!("spawn_thread_core.rs");
+    const THREAD: &str = include_str!("thread_state.rs");
+
+    fn route_body() -> &'static str {
+        SPLIT_SRC
+            .split("fn try_split_spawn_thread_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the NR 11 route body")
+    }
+
+    /// Edge 1 of 3 — x86_64: the classifier and the dispatch arm.
+    #[test]
+    fn x86_64_has_a_pre_lock_owner() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::SpawnThread => Some(syscall),"),
+            "the number-only classifier must admit NR 11"
+        );
+        assert!(
+            SPLIT_SRC.contains(
+                "if matches!(syscall, Syscall::SpawnThread) {\n        return try_split_spawn_thread_into_frame(shared, cpu, frame);"
+            ),
+            "the split dispatcher must route NR 11 to its own pre-lock owner"
+        );
+    }
+
+    /// Edge 2 of 3 — AArch64: without the ABI import `nr` stays 0 whatever the classifier says.
+    #[test]
+    fn aarch64_imports_the_nr11_abi_before_the_split_dispatch() {
+        assert!(
+            TRAP_ENTRY.contains("raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR"),
+            "AArch64 must import the NR 11 ABI before the split dispatch inspects it"
+        );
+        let after = TRAP_ENTRY
+            .split("|| raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR")
+            .nth(1)
+            .expect("the NR 11 import term");
+        let next = after
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .expect("a following term");
+        assert!(
+            next.starts_with("||"),
+            "the NR 11 import must be its own unconditional term (next: {next})"
+        );
+    }
+
+    /// Edge 3 of 3 — RISC-V: the whitelist, with NR 2 still out of it.
+    #[test]
+    fn riscv_admits_nr11_into_the_split_dispatcher() {
+        let whitelist = RISCV
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("the RISC-V whitelist");
+        assert!(
+            whitelist.contains("SYSCALL_SPAWN_THREAD_NR"),
+            "RISC-V must admit NR 11 into the split dispatcher"
+        );
+        assert!(
+            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "NR 2's RISC-V admission is a separate class and stays untouched"
+        );
+    }
+
+    /// The broad handler survives as the fallback for everything declined pre-mutation.
+    #[test]
+    fn the_broad_handler_survives_as_the_fallback() {
+        assert!(
+            SYSCALL_SRC.contains("Syscall::SpawnThread => handle_spawn_thread(kernel, frame)"),
+            "the broad arm must remain reachable"
+        );
+    }
+
+    /// SP-2's scope bound, mechanically: the route introduces no address-space, ELF, endpoint,
+    /// capability, VM or switch work. If a later edit reaches for any of those, this fails.
+    #[test]
+    fn the_route_introduces_no_forbidden_work() {
+        let body = route_body();
+        let txn = RUNTIME
+            .split("pub(crate) fn try_spawn_thread_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the transaction");
+        for (name, src) in [("route", body), ("transaction", txn)] {
+            for forbidden in [
+                "create_user_address_space",
+                "load_elf",
+                "create_endpoint",
+                "mint_capability",
+                "grant_capability",
+                "map_user_page",
+                "alloc_contiguous",
+                "free_frame",
+                "dispatch_next_task",
+                "block_current_cpu",
+                "with_vm_split",
+                "with_memory_split_mut",
+                "with_capability_state_split_mut",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "the NR 11 {name} must not introduce `{forbidden}` — SP-2 is rank 2 then \
+                     rank 1 and nothing else"
+                );
+            }
+        }
+    }
+
+    /// No fallback survives the first mutation, and the mutation is where it is claimed to be.
+    #[test]
+    fn no_fallback_survives_the_first_mutation() {
+        let body = route_body();
+        let mutation = body
+            .find("shared.try_spawn_thread_split(")
+            .expect("the one mutating call");
+        let tail = &body[mutation..];
+        for escape in ["return None", "None\n", "?;", ")?"] {
+            assert!(
+                !tail.contains(escape),
+                "no fallback may escape after the mutation: found `{escape}`"
+            );
+        }
+        assert!(
+            tail.contains("frame.set_ok(ret, 0, 0);")
+                && tail.contains("Some(Ok(()))")
+                && tail.contains("SyscallError::from(err)"),
+            "success returns the child TID; failure returns the exact typed error"
+        );
+        // The pre-mutation half may still decline — that is what makes this a boundary.
+        assert!(
+            body[..mutation].contains("shared.current_tid_authoritative(cpu)?")
+                && body[..mutation].contains("shared.task_cnode_split(parent_tid)?"),
+            "the pre-mutation half declines on an unavailable requester or an absent process \
+             CNode, both of which are READS"
+        );
+    }
+
+    /// Every post-registration failure undoes the EXACT incarnation, on BOTH paths, through the
+    /// same owner. This is the property that lets the route refuse to fall back.
+    #[test]
+    fn every_post_registration_failure_undoes_the_exact_incarnation() {
+        assert_eq!(
+            CORE.matches("pub(crate) fn unregister_thread_incarnation_locked(")
+                .count(),
+            1,
+            "one undo owner"
+        );
+        // It is identity-exact: TID *and* thread group, so a stale identity names nothing.
+        let undo = CORE
+            .split("pub(crate) fn unregister_thread_incarnation_locked(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the undo body");
+        assert!(
+            undo.contains("tcb.tid.0 == tid && tcb.thread_group_id.0 == expected_group.0"),
+            "the undo must match the exact incarnation, not just the TID"
+        );
+        assert!(
+            undo.contains("return false;"),
+            "and be inert on a stale or already-undone identity"
+        );
+        assert!(
+            undo.contains("clear_reservation_slot(tcbs, idx)"),
+            "clearing a TCB slot has one owner; the undo delegates to it"
+        );
+        // Both the split transaction and the broad path call it on their post-mutation failures.
+        let txn = RUNTIME
+            .split("pub(crate) fn try_spawn_thread_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the transaction");
+        assert_eq!(
+            txn.matches("unregister_thread_incarnation_locked").count(),
+            2,
+            "the split transaction undoes on BOTH of its post-mutation failure arms: a failed \
+             initialise and a failed enqueue"
+        );
+        let broad = THREAD
+            .split("pub fn spawn_user_thread(")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub").next())
+            .expect("the broad spawn");
+        assert_eq!(
+            broad
+                .matches("unregister_thread_incarnation_locked")
+                .count(),
+            2,
+            "and so does the broad path, which leaked on a failed enqueue before SP-2"
+        );
+        assert!(
+            !broad.contains("let _ = self.enqueue_task(tid)?;"),
+            "the leaking form must not come back"
+        );
+    }
+
+    /// Rank order: the whole task-domain half is ONE acquisition, and rank 1 is strictly last.
+    #[test]
+    fn the_transaction_takes_rank_two_once_then_rank_one_last() {
+        let txn = RUNTIME
+            .split("pub(crate) fn try_spawn_thread_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the transaction");
+        // One rank-2 acquisition for the whole build-up; a second only to compensate.
+        assert_eq!(
+            txn.matches("with_spawn_thread_split_mut").count(),
+            2,
+            "one acquisition builds the incarnation; the only other one undoes it"
+        );
+        let build = txn.find("with_spawn_thread_split_mut").expect("rank 2");
+        let rank1 = txn.find("self.enqueue_task_split(").expect("rank 1");
+        assert!(build < rank1, "rank 2 completes before rank 1 is taken");
+        // Rank 10 sits between them, with the task lock released — never nested inside it.
+        let rank10 = txn
+            .find("self.apply_tid_allocation_delta_split(")
+            .expect("rank 10");
+        assert!(
+            build < rank10 && rank10 < rank1,
+            "telemetry is applied after rank 2 is released and before rank 1 is taken"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A64-DEPTH — the two boundaries that made AArch64's live evidence unobtainable.
+//
+// Both were mine, both silent, and both presented as something other than what they were: the
+// first as "a boot-depth fact about the workload", the second as a hang inside `spawn_thread`.
+mod a64depth_writeback_and_selector {
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const FT4_ABI: &str =
+        include_str!("../../../crates/yarm-ipc-abi/src/terminal_fault_oracle_abi.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const BOOT: &str = include_str!("mod.rs");
+
+    /// The writeback gate must ask WHY it was called, never WHICH syscall this is. An NR list
+    /// here is a second admission surface that every future class must remember to update, and
+    /// forgetting it discards the syscall's result in total silence.
+    #[test]
+    fn the_writeback_gate_is_keyed_on_the_reason_not_the_syscall_number() {
+        let owner = TRAP_ENTRY
+            .split("fn finalize_split_handled_syscall(\n    shared:")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the aarch64 finalize owner");
+        let reason = owner
+            .find("matches!(reason, SplitFinalizeReason::CompletedInThisTrap)")
+            .expect("the reason gate");
+        // A completed syscall commits before any syscall-number question is asked.
+        match owner.find("frame.syscall_num() ==") {
+            Some(nr) => assert!(
+                reason < nr,
+                "a completed syscall must commit its ABI before any per-class list is consulted"
+            ),
+            None => {}
+        }
+        // The per-class list that remains may only govern the DEFERRED case.
+        assert!(
+            owner[..reason].find("frame.syscall_num() ==").is_none(),
+            "no syscall-number test may precede the reason gate"
+        );
+    }
+
+    /// Every class the AArch64 ABI import admits must be able to reach a writeback. This is the
+    /// invariant whose absence broke NR 28: admitted to the route and to the import, forgotten
+    /// at the finalize, result discarded.
+    #[test]
+    fn every_imported_nr_can_reach_a_writeback() {
+        // The import list and the finalize gate are no longer parallel lists to keep in sync —
+        // the finalize is reason-keyed, so an imported NR that COMPLETES always writes back.
+        for nr in [
+            "SYSCALL_DEBUG_LOG_NR",
+            "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
+            "SYSCALL_SPAWN_THREAD_NR",
+        ] {
+            assert!(
+                TRAP_ENTRY.contains(&alloc::format!("raw_nr == crate::kernel::syscall::{nr}")),
+                "{nr} is imported on AArch64"
+            );
+        }
+        assert!(
+            TRAP_ENTRY.contains("SplitFinalizeReason::CompletedInThisTrap"),
+            "and a completed syscall's writeback is unconditional"
+        );
+    }
+
+    /// Slot 5 is mutually exclusive. Its two authoritative tables must not overlap, and no
+    /// production arm may match a slot-5 value with a bare literal — the exact shape that let
+    /// the terminal-fault oracle and the AArch64 ExitCurrentTask oracle both claim 21.
+    #[test]
+    fn the_slot5_selectors_have_owners_and_do_not_overlap() {
+        assert!(
+            FT4_ABI.contains("pub const AARCH64_TERMINAL_FAULT_SELECTOR: usize = 23;"),
+            "the terminal-fault selector has a single declared owner"
+        );
+        assert!(
+            BOOT.contains(
+                "yarm_ipc_abi::terminal_fault_oracle_abi::AARCH64_TERMINAL_FAULT_SELECTOR as u64"
+            ),
+            "and the kernel writes it from that owner, not from a literal"
+        );
+        // Userspace decodes rather than comparing a literal.
+        assert!(
+            INIT_SRC
+                .contains("yarm_ipc_abi::terminal_fault_oracle_abi::terminal_fault_scenario_for"),
+            "init must DECODE the terminal-fault selector"
+        );
+        assert!(
+            !INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(21)"),
+            "the bare literal that collided with the ExitCurrentTask block must not come back"
+        );
+        // And the two tables carry the cross-check between them.
+        assert!(
+            FT4_ABI.contains("fn it_does_not_collide_with_the_exit_block()"),
+            "the owner must assert it cannot collide with the reserved exit selectors"
+        );
+    }
+
+    /// The NR 11 witness counter must not be able to go blind on an architecture again.
+    ///
+    /// The original counter lived in a scratch file and required the marker name and
+    /// `disposable_tid=` to be ADJACENT. x86_64 and AArch64 satisfy that; RISC-V interposes
+    /// `arch=riscv64`, so a healthy RISC-V boot scored zero split successes and a NEGATIVE broad
+    /// count. Nothing could have caught it, because the counter and the markers it read shared
+    /// only a hand-copied literal.
+    ///
+    /// Two structural properties close that, and both are pinned here rather than reimplemented
+    /// — a Rust copy of the matcher would be the very drift this guards against.
+    #[test]
+    fn the_nr11_witness_counter_is_committed_and_architecture_field_proof() {
+        const EVAL: &str = include_str!("../../../scripts/nr11-spawn-thread-oracle-eval.sh");
+        // (1) The architecture field is OPTIONAL in the pattern, so a marker that carries one and
+        //     a marker that does not both count.
+        assert!(
+            EVAL.contains("EXIT_TASK_ORACLE_SPAWNED( arch=[A-Za-z0-9_]+)? disposable_tid=([0-9]+)"),
+            "the witness pattern must tolerate an architecture field between the marker name and \
+             the TID"
+        );
+        // (2) The self-test derives the spellings it exercises FROM the userspace source that
+        //     emits them, so a new or changed marker is covered automatically instead of
+        //     silently zeroing its count.
+        assert!(
+            EVAL.contains("grep -aoE '\"EXIT_TASK_ORACLE_SPAWNED[^\"]*\"' \"$INIT_SRC\""),
+            "the self-test must derive marker spellings from the emitting source, not from \
+             literals typed into the evaluator"
+        );
+        // The three spellings that exist today, so a silent DELETION of an architecture's oracle
+        // marker is also caught.
+        for expected in [
+            "\"EXIT_TASK_ORACLE_SPAWNED disposable_tid={}\"",
+            "\"EXIT_TASK_ORACLE_SPAWNED arch=aarch64 disposable_tid={}\"",
+            "\"EXIT_TASK_ORACLE_SPAWNED arch=riscv64 disposable_tid={}\"",
+        ] {
+            assert!(
+                INIT_SRC.contains(expected),
+                "the exit oracle must still emit {expected}"
+            );
+        }
+    }
+}
+
+/// U9-SPAWN1 SP-3 — the spawn transaction's compensation ledger, proved by real failures.
+///
+/// Nothing here injects through a debug hook. Each phase is failed by arranging the condition
+/// that actually makes it fail — an exhausted task table, an exhausted ASID pool, a malformed
+/// image, an entry point of zero — so what is proved is the production owner's behaviour and not
+/// a test-only branch through it.
+#[cfg(test)]
+mod u9spawn1_sp3_spawn_ledger {
+    use super::*;
+    use crate::kernel::capabilities::{CNodeId, CapId};
+    use crate::kernel::syscall::spawn_image_txn::{
+        MAX_PROVISIONAL_SPAWN_RESOURCES, ProvisionalSpawnResource, SpawnImageRequest,
+        SpawnImageSource, SpawnLedger, run_image_spawn_transaction,
+    };
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::vm::{Asid, MAX_ADDRESS_SPACES};
+    use crate::runtime::SharedKernel;
+
+    const TXN_SRC: &str = include_str!("../syscall/spawn_image_txn.rs");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+
+    /// A real ELF64 image with one PT_LOAD segment, so the load phase runs the production loader
+    /// rather than a stub. `entry` is a parameter because an entry of zero is exactly how the
+    /// commit phase is made to fail.
+    pub(super) fn tiny_elf() -> alloc::vec::Vec<u8> {
+        const PAGE: usize = 0x1000;
+        let mut img = alloc::vec![0u8; PAGE + 0x40];
+        img[..4].copy_from_slice(b"\x7FELF");
+        img[4] = 2; // ELFCLASS64
+        img[5] = 1; // little endian
+        img[6] = 1; // EV_CURRENT
+        img[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        img[24..32].copy_from_slice(&0x40_0000u64.to_le_bytes()); // e_entry
+        img[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        img[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        img[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        img[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        let ph = 64;
+        img[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        img[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // R|X
+        img[ph + 8..ph + 16].copy_from_slice(&(PAGE as u64).to_le_bytes()); // p_offset
+        img[ph + 16..ph + 24].copy_from_slice(&0x40_0000u64.to_le_bytes()); // p_vaddr
+        img[ph + 24..ph + 32].copy_from_slice(&0x40_0000u64.to_le_bytes()); // p_paddr
+        img[ph + 32..ph + 40].copy_from_slice(&0x40u64.to_le_bytes()); // p_filesz
+        img[ph + 40..ph + 48].copy_from_slice(&(PAGE as u64).to_le_bytes()); // p_memsz
+        img[ph + 48..ph + 56].copy_from_slice(&(PAGE as u64).to_le_bytes()); // p_align
+        img
+    }
+
+    /// Everything a leak would move. Compared before and after each failing transaction.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Baseline {
+        tasks: usize,
+        address_spaces: usize,
+        free_frames: usize,
+        endpoints: usize,
+        spawner_caps: usize,
+    }
+
+    fn baseline(k: &SharedKernel) -> Baseline {
+        k.with(|s| {
+            let cnode = s.current_task_cnode();
+            Baseline {
+                tasks: s.with_tcbs(|tcbs| tcbs.iter().flatten().count()),
+                address_spaces: s.with_user_spaces(|spaces| {
+                    (0..MAX_ADDRESS_SPACES)
+                        .filter(|n| spaces.get(Asid(*n as u16)).is_some())
+                        .count()
+                }),
+                free_frames: s.with_memory_state(|m| m.frame_allocator.free_frames()),
+                endpoints: s.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count()),
+                spawner_caps: match cnode {
+                    Some(cnode) => s.with_capability_state(|cap| {
+                        cap.cnode_spaces
+                            .iter()
+                            .flatten()
+                            .filter(|space| space.id == cnode)
+                            .map(|space| {
+                                crate::kernel::boot::kernel_ref(&space.cspace).occupied_slots()
+                            })
+                            .sum::<usize>()
+                    }),
+                    None => 0,
+                },
+            }
+        })
+    }
+
+    /// A kernel with a live spawner, so the endpoint and capability phases mint into a real
+    /// cspace instead of being skipped.
+    fn fixture() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            assert!(
+                s.current_task_cnode().is_some(),
+                "the spawner must own a cspace, or the capability phases are not exercised"
+            );
+        });
+        k
+    }
+
+    fn run(
+        k: &SharedKernel,
+        elf: &[u8],
+        entry: usize,
+    ) -> Result<u64, crate::kernel::syscall::SyscallError> {
+        k.with(|s| {
+            run_image_spawn_transaction(
+                s,
+                SpawnImageRequest {
+                    image_id: 0,
+                    image_path: "init",
+                    source: SpawnImageSource::PtLoadSegments { elf, entry },
+                    class: TaskClass::SystemServer,
+                    parent_pid: 0,
+                    startup_args: [0u64; 18],
+                    extra_send_caps: [0u64; 4],
+                    map_initrd_window: false,
+                    lifecycle_markers: false,
+                },
+            )
+            .map(|c| c.tid)
+        })
+    }
+
+    /// The success path first, so the failure cases are known to be failing something that
+    /// otherwise works.
+    #[test]
+    fn a_committed_spawn_keeps_everything_it_acquired() {
+        let k = fixture();
+        let before = baseline(&k);
+        let elf = tiny_elf();
+        let tid = run(&k, &elf, 0x40_0000).expect("a well-formed spawn commits");
+        let after = baseline(&k);
+        assert_eq!(after.tasks, before.tasks + 1, "one live task");
+        assert_eq!(
+            after.address_spaces,
+            before.address_spaces + 1,
+            "one address space"
+        );
+        assert_eq!(after.endpoints, before.endpoints + 2, "two endpoints");
+        assert!(
+            after.spawner_caps > before.spawner_caps,
+            "the endpoint capabilities were minted into the spawner's cspace"
+        );
+        // The committed task is LIVE, not a leftover reservation.
+        let status = k.with(|s| s.task_status(tid));
+        assert!(
+            !matches!(status, Some(crate::kernel::task::TaskStatus::Reserved)),
+            "a committed spawn leaves a live task, not a reservation: {status:?}"
+        );
+    }
+
+    /// Phase 3 — the image. The transaction holds the reservation and the address space when the
+    /// loader refuses, and both must go back.
+    #[test]
+    fn a_failed_image_load_restores_the_baseline() {
+        let k = fixture();
+        let before = baseline(&k);
+        let junk = alloc::vec![0u8; 0x200];
+        let err = run(&k, &junk, 0x40_0000).expect_err("a malformed image cannot load");
+        assert_eq!(
+            baseline(&k),
+            before,
+            "failed load left something behind: {err:?}"
+        );
+    }
+
+    /// Phase 6 — the commit. This is the arm the old code could not undo at all: the reservation
+    /// is restored to `ReservedUnstarted` by `spawn_user_task_from_image` and then belonged to
+    /// nobody. By now the ledger is holding all eight provisional resources.
+    #[test]
+    fn a_failed_commit_restores_the_baseline() {
+        let k = fixture();
+        let before = baseline(&k);
+        let elf = tiny_elf();
+        // `spawn_image_after_claim` refuses an entry point of zero, AFTER the reservation has
+        // been claimed — so this fails at the last possible moment.
+        let err = run(&k, &elf, 0).expect_err("a zero entry point cannot be committed");
+        let after = baseline(&k);
+        assert_eq!(
+            (
+                after.tasks,
+                after.address_spaces,
+                after.endpoints,
+                after.spawner_caps
+            ),
+            (
+                before.tasks,
+                before.address_spaces,
+                before.endpoints,
+                before.spawner_caps
+            ),
+            "failed commit left something behind: {err:?}"
+        );
+
+        // Frames are the ONE thing that does not come back, and the reason is not the ledger.
+        // See `the_frame_the_unwind_cannot_reclaim_is_the_loaders_not_the_ledgers` below: the
+        // address-space teardown owner reclaims only MemoryObject-backed frames, so the page an
+        // ELF PT_LOAD lands in is lost whenever any address space is destroyed — spawn or not.
+        // The ledger calls the correct owner; the owner is incomplete.
+        assert_eq!(
+            before.free_frames - after.free_frames,
+            elf_load_frame_cost(),
+            "the only unrecovered frames are the loader's, and there is exactly one load here"
+        );
+    }
+
+    /// The frame the failed spawn does not get back is charged by the ELF loader and lost by the
+    /// address-space teardown owner — NOT by the compensation ledger. Proved by taking the ledger
+    /// out of the picture entirely: a bare create / load / destroy cycle, with no spawn, no
+    /// reservation, no endpoint and no transaction, loses exactly the same frame.
+    ///
+    /// The cause is that `destroy_user_address_space_by_asid` reclaims a drained mapping through
+    /// `note_mapping_removed` + `reclaim_memory_object_for_phys`, both of which are
+    /// MemoryObject-scoped. A page the loader took straight from the frame allocator has no
+    /// MemoryObject, so nothing ever returns it. Repairing that means teaching teardown which
+    /// drained frames are allocator-owned and which are borrowed — the zero-copy initramfs grants
+    /// are borrowed and freeing them would hand the boot initrd's own frames to the allocator —
+    /// which is a distinct backing-ownership repair, not a spawn compensation.
+    #[test]
+    fn the_frame_the_unwind_cannot_reclaim_is_the_loaders_not_the_ledgers() {
+        let k = fixture();
+        let elf = tiny_elf();
+        let free =
+            |k: &SharedKernel| k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        for _ in 0..3 {
+            let before = free(&k);
+            let (asid, cap) = k.with(|s| s.create_user_address_space().expect("an address space"));
+            k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("a load"));
+            k.with(|s| {
+                s.destroy_user_address_space_by_asid(asid)
+                    .expect("teardown");
+                let cnode = s.current_task_cnode().expect("spawner cspace");
+                let _ = s.revoke_capability_in_cnode(cnode, cap);
+            });
+            assert_eq!(
+                before - free(&k),
+                elf_load_frame_cost(),
+                "the cost is per address-space teardown and recurs, so it is a loader/teardown \
+                 defect rather than one-time capacity growth"
+            );
+        }
+    }
+
+    /// One PT_LOAD segment of one page. Named rather than inlined so the two tests above cannot
+    /// drift, and so raising it silently is impossible.
+    const fn elf_load_frame_cost() -> usize {
+        1
+    }
+
+    /// Phase 2 — the address space. With the ASID pool exhausted the transaction fails holding
+    /// only the reservation.
+    #[test]
+    fn a_failed_address_space_restores_the_baseline() {
+        let k = fixture();
+        // Exhaust the pool through the production owner.
+        k.with(|s| while s.create_user_address_space().is_ok() {});
+        let before = baseline(&k);
+        let elf = tiny_elf();
+        let err = run(&k, &elf, 0x40_0000).expect_err("no address space is available");
+        assert_eq!(
+            baseline(&k),
+            before,
+            "failed address-space phase left something behind: {err:?}"
+        );
+    }
+
+    /// Every ledger class is released by an owner that actually owns it. Built by hand so all
+    /// four variants are exercised in one unwind, including the reverse ordering.
+    #[test]
+    fn every_provisional_class_is_released_by_its_owner() {
+        let k = fixture();
+        let before = baseline(&k);
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let mut ledger = SpawnLedger::new();
+        k.with(|s| {
+            let token = s
+                .reserve_task_for_spawn_with_class(90_001, TaskClass::App)
+                .expect("a reservation");
+            ledger.record(ProvisionalSpawnResource::Reservation(token));
+            let (asid, aspace_cap) = s.create_user_address_space().expect("an address space");
+            ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
+            ledger.record(ProvisionalSpawnResource::Capability {
+                cnode,
+                cap: aspace_cap,
+            });
+            let (idx, send, recv) = s.create_endpoint(8).expect("an endpoint");
+            ledger.record(ProvisionalSpawnResource::Endpoint(idx));
+            ledger.record(ProvisionalSpawnResource::Capability { cnode, cap: send });
+            ledger.record(ProvisionalSpawnResource::Capability { cnode, cap: recv });
+        });
+        assert_eq!(ledger.len(), 6, "one entry per acquisition");
+        assert_ne!(baseline(&k), before, "the acquisitions must be observable");
+        k.with(|s| s.unwind_spawn_ledger(ledger));
+        assert_eq!(
+            baseline(&k),
+            before,
+            "every class went back through its owner"
+        );
+    }
+
+    /// Repeated cleanup is inert. The ledger cannot be unwound twice — it is consumed — so what
+    /// is proved here is the other half: a ledger naming resources that are ALREADY gone unwinds
+    /// without disturbing anything, which is what makes a stale entry harmless.
+    #[test]
+    fn unwinding_already_released_resources_is_inert() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let (token, asid, idx, send) = k.with(|s| {
+            let token = s
+                .reserve_task_for_spawn_with_class(90_002, TaskClass::App)
+                .expect("a reservation");
+            let (asid, _cap) = s.create_user_address_space().expect("an address space");
+            let (idx, send, _recv) = s.create_endpoint(8).expect("an endpoint");
+            (token, asid, idx, send)
+        });
+        // Release every one of them through its owner FIRST.
+        k.with(|s| {
+            s.cancel_spawn_reservation(token).expect("cancel");
+            s.destroy_user_address_space_by_asid(asid).expect("destroy");
+            s.destroy_endpoint(idx).expect("destroy");
+            let _ = s.revoke_capability_in_cnode(cnode, send);
+        });
+        let before = baseline(&k);
+        // Now unwind a ledger that still names them.
+        let mut ledger = SpawnLedger::new();
+        ledger.record(ProvisionalSpawnResource::Reservation(token));
+        ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
+        ledger.record(ProvisionalSpawnResource::Endpoint(idx));
+        ledger.record(ProvisionalSpawnResource::Capability { cnode, cap: send });
+        k.with(|s| s.unwind_spawn_ledger(ledger));
+        assert_eq!(
+            baseline(&k),
+            before,
+            "a stale ledger entry must release nothing — least of all a replacement occupant"
+        );
+    }
+
+    /// The capacity is exactly what one production spawn can hold, and the arithmetic is stated
+    /// where it can be checked rather than left as a magic number.
+    #[test]
+    fn the_ledger_capacity_covers_every_production_spawn_shape() {
+        // 1 reservation + 1 address space + 1 address-space capability + 2 endpoints
+        // + 2 × (send, recv) endpoint capabilities.
+        assert_eq!(MAX_PROVISIONAL_SPAWN_RESOURCES, 1 + 1 + 1 + 2 + 2 * 2);
+        let mut ledger = SpawnLedger::new();
+        for n in 0..MAX_PROVISIONAL_SPAWN_RESOURCES {
+            ledger.record(ProvisionalSpawnResource::Capability {
+                cnode: CNodeId(1),
+                cap: CapId(n as u64),
+            });
+        }
+        assert_eq!(
+            ledger.len(),
+            MAX_PROVISIONAL_SPAWN_RESOURCES,
+            "all recorded"
+        );
+    }
+
+    /// The reservation is the FIRST provisional resource. This is the ordering SP-3 changed: it
+    /// used to be taken just before the commit, which is why the commit's failure arm had no
+    /// token left to cancel with.
+    #[test]
+    fn the_reservation_precedes_the_first_address_space() {
+        let txn = TXN_SRC
+            .split("pub(crate) fn run_image_spawn_transaction(")
+            .nth(1)
+            .expect("the transaction body");
+        let reserve = txn
+            .find("reserve_task_for_spawn_with_class(tid, class)")
+            .expect("the reservation phase");
+        let aspace = txn
+            .find("create_user_address_space()")
+            .expect("the address-space phase");
+        let commit = txn
+            .find("spawn_user_task_from_image(")
+            .expect("the commit phase");
+        assert!(
+            reserve < aspace,
+            "the reservation must be taken before the first provisional address space"
+        );
+        assert!(
+            aspace < commit,
+            "and the commit stays last — it is the only step that publishes a reachable task"
+        );
+    }
+
+    /// No acquisition step may return through a bare `?`. That is precisely what leaked: a `?`
+    /// abandons whatever the transaction is already holding.
+    #[test]
+    fn no_acquisition_step_returns_through_a_bare_question_mark() {
+        let txn = TXN_SRC
+            .split("pub(crate) fn run_image_spawn_transaction(")
+            .nth(1)
+            .expect("the transaction body");
+        for acquisition in [
+            "reserve_task_for_spawn_with_class",
+            "create_user_address_space",
+            "load_elf_pt_load_segments",
+            "load_elf_with_mo_zero_copy",
+            "spawn_user_task_from_image",
+        ] {
+            let at = txn.find(acquisition).expect(acquisition);
+            let stmt: &str = &txn[at..txn[at..].find(";\n").map(|e| at + e).unwrap_or(txn.len())];
+            assert!(
+                stmt.starts_with(acquisition) || stmt.contains(acquisition),
+                "{acquisition} must be reachable"
+            );
+            assert!(
+                !stmt.contains(")?"),
+                "{acquisition} must hand its outcome to the ledger-aware `advance`, not to a \
+                 bare `?` that abandons everything already acquired"
+            );
+        }
+        // And every one of them goes through the one carrier.
+        assert!(
+            txn.matches("advance(kernel, ledger, outcome,").count() >= 5,
+            "each fallible acquisition is carried by the same ledger-aware step"
+        );
+    }
+
+    /// U9-SPAWN1 SP-4 stopped here, and this pins WHY so the boundary cannot go stale.
+    ///
+    /// Routing NR 23 off the terminal dispatchers needs every phase to run under one rank-local
+    /// lock. A process spawn creates a NEW process CNode, and the two capability-domain owners
+    /// that do it have no split variant at all — not a partial one, no presence in `runtime.rs`.
+    ///
+    /// This is the same boundary SP-2 stopped at, approached from the other side: the NR 11 route
+    /// is admissible precisely BECAUSE a thread joins its parent's EXISTING CNode, and its
+    /// pre-mutation gate declines outright when that CNode is absent rather than creating one.
+    ///
+    /// When someone builds those owners, this test fails and the blocker is genuinely gone.
+    #[test]
+    fn nr23_is_blocked_on_an_absent_process_cnode_owner() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for missing in ["ensure_cnode_space_with_slots", "set_process_cnode_for_pid"] {
+            assert!(
+                !RUNTIME_SRC.contains(missing),
+                "{missing} now has an off-lock caller — the SP-4 blocker may be gone; re-derive \
+                 the NR 23 phase table before trusting this note"
+            );
+        }
+        // And the NR 11 route still declines rather than creating one, which is what keeps it
+        // sound while NR 23 waits.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        let route = SPLIT_SRC
+            .split("fn try_split_spawn_thread_into_frame(")
+            .nth(1)
+            .expect("the NR 11 route");
+        let gate = route
+            .find("task_cnode_split(parent_tid)?")
+            .expect("the CNode gate");
+        let mutation = route
+            .find("try_spawn_thread_split(")
+            .expect("the first mutation");
+        assert!(
+            gate < mutation,
+            "the NR 11 route must decline on an absent process CNode BEFORE it mutates anything"
+        );
+    }
+
+    /// The four spawn syscalls delegate; none of them keeps a second, uncompensated copy of the
+    /// transaction.
+    #[test]
+    fn all_four_spawn_syscalls_delegate_to_the_one_transaction() {
+        assert_eq!(
+            PROCESS_SRC
+                .matches("spawn_image_txn::run_image_spawn_transaction(")
+                .count(),
+            4,
+            "NR 23, NR 24, NR 26 and NR 29 all commit through the one compensated transaction"
+        );
+        for abandoned in [
+            "create_user_address_space",
+            "reserve_task_for_spawn_with_class",
+            "spawn_user_task_from_image",
+            "create_endpoint(8)",
+        ] {
+            assert!(
+                !PROCESS_SRC.contains(abandoned),
+                "{abandoned} belongs to the transaction; a handler copy is an uncompensated \
+                 second acquisition"
+            );
+        }
     }
 }

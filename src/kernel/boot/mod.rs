@@ -57,6 +57,8 @@ mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
 pub(crate) mod shared_region_txn;
+/// U9-SPAWN1 SP-2: THE thread-incarnation lifecycle — allocate, register, undo.
+pub(crate) mod spawn_thread_core;
 mod task_core_state;
 mod task_policy_state;
 mod thread_state;
@@ -111,6 +113,11 @@ use crate::kernel::lock::SpinLockIrq;
 #[cfg(feature = "hosted-dev")]
 use alloc::collections::BTreeMap;
 use tid_allocation_policy::{TidAllocationCursor, TidAllocationPolicy};
+/// U9-SPAWN1 SP-2: the dynamic-TID cursor, re-exported for the `SharedKernel` spawn-thread
+/// seam. The cursor is task-domain state — see `with_task_tid_alloc_mut`.
+pub(crate) type TidAllocationCursorRef = TidAllocationCursor;
+/// U9-SPAWN1 SP-2: the allocation policy, read-only, for the same seam.
+pub(crate) type TidAllocationPolicyRef = TidAllocationPolicy;
 
 const MAX_ENDPOINTS: usize = 256;
 
@@ -3245,7 +3252,8 @@ pub fn aarch64_terminal_fault_oracle_enabled() -> bool {
 
 /// The init startup-slot-5 selector for the terminal-fault oracle. Slot-5 values 1-8 and 20 are
 /// already claimed on AArch64, so this takes the next clearly free value.
-pub const AARCH64_TERMINAL_FAULT_ORACLE_SELECTOR: u64 = 21;
+pub const AARCH64_TERMINAL_FAULT_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::terminal_fault_oracle_abi::AARCH64_TERMINAL_FAULT_SELECTOR as u64;
 
 /// Stage 196A: default-off RISC-V post-lock-drain FOUNDATION oracle selector.
 /// When enabled, the RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`)

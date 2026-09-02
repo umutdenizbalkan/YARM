@@ -28,28 +28,22 @@ impl KernelState {
             Self::requested_cnode_slot_capacity_for_class(class, limits, requested_cnode_slots)?;
         self.ensure_cnode_space_with_slots(cnode, cnode_slots)?;
         self.set_process_cnode_for_pid(process_pid, cnode)?;
-        // Allocate TCB slot under task_state_lock (rank 2) to prevent concurrent
-        // task creation from claiming the same slot.  task_classes is a companion
-        // array indexed in tandem with tcbs (same MAX_TASKS length, no separate
-        // lock); set it immediately after the TCB is inserted while the index is
-        // still in scope.
-        let inserted_idx = self.with_tcbs_mut(|tcbs| {
-            if let Some(idx) = tcbs.iter().position(|slot| slot.is_none()) {
-                let tcb = ThreadControlBlock::new(ThreadId(tid), None);
-                tcbs[idx] = Some(tcb);
-                Some(idx)
-            } else {
-                None
-            }
-        });
-        let Some(inserted_idx) = inserted_idx else {
-            return Err(KernelError::TaskTableFull);
-        };
-        // Set the class entry for the slot we just claimed.  task_state_lock is
-        // released here, but no other path can observe this slot until the class
-        // is set and provision_default_kernel_context completes.
-        super::kernel_mut(&mut self.task_classes)[inserted_idx] = Some(class);
-        self.provision_default_kernel_context(tid)?;
+        // U9-SPAWN1 SP-2: the task-domain half — free slot, TCB, class entry and the fixed
+        // per-slot kernel-stack range — is now ONE owner shared with the pre-lock route, taken
+        // in ONE task-lock acquisition. Previously the slot claim, the class write and
+        // `provision_default_kernel_context` were three separate acquisitions with the slot
+        // observable-but-classless in between; the owner closes that window as a side effect of
+        // having one home. The rank-4 CNode half above stays here, because a thread joining a
+        // live process needs it to be a no-op while a fresh process genuinely needs it done.
+        let _ = self.with_task_enqueue_policy_mut(|tcbs, classes| {
+            super::spawn_thread_core::register_thread_incarnation_locked(
+                tcbs,
+                classes,
+                tid,
+                class,
+                limits.max_tasks,
+            )
+        })?;
         Ok(())
     }
 
@@ -239,48 +233,37 @@ impl KernelState {
         });
     }
 
+    /// U9-SPAWN1 SP-2: the allocation rule moved to
+    /// [`super::spawn_thread_core::allocate_dynamic_tid_locked`], so the broad path and the
+    /// pre-lock route allocate from the SAME cursor under the SAME lock. The telemetry the
+    /// allocator owes is returned rather than written, and applied here at rank 10 — outside the
+    /// task lock, which is what keeps 2 → 10 from ever being held nested.
     pub fn allocate_thread_id(&mut self) -> Result<u64, KernelError> {
-        let limits = self.runtime_capacity_config();
-        if self.with_tcbs(|tcbs| tcbs.iter().flatten().count()) >= limits.max_tasks {
-            return Err(KernelError::TaskTableFull);
-        }
+        let max_tasks = self.runtime_capacity_config().max_tasks;
         let policy = self.tid_allocation_policy;
-        let raw_cursor = self.tid_allocation_cursor.raw_next_dynamic_tid();
-        let mut candidate = self.tid_allocation_cursor.next_dynamic_tid(policy);
-        if raw_cursor < policy.dynamic_tid_floor() {
-            self.with_telemetry_state_mut(|telemetry| {
-                telemetry.tid_allocation.gap_floor_repairs =
-                    telemetry.tid_allocation.gap_floor_repairs.saturating_add(1);
-            });
+        let (tid, delta) = self.with_task_tid_alloc_mut(|tcbs, cursor| {
+            super::spawn_thread_core::allocate_dynamic_tid_locked(tcbs, cursor, policy, max_tasks)
+        })?;
+        self.apply_tid_allocation_delta(delta);
+        Ok(tid)
+    }
+
+    /// Apply one allocation's telemetry, at rank 10, with the task lock released.
+    pub(crate) fn apply_tid_allocation_delta(
+        &mut self,
+        delta: super::spawn_thread_core::TidAllocationDelta,
+    ) {
+        if delta == super::spawn_thread_core::TidAllocationDelta::default() {
+            return;
         }
-        for _ in 0..=limits.max_tasks {
-            debug_assert!(candidate > policy.static_tid_upper_bound());
-            if self.task_status(candidate).is_none() {
-                let wraps = policy.advance_dynamic_cursor(candidate) == policy.dynamic_tid_floor();
-                self.tid_allocation_cursor
-                    .advance_after_allocation(policy, candidate);
-                self.with_telemetry_state_mut(|telemetry| {
-                    telemetry.tid_allocation.dynamic_tid_allocations = telemetry
-                        .tid_allocation
-                        .dynamic_tid_allocations
-                        .saturating_add(1);
-                    if wraps {
-                        telemetry.tid_allocation.dynamic_tid_wraps =
-                            telemetry.tid_allocation.dynamic_tid_wraps.saturating_add(1);
-                    }
-                });
-                if wraps {
-                    crate::yarm_log!(
-                        "YARM_TID_ALLOC_WRAP allocated={} reset_cursor_to={}",
-                        candidate,
-                        policy.dynamic_tid_floor()
-                    );
-                }
-                return Ok(candidate);
-            }
-            candidate = policy.advance_dynamic_cursor(candidate);
-        }
-        Err(KernelError::TaskTableFull)
+        self.with_telemetry_state_mut(|telemetry| {
+            let t = &mut telemetry.tid_allocation;
+            t.gap_floor_repairs = t.gap_floor_repairs.saturating_add(delta.gap_floor_repairs);
+            t.dynamic_tid_allocations = t
+                .dynamic_tid_allocations
+                .saturating_add(delta.dynamic_tid_allocations);
+            t.dynamic_tid_wraps = t.dynamic_tid_wraps.saturating_add(delta.dynamic_tid_wraps);
+        });
     }
 
     #[cfg(test)]

@@ -2277,6 +2277,13 @@ fn try_split_dispatch_nonswitching_into_frame(
     // non-empty file, provisioned cspace) can only be decided inside the helper. Every case it
     // declines BEFORE its first mutation returns `None`, which propagates UNCHANGED back to the
     // global-lock fallback below; after the mutation it never declines.
+    // U9-SPAWN1 SP-2: `SpawnThread` (NR 11) is routed to its own pre-lock owner. Every case it
+    // declines BEFORE its first mutation returns `None` and propagates UNCHANGED to the
+    // global-lock fallback below; after the mutation it never declines.
+    if matches!(syscall, Syscall::SpawnThread) {
+        return try_split_spawn_thread_into_frame(shared, cpu, frame);
+    }
+
     if matches!(syscall, Syscall::CreateInitramfsFileSliceMo) {
         return try_split_create_initramfs_mo_into_frame(shared, cpu, frame);
     }
@@ -3521,6 +3528,51 @@ pub(crate) fn try_split_vm_brk_shrink_into_frame(
     shared.try_split_vm_brk_shrink_into_frame(cpu, frame)
 }
 
+/// U9-SPAWN1 SP-2 — the pre-lock NR 11 (`SpawnThread`) route.
+///
+/// NR 11 is the smallest member of the spawn family: it creates no address space, loads no ELF,
+/// mints no capability, creates no endpoint, maps no page and never switches tasks. Its whole
+/// body is rank 2 followed by rank 1, which is why it lands in the NON-SWITCHING lane where
+/// `entering_tid == exiting_tid` and `task_switched == false` hold for the existing architecture
+/// writeback on all three targets — the same lane NR 15 and NR 28 already use. No new resume
+/// consumer, no queue-advance publication, no arch-specific adapter.
+///
+/// The disposition is exhaustive in the direction that matters. Two refusals may still fall back
+/// — an unavailable requester, and a parent whose process CNode does not yet exist, which the
+/// broad handler would create. Both are reads. Everything after the first mutation is terminal:
+/// the transaction compensates its own incarnation and returns the exact error the broad handler
+/// would have returned, because falling back would let the broad handler spawn a SECOND thread
+/// for a request it never saw refused.
+fn try_split_spawn_thread_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError};
+
+    // ── Pre-mutation. Both refusals here are reads and may still fall back. ──
+    let parent_tid = shared.current_tid_authoritative(cpu)?;
+    // A thread joins its parent's EXISTING process CNode; registration only ever ensures it.
+    // If it is somehow absent the broad handler must create it, so decline before mutating.
+    shared.task_cnode_split(parent_tid)?;
+
+    let tls_base = frame.arg(SYSCALL_ARG_CAP);
+    let user_stack_top = frame.arg(SYSCALL_ARG_PTR);
+    let user_entry = frame.arg(SYSCALL_ARG_LEN);
+
+    // ── The transaction. From here every outcome is terminal. ──
+    match shared.try_spawn_thread_split(cpu, parent_tid, tls_base, user_stack_top, user_entry) {
+        Ok(tid) => {
+            let Ok(ret) = usize::try_from(tid) else {
+                return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+            };
+            frame.set_ok(ret, 0, 0);
+            Some(Ok(()))
+        }
+        Err(err) => Some(Err(TrapHandleError::Syscall(SyscallError::from(err)))),
+    }
+}
+
 /// U9-MO2 §4 — the pre-lock NR 28 (`CreateInitramfsFileSliceMo`) route.
 ///
 /// NR 28 was the smallest live production class still reaching a terminal broad acquisition. Its
@@ -3695,6 +3747,10 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // still reaching a terminal broad acquisition. Its object is BORROWED initrd backing, so
         // its compensation never touches the frame allocator; every owner it needs already exists
         // off-lock. `try_split_create_initramfs_mo_into_frame` decides the rest.
+        // U9-SPAWN1 SP-2: SpawnThread (NR 11) — the smallest spawn-family class. Its whole body
+        // is rank 2 then rank 1: no address space, no ELF, no endpoint, no capability, no VM
+        // work and no task switch. `try_split_spawn_thread_into_frame` decides the rest.
+        Syscall::SpawnThread => Some(syscall),
         Syscall::CreateInitramfsFileSliceMo => Some(syscall),
         // Stage 197A removed the former NR 27 InitramfsReadChunk split class along with the
         // syscall. Its sibling note — that NR 28 MINTS a capability and therefore "stays
@@ -4260,10 +4316,20 @@ mod tests {
             matches!(decode(SYSCALL_FUTEX_WAKE_NR), Syscall::FutexWake),
             "NR 10 must decode to FutexWake"
         );
-        // Only FutexWake (NR 10) passes the NR-only split gate.
+        // U9-SPAWN1 SP-2: this guard's subject is the NR-IDENTITY confusion above — the Stage
+        // 195C task text called FutexWake "NR11", and NR 11 is SpawnThread. That pinning is
+        // unchanged. What changed is the eligibility line: NR 11 is now admitted in its own
+        // right, for a reason that has nothing to do with NR 10's, so the guard asserts the
+        // DISTINCTION rather than a shared exclusion.
+        //
+        // NR 10 (FutexWake) and NR 11 (SpawnThread) are both non-switching and both admitted.
+        // NR 9 (FutexWait) BLOCKS the caller and is still excluded from the non-switching gate.
         assert!(classify_split_eligible_nr_only(decode(SYSCALL_FUTEX_WAKE_NR)).is_some());
-        assert!(classify_split_eligible_nr_only(decode(SYSCALL_FUTEX_WAIT_NR)).is_none());
-        assert!(classify_split_eligible_nr_only(decode(SYSCALL_SPAWN_THREAD_NR)).is_none());
+        assert!(classify_split_eligible_nr_only(decode(SYSCALL_SPAWN_THREAD_NR)).is_some());
+        assert!(
+            classify_split_eligible_nr_only(decode(SYSCALL_FUTEX_WAIT_NR)).is_none(),
+            "FutexWait blocks the caller and must stay off the non-switching gate"
+        );
     }
 
     #[test]
@@ -4275,8 +4341,8 @@ mod tests {
     fn stage29_whitelist_exhaustive() {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
         // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A),
-        // NR 10 (FutexWake, Stage 191B) and NR 28 (CreateInitramfsFileSliceMo,
-        // U9-MO2 §4) may pass the NR-only split-eligibility gate.
+        // NR 10 (FutexWake, Stage 191B), NR 28 (CreateInitramfsFileSliceMo, U9-MO2 §4)
+        // and NR 11 (SpawnThread, U9-SPAWN1 SP-2) may pass the NR-only split-eligibility gate.
         // (Stage 197A removed NR 27 InitramfsReadChunk from the whitelist and the ABI.)
         // Every other syscall stays global-lock-only. This is an EXHAUSTIVE sweep of the
         // whole NR space, so it is the guard that would catch a sixth admission arriving
@@ -4292,6 +4358,7 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
                 || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
                 || nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
+                || nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {

@@ -528,15 +528,17 @@ impl KernelState {
         sched.timer.tick_and_check()
     }
 
+    /// U9-SPAWN1 SP-1: the class→priority rule itself moved to
+    /// [`crate::kernel::task_enqueue::priority_for_class`], so this is now the TID-0 sentinel
+    /// and the class lookup only. Retained because it is the readable spelling of "what
+    /// priority would this task get", but it is no longer a second copy of the rule.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn task_priority(&self, tid: u64) -> Result<TaskPriority, KernelError> {
         if tid == 0 {
             return Ok(TaskPriority::Normal);
         }
         let class = self.task_class(tid).ok_or(KernelError::TaskMissing)?;
-        Ok(match class {
-            TaskClass::SystemServer => TaskPriority::High,
-            TaskClass::Driver | TaskClass::App => TaskPriority::Normal,
-        })
+        Ok(crate::kernel::task_enqueue::priority_for_class(class))
     }
 
     fn task_cpu_affinity(&self, tid: u64) -> Result<Option<CpuId>, KernelError> {
@@ -575,76 +577,41 @@ impl KernelState {
         self.task_cpu_affinity(tid).ok().flatten()
     }
 
-    fn ensure_driver_affinity(&mut self, tid: u64) -> Result<(), KernelError> {
-        if tid == 0 {
-            return Ok(());
-        }
-        let current_cpu = self.current_cpu();
-        let class = self.task_class(tid).ok_or(KernelError::TaskMissing)?;
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            if class == TaskClass::Driver && tcb.cpu_affinity.is_none() {
-                tcb.cpu_affinity = Some(current_cpu);
-            }
-            Ok(())
-        })
-    }
+    // Stage 199D-WA3B's `refuse_enqueue_of_spawn_reservation` moved to
+    // `crate::kernel::task_enqueue::refuse_reservation_locked` in U9-SPAWN1 SP-1. Its reason is
+    // unchanged and worth restating where the enqueue lives: the run queue carries bare TIDs
+    // with no status precondition, so the enqueue seam is the only place that can keep a
+    // `Reserved` task out of it — which is why the refusal must sit inside the ONE planner every
+    // caller now goes through, rather than in each caller.
 
-    /// Stage 199D-WA3B: refuse to make a non-live spawn reservation scheduler-visible.
+    /// U9-SPAWN1 SP-1: the composition moved to [`crate::kernel::task_enqueue`]. The rank-2
+    /// half — reservation refusal, driver-affinity pin, class→priority, affinity read — is one
+    /// planner; the rank-1 half is one committer. Under the broad lock both ranks are already
+    /// held, so this reads as two calls; a split caller takes them as two separate acquisitions
+    /// with rank 2 RELEASED before rank 1. Same policy, one definition.
     ///
-    /// This is the structural half of "a reservation cannot be selected or enqueued": the run
-    /// queue carries bare TIDs with no status precondition, so the only place that can keep a
-    /// `Reserved` task out of it is the enqueue seam itself. Every enqueue path goes through
-    /// here, and the typed live commit is what clears `Reserved` — so a reservation becomes
-    /// enqueueable at exactly the moment it stops being a reservation, and not before.
-    fn refuse_enqueue_of_spawn_reservation(&self, tid: u64) -> Result<(), KernelError> {
-        let reserved = self.with_tcbs(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .is_some_and(|tcb| tcb.is_spawn_reservation())
-        });
-        if reserved {
-            crate::yarm_log!(
-                "ENQUEUE_REFUSED tid={} reason=spawn_reservation_not_live",
-                tid
-            );
-            return Err(KernelError::WrongObject);
-        }
-        Ok(())
-    }
-
+    /// Stage 195D is preserved by delegation: `EnqueueTarget::Balanced` still reaches
+    /// `enqueue_balanced`, which picks the least-loaded NON-wake-only online CPU, so an
+    /// unpinned user task lands on the BSP dispatcher queue rather than stranding on a
+    /// non-dispatching AArch64 AP.
     pub(crate) fn enqueue_task(&mut self, tid: u64) -> Result<CpuId, KernelError> {
-        self.refuse_enqueue_of_spawn_reservation(tid)?;
-        self.ensure_driver_affinity(tid)?;
-        let priority = self.task_priority(tid)?;
+        let current_cpu = self.current_cpu();
+        let plan = self.with_task_enqueue_policy_mut(|tcbs, classes| {
+            crate::kernel::task_enqueue::plan_balanced_enqueue_locked(
+                tcbs,
+                classes,
+                tid,
+                current_cpu,
+            )
+        })?;
         let mut sched = self.scheduler_state();
-        let cpu = if let Some(cpu) = self.task_cpu_affinity(tid)? {
-            kernel_mut(&mut sched.scheduler)
-                .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
-                .map_err(map_scheduler_error)?;
-            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
-            }
-            cpu
-        } else {
-            // Stage 195D: `enqueue_balanced` picks the least-loaded NON-wake-only online CPU.
-            // On AArch64 every AP is wake-only (BSP dispatch affinity), so a balanced,
-            // unpinned user task (e.g. a `SpawnThread` child) is placed on the BSP dispatcher
-            // queue instead of stranding on a non-dispatching AP — the invariant that the
-            // 195C oracle needed SMP=1 to sidestep.
-            let cpu = kernel_mut(&mut sched.scheduler)
-                .enqueue_balanced(ThreadId(tid), priority)
-                .map_err(map_scheduler_error)?;
-            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
-            }
-            cpu
-        };
+        let cpu = crate::kernel::task_enqueue::commit_enqueue_locked(
+            kernel_mut(&mut sched.scheduler),
+            &plan,
+        )?;
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
+        }
         // Stage 195D (BSP DISPATCH AFFINITY): pin the placement proof for AArch64 user tasks.
         // Under BSP-only user dispatch this must always be the BSP (cpu 0); a runnable user
         // task is never left exclusively on a wake-only AP queue.
@@ -666,9 +633,13 @@ impl KernelState {
         Ok((cpu, "current_cpu"))
     }
 
+    /// U9-SPAWN1 SP-1: the task-domain half is now the shared pinned planner. `enqueue_on_cpu`
+    /// deliberately does NOT pin driver affinity and does NOT read `cpu_affinity` — it enqueues
+    /// where it is told — so it uses `plan_pinned_enqueue_locked`, not the balanced twin.
     pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
-        self.refuse_enqueue_of_spawn_reservation(tid)?;
-        let priority = self.task_priority(tid)?;
+        let plan = self.with_task_enqueue_policy_mut(|tcbs, classes| {
+            crate::kernel::task_enqueue::plan_pinned_enqueue_locked(tcbs, classes, tid, cpu)
+        })?;
         let current_cpu = self.current_cpu();
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
@@ -696,9 +667,10 @@ impl KernelState {
             }
         }
         let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler)
-            .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
-            .map_err(map_scheduler_error)?;
+        crate::kernel::task_enqueue::commit_enqueue_locked(
+            kernel_mut(&mut sched.scheduler),
+            &plan,
+        )?;
         if tid == BOOTSTRAP_FIRST_USER_TID && cfg!(not(feature = "hosted-dev")) {
             let queue0 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(0));
             let queue1 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(1));

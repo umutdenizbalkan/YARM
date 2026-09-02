@@ -7,15 +7,15 @@
 //! behavior change. `syscall.rs` keeps minimal delegation shims so dispatch arms
 //! and source-grep guard rails remain stable.
 
+use super::spawn_image_txn;
 use super::{
     PM_BOOTSTRAP_TID, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_LEN,
     SYSCALL_ARG_PTR, SyscallError, current_tid, validate_user_region,
 };
 use crate::kernel::boot::{KernelError, KernelState, MemoryObjectKind, UserImageSpec};
-use crate::kernel::capabilities::{CapId, CapObject, CapRights};
+use crate::kernel::capabilities::{CapId, CapObject};
 use crate::kernel::task::TaskClass;
 use crate::kernel::trapframe::TrapFrame;
-use crate::kernel::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use yarm_srv_common::{cpio::CpioArchive, elf::ElfImageInfo};
 
 pub(super) fn handle_spawn_thread(
@@ -125,28 +125,6 @@ pub(super) fn handle_spawn_process(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    fn normalize_initrd_phys_ptr(raw_ptr: u64) -> Result<u64, SyscallError> {
-        let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
-        let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
-        if virt_base > phys_base && raw_ptr >= virt_base {
-            let off = raw_ptr
-                .checked_sub(virt_base)
-                .ok_or(SyscallError::Internal)?;
-            let phys = phys_base.checked_add(off).ok_or(SyscallError::Internal)?;
-            return Ok(phys);
-        }
-        if raw_ptr < virt_base || virt_base == phys_base {
-            return Ok(raw_ptr);
-        }
-        crate::yarm_log!(
-            "INITRAMFS_INITRD_ADDR_INVALID raw_ptr=0x{:x} virt_base=0x{:x} phys_base=0x{:x}",
-            raw_ptr,
-            virt_base,
-            phys_base
-        );
-        Err(SyscallError::InvalidArgs)
-    }
-
     let image_id = frame.arg(SYSCALL_ARG_CAP) as u64;
     let parent_pid = frame.arg(SYSCALL_ARG_PTR) as u64;
     let startup_args_ptr = frame.arg(SYSCALL_ARG_LEN);
@@ -157,24 +135,11 @@ pub(super) fn handle_spawn_process(
         parent_pid,
         startup_args_count
     );
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    startup_args[2] = 0;
-    let extra_send_caps = [
-        startup_args[13],
-        startup_args[14],
-        startup_args[15],
-        startup_args[16],
-    ];
-    startup_args[12] = 0;
-    startup_args[13] = 0;
-    startup_args[14] = 0;
-    startup_args[15] = 0;
-    startup_args[16] = 0;
-    // For initramfs_srv (image_id=4), we will map the boot initrd read-only
-    // into its address space and pass the user VA + length via startup slots 15/16.
-    // The mapping happens after the ASID is created below.
+    let (startup_args, extra_send_caps) =
+        normalized_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    // For initramfs_srv (image_id=4) the transaction maps the boot initrd read-only into its
+    // address space after the load, publishing the user VA + length in startup slots 15/16.
     const INITRAMFS_IMAGE_ID: u64 = 4;
-    const INITRD_USER_VA_BASE: u64 = 0x0C00_0000;
     let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
     crate::yarm_log!("KSPAWN_PATH path={}", image_path);
     let initrd =
@@ -187,210 +152,24 @@ pub(super) fn handle_spawn_process(
     crate::yarm_log!("KSPAWN_ELF_FOUND size={}", elf_bytes.len());
     let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
     crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
-    let tid = kernel.allocate_thread_id().map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=allocate_tid err={:?}", err);
-        SyscallError::from(err)
-    })?;
-    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=create_asid err={:?}", err);
-        SyscallError::from(err)
-    })?;
-    crate::yarm_log!("KSPAWN_ASID_OK tid={} asid={}", tid, asid.0);
-    kernel
-        .load_elf_pt_load_segments(asid, elf_bytes)
-        .map_err(|err| {
-            crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
-            SyscallError::from(err)
-        })?;
-    crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
-
-    // Map boot initrd pages read-only into initramfs_srv (image_id=4).
-    // This provides the CPIO data in userspace without syscall bridge.
-    if image_id == INITRAMFS_IMAGE_ID {
-        if let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() {
-            let initrd_virt_raw = initrd.as_ptr() as u64;
-            let initrd_phys_raw = normalize_initrd_phys_ptr(initrd_virt_raw)?;
-            let initrd_len = initrd.len() as u64;
-            let mut first6 = [0u8; 6];
-            let first6_len = core::cmp::min(initrd.len(), first6.len());
-            first6[..first6_len].copy_from_slice(&initrd[..first6_len]);
-            crate::yarm_log!(
-                "INITRAMFS_INITRD_SOURCE_RANGE raw_ptr=0x{:x} phys_start=0x{:x} len={}",
-                initrd_virt_raw,
-                initrd_phys_raw,
-                initrd_len
-            );
-            crate::yarm_log!("INITRAMFS_INITRD_FIRST6 bytes={:?}", first6);
-            let page: u64 = PAGE_SIZE as u64;
-            let phys_start = initrd_phys_raw & !(page - 1);
-            let phys_end = (initrd_phys_raw + initrd_len + page - 1) & !(page - 1);
-            let pages_to_map = ((phys_end - phys_start) / page) as usize;
-            let initrd_offset_in_first_page = (initrd_phys_raw - phys_start) as u64;
-            crate::yarm_log!(
-                "INITRAMFS_INITRD_MAP_BEGIN phys_start=0x{:x} phys_end=0x{:x} len={} pages={}",
-                phys_start,
-                phys_end,
-                initrd_len,
-                pages_to_map
-            );
-            let initrd_flags = PageFlags {
-                read: true,
-                write: false,
-                execute: false,
-                user: true,
-                cache_policy: CachePolicy::WriteBack,
-            };
-            let mut map_ok = true;
-            for i in 0..pages_to_map {
-                let virt = VirtAddr(INITRD_USER_VA_BASE + (i as u64) * page);
-                let phys = PhysAddr(phys_start + (i as u64) * page);
-                if let Err(e) = kernel.map_user_page_in_asid_raw(
-                    asid,
-                    virt,
-                    Mapping {
-                        phys,
-                        flags: initrd_flags,
-                    },
-                ) {
-                    crate::yarm_log!(
-                        "INITRAMFS_INITRD_MAP_FAIL page={} virt=0x{:x} err={:?}",
-                        i,
-                        virt.0,
-                        e
-                    );
-                    map_ok = false;
-                    break;
-                }
-            }
-            if map_ok {
-                let user_initrd_ptr = INITRD_USER_VA_BASE + initrd_offset_in_first_page;
-                startup_args[15] = user_initrd_ptr;
-                startup_args[16] = initrd_len;
-                crate::yarm_log!(
-                    "INITRAMFS_INITRD_MAP_DONE user_ptr=0x{:x} len={} rights=ro",
-                    user_initrd_ptr,
-                    initrd_len
-                );
-            }
-        } else {
-            crate::yarm_log!("INITRAMFS_INITRD_MAP_SKIP reason=no_boot_initrd");
-        }
-    }
-
-    let spawner_tid = current_tid(kernel).unwrap_or(0);
-    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
-        Ok((_, send_cap, recv_cap)) => {
-            crate::yarm_log!(
-                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid,
-                send_cap.0,
-                recv_cap.0
-            );
-            (send_cap.0, recv_cap.0)
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
-            (0u64, 0u64)
-        }
-    };
-    let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((eid, _, recv_cap)) => {
-            crate::yarm_log!(
-                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
-                eid,
-                recv_cap.0
-            );
-            recv_cap.0
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
-            0u64
-        }
-    };
-    // If the caller supplied a parent_pid, grant a SEND copy of the new endpoint
-    // into the parent's cnode and return that local cap so the parent can use it
-    // directly without going through the spawner.
-    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
-        match kernel.grant_capability_task_to_task_with_rights(
-            spawner_tid,
-            CapId(service_send_cap),
-            parent_pid,
-            CapRights::SEND,
-        ) {
-            Ok(cap) => {
-                crate::yarm_log!(
-                    "KSPAWN_PARENT_SEND_DELEGATED parent_tid={} cap={}",
-                    parent_pid,
-                    cap.0
-                );
-                cap.0
-            }
-            Err(e) => {
-                crate::yarm_log!(
-                    "KSPAWN_PARENT_SEND_DELEGATE_FAIL parent_tid={} err={:?}",
-                    parent_pid,
-                    e
-                );
-                service_send_cap
-            }
-        }
-    } else {
-        service_send_cap
-    };
-
-    crate::yarm_log!(
-        "KSPAWN_BEFORE_SPAWN_TASK tid={} asid={} entry=0x{:x} parent_pid={} args_count={}",
-        tid,
-        asid.0,
-        elf.entry,
-        parent_pid,
-        startup_args_count
-    );
-    // Stage 199D-WA3B: this site has no pre-spawn setup, so it reserves immediately before the
-    // spawn and consumes that exact reservation. `tid` came from `allocate_thread_id`, so the
-    // reservation refuses if anything already occupies it — the overwrite contract is gone.
-    let reservation = kernel
-        .reserve_task_for_spawn_with_class(tid, TaskClass::SystemServer)
-        .map_err(SyscallError::from)?;
-    let spawned = kernel
-        .spawn_user_task_from_image(
-            reservation,
-            UserImageSpec {
-                tid,
+    let committed = spawn_image_txn::run_image_spawn_transaction(
+        kernel,
+        spawn_image_txn::SpawnImageRequest {
+            image_id,
+            image_path,
+            source: spawn_image_txn::SpawnImageSource::PtLoadSegments {
+                elf: elf_bytes,
                 entry: elf.entry as usize,
-                asid: Some(asid),
-                class: TaskClass::SystemServer,
-                startup_args,
-                spawner_tid,
-                service_recv_cap,
-                service_reply_recv_cap,
-                extra_send_caps,
             },
-        )
-        .map_err(|err| {
-            crate::yarm_log!(
-                "KSPAWN_SPAWN_TASK_FAIL tid={} asid={} err={:?}",
-                tid,
-                asid.0,
-                err
-            );
-            SyscallError::from(err)
-        })?;
-    crate::yarm_log!("KSPAWN_TASK_READY tid={}", spawned.tid);
-    // When parent delegation occurred, pack both the spawner's own send cap (high
-    // 32 bits) and the parent-delegated cap (low 32 bits) into ret2 so the
-    // spawner can use its own copy while forwarding the parent's copy.
-    let packed_ret2 =
-        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-        } else {
-            caller_send_cap as u64
-        };
-    frame.set_ok(
-        0,
-        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        packed_ret2 as usize,
-    );
+            class: TaskClass::SystemServer,
+            parent_pid,
+            startup_args,
+            extra_send_caps,
+            map_initrd_window: image_id == INITRAMFS_IMAGE_ID,
+            lifecycle_markers: false,
+        },
+    )?;
+    frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
     Ok(())
 }
 
@@ -503,142 +282,26 @@ pub(super) fn handle_spawn_process_from_user_buf(
     crate::yarm_log!("KSPAWN_PATH path={}", image_path);
     let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
     crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    startup_args[2] = 0;
-    let extra_send_caps = [
-        startup_args[13],
-        startup_args[14],
-        startup_args[15],
-        startup_args[16],
-    ];
-    startup_args[12] = 0;
-    startup_args[13] = 0;
-    startup_args[14] = 0;
-    startup_args[15] = 0;
-    startup_args[16] = 0;
-    let tid = kernel.allocate_thread_id().map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=allocate_tid err={:?}", err);
-        SyscallError::from(err)
-    })?;
-    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=create_asid err={:?}", err);
-        SyscallError::from(err)
-    })?;
-    crate::yarm_log!("KSPAWN_ASID_OK tid={} asid={}", tid, asid.0);
-    kernel
-        .load_elf_pt_load_segments(asid, elf_bytes)
-        .map_err(|err| {
-            crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
-            SyscallError::from(err)
-        })?;
-    crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
-    let spawner_tid = current_tid(kernel).unwrap_or(0);
-    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
-        Ok((_, send_cap, recv_cap)) => {
-            crate::yarm_log!(
-                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid,
-                send_cap.0,
-                recv_cap.0
-            );
-            (send_cap.0, recv_cap.0)
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
-            (0u64, 0u64)
-        }
-    };
-    let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((eid, _, recv_cap)) => {
-            crate::yarm_log!(
-                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
-                eid,
-                recv_cap.0
-            );
-            recv_cap.0
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
-            0u64
-        }
-    };
-    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
-        match kernel.grant_capability_task_to_task_with_rights(
-            spawner_tid,
-            CapId(service_send_cap),
-            parent_pid,
-            CapRights::SEND,
-        ) {
-            Ok(cap) => {
-                crate::yarm_log!(
-                    "KSPAWN_PARENT_SEND_DELEGATED parent_tid={} cap={}",
-                    parent_pid,
-                    cap.0
-                );
-                cap.0
-            }
-            Err(e) => {
-                crate::yarm_log!(
-                    "KSPAWN_PARENT_SEND_DELEGATE_FAIL parent_tid={} err={:?}",
-                    parent_pid,
-                    e
-                );
-                service_send_cap
-            }
-        }
-    } else {
-        service_send_cap
-    };
-    crate::yarm_log!(
-        "KSPAWN_BEFORE_SPAWN_TASK tid={} asid={} entry=0x{:x} parent_pid={} args_count={}",
-        tid,
-        asid.0,
-        elf.entry,
-        parent_pid,
-        startup_args_count
-    );
-    // Stage 199D-WA3B: this site has no pre-spawn setup, so it reserves immediately before the
-    // spawn and consumes that exact reservation. `tid` came from `allocate_thread_id`, so the
-    // reservation refuses if anything already occupies it — the overwrite contract is gone.
-    let reservation = kernel
-        .reserve_task_for_spawn_with_class(tid, TaskClass::SystemServer)
-        .map_err(SyscallError::from)?;
-    let spawned = kernel
-        .spawn_user_task_from_image(
-            reservation,
-            UserImageSpec {
-                tid,
+    let (startup_args, extra_send_caps) =
+        normalized_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    let committed = spawn_image_txn::run_image_spawn_transaction(
+        kernel,
+        spawn_image_txn::SpawnImageRequest {
+            image_id,
+            image_path,
+            source: spawn_image_txn::SpawnImageSource::PtLoadSegments {
+                elf: elf_bytes,
                 entry: elf.entry as usize,
-                asid: Some(asid),
-                class: TaskClass::SystemServer,
-                startup_args,
-                spawner_tid,
-                service_recv_cap,
-                service_reply_recv_cap,
-                extra_send_caps,
             },
-        )
-        .map_err(|err| {
-            crate::yarm_log!(
-                "KSPAWN_SPAWN_TASK_FAIL tid={} asid={} err={:?}",
-                tid,
-                asid.0,
-                err
-            );
-            SyscallError::from(err)
-        })?;
-    crate::yarm_log!("KSPAWN_TASK_READY tid={}", spawned.tid);
-    let packed_ret2 =
-        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-        } else {
-            caller_send_cap as u64
-        };
-    frame.set_ok(
-        0,
-        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        packed_ret2 as usize,
-    );
+            class: TaskClass::SystemServer,
+            parent_pid,
+            startup_args,
+            extra_send_caps,
+            map_initrd_window: false,
+            lifecycle_markers: false,
+        },
+    )?;
+    frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
     Ok(())
 }
 
@@ -743,144 +406,27 @@ pub(super) fn handle_spawn_from_initramfs_file(
         );
     }
 
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    startup_args[2] = 0;
-    let extra_send_caps = [
-        startup_args[13],
-        startup_args[14],
-        startup_args[15],
-        startup_args[16],
-    ];
-    startup_args[12] = 0;
-    startup_args[13] = 0;
-    startup_args[14] = 0;
-    startup_args[15] = 0;
-    startup_args[16] = 0;
-
-    let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
-    let (asid, _aspace_cap) = kernel
-        .create_user_address_space()
-        .map_err(SyscallError::from)?;
-    crate::yarm_log!("KSPAWN_FROM_CPIO tid={} asid={}", tid, asid.0);
-    if spawn_lc {
-        crate::yarm_log!(
-            "SPAWN_LIFECYCLE_ASPACE_CREATE_OK tid={} asid={}",
-            tid,
-            asid.0
-        );
-        crate::yarm_log!("SPAWN_LIFECYCLE_ELF_LOAD_BEGIN tid={} asid={}", tid, asid.0);
-    }
-
-    kernel
-        .load_elf_pt_load_segments(asid, elf_bytes)
-        .map_err(SyscallError::from)?;
-    if spawn_lc {
-        // load_elf_pt_load_segments finalizes the PT_LOAD segments (the
-        // initramfs-backed zero-copy grant / staged copy) into the new ASID.
-        crate::yarm_log!("SPAWN_LIFECYCLE_ELF_LOAD_OK tid={} asid={}", tid, asid.0);
-        crate::yarm_log!("SPAWN_LIFECYCLE_ZC_LOAD_OK tid={} asid={}", tid, asid.0);
-    }
-
-    let spawner_tid = current_tid(kernel).unwrap_or(0);
-    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
-        Ok((_, send_cap, recv_cap)) => {
-            crate::yarm_log!(
-                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid,
-                send_cap.0,
-                recv_cap.0
-            );
-            (send_cap.0, recv_cap.0)
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
-            (0u64, 0u64)
-        }
-    };
-    let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((eid, _, recv_cap)) => {
-            crate::yarm_log!(
-                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
-                eid,
-                recv_cap.0
-            );
-            recv_cap.0
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
-            0u64
-        }
-    };
-    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
-        match kernel.grant_capability_task_to_task_with_rights(
-            spawner_tid,
-            CapId(service_send_cap),
-            parent_pid,
-            CapRights::SEND,
-        ) {
-            Ok(cap) => cap.0,
-            Err(_) => service_send_cap,
-        }
-    } else {
-        service_send_cap
-    };
-
-    // Stage 199D-WA3B: this site has no pre-spawn setup, so it reserves immediately before the
-    // spawn and consumes that exact reservation. `tid` came from `allocate_thread_id`, so the
-    // reservation refuses if anything already occupies it — the overwrite contract is gone.
-    let reservation = kernel
-        .reserve_task_for_spawn_with_class(tid, TaskClass::SystemServer)
-        .map_err(SyscallError::from)?;
-    let spawned = kernel
-        .spawn_user_task_from_image(
-            reservation,
-            UserImageSpec {
-                tid,
+    let (startup_args, extra_send_caps) =
+        normalized_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    let committed = spawn_image_txn::run_image_spawn_transaction(
+        kernel,
+        spawn_image_txn::SpawnImageRequest {
+            image_id,
+            image_path,
+            source: spawn_image_txn::SpawnImageSource::PtLoadSegments {
+                elf: elf_bytes,
                 entry: elf.entry as usize,
-                asid: Some(asid),
-                class: TaskClass::SystemServer,
-                startup_args,
-                spawner_tid,
-                service_recv_cap,
-                service_reply_recv_cap,
-                extra_send_caps,
             },
-        )
-        .map_err(SyscallError::from)?;
-
-    crate::yarm_log!("KSPAWN_FROM_CPIO spawned_tid={}", spawned.tid);
-    if spawn_lc {
-        // Spawned system servers become services as they come up. TIDs are
-        // monotonically allocated, so a spawned service tid that regresses below a
-        // previously-observed service tid indicates a startup-order anomaly.
-        use core::sync::atomic::{AtomicU64, Ordering};
-        static LAST_SERVICE_TID: AtomicU64 = AtomicU64::new(0);
-        let prev = LAST_SERVICE_TID.swap(spawned.tid, Ordering::Relaxed);
-        if prev != 0 && spawned.tid < prev {
-            crate::yarm_log!(
-                "SPAWN_LIFECYCLE_SERVICE_ORDER_VIOLATION tid={} prev={}",
-                spawned.tid,
-                prev
-            );
-        }
-        crate::yarm_log!(
-            "SPAWN_LIFECYCLE_SERVICE_READY tid={} image_id={}",
-            spawned.tid,
-            image_id
-        );
-    }
-
-    let packed_ret2 =
-        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-        } else {
-            caller_send_cap as u64
-        };
-    frame.set_ok(
-        0,
-        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        packed_ret2 as usize,
-    );
+            class: TaskClass::SystemServer,
+            parent_pid,
+            startup_args,
+            extra_send_caps,
+            map_initrd_window: false,
+            lifecycle_markers: spawn_lc,
+        },
+    )?;
+    crate::yarm_log!("KSPAWN_FROM_CPIO spawned_tid={}", committed.tid);
+    frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
     Ok(())
 }
 
@@ -904,6 +450,36 @@ fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
         12 => Some("sbin/ext4_srv"),
         _ => None,
     }
+}
+
+/// U9-SPAWN1 SP-3 — the startup-argument normalization every image-loading spawn performs.
+///
+/// All four handlers copied the caller's array and then applied the SAME edits, transcribed four
+/// times: slot 2 (the service reply recv capability) and slot 12 (the service recv capability)
+/// are kernel-filled, so a caller may not preselect them; slots 13..16 are lifted out as the
+/// extra send capabilities to delegate and then cleared, because the values the caller put there
+/// name capabilities in ITS cspace, not the child's.
+///
+/// Returned as a pair so a caller cannot use the array before the extras have been lifted out.
+fn normalized_startup_args(
+    kernel: &KernelState,
+    startup_args_ptr: usize,
+    startup_args_count: usize,
+) -> Result<([u64; UserImageSpec::DEFAULT_STARTUP_ARGS.len()], [u64; 4]), SyscallError> {
+    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    startup_args[2] = 0;
+    let extra_send_caps = [
+        startup_args[13],
+        startup_args[14],
+        startup_args[15],
+        startup_args[16],
+    ];
+    startup_args[12] = 0;
+    startup_args[13] = 0;
+    startup_args[14] = 0;
+    startup_args[15] = 0;
+    startup_args[16] = 0;
+    Ok((startup_args, extra_send_caps))
 }
 
 fn copy_spawn_startup_args(
@@ -1116,27 +692,10 @@ pub(super) fn handle_spawn_from_memory_object(
 
     let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
 
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    startup_args[2] = 0;
-    let extra_send_caps = [
-        startup_args[13],
-        startup_args[14],
-        startup_args[15],
-        startup_args[16],
-    ];
-    startup_args[12] = 0;
-    startup_args[13] = 0;
-    startup_args[14] = 0;
-    startup_args[15] = 0;
-    startup_args[16] = 0;
+    let (startup_args, extra_send_caps) =
+        normalized_startup_args(kernel, startup_args_ptr, startup_args_count)?;
 
-    let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
-    let (asid, _aspace_cap) = kernel
-        .create_user_address_space()
-        .map_err(SyscallError::from)?;
-    crate::yarm_log!("SPAWN_FROM_MO_TID tid={} asid={}", tid, asid.0);
-
-    // Compute physical base of the initrd blob for zero-copy feasibility check.
+    // Physical base of the initrd blob, for the zero-copy loader's feasibility check.
     let initrd_virt_raw = initrd.as_ptr() as u64;
     let initrd_phys_base = {
         let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
@@ -1148,108 +707,29 @@ pub(super) fn handle_spawn_from_memory_object(
         }
     };
 
-    // Load ELF using zero-copy path (falls back to copy if alignment not feasible).
-    let (entry, _first_vaddr, _heap_base, zc_pages, copied_pages) = kernel
-        .load_elf_with_mo_zero_copy(
+    let committed = spawn_image_txn::run_image_spawn_transaction(
+        kernel,
+        spawn_image_txn::SpawnImageRequest {
             image_id,
-            asid,
-            elf_bytes,
-            initrd_phys_base,
-            file_data_offset as u64,
-        )
-        .map_err(SyscallError::from)?;
-
-    crate::yarm_log!(
-        "PM_ELF_ZC_DONE image_id={} path={} zc_pages={} copied_pages={}",
-        image_id,
-        image_path,
-        zc_pages,
-        copied_pages
-    );
-
-    let spawner_tid = caller_tid;
-    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
-        Ok((_, send_cap, recv_cap)) => {
-            crate::yarm_log!(
-                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid,
-                send_cap.0,
-                recv_cap.0
-            );
-            (send_cap.0, recv_cap.0)
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
-            (0u64, 0u64)
-        }
-    };
-    let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((eid, _, recv_cap)) => {
-            crate::yarm_log!(
-                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
-                eid,
-                recv_cap.0
-            );
-            recv_cap.0
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
-            0u64
-        }
-    };
-    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
-        match kernel.grant_capability_task_to_task_with_rights(
-            spawner_tid,
-            CapId(service_send_cap),
-            parent_pid,
-            CapRights::SEND,
-        ) {
-            Ok(cap) => cap.0,
-            Err(_) => service_send_cap,
-        }
-    } else {
-        service_send_cap
-    };
-
-    // Stage 199D-WA3B: this site has no pre-spawn setup, so it reserves immediately before the
-    // spawn and consumes that exact reservation. `tid` came from `allocate_thread_id`, so the
-    // reservation refuses if anything already occupies it — the overwrite contract is gone.
-    let reservation = kernel
-        .reserve_task_for_spawn_with_class(tid, TaskClass::SystemServer)
-        .map_err(SyscallError::from)?;
-    let spawned = kernel
-        .spawn_user_task_from_image(
-            reservation,
-            UserImageSpec {
-                tid,
-                entry,
-                asid: Some(asid),
-                class: TaskClass::SystemServer,
-                startup_args,
-                spawner_tid,
-                service_recv_cap,
-                service_reply_recv_cap,
-                extra_send_caps,
+            image_path,
+            source: spawn_image_txn::SpawnImageSource::ZeroCopyInitramfsSlice {
+                elf: elf_bytes,
+                initrd_phys_base,
+                file_initrd_offset: file_data_offset as u64,
             },
-        )
-        .map_err(SyscallError::from)?;
-
+            class: TaskClass::SystemServer,
+            parent_pid,
+            startup_args,
+            extra_send_caps,
+            map_initrd_window: false,
+            lifecycle_markers: false,
+        },
+    )?;
     crate::yarm_log!(
         "SPAWN_FROM_MO_OK image_id={} spawned_tid={}",
         image_id,
-        spawned.tid
+        committed.tid
     );
-
-    let packed_ret2 =
-        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-        } else {
-            caller_send_cap as u64
-        };
-    frame.set_ok(
-        0,
-        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        packed_ret2 as usize,
-    );
+    frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
     Ok(())
 }
