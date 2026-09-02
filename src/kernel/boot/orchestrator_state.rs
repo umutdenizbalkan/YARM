@@ -1523,6 +1523,18 @@ impl KernelState {
         }
     }
 
+    /// U9-SPAWN1 SP-2: the TID-allocation policy — boot-config state, immutable after bootstrap.
+    ///
+    /// # Safety
+    /// `state` must point at live `KernelState` storage.
+    pub(crate) unsafe fn tid_allocation_policy_from_raw(
+        state: *const KernelState,
+    ) -> super::tid_allocation_policy::TidAllocationPolicy {
+        // SAFETY: see module pattern note above. The policy is written once during bootstrap and
+        // never mutated afterwards, so an unsynchronized read of a `Copy` value is sound.
+        unsafe { core::ptr::addr_of!((*state).tid_allocation_policy).read() }
+    }
+
     /// Stage 108: VM/user-spaces (rank 5) seam projector.
     pub(crate) unsafe fn vm_split_mut_ptrs_from_raw(
         state: *mut KernelState,

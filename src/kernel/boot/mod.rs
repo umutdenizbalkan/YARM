@@ -57,7 +57,7 @@ mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
 /// U9-SPAWN1 SP-2: THE thread-incarnation lifecycle — allocate, register, undo.
-mod spawn_thread_core;
+pub(crate) mod spawn_thread_core;
 pub(crate) mod shared_region_txn;
 mod task_core_state;
 mod task_policy_state;
@@ -113,6 +113,11 @@ use crate::kernel::lock::SpinLockIrq;
 #[cfg(feature = "hosted-dev")]
 use alloc::collections::BTreeMap;
 use tid_allocation_policy::{TidAllocationCursor, TidAllocationPolicy};
+/// U9-SPAWN1 SP-2: the dynamic-TID cursor, re-exported for the `SharedKernel` spawn-thread
+/// seam. The cursor is task-domain state — see `with_task_tid_alloc_mut`.
+pub(crate) type TidAllocationCursorRef = TidAllocationCursor;
+/// U9-SPAWN1 SP-2: the allocation policy, read-only, for the same seam.
+pub(crate) type TidAllocationPolicyRef = TidAllocationPolicy;
 
 const MAX_ENDPOINTS: usize = 256;
 

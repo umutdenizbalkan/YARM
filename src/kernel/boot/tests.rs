@@ -61509,8 +61509,12 @@ mod stage191a_lock_retire_inventory {
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
             "Syscall::Fork => Some",
-            "Syscall::SpawnThread => Some",
+            // U9-SPAWN1 SP-2 removed NR 11 from this list. It was here because the whole spawn
+            // family was, not because NR 11 shares the family's obstacles: it creates no address
+            // space, loads no ELF, mints nothing, maps nothing and never switches tasks. Its
+            // siblings below still do, and stay.
             "Syscall::SpawnProcess => Some",
+            "Syscall::SpawnFromMemoryObject => Some",
             "Syscall::ReapFaultedTask => Some",
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
@@ -61909,13 +61913,14 @@ mod stage191c_split_user_copy_seam {
     fn non_selected_classes_remain_locked() {
         for locked in [
             "Syscall::InitramfsReadChunk => Some",
+            // U9-SPAWN1 SP-2: NR 11 left this list. It never blocked, switched tasks or mutated
+            // a page table — the three things this seam actually cannot serve.
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
             "Syscall::IpcReply => Some",
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
             "Syscall::Fork => Some",
-            "Syscall::SpawnThread => Some",
             "Syscall::SpawnProcess => Some",
             "Syscall::ReapFaultedTask => Some",
             "Syscall::FutexWait => Some",
@@ -62238,7 +62243,8 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::VmAnonMap => Some",
             "Syscall::TransferRelease => Some",
             "Syscall::Fork => Some",
-            "Syscall::SpawnThread => Some",
+            // U9-SPAWN1 SP-2 removed NR 11: the candidate seam never owned the whitelist's
+            // contents, and NR 11's admission came from SP-2 with its own guards.
             "Syscall::SpawnProcess => Some",
             "Syscall::SpawnFromMemoryObject => Some",
             // U9-MO2 §4 removed NR 28 from this list. Stage 191E's claim is that the CANDIDATE
@@ -113704,6 +113710,9 @@ mod stage199d_riscv_canonical_admission {
             // U9-MO2 §4: the one NON-switching member added since — NR 28 finalizes through the
             // same same-task ecall writeback DebugLog uses.
             "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
+            // U9-SPAWN1 SP-2: the second NON-switching member — NR 11 finalizes through the
+            // same same-task ecall writeback DebugLog and NR 28 use.
+            "SYSCALL_SPAWN_THREAD_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -113715,9 +113724,10 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            6,
-            "exactly six literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
-             FutexWait, IpcRecvTimeout, IpcSend and (U9-MO2 §4) CreateInitramfsFileSliceMo"
+            7,
+            "exactly seven literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+             FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo and \
+             (U9-SPAWN1 SP-2) SpawnThread"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -150898,9 +150908,18 @@ mod u9mo2_nr28_terminal_edges {
             .split("|| raw_nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR")
             .nth(1)
             .expect("the NR 28 import term");
+        // The next non-comment line must be another `||` term — i.e. NR 28's import is its own
+        // unconditional disjunct, not a conjunct of a gate. Comments between terms are ordinary
+        // (each admission records why it exists), so they are skipped rather than tripped over.
+        let next = after
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .expect("a following term");
         assert!(
-            after.trim_start().starts_with("||"),
-            "the NR 28 import must be its own unconditional term, not a conjunct of a gate"
+            next.starts_with("||"),
+            "the NR 28 import must be its own unconditional term, not a conjunct of a gate \
+             (next term: {next})"
         );
     }
 
@@ -151535,6 +151554,239 @@ mod u9spawn1_one_enqueue_owner {
         assert!(
             !OWNER.contains("with_scheduler_split_mut") && !OWNER.contains("scheduler_state()"),
             "the owner must take no locks itself"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// U9-SPAWN1 SP-2 — NR 11 terminal edges 3 → 0, and the compensation that makes it safe.
+mod u9spawn1_nr11_terminal_edges {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const CORE: &str = include_str!("spawn_thread_core.rs");
+    const THREAD: &str = include_str!("thread_state.rs");
+
+    fn route_body() -> &'static str {
+        SPLIT_SRC
+            .split("fn try_split_spawn_thread_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the NR 11 route body")
+    }
+
+    /// Edge 1 of 3 — x86_64: the classifier and the dispatch arm.
+    #[test]
+    fn x86_64_has_a_pre_lock_owner() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::SpawnThread => Some(syscall),"),
+            "the number-only classifier must admit NR 11"
+        );
+        assert!(
+            SPLIT_SRC.contains(
+                "if matches!(syscall, Syscall::SpawnThread) {\n        return try_split_spawn_thread_into_frame(shared, cpu, frame);"
+            ),
+            "the split dispatcher must route NR 11 to its own pre-lock owner"
+        );
+    }
+
+    /// Edge 2 of 3 — AArch64: without the ABI import `nr` stays 0 whatever the classifier says.
+    #[test]
+    fn aarch64_imports_the_nr11_abi_before_the_split_dispatch() {
+        assert!(
+            TRAP_ENTRY.contains("raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR"),
+            "AArch64 must import the NR 11 ABI before the split dispatch inspects it"
+        );
+        let after = TRAP_ENTRY
+            .split("|| raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR")
+            .nth(1)
+            .expect("the NR 11 import term");
+        let next = after
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .expect("a following term");
+        assert!(
+            next.starts_with("||"),
+            "the NR 11 import must be its own unconditional term (next: {next})"
+        );
+    }
+
+    /// Edge 3 of 3 — RISC-V: the whitelist, with NR 2 still out of it.
+    #[test]
+    fn riscv_admits_nr11_into_the_split_dispatcher() {
+        let whitelist = RISCV
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("the RISC-V whitelist");
+        assert!(
+            whitelist.contains("SYSCALL_SPAWN_THREAD_NR"),
+            "RISC-V must admit NR 11 into the split dispatcher"
+        );
+        assert!(
+            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "NR 2's RISC-V admission is a separate class and stays untouched"
+        );
+    }
+
+    /// The broad handler survives as the fallback for everything declined pre-mutation.
+    #[test]
+    fn the_broad_handler_survives_as_the_fallback() {
+        assert!(
+            SYSCALL_SRC.contains("Syscall::SpawnThread => handle_spawn_thread(kernel, frame)"),
+            "the broad arm must remain reachable"
+        );
+    }
+
+    /// SP-2's scope bound, mechanically: the route introduces no address-space, ELF, endpoint,
+    /// capability, VM or switch work. If a later edit reaches for any of those, this fails.
+    #[test]
+    fn the_route_introduces_no_forbidden_work() {
+        let body = route_body();
+        let txn = RUNTIME
+            .split("pub(crate) fn try_spawn_thread_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the transaction");
+        for (name, src) in [("route", body), ("transaction", txn)] {
+            for forbidden in [
+                "create_user_address_space",
+                "load_elf",
+                "create_endpoint",
+                "mint_capability",
+                "grant_capability",
+                "map_user_page",
+                "alloc_contiguous",
+                "free_frame",
+                "dispatch_next_task",
+                "block_current_cpu",
+                "with_vm_split",
+                "with_memory_split_mut",
+                "with_capability_state_split_mut",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "the NR 11 {name} must not introduce `{forbidden}` — SP-2 is rank 2 then \
+                     rank 1 and nothing else"
+                );
+            }
+        }
+    }
+
+    /// No fallback survives the first mutation, and the mutation is where it is claimed to be.
+    #[test]
+    fn no_fallback_survives_the_first_mutation() {
+        let body = route_body();
+        let mutation = body
+            .find("shared.try_spawn_thread_split(")
+            .expect("the one mutating call");
+        let tail = &body[mutation..];
+        for escape in ["return None", "None\n", "?;", ")?"] {
+            assert!(
+                !tail.contains(escape),
+                "no fallback may escape after the mutation: found `{escape}`"
+            );
+        }
+        assert!(
+            tail.contains("frame.set_ok(ret, 0, 0);")
+                && tail.contains("Some(Ok(()))")
+                && tail.contains("SyscallError::from(err)"),
+            "success returns the child TID; failure returns the exact typed error"
+        );
+        // The pre-mutation half may still decline — that is what makes this a boundary.
+        assert!(
+            body[..mutation].contains("shared.current_tid_authoritative(cpu)?")
+                && body[..mutation].contains("shared.task_cnode_split(parent_tid)?"),
+            "the pre-mutation half declines on an unavailable requester or an absent process \
+             CNode, both of which are READS"
+        );
+    }
+
+    /// Every post-registration failure undoes the EXACT incarnation, on BOTH paths, through the
+    /// same owner. This is the property that lets the route refuse to fall back.
+    #[test]
+    fn every_post_registration_failure_undoes_the_exact_incarnation() {
+        assert_eq!(
+            CORE.matches("pub(crate) fn unregister_thread_incarnation_locked(")
+                .count(),
+            1,
+            "one undo owner"
+        );
+        // It is identity-exact: TID *and* thread group, so a stale identity names nothing.
+        let undo = CORE
+            .split("pub(crate) fn unregister_thread_incarnation_locked(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the undo body");
+        assert!(
+            undo.contains("tcb.tid.0 == tid && tcb.thread_group_id.0 == expected_group.0"),
+            "the undo must match the exact incarnation, not just the TID"
+        );
+        assert!(
+            undo.contains("return false;"),
+            "and be inert on a stale or already-undone identity"
+        );
+        assert!(
+            undo.contains("clear_reservation_slot(tcbs, idx)"),
+            "clearing a TCB slot has one owner; the undo delegates to it"
+        );
+        // Both the split transaction and the broad path call it on their post-mutation failures.
+        let txn = RUNTIME
+            .split("pub(crate) fn try_spawn_thread_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the transaction");
+        assert_eq!(
+            txn.matches("unregister_thread_incarnation_locked").count(),
+            2,
+            "the split transaction undoes on BOTH of its post-mutation failure arms: a failed \
+             initialise and a failed enqueue"
+        );
+        let broad = THREAD
+            .split("pub fn spawn_user_thread(")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub").next())
+            .expect("the broad spawn");
+        assert_eq!(
+            broad
+                .matches("unregister_thread_incarnation_locked")
+                .count(),
+            2,
+            "and so does the broad path, which leaked on a failed enqueue before SP-2"
+        );
+        assert!(
+            !broad.contains("let _ = self.enqueue_task(tid)?;"),
+            "the leaking form must not come back"
+        );
+    }
+
+    /// Rank order: the whole task-domain half is ONE acquisition, and rank 1 is strictly last.
+    #[test]
+    fn the_transaction_takes_rank_two_once_then_rank_one_last() {
+        let txn = RUNTIME
+            .split("pub(crate) fn try_spawn_thread_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the transaction");
+        // One rank-2 acquisition for the whole build-up; a second only to compensate.
+        assert_eq!(
+            txn.matches("with_spawn_thread_split_mut").count(),
+            2,
+            "one acquisition builds the incarnation; the only other one undoes it"
+        );
+        let build = txn.find("with_spawn_thread_split_mut").expect("rank 2");
+        let rank1 = txn.find("self.enqueue_task_split(").expect("rank 1");
+        assert!(build < rank1, "rank 2 completes before rank 1 is taken");
+        // Rank 10 sits between them, with the task lock released — never nested inside it.
+        let rank10 = txn
+            .find("self.apply_tid_allocation_delta_split(")
+            .expect("rank 10");
+        assert!(
+            build < rank10 && rank10 < rank1,
+            "telemetry is applied after rank 2 is released and before rank 1 is taken"
         );
     }
 }

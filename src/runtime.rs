@@ -2233,6 +2233,109 @@ impl SharedKernel {
         )
     }
 
+    /// U9-SPAWN1 SP-2 — THE off-lock `SpawnThread` (NR 11) transaction.
+    ///
+    /// Composes the shared thread-incarnation owner and the SP-1 enqueue owner, in the order the
+    /// broad `spawn_user_thread` composes them, with the rank-2 half taken as ONE acquisition and
+    /// rank 1 strictly last:
+    ///
+    /// ```text
+    ///  (pure)   validate tls_base / stack_top / entry        -> may still fall back
+    ///  rank 4   the parent's process CNode must already exist -> may still fall back
+    /// ── rank 2, ONE acquisition ─────────────────────────────────────────────────────
+    ///           read the parent's group / ASID / class
+    ///           allocate the TID                              (FIRST MUTATION: cursor)
+    ///           register the incarnation                      (TCB + class + stack range)
+    ///           initialise it from the caller's arguments     (-> Runnable)
+    ///           claim its TLS-restore slot
+    ///           any failure here undoes the incarnation inside the SAME acquisition
+    /// ── rank 2 RELEASED ─────────────────────────────────────────────────────────────
+    ///  rank 10  apply the allocator's telemetry
+    ///  rank 1   enqueue; on failure undo the EXACT incarnation and return the exact error
+    /// ```
+    ///
+    /// The rank-4 CNode check is a READ, and it is what lets the whole rank-2 half assume
+    /// registration's CNode work is a no-op: a thread joins its parent's existing process. A
+    /// parent whose process CNode is somehow absent is declined BEFORE any mutation, so the broad
+    /// handler — which would create it — still gets the request.
+    ///
+    /// Returns the child TID. `Err` is the exact error the broad handler would have returned,
+    /// with the kernel restored to its pre-call state in every case.
+    pub(crate) fn try_spawn_thread_split(
+        &self,
+        cpu: CpuId,
+        parent_tid: u64,
+        tls_base: usize,
+        user_stack_top: usize,
+        user_entry: usize,
+    ) -> Result<u64, KernelError> {
+        use crate::kernel::boot::spawn_thread_core as core_;
+
+        // (1) Pure. A refusal here has touched nothing.
+        let args = core_::SpawnThreadArgs::validate(tls_base, user_stack_top, user_entry)?;
+        let max_tasks = self.runtime_capacity_config_split_read().max_tasks;
+        let policy = self.tid_allocation_policy_split_read();
+
+        // (2) rank 2, ONE acquisition: everything up to and including `Runnable`.
+        let outcome = self.with_spawn_thread_split_mut(|tcbs, classes, cursor, tls| {
+            let parent = core_::parent_facts_locked(tcbs, classes, parent_tid)?;
+            let (tid, delta) =
+                core_::allocate_dynamic_tid_locked(tcbs, cursor, policy, max_tasks)?;
+            let idx = core_::register_thread_incarnation_locked(
+                tcbs,
+                classes,
+                tid,
+                parent.class,
+                max_tasks,
+            )?;
+            // FIRST IRREVERSIBLE MUTATION is behind us; from here every failure undoes it.
+            if let Err(err) = core_::initialize_thread_incarnation_locked(tcbs, idx, &parent, &args)
+            {
+                core_::unregister_thread_incarnation_locked(
+                    tcbs,
+                    classes,
+                    tid,
+                    parent.thread_group_id,
+                );
+                return Err(err);
+            }
+            core_::claim_tls_restore_slot_locked(tls, tid);
+            Ok((tid, parent.thread_group_id, delta))
+        });
+        let (tid, group, delta) = outcome?;
+
+        // (3) rank 10, with the task lock released.
+        self.apply_tid_allocation_delta_split(delta);
+
+        // (4) rank 1, last. A failed enqueue undoes the exact incarnation — the same repair the
+        //     broad path now performs, through the same owner.
+        match self.enqueue_task_split(cpu, tid) {
+            Ok(_) => {
+                crate::yarm_log!(
+                    "SPAWN_THREAD_SPLIT_OK parent_tid={} tid={} entry=0x{:x} stack=0x{:x} tls=0x{:x} result=ok",
+                    parent_tid,
+                    tid,
+                    user_entry,
+                    user_stack_top,
+                    tls_base
+                );
+                Ok(tid)
+            }
+            Err(err) => {
+                self.with_spawn_thread_split_mut(|tcbs, classes, _cursor, _tls| {
+                    core_::unregister_thread_incarnation_locked(tcbs, classes, tid, group)
+                });
+                crate::yarm_log!(
+                    "SPAWN_THREAD_SPLIT_FAIL parent_tid={} tid={} err={:?} tasks=0 result=compensated",
+                    parent_tid,
+                    tid,
+                    err
+                );
+                Err(err)
+            }
+        }
+    }
+
     /// U9-SPAWN1 SP-1 — THE off-lock task enqueue: plan under rank 2, RELEASE rank 2, commit
     /// under rank 1.
     ///
@@ -2255,6 +2358,42 @@ impl SharedKernel {
                 &plan,
             )
         })
+    }
+
+    /// U9-SPAWN1 SP-2 — task (rank 2) split-mut seam for the whole SPAWN-THREAD transaction.
+    ///
+    /// Exposes the TCB array, the task-class table, the dynamic-TID cursor and the TLS-restore
+    /// table under ONE acquisition, because NR 11's task-domain half is one decision about one
+    /// new task: read the parent, allocate the TID, register the incarnation, initialise it,
+    /// claim its restore slot. Straddling acquisitions would let the parent be replaced, or the
+    /// TID be re-allocated, between two steps that must agree about both.
+    ///
+    /// Callers must not already hold a lock of rank >= 2.
+    pub(crate) fn with_spawn_thread_split_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut [Option<crate::kernel::task::ThreadControlBlock>],
+            &mut [Option<crate::kernel::task::TaskClass>],
+            &mut crate::kernel::boot::TidAllocationCursorRef,
+            &mut [Option<crate::kernel::ipc::ThreadId>],
+        ) -> R,
+    ) -> R {
+        // SAFETY: same pattern as `with_task_enqueue_policy_split_mut` — all four storages live
+        // in the task domain and are serialized by `task_state_lock`, held for the whole closure.
+        let (task_lock, tcbs, classes, cursor, tls) =
+            unsafe { KernelState::spawn_thread_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let tcbs = unsafe { &mut *tcbs };
+        let classes = unsafe { &mut *classes };
+        let cursor = unsafe { &mut *cursor };
+        let tls = unsafe { &mut *tls };
+        f(
+            kernel_mut(tcbs).as_mut_slice(),
+            kernel_mut(classes).as_mut_slice(),
+            cursor,
+            kernel_mut(tls).as_mut_slice(),
+        )
     }
 
     /// Stage 108: task/TCB (rank 2) split-mut seam.
@@ -11960,6 +12099,32 @@ impl SharedKernel {
     }
 
     // ── Stage 5A split-read helpers ──────────────────────────────────────────
+
+    /// U9-SPAWN1 SP-2: the TID-allocation policy is boot-config state, immutable after
+    /// bootstrap, read through the same seam the capacity config uses.
+    pub(crate) fn tid_allocation_policy_split_read(
+        &self,
+    ) -> crate::kernel::boot::TidAllocationPolicyRef {
+        unsafe { KernelState::tid_allocation_policy_from_raw(self.state.data_ptr() as *const _) }
+    }
+
+    /// U9-SPAWN1 SP-2: apply one TID allocation's telemetry at rank 10, task lock released.
+    pub(crate) fn apply_tid_allocation_delta_split(
+        &self,
+        delta: crate::kernel::boot::spawn_thread_core::TidAllocationDelta,
+    ) {
+        if delta == Default::default() {
+            return;
+        }
+        self.with_telemetry_split_mut(|telemetry| {
+            let t = &mut telemetry.tid_allocation;
+            t.gap_floor_repairs = t.gap_floor_repairs.saturating_add(delta.gap_floor_repairs);
+            t.dynamic_tid_allocations = t
+                .dynamic_tid_allocations
+                .saturating_add(delta.dynamic_tid_allocations);
+            t.dynamic_tid_wraps = t.dynamic_tid_wraps.saturating_add(delta.dynamic_tid_wraps);
+        });
+    }
 
     pub fn task_class_split_read(&self, tid: u64) -> Option<TaskClass> {
         // Stage 5A split-read: read task class under task lock (rank 2) only.

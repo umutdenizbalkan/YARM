@@ -2631,6 +2631,12 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // result in the same frame, exactly as DebugLog does. Its three arguments (name pointer,
         // name length, flags) are the first three the ABI import already carries.
         || raw_nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
+        // U9-SPAWN1 SP-2 — SpawnThread (NR 11). Without the import `nr` stays 0, the split
+        // dispatcher declines, and NR 11 keeps its terminal broad edge on this architecture no
+        // matter what its route admits. Its three arguments (TLS base, user stack top, user
+        // entry) are the first three the ABI import already carries, and its route neither
+        // blocks nor switches — it returns the child TID in the same frame.
+        || raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply
