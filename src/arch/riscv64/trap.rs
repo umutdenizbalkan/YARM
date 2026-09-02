@@ -782,6 +782,11 @@ pub fn handle_riscv_trap_entry_shared(
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
             || nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
             || nr == crate::kernel::syscall::SYSCALL_IPC_SEND_NR
+            // U9-MO2 §4: CreateInitramfsFileSliceMo (NR 28). Same reason as the classes above
+            // — the route is architecture-neutral but reachable here only for a listed NR. It
+            // neither blocks nor switches, so it finalizes through the same same-task ecall
+            // writeback DebugLog uses (sepc+4 once, sstatus preserved, a0 from `set_ok`).
+            || nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without

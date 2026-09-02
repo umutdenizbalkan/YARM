@@ -2272,6 +2272,15 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_vm_brk_shrink_into_frame(shared, cpu, frame);
     }
 
+    // U9-MO2 §4: `CreateInitramfsFileSliceMo` (NR 28) is routed to its own pre-lock owner for
+    // the same reason as the two above — eligibility (SystemServer caller, resolvable name,
+    // non-empty file, provisioned cspace) can only be decided inside the helper. Every case it
+    // declines BEFORE its first mutation returns `None`, which propagates UNCHANGED back to the
+    // global-lock fallback below; after the mutation it never declines.
+    if matches!(syscall, Syscall::CreateInitramfsFileSliceMo) {
+        return try_split_create_initramfs_mo_into_frame(shared, cpu, frame);
+    }
+
     // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) — a pure read
     // serviced off the global lock. The helper returns `None` for any case it cannot
     // service (hosted-dev, unavailable requester), which propagates UNCHANGED back to
@@ -3512,6 +3521,142 @@ pub(crate) fn try_split_vm_brk_shrink_into_frame(
     shared.try_split_vm_brk_shrink_into_frame(cpu, frame)
 }
 
+/// U9-MO2 §4 — the pre-lock NR 28 (`CreateInitramfsFileSliceMo`) route.
+///
+/// NR 28 was the smallest live production class still reaching a terminal broad acquisition. Its
+/// whole body is: an access gate, a bounded user string copy, a pure CPIO lookup on the immutable
+/// boot initrd, one MemoryObject install and one capability mint — every one of which already had
+/// an off-lock owner once the MemoryObject lifecycle learned that an initramfs slice's backing is
+/// BORROWED. Before that, an off-lock mint failure had no exact compensation to call: the only
+/// reclaim path would have handed the boot initrd's own frames to the allocator.
+///
+/// The disposition is exhaustive by construction. Everything fallible that can still fall back
+/// runs BEFORE the first mutation, so `None` is only reachable there; from the object install
+/// onward every path returns `Some`, carrying either the success lanes or the exact error the
+/// broad handler would have produced. `Some(Err(..))` after a mutation is deliberate: falling
+/// back would let the broad handler create a SECOND object for a request it never saw refused.
+///
+/// Byte-for-byte at the ABI boundary with `handle_create_initramfs_file_slice_mo`: the same
+/// `SystemServer` gate and `MissingRight`, the same `name_len` bounds and `flags != 0` rejection,
+/// the same leading-slash and `initramfs/` prefix stripping, the same `InvalidArgs` for a bad
+/// UTF-8 name / missing entry / empty file, and the same `set_ok(0, cap_id, file_len)` success.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_create_initramfs_mo_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::task::TaskClass;
+    use yarm_srv_common::cpio::CpioArchive;
+
+    let fail = |e: SyscallError| -> Option<Result<(), TrapHandleError>> {
+        Some(Err(TrapHandleError::Syscall(e)))
+    };
+
+    // ── Pre-mutation. Every refusal here may still fall back; none has touched anything. ──
+    let tid = shared.current_tid_authoritative(cpu)?;
+    // Access gate: SystemServer only, exactly as the broad handler gates it.
+    if shared.task_class_split_read(tid) != Some(TaskClass::SystemServer) {
+        crate::yarm_log!(
+            "CREATE_INITRAMFS_FILE_SLICE_MO_DENIED tid={} reason=not_system_server",
+            tid
+        );
+        return fail(SyscallError::MissingRight);
+    }
+    let name_ptr = frame.arg(0);
+    let name_len = frame.arg(1);
+    let flags = frame.arg(2) as u64;
+    if name_len == 0 || name_len > 128 || flags != 0 {
+        return fail(SyscallError::InvalidArgs);
+    }
+    let asid_raw = shared.task_asid_for_tid_split_read(tid);
+    let Some(name_buf) = shared.copy_from_user_asid_split_read(asid_raw, name_ptr, name_len) else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    let Ok(raw_name) = core::str::from_utf8(&name_buf[..name_len]) else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    // The same normalisation the broad handler applies, in the same order.
+    let name = raw_name.trim_start_matches('/');
+    let name = name.strip_prefix("initramfs/").unwrap_or(name);
+    let name = name.trim_start_matches('/');
+
+    let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    let Ok(entry) = CpioArchive::new(initrd).find(name) else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    let Some(cpio_entry) = entry else {
+        crate::yarm_log!("CREATE_INITRAMFS_FILE_SLICE_MO_NOT_FOUND name={}", name);
+        return fail(SyscallError::InvalidArgs);
+    };
+    let file_data = cpio_entry.file_data();
+    let file_len = file_data.len();
+    if file_len == 0 {
+        crate::yarm_log!("CREATE_INITRAMFS_FILE_SLICE_MO_EMPTY name={}", name);
+        return fail(SyscallError::InvalidArgs);
+    }
+    let Some(file_data_offset) =
+        (file_data.as_ptr() as usize).checked_sub(initrd.as_ptr() as usize)
+    else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    // The destination cspace, resolved before anything is created.
+    let Some(cnode) = shared.task_cnode_split(tid) else {
+        return fail(SyscallError::InvalidCapability);
+    };
+
+    // ── The transaction. From here every outcome is `Some`: a post-mutation fallback would
+    //    let the broad handler build a second object for a request it never saw. ──
+    match shared.create_initramfs_file_slice_mo_split(cnode, initrd, file_data_offset, file_len) {
+        Ok((mo_id, cap_id)) => {
+            crate::yarm_log!(
+                "CREATE_INITRAMFS_FILE_SLICE_MO_OK tid={} name={} file_len={} mo_id={} cap={}",
+                tid,
+                name,
+                file_len,
+                mo_id,
+                cap_id.0
+            );
+            crate::yarm_log!(
+                "CREATE_INITRAMFS_FILE_SLICE_MO_SPLIT_OK tid={} mo_id={} cap={} offset={} file_len={} backing=borrowed result=ok",
+                tid,
+                mo_id,
+                cap_id.0,
+                file_data_offset,
+                file_len
+            );
+            frame.set_ok(0, cap_id.0 as usize, file_len);
+            Some(Ok(()))
+        }
+        Err(err) => {
+            // Compensated: the object (if any) is released through the backing-aware owner and
+            // the mint rolled back its own refcount, so nothing is left behind. The caller sees
+            // exactly the error the broad handler would have returned.
+            crate::yarm_log!(
+                "CREATE_INITRAMFS_FILE_SLICE_MO_SPLIT_FAIL tid={} name={} err={:?} objects=0 caps=0 result=compensated",
+                tid,
+                name,
+                err
+            );
+            fail(SyscallError::from(err))
+        }
+    }
+}
+
+/// Hosted: the off-lock user-read seam uses the direct map, which only exists on the real
+/// targets. The transaction itself is exercised directly by the `u9mo2_nr28_*` hosted tests.
+#[cfg(feature = "hosted-dev")]
+fn try_split_create_initramfs_mo_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
 /// Number-only split eligibility classifier (no arg validation, no lock).
 ///
 /// Used by [`try_split_dispatch_into_frame`] as the fast default-deny gate before
@@ -3546,9 +3691,17 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // addr) return `None` → unchanged global-lock fallback, which produces the exact
         // error. (NR 11 is SpawnThread, NOT FutexWake — do not confuse the two.)
         Syscall::FutexWake => Some(syscall),
+        // U9-MO2 §4: CreateInitramfsFileSliceMo (NR 28) — the smallest live production class
+        // still reaching a terminal broad acquisition. Its object is BORROWED initrd backing, so
+        // its compensation never touches the frame allocator; every owner it needs already exists
+        // off-lock. `try_split_create_initramfs_mo_into_frame` decides the rest.
+        Syscall::CreateInitramfsFileSliceMo => Some(syscall),
         // Stage 197A removed the former NR 27 InitramfsReadChunk split class along with the
-        // syscall. CreateInitramfsFileSliceMo (NR 28) MINTS a capability (cap-state mutation)
-        // and stays global-lock-only.
+        // syscall. Its sibling note — that NR 28 MINTS a capability and therefore "stays
+        // global-lock-only" — was retired by U9-MO2 §4: the mint was never the obstacle, the
+        // UNCLASSIFIED BACKING was. With `MemoryObjectKind::backing()` exhaustive and the reclaim
+        // owner backing-aware, the mint's rollback is exact off-lock, so NR 28 is admitted above
+        // rather than excluded here.
         _ => None,
     }
 }

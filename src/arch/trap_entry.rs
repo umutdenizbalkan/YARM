@@ -2624,6 +2624,13 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // the route reads: the endpoint cap, the payload pointer/length, the inline payload
         // words and the transfer cap.
         || raw_nr == crate::kernel::syscall::SYSCALL_IPC_SEND_NR
+        // U9-MO2 §4 — CreateInitramfsFileSliceMo (NR 28). Without the import `nr` stays 0, the
+        // split dispatcher declines, and NR 28 keeps its terminal broad edge on this
+        // architecture no matter what its route admits. The class needs nothing from AArch64 it
+        // does not already have: its route neither blocks, switches nor defers — it returns its
+        // result in the same frame, exactly as DebugLog does. Its three arguments (name pointer,
+        // name length, flags) are the first three the ABI import already carries.
+        || raw_nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply
