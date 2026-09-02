@@ -456,47 +456,208 @@ u9rx4_require_one "the reply cap is materialized exactly once" \
 # PM can now decode and answer.
 u9rx4_require_one "PM decodes the lifecycle query" 'PM_LIFECYCLE_QUERY_RECV tid=2'
 u9rx4_require_one "PM replies successfully" 'PM_LIFECYCLE_QUERY_REPLY tid=2 found=1'
-# Stage 199D-DW2 (COMPOSITION): the subject here is that PM's reply RESOLVES against the LIVE
-# one-shot object -- witnessed caller (tid=3), witnessed cap (65538), live generation (1). The
-# `reply_index` is the slot the allocator happened to hand out, not part of that subject, and any
-# co-armed proof that provisions an extra reply cap first (the 193D send-reply-cap oracle does
-# exactly that) shifts it. Anchoring on it made this assertion satisfiable only in the default
-# cell; matching tid + cap + generation and tolerating the slot keeps every part of the subject
-# and holds in every cell.
-u9rx4_require_one_re "the reply resolves against the live one-shot object" \
-  '^IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=[0-9]+ generation=1'
-# The one-shot is CONSUMED exactly once, on both sides, and the caller resumes once.
-u9rx4_require_one "the replier side of the one-shot is revoked once" \
-  'IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538'
-u9rx4_require_one "the caller side of the one-shot is revoked once" \
-  'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2'
-# Stage 199G-B §2: the caller's reply-wait is an NR 5 receive, so it now parks through the
-# pre-lock route and saves a real blocked-receive record. That makes the reply-boundary producer
-# ACCEPT, and the wake moves from the legacy in-lock `IPC_REPLY_WAKE_CALLER` to the deferred
-# plain-delivery executor's own single wake. Both are the same event — the caller resuming exactly
-# once — so the witness accepts whichever owner performed it, and still requires exactly one.
+# ── U9-RX4 TERMINAL-OUTCOME EVALUATOR (claimant-aware, identity-scoped) ─────────────
 #
-# Stage 199D-DW2 (COMPOSITION): the previous split counter was
-# `DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_plain`, which carries NO tid and so counted
-# EVERY plain delivery in the boot, not just U9-RX4's caller. That was only ever satisfiable
-# because the co-armed proof workloads (`yarm.ipc_recv_proof=1` and the send oracles layered on
-# it) were dead on this bridge; once they run, each of them legitimately wakes its OWN blocked
-# waiter and the global count exceeds 1 without anything being wrong with U9-RX4.
+# The witnessed exchange arms a FOUR-TICK reply deadline on tid 2's PM lifecycle query, in
+# every boot. That makes TWO outcomes legitimate, and which one occurs is a genuine race:
 #
-# `IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2` is the exact, subject-scoped replacement and is
-# STRICTLY STRONGER than the pair it replaces: it names the witnessed caller, it is emitted once
-# per completed blocked-waiter delivery, and it is emitted by BOTH owners — the legacy in-lock
-# completion in `kernel/syscall.rs` and all three off-lock producers in `runtime.rs` — so
-# "whichever owner performed it" is still accepted with no owner enumerated. The legacy
-# `IPC_REPLY_WAKE_CALLER tid=2` count is kept alongside it purely as a reported breakdown.
-u9rx4_caller_wake_legacy="$(u9rx4_count 'IPC_REPLY_WAKE_CALLER tid=2')"
-u9rx4_caller_resume="$(u9rx4_count 'IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 ')"
-if (( u9rx4_caller_resume != 1 )); then
-  echo "[error] U9-RX4: the blocked caller resumes exactly once -- expected exactly 1, got resume=${u9rx4_caller_resume} (legacy_wake=${u9rx4_caller_wake_legacy})"
-  u9rx4_fail=1
-else
-  echo "[ok] U9-RX4: the blocked caller resumes exactly once (resume=${u9rx4_caller_resume} legacy_wake=${u9rx4_caller_wake_legacy})"
+#   REPLY WINS    PM answers inside four ticks. The reply claims and commits the terminal,
+#                 both sides of the one-shot are revoked, and the caller resumes via the reply.
+#   TIMEOUT WINS  PM does not. The deadline claims and commits the SAME terminal, wakes the
+#                 caller exactly once, invalidates the reply aliases, and every later reply is
+#                 refused.
+#
+# This evaluator used to assert the reply outcome unconditionally, so a legitimate timeout win
+# was reported as `resume=0` and read as a lost reply. That was the ORACLE encoding a timing
+# assumption as an invariant — the arbitration itself was correct, settling exactly once either
+# way. It is now claimant-aware: it requires exactly one winner, exactly one caller wake
+# attributed to THAT winner, and exactly one terminal settlement, and it holds the losing
+# claimant to having changed nothing.
+#
+# It is deliberately NOT weaker than what it replaced. It still fails a genuinely lost reply
+# (no winner, no wake), and it additionally rejects two winners, a winner without its wake, a
+# reply that succeeds after a timeout, and a leaked alias/record/link — none of which the old
+# form could see. The four-tick deadline is preserved; the race is arbitrated, not suppressed.
+#
+# Every anchor is scoped to the witnessed identities — caller tid 2, replier tid 3, one-shot cap
+# 65538, record generation 1 — never to boot-global counts that other replies also satisfy.
+
+_u9_c()   { printf '%s\n' "$_U9_LOG" | rg -a -F -c -- "$1" 2>/dev/null || printf '0'; }
+_u9_cre() { printf '%s\n' "$_U9_LOG" | rg -a -c -e "$1" 2>/dev/null || printf '0'; }
+# First line matching <regex>, then the numeric value of <key>= on it ('' when absent).
+_u9_field() {
+  printf '%s\n' "$_U9_LOG" | rg -a -m1 -e "$1" 2>/dev/null | rg -o -m1 -e "$2=[0-9]+" 2>/dev/null | cut -d= -f2
+}
+
+# Evaluate one boot log's terminal outcome. Echoes [ok]/[error] lines; returns 0 on accept.
+u9rx4_eval_terminal() {
+  _U9_LOG="$1"
+  local tag="${2:-U9-RX4}" bad=0
+
+  # The scenario's own terminal, named by the caller the witness is about. Its record slot is
+  # an allocation detail, so it is READ from the arming rather than assumed, and every
+  # record-scoped assertion below is then exact on that slot.
+  local arm_re='^IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=2 caller_asid=2 record_index=[0-9]+ record_generation=1 '
+  local armed rec
+  armed="$(_u9_cre "$arm_re")"
+  rec="$(_u9_field "$arm_re" 'record_index')"
+  if [[ "$armed" != "1" || -z "$rec" ]]; then
+    echo "[error] $tag: the witnessed reply terminal is armed exactly once -- got ${armed}"
+    return 1
+  fi
+
+  # A FINITE reply deadline must still be armed on it. Preserved deliberately: it is what makes
+  # both outcomes reachable, and removing it would hide the race rather than arbitrate it.
+  #
+  # Anchored on `finite_deadline=1 deadline_reserved=1` and on the arming EXISTING for this
+  # record — never on the `deadline=` value, which is the ABSOLUTE EXPIRY TICK and therefore
+  # varies with the tick the caller happened to block on (4 or 5 across observed boots). Pinning
+  # it made the witness fail for a timing detail rather than a property, which is the same class
+  # of mistake as anchoring on the record's allocated slot. The workload's deadline itself is
+  # unchanged — this asserts that one is armed, not when it lands.
+  local finite dl
+  finite="$(_u9_cre "^IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=2 caller_asid=2 record_index=${rec} record_generation=1 .*finite_deadline=1 deadline_reserved=1 ")"
+  dl="$(_u9_cre "^IPC_REPLY_TIMEOUT_ARMED arch=aarch64 caller_tid=2 caller_asid=2 record_index=${rec} record_generation=1 ")"
+  if [[ "$finite" != "1" || "$dl" != "1" ]]; then
+    echo "[error] $tag: a finite reply deadline must be armed exactly once on the witnessed record -- finite=${finite} armed=${dl}"
+    bad=1
+  fi
+
+  # ── the two winners, each discriminated by its own exact claim ──
+  local reply_resolve reply_commit reply_resume replier_revoke caller_revoke
+  reply_resolve="$(_u9_cre '^IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=[0-9]+ generation=1')"
+  reply_commit="$(_u9_cre "^IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=${rec} record_generation=1 replier_tid=3 terminal=Reply resolution=commit settled=1")"
+  reply_resume="$(_u9_c 'IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 ')"
+  replier_revoke="$(_u9_c 'IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538')"
+  caller_revoke="$(_u9_c 'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2')"
+
+  local timeout_ok timeout_commit timeout_wake aliases late_ok late_refused
+  timeout_ok="$(_u9_cre '^IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut')"
+  timeout_commit="$(_u9_c 'IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok')"
+  timeout_wake="$(_u9_field '^IPC_REPLY_TIMEOUT_OK ' 'caller_wakes')"
+  aliases="$(_u9_field '^IPC_REPLY_TIMEOUT_OK ' 'reply_aliases_invalid')"
+  late_ok="$(_u9_field '^IPC_REPLY_TIMEOUT_OK ' 'late_reply_successes')"
+  late_refused="$(_u9_c 'IPC_REPLY_FAIL tid=3 reply_cap=65538 err=WrongObject')"
+  : "${timeout_wake:=0}" ; : "${aliases:=0}" ; : "${late_ok:=0}"
+
+  local reply_win=0 timeout_win=0
+  [[ "$reply_resolve" == "1" ]] && reply_win=1
+  [[ "$timeout_ok"    == "1" ]] && timeout_win=1
+
+  # EXACTLY ONE WINNER. Zero is the genuinely lost reply the old form was written for; two is a
+  # double settlement, which the old form could not see at all.
+  if (( reply_win + timeout_win != 1 )); then
+    echo "[error] $tag: exactly one claimant must win -- reply_win=${reply_win} timeout_win=${timeout_win} (resolve=${reply_resolve} timeout_ok=${timeout_ok})"
+    return 1
+  fi
+
+  # EXACTLY ONE TERMINAL SETTLEMENT, and EXACTLY ONE CALLER WAKE, attributed to the winner.
+  local settlements=$(( reply_commit + timeout_commit ))
+  local wakes=$(( reply_resume + timeout_wake ))
+  if (( settlements != 1 )); then
+    echo "[error] $tag: the terminal must settle exactly once -- reply_commit=${reply_commit} timeout_commit=${timeout_commit}"
+    bad=1
+  fi
+  if (( wakes != 1 )); then
+    echo "[error] $tag: the caller must wake exactly once -- reply_resume=${reply_resume} timeout_wake=${timeout_wake}"
+    bad=1
+  fi
+
+  if (( reply_win )); then
+    (( reply_commit == 1 ))   || { echo "[error] $tag: reply won but did not commit its terminal (commit=${reply_commit})"; bad=1; }
+    (( reply_resume == 1 ))   || { echo "[error] $tag: reply won but the caller did not resume via the reply (resume=${reply_resume})"; bad=1; }
+    (( timeout_win == 0 ))    || { echo "[error] $tag: reply won yet a timeout also won"; bad=1; }
+    (( timeout_wake == 0 ))   || { echo "[error] $tag: reply won yet the timeout also woke the caller (timeout_wake=${timeout_wake})"; bad=1; }
+    (( late_ok == 0 ))        || { echo "[error] $tag: late_reply_successes must be 0 (got ${late_ok})"; bad=1; }
+    (( replier_revoke == 1 )) || { echo "[error] $tag: the replier side of the one-shot is revoked once (got ${replier_revoke})"; bad=1; }
+    (( caller_revoke == 1 ))  || { echo "[error] $tag: the caller side of the one-shot is revoked once (got ${caller_revoke})"; bad=1; }
+    (( bad == 0 )) && echo "[ok] $tag: REPLY won the terminal — commit=1 resume=1 one-shot revoked on both sides, no timeout win"
+  else
+    (( timeout_commit == 1 )) || { echo "[error] $tag: timeout won but did not commit its terminal (commit=${timeout_commit})"; bad=1; }
+    (( timeout_wake == 1 ))   || { echo "[error] $tag: timeout won but did not wake the caller exactly once (caller_wakes=${timeout_wake})"; bad=1; }
+    (( aliases == 1 ))        || { echo "[error] $tag: the reply aliases must be invalidated exactly once (got ${aliases})"; bad=1; }
+    (( reply_resume == 0 ))   || { echo "[error] $tag: timeout owns the terminal, so the reply must NOT complete the caller (resume=${reply_resume})"; bad=1; }
+    (( reply_commit == 0 ))   || { echo "[error] $tag: timeout owns the terminal, so no reply commit may exist (got ${reply_commit})"; bad=1; }
+    (( reply_resolve == 0 ))  || { echo "[error] $tag: a reply succeeded after the timeout won (resolve=${reply_resolve})"; bad=1; }
+    (( late_ok == 0 ))        || { echo "[error] $tag: late_reply_successes must be 0 (got ${late_ok})"; bad=1; }
+    (( late_refused >= 1 ))   || { echo "[error] $tag: a reply attempted after the timeout must be refused (refusals=${late_refused})"; bad=1; }
+    # The one-shot must not be half-revoked behind a timeout win: either the alias
+    # invalidation owns it, or nothing does.
+    (( replier_revoke == 0 )) || { echo "[error] $tag: timeout won yet the replier one-shot slot was revoked by a reply (got ${replier_revoke})"; bad=1; }
+    (( bad == 0 )) && echo "[ok] $tag: TIMEOUT won the terminal — commit=1 caller_wakes=1 aliases_invalid=1 late reply refused (${late_refused}), no reply completion"
+  fi
+
+  # Neither outcome may leak, on any path.
+  local leak_cap leak_link leak_rec
+  leak_cap="$(_u9_c 'IPC_REPLY_FAST_REVOKE_FAIL')"
+  leak_link="$(_u9_c 'IPC_SERVER_REPLY_LINK_REGISTER_FAIL')"
+  leak_rec="$(_u9_c 'err=CapabilityFull')"
+  if (( leak_cap + leak_link + leak_rec != 0 )); then
+    echo "[error] $tag: leak on the witnessed path -- cap=${leak_cap} link=${leak_link} record=${leak_rec}"
+    bad=1
+  fi
+  return $bad
+}
+
+# ── Self-test: the evaluator must REJECT every malformed outcome ────────────────────
+# Run before the real log is judged, so a witness that has stopped discriminating fails here
+# rather than silently passing everything.
+_u9_arm='IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=2 caller_asid=2 record_index=0 record_generation=1 replier_tid=0 blocked_recv_generation=1 finite_deadline=1 deadline_reserved=1 result=ok
+IPC_REPLY_TIMEOUT_ARMED arch=aarch64 caller_tid=2 caller_asid=2 record_index=0 record_generation=1 terminal_epoch=1 token_slot=0 token_generation=1 deadline=9 result=ok'
+_u9_replywin="${_u9_arm}
+IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=0 generation=1 target_endpoint=5
+IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=0 record_generation=1 replier_tid=3 terminal=Reply resolution=commit settled=1 result=ok
+IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538 waiter_cap=65538 ok=true
+IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2 cap=65541 ok=true
+IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 len=40"
+_u9_timeoutwin="${_u9_arm}
+IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok
+IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok
+IPC_REPLY_FAIL tid=3 reply_cap=65538 err=WrongObject"
+
+_u9_selftest_fail=0
+_u9_expect() { # <expect 0|1> <desc> <log>
+  local want="$1" desc="$2" log="$3" got
+  u9rx4_eval_terminal "$log" "SELFTEST" >/dev/null 2>&1 && got=0 || got=1
+  if [[ "$got" != "$want" ]]; then
+    echo "[error] U9-RX4 evaluator self-test: '$desc' expected $( ((want)) && echo reject || echo accept ), got $( ((got)) && echo reject || echo accept )"
+    _u9_selftest_fail=1
+  fi
+}
+_u9_expect 0 "reply-win accepted"   "$_u9_replywin"
+_u9_expect 0 "timeout-win accepted" "$_u9_timeoutwin"
+_u9_expect 1 "no winner (the genuinely lost reply)" "$_u9_arm"
+_u9_expect 1 "two winners" "${_u9_replywin}
+IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok
+IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok"
+_u9_expect 1 "winner without its attributed wake" "${_u9_arm}
+IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=0 generation=1 target_endpoint=5
+IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=0 record_generation=1 replier_tid=3 terminal=Reply resolution=commit settled=1 result=ok
+IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538 waiter_cap=65538 ok=true
+IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2 cap=65541 ok=true"
+_u9_expect 1 "reply success after timeout" "${_u9_timeoutwin}
+IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=0 generation=1 target_endpoint=5"
+_u9_expect 1 "reply completion with timeout ownership" "${_u9_timeoutwin}
+IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 len=40"
+_u9_expect 1 "late_reply_successes non-zero" "${_u9_arm}
+IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=1 result=ok
+IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok
+IPC_REPLY_FAIL tid=3 reply_cap=65538 err=WrongObject"
+_u9_expect 1 "timeout win with no refusal of the late reply" "${_u9_arm}
+IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok
+IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok"
+_u9_expect 1 "leaked alias/record/link" "${_u9_replywin}
+IPC_REPLY_FAST_REVOKE_FAIL tid=3"
+if (( _u9_selftest_fail )); then
+  echo "[error] U9-RX4 terminal-outcome evaluator self-test FAILED"
+  exit 1
 fi
+echo "[ok] U9-RX4: terminal-outcome evaluator self-test passed (2 accepted, 8 rejected)"
+
+if ! u9rx4_eval_terminal "$u9rx4_log" "U9-RX4"; then
+  u9rx4_fail=1
+fi
+
 # The defect's own signatures must be gone.
 u9rx4_require_zero "no reply cap is lost to the u32::MAX sentinel" 'reply_cap=4294967295'
 u9rx4_require_zero "PM never fails to decode" 'PM_RECV_DECODE_FAIL'
@@ -556,7 +717,17 @@ BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_CO
 # This is the canonical one-shot rejection (the proof `second_reply=rejected`), NOT a
 # boot blocker; the x86_64 and riscv64 core smokes never flag it. Exclude ONLY this
 # exact IPC_REPLY_FAIL form; every other InvalidCapability still blocks.
-BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295'
+# DIRECT3-CAP-FINAL §5A: the OTHER canonical one-shot rejection, excluded on exactly the same
+# grounds as the InvalidCapability form above. When the four-tick reply deadline wins the
+# terminal, the reply that arrives afterwards MUST be refused, and the kernel refuses it with
+# `IPC_REPLY_FAIL tid=<replier> reply_cap=<c> err=WrongObject`. That is the arbitration working:
+# the record's terminal is already settled by Timeout, so no second claimant may complete it.
+#
+# This is not a blanket WrongObject tolerance — only the exact `IPC_REPLY_FAIL` form is excluded,
+# and every other WrongObject still blocks the boot. Nor is it unguarded: the U9-RX4 evaluator
+# REQUIRES this refusal on a timeout win (and requires `late_reply_successes=0` with it), so the
+# line is positively asserted where it belongs rather than merely tolerated here.
+BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=WrongObject|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295'
 
 if [[ -f "$LOGFILE" ]]; then
   blocker_lines="$(tr '\r' '\n' <"$LOGFILE" | rg -a -n "$BLOCKER_REGEX" || true)"

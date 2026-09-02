@@ -6357,3 +6357,172 @@ byte-identical to `7e240e5`, i.e. it predates this pass and traces to the 199D-D
 context capture making the scenario reachable at all. It is a real signal about the server-death
 path, it is outside this pass's owner set, and it needs its own increment; it is recorded here
 rather than excluded or explained away.
+
+## 199D-SD §1 — the server-death "wrong identity/generation" is not an arbitration race: the terminal cell is never armed in production (WIP; NOT delivered)
+
+**What the failure actually is.** The x86_64 server-death profile reports
+`IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY armed_tid=0 armed_asid=0 item_tid=10009 item_asid=1
+record_index=41` and `IPC_SERVER_DEATH_WRONG_RECORD_GENERATION armed_generation=0
+item_generation=1`, then `outcome=stale_identity caller_wakes=0`. The armed side is **all zeros**,
+which is the DEFAULT identity of an unarmed `reply_terminal_ownership` cell — not a competing
+owner. The published item is not stale: the drain's own generation pre-check passed
+(`reply_cap_generations[41] == Some(1)`, so it never reported `stale_record`) and the exiting
+incarnation `{tid 10009, asid 1}` is exactly the one `take_server_reply_link` detached the link
+from. Nothing raced. There was simply nothing armed to claim against, so the blocked caller is
+never woken with `ServerGone`: `caller_wakes=0`, `PeerDeath winners=0`.
+
+**Why nothing is armed.** `arm_reply_terminal` has exactly one production caller,
+`arm_production_reply_deadline`, and that function has exactly one call site —
+`block_current_on_receive_with_deadline` in `kernel/boot/ipc_state.rs`, the **in-lock** blocking
+receive. But NR 2 / NR 5 blocking receives are serviced by the **pre-lock split route**,
+`try_split_blocking_ipc_recv_into_frame` in `kernel/syscall_split.rs`, which publishes its own
+`IPC_RECV_BLOCK_REGISTER` and never arms anything. Both markers appear 118 times in one boot
+because the two are paired per receive, which is what made the in-lock owner look reachable.
+Temporary instrumentation inside `arm_production_reply_deadline` settled it: **0 invocations**
+across an entire boot with 118 blocking receives.
+
+**A second consequence of the same root cause.** The same dead function also owns production
+reply-deadline registration, so `IPC_REPLY_TIMEOUT_ARMED` is **0** for a whole boot. Production
+reply/call timeout registration is not running either — the terminal arming and the deadline
+registration were both stranded when the blocking receive moved to the pre-lock route. The
+`doc/KERNEL_UNLOCKING.md` 199E claim that "reply/call timeout registration is now ORDINARY
+production code (`arm_production_reply_deadline`, ungated)" is true of the code but not of its
+reachability on any port that takes the split route.
+
+**Also recorded, and NOT a defect.** `IPC_SERVER_DEATH_DUPLICATE_TRANSITION class=deferred_reserved
+count=2` and the two "marker out of order" failures come from the boot-global transition counter
+and ordering stamps seeing an unrelated earlier server exit (tid 10000, ~6000 lines before the
+witnessed scenario). They became visible only because the service chain now spawns and exits more
+servers. The audit is boot-scoped where the witness is scenario-scoped.
+
+**State.** One checkpoint is on WIP: `arm_production_reply_deadline` now separates ARMING from
+DEADLINE REGISTRATION, so a caller that blocks on a reply receive without a finite timeout still
+arms its terminal cell. That is necessary and correct, and it is **inert until the split route
+calls it** — the in-lock owner it lives in is unreachable in production. Completing the repair
+means giving the pre-lock route the same transaction through split seams, which is genuinely
+multi-domain: the token check and the committed-blocked check read TCBs (task rank 2) while the
+record lookup, terminal cell and deadline store are IPC rank 3. That is a real rank-ordered
+transaction, not a wrapper, and it was not attempted here rather than risk a half-verified one.
+NR 6 / NR 7 portability to AArch64 and RISC-V was not started. Main is unchanged.
+
+## 199E-ARM — the split receive route now arms the reply terminal; server death settles (WIP; NOT delivered)
+
+**What was wired.** `arm_reply_terminal_for_committed_block_locked` is the arming policy and it is
+rank 3 only — everything it reads and writes lives in `IpcSubsystem`. It runs inside the SAME
+`with_ipc_split_mut` scope that publishes the endpoint waiter, so a committed reply wait and its
+terminal owner become visible together and there is no window in which a committed wait exists
+with no owner to claim it. It arms only on a successful publish (a refused publish unwinds the
+block), only for a genuine reply/call wait (a live `Available` reply record naming this exact
+`{caller_tid, caller_asid}` at this exact reply endpoint, so ordinary receives and NR 2 / NR 5
+timeout semantics are untouched), and regardless of any deadline — the cell is the single
+authority for reply, timeout, peer death, caller exit and endpoint destruction, and only one of
+those is a timeout. An identity already armed exactly is left alone rather than re-armed, because
+`arm` bumps the cell epoch and would invalidate a deadline token keyed on the old one.
+
+**Live result — server death now settles.** The witnessed scenario arms with the exact identity
+and the drain wins:
+
+```
+IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=1 caller_asid=1 record_index=0 record_generation=18
+                               replier_tid=10009 blocked_recv_generation=17 finite_deadline=1
+IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won record_index=0 record_generation=18
+                                caller_tid=1 caller_asid=1 broad_lock=0
+IPC_SERVER_DEATH_COMPLETION_COMMITTED code=10 caller_tid=1 caller_asid=1 runnable=1 result=ok
+IPC_SERVER_DEATH_CALLER_ENQUEUED caller_tid=1 caller_asid=1 enqueues=1 result=ok
+IPC_SERVER_DEATH_OK arch=x86_64 terminal=PeerDeath death_result=ServerDied caller_wakes=1
+                    reply_aliases_invalid=1 reply_copies=0 result=ok
+IPC_SERVER_DEATH_DRAIN outcome=Woken record_index=0 record_generation=18 result=ok
+```
+
+`IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY` and `IPC_SERVER_DEATH_WRONG_RECORD_GENERATION` are gone,
+and the blocked caller receives `ServerGone` exactly once. The profile's failure count falls from
+15 to 3.
+
+**The three that remain, and why they are one cause.** The finite-deadline STORE registration is
+still dead: it additionally writes the caller's TCB (`reply_timeout_token`, `reply_timeout_clock`),
+which is rank 2, so it cannot ride the rank-3 publish scope the way the arm does. That single gap
+explains all three:
+
+* `IPC_SERVER_DEATH_RECORD_LEAK detached=0 peer_death_winners=1` — the audit compares
+  `LinkDetached` against `PeerDeathWinner`, and the `LinkDetached` counter is scoped by
+  `arm_server_dies_link_scope`, which is called from `register_reply_receive_deadline`. With that
+  registration dead the scope is never armed, so the detach is never counted while the winner is.
+  It is a counting asymmetry, not an actual leaked record — the drain reports `outcome=Woken` and
+  `reply_aliases_invalid=1 reply_copies=0`.
+* the two `marker out of order` failures — boot-global ordering stamps observing an unrelated
+  earlier server exit (tid 10000, ~6000 lines before the witnessed scenario), as already recorded.
+
+**Next step, precisely.** The deadline half is a 2 → 3 → 2 sequence with compensation: rank 3
+reserves the token (`arm_deadline_token` is itself IpcState-only), rank 2 publishes the handle into
+the caller's TCB, and a rank-3 release compensates if that publish fails. No two domains are ever
+held together. Until it lands, `IPC_REPLY_TIMEOUT_ARMED` stays 0 and §4's finite-timeout
+requirement is unmet, so this is NOT delivered and NR 6 / NR 7 portability was not started. Main is
+unchanged.
+
+---
+
+## DIRECT3-CAP-FINAL — capability-bearing direct replies, and NR6/NR7 on all three architectures
+
+Production NR7 no longer reaches the broad dispatcher on any architecture.
+
+### The ledger, three consecutive clean runs per architecture
+
+| | total NR7 | blocked plain | blocked cap-bearing | queued | broad/legacy | refused pre-lock |
+|---|---|---|---|---|---|---|
+| x86_64  | 54 | 42 | 10 | 2 | **0** | 0 |
+| AArch64 | 54 | 42 | 10 | 2 | **0** | 0 |
+| RISC-V  | 54 | 41 | 10 | 2 | **0** | 1 |
+
+`settled=10 restored=0 CapabilityFull=0 link failures=0 terminal losses=0 panic=0` on every run.
+RISC-V's boot deterministically loses one reply to its own reply deadline; that reply is refused
+pre-lock rather than entering the broad dispatcher to be refused there (see the residual matrix).
+
+### The capability lane
+
+The ten cap-bearing replies are one class: MemoryObject initramfs file-slice grants relayed
+`tid 3 → VFS backend → initramfs server`, every one delivered through the `ordinary_cap`
+materialization class to a committed-blocked caller. Rights verified at both relay hops
+(`dst_rights=5 expected_rights=5 rights_ok=1`), object identity `match=1`. No DmaRegion,
+shared-region or pin path is exercised, and none is claimed live.
+
+The lane composes existing owners only — the transfer-envelope stash, the blocked-waiter
+ordinary-cap producer and executor, the materialize/rollback seams, and the reply's own terminal,
+authority, record and reverse-link owners. The full producer preference chain is retained so a
+future class lands correctly rather than silently.
+
+**Materialization cannot happen under the syscall, so the reply does not settle there.**
+`ReplyTerminalContinuation` carries the exact reply-record identity, the `TerminalOwner` the
+syscall won and deliberately did not settle, the one-shot authority identities and both
+incarnations through `DispatchPostWork`. The executor then orders:
+
+```
+materialize → payload + meta copy
+  ├─ failure → roll the minted cap fully back, then restore RETRYABLE reply ownership:
+  │            terminal released at the SAME epoch, record back to Available, one-shot unspent
+  └─ success → consume the record (THE one-shot barrier) → reclaim the reply authority
+               → commit the terminal → close the reverse link → release the slot
+               → complete and wake exactly once
+```
+
+Nothing is consumed, revoked, committed or released before the last step that may still require a
+retry, and there is no broad fallback after any consuming step.
+
+### Residual terminal-dispatch matrix (source-recomputed)
+
+| edge | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| NR6 production terminal edges | 0 | 0 | 0 |
+| NR7 production terminal edges | 0 | 0 | 0 |
+| NR7 deterministic refusal (spent authority) | pre-lock | pre-lock | pre-lock |
+| broad-lock census (`with_cpu / with_broad / TOTAL`) | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+The census is unchanged at **2 / 0 / 2**. Both terminal acquisitions still exist, so **U9 remains
+OPEN**: this increment empties the NR6/NR7 population that reached them, it does not delete them.
+
+### Known red, unchanged and not weakened
+
+The x86_64 reply-timeout retirement profile is red at `a3aa7cb` and remains red. Its first failure —
+`oracle-identity ARMED count != 1 (got 0) for caller_tid=1` — reproduces identically at base; the
+oracle never arms its identity cell, so it creates no reply-wins race. Four of base's five failures
+are now fixed and the seal moved `timeout_wins=0 → 1`, with `reply_wins=0` unchanged. The oracle is
+neither weakened, conditionalized nor deleted.

@@ -63,26 +63,19 @@ impl crate::runtime::SharedKernel {
         reply_index: usize,
         reply_generation: u64,
         cap: CapId,
+        responder: Option<crate::kernel::boot::ReceiverWaiterIdentity>,
     ) -> ReplyRecordSetOutcome {
+        // DIRECT3 §1: a thin rank-3 adapter over the ONE priming policy. This used to
+        // re-implement the range/generation/slot checks, which is how the responder binding came
+        // to exist on the broad copies and not on the seam production actually takes.
         self.with_ipc_split_mut(|ipc| {
-            if reply_index >= super::MAX_REPLY_CAPS {
-                return ReplyRecordSetOutcome::IndexOutOfRange;
-            }
-            if ipc.reply_cap_generations[reply_index] != reply_generation {
-                return ReplyRecordSetOutcome::GenerationMismatch;
-            }
-            if let Some(record) = &mut ipc.reply_caps[reply_index] {
-                record.waiter_cap_id = Some(cap);
-                crate::yarm_log!(
-                    "IPC_RECV_REPLY_CAP_WAITER_CAP_SET reply_index={} reply_gen={} cap={}",
-                    reply_index,
-                    reply_generation,
-                    cap.0
-                );
-                ReplyRecordSetOutcome::Set
-            } else {
-                ReplyRecordSetOutcome::SlotEmpty
-            }
+            super::ipc_state::record_reply_waiter_cap_locked(
+                ipc,
+                reply_index,
+                reply_generation,
+                cap,
+                responder,
+            )
         })
     }
 

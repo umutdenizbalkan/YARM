@@ -52,27 +52,83 @@ serverdies_recheck_commit() {
 # `..._DONE` after. The earlier attempts never reached the caller wake, so the inversion was
 # never exposed. Nothing about the SET of required markers was weakened by the correction;
 # the tail below adds the quiescent attestations rather than removing anything.
+#
+# 199D-SD3 (§4) — SCENARIO SCOPE. The chain used to be matched by identity-free literals,
+# and two of its markers are emitted by EVERY task exit in the boot, not only by the
+# scenario's: the deferred RESERVATION and the architecture's exit-disposition consumption.
+# On a boot where any unrelated task exits first — the fork/COW proof child does, thousands
+# of lines earlier — the "first occurrence" the order check compared against belonged to
+# that exit, and the run failed on two markers that were entirely correct.
+#
+# The chain is therefore matched against the WITNESSED transaction: the dying server
+# `{tid, asid}`, the reply record `{index, generation}` its reverse link named, and the
+# caller `{tid, asid}` the completion was published for. `serverdies_resolve_identity`
+# reads all of that out of the log and requires the completion to name the same reply
+# record the captured link did, so the identity is a causal join rather than an assumption
+# that only one scenario is present.
+#
+# (The terminal cell's epoch is not exposed in any live marker; the reply record's
+# generation is the incarnation discriminator that is, and it is what every scoped literal
+# below carries.)
 serverdies_required_markers() {
   cat <<MARKERS
 IPC_SERVER_DEATH_REQUEST_RECEIVED
 IPC_SERVER_DEATH_REPLY_CAP_RECEIVED
 IPC_SERVER_DEATH_EXIT_ENTERED nr=16 role=server
-IPC_SERVER_DEATH_DEFERRED_RESERVED
-IPC_SERVER_DEATH_LINK_CAPTURED
-IPC_SERVER_DEATH_DEFERRED_PUBLISHED
-EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG}
+IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID}
+IPC_SERVER_DEATH_SCOPE_ARMED record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION} server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID} link_present=1
+IPC_SERVER_DEATH_LINK_CAPTURED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID} record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION}
+IPC_SERVER_DEATH_DEFERRED_PUBLISHED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID} record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION}
+EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG} tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}
 IPC_SERVER_DEATH_BROAD_LOCK_RELEASED
 IPC_SERVER_DEATH_POST_LOCK_DRAIN_BEGIN
-IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won
-IPC_SERVER_DEATH_COMPLETION_COMMITTED
-IPC_SERVER_DEATH_CALLER_ENQUEUED
+IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION} caller_tid=${SD_CALLER_TID} caller_asid=${SD_CALLER_ASID}
+IPC_SERVER_DEATH_COMPLETION_COMMITTED code=10 caller_tid=${SD_CALLER_TID} caller_asid=${SD_CALLER_ASID} record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION}
+IPC_SERVER_DEATH_CALLER_ENQUEUED caller_tid=${SD_CALLER_TID} caller_asid=${SD_CALLER_ASID}
 IPC_SERVER_DEATH_OK
-IPC_SERVER_DEATH_TRANSITION_AUDIT
+IPC_SERVER_DEATH_TRANSITION_AUDIT vector=[1, 1, 1, 1, 1, 1, 1, 1, 1] result_before_enqueue=1 result=ok
 IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code=10
 IPC_SERVER_DEATH_SURVIVOR_PROGRESS_OK
 IPC_SERVER_DEATH_SYSTEM_HEALTH_OK
 IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT
 MARKERS
+}
+
+# One `key=value` field out of one marker line. Anchored on the whitespace before the key,
+# so `record_index` never matches `reply_record_index`.
+serverdies_field() {
+  printf '%s' "$1" | tr -d '\r' | sed -n "s/.*[[:space:]]$2=\([^[:space:]]*\).*/\1/p"
+}
+
+# Resolve the witnessed transaction's identity from the log, failing closed.
+#
+# Both anchor lines must be unique — more than one captured link or more than one published
+# completion in a single boot is itself a defect, not something to pick a winner from — and
+# the completion must name the SAME reply record the captured link did.
+serverdies_resolve_identity() {
+  local log=$1 captured committed n f
+  n=$(grep -c -F "IPC_SERVER_DEATH_LINK_CAPTURED " "$log" || true)
+  [[ "$n" == "1" ]] || { die "RUN_B expected exactly one captured reverse link, saw $n"; return 1; }
+  n=$(grep -c -F "IPC_SERVER_DEATH_COMPLETION_COMMITTED " "$log" || true)
+  [[ "$n" == "1" ]] || { die "RUN_B expected exactly one committed completion, saw $n"; return 1; }
+  captured=$(grep -m1 -F "IPC_SERVER_DEATH_LINK_CAPTURED " "$log")
+  committed=$(grep -m1 -F "IPC_SERVER_DEATH_COMPLETION_COMMITTED " "$log")
+  SD_SERVER_TID=$(serverdies_field "$captured" server_tid)
+  SD_SERVER_ASID=$(serverdies_field "$captured" server_asid)
+  SD_RECORD_INDEX=$(serverdies_field "$captured" record_index)
+  SD_RECORD_GENERATION=$(serverdies_field "$captured" record_generation)
+  SD_CALLER_TID=$(serverdies_field "$committed" caller_tid)
+  SD_CALLER_ASID=$(serverdies_field "$committed" caller_asid)
+  for f in "$SD_SERVER_TID" "$SD_SERVER_ASID" "$SD_RECORD_INDEX" "$SD_RECORD_GENERATION" \
+           "$SD_CALLER_TID" "$SD_CALLER_ASID"; do
+    [[ "$f" =~ ^[0-9]+$ ]] || { die "RUN_B could not resolve the witnessed identity"; return 1; }
+  done
+  if [[ "$(serverdies_field "$committed" record_index)" != "$SD_RECORD_INDEX" ]] \
+     || [[ "$(serverdies_field "$committed" record_generation)" != "$SD_RECORD_GENERATION" ]]; then
+    die "RUN_B completion names a different reply record than the captured link"
+    return 1
+  fi
+  note "RUN_B witnessed scenario: server={${SD_SERVER_TID},${SD_SERVER_ASID}} caller={${SD_CALLER_TID},${SD_CALLER_ASID}} record={${SD_RECORD_INDEX},${SD_RECORD_GENERATION}}"
 }
 
 # Any of these in a live log is fatal: the server returned from NR16, a wrong incarnation was
@@ -88,6 +144,10 @@ IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION
 IPC_SERVER_DEATH_DUPLICATE_COMPLETION
 IPC_SERVER_DEATH_DUPLICATE_WAKE
 IPC_SERVER_DEATH_DUPLICATE_DEFERRED
+IPC_SERVER_DEATH_DUPLICATE_TRANSITION
+IPC_SERVER_DEATH_TRANSITION_COUNT
+IPC_SERVER_DEATH_SCOPE_CONFLICT
+IPC_SERVER_DEATH_SCOPE_UNARMED
 IPC_SERVER_DEATH_LINK_LEAK
 IPC_SERVER_DEATH_RECORD_LEAK
 IPC_SERVER_DEATH_DEFERRED_LEAK
@@ -119,6 +179,11 @@ IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION
 IPC_SERVER_DEATH_LATE_TIMEOUT_SCANNED
 IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT
 IPC_SERVER_DEATH_LINK_BALANCE_DEFERRED
+IPC_SERVER_DEATH_SCOPE_ARMED
+IPC_SERVER_DEATH_SCOPE_CONFLICT
+IPC_SERVER_DEATH_SCOPE_UNARMED
+IPC_SERVER_DEATH_FOREIGN_LINK_CLOSE
+IPC_SERVER_DEATH_FOREIGN_TRANSITION
 ORACLE
 }
 
@@ -192,7 +257,13 @@ serverdies_run_b_live_cell() {
   banners=$(grep -c "YARM_BOOT_OK" "$log" || true)
   [[ "$banners" == "1" ]] || die "RUN_B expected exactly one boot banner, saw $banners"
 
-  # Ordered required markers.
+  # 199D-SD3 (§4): resolve the witnessed transaction before grading anything against it.
+  # A boot that cannot name its own scenario has already failed, so this returns early
+  # rather than grading an identity-free chain as a fallback.
+  serverdies_resolve_identity "$log" || return
+
+  # Ordered required markers, each scoped to the witnessed transaction where the marker is
+  # one that other exits also emit.
   local prev=0 line idx
   while read -r line; do
     [[ -z "$line" ]] && continue
@@ -201,6 +272,20 @@ serverdies_run_b_live_cell() {
     if (( idx < prev )); then die "RUN_B marker out of order: $line"; fi
     prev=$idx
   done < <(serverdies_required_markers)
+
+  # 199D-SD3 (§4): scoping the chain must not cost duplicate detection. The two markers that
+  # every exit emits are now matched by the witnessed server's identity, so a SECOND
+  # occurrence carrying that same identity is a genuine repeat of the scenario's own exit and
+  # must still fail. (The kernel's own nine-vector answers the same question from the other
+  # side: `TRANSITION_AUDIT` above is required to read exactly all-ones, and both
+  # `DUPLICATE_TRANSITION` and `TRANSITION_COUNT` are forbidden.)
+  local dup
+  for line in \
+    "IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID}" \
+    "EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG} tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}"; do
+    dup=$(grep -c -F "$line" "$log" || true)
+    [[ "$dup" == "1" ]] || die "RUN_B scoped marker seen $dup times (expected 1): $line"
+  done
 
   # Forbidden markers.
   while read -r line; do

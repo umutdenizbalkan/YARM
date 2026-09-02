@@ -20758,7 +20758,7 @@ fn stage20_rollback_materialized_reply_cap_clears_slot_and_waiter_id() {
             // Simulate materialization: record the caller-local cap as the waiter cap
             // (set_reply_cap_waiter_cap is what the recv path calls).
             let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
-            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
+            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap, None);
             assert_eq!(
                 state.reply_cap_record_waiter_cap(reply_index),
                 Some(reply_cap),
@@ -20832,7 +20832,7 @@ fn stage20_clear_reply_cap_waiter_cap_generation_guard() {
                 .expect("create reply cap");
             let reply_index = 0usize;
             let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
-            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
+            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap, None);
             assert_eq!(
                 state.reply_cap_record_waiter_cap(reply_index),
                 Some(reply_cap)
@@ -22252,7 +22252,7 @@ fn stage25c_stale_waiter_cap_id_cleared_on_replier_teardown() {
                 .expect("create reply cap");
             let reply_index = 0usize;
             let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
-            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
+            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap, None);
             assert_eq!(
                 state.reply_cap_record_waiter_cap(reply_index),
                 Some(reply_cap),
@@ -51737,7 +51737,7 @@ mod stage188d_reply_cap_rank_inversion_seam {
                 k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].is_none()),
                 "the consumed record slot must be empty (one-shot consume point)"
             );
-            let reprime = k.try_set_reply_cap_waiter_cap(reply_index, reply_generation, receiver_cap);
+            let reprime = k.try_set_reply_cap_waiter_cap(reply_index, reply_generation, receiver_cap, None);
             assert!(
                 !matches!(reprime, crate::kernel::boot::ReplyRecordSetOutcome::Set),
                 "re-priming a consumed record must fail — the record is the one-shot arbiter"
@@ -65060,7 +65060,7 @@ mod stage198d1_queued_reply_cap_lifetime {
         let minted = state
             .mint_capability_in_cnode(cnode, Capability::new(reply_obj, CapRights::SEND))
             .expect("provisional receiver mint");
-        state.set_reply_cap_waiter_cap(index, generation, minted);
+        state.set_reply_cap_waiter_cap(index, generation, minted, None);
         assert_eq!(state.reply_cap_record_waiter_cap(index), Some(minted));
 
         // A subsequent copy/CNode failure rolls the provisional mint back.
@@ -81032,10 +81032,13 @@ mod stage199a2b3_direct_reply_txn {
     /// **A terminal-arbitrated reply still declines before EVERY mutation.** The direct path is
     /// only reachable for untimed replies — which is exactly why route A (restore the authority)
     /// is required rather than leaning on a timeout that is not armed.
+    /// 199D-TRC — an UNCLAIMABLE terminal declines before every mutation; an armed-and-
+    /// available one does not decline at all.
     #[test]
     fn a_terminal_arbitrated_reply_declines_before_every_mutation() {
         use crate::kernel::direct_eligibility::{
-            DirectReplyEligibility, DirectReplyFacts, classify_direct_reply_eligibility,
+            DirectReplyEligibility, DirectReplyFacts, DirectReplyTerminal,
+            classify_direct_reply_eligibility,
         };
         let facts = DirectReplyFacts {
             payload_len: 8,
@@ -81044,25 +81047,26 @@ mod stage199a2b3_direct_reply_txn {
             reply_endpoint: Some((4, 9)),
             endpoint_admitted: true,
             transfer_cap_present: false,
-            terminal_arbitrated: true,
+            terminal: DirectReplyTerminal::OwnedByCompetitor,
         };
         assert_eq!(
             classify_direct_reply_eligibility(&facts),
-            DirectReplyEligibility::TerminalArbitrationUnsupported,
-            "an armed reply timeout keeps the reply on the legacy path"
+            DirectReplyEligibility::TerminalUnavailable(DirectReplyTerminal::OwnedByCompetitor),
+            "a terminal a competitor owns keeps the reply off the direct path"
         );
-        // Sanity: the SAME facts with the flag clear ARE eligible, so the decline is caused by
-        // arbitration alone and this test cannot pass vacuously.
-        let mut untimed = facts;
-        untimed.terminal_arbitrated = false;
+        // Sanity: the SAME facts with an ARMED-AND-AVAILABLE terminal ARE eligible, so the
+        // decline is caused by unclaimability alone and this test cannot pass vacuously. This
+        // is the exact assertion the pre-199D-TRC version got backwards.
+        let mut available = facts;
+        available.terminal = DirectReplyTerminal::AvailableExact;
         assert!(matches!(
-            classify_direct_reply_eligibility(&untimed),
+            classify_direct_reply_eligibility(&available),
             DirectReplyEligibility::Eligible { .. }
         ));
         // …and the decline is ahead of every mutating step in the classifier's source order.
         const ELIG: &str = include_str!("../direct_eligibility.rs");
         let at = ELIG
-            .find("if facts.terminal_arbitrated {")
+            .find("if !facts.terminal.admits_direct_reply() {")
             .expect("the arbitration gate");
         let tail = &ELIG[at..];
         for mutating in [
@@ -85207,26 +85211,56 @@ mod stage199d_delivery_projection_differential {
                 split
                     .matches("COUNTERS.note_declined_pre_transaction();")
                     .count(),
-                6,
-                "three pre-transaction decline sites per direction: copy, snapshot, ack claim"
+                20,
+                "NR6 has three (copy, snapshot, ack claim); 199D-TRC gave NR7 three more — the \
+                 unresolved-record fail-close, the mode-indeterminate refusal and the lost \
+                 terminal claim; DIRECT3-QUEUECAP gave it two more on the queued mode — the \
+                 message-framing refusal and the pre-mutation queue refusal; DIRECT3-CAP-FINAL \
+                 gave the capability lane nine, one per way it can refuse having mutated \
+                 nothing it cannot undo — absent transfer cap, unreadable caller, unreadable \
+                 authority slots, refused record reservation, an unarmed terminal, a LOST \
+                 terminal claim, a refused envelope stash, a refused message framing, and a \
+                 producer that declined or failed. §7's pre-lock refusal of a spent reply \
+                 authority is NOT among them: it is a PREFLIGHT decline, counted through \
+                 `note_declined_preflight_reply` with every other ineligibility"
             );
-            for direction in ["REQUEST_COUNTERS", "REPLY_COUNTERS"] {
+            for (direction, sites, what) in [
+                (
+                    "REQUEST_COUNTERS",
+                    3,
+                    "copy, snapshot and ack-claim declines are all counted",
+                ),
+                (
+                    "REPLY_COUNTERS",
+                    17,
+                    "copy, snapshot, ack-claim, unresolved-record, mode-indeterminate, \
+                     lost-claim, queued-framing and queued-refusal declines are all counted, \
+                     plus the capability lane's nine — absent transfer cap, unreadable caller, \
+                     unreadable authority slots, refused record reservation, unarmed terminal, \
+                     lost terminal claim, refused envelope stash, refused message framing, and \
+                     a producer that declined or failed. The lane uses THIS counter rather than \
+                     a second alias for it, so a cap-bearing refusal is never accounted apart \
+                     from every other NR7 refusal",
+                ),
+            ] {
                 assert_eq!(
                     split
                         .matches(&alloc::format!(
                             "{direction}.note_declined_pre_transaction();"
                         ))
                         .count(),
-                    3,
-                    "{direction}: copy, snapshot and ack-claim declines are all counted"
+                    sites,
+                    "{direction}: {what}"
                 );
             }
             assert_eq!(
                 split
                     .matches("direct_ipc_counters::note_disposition(")
                     .count(),
-                2,
-                "both directions count their terminal disposition"
+                3,
+                "NR6, the plain NR7 lanes, and the capability lane each count their terminal \
+                 disposition — the capability lane needs its own because it returns from the \
+                 route before the shared tail, having handed its delivery to the drain"
             );
             // Only the NR6 direction can report a MODE decline; NR7 has no mode requirement.
             // Whitespace-collapsed so rustfmt's line breaking cannot break the guard.
@@ -85782,7 +85816,7 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "the whole condition is the target architecture: x86_64 is production-default, \
              every other architecture is not"
         );
@@ -85858,15 +85892,25 @@ mod stage199d_production_default_guards {
         // AArch64 and RISC-V are explicitly unchanged.
         // WA3C2-DOC-SEAL: WA1-GATE's universal fall-back wording is retired with the gate. The
         // record now names the architecture split, which is what the predicate actually says.
+        // DIRECT3-CAP-FINAL §5: the record must still name which architectures are
+        // production-default and which are not, and must still say WHY — the term is true
+        // where live profiles exist and false where they do not. Repointed to the current
+        // split (x86_64 + AArch64 on, RISC-V off), not relaxed: the doc is still required to
+        // state the scope explicitly rather than merely assert it.
         assert!(
-            doc.contains("`true` on x86_64 only")
-                && doc.contains("AArch64 and RISC-V keep the legacy path"),
+            doc.contains("never as a knob or a selector, and never ahead of")
+                && doc.contains("DIRECT3-CAP-FINAL §6 adds RISC-V on the same evidentiary"),
             "the record states which architectures are production-default and which are not"
         );
-        // Stage 199D-WA3C2: the default is ON for x86_64 and OFF elsewhere.
+        assert!(
+            doc.contains("DIRECT3-CAP-FINAL adds AArch64"),
+            "and names the architecture the scope most recently gained, with its evidence"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
             cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64")
         );
         // Where production is off, admission and publication are EXACTLY the proof gate: the
         // ordinary configuration reaches neither, and the explicit selector reaches both. Where
@@ -91353,12 +91397,41 @@ mod stage200b_memory_ordering {
     #[test]
     fn terminal_rearm_publishes_open_with_release_last() {
         let s = terminal_src();
-        // The re-arm publishes Open with the SAME Release discipline as arm.
+        // EVERY publisher of `Open` — arm, try_rearm and the 199A2D-RR vacate-for-reuse —
+        // writes the identity first and publishes Open LAST with one Release store, so an
+        // Acquire reader that sees Open also sees the whole identity it belongs to. Pinned
+        // per publisher rather than by a bare count: a new publisher that skipped the
+        // discipline would keep any count honest only by accident.
+        for publisher in [
+            "pub fn arm(&mut self, identity: TerminalIdentity) {",
+            "pub fn try_rearm(",
+            "pub fn vacate_for_reuse(&mut self) -> bool {",
+        ] {
+            let body = s.split(publisher).nth(1).unwrap_or_else(|| {
+                panic!("missing terminal publisher: {publisher}");
+            });
+            let end = body.find("\n    /// ").unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                body.contains("store(encode(epoch, 0, PHASE_OPEN), Ordering::Release)"),
+                "{publisher} must publish Open with a Release store"
+            );
+            let ident = body
+                .find("self.identity = ")
+                .unwrap_or_else(|| panic!("{publisher} must write the identity"));
+            let publish = body
+                .find("store(encode(epoch, 0, PHASE_OPEN), Ordering::Release)")
+                .expect("checked above");
+            assert!(
+                ident < publish,
+                "{publisher} must write the identity BEFORE publishing Open"
+            );
+        }
         assert_eq!(
             s.matches("store(encode(epoch, 0, PHASE_OPEN), Ordering::Release)")
                 .count(),
-            2,
-            "both arm and try_rearm publish Open with a Release store"
+            3,
+            "arm, try_rearm and vacate_for_reuse are the ONLY publishers of Open"
         );
         assert!(
             s.contains(".compare_exchange(open, reserved, Ordering::AcqRel, Ordering::Acquire)"),
@@ -97543,6 +97616,13 @@ mod stage200d2a_deferred_death {
             Some(r) => r,
             None => return false,
         };
+        // 199D-SD3 (§4): mirror `exit_task` — the held reservation is attributed by the
+        // dying server's identity, at the point that identity is known.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        crate::kernel::boot::server_dies_counters::note_deferred_reserved(
+            fx.replier.tid.0,
+            fx.replier.asid.0,
+        );
         match fx
             .k
             .with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
@@ -98228,10 +98308,34 @@ mod stage200df0_feature_gating {
         let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
         let exit = exit.split("\n    pub fn ").next().unwrap();
         assert!(exit.contains("server_death_work_reserve(cpu_idx)"));
-        assert!(
-            !exit.contains(ORACLE_FEATURE),
-            "the teardown handoff must not be oracle-gated"
-        );
+        // 199D-SD3: this used to require that the oracle feature appear NOWHERE in `exit_task`,
+        // which conflated two different claims. The load-bearing one is that the production
+        // HANDOFF - reserve, detach, publish - is ungated. `exit_task` now also arms the
+        // ServerDies audit SCOPE from the death identity, and that is observation only and
+        // correctly oracle-gated. So assert the real property instead of the proxy: every gated
+        // region in `exit_task` is the scope arming, and each production handoff step is outside
+        // any of them.
+        for step in [
+            "server_death_work_reserve(cpu_idx)",
+            "take_server_reply_link(tid, exit_identity.asid)",
+            "server_death_work_publish(reservation, work)",
+        ] {
+            let at = exit
+                .find(step)
+                .unwrap_or_else(|| panic!("the handoff step {step}"));
+            let cfgs = preceding_cfgs(exit, step);
+            assert!(
+                !cfgs.contains(ORACLE_FEATURE),
+                "handoff step {step} must not be oracle-gated: {cfgs} (at {at})"
+            );
+        }
+        for (i, _) in exit.match_indices(ORACLE_FEATURE) {
+            let window = &exit[i..exit.len().min(i + 260)];
+            assert!(
+                window.contains("arm_server_dies_link_scope"),
+                "the only oracle-gated region in exit_task is the audit scope arming"
+            );
+        }
     }
 
     /// (2) the ORACLE's own scaffolding stays gated — the repair widened nothing.
@@ -102534,29 +102638,66 @@ mod stage200d2b1bi_counters {
                 .count(),
             1
         );
-        // 3/4/5 deferred queue operations.
+        // 4/5 deferred queue operations, each attributed AT the real operation and scoped by
+        // the identity that operation actually carries — the item's own reply record.
         for (f, class, must) in [
             (
-                "pub(crate) fn server_death_work_reserve(",
-                "Transition::DeferredReserved",
-                "Some(ServerDeathWorkReservation { cpu_idx, slot })",
-            ),
-            (
                 "pub(crate) fn server_death_work_publish(",
-                "Transition::DeferredPublished",
+                "note_deferred_published(",
                 "q[reservation.slot] = Some(work);",
             ),
             (
                 "pub(crate) fn server_death_work_drain_next(",
-                "Transition::DeferredConsumed",
-                "if taken.is_some() {",
+                "note_deferred_consumed(",
+                "if let Some(work) = taken {",
             ),
         ] {
             let body = MOD_SRC.split(f).nth(1).expect(f);
             let body = body.split("\n}\n").next().unwrap();
             assert!(body.contains(class), "{f} records {class}");
             assert!(body.contains(must), "{f} performs the real operation");
+            assert!(
+                body.contains("work.reply_record_index")
+                    && body.contains("work.reply_record_generation"),
+                "{f} attributes by the item's own record identity"
+            );
         }
+        // 3 — the RESERVATION. 199D-SD3 (§4): the queue operation carries no record identity
+        // (the reverse link has not been read yet), so it counts nothing at all and the exit
+        // path attributes the reservation it holds, by the dying server's identity. The
+        // reserve function must therefore perform its real operation and reach NO class.
+        let reserve = MOD_SRC
+            .split("pub(crate) fn server_death_work_reserve(")
+            .nth(1)
+            .expect("reserve")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(
+            reserve.contains("Some(ServerDeathWorkReservation { cpu_idx, slot })"),
+            "the reserve still performs the real operation"
+        );
+        assert!(
+            !reserve.contains("Transition::") && !reserve.contains("note_deferred_reserved("),
+            "an identity-less reservation must not attribute itself"
+        );
+        // The exit path attributes it, inside the arm that HOLDS a reservation, after the
+        // scope is armed and before the irreversible detach.
+        let held = RESTART_SRC
+            .split("let death_link = match crate::kernel::boot::server_death_work_reserve(cpu_idx)")
+            .nth(1)
+            .expect("exit block");
+        let armed = held
+            .find("arm_server_dies_link_scope(")
+            .expect("the scope is armed first");
+        let noted = held
+            .find("note_deferred_reserved(")
+            .expect("the exit path attributes the reservation it holds");
+        let detach = held
+            .find("take_server_reply_link(tid, exit_identity.asid)")
+            .expect("the detach");
+        assert!(armed < noted, "attributed only once the scope is armed");
+        assert!(noted < detach, "attributed before the irreversible detach");
         // 6/7/8/9 in the completion transaction, each after its real operation.
         let comp = IPC_SRC
             .split("pub(crate) fn complete_server_death_over")
@@ -102594,19 +102735,39 @@ mod stage200d2b1bi_counters {
         // Every production transition entry point lives in one of the four kernel files
         // that own the real operations.
         //
-        // Stage 199D: seven classes are still recorded by a direct qualified
-        // `server_dies_counters::record(...)` at their real operation. The two LINK classes
-        // go through the scoped helpers instead — `note_link_created` / `note_link_closed`
-        // (which also feed the system-wide leak totals) and `note_armed_link_present` — so
-        // a transition can be attributed to the ONE armed transaction rather than counted
-        // for every call in the system. Nine classes, nine real operations, still no
-        // synthesized transition.
+        // Stage 199D: the classes that CAN attribute themselves at their real operation are
+        // still recorded by a direct qualified `server_dies_counters::record(...)` there. The
+        // rest go through scoped helpers — `note_link_created` / `note_link_closed` (which
+        // also feed the system-wide leak totals), `note_armed_link_present`, and, since
+        // 199D-SD3 (§4), `note_deferred_reserved` / `note_deferred_published` /
+        // `note_deferred_consumed` — so a transition is attributed to the ONE armed
+        // transaction rather than counted for every call in the system. Nine classes, nine
+        // real operations, still no synthesized transition.
         let files = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC];
         let direct: usize = files
             .iter()
             .map(|s| s.matches("server_dies_counters::record(").count())
             .sum();
-        assert_eq!(direct, 7, "seven directly-recorded classes");
+        assert_eq!(direct, 4, "four directly-recorded classes");
+        let deferred: usize = files
+            .iter()
+            .map(|s| {
+                s.matches("server_dies_counters::note_deferred_reserved(")
+                    .count()
+                    + s.matches("server_dies_counters::note_deferred_published(")
+                        .count()
+                    + s.matches("server_dies_counters::note_deferred_consumed(")
+                        .count()
+            })
+            .sum();
+        assert_eq!(deferred, 3, "three scoped deferred edges, one per class");
+        // The scoped helpers are the ONLY way the deferred classes are reached.
+        for f in files {
+            assert!(
+                !f.contains("record(server_dies_counters::Transition::Deferred"),
+                "no unscoped deferred count may reappear"
+            );
+        }
         let created: usize = files
             .iter()
             .map(|s| {
@@ -102827,6 +102988,13 @@ mod stage200d2b1bii_races {
             c::arm_record(fx.record_index, fx.record_generation),
             "the fixture's record arms the counter scope"
         );
+        // 199D-SD3 (§4): the deferred RESERVATION has no record identity, so the scope also
+        // names the SERVER incarnation the transaction is about — exactly as
+        // `arm_server_dies_link_scope` does live, from the record's bound replier.
+        assert!(
+            c::arm_scenario_server(fx.replier.tid.0, fx.replier.asid.0),
+            "the fixture's replier arms the server half of the counter scope"
+        );
         (g, fx)
     }
 
@@ -102865,6 +103033,13 @@ mod stage200d2b1bii_races {
             Some(r) => r,
             None => return false,
         };
+        // 199D-SD3 (§4): mirror `exit_task` — the held reservation is attributed by the
+        // dying server's identity, at the point that identity is known.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        crate::kernel::boot::server_dies_counters::note_deferred_reserved(
+            fx.replier.tid.0,
+            fx.replier.asid.0,
+        );
         match fx
             .k
             .with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
@@ -103260,8 +103435,12 @@ mod stage200d2b1bii_races {
         let id = arm(&fx);
         assert!(link(&fx));
         assert!(broad_lock_exit_phase(&fx));
-        // A second publication for the SAME record/generation is refused.
+        // A second publication for the SAME record/generation is refused. The second attempt
+        // is a repeated exit of the ARMED server, so it attributes its reservation exactly as
+        // the exit path does — 199D-SD3 (§4) narrows WHICH reservations are attributed, and
+        // deliberately keeps a genuine repeat of the scenario's own attempt visible.
         let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        c::note_deferred_reserved(fx.replier.tid.0, fx.replier.asid.0);
         let dup = crate::kernel::boot::server_death_work_publish(
             res,
             DeferredServerDeathCompletion {
@@ -103295,13 +103474,21 @@ mod stage200d2b1bii_races {
         while let Some(r) = crate::kernel::boot::server_death_work_reserve(0) {
             held.push(r);
         }
-        // Each successful fill reservation is itself a real class-2 transition; the exit
-        // phase then adds none, because its own reservation never succeeds.
-        let filled = v()[T::DeferredReserved as usize];
-        assert_eq!(filled as usize, held.len(), "every fill was counted");
+        assert!(!held.is_empty(), "the queue really filled");
+        // 199D-SD3 (§4): a raw capacity fill is not an exit of the ARMED server, so it is not
+        // attributed. The reserve class describes the scenario's transaction, not whoever
+        // happens to take a slot — which is exactly the defect this narrowing repairs: an
+        // unrelated task exiting earlier in the boot used to move this class and fail the
+        // scenario's audit with `count=2 expected=1`.
+        assert_eq!(
+            v()[T::DeferredReserved as usize],
+            0,
+            "a foreign reservation is not attributed to the scenario"
+        );
+        // The exit phase then adds none either, because its own reservation never succeeds.
         assert!(!broad_lock_exit_phase(&fx), "the exit phase declines");
         assert_eq!(live_links(&fx), 1, "the link is retained");
-        assert_race(&fx, &id, [1, 0, filled, 0, 0, 0, 0, 0, 0], None);
+        assert_race(&fx, &id, [1, 0, 0, 0, 0, 0, 0, 0, 0], None);
         for r in held {
             crate::kernel::boot::server_death_work_release(r);
         }
@@ -103323,10 +103510,14 @@ mod stage200d2b1bii_races {
                 reply_record_generation: fx.record_generation.wrapping_add(1),
             }
         ));
-        assert_eq!(drain(&fx), 1);
+        assert_eq!(queued(0), 1, "the stale item really queued");
+        assert_eq!(drain(&fx), 1, "and really drained");
         assert_eq!(caller_result(&fx), None, "nothing was published");
-        // The link was never detached: only reserve → publish → consume ran.
-        assert_race(&fx, &id, [1, 0, 1, 1, 1, 0, 0, 0, 0], None);
+        // The link was never detached, and 199D-SD3 (§4) attributes the deferred classes by
+        // the item's OWN record identity — this item names a generation the armed scenario
+        // does not own, so its publication and consumption are reported and not counted. The
+        // flow itself is still proven, by the queue depth and the drain above.
+        assert_race(&fx, &id, [1, 0, 0, 0, 0, 0, 0, 0, 0], None);
         teardown();
     }
 
@@ -103352,7 +103543,9 @@ mod stage200d2b1bii_races {
         assert_eq!(drain(&fx), 1);
         assert_eq!(caller_result(&fx), None, "a stale server wakes nobody");
         assert_eq!(live_links(&fx), 1, "the real link is untouched");
-        assert_race(&fx, &id, [1, 0, 1, 1, 1, 0, 0, 0, 0], None);
+        // The item names the ARMED record, so publication and consumption are attributed; the
+        // raw reservation is not, because it is not an exit of the armed server.
+        assert_race(&fx, &id, [1, 0, 0, 1, 1, 0, 0, 0, 0], None);
         teardown();
     }
 
@@ -107309,16 +107502,38 @@ mod stage199d_transfer_cap_safety {
                 "the transfer-cap decline must precede {later}"
             );
         }
-        // The decline arm itself returns — it does not fall through.
+        // The decline arm itself EXITS — it never falls through into the transaction — and it
+        // mutates nothing on the way out.
+        //
+        // DIRECT3-CAP-FINAL §7 gave the arm a second exit: a reply whose authority is already
+        // spent is refused here with the typed `WrongObject` the legacy path would have
+        // produced, rather than entering the broad dispatcher purely to be refused there. So
+        // the assertion is no longer "the arm is exactly this text" but the property that text
+        // was standing in for — both exits are returns, and neither touches any mutating or
+        // user-memory step.
+        let arm = &flat[decline_at..];
+        let arm_end = arm
+            .find("return None;")
+            .expect("the decline arm still ends in a return to the legacy path");
+        let arm = &arm[..arm_end + "return None;".len()];
         assert!(
-            flat[decline_at..].starts_with(
-                "REPLY_COUNTERS.note_declined_preflight_reply( verdict == \
-                 crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted, \
-                 verdict.is_transfer_cap_decline(), \
-                 verdict.is_terminal_arbitration_decline(), ); return None;"
-            ),
-            "the preflight decline returns None so the legacy path runs"
+            arm.contains("frame.set_err( crate::kernel::syscall::SyscallError::WrongObject.code(), ); return Some(Ok(()));")
+                || arm.contains("frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code()); return Some(Ok(()));"),
+            "the spent-authority refusal returns the typed error rather than falling through"
         );
+        for mutating in [
+            "ipcreply_direct_ack::claim(",
+            "reserve_existing_reply_record_split(",
+            "claim_direct_reply_terminal_split(",
+            "stash_transfer_envelope_split(",
+            "copy_from_user_asid_split_read(",
+            "drain_direct_reply_post_work(",
+        ] {
+            assert!(
+                !arm.contains(mutating),
+                "the preflight decline arm must not `{mutating}` — it declines before any mutation"
+            );
+        }
     }
 
     /// The transfer-cap decline is observable on a live boot, as a breakdown of the preflight
@@ -107940,23 +108155,26 @@ mod stage199d_link_creation_parity {
     }
 }
 
-/// Stage 199D — **terminal-arbitration safety on the direct reply path.**
+/// 199D-TRC — **exact terminal claiming on the direct reply path.**
 ///
-/// A reply whose record is arbitrated by an armed terminal-ownership / reply-timeout race must
-/// reserve the terminal before its caller copy and commit it after, so a concurrent timeout
-/// claimant provably loses. That lease — `reserve_reply_win_before_copy` → delivery →
-/// `commit_reply_win_after_delivery`, with `rollback_reply_win` on a retryable fault — lives
-/// only on the legacy reply path. Servicing an arbitrated reply off-lock lost the race the
-/// caller was promised: live, the reply reserved, rolled back, and the timeout's deferred path
-/// completed instead (`IPC_REPLY_WIN_ROLLBACK` + `IPC_REPLY_TIMEOUT_DEFERRED`, with
-/// `IPC_REPLY_BEATS_TIMEOUT_OK` absent).
+/// A reply whose record has an armed terminal used to be declined outright: the eligibility
+/// fact was a boolean, "is this record arbitrated at all", and any `true` sent the reply to the
+/// legacy path. While production armed nothing that decline never fired. Once 199E-ARM made
+/// production reply waits arm their terminals, it fired for EVERY reply and 41 direct NR7
+/// transactions per x86_64 boot fell back onto the terminal broad dispatcher.
 ///
-/// Porting the lease into the direct transaction is future canonical 199E work. This increment
-/// makes the arbitrated population explicitly ineligible instead.
+/// The repair is not to ignore the terminal — it is to COMPETE for it. A direct reply is one of
+/// the cell's five legitimate claimants, alongside timeout, peer death, caller exit and
+/// endpoint destruction. It classifies the cell against its own exact identities, claims it
+/// exclusively at the rank-3 mutation point through the same compare-exchange every other
+/// claimant uses, delivers, and then commits — or, on any pre-delivery failure, restores the
+/// exact claim so the record is left precisely as it was found.
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]
 mod stage199d_terminal_arbitration_safety {
     use super::*;
-    use crate::kernel::terminal_ownership::TerminalIdentity;
+    use crate::kernel::boot::DirectReplyTerminalClaim;
+    use crate::kernel::direct_eligibility::DirectReplyTerminal as T;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
     use crate::kernel::vm::Asid;
     use crate::runtime::SharedKernel;
 
@@ -108003,272 +108221,517 @@ mod stage199d_terminal_arbitration_safety {
         }
     }
 
-    /// An UNARMED record is not arbitrated — the ordinary case, and the one that stays
-    /// direct-eligible.
-    #[test]
-    fn an_unarmed_record_is_not_arbitrated() {
-        let (k, index, generation) = fixture();
+    /// The replier incarnation the fixture's record binds.
+    fn replier() -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(2))
+    }
+
+    fn classify(k: &SharedKernel, index: usize, generation: u64) -> T {
+        k.classify_direct_reply_terminal_split_read(index, generation, replier(), 0, 1)
+    }
+
+    fn claim(k: &SharedKernel, index: usize, generation: u64) -> DirectReplyTerminalClaim {
+        k.claim_direct_reply_terminal_split(index, generation, replier(), 0, 1)
+    }
+
+    /// A competitor taking the cell for real, through the same single authority.
+    fn competitor_claims(
+        k: &SharedKernel,
+        index: usize,
+        kind: TerminalClaimant,
+        id: &TerminalIdentity,
+    ) {
+        let owner = k
+            .with(|s| s.try_claim_reply_terminal_slot(index, kind, id))
+            .expect("the competitor claims the open cell");
         assert!(
-            !k.reply_record_terminal_arbitrated_split_read(index, generation),
-            "a vacant terminal cell arbitrates nothing"
+            k.with(|s| s.commit_reply_terminal_slot(index, &owner)),
+            "and commits it"
         );
     }
 
-    /// An ARMED record IS arbitrated, and the predicate reads it from the authoritative cell.
+    // ── Classification ──────────────────────────────────────────────────────────────────
+
+    /// An UNARMED record has no arbitration to join: nothing can be racing it, because a
+    /// timeout claimant reaches a record only through a deadline token and a token can only be
+    /// reserved against an armed, open cell.
     #[test]
-    fn an_armed_record_is_arbitrated() {
+    fn an_unarmed_record_is_unarmed_and_admits_the_reply() {
+        let (k, index, generation) = fixture();
+        assert_eq!(classify(&k, index, generation), T::Unarmed);
+        assert!(T::Unarmed.admits_direct_reply());
+        assert!(!T::Unarmed.requires_claim());
+        assert_eq!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::NotArmed
+        );
+    }
+
+    /// **The headline case.** An ARMED, OPEN cell whose identity names this exact reply admits
+    /// the direct reply — this is the classification the pre-199D-TRC boolean got backwards.
+    #[test]
+    fn an_exact_armed_terminal_admits_the_direct_reply() {
         let (k, index, generation) = fixture();
         k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
-        assert!(
-            k.reply_record_terminal_arbitrated_split_read(index, generation),
-            "an armed terminal cell arbitrates this record"
-        );
+        assert_eq!(classify(&k, index, generation), T::AvailableExact);
+        assert!(T::AvailableExact.admits_direct_reply());
+        assert!(T::AvailableExact.requires_claim());
     }
 
     /// EXACTNESS: a cell armed for another record incarnation — the previous occupant of a
-    /// recycled slot, or a different slot entirely — arbitrates nothing here.
+    /// recycled slot, or a different slot entirely — never authorizes this reply.
     #[test]
-    fn arbitration_is_exact_in_record_index_and_generation() {
+    fn a_wrong_record_generation_or_slot_refuses() {
         let (k, index, generation) = fixture();
-        // Armed for a DIFFERENT generation of this slot: not this incarnation's race.
         k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation.wrapping_add(1))));
-        assert!(
-            !k.reply_record_terminal_arbitrated_split_read(index, generation),
-            "a cell armed for a stale generation arbitrates nothing"
-        );
-        // Armed for a different SLOT.
+        assert_eq!(classify(&k, index, generation), T::IdentityMismatch);
         k.with(|s| s.arm_reply_terminal(index, identity_for(index + 1, generation)));
-        assert!(!k.reply_record_terminal_arbitrated_split_read(index, generation));
-        // And a stale/foreign query against the real armed cell mutates nothing and reads
-        // false.
+        assert_eq!(classify(&k, index, generation), T::IdentityMismatch);
+        // A stale query against the REAL armed cell is refused too, and mutates nothing.
         k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
-        assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
-        assert!(
-            !k.reply_record_terminal_arbitrated_split_read(index, generation.wrapping_add(1)),
-            "a stale generation query reads false"
+        assert_eq!(classify(&k, index, generation), T::AvailableExact);
+        assert_eq!(
+            classify(&k, index, generation.wrapping_add(1)),
+            T::IdentityMismatch
         );
-        assert!(
-            !k.reply_record_terminal_arbitrated_split_read(usize::MAX, generation),
-            "an out-of-range index reads false"
-        );
-        // The cell is untouched by any of those reads.
-        assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+        assert_eq!(classify(&k, usize::MAX, generation), T::IdentityMismatch);
+        assert_eq!(classify(&k, index, generation), T::AvailableExact);
     }
 
-    /// The predicate is read-only: repeated reads never mutate the cell or the record.
+    /// EXACTNESS: a wrong caller or replier identity in the armed cell refuses. The cell is
+    /// armed with a foreign caller/replier while the live record still names the fixture's, so
+    /// the field-by-field comparison is what rejects it.
     #[test]
-    fn the_predicate_mutates_nothing() {
+    fn a_wrong_caller_or_replier_identity_refuses() {
+        for mutate in [
+            (|id: &mut TerminalIdentity| id.caller_tid = ThreadId(77)) as fn(&mut TerminalIdentity),
+            |id: &mut TerminalIdentity| id.caller_asid = Asid(33),
+            |id: &mut TerminalIdentity| id.replier_tid = ThreadId(88),
+            |id: &mut TerminalIdentity| id.replier_asid = Asid(44),
+            |id: &mut TerminalIdentity| id.reply_endpoint_index = 9,
+            |id: &mut TerminalIdentity| id.reply_endpoint_generation = 7,
+        ] {
+            let (k, index, generation) = fixture();
+            let mut id = identity_for(index, generation);
+            mutate(&mut id);
+            k.with(|s| s.arm_reply_terminal(index, id));
+            assert_eq!(
+                classify(&k, index, generation),
+                T::IdentityMismatch,
+                "a foreign identity never authorizes a claim: {id:?}"
+            );
+            assert!(matches!(
+                claim(&k, index, generation),
+                DirectReplyTerminalClaim::Lost(T::IdentityMismatch)
+            ));
+        }
+    }
+
+    /// The classification is read-only: repeated reads never disturb the cell.
+    #[test]
+    fn classification_mutates_nothing() {
         let (k, index, generation) = fixture();
         k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
         let epoch_before = k.with(|s| s.reply_terminal_epoch(index));
         for _ in 0..8 {
-            assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+            assert_eq!(classify(&k, index, generation), T::AvailableExact);
         }
         assert_eq!(
             k.with(|s| s.reply_terminal_epoch(index)),
             epoch_before,
-            "reading the arbitration fact never re-arms or disturbs the cell"
+            "classifying never re-arms or disturbs the cell"
         );
     }
 
-    /// **An armed record can never enter the direct transaction.** The fact feeds the
-    /// eligibility contract, whose decline arm returns before anything mutates.
+    // ── The exclusive claim ─────────────────────────────────────────────────────────────
+
+    /// The reply WINS an exact open terminal, and holds it exclusively: a competitor that
+    /// arrives afterwards cannot claim the same cell.
     #[test]
-    fn an_armed_record_never_reaches_the_direct_transaction() {
-        use crate::kernel::direct_eligibility::{
-            DirectReplyEligibility, DirectReplyFacts, classify_direct_reply_eligibility,
-        };
+    fn the_reply_wins_the_exact_terminal_and_holds_it_exclusively() {
         let (k, index, generation) = fixture();
-        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
-        let facts = DirectReplyFacts {
-            payload_len: 8,
-            requester_available: true,
-            reply_object: Ok((index, generation)),
-            reply_endpoint: Some((0, 1)),
-            endpoint_admitted: true,
-            transfer_cap_present: false,
-            terminal_arbitrated: k.reply_record_terminal_arbitrated_split_read(index, generation),
+        let id = identity_for(index, generation);
+        k.with(|s| s.arm_reply_terminal(index, id));
+        let DirectReplyTerminalClaim::Won(owner) = claim(&k, index, generation) else {
+            panic!("an exact open terminal must be claimable by the reply");
         };
-        let verdict = classify_direct_reply_eligibility(&facts);
-        assert_eq!(
-            verdict,
-            DirectReplyEligibility::TerminalArbitrationUnsupported
-        );
-        assert_eq!(
-            verdict.endpoint(),
-            None,
-            "no endpoint is yielded, so no acknowledgement can be claimed"
-        );
-        // Disarming the same record makes it eligible again — the fact is the only thing
-        // standing between this reply and the direct path.
-        let mut unarmed = facts;
-        unarmed.terminal_arbitrated = false;
-        assert_eq!(
-            classify_direct_reply_eligibility(&unarmed),
-            DirectReplyEligibility::Eligible {
-                endpoint_index: 0,
-                endpoint_generation: 1,
-            }
-        );
-    }
-
-    /// The fact is derived from the CANONICAL predicate — never from an oracle selector, a
-    /// marker or a counter.
-    #[test]
-    fn the_fact_comes_from_the_authoritative_state_only() {
-        assert!(
-            SPLIT.contains("shared.reply_record_terminal_arbitrated_split_read(rec_idx, rec_gen)"),
-            "the call site asks the canonical predicate with the exact record incarnation"
-        );
-        let predicate = include_str!("../../runtime.rs")
-            .split("pub(crate) fn reply_record_terminal_arbitrated_split_read(")
-            .nth(1)
-            .expect("predicate present")
-            .split("\n    }\n")
-            .next()
-            .expect("body bounded");
-        // Reads the authoritative store, exact in index AND generation.
-        assert!(
-            predicate.contains("ipc.reply_terminal_ownership.get(index)")
-                && predicate.contains("ipc.reply_cap_generations.get(index)")
-                && predicate.contains("identity.reply_record_index == index")
-                && predicate.contains("identity.reply_record_generation == generation"),
-            "the predicate is the authoritative cell, exact in index and generation"
-        );
-        // A vacant cell (epoch 0) is not arbitration.
-        assert!(predicate.contains("cell.current_epoch() == 0"));
-        // NOT inferred from selectors, markers or counters.
-        for forbidden in [
-            "oracle",
-            "yarm_log",
-            "note_",
-            "_COUNTERS",
-            "IPC_REPLY_TIMEOUT_MODE",
-            "selector",
+        assert_eq!(owner.claimant(), TerminalClaimant::Reply);
+        for kind in [
+            TerminalClaimant::Timeout,
+            TerminalClaimant::PeerDeath,
+            TerminalClaimant::CallerExit,
+            TerminalClaimant::EndpointGone,
         ] {
             assert!(
-                !predicate.contains(forbidden),
-                "the predicate must not infer arbitration from {forbidden}"
+                k.with(|s| s.try_claim_reply_terminal_slot(index, kind, &id))
+                    .is_none(),
+                "{kind:?} must not claim a terminal the reply already holds"
             );
         }
-        // ONE rank-3 acquisition covers both reads, so the pair cannot be torn.
+        // A second direct reply cannot claim it either.
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Lost(T::OwnedByCompetitor)
+        ));
+        assert!(k.commit_direct_reply_terminal_split(index, &owner));
         assert_eq!(
-            predicate.matches("self.with_ipc_split_mut(").count(),
-            1,
-            "the record generation and the terminal cell are read together"
+            k.with(|s| s.reply_terminal_committed_winner(index)),
+            Some(TerminalClaimant::Reply)
         );
     }
 
-    /// The decline precedes every mutation in the NR7 helper — ack claim, payload copy,
-    /// snapshot build and the transaction call all come after the preflight decline arm.
+    /// Each of the four competitors, winning BEFORE the reply: the reply loses, reports the
+    /// settled cell, and mutates nothing.
     #[test]
-    fn the_decline_precedes_every_mutation() {
+    fn timeout_server_death_caller_exit_or_endpoint_loss_beats_a_later_reply() {
+        for kind in [
+            TerminalClaimant::Timeout,
+            TerminalClaimant::PeerDeath,
+            TerminalClaimant::CallerExit,
+            TerminalClaimant::EndpointGone,
+        ] {
+            let (k, index, generation) = fixture();
+            let id = identity_for(index, generation);
+            k.with(|s| s.arm_reply_terminal(index, id));
+            competitor_claims(&k, index, kind, &id);
+            assert_eq!(
+                classify(&k, index, generation),
+                T::Settled,
+                "{kind:?} settled the cell"
+            );
+            assert!(matches!(
+                claim(&k, index, generation),
+                DirectReplyTerminalClaim::Lost(T::Settled)
+            ));
+            assert_eq!(
+                k.with(|s| s.reply_terminal_committed_winner(index)),
+                Some(kind),
+                "{kind:?} remains the winner: a losing reply mutates nothing"
+            );
+        }
+    }
+
+    /// A competitor holding a RESERVED (not yet committed) claim also refuses the reply, and
+    /// is reported as owned rather than settled.
+    #[test]
+    fn a_reserved_competitor_refuses_the_reply() {
+        let (k, index, generation) = fixture();
+        let id = identity_for(index, generation);
+        k.with(|s| s.arm_reply_terminal(index, id));
+        let _owner = k
+            .with(|s| s.try_claim_reply_terminal_slot(index, TerminalClaimant::Timeout, &id))
+            .expect("timeout reserves");
+        assert_eq!(classify(&k, index, generation), T::OwnedByCompetitor);
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Lost(T::OwnedByCompetitor)
+        ));
+    }
+
+    /// A DUPLICATE reply after the first one committed is refused — the one-shot is spent.
+    #[test]
+    fn a_duplicate_reply_after_consume_refuses() {
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let DirectReplyTerminalClaim::Won(owner) = claim(&k, index, generation) else {
+            panic!("first reply wins");
+        };
+        assert!(k.commit_direct_reply_terminal_split(index, &owner));
+        assert_eq!(classify(&k, index, generation), T::Settled);
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Lost(T::Settled)
+        ));
+        // And committing again with the spent owner is refused.
+        assert!(!k.commit_direct_reply_terminal_split(index, &owner));
+    }
+
+    /// A STALE terminal epoch refuses: re-arming bumps the epoch, so an owner token minted
+    /// against the previous epoch can neither commit nor release.
+    #[test]
+    fn a_stale_terminal_epoch_refuses_and_restores_nothing() {
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let DirectReplyTerminalClaim::Won(stale) = claim(&k, index, generation) else {
+            panic!("first claim wins");
+        };
+        // Re-arm the same record: a fresh epoch, a fresh Open cell.
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let epoch_now = k.with(|s| s.reply_terminal_epoch(index));
+        assert!(!k.commit_direct_reply_terminal_split(index, &stale));
+        assert!(!k.release_direct_reply_terminal_split(index, &stale));
+        assert_eq!(
+            k.with(|s| s.reply_terminal_epoch(index)),
+            epoch_now,
+            "a stale owner token mutates nothing"
+        );
+        // The cell is still claimable by the reply at the CURRENT epoch.
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Won(_)
+        ));
+    }
+
+    /// The claim is RESTORED exactly on a pre-delivery failure: the cell returns to `Open` at
+    /// the same epoch, and any claimant — including a competitor — may then win it.
+    #[test]
+    fn a_pre_delivery_failure_restores_the_exact_claim() {
+        let (k, index, generation) = fixture();
+        let id = identity_for(index, generation);
+        k.with(|s| s.arm_reply_terminal(index, id));
+        let epoch = k.with(|s| s.reply_terminal_epoch(index));
+        let DirectReplyTerminalClaim::Won(owner) = claim(&k, index, generation) else {
+            panic!("the reply wins");
+        };
+        assert!(k.release_direct_reply_terminal_split(index, &owner));
+        assert_eq!(
+            k.with(|s| s.reply_terminal_epoch(index)),
+            epoch,
+            "a release restores the SAME epoch, it does not re-arm"
+        );
+        assert_eq!(classify(&k, index, generation), T::AvailableExact);
+        assert_eq!(
+            k.with(|s| s.reply_terminal_committed_winner(index)),
+            None,
+            "nothing was settled"
+        );
+        // Both a retried reply and a competitor can now win the restored cell.
+        assert!(matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Won(_)
+        ));
+    }
+
+    /// Exactly ONE claimant wins across a full field of contenders — the property the whole
+    /// arbitration exists for.
+    #[test]
+    fn exactly_one_claimant_wins() {
+        let (k, index, generation) = fixture();
+        let id = identity_for(index, generation);
+        k.with(|s| s.arm_reply_terminal(index, id));
+        let mut wins = 0;
+        if matches!(
+            claim(&k, index, generation),
+            DirectReplyTerminalClaim::Won(_)
+        ) {
+            wins += 1;
+        }
+        for kind in [
+            TerminalClaimant::Timeout,
+            TerminalClaimant::PeerDeath,
+            TerminalClaimant::CallerExit,
+            TerminalClaimant::EndpointGone,
+        ] {
+            if k.with(|s| s.try_claim_reply_terminal_slot(index, kind, &id))
+                .is_some()
+            {
+                wins += 1;
+            }
+        }
+        assert_eq!(wins, 1, "the terminal cell admits exactly one claimant");
+    }
+
+    // ── Source contract ─────────────────────────────────────────────────────────────────
+
+    /// The claim is taken at the mutation point, AFTER the snapshot and the acknowledgement
+    /// probe, and BEFORE the acknowledgement is consumed and the transaction runs.
+    #[test]
+    fn the_claim_is_ordered_between_the_snapshot_and_the_delivery() {
         let body = SPLIT
             .split("fn try_split_ipcreply_direct_into_frame(")
             .nth(1)
-            .expect("NR7 helper present")
-            .split("\n#[cfg(feature = \"hosted-dev\")]")
-            .next()
-            .expect("body bounded");
-        let flat = body
-            .split_whitespace()
-            .collect::<alloc::vec::Vec<_>>()
-            .join(" ");
-        let fact_at = flat
-            .find("terminal_arbitrated:")
-            .expect("the fact is gathered");
-        let decline_at = flat
-            .find("REPLY_COUNTERS.note_declined_preflight_reply(")
-            .expect("the preflight decline is reported");
+            .expect("the NR7 helper");
+        let snapshot = body
+            .find("IpcReplyDirectSnapshot::build(")
+            .expect("snapshot");
+        // `is_claimable` also appears in the earlier SMP duplicate-refusal branch, so the probe
+        // is located from the snapshot forward — the one this ordering is about.
+        let probe = snapshot
+            + body[snapshot..]
+                .find("ipcreply_direct_ack::is_claimable(")
+                .expect("ack probe");
+        let claim = body
+            .find("claim_direct_reply_terminal_split(")
+            .expect("the exclusive claim");
+        let consume = body
+            .find("ipcreply_direct_ack::claim(")
+            .expect("ack consume");
+        let deliver = body
+            .find("drain_direct_reply_post_work(")
+            .expect("the delivery");
+        let commit = body
+            .find("commit_direct_reply_terminal_split(")
+            .expect("the commit");
         assert!(
-            fact_at < decline_at,
-            "the fact is gathered before the verdict"
+            snapshot < probe,
+            "snapshot before the acknowledgement probe"
         );
-        for later in [
-            "ipcreply_direct_ack::claim(",
-            "copy_from_user_asid_split_read(",
-            "IpcReplyDirectSnapshot::build(",
-            "drain_direct_reply_post_work(",
-        ] {
-            let at = flat
-                .find(later)
-                .unwrap_or_else(|| panic!("{later} present in the NR7 helper"));
-            assert!(
-                decline_at < at,
-                "the terminal-arbitration decline must precede {later}"
-            );
-        }
+        assert!(
+            probe < claim,
+            "the fallback-eligible probe precedes the claim"
+        );
+        assert!(claim < consume, "the claim precedes consuming the ack");
+        assert!(consume < deliver, "the ack is consumed before delivery");
+        assert!(deliver < commit, "the claim is committed after delivery");
     }
 
-    /// The decline has its OWN counter, as a breakdown of the preflight declines rather than a
-    /// new terminal bucket, so the balance invariant is untouched and a live boot can show how
-    /// much of the reply population is arbitrated.
+    /// A LOST claim never falls back to the broad dispatcher: it returns a typed result.
     #[test]
-    fn the_decline_is_counted_separately_without_disturbing_the_balance() {
-        use crate::kernel::direct_ipc_counters::DirectPathCounters;
-        let c = DirectPathCounters::new();
-        c.note_attempt();
-        c.note_declined_preflight_reply(false, false, true);
-        assert_eq!(c.declined_terminal_arbitration(), 1);
-        assert_eq!(c.declined_preflight(), 1, "it IS a preflight decline");
+    fn a_lost_claim_returns_a_typed_result_and_never_falls_back() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
+        let lost = body
+            .find("DirectReplyTerminalClaim::Lost(class)")
+            .expect("the lost arm");
+        // The arm ends where the match does; bound it there rather than by a character count.
+        let arm_end = body[lost..].find("\n    };").expect("the match ends");
+        let arm = &body[lost..lost + arm_end];
+        assert!(
+            arm.contains("frame.set_err(") && arm.contains("return Some(Ok(()))"),
+            "a lost claim encodes a canonical error and completes the syscall"
+        );
+        assert!(
+            !arm.contains("return None"),
+            "a lost claim must never fall back to the terminal broad dispatcher"
+        );
+        assert!(
+            arm.contains("reply_copies=0") && arm.contains("caller_wakes=0"),
+            "and attests that it mutated nothing"
+        );
+    }
+
+    /// Every claim exit resolves the claim — commit or release, never silently dropped.
+    #[test]
+    fn every_claim_exit_commits_or_releases() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
         assert_eq!(
-            c.declined_transfer_cap(),
-            0,
-            "not confused with transfer-cap"
+            body.matches("release_direct_reply_terminal_split(").count(),
+            2,
+            "two pre-delivery restore sites: the ack race and the outcome resolution"
         );
-        assert_eq!(c.declined_ineligible_mode(), 0);
-        assert_eq!(c.declined_not_admitted(), 0);
-        assert!(c.terminals_balance(), "still exactly one terminal");
-        assert!(c.eligibility_balances());
-        // The two NR7 breakdowns are independent.
-        let c2 = DirectPathCounters::new();
-        c2.note_attempt();
-        c2.note_declined_preflight_reply(false, true, false);
-        assert_eq!(c2.declined_terminal_arbitration(), 0);
-        assert_eq!(c2.declined_transfer_cap(), 1);
-        assert!(c2.terminals_balance());
-    }
-
-    /// The legacy reply path still owns the terminal lease, and the direct transaction still
-    /// does not — which is exactly why the arbitrated population is declined. Pinned so that
-    /// porting the lease (future canonical 199E work) has to update this guard deliberately.
-    #[test]
-    fn the_terminal_lease_remains_legacy_only() {
-        let legacy = include_str!("../syscall/ipc.rs");
-        for lease in [
-            "reserve_reply_win_before_copy",
-            "commit_reply_win_after_delivery",
-            "rollback_reply_win",
+        assert_eq!(
+            body.matches("commit_direct_reply_terminal_split(").count(),
+            1,
+            "one commit site"
+        );
+        // The outcome resolution is exhaustive over the transaction's own error type — no
+        // wildcard may decide whether a claim is committed or restored.
+        let resolve = body
+            .split("let commit = match &outcome {")
+            .nth(1)
+            .expect("the resolution")
+            .split("};")
+            .next()
+            .expect("bounded");
+        assert!(
+            !resolve.contains("_ =>"),
+            "the claim resolution has no wildcard arm"
+        );
+        for variant in [
+            "E::WouldBlock",
+            "E::ReplyCapResolve(_)",
+            "E::ReservePreconditionFailed",
+            "E::WaiterLost",
+            "E::LeaseNotClaimed",
+            "E::PayloadCopyFault",
+            "E::MetaCopyFault",
+            "E::EnqueueRejected(_)",
+            "E::WaiterLostAfterCopy",
+            "E::CallerGone",
+            "E::RecordConsumeFailed",
+            "E::EnqueueRejectedUnreconciled(_)",
+            "E::ReceiverMembershipViolation",
         ] {
             assert!(
-                legacy.contains(lease),
-                "the legacy reply path takes the terminal lease ({lease})"
+                resolve.contains(variant),
+                "resolution must decide {variant}"
             );
         }
-        for (name, src) in [
-            ("syscall_split.rs", SPLIT),
-            (
-                "ipccall_direct_txn.rs",
-                include_str!("../ipccall_direct_txn.rs"),
-            ),
-            ("ipccall_direct.rs", include_str!("../ipccall_direct.rs")),
+    }
+
+    /// ONE terminal policy: the broad reply path delegates to the same locked owners the split
+    /// route uses, so the two can never disagree about what claiming, committing or releasing
+    /// means.
+    #[test]
+    fn the_broad_and_split_paths_share_one_terminal_policy() {
+        const IPC: &str = include_str!("ipc_state.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for owner in [
+            "pub(crate) fn classify_direct_reply_terminal_locked(",
+            "pub(crate) fn claim_direct_reply_terminal_locked(",
+            "pub(crate) fn commit_reply_terminal_locked(",
+            "pub(crate) fn release_reply_terminal_locked(",
         ] {
-            for lease in [
-                "reserve_reply_win_before_copy",
-                "commit_reply_win_after_delivery",
-                "rollback_reply_win",
-            ] {
-                let code: alloc::string::String = src
-                    .lines()
-                    .filter(|l| !l.trim_start().starts_with("//"))
-                    .collect::<alloc::vec::Vec<_>>()
-                    .join("\n");
-                assert!(
-                    !code.contains(lease),
-                    "{name}: the direct path does not take the terminal lease ({lease}) — \
-                     which is why an arbitrated reply must decline to legacy"
-                );
-            }
+            assert_eq!(IPC.matches(owner).count(), 1, "one owner: {owner}");
+        }
+        // The broad adapters delegate rather than re-implementing the cell protocol.
+        for (adapter, delegate) in [
+            (
+                "pub(crate) fn commit_reply_terminal_slot(",
+                "commit_reply_terminal_locked(ipc, index, owner)",
+            ),
+            (
+                "pub(crate) fn release_reply_terminal_slot_if_retryable(",
+                "release_reply_terminal_locked(ipc, index, owner)",
+            ),
+        ] {
+            let body = IPC
+                .split(adapter)
+                .nth(1)
+                .expect("adapter present")
+                .split("\n    }\n")
+                .next()
+                .expect("bounded");
+            assert!(body.contains(delegate), "{adapter} must delegate");
+            assert!(
+                !body.contains("cell.commit_terminal(") && !body.contains("cell.release_"),
+                "{adapter} must not re-implement the cell protocol"
+            );
+        }
+        // And the split adapters delegate to the very same owners.
+        for delegate in [
+            "crate::kernel::boot::classify_direct_reply_terminal_locked(",
+            "crate::kernel::boot::claim_direct_reply_terminal_locked(",
+            "crate::kernel::boot::commit_reply_terminal_locked(",
+            "crate::kernel::boot::release_reply_terminal_locked(",
+        ] {
+            assert!(
+                RUNTIME_SRC.contains(delegate),
+                "split must delegate: {delegate}"
+            );
+        }
+    }
+
+    /// No boolean "any arbitration means decline" decision survives anywhere.
+    #[test]
+    fn no_boolean_arbitration_decision_remains() {
+        const IPC: &str = include_str!("ipc_state.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const ELIG: &str = include_str!("../direct_eligibility.rs");
+        for (what, src) in [
+            ("split helper", SPLIT),
+            ("ipc state", IPC),
+            ("runtime", RUNTIME_SRC),
+            ("eligibility", ELIG),
+        ] {
+            // The names may survive in prose that records WHY the boolean was wrong; what may
+            // not survive is any USE of them — a field read or a call.
+            assert!(
+                !src.contains("facts.terminal_arbitrated")
+                    && !src.contains("terminal_arbitrated:")
+                    && !src.contains("terminal_arbitrated ="),
+                "{what}: the boolean arbitration fact must no longer be used"
+            );
+            assert!(
+                !src.contains(".reply_record_terminal_arbitrated_split_read(")
+                    && !src.contains("fn reply_record_terminal_arbitrated_split_read"),
+                "{what}: the boolean arbitration read must no longer exist or be called"
+            );
         }
     }
 }
@@ -108528,7 +108991,7 @@ mod stage199d_aarch64_readiness_audit {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "AArch64 stays off until its blockers are closed — the predicate names x86_64 and \
              nothing else, so no AArch64 term can hide in it"
         );
@@ -108982,7 +109445,10 @@ mod stage199d_split_return_without_broad_lock {
             .split("\n}\n")
             .next()
             .expect("body bounded");
-        assert_eq!(body.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            body.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
+        );
     }
 }
 
@@ -109729,10 +110195,15 @@ mod stage199d_aarch64_offlock_dispatch {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
         assert_eq!(
@@ -110651,11 +111122,11 @@ mod stage199d_closure_matrix {
         // recording the arbitrated decline. Not a transfer-cap counter.
         Coordinate {
             id: 13,
-            name: "Terminal-arbitrated NR7 declines before mutation; legacy wins the causal \
+            name: "NR7 claims its own exact terminal and competes in the causal \
                    reply-vs-timeout race",
             status: Complete,
             blocker: None,
-            seam: "fn reply_record_terminal_arbitrated_split_read",
+            seam: "fn claim_direct_reply_terminal_locked",
             test: "stage199d_terminal_arbitration_safety",
             evidence: &[
                 Evidence {
@@ -111307,7 +111778,7 @@ mod stage199d_closure_matrix {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "x86_64 ON, every other architecture OFF"
         );
     }
@@ -112290,18 +112761,25 @@ mod stage199d_riscv_production_readiness_audit {
             );
         }
         assert!(
-            RUNTIME.contains("fn reply_record_terminal_arbitrated_split_read"),
-            "the terminal-arbitration read is a shared split seam"
+            RUNTIME.contains("fn classify_direct_reply_terminal_split_read"),
+            "the terminal classification is a shared split seam"
+        );
+        // 199D-TRC: the claim is a shared split seam too, so RISC-V inherits the exclusive
+        // arbitration with no copy — the classification alone would only inherit the decision.
+        assert!(
+            RUNTIME.contains("fn claim_direct_reply_terminal_split"),
+            "the exclusive terminal claim is a shared split seam"
         );
         // The decline lives in the PURE eligibility classifier, so it is reached before any
         // mutation by construction — not by ordering discipline inside the transaction.
         assert!(
-            ELIGIBILITY.contains("if facts.terminal_arbitrated {"),
-            "a terminal-arbitrated reply is declined by the pure classifier"
+            ELIGIBILITY.contains("if !facts.terminal.admits_direct_reply() {"),
+            "an unclaimable terminal is declined by the pure classifier"
         );
         assert!(
-            ELIGIBILITY.contains("pub(crate) terminal_arbitrated: bool,"),
-            "the fact is carried into the classifier, not re-derived per architecture"
+            ELIGIBILITY.contains("pub(crate) terminal: DirectReplyTerminal,"),
+            "the typed classification is carried into the classifier, not re-derived per \
+             architecture"
         );
     }
 
@@ -112835,10 +113313,15 @@ mod stage199d_riscv_narrow_trap_snapshots {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -113028,7 +113511,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "production is x86_64-only, so it is compile-time false on RISC-V"
         );
         assert!(
@@ -113072,7 +113555,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "production is x86_64-only, so on RISC-V admission adds no term beyond proof"
         );
     }
@@ -113211,10 +113694,15 @@ mod stage199d_riscv_canonical_admission {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
         let admission = MOD_SRC
@@ -113760,10 +114248,15 @@ mod stage199d_riscv_remote_wake_readiness {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -114438,10 +114931,15 @@ mod stage199d_riscv_link2_wake_only_online {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -114879,10 +115377,15 @@ mod stage199d_runqueue_withdrawal_foundation {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -115201,10 +115704,15 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -116450,6 +116958,8 @@ mod stage199d_wa1_gate {
         assert_eq!(
             ipccall_direct_production_enabled(),
             cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64")
         );
         set_ipccall_direct_proof_enabled(false);
         assert_eq!(
@@ -116495,7 +117005,7 @@ mod stage199d_wa1_gate {
             .expect("the predicate");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")",
             "the whole body is the architecture test"
         );
         // Stage 199D-WA3C2: `target_arch` / `cfg!` ARE the body now, so they leave the
@@ -116503,23 +117013,44 @@ mod stage199d_wa1_gate {
         // something other than a compile-time architecture fact — a second disjunct, a runtime
         // load, or a call to any other predicate, which is what an oracle/knob dependency
         // would have to look like.
-        for forbidden in [
-            "||",
-            "&&",
-            "load(",
-            "enabled()",
-            "oracle",
-            "proof",
-            "feature = ",
-        ] {
+        for forbidden in ["&&", "load(", "enabled()", "oracle", "proof", "feature = "] {
             assert!(
                 !body.contains(forbidden),
                 "the predicate must carry no `{forbidden}` term"
             );
         }
-        // …and it names exactly one architecture.
-        assert_eq!(body.matches("target_arch").count(), 1);
-        assert!(!body.contains("aarch64") && !body.contains("riscv"));
+        // …and it is NOTHING BUT architecture tests.
+        //
+        // `||` is admitted now that production spans two architectures, but only between
+        // `cfg!(target_arch = ...)` operands: the property this guard exists for is that the
+        // predicate is a pure compile-time architecture constant, never that it names exactly
+        // one. Splitting on `||` and requiring every operand to be such a test keeps that
+        // property exactly — a runtime term smuggled in as a third operand still fails, and so
+        // does one substituted for either existing operand.
+        let operands: alloc::vec::Vec<&str> = body.split("||").map(|o| o.trim()).collect();
+        assert_eq!(
+            operands.len(),
+            body.matches("target_arch").count(),
+            "every `||` operand must be an architecture test and nothing else"
+        );
+        for operand in &operands {
+            assert!(
+                operand.starts_with("cfg!(target_arch = \"") && operand.ends_with("\")"),
+                "operand `{operand}` is not a bare compile-time architecture test"
+            );
+        }
+        // RISC-V is still off, and the predicate must not name it. AArch64 IS named now, so
+        // the check is scoped to the architecture that has not qualified rather than to "any
+        // architecture but x86_64" — which is what it always meant.
+        // Every architecture the tree builds for is now production-default, each admitted on
+        // its own enumerated evidence. The guard that named the not-yet-qualified architecture
+        // has nothing left to name, so what remains is the property it always protected: the
+        // predicate is nothing but compile-time architecture tests, which the operand walk
+        // above enforces exactly.
+        assert!(
+            body.matches("target_arch").count() >= 1,
+            "the predicate is still expressed as architecture tests"
+        );
         // Admission keeps its form: production OR proof, with production now true on x86_64.
         let adm = MODRS
             .split("pub fn ipccall_direct_admission_enabled() -> bool {")
@@ -117929,7 +118460,10 @@ mod stage199d_wa2a_ownership_boundary {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the predicate");
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
             cfg!(target_arch = "x86_64")
@@ -126385,7 +126919,7 @@ mod u3_ordinary_cap_sender_wake {
         let mod_rs = include_str!("mod.rs");
         assert!(
             mod_rs.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")\n}"
             ),
             "direct production is the target architecture and nothing else"
         );
@@ -126513,10 +127047,12 @@ mod u4_cross_arch_queue_advancing_dispatch {
         assert_eq!(
             ipccall_direct_production_enabled(),
             cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64")
         );
         assert!(
             MOD_SRC.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")\n}"
             ),
             "direct production is the target architecture and nothing else"
         );
@@ -129291,7 +129827,7 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 }
                 assert!(
                     MOD_SRC.contains(
-                        "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
+                        "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")\n}"
                     ),
                     "direct production is the target architecture and nothing else"
                 );
@@ -136926,11 +137462,21 @@ mod u9c_reply_cap_ordered_transaction {
             body.contains("reply_object_live_split(reply_index, reply_generation)"),
             "liveness is checked against the exact generation"
         );
+        // DIRECT3 §1: the call now also carries the responder identity, so the argument list is
+        // matched on its generation-guarding head rather than as one literal.
         assert!(
-            body.contains(
-                "try_record_reply_waiter_cap_split(reply_index, reply_generation, minted)"
-            ),
+            body.contains("try_record_reply_waiter_cap_split(")
+                && body.contains("reply_index,")
+                && body.contains("reply_generation,")
+                && body.contains("minted,"),
             "the record write is generation-guarded again, closing the mint->record window"
+        );
+        // And the responder it binds is the EXACT receiver incarnation, resolved by tid, never
+        // the ambient current task.
+        assert!(
+            body.contains("task_asid_opt_split_read(receiver_tid)")
+                && body.contains("responder_identity,"),
+            "the responder binding is keyed by the receiver's exact tid and asid"
         );
         assert!(
             !body.contains("current_tid"),
@@ -140822,13 +141368,15 @@ mod u9qa_not_retired {
     fn direct_production_remains_a_compile_time_architecture_constant() {
         assert!(
             MOD_SRC.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\") || cfg!(target_arch = \"riscv64\")\n}"
             ),
             "direct-IpcCall production must remain a compile-time architecture constant"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64")
+                || cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "riscv64"),
             "and must evaluate to the target architecture"
         );
     }
@@ -141042,7 +141590,6 @@ mod u9qa_apply_convention {
         // yields are scoped to NR 2, whose handler owns the hooks they protect.
         for yielded in [
             "if !recv_timeout && cfg!(feature = \"shared-region-direct-oracle\")",
-            "if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled()",
             "if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm()",
         ] {
             assert!(
@@ -141050,6 +141597,19 @@ mod u9qa_apply_convention {
                 "every broad-arm yield must be scoped to NR 2: {yielded}"
             );
         }
+        // DIRECT3-CAP-FINAL §5: there used to be a THIRD yield, scoped to non-x86_64 and keyed
+        // on `ipccall_direct_publication_enabled()`. It was written when only the broad arm
+        // could publish the NR6/NR7 acknowledgements; step (10) has published them
+        // unconditionally since the publication bodies became shared, so it had become a stale
+        // second owner of the policy the predicate above owns. It must not come back: with a
+        // production term on, it fires on EVERY blocking recv-v2 and hands the whole receive to
+        // the broad arm.
+        assert!(
+            !SPLIT_SRC.contains(
+                "if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled()"
+            ),
+            "the blocked-recv yield has ONE owner; the publication-keyed duplicate is retired"
+        );
     }
 
     /// `X86FirstResume` has ONE policy owner and ONE apply owner, and neither is duplicated in
@@ -144501,21 +145061,33 @@ mod u9rx3_route {
         let after = &code[code
             .find("d2_recv_dispatch_try_defer(")
             .expect("the reservation")..];
-        // Four fallbacks sit at or after the reservation call: the reservation FAILING (nothing
-        // was reserved, so it correctly clears nothing), and then phase A, phase B and the race
-        // branch — each of which holds a reservation and must release it. A fifth clear belongs
-        // to the defensive publish arm, which settles as `Complete` rather than falling back.
+        // Fallbacks at or after the reservation call: the reservation FAILING (nothing was
+        // reserved, so it correctly clears nothing), then phase A, phase B and the race branch —
+        // each of which holds a reservation and must release it. Two further clears belong to
+        // arms that settle rather than fall back: the defensive publish arm (`Complete`), and,
+        // since 199E-DL, the deadline-reservation refusal.
+        //
+        // 199E-DL added that fifth clearing arm deliberately. A FINITE reply wait whose terminal
+        // armed but whose deadline could not be reserved must NOT park: that would leave a
+        // blocked caller holding a deadline it cannot identify. It unwinds exactly as the race
+        // branches do — restore the task, clear the reservation, decline — so the broad arm owns
+        // the outcome. Counting it here is what keeps "every post-reservation decline releases
+        // the reservation" true rather than merely re-passing.
         let clears = after.matches("d2_recv_dispatch_clear(").count();
         assert_eq!(
-            clears, 4,
-            "phase A, phase B, the race branch and the defensive publish branch must each clear \
-             the reservation"
+            clears, 5,
+            "phase A, phase B, the race branch, the defensive publish branch and the \
+             deadline-reservation refusal must each clear the reservation"
+        );
+        assert!(
+            after.contains("reason=deadline_reservation"),
+            "the deadline-reservation refusal is one of them, and names itself"
         );
         assert_eq!(
             after.matches("D::NotHandled").count(),
-            4,
+            5,
             "the only fallbacks at or after the reservation are: reservation failed, phase A, \
-             phase B, and the race branch"
+             phase B, the race branch, and the deadline-reservation refusal"
         );
     }
 
@@ -148079,6 +148651,1688 @@ mod stage199gc4_nr1_terminal_edges {
                 body.contains(tag),
                 "the route tags the stash origin: `{tag}`"
             );
+        }
+    }
+}
+
+/// 199E-DL (§5) — the compensated reply-deadline registration matrix.
+///
+/// The split blocking-receive route arms the reply terminal and reserves its deadline token in
+/// ONE rank-3 scope, then publishes the token into the caller's TCB under rank 2. These cases
+/// drive the two policy owners directly, so each arm of the transaction is decided by the
+/// mechanism rather than by a live boot's timing:
+///
+///   * no deadline               → armed, nothing reserved
+///   * finite deadline           → armed, exactly one reservation, keyed to the live epoch
+///   * the safety window         → a reservation NOTHING can reach until the TCB owns it
+///   * publication               → exact incarnation only, once
+///   * a stale/recycled caller   → refused, and compensated exactly
+///   * a second finite arm       → refused, and the first registration survives
+///   * an ordinary receive       → not a reply wait, nothing armed, nothing reserved
+mod stage199e_dl_registration {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::ReplyWaitArm;
+    use crate::kernel::deadline_token::{DeadlineTokenHandle, ReplyDeadlineClock};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::vm::Asid;
+
+    /// The caller's committed wait generation — the incarnation discriminator every step keys on.
+    fn wait_gen(fx: &CallerFx) -> u64 {
+        fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+            .expect("the fixture's caller is committed-blocked")
+    }
+
+    /// Arm the reply terminal exactly as `recv_block_phase_c_split` does, in one rank-3 scope.
+    fn arm(fx: &CallerFx, finite: bool) -> ReplyWaitArm {
+        let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), fx.caller_asid);
+        let wgen = wait_gen(fx);
+        fx.k.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::arm_reply_terminal_for_committed_block_locked(
+                ipc,
+                caller,
+                fx.reply_eidx,
+                wgen,
+                finite,
+            )
+        })
+    }
+
+    /// Every deadline token the store currently holds as armed or fire-claimed.
+    fn live_tokens(fx: &CallerFx) -> usize {
+        fx.k.with_ipc_split_mut(|ipc| {
+            ipc.reply_deadline_tokens
+                .iter()
+                .filter(|t| t.is_armed() || t.is_fire_claimed())
+                .count()
+        })
+    }
+
+    /// The reply record's terminal-cell epoch.
+    fn epoch(fx: &CallerFx) -> u64 {
+        fx.k.with_ipc_split_mut(|ipc| ipc.reply_terminal_ownership[fx.record_index].current_epoch())
+    }
+
+    /// The token the caller's TCB actually owns — what the timeout collector can reach.
+    fn tcb_token(fx: &CallerFx) -> Option<DeadlineTokenHandle> {
+        fx.k.with(|s| s.reply_timeout_token_for_caller(1, fx.caller_asid))
+    }
+
+    #[test]
+    fn dl01_a_wait_with_no_deadline_arms_and_reserves_nothing() {
+        let fx = caller_fixture();
+        assert_eq!(
+            live_tokens(&fx),
+            0,
+            "the fixture starts with no reservation"
+        );
+        let armed = arm(&fx, false);
+        let ReplyWaitArm::Armed { identity, token } = armed else {
+            panic!("a live reply wait must arm: {armed:?}");
+        };
+        assert!(
+            token.is_none(),
+            "no deadline was asked for, none is reserved"
+        );
+        assert_eq!(
+            identity.deadline_token_generation, None,
+            "the identity must not imply a registration it does not own"
+        );
+        assert_eq!(identity.reply_record_index, fx.record_index);
+        assert_eq!(identity.reply_record_generation, fx.record_generation);
+        assert_eq!(live_tokens(&fx), 0, "nothing was reserved");
+        assert!(tcb_token(&fx).is_none(), "and nothing is reachable");
+        teardown();
+    }
+
+    #[test]
+    fn dl02_a_finite_wait_reserves_exactly_one_token_keyed_to_the_live_epoch() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        let armed = arm(&fx, true);
+        let ReplyWaitArm::Armed {
+            identity,
+            token: Some(handle),
+        } = armed
+        else {
+            panic!("a finite reply wait must arm and reserve: {armed:?}");
+        };
+        assert_eq!(
+            identity.deadline_token_generation,
+            Some(wgen),
+            "the registration is keyed to THIS block, not to a re-derived number"
+        );
+        assert_eq!(live_tokens(&fx), 1, "exactly one reservation");
+        let live_epoch = epoch(&fx);
+        fx.k.with_ipc_split_mut(|ipc| {
+            let t = &ipc.reply_deadline_tokens[handle.token_index()];
+            let id = t.identity();
+            assert_eq!(id.token_generation, wgen, "token generation is the wait's");
+            assert_eq!(
+                id.terminal_epoch, live_epoch,
+                "the reservation names the cell's CURRENT epoch"
+            );
+            assert_eq!(
+                id.terminal_identity, identity,
+                "and the exact identity armed"
+            );
+        });
+        teardown();
+    }
+
+    #[test]
+    fn dl03_a_reservation_is_unreachable_until_the_tcb_owns_it() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        let ReplyWaitArm::Armed {
+            token: Some(handle),
+            ..
+        } = arm(&fx, true)
+        else {
+            panic!("finite wait arms");
+        };
+        // THE hard requirement: the token exists, but the only path to it — the caller's TCB —
+        // does not name it yet, so no timeout claimant can win with a token the caller does not
+        // own. This is a structural property of the store, not a timing assumption.
+        assert_eq!(live_tokens(&fx), 1, "reserved");
+        assert!(
+            tcb_token(&fx).is_none(),
+            "but not yet reachable through the caller"
+        );
+        assert!(
+            fx.k.publish_reply_timeout_token_split(
+                1,
+                fx.caller_asid,
+                wgen,
+                handle,
+                ReplyDeadlineClock::ProductionTick
+            ),
+            "the exact incarnation accepts the publication"
+        );
+        assert_eq!(
+            tcb_token(&fx).map(|h| h.token_index()),
+            Some(handle.token_index()),
+            "and now the caller owns exactly that token"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn dl04_the_token_is_published_once_and_never_overwritten() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        let ReplyWaitArm::Armed {
+            token: Some(handle),
+            ..
+        } = arm(&fx, true)
+        else {
+            panic!("finite wait arms");
+        };
+        assert!(fx.k.publish_reply_timeout_token_split(
+            1,
+            fx.caller_asid,
+            wgen,
+            handle,
+            ReplyDeadlineClock::ProductionTick
+        ));
+        assert!(
+            !fx.k.publish_reply_timeout_token_split(
+                1,
+                fx.caller_asid,
+                wgen,
+                handle,
+                ReplyDeadlineClock::ProductionTick
+            ),
+            "a TCB that already owns a token refuses a second registration"
+        );
+        assert_eq!(live_tokens(&fx), 1, "and no second reservation appeared");
+        teardown();
+    }
+
+    #[test]
+    fn dl05_a_wrong_incarnation_is_refused_and_compensated_exactly() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        let ReplyWaitArm::Armed {
+            token: Some(handle),
+            ..
+        } = arm(&fx, true)
+        else {
+            panic!("finite wait arms");
+        };
+        // Each of the three incarnation fields is refused on its own.
+        for (tid, asid, g, why) in [
+            (7_u64, fx.caller_asid, wgen, "a different task"),
+            (
+                1,
+                Asid(fx.caller_asid.0.wrapping_add(9)),
+                wgen,
+                "a replacement ASID",
+            ),
+            (1, fx.caller_asid, wgen.wrapping_add(1), "a later block"),
+        ] {
+            assert!(
+                !fx.k.publish_reply_timeout_token_split(
+                    tid,
+                    asid,
+                    g,
+                    handle,
+                    ReplyDeadlineClock::ProductionTick
+                ),
+                "{why} is not this registration's caller"
+            );
+            assert!(tcb_token(&fx).is_none(), "{why}: nothing was written");
+        }
+        // The compensation is exact and leaves no leak.
+        assert!(
+            fx.k.cancel_deadline_exact_split(&handle),
+            "the refused reservation is cancelled by the handle that made it"
+        );
+        assert_eq!(live_tokens(&fx), 0, "zero leak after compensation");
+        assert!(
+            !fx.k.cancel_deadline_exact_split(&handle),
+            "a repeated compensation with a now-stale handle cancels nothing"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn dl06_a_second_finite_arm_is_refused_and_the_first_registration_survives() {
+        let fx = caller_fixture();
+        let ReplyWaitArm::Armed {
+            identity: first,
+            token: Some(handle),
+        } = arm(&fx, true)
+        else {
+            panic!("finite wait arms");
+        };
+        let epoch_after_first = epoch(&fx);
+        // The identity is unchanged, so the cell is NOT re-armed — re-arming would bump the epoch
+        // and invalidate the reservation keyed on the old one.
+        let again = arm(&fx, true);
+        assert_eq!(
+            again,
+            ReplyWaitArm::DeadlineRefused { identity: first },
+            "one active registration per reply record, refused rather than overwritten"
+        );
+        assert_eq!(
+            epoch(&fx),
+            epoch_after_first,
+            "an identical arm must not bump the terminal epoch"
+        );
+        assert_eq!(live_tokens(&fx), 1, "the FIRST reservation still stands");
+        fx.k.with_ipc_split_mut(|ipc| {
+            assert_eq!(
+                ipc.reply_deadline_tokens[handle.token_index()]
+                    .identity()
+                    .terminal_epoch,
+                epoch_after_first,
+                "and it is still keyed to the live epoch"
+            );
+        });
+        teardown();
+    }
+
+    #[test]
+    fn dl07_an_ordinary_receive_is_not_a_reply_wait() {
+        let fx = caller_fixture();
+        let wgen = wait_gen(&fx);
+        // A caller identity that owns no `Available` reply record at this endpoint.
+        let stranger = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            ThreadId(9),
+            Asid(fx.caller_asid.0.wrapping_add(31)),
+        );
+        let armed = fx.k.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::arm_reply_terminal_for_committed_block_locked(
+                ipc,
+                stranger,
+                fx.reply_eidx,
+                wgen,
+                true,
+            )
+        });
+        assert_eq!(
+            armed,
+            ReplyWaitArm::NotAReplyWait,
+            "an ordinary receive owns no reply record and must arm nothing"
+        );
+        assert_eq!(
+            live_tokens(&fx),
+            0,
+            "and reserve nothing — NR 2 / NR 5 unchanged"
+        );
+        teardown();
+    }
+}
+
+/// 199A2D-RR — the reply-record RELEASE invariants.
+///
+/// Legacy `ipc_reply` frees the record slot (`ipc.reply_caps[slot] = None`); the direct path
+/// did not, and because the allocator reuses only `is_none()` slots, every direct reply
+/// permanently consumed one of `MAX_REPLY_CAPS`. A default boot already sat at the boundary —
+/// high-water record index 41 against 42 direct replies — surviving only because the twelve
+/// legacy replies still freed theirs. Taking one reply off the legacy path exhausted the table
+/// and the next `ipc_call` failed `stage=reply_cap_alloc err=CapabilityFull`, losing a request
+/// and its reply.
+///
+/// The six transaction-level tests still pin the TRANSACTION's post-state, which is unchanged:
+/// the record is `Consumed` when `ipc_reply_direct_txn` returns. The release is the split
+/// route's own step, ordered after the terminal commit, and these cases pin THAT.
+mod stage199a2drr_reply_record_release {
+    use super::*;
+    use crate::kernel::boot::{ReceiverWaiterIdentity, ReplyRecordReservation};
+    use crate::runtime::SharedKernel;
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    struct Fx {
+        k: SharedKernel,
+        index: usize,
+        generation: u64,
+        caller: ReceiverWaiterIdentity,
+        replier: ReceiverWaiterIdentity,
+    }
+
+    /// The identities here are the ones the kernel actually allocated: the record's reserve
+    /// precondition is an EXACT identity match, so a fabricated ASID would refuse for the
+    /// wrong reason and the tests below would pin nothing.
+    fn fixture() -> Fx {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (index, generation, caller, replier) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("bind1");
+            s.bind_task_asid(2, sasid).expect("bind2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            let caller = ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            let (index, generation) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("record");
+            // The NR6 request path commits `Reserved → Available` as its last record
+            // mutation; only an `Available` record is externally invokable, and only such
+            // a record can be re-reserved by a reply. Without this the reply-side reserve
+            // below would refuse for the wrong reason.
+            assert!(s.commit_direct_reply_record(index, generation));
+            (index, generation, caller, replier)
+        });
+        Fx {
+            k,
+            index,
+            generation,
+            caller,
+            replier,
+        }
+    }
+
+    fn present(k: &SharedKernel, index: usize) -> bool {
+        k.with(|s| s.reply_cap_record_reservation(index)).is_some()
+    }
+
+    /// A CONSUMED record at the exact generation is released, and the slot becomes reusable —
+    /// which is the whole point: the allocator only ever reuses an absent slot.
+    #[test]
+    fn an_exact_consumed_record_is_released_and_the_slot_is_reusable() {
+        let Fx {
+            k,
+            index,
+            generation,
+            replier,
+            ..
+        } = fixture();
+        assert!(k.reserve_existing_reply_record_split(index, generation, replier));
+        assert!(k.consume_reply_record_split(index, generation));
+        assert_eq!(
+            k.with(|s| s.reply_cap_record_reservation(index)),
+            Some(ReplyRecordReservation::Consumed)
+        );
+        k.release_consumed_reply_record_split(index, generation);
+        assert!(
+            !present(&k, index),
+            "the slot must be ABSENT, not merely Consumed — a Consumed record still occupies it"
+        );
+    }
+
+    /// A record that is NOT `Consumed` is never released: an in-flight reservation or a live
+    /// `Available` authority must survive.
+    #[test]
+    fn a_record_that_is_not_consumed_is_never_released() {
+        for reserve_first in [false, true] {
+            let Fx {
+                k,
+                index,
+                generation,
+                replier,
+                ..
+            } = fixture();
+            if reserve_first {
+                assert!(k.reserve_existing_reply_record_split(index, generation, replier));
+            }
+            k.release_consumed_reply_record_split(index, generation);
+            assert!(
+                present(&k, index),
+                "reserve_first={reserve_first}: only a Consumed record may be released"
+            );
+        }
+    }
+
+    /// A STALE release cannot clear a REUSED slot. This is the reuse hazard the exactness
+    /// exists for: the same index, a new incarnation, and an old caller still holding the old
+    /// generation.
+    #[test]
+    fn a_stale_release_cannot_clear_a_reused_slot() {
+        let Fx {
+            k,
+            index,
+            generation,
+            caller,
+            replier,
+        } = fixture();
+        assert!(k.reserve_existing_reply_record_split(index, generation, replier));
+        assert!(k.consume_reply_record_split(index, generation));
+        k.release_consumed_reply_record_split(index, generation);
+        assert!(!present(&k, index));
+        // The slot is recycled into a NEW incarnation at an advanced generation.
+        let (new_index, new_generation) = k
+            .with(|s| {
+                s.reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+            })
+            .expect("recycled record");
+        assert_eq!(new_index, index, "the freed slot is the one reused");
+        assert!(
+            new_generation > generation,
+            "the generation strictly advances"
+        );
+        // The OLD holder retries its release with the OLD generation: nothing happens.
+        k.release_consumed_reply_record_split(index, generation);
+        assert!(
+            present(&k, index),
+            "a stale generation must never free a live reused record"
+        );
+        // And a repeat at the new generation still refuses, because it is not Consumed.
+        k.release_consumed_reply_record_split(index, new_generation);
+        assert!(present(&k, index), "a live record is not releasable");
+    }
+
+    /// Repeated release is inert.
+    #[test]
+    fn repeated_release_is_harmless() {
+        let Fx {
+            k,
+            index,
+            generation,
+            replier,
+            ..
+        } = fixture();
+        assert!(k.reserve_existing_reply_record_split(index, generation, replier));
+        assert!(k.consume_reply_record_split(index, generation));
+        for _ in 0..4 {
+            k.release_consumed_reply_record_split(index, generation);
+        }
+        assert!(!present(&k, index));
+    }
+
+    /// ORDER: the split route releases the record only on success, and only AFTER it commits
+    /// the terminal claim. Releasing while the cell is still `Reserved(Reply)` would let a
+    /// reallocation of this slot `arm` over a live claim.
+    #[test]
+    fn the_release_is_ordered_after_the_terminal_commit_and_gated_on_success() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
+        let commit = body
+            .find("commit_direct_reply_terminal_split(")
+            .expect("the terminal commit");
+        let release = body
+            .find("release_consumed_reply_record_split(")
+            .expect("the record release");
+        assert!(
+            commit < release,
+            "the record is released only after the terminal claim is committed"
+        );
+        let gate = body
+            .find("if matches!(outcome, Ok(_)) {")
+            .expect("the success gate");
+        assert!(
+            gate < release && release - gate < 400,
+            "the release is gated on a successful delivery"
+        );
+        // The transaction itself must NOT release: its documented post-state is `Consumed`,
+        // and its `EnqueueRejected` arm restores the authority for a retry.
+        assert!(
+            !TXN.contains("release_consumed_reply_record_split("),
+            "the transaction must leave the release to its caller"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 199A2D-RR §1 — the enumerated visibility order is documented on the NR7 helper. These
+// hold the DOCUMENT to the code: every ordering the enumeration claims is re-derived from
+// source here, so the two cannot drift apart.
+mod stage199a2drr_visibility_order {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    /// The transaction's body, from the reply transaction's signature to its end.
+    fn txn_body() -> &'static str {
+        let b = TXN
+            .split("pub(crate) fn ipc_reply_direct_txn(")
+            .nth(1)
+            .expect("the reply transaction");
+        &b[..b.find("\n    pub(crate) fn ").unwrap_or(b.len())]
+    }
+
+    fn at(hay: &str, needle: &str) -> usize {
+        hay.find(needle)
+            .unwrap_or_else(|| panic!("missing step: {needle}"))
+    }
+
+    /// THE BARRIER is `Reserved → Consumed`, and it precedes BOTH the authority revoke and
+    /// the wake. No window may exist where the caller runs while the record would still
+    /// authorize a second reply.
+    #[test]
+    fn the_barrier_precedes_the_authority_revoke_and_the_single_wake() {
+        let b = txn_body();
+        let barrier = at(b, "self.consume_reply_record_split(idx, rgen)");
+        let reclaim = at(b, "self.reclaim_reply_authority_split(");
+        let wake = at(b, "self.sr_enqueue_committed_receiver_reconciled_split(");
+        assert!(
+            barrier < reclaim,
+            "the one-shot is spent in the record before its CNode slots are reclaimed"
+        );
+        assert!(
+            barrier < wake,
+            "and before the caller is woken, so a woken caller can never be replied to twice"
+        );
+    }
+
+    /// Everything fallible-and-retryable is ordered ahead of the barrier: the caller's
+    /// copies and the waiter claim all precede it, so a copy fault still rolls back.
+    #[test]
+    fn every_retryable_step_precedes_the_barrier() {
+        let b = txn_body();
+        let barrier = at(b, "self.consume_reply_record_split(idx, rgen)");
+        for step in [
+            "self.reserve_existing_reply_record_split(idx, rgen, snapshot.replier)",
+            "copy_slice_to_user_asid_split_write(",
+            "self.sr_claim_endpoint_waiter_split(",
+            "self.sr_commit_blocked_receiver_split(",
+        ] {
+            assert!(
+                at(b, step) < barrier,
+                "a refusal at `{step}` must still be able to roll back, so it precedes the barrier"
+            );
+        }
+    }
+
+    /// The blocked route's tail: terminal claim → transaction → terminal resolution →
+    /// record release. The release is last because a slot handed back while its cell is
+    /// still `Reserved(Reply)` could be re-armed over a live claim.
+    #[test]
+    fn the_route_resolves_the_terminal_before_it_releases_the_slot() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
+        let claim = at(body, "shared.claim_direct_reply_terminal_split(");
+        let drain = at(body, "shared.drain_direct_reply_post_work(");
+        let commit = at(body, "shared.commit_direct_reply_terminal_split(");
+        let release = at(body, "shared.release_consumed_reply_record_split(");
+        assert!(
+            claim < drain,
+            "the exclusive claim precedes the transaction"
+        );
+        assert!(
+            drain < commit,
+            "the terminal is resolved by what the transaction did"
+        );
+        assert!(
+            commit < release,
+            "and the slot is released only after that resolution"
+        );
+    }
+
+    /// The enumeration is not decoration: the doc block naming the barrier and both
+    /// load-bearing orderings must stay attached to the helper it describes.
+    #[test]
+    fn the_enumeration_is_documented_on_the_helper_it_describes() {
+        let doc = SPLIT
+            .split("/// # 199A2D-RR §1 — the one-shot barrier and the enumerated visibility order")
+            .nth(1)
+            .expect("the §1 enumeration");
+        let doc = &doc[..at(doc, "#[cfg(not(feature = \"hosted-dev\"))]")];
+        for claim in [
+            "THE BARRIER",
+            "Reserved → Consumed",
+            "record slot released",
+            "no artificial wake",
+        ] {
+            assert!(doc.contains(claim), "the enumeration must state: {claim}");
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 199A2D-RR §5 — the QUEUED (unblocked-caller) reply settles its record in the order the
+// reverse link needs.
+//
+// The reverse link on the server TCB is closed by resolving the bound responder FROM the
+// reply record. The queued commit used to free the record inside its own rank-3 section, so
+// that resolution found nothing, the link was never detached, and the server kept a link it
+// no longer owed. Its next inbound `ipc_call` then failed `install_server_reply_link`,
+// rolled the record allocation back, and lost a request and its reply.
+mod stage199a2drr_queued_reply_settlement {
+    use super::*;
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+
+    struct Fx {
+        k: SharedKernel,
+        index: usize,
+        generation: u64,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    }
+
+    /// A committed, externally-invokable reply record whose server holds the reverse link,
+    /// with the caller NOT blocked — the queued mode's shape.
+    fn fixture() -> Fx {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (index, generation, replier) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("bind1");
+            s.bind_task_asid(2, sasid).expect("bind2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            let (index, generation) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("record");
+            assert!(s.commit_direct_reply_record(index, generation));
+            assert!(
+                s.register_server_reply_link(replier.tid.0, replier.asid, index, generation),
+                "the server owes this reply"
+            );
+            (index, generation, replier)
+        });
+        Fx {
+            k,
+            index,
+            generation,
+            replier,
+        }
+    }
+
+    impl Fx {
+        fn link(&self) -> Option<crate::kernel::task::ServerReplyLink> {
+            self.k
+                .with(|s| s.server_reply_link_for(self.replier.tid.0, self.replier.asid))
+        }
+        fn reservation(&self) -> Option<ReplyRecordReservation> {
+            self.k.with(|s| s.reply_cap_record_reservation(self.index))
+        }
+        fn commit(
+            &self,
+        ) -> Result<Option<crate::kernel::boot::ReceiverWaiterIdentity>, KernelError> {
+            self.k.commit_queued_reply_split(
+                self.index,
+                self.generation,
+                self.replier,
+                0,
+                1,
+                Message::new(9, b"ok").expect("reply"),
+            )
+        }
+    }
+
+    /// THE §5 REPAIR, end to end: a queued reply closes the server's reverse link AND frees
+    /// the record slot. Closing the link is what lets the server take its next call.
+    #[test]
+    fn a_queued_reply_closes_the_reverse_link_and_frees_the_slot() {
+        let fx = fixture();
+        assert!(fx.link().is_some(), "precondition: the link is live");
+
+        fx.commit().expect("the queued reply commits");
+
+        assert_eq!(
+            fx.link(),
+            None,
+            "the server must not keep a link for a reply it has delivered — the next \
+             ipc_call to it would fail install_server_reply_link and lose the request"
+        );
+        assert_eq!(
+            fx.reservation(),
+            None,
+            "and the slot must be absent, not merely Consumed: the allocator reuses only \
+             absent slots and MAX_REPLY_CAPS == MAX_TASKS"
+        );
+    }
+
+    /// The record is still PRESENT when the commit returns from its rank-3 section — that
+    /// presence is exactly what the link close needs to resolve the responder.
+    #[test]
+    fn the_rank3_commit_leaves_the_record_consumed_not_freed() {
+        let fx = fixture();
+        let woken = fx.k.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::commit_queued_reply_locked(
+                ipc,
+                fx.index,
+                fx.generation,
+                fx.replier,
+                0,
+                1,
+                Message::new(9, b"ok").expect("reply"),
+            )
+        });
+        assert!(woken.is_ok());
+        assert_eq!(
+            fx.reservation(),
+            Some(ReplyRecordReservation::Consumed),
+            "the rank-3 owner spends the one-shot but must leave the record resolvable"
+        );
+        assert!(
+            fx.link().is_some(),
+            "and it must not close the link itself: the link lives in the task domain"
+        );
+    }
+
+    /// A pre-mutation refusal leaves everything untouched — the record stays invokable and
+    /// the server keeps the link it still owes.
+    #[test]
+    fn a_refused_queued_commit_mutates_nothing() {
+        for name in [
+            "stale generation",
+            "wrong replier",
+            "wrong endpoint generation",
+        ] {
+            let fx = fixture();
+            let (record_generation, replier, endpoint_generation) = match name {
+                "stale generation" => (fx.generation.wrapping_add(9), fx.replier, 1),
+                "wrong replier" => (
+                    fx.generation,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), fx.replier.asid),
+                    1,
+                ),
+                _ => (fx.generation, fx.replier, 99),
+            };
+            let out = fx.k.commit_queued_reply_split(
+                fx.index,
+                record_generation,
+                replier,
+                0,
+                endpoint_generation,
+                Message::new(9, b"ok").expect("reply"),
+            );
+            assert!(out.is_err(), "{name}: must refuse");
+            assert_eq!(
+                fx.reservation(),
+                Some(ReplyRecordReservation::Available),
+                "{name}: the reply authority stays invokable"
+            );
+            assert!(fx.link().is_some(), "{name}: the link still stands");
+        }
+    }
+
+    /// ORDER, from source: the link close runs BEFORE the release, and both only on success.
+    #[test]
+    fn the_link_close_is_ordered_before_the_record_release() {
+        let body = RUNTIME
+            .split("pub(crate) fn commit_queued_reply_split(")
+            .nth(1)
+            .expect("the queued split seam");
+        let end = body.find("\n    /// ").unwrap_or(body.len());
+        let body = &body[..end];
+        let gate = body.find("if out.is_ok() {").expect("the success gate");
+        let close = body
+            .find("finalize_server_reply_link_for_record_split(")
+            .expect("the link close");
+        let release = body
+            .find("release_consumed_reply_record_split(")
+            .expect("the record release");
+        assert!(
+            gate < close && close < release,
+            "close the link, then release"
+        );
+
+        // And the rank-3 owner must not free the slot itself, which would make the close
+        // above resolve nothing.
+        let owner = IPC_STATE
+            .split("pub(crate) fn commit_queued_reply_locked(")
+            .nth(1)
+            .expect("the rank-3 owner");
+        let owner = &owner[..owner.find("\n}\n").unwrap_or(owner.len())];
+        assert!(
+            !owner.contains("*slot = None"),
+            "the rank-3 owner must leave the record present for the link close"
+        );
+        assert!(
+            owner.contains("record.reservation = super::ReplyRecordReservation::Consumed;"),
+            "it marks the one-shot spent instead"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 199A2D-RR §2/§3 — safe TERMINAL-CELL reuse across a recycled reply-record slot.
+//
+// Once a reply-record slot became physically reclaimable, an allocation is normally a
+// REUSE, and the slot's terminal cell still names the incarnation that is gone. The
+// allocation owner therefore vacates the cell atomically with taking the slot. These pin
+// the two halves that make that safe: the new incarnation classifies as genuinely
+// `Unarmed` (so queued mode can be selected again), and a slot whose terminal may still
+// be decided is never taken at all.
+mod stage199a2drr_terminal_reuse {
+    use super::*;
+    use crate::kernel::direct_eligibility::DirectReplyTerminal as T;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::runtime::SharedKernel;
+
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    struct Fx {
+        k: SharedKernel,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    }
+
+    fn fixture() -> Fx {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (caller, replier) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("bind1");
+            s.bind_task_asid(2, sasid).expect("bind2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            (
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid),
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid),
+            )
+        });
+        Fx { k, caller, replier }
+    }
+
+    impl Fx {
+        fn allocate(&self) -> Result<(usize, u64), KernelError> {
+            self.k.with(|s| {
+                s.reserve_direct_reply_record(
+                    self.caller,
+                    self.replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+            })
+        }
+
+        /// The identity the receive route would arm this incarnation's terminal with.
+        fn identity(&self, index: usize, generation: u64) -> TerminalIdentity {
+            TerminalIdentity {
+                reply_record_index: index,
+                reply_record_generation: generation,
+                caller_tid: self.caller.tid,
+                caller_asid: self.caller.asid,
+                replier_tid: self.replier.tid,
+                replier_asid: self.replier.asid,
+                reply_endpoint_index: 0,
+                reply_endpoint_generation: 1,
+                blocked_recv_generation: 1,
+                deadline_token_generation: Some(1),
+            }
+        }
+
+        fn arm(&self, index: usize, generation: u64) {
+            let id = self.identity(index, generation);
+            self.k.with(|s| s.arm_reply_terminal(index, id));
+        }
+
+        fn classify(&self, index: usize, generation: u64) -> T {
+            self.k
+                .classify_direct_reply_terminal_split_read(index, generation, self.replier, 0, 1)
+        }
+
+        /// Drive the whole reply lifecycle of one incarnation to its settled terminal and
+        /// release the slot, exactly as the NR7 split route does.
+        fn settle_and_release(&self, index: usize, generation: u64) {
+            let id = self.identity(index, generation);
+            let owner = self
+                .k
+                .with(|s| s.try_claim_reply_terminal_slot(index, TerminalClaimant::Reply, &id))
+                .expect("the reply claims its own armed terminal");
+            assert!(self.k.with(|s| s.commit_reply_terminal_slot(index, &owner)));
+            // The request path commits `Reserved → Available` before the record is
+            // externally invokable; only such a record can be re-reserved by a reply.
+            assert!(
+                self.k
+                    .with(|s| s.commit_direct_reply_record(index, generation))
+            );
+            assert!(
+                self.k
+                    .reserve_existing_reply_record_split(index, generation, self.replier)
+            );
+            assert!(self.k.consume_reply_record_split(index, generation));
+            self.k
+                .release_consumed_reply_record_split(index, generation);
+        }
+    }
+
+    /// THE §2 REPAIR. A recycled slot's new incarnation is `Unarmed` — not the
+    /// `IdentityMismatch` a cell left naming its predecessor would report. This is what
+    /// makes the queued (unblocked-caller) reply mode selectable on a reused slot; without
+    /// it the mode goes permanently dormant the first time a slot is recycled.
+    #[test]
+    fn a_recycled_slot_classifies_as_unarmed_not_as_a_mismatch() {
+        let fx = fixture();
+        let (index, generation) = fx.allocate().expect("first incarnation");
+        fx.arm(index, generation);
+        assert_eq!(fx.classify(index, generation), T::AvailableExact);
+        fx.settle_and_release(index, generation);
+
+        let (new_index, new_generation) = fx.allocate().expect("recycled incarnation");
+        assert_eq!(new_index, index, "the freed slot is the one reused");
+        assert!(
+            new_generation > generation,
+            "the generation strictly advances"
+        );
+
+        assert_eq!(
+            fx.classify(new_index, new_generation),
+            T::Unarmed,
+            "the allocation owner must have ENDED the previous incarnation's naming"
+        );
+    }
+
+    /// The epoch is bumped, never reset. Vacancy is a property of the identity, so the ABA
+    /// nonce that every stale owner and deadline token is keyed on stays monotonic across
+    /// the recycle — an old token fails on the epoch before it reaches the identity.
+    #[test]
+    fn the_recycle_advances_the_terminal_epoch_rather_than_resetting_it() {
+        let fx = fixture();
+        let (index, generation) = fx.allocate().expect("first incarnation");
+        fx.arm(index, generation);
+        let armed_epoch = fx.k.with(|s| s.reply_terminal_epoch(index)).expect("epoch");
+        assert!(armed_epoch > 0);
+        fx.settle_and_release(index, generation);
+
+        let (_, new_generation) = fx.allocate().expect("recycled incarnation");
+        let vacated_epoch = fx.k.with(|s| s.reply_terminal_epoch(index)).expect("epoch");
+        assert!(
+            vacated_epoch > armed_epoch,
+            "vacating must ADVANCE the epoch ({vacated_epoch} vs {armed_epoch})"
+        );
+
+        // And the old incarnation's identity can no longer claim the cell, at any phase.
+        fx.arm(index, new_generation);
+        let stale = fx.identity(index, generation);
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                index,
+                TerminalClaimant::Timeout,
+                &stale
+            ))
+            .is_none(),
+            "a deadline token from the previous incarnation must never win the reused cell"
+        );
+    }
+
+    /// A cell that may still be decided is never recycled. An armed, UNSETTLED terminal
+    /// still belongs to a live deadline / peer-death / caller-exit claimant, so the
+    /// allocator skips the slot instead of discarding that outcome.
+    #[test]
+    fn a_slot_whose_terminal_is_still_live_is_skipped_not_stolen() {
+        let fx = fixture();
+        let (index, generation) = fx.allocate().expect("first incarnation");
+        // Armed and OPEN: the caller is blocked and its deadline can still fire.
+        fx.arm(index, generation);
+        // The record itself goes away without the terminal ever being settled — the shape
+        // the caller-exit and server-death sweeps leave behind.
+        assert!(fx.k.with(|s| s.cancel_direct_reply_record(index, generation)));
+
+        let (next_index, _next_generation) = fx.allocate().expect("a later allocation");
+        assert_ne!(
+            next_index, index,
+            "the slot with a live unsettled terminal must be SKIPPED, not reused"
+        );
+        // The evidence that it really was still live: the deadline still wins it.
+        let id = fx.identity(index, generation);
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(index, TerminalClaimant::Timeout, &id))
+                .is_some(),
+            "the outcome the skip preserved is still claimable"
+        );
+    }
+
+    /// Vacancy must NOT be inferred from a mismatch. A cell naming a different, live
+    /// incarnation is still `IdentityMismatch` — the classifier gained no license to treat
+    /// a mismatch as an absent terminal.
+    #[test]
+    fn a_cell_naming_another_incarnation_is_still_a_mismatch() {
+        let fx = fixture();
+        let (index, generation) = fx.allocate().expect("incarnation");
+        // Arm the cell for a DIFFERENT record generation than the live record's.
+        let mut wrong = fx.identity(index, generation);
+        wrong.reply_record_generation = generation + 7;
+        fx.k.with(|s| s.arm_reply_terminal(index, wrong));
+
+        assert_eq!(
+            fx.classify(index, generation),
+            T::IdentityMismatch,
+            "a mismatch must never be reported as Unarmed"
+        );
+        assert!(
+            !matches!(fx.classify(index, generation), T::Unarmed),
+            "and therefore must never admit a direct reply"
+        );
+    }
+
+    /// Both allocation routes drive the SAME owner, so the prepare-for-reuse step cannot
+    /// be present on one and missing on the other.
+    #[test]
+    fn both_allocation_routes_delegate_to_the_one_owner() {
+        let owner = IPC_STATE
+            .split("pub(crate) fn reserve_direct_reply_record_locked(")
+            .nth(1)
+            .expect("the allocation owner");
+        let end = owner.find("\npub(crate) fn ").unwrap_or(owner.len());
+        let owner = &owner[..end];
+        assert!(
+            owner.contains("vacate_for_reuse()"),
+            "the allocation owner must prepare the slot's terminal cell for reuse"
+        );
+        let vacate = owner.find("vacate_for_reuse()").expect("checked above");
+        let install = owner
+            .find("ipc.reply_caps[idx] = Some(ReplyCapRecord {")
+            .expect("the record install");
+        assert!(
+            vacate < install,
+            "the cell must stop naming its predecessor BEFORE the new record exists"
+        );
+        assert!(
+            owner.contains("continue;"),
+            "a cell that refuses to vacate must skip the slot, not take it anyway"
+        );
+
+        // Neither route may keep a private copy of the scan.
+        for (name, src) in [
+            (
+                "broad",
+                IPC_STATE
+                    .split("pub(crate) fn reserve_direct_reply_record(")
+                    .nth(1),
+            ),
+            (
+                "split",
+                RUNTIME
+                    .split("pub(crate) fn reserve_direct_reply_record_split(")
+                    .nth(1),
+            ),
+        ] {
+            let body = src.expect("route present");
+            let end = body.find("\n    /// ").unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                body.contains("reserve_direct_reply_record_locked("),
+                "the {name} route must delegate to the one allocation owner"
+            );
+            assert!(
+                !body.contains("ReplyCapRecord {"),
+                "the {name} route must not keep a private copy of the record install"
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DIRECT3-CAP-FINAL §4 — the CAP-BEARING reply lane.
+//
+// The lane's whole reason to exist is an ordering claim: materializing the transferred
+// capability and copying the caller's payload and metadata are the last steps that can still
+// fail, so the reply must not settle until both have succeeded. These pin that claim from
+// both ends — the settlement's internal order, and the fact that every failure arm hands the
+// reply back re-sendable instead of spending it.
+mod direct3_cap_final_reply_lane {
+    use super::*;
+    use crate::kernel::boot::{ReplyAuthoritySlots, ReplyRecordReservation};
+    use crate::kernel::capabilities::{CapId, CapObject};
+    use crate::kernel::dispatch_post_work::ReplyTerminalContinuation;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const POSTWORK: &str = include_str!("../dispatch_post_work.rs");
+
+    struct Fx {
+        k: SharedKernel,
+        index: usize,
+        generation: u64,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    }
+
+    /// A committed, externally-invokable reply record with its terminal armed — the state a
+    /// cap-bearing reply finds when its caller is committed-blocked.
+    fn fixture() -> Fx {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (index, generation, caller, replier) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("bind1");
+            s.bind_task_asid(2, sasid).expect("bind2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            let (index, generation) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("record");
+            assert!(s.commit_direct_reply_record(index, generation));
+            (index, generation, caller, replier)
+        });
+        Fx {
+            k,
+            index,
+            generation,
+            caller,
+            replier,
+        }
+    }
+
+    impl Fx {
+        fn identity(&self) -> TerminalIdentity {
+            TerminalIdentity {
+                reply_record_index: self.index,
+                reply_record_generation: self.generation,
+                caller_tid: self.caller.tid,
+                caller_asid: self.caller.asid,
+                replier_tid: self.replier.tid,
+                replier_asid: self.replier.asid,
+                reply_endpoint_index: 0,
+                reply_endpoint_generation: 1,
+                blocked_recv_generation: 1,
+                deadline_token_generation: Some(1),
+            }
+        }
+
+        /// Reserve the record and win the terminal, exactly as the lane's syscall half does.
+        fn claim(&self) -> ReplyTerminalContinuation {
+            let id = self.identity();
+            self.k.with(|s| s.arm_reply_terminal(self.index, id));
+            assert!(self.k.reserve_existing_reply_record_split(
+                self.index,
+                self.generation,
+                self.replier
+            ));
+            let owner = self
+                .k
+                .with(|s| s.try_claim_reply_terminal_slot(self.index, TerminalClaimant::Reply, &id))
+                .expect("the reply wins its own armed terminal");
+            ReplyTerminalContinuation {
+                record_index: self.index,
+                record_generation: self.generation,
+                terminal_owner: owner,
+                authority: ReplyAuthoritySlots {
+                    reply_object: CapObject::Reply {
+                        index: self.index,
+                        generation: self.generation,
+                    },
+                    replier_cap: None,
+                    caller_cap: CapId(0),
+                    caller_tid: self.caller.tid,
+                },
+                replier: self.replier,
+                caller: self.caller,
+            }
+        }
+
+        fn reservation(&self) -> Option<ReplyRecordReservation> {
+            self.k.with(|s| s.reply_cap_record_reservation(self.index))
+        }
+        fn terminal_open(&self) -> bool {
+            self.k.with(|s| s.reply_terminal_is_open(self.index))
+        }
+        fn terminal_winner(&self) -> Option<TerminalClaimant> {
+            self.k
+                .with(|s| s.reply_terminal_committed_winner(self.index))
+        }
+        fn epoch(&self) -> u64 {
+            self.k
+                .with(|s| s.reply_terminal_epoch(self.index))
+                .expect("epoch")
+        }
+    }
+
+    /// SUCCESS: the reply settles only as a whole — record consumed, authority reclaimed,
+    /// terminal committed, slot released — leaving nothing for a second reply to claim.
+    #[test]
+    fn a_delivered_cap_reply_settles_its_record_terminal_and_slot_together() {
+        let fx = fixture();
+        let k = fx.claim();
+        assert_eq!(fx.reservation(), Some(ReplyRecordReservation::Reserved));
+
+        fx.k.settle_delivered_reply_continuation_split(&k);
+
+        assert_eq!(
+            fx.reservation(),
+            None,
+            "the slot must be released, not left Consumed: only an absent slot is reusable"
+        );
+        assert_eq!(
+            fx.terminal_winner(),
+            Some(TerminalClaimant::Reply),
+            "the terminal is committed by the exact owner the syscall claimed"
+        );
+    }
+
+    /// FAILURE: every executor failure hands the reply back RE-SENDABLE. Nothing is consumed,
+    /// revoked or released, so the replier may simply reply again — which is the entire reason
+    /// the lifecycle is deferred rather than settled under the syscall.
+    #[test]
+    fn a_failed_cap_reply_is_handed_back_re_sendable() {
+        let fx = fixture();
+        let k = fx.claim();
+        let epoch_before = fx.epoch();
+
+        fx.k.restore_retryable_reply_continuation_split(&k, "user_copy");
+
+        assert_eq!(
+            fx.reservation(),
+            Some(ReplyRecordReservation::Available),
+            "the reply authority must be externally invokable again"
+        );
+        assert!(fx.terminal_open(), "and its terminal claimable again");
+        assert_eq!(
+            fx.epoch(),
+            epoch_before,
+            "released at the SAME epoch — a release is not a re-arm"
+        );
+        assert_eq!(fx.terminal_winner(), None, "nothing was settled");
+
+        // Proof it is genuinely re-sendable: the whole claim succeeds a second time.
+        let again = fx.claim();
+        fx.k.settle_delivered_reply_continuation_split(&again);
+        assert_eq!(fx.reservation(), None);
+        assert_eq!(fx.terminal_winner(), Some(TerminalClaimant::Reply));
+    }
+
+    /// DUPLICATE REPLY: once settled, the record is gone and its terminal is Completed, so a
+    /// second reply naming the same incarnation can neither reserve it nor claim its terminal.
+    #[test]
+    fn a_duplicate_cap_reply_can_neither_reserve_nor_claim() {
+        let fx = fixture();
+        let k = fx.claim();
+        fx.k.settle_delivered_reply_continuation_split(&k);
+
+        assert!(
+            !fx.k
+                .reserve_existing_reply_record_split(fx.index, fx.generation, fx.replier),
+            "a released record cannot be reserved again"
+        );
+        let id = fx.identity();
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(fx.index, TerminalClaimant::Reply, &id))
+                .is_none(),
+            "and its terminal is settled, so no second claimant wins"
+        );
+    }
+
+    /// REUSED SLOT: a continuation from a previous incarnation cannot settle the record that
+    /// recycled its slot. Every step is exact on the record generation and on the terminal
+    /// owner's epoch, both of which advanced.
+    #[test]
+    fn a_stale_continuation_cannot_settle_a_recycled_slot() {
+        let fx = fixture();
+        let stale = fx.claim();
+        fx.k.settle_delivered_reply_continuation_split(&stale);
+        assert_eq!(fx.reservation(), None);
+
+        // The slot is recycled into a new incarnation and committed invokable.
+        let (new_index, new_generation) =
+            fx.k.with(|s| {
+                let r = s.reserve_direct_reply_record(
+                    fx.caller,
+                    fx.replier,
+                    CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                );
+                if let Ok((i, g)) = r {
+                    assert!(s.commit_direct_reply_record(i, g));
+                }
+                r
+            })
+            .expect("recycled");
+        assert_eq!(new_index, fx.index, "the freed slot is the one reused");
+        assert!(new_generation > fx.generation);
+
+        // The stale continuation settles NOTHING on the new incarnation.
+        fx.k.settle_delivered_reply_continuation_split(&stale);
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(new_index)),
+            Some(ReplyRecordReservation::Available),
+            "the new incarnation must be untouched by the old reply's continuation"
+        );
+        assert_eq!(
+            fx.terminal_winner(),
+            None,
+            "and its terminal must not be committed by a stale owner token"
+        );
+    }
+
+    /// The authority the lane reclaims is EXACT on the reply object, so settling one reply can
+    /// never revoke a capability that a recycled slot handed to somebody else.
+    #[test]
+    fn settlement_never_revokes_an_unrelated_reused_capability() {
+        let fx = fixture();
+        let mut k = fx.claim();
+        // Point the continuation's authority at a DIFFERENT reply object, as a stale
+        // continuation against a recycled slot would.
+        k.authority.reply_object = CapObject::Reply {
+            index: fx.index,
+            generation: fx.generation + 41,
+        };
+        k.authority.replier_cap = Some(CapId(4242));
+        let reclaim =
+            fx.k.reclaim_reply_authority_split(k.authority, fx.replier.tid.0);
+        assert!(
+            !reclaim.replier_revoked,
+            "a slot whose object does not match the expected reply object is never revoked"
+        );
+    }
+
+    /// SOURCE ORDER, executor: materialize → copy → settle. The settlement must sit after the
+    /// copy-success gate and before the wake, and every failure arm must restore.
+    #[test]
+    fn the_executor_settles_only_after_the_materialize_and_both_copies() {
+        let body = RUNTIME
+            .split("fn execute_blocked_waiter_ordinary_cap_delivery(")
+            .nth(1)
+            .expect("the ordinary-cap executor");
+        let body = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        let materialize = body
+            .find("materialize_received_message_cap_routed_with_delegation_split(")
+            .expect("the materialize");
+        let copy_gate = body.find("if !copy_ok {").expect("the copy gate");
+        let settle = body
+            .find("settle_delivered_reply_continuation_split(")
+            .expect("the settlement");
+        let wake = body
+            .find("complete_blocked_waiter_delivery_split(")
+            .expect("the wake");
+        assert!(materialize < copy_gate, "materialize precedes the copy");
+        assert!(
+            copy_gate < settle,
+            "the reply settles only after BOTH user copies have succeeded"
+        );
+        assert!(settle < wake, "and strictly before the caller is woken");
+
+        // Every failure arm restores: three in this executor (unexpected object, materialize,
+        // user copy). None of them may settle.
+        assert_eq!(
+            body.matches("restore_retryable_reply_continuation_split(")
+                .count(),
+            3,
+            "each of the three failure arms hands the reply back re-sendable"
+        );
+        assert_eq!(
+            body.matches("settle_delivered_reply_continuation_split(")
+                .count(),
+            1,
+            "and there is exactly one settlement, on the success path"
+        );
+    }
+
+    /// SOURCE ORDER, settlement: consume → reclaim → commit → link → release.
+    #[test]
+    fn the_settlement_orders_the_barrier_before_the_revoke_and_the_commit_before_the_release() {
+        let body = RUNTIME
+            .split("fn settle_delivered_reply_continuation_split(")
+            .nth(1)
+            .expect("the settlement owner");
+        let body = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        let consume = body
+            .find("consume_reply_record_split(")
+            .expect("the barrier");
+        let reclaim = body
+            .find("reclaim_reply_authority_split(")
+            .expect("the authority reclaim");
+        let commit = body
+            .find("commit_direct_reply_terminal_split(")
+            .expect("the terminal commit");
+        let link = body
+            .find("finalize_server_reply_link_for_record_split(")
+            .expect("the link close");
+        let release = body
+            .find("release_consumed_reply_record_split(")
+            .expect("the slot release");
+        assert!(
+            consume < reclaim,
+            "the barrier precedes the authority revoke"
+        );
+        assert!(
+            reclaim < commit,
+            "the authority is reclaimed before the commit"
+        );
+        assert!(
+            commit < release,
+            "the slot is released only after the commit"
+        );
+        assert!(
+            link < release,
+            "and the link closes while the record still resolves"
+        );
+    }
+
+    /// The syscall half claims and settles NOTHING: no commit, no revoke, no release before
+    /// the drain. That is the correction this lane exists to honour.
+    #[test]
+    fn the_syscall_half_never_settles_the_reply() {
+        let lane = SPLIT
+            .split("DirectReplyMode::DeliverBlockedWithCap {")
+            .nth(1)
+            .expect("the capability lane");
+        let lane = &lane[..lane
+            .find("} else if mode ==")
+            .expect("the lane ends at the queued branch")];
+        assert!(
+            lane.contains("claim_direct_reply_terminal_split("),
+            "the lane claims the terminal under the syscall"
+        );
+        for forbidden in [
+            "commit_direct_reply_terminal_split(",
+            "reclaim_reply_authority_split(",
+            "consume_reply_record_split(",
+            "release_consumed_reply_record_split(",
+            "finalize_server_reply_link_for_record_split(",
+        ] {
+            assert!(
+                !lane.contains(forbidden),
+                "the syscall half must not `{forbidden}` — materialization has not run yet"
+            );
+        }
+        // It hands the whole lifecycle over instead.
+        assert!(lane.contains("ReplyTerminalContinuation {"));
+        assert!(lane.contains("produce_blocked_waiter_ordinary_cap_delivery_split("));
+        // And it never falls back to the broad dispatcher after a consuming step.
+        assert!(
+            !lane.contains("with_cpu("),
+            "no broad fallback anywhere in the capability lane"
+        );
+    }
+
+    /// The continuation carries the identities the executor needs to be exact, and reaches it
+    /// through the ONE snapshot assembler rather than a second construction site.
+    #[test]
+    fn the_continuation_carries_exact_identities_through_one_assembler() {
+        let decl = POSTWORK
+            .split("pub(crate) struct ReplyTerminalContinuation {")
+            .nth(1)
+            .expect("the continuation");
+        let decl = &decl[..decl.find("\n}").expect("bounded")];
+        for field in [
+            "record_index",
+            "record_generation",
+            "terminal_owner",
+            "authority",
+            "replier",
+            "caller",
+        ] {
+            assert!(decl.contains(field), "the continuation must carry {field}");
+        }
+        // One construction site for the snapshot: the shared plan.
+        assert_eq!(
+            RUNTIME
+                .matches("BlockedWaiterOrdinaryCapDeliverySnapshot {")
+                .count(),
+            0,
+            "the split producer must not build the snapshot itself"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DIRECT3-CAP-FINAL §7 — the deterministic-refusal terminal edge.
+//
+// A reply whose authority is already spent has one possible outcome, and the split route knows
+// it: the record the capability names is gone, generation-stale or no longer invokable, so the
+// legacy path's only remaining act is to refuse. Entering the broad dispatcher purely to be
+// refused is a terminal edge that buys nothing, so the refusal is given pre-lock — with the
+// same typed error, and having mutated nothing.
+mod direct3_cap_final_prelock_refusal {
+    use super::*;
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::kernel::capabilities::CapObject;
+    use crate::runtime::SharedKernel;
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+
+    fn fixture() -> (
+        SharedKernel,
+        usize,
+        u64,
+        crate::kernel::boot::ReceiverWaiterIdentity,
+    ) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (i, g, r) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("b1");
+            s.bind_task_asid(2, sasid).expect("b2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            let (i, g) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("record");
+            assert!(s.commit_direct_reply_record(i, g));
+            (i, g, replier)
+        });
+        (k, i, g, r)
+    }
+
+    /// THE predicate: it mirrors `resolve_reply_index`'s refusal one-for-one, which is what
+    /// makes the pre-lock answer byte-identical rather than merely similar.
+    #[test]
+    fn the_invokability_predicate_matches_the_legacy_one_state_for_state() {
+        let (k, i, g, replier) = fixture();
+        // Available — externally invokable, so NOT refused here.
+        assert!(k.reply_record_externally_invokable_split_read(i, g));
+        // A stale generation names no live authority.
+        assert!(!k.reply_record_externally_invokable_split_read(i, g.wrapping_add(7)));
+        // Reserved by an in-flight transaction is not externally invokable.
+        assert!(k.reserve_existing_reply_record_split(i, g, replier));
+        assert_eq!(
+            k.with(|s| s.reply_cap_record_reservation(i)),
+            Some(ReplyRecordReservation::Reserved)
+        );
+        assert!(!k.reply_record_externally_invokable_split_read(i, g));
+        // Consumed — the one-shot is spent.
+        assert!(k.consume_reply_record_split(i, g));
+        assert!(!k.reply_record_externally_invokable_split_read(i, g));
+        // Released — the slot is gone entirely.
+        k.release_consumed_reply_record_split(i, g);
+        assert!(!k.reply_record_externally_invokable_split_read(i, g));
+        // And it reads only: the slot is still absent, nothing was resurrected.
+        assert_eq!(k.with(|s| s.reply_cap_record_reservation(i)), None);
+    }
+
+    /// The legacy refusal it stands in for really is this error. `resolve_reply_index` returns
+    /// `StaleCapability` for exactly the states above, and the syscall wrapper maps that to the
+    /// user-visible `WrongObject` — which is the code the pre-lock arm writes.
+    #[test]
+    fn the_pre_lock_error_is_the_one_the_legacy_path_would_have_produced() {
+        let resolver = IPC_STATE
+            .split("fn resolve_reply_index(")
+            .nth(1)
+            .expect("the legacy resolver");
+        let resolver = &resolver[..resolver.find("\n    pub").unwrap_or(resolver.len())];
+        assert!(
+            resolver.contains("ipc.reply_cap_generations[index] == generation")
+                && resolver.contains("record.reservation.is_invokable()")
+                && resolver.contains("_ => Err(KernelError::StaleCapability)"),
+            "the legacy refusal is: slot present, generation exact, reservation invokable"
+        );
+        assert_eq!(
+            crate::kernel::syscall::SyscallError::from(
+                crate::kernel::boot::KernelError::StaleCapability
+            ),
+            crate::kernel::syscall::SyscallError::WrongObject,
+            "and StaleCapability is what the user sees as WrongObject"
+        );
+    }
+
+    /// The refusal is given at the PREFLIGHT decline — before the acknowledgement claim, the
+    /// record reservation, the terminal claim and the envelope stash — and only when the route
+    /// actually resolved a record to be exact about.
+    #[test]
+    fn the_refusal_is_pre_mutation_and_only_with_a_resolved_record() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 helper");
+        let arm = body
+            .split("REPLY_COUNTERS.note_declined_preflight_reply(")
+            .nth(1)
+            .expect("the preflight decline arm");
+        let arm = &arm[..arm.find("return None;").expect("the arm still falls back")];
+        assert!(
+            arm.contains("if let Ok((rec_idx, rec_gen)) = reply_object"),
+            "an unresolved capability still declines to legacy — no record to be exact about"
+        );
+        assert!(
+            arm.contains("!shared.reply_record_externally_invokable_split_read(rec_idx, rec_gen)"),
+            "the decision is made on the RECORD, not re-derived from the classification"
+        );
+        assert!(
+            arm.contains("SyscallError::WrongObject.code()"),
+            "and answered with the typed error the legacy path produces"
+        );
+        // It precedes every consuming step in the helper.
+        let refusal = body
+            .find("IPCREPLY_DIRECT_REFUSED_PRE_LOCK")
+            .expect("the refusal marker");
+        for consuming in [
+            "ipcreply_direct_ack::claim(",
+            "reserve_existing_reply_record_split(",
+            "claim_direct_reply_terminal_split(",
+            "stash_transfer_envelope_split(",
+        ] {
+            let at = body
+                .find(consuming)
+                .unwrap_or_else(|| panic!("{consuming} present"));
+            assert!(refusal < at, "the refusal precedes {consuming}");
         }
     }
 }

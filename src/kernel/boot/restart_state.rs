@@ -167,6 +167,38 @@ impl KernelState {
                     exit_identity.asid.0,
                     cpu_idx
                 );
+                // 199D-SD3 — arm the ServerDies scenario scope from the DEATH identity, here,
+                // where `{record index, generation}` is exactly the scenario's and the link is
+                // still attached to observe. It used to be armed at reply-deadline registration
+                // time, which tied the whole audit to the caller having asked for a finite
+                // timeout; arming it from the terminal arm instead was no better, because the
+                // one-shot latch then claimed whichever reply wait happened to be FIRST in the
+                // boot (record generation 1) rather than the one that dies (generation 18), and
+                // the real detach was counted as a foreign close.
+                #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                {
+                    if let Some(link) = self.server_reply_link_for(tid, exit_identity.asid) {
+                        self.arm_server_dies_link_scope(
+                            link.reply_record_index,
+                            link.reply_record_generation,
+                        );
+                    }
+                    // 199D-SD3 (§4) — attribute the reservation we are HOLDING to the armed
+                    // scenario, by the dying server's identity. The reservation itself carries
+                    // no record identity (it is taken before the link is read), so this is the
+                    // first point at which it can be attributed at all, and it is attributed
+                    // from a live token rather than inferred.
+                    //
+                    // This is what stops an unrelated earlier exit — a task that owns no
+                    // reverse link and takes no part in the scenario — from incrementing the
+                    // scenario's reserve class and failing its audit with `count=2 expected=1`.
+                    // A REPEATED exit attempt for the armed server still counts again, so a
+                    // genuine duplicate reservation stays detectable.
+                    crate::kernel::boot::server_dies_counters::note_deferred_reserved(
+                        tid,
+                        exit_identity.asid.0,
+                    );
+                }
                 match self.take_server_reply_link(tid, exit_identity.asid) {
                     Some(link) => {
                         // The EXACT link this server owned, detached by full incarnation

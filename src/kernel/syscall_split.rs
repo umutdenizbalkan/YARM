@@ -1095,6 +1095,8 @@ fn try_split_ipc_send_into_frame(
                         waiter_tid.0,
                         endpoint_idx,
                         &msg,
+                        // IpcSend origin: no reply record, no terminal, nothing owed.
+                        None,
                     )
                     .map(|done| {
                         if done {
@@ -1438,25 +1440,25 @@ fn try_split_blocking_ipc_recv_into_frame(
         );
         return D::NotHandled;
     }
-    // NON-x86_64: UNCHANGED from before WA3C2. The narrowing is scoped to x86_64 because that is
-    // the architecture WA3C2 qualified — the default core boot, the four AP cross-CPU profiles
-    // and the SMP=2 bidirectional seal are all x86_64 witnesses. On AArch64 direct publication is
-    // armed only by its oracle knob, and that oracle's live round-trip depends on blocked-recv
-    // work this route does not reproduce, so it keeps yielding exactly as it did at `894cc5a`.
-    // Widening it is a separate increment with its own AArch64 witness, not a side effect here.
-    #[cfg(not(target_arch = "x86_64"))]
-    if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled() {
-        crate::yarm_log!(
-            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=ack_publication_armed",
-            cpu.0
-        );
-        return D::NotHandled;
-    }
-    // x86_64: the yield is scoped to an ARMED SELECTOR, never to the production default. The
-    // policy has ONE owner — the `boot` predicate called just below — and it is not an admission
-    // question, so the split dispatcher's admission logic stays free of proof-gate terms. See
-    // that predicate for which blocked-recv work only the broad arm performs.
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    // DIRECT3-CAP-FINAL §5 — ONE owner for this yield, on every architecture.
+    //
+    // The yield is scoped to an ARMED SELECTOR, never to the production default: a selector's
+    // profile depends on blocked-recv work this route does not reproduce, while the ordinary
+    // production configuration needs the route to keep the receive and publish its own
+    // acknowledgements at step (10). It is not an admission question, so the split dispatcher's
+    // admission logic stays free of proof-gate terms.
+    //
+    // This used to be TWO owners. Non-x86_64 yielded on `ipccall_direct_publication_enabled()`,
+    // written when only the broad arm could publish the NR6/NR7 acknowledgements. Step (10) has
+    // published them unconditionally since WA3C2 made the publication bodies shared — both
+    // publishers are strict no-ops when publication is off — so that branch had become a stale
+    // duplicate of this policy. Live on AArch64 it was the §5 gap: with direct production on,
+    // `publication_enabled()` turned true, the branch fired on EVERY blocking recv-v2, and the
+    // whole receive was handed to the broad arm. That reopened the window this route exists to
+    // close — the caller's block was published late, so a reply could arrive with no claimable
+    // acknowledgement and an armed terminal, be declined as mode-indeterminate, fall to legacy,
+    // and be LOST (`IPC_REPLY_FAIL err=WrongObject`, caller never resumed, `resume=0`).
+    #[cfg(not(feature = "hosted-dev"))]
     if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm() {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=direct_oracle_selector_armed",
@@ -1714,7 +1716,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     // of that write and already prints it, so printing it again would double the marker.
     // Phase C — ipc rank 3. The atomic recheck-and-publish, through the ONE policy owner both
     // routes share.
-    let outcome = shared.recv_block_phase_c_split(
+    let (outcome, reply_wait_arm) = shared.recv_block_phase_c_split(
         endpoint_idx,
         crate::kernel::boot::EndpointWaiterRecord::new(
             crate::kernel::boot::ReceiverWaiterIdentity::new(
@@ -1724,6 +1726,10 @@ fn try_split_blocking_ipc_recv_into_frame(
             wait_generation,
         ),
         cap,
+        // 199E-ARM: a finite, non-zero deadline is what makes this wait deadline-bearing. The
+        // terminal cell is armed either way; this only decides the identity's
+        // `deadline_token_generation`, so an unregistered deadline is never implied.
+        deadline.is_some_and(|tick| tick != 0),
     );
     match outcome {
         crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published => {}
@@ -1784,6 +1790,82 @@ fn try_split_blocking_ipc_recv_into_frame(
             return D::Complete(Err(TrapHandleError::Syscall(
                 crate::kernel::syscall::SyscallError::WrongObject,
             )));
+        }
+    }
+    // (9b) 199E-DL — the COMPENSATED rank-2 half of the finite-deadline registration.
+    //
+    // Phase C reserved the token under rank 3, in the same scope that armed the terminal and
+    // published the waiter. A reservation is not claimable: the timeout collector scans TCBs and
+    // reaches a token only through `tcb.reply_timeout_token`, and every other touch of the store
+    // is keyed by a handle already read from a TCB. So this write is what activates it, and no
+    // interval exists in which timeout can win using a token the caller does not yet own.
+    //
+    // Ranks are never held together — rank 3 was released when Phase C returned. On refusal the
+    // exact reservation is cancelled, so nothing is left armed for a caller that does not own it.
+    match reply_wait_arm {
+        // Not a reply wait, or a reply wait with no finite deadline: nothing was reserved.
+        crate::kernel::boot::ReplyWaitArm::NotAReplyWait
+        | crate::kernel::boot::ReplyWaitArm::Armed { token: None, .. } => {}
+        // A FINITE wait whose terminal armed but whose deadline could not be reserved. Parking it
+        // would leave a blocked caller with a deadline it cannot identify, so unwind the whole
+        // block exactly as the publish races do and let the broad arm own the outcome.
+        crate::kernel::boot::ReplyWaitArm::DeadlineRefused { .. } => {
+            let unwound = shared.recv_block_unwind_race_split(cpu, tid);
+            crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} endpoint={} reason=deadline_reservation unwound={}",
+                cpu.0,
+                tid,
+                endpoint_idx,
+                u8::from(unwound)
+            );
+            if !unwound {
+                return D::Complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                )));
+            }
+            return D::NotHandled;
+        }
+        crate::kernel::boot::ReplyWaitArm::Armed {
+            token: Some(handle),
+            ..
+        } => {
+            let published = shared.publish_reply_timeout_token_split(
+                tid,
+                receiver_asid,
+                wait_generation,
+                handle,
+                crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick,
+            );
+            if published {
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_ARMED arch={} caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                    tid,
+                    receiver_asid.0,
+                    handle.identity().terminal_identity.reply_record_index,
+                    handle.identity().terminal_identity.reply_record_generation,
+                    handle.identity().terminal_epoch,
+                    handle.identity().token_index,
+                    handle.identity().token_generation,
+                    deadline.unwrap_or(0)
+                );
+            } else {
+                // The caller incarnation moved under us between rank 3 and rank 2. Cancel the
+                // EXACT reservation — a stale cancel mutates nothing — and leave the block
+                // otherwise intact: the wait is still armed for reply/death/caller-exit, and its
+                // deadline stays on the ordinary receive-timeout class exactly as an
+                // unregistered wait's does. Nothing is left claimable that the caller cannot own.
+                let cancelled = shared.cancel_deadline_exact_split(&handle);
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_ARM_COMPENSATED caller_tid={} caller_asid={} token_slot={} token_generation={} cancelled={} result=ok",
+                    tid,
+                    receiver_asid.0,
+                    handle.identity().token_index,
+                    handle.identity().token_generation,
+                    u8::from(cancelled)
+                );
+            }
         }
     }
     // (10) Stage 199D-WA3C2 — publish the NR6/NR7 blocked-waiter acknowledgements from the
@@ -2717,6 +2799,67 @@ fn try_split_ipccall_direct_into_frame(
 ///   `SharedKernel::ipc_reply_direct_txn`. No userspace payload pointer survives the
 ///   snapshot. On invalid length / copy fault / no committed ack, returns `None` (the
 ///   ack is never claimed, nothing is mutated) so NR7 stays on its existing path.
+///
+/// # 199A2D-RR §1 — the one-shot barrier and the enumerated visibility order
+///
+/// THE BARRIER is the reply record's `Reserved → Consumed` transition, taken under the
+/// rank-3 IPC claim. After it, a stale or aliased reply capability that still resolves to
+/// the same `(record index, generation)` fails through the `Consumed` record — before its
+/// physical CNode slots are reclaimed, and before the caller is woken. The record state,
+/// not the capability slot, is what makes the reply one-shot; slot reclamation is only
+/// storage recovery behind it.
+///
+/// Everything fallible and still-retryable is ordered AHEAD of the barrier, and everything
+/// past it is irrevocable. The full order, blocked (`DeliverBlocked`) mode:
+///
+/// ```text
+///   pre-barrier — a refusal here mutates nothing and may still decline or fall back
+///     1  facts + eligibility verdict (replier probe resolved first)
+///     2  SMP pre-ack, then the reply payload copied IN from the replier
+///     3  owned snapshot built (no user pointer survives it)
+///     4  MODE chosen: claimable acknowledgement → blocked; else unarmed terminal → queued
+///     5  EXCLUSIVE rank-3 terminal claim  ── Open → Reserved(Reply)
+///     6  acknowledgement claimed, at most once, keyed by reply-endpoint incarnation
+///     7  record reserved            ── Available → Reserved  (exact replier)
+///     8  reply payload copied OUT to the caller's buffer
+///     9  recv-v2 meta copied OUT to the caller
+///    10  endpoint waiter claimed (removable, and restorable on a later refusal)
+///    11  blocked receiver committed ── the caller becomes Runnable
+///   ── THE BARRIER ────────────────────────────────────────────────────────────────
+///    12  record consumed             ── Reserved → Consumed
+///   post-barrier — the one-shot is spent; no other claimant may win
+///    13  reply authority reclaimed   ── both CNode slots revoked through one owner
+///    14  caller enqueued             ── the SINGLE wake, LAST and non-fallible
+///    15  endpoint-waiter claim consumed
+///    16  terminal claim resolved     ── Reserved(Reply) → Completed
+///    17  record slot released        ── only on success, only AFTER (16)
+/// ```
+///
+/// Two orderings in that list are load-bearing rather than incidental:
+///
+/// * (12) before (13) and (14). The barrier precedes both the authority revoke and the
+///   wake, so no window exists in which the caller is running while the record would still
+///   authorize a second reply.
+/// * (17) after (16). The slot is handed back to the allocator only once the terminal cell
+///   is `Completed`; releasing it while the cell is still `Reserved(Reply)` would let a
+///   reallocation of this slot arm over a live claim.
+///
+/// The queued (`QueueUnblocked`) mode reaches the same barrier through one rank-3
+/// acquisition, and settles in the order its reverse link requires:
+///
+/// ```text
+///     1..4 as above (the caller is NOT blocked, so there is no ack and no terminal)
+///     5' revalidate record generation, `Available`, exact replier, endpoint incarnation
+///     6' enqueue into the reply endpoint — admission decided FIRST; a refusal here leaves
+///        the record `Available` and the reply exactly re-sendable
+///   ── THE BARRIER ────────────────────────────────────────────────────────────────
+///     7' record consumed          ── Available → Consumed, record left PRESENT
+///     8' reverse link closed      ── resolves the responder FROM the still-present record
+///     9' record slot released     ── through the same release owner as (17)
+///    10' reply authority reclaimed
+///    11' a receiver is woken ONLY if the commit actually removed one from the waiter
+///        table; a polling receiver with no published waiter gets no artificial wake
+/// ```
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_ipcreply_direct_into_frame(
     shared: &SharedKernel,
@@ -2757,6 +2900,14 @@ fn try_split_ipcreply_direct_into_frame(
         Some((eidx, _)) => crate::kernel::boot::ipccall_direct_reply_endpoint_admitted(eidx),
         None => false,
     };
+    // 199D-TRC: the replier's exact incarnation is needed by the terminal classification, so it
+    // is resolved here rather than after the verdict. Both reads; nothing is mutated.
+    let replier_probe = tid.map(|t| {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(t),
+            crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(t) as u16),
+        )
+    });
     let facts = DirectReplyFacts {
         payload_len: len,
         requester_available: tid.is_some(),
@@ -2768,15 +2919,18 @@ fn try_split_ipcreply_direct_into_frame(
         // transaction cannot transfer a capability, so a cap-bearing reply must decline
         // before any mutation rather than deliver the payload and drop the capability.
         transfer_cap_present: crate::kernel::syscall::ipc_abi::transfer_cap_arg_present(frame),
-        // Read from the authoritative terminal-ownership cell, exact in record index AND
-        // generation. An arbitrated reply must reserve its terminal before the caller copy
-        // and commit it after so a concurrent timeout provably loses; that lease lives only
-        // on the legacy path, so this reply declines before any mutation.
-        terminal_arbitrated: match reply_object {
-            Ok((rec_idx, rec_gen)) => {
-                shared.reply_record_terminal_arbitrated_split_read(rec_idx, rec_gen)
-            }
-            Err(_) => false,
+        // 199D-TRC: the ADVISORY terminal classification, exact in record incarnation, caller,
+        // replier and reply-endpoint incarnation. An armed-and-available cell ADMITS this
+        // reply — it is one of the cell's five legitimate claimants — and the exclusive claim
+        // is taken at the mutation point below. Only a competitor-owned, already-settled or
+        // identity-mismatched cell declines, and each declines before any mutation.
+        terminal: match (reply_object, reply_endpoint, replier_probe) {
+            (Ok((rec_idx, rec_gen)), Some((eidx, egen)), Some(replier)) => shared
+                .classify_direct_reply_terminal_split_read(rec_idx, rec_gen, replier, eidx, egen),
+            // Without a resolved record, endpoint incarnation or replier there is no identity to
+            // be exact about. Those cases are declined by their own facts above; naming the
+            // terminal `IdentityMismatch` here keeps the field from ever reading as permissive.
+            _ => crate::kernel::direct_eligibility::DirectReplyTerminal::IdentityMismatch,
         },
     };
     let verdict = classify_direct_reply_eligibility(&facts);
@@ -2788,6 +2942,39 @@ fn try_split_ipcreply_direct_into_frame(
             verdict.is_transfer_cap_decline(),
             verdict.is_terminal_arbitration_decline(),
         );
+        // DIRECT3-CAP-FINAL §7 — CLOSE THE DETERMINISTIC-REFUSAL EDGE.
+        //
+        // One shape of ineligibility is not an "ask the broad path instead": it is a refusal
+        // whose answer is already known here. When the capability resolves to a `Reply` object
+        // but the record it names is gone, generation-stale or no longer invokable — because a
+        // deadline, a peer death, a caller exit or an endpoint destruction settled the terminal
+        // — the legacy path's ONLY remaining act is to fail. `resolve_reply_index` refuses with
+        // `StaleCapability`, which the syscall wrapper maps to `SyscallError::WrongObject`.
+        //
+        // Entering the broad dispatcher purely to be told that is a terminal edge that buys
+        // nothing. The refusal is given here instead, from the SAME typed error written the
+        // same way, so the user-visible result is byte-identical — and given having mutated
+        // NOTHING, because this is before the record reservation, the terminal claim, the
+        // envelope stash and the acknowledgement claim.
+        //
+        // The predicate is the legacy one mirrored exactly, not a re-derivation from the
+        // terminal classification: a classification can be `IdentityMismatch` for reasons whose
+        // legacy answer is NOT this error, so the decision is made on the record itself. An
+        // unresolved capability still declines to legacy, because then this route has no record
+        // identity to be exact about.
+        if let Ok((rec_idx, rec_gen)) = reply_object
+            && !shared.reply_record_externally_invokable_split_read(rec_idx, rec_gen)
+        {
+            crate::yarm_log!(
+                "IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index={} record_generation={} replier_tid={} terminal={:?} reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok",
+                rec_idx,
+                rec_gen,
+                tid.unwrap_or(0),
+                facts.terminal
+            );
+            frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
+            return Some(Ok(()));
+        }
         return None; // ineligible: no ack claim, no copy, no mutation — legacy path
     };
     REPLY_COUNTERS.note_eligible();
@@ -2822,10 +3009,19 @@ fn try_split_ipcreply_direct_into_frame(
         }
     }
     let asid_raw = shared.task_asid_for_tid_split_read(tid);
+    // The same incarnation the terminal classification was keyed on.
     let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(
         crate::kernel::ipc::ThreadId(tid),
         crate::kernel::vm::Asid(asid_raw as u16),
     );
+    let (rec_idx, rec_gen) = match reply_object {
+        Ok(pair) => pair,
+        // Unreachable: eligibility required a resolved record. Fail closed rather than assume.
+        Err(_) => {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        }
+    };
     // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing. As on the
     // NR6 twin, every decline from here to the ack claim is eligible-but-pre-transaction and
     // is counted as such — the oracle server's bounded pre-acknowledgement retries live here.
@@ -2837,11 +3033,309 @@ fn try_split_ipcreply_direct_into_frame(
         REPLY_COUNTERS.note_declined_pre_transaction();
         return None;
     };
+    // 199D-TRC: probe the acknowledgement WITHOUT consuming it, so the ordinary
+    // "caller has not blocked yet" decline still happens BEFORE any terminal claim and can
+    // still fall back. Everything fallible-and-fallback-worthy is ordered ahead of the claim.
+    // DIRECT3-QUEUECAP §3 — CHOOSE THE MODE, before any mutation.
+    //
+    // A reply has two production shapes and the direct route only ever implemented one.
+    // "No claimable acknowledgement" is not a generic decline: together with an unarmed
+    // terminal it is the positive signature of the QUEUED mode — the caller is not blocked on
+    // its reply endpoint, so there is nothing to deliver into and the reply is enqueued for a
+    // later receive. Treating that signature as "let the broad path have it" is what left a
+    // permanent legacy population.
+    //
+    // `Unarmed` alone is never sufficient: the acknowledgement store is consulted too, and the
+    // queued commit re-validates the record, its binding and the endpoint incarnation against
+    // live state in the same acquisition that mutates.
+    let mode = if crate::kernel::boot::ipcreply_direct_ack::is_claimable(reply_eidx, reply_egen) {
+        // DIRECT3-CAP-FINAL: the caller IS blocked, so the cap-bearing lane applies when the
+        // reply carries a capability. Both lanes claim the same terminal through the same
+        // arbitration; they differ only in who performs the delivery and when the reply
+        // settles.
+        if facts.transfer_cap_present {
+            crate::kernel::direct_eligibility::DirectReplyMode::DeliverBlockedWithCap
+        } else {
+            crate::kernel::direct_eligibility::DirectReplyMode::DeliverBlocked
+        }
+    } else if matches!(
+        facts.terminal,
+        crate::kernel::direct_eligibility::DirectReplyTerminal::Unarmed
+    ) && !facts.transfer_cap_present
+    {
+        // A cap-bearing reply to an UNBLOCKED caller would have to ride its transfer envelope
+        // in the queued message and be materialized by the receive-side owner on a later
+        // receive. That class is not witnessed in production and this lane does not claim it:
+        // it declines pre-mutation and the legacy path owns it, rather than being enqueued
+        // with a capability nothing would materialize.
+        crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked
+    } else {
+        // An armed terminal with no claimable acknowledgement is neither delivery mode: the
+        // record is mid-transaction or settling. Refuse pre-mutation rather than guess.
+        REPLY_COUNTERS.note_declined_pre_transaction();
+        return None;
+    };
+    // ── DIRECT3-CAP-FINAL — the CAP-BEARING blocked lane ────────────────────────────────
+    //
+    // Composed entirely from owners that already exist and are already live on the split
+    // IpcSend boundary: the transfer-envelope stash, the blocked-waiter ordinary-cap producer,
+    // its executor's materialize/rollback seams, and the reply's own terminal, authority,
+    // record and reverse-link owners. Nothing here is a second implementation of any of them.
+    //
+    // The reply claims its terminal HERE and settles it NOWHERE here. Materializing the
+    // capability and copying the caller's payload and metadata are the last steps that can
+    // still fail, and both run in the executor; so the claim, the record reservation and the
+    // authority identities travel to it as a typed continuation. Committing the terminal or
+    // revoking the authority at this point would make a materialization failure unrecoverable.
+    if mode == crate::kernel::direct_eligibility::DirectReplyMode::DeliverBlockedWithCap {
+        let Some(transfer_cap) = crate::kernel::syscall::ipc_abi::transfer_cap_arg_value(frame)
+        else {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        // The caller this reply settles, read from the record itself — never re-derived.
+        let Some(caller) = shared.reply_record_caller_split_read(rec_idx, rec_gen) else {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        // (1) The one-shot authority identities, snapshotted BEFORE any mutation so a recycled
+        // record can never hand out another transaction's slots.
+        let Some(authority) = shared.reply_authority_slots_split_read(rec_idx, rec_gen) else {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        // (2) Reserve the record for this exact replier: `Available → Reserved`. Refused
+        // pre-mutation if the record is not this replier's to answer.
+        if !shared.reserve_existing_reply_record_split(rec_idx, rec_gen, replier) {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        }
+        // (3) THE EXCLUSIVE CLAIM, through the same single authority every other terminal
+        // claimant uses. A loser mutates nothing and does NOT fall back to the broad
+        // dispatcher: the record has an owner and that owner will complete it.
+        let claim = shared
+            .claim_direct_reply_terminal_split(rec_idx, rec_gen, replier, reply_eidx, reply_egen);
+        let terminal_owner = match claim {
+            crate::kernel::boot::DirectReplyTerminalClaim::Won(owner) => owner,
+            crate::kernel::boot::DirectReplyTerminalClaim::NotArmed => {
+                // The ack was claimable, so a terminal must be armed. Restore and refuse.
+                let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+                REPLY_COUNTERS.note_declined_pre_transaction();
+                return None;
+            }
+            crate::kernel::boot::DirectReplyTerminalClaim::Lost(class) => {
+                let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+                REPLY_COUNTERS.note_declined_pre_transaction();
+                crate::yarm_log!(
+                    "IPCREPLY_DIRECT_TERMINAL_LOST record_index={} record_generation={} replier_tid={} reason={:?} reply_copies=0 caller_wakes=0 result=ok",
+                    rec_idx,
+                    rec_gen,
+                    tid,
+                    class
+                );
+                frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
+                return Some(Ok(()));
+            }
+        };
+        // (4) Stash the transfer envelope through the SAME owner the split IpcSend route uses.
+        // It only RESOLVES the replier's source capability — it never takes it — which is why
+        // a later failure can hand the reply back genuinely re-sendable.
+        let reply_endpoint_object = crate::kernel::capabilities::CapObject::Endpoint {
+            index: reply_eidx,
+            generation: reply_egen,
+        };
+        let stashed = shared.stash_transfer_envelope_split(
+            crate::kernel::ipc::ThreadId(tid),
+            transfer_cap,
+            reply_endpoint_object,
+            Some(caller.tid),
+            None,
+        );
+        let Ok(stashed) = stashed else {
+            let _ = shared.release_direct_reply_terminal_split(rec_idx, &terminal_owner);
+            let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        crate::yarm_log!(
+            "IPC_REPLY_DIRECT_CAP_STASH tid={} transfer_cap={} handle={} endpoint={} endpoint_generation={} caller_tid={}",
+            tid,
+            transfer_cap.0,
+            stashed.handle,
+            reply_eidx,
+            reply_egen,
+            caller.tid.0
+        );
+        // (5) The message the caller receives, framed exactly as the legacy reply frames it:
+        // FLAG_CAP_TRANSFER_PLAIN, so the receiver does not strip an opcode prefix a reply
+        // never prepends.
+        let Ok(msg) = crate::kernel::syscall::ipc_abi::frame_reply_message_with_cap(
+            tid,
+            &payload[..len],
+            stashed.handle,
+        ) else {
+            let _ = shared.release_direct_reply_terminal_split(rec_idx, &terminal_owner);
+            let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        // (6) The delivery, produced by the existing owner, carrying the reply lifecycle.
+        let continuation = crate::kernel::dispatch_post_work::ReplyTerminalContinuation {
+            record_index: rec_idx,
+            record_generation: rec_gen,
+            terminal_owner,
+            authority,
+            replier,
+            caller,
+        };
+        match shared.produce_blocked_waiter_ordinary_cap_delivery_split(
+            caller.tid.0,
+            reply_eidx,
+            &msg,
+            Some(continuation),
+        ) {
+            Ok(true) => {
+                crate::yarm_log!(
+                    "IPC_REPLY_DIRECT_CAP_PRODUCED record_index={} record_generation={} replier_tid={} caller_tid={} endpoint={} result=ok",
+                    rec_idx,
+                    rec_gen,
+                    tid,
+                    caller.tid.0,
+                    reply_eidx
+                );
+                // The acknowledgement published for this exact endpoint incarnation is spent
+                // by this delivery; consume it so no second reply can claim the same caller.
+                let _ = crate::kernel::boot::ipcreply_direct_ack::claim(reply_eidx, reply_egen);
+                crate::kernel::direct_ipc_counters::note_disposition(
+                    &REPLY_COUNTERS,
+                    crate::kernel::direct_disposition::DirectDisposition::Completed,
+                );
+                return crate::kernel::direct_disposition::apply_direct_disposition(
+                    frame,
+                    crate::kernel::direct_disposition::DirectDisposition::Completed,
+                )
+                .map(|()| Ok(()));
+            }
+            // Declined or failed having consumed nothing irreversible: hand the reply back
+            // re-sendable. The envelope is dropped with it, and the replier still holds the
+            // source capability it only ever resolved.
+            Ok(false) | Err(_) => {
+                let _ = shared.take_transfer_envelope_facts_split(
+                    stashed.handle,
+                    reply_eidx,
+                    caller.tid,
+                );
+                let _ = shared.release_direct_reply_terminal_split(rec_idx, &terminal_owner);
+                let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+                REPLY_COUNTERS.note_declined_pre_transaction();
+                return None;
+            }
+        }
+    } else if mode == crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked {
+        // The queued mode carries no capability today: a cap-bearing reply declined at the
+        // transfer-cap fact above, before the mode was chosen, so the envelope-bearing message
+        // shape cannot reach here. Plain framing, exactly as the broad path builds it when it
+        // has no transfer handle.
+        let Ok(msg) = crate::kernel::ipc::Message::new(tid, &payload[..len]) else {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        let authority = shared.reply_authority_slots_split_read(rec_idx, rec_gen);
+        return match shared
+            .commit_queued_reply_split(rec_idx, rec_gen, replier, reply_eidx, reply_egen, msg)
+        {
+            Ok(woken) => {
+                // The one-shot is spent, so its authority slots are reclaimed through the same
+                // owner the blocked mode uses. The transferred payload carries no capability
+                // here, so nothing else is owed.
+                if let Some(slots) = authority {
+                    let reclaim = shared.reclaim_reply_authority_split(slots, tid);
+                    crate::yarm_log!(
+                        "IPC_REPLY_QUEUED_AUTHORITY_RECLAIMED record_index={} record_generation={} replier_tid={} replier_ok={} caller_ok={} result=ok",
+                        rec_idx,
+                        rec_gen,
+                        tid,
+                        u8::from(reclaim.replier_revoked),
+                        u8::from(reclaim.caller_revoked)
+                    );
+                }
+                crate::yarm_log!(
+                    "IPC_REPLY_QUEUED_SPLIT_OK record_index={} record_generation={} replier_tid={} endpoint={} endpoint_generation={} len={} woken={} result=ok",
+                    rec_idx,
+                    rec_gen,
+                    tid,
+                    reply_eidx,
+                    reply_egen,
+                    len,
+                    woken.map(|w| w.tid.0).unwrap_or(0)
+                );
+                // A receiver that blocked between classification and commit was taken out of
+                // the waiter table by the commit, so waking it is this transaction's to do —
+                // the same contract the broad path's `SchedulerWakePlain::Wake` carries.
+                if let Some(w) = woken {
+                    shared.sr_enqueue_committed_receiver_split(w.tid.0, None);
+                }
+                crate::kernel::direct_disposition::apply_direct_disposition(
+                    frame,
+                    crate::kernel::direct_disposition::DirectDisposition::Completed,
+                )
+                .map(|()| Ok(()))
+            }
+            Err(_) => {
+                // Nothing was mutated: the record is still `Available` and the reply is exactly
+                // re-sendable. This is the one refusal the broad path cannot offer, because it
+                // consumes the record before it ever reaches the queue.
+                REPLY_COUNTERS.note_declined_pre_transaction();
+                None
+            }
+        };
+    }
+    // 199D-TRC — THE EXCLUSIVE CLAIM. Classify and compare-exchange in one rank-3 acquisition,
+    // through the same single-authority `TerminalCell` that timeout, peer death, caller exit and
+    // endpoint destruction claim. The preflight classification above was advisory; this is the
+    // step that decides. A loser mutates nothing and does NOT fall back to the broad
+    // dispatcher — the record has a terminal owner, and that owner will complete it.
+    let terminal_claim =
+        shared.claim_direct_reply_terminal_split(rec_idx, rec_gen, replier, reply_eidx, reply_egen);
+    let terminal_owner = match terminal_claim {
+        crate::kernel::boot::DirectReplyTerminalClaim::NotArmed => None,
+        crate::kernel::boot::DirectReplyTerminalClaim::Won(owner) => Some(owner),
+        crate::kernel::boot::DirectReplyTerminalClaim::Lost(class) => {
+            // Eligible, but the exclusive claim was lost — counted where every other
+            // eligible-but-pre-transaction refusal is counted. It is deliberately NOT a
+            // preflight decline: preflight passed, and the arbitration outcome is reported
+            // by the marker below rather than folded into the preflight subset.
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            crate::yarm_log!(
+                "IPCREPLY_DIRECT_TERMINAL_LOST record_index={} record_generation={} replier_tid={} reason={:?} reply_copies=0 caller_wakes=0 result=ok",
+                rec_idx,
+                rec_gen,
+                tid,
+                class
+            );
+            // A typed terminal result, never a fallback: the reply authority this replier held
+            // has been settled by another claimant, so the canonical answer is the same one a
+            // duplicate reply gets. Zero copies, zero wakes, zero mutation.
+            frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
+            return Some(Ok(()));
+        }
+    };
     // Consume the acknowledgement published for EXACTLY this reply-endpoint incarnation,
     // at most once (Stage 199D endpoint-keyed, generation-bearing store).
     let Some((ack, ack_seq)) =
         crate::kernel::boot::ipcreply_direct_ack::claim(reply_eidx, reply_egen)
     else {
+        // Enumerated post-claim failure #1: the acknowledgement was claimable a moment ago and
+        // is not now. Restore the exact claim so the record is left precisely as it was found,
+        // then decline pre-mutation. A stale restore mutates nothing.
+        if let Some(owner) = terminal_owner.as_ref()
+            && !shared.release_direct_reply_terminal_split(rec_idx, owner)
+        {
+            // Unreachable while we hold `Reserved`; fail closed rather than fall back with an
+            // unresolved claim.
+            frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
+            return Some(Ok(()));
+        }
         REPLY_COUNTERS.note_declined_pre_transaction();
         return None;
     };
@@ -2852,6 +3346,58 @@ fn try_split_ipcreply_direct_into_frame(
     };
     // Stage 199D HARD-STOP B: classified, never discarded — see the NR6 twin.
     let outcome = shared.drain_direct_reply_post_work(cpu, &work);
+    // 199D-TRC — enumerated post-claim failure #2..n: resolve the claim against what the
+    // transaction actually did, exhaustively and by the transaction's OWN documented
+    // post-states. `Release` is used for every outcome that left the reply authority
+    // re-sendable (nothing delivered, a retryable copy fault, or an enqueue refusal that the
+    // transaction explicitly restores); `Commit` for every outcome past the publication line,
+    // where the one-shot is spent and no other claimant may win.
+    if let Some(owner) = terminal_owner.as_ref() {
+        use crate::kernel::ipccall_direct_txn::IpcReplyDirectError as E;
+        let commit = match &outcome {
+            Ok(_) => true,
+            Err(
+                E::WouldBlock
+                | E::ReplyCapResolve(_)
+                | E::ReservePreconditionFailed
+                | E::WaiterLost
+                | E::LeaseNotClaimed
+                | E::PayloadCopyFault
+                | E::MetaCopyFault
+                | E::EnqueueRejected(_),
+            ) => false,
+            Err(
+                E::WaiterLostAfterCopy
+                | E::CallerGone
+                | E::RecordConsumeFailed
+                | E::EnqueueRejectedUnreconciled(_)
+                | E::ReceiverMembershipViolation,
+            ) => true,
+        };
+        let settled = if commit {
+            shared.commit_direct_reply_terminal_split(rec_idx, owner)
+        } else {
+            shared.release_direct_reply_terminal_split(rec_idx, owner)
+        };
+        crate::yarm_log!(
+            "IPCREPLY_DIRECT_TERMINAL_CLAIM record_index={} record_generation={} replier_tid={} terminal=Reply resolution={} settled={} result=ok",
+            rec_idx,
+            rec_gen,
+            tid,
+            if commit { "commit" } else { "release" },
+            u8::from(settled)
+        );
+    }
+    // DIRECT3-QUEUE3 — RELEASE THE REPLY-RECORD SLOT, last, and only on success.
+    //
+    // Legacy `ipc_reply` frees the slot (`ipc.reply_caps[slot] = None`); the direct path did
+    // not, so every direct reply permanently consumed one of `MAX_REPLY_CAPS` slots. Ordered
+    // after the terminal commit on purpose: releasing while the cell is still `Reserved(Reply)`
+    // would let a reallocation of this slot `arm` over a live claim. Exact by record generation
+    // and by the `Consumed` state, so a repeat, a stale caller or a recycled slot frees nothing.
+    if matches!(outcome, Ok(_)) {
+        shared.release_consumed_reply_record_split(rec_idx, rec_gen);
+    }
     let disposition = crate::kernel::direct_disposition::classify_direct_reply_outcome(&outcome);
     crate::kernel::direct_ipc_counters::note_disposition(&REPLY_COUNTERS, disposition);
     // Same shared encoder as the NR6 twin: legacy `handle_ipc_reply` ends with the identical

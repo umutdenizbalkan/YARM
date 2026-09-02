@@ -556,7 +556,16 @@ pub(crate) fn materialize_received_message_cap(
         };
         // Record the materialized CapId in the global ReplyCapRecord so that
         // ipc_reply can fast-revoke the exact slot using a kernel-controlled value.
-        kernel.set_reply_cap_waiter_cap(reply_index, reply_generation, minted);
+        // DIRECT3 §1: the receiver taking the one-shot cap IS the responder — bind it here,
+        // on the same edge, so a QUEUED request's record reaches the replier bound exactly as a
+        // direct request's does. Bind-once; an already-bound record is never re-bound.
+        let responder_identity = kernel.task_asid(receiver_tid).map(|asid| {
+            crate::kernel::boot::ReceiverWaiterIdentity::new(
+                crate::kernel::ipc::ThreadId(receiver_tid),
+                asid,
+            )
+        });
+        kernel.set_reply_cap_waiter_cap(reply_index, reply_generation, minted, responder_identity);
         crate::yarm_log!(
             "IPC_RECV_REPLY_CAP_MATERIALIZE_OK waiter_tid={} local_reply_cap={}",
             receiver_tid,

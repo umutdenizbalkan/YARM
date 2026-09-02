@@ -201,6 +201,32 @@ impl crate::runtime::SharedKernel {
     /// touches `ipc_state_lock`. Non-memory-backed objects (`Reply`/`Endpoint`/…)
     /// only clear the slot — the refcount phase is a no-op for them.
     #[cfg_attr(not(test), allow(dead_code))]
+    /// DIRECT3-CAP §2 — revoke ONE reply-authority CNode slot through the split seam and report
+    /// whether it was actually reclaimed.
+    ///
+    /// This is Phase A of `rollback_minted_cap_split` and nothing else: a `Reply` object holds
+    /// no memory reference, so that helper's rank-6 half is a no-op for it. It exists to return
+    /// the bool the attestation needs; the POLICY is still the one shared
+    /// `fast_revoke_reply_slot` the broad path reaches through
+    /// `KernelState::fast_revoke_reply_cap_in_cnode`. Rank 4 is acquired and released here
+    /// alone — no IPC rank-3 lock is held across it.
+    pub(crate) fn revoke_reply_authority_slot_split(
+        &self,
+        cnode: CNodeId,
+        cap: CapId,
+        object: CapObject,
+    ) -> bool {
+        self.with_capability_state_split_mut(|state| {
+            state
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| kernel_mut(&mut space.cspace).fast_revoke_reply_slot(cap, object))
+                .unwrap_or(false)
+        })
+    }
+
     pub(crate) fn rollback_minted_cap_split(
         &self,
         cnode: CNodeId,

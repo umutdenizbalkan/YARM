@@ -150,6 +150,81 @@ fn required_marker_chain_is_ordered_and_complete() {
     );
 }
 
+/// 199D-SD3 (§4) — the chain is graded against the WITNESSED transaction, not against
+/// identity-free literals that any other task's exit also satisfies.
+#[test]
+fn required_chain_is_scoped_to_the_witnessed_transaction() {
+    // The identity is resolved from the log, from two lines that must each be unique and
+    // must name the same reply record — a causal join, not an assumption.
+    assert!(
+        COMMON.contains("serverdies_resolve_identity"),
+        "the runner must resolve the witnessed transaction's identity"
+    );
+    for anchor in [
+        "expected exactly one captured reverse link",
+        "expected exactly one committed completion",
+        "completion names a different reply record than the captured link",
+        "could not resolve the witnessed identity",
+    ] {
+        assert!(
+            COMMON.contains(anchor),
+            "identity resolution must fail closed on: {anchor}"
+        );
+    }
+    // It is resolved BEFORE the chain is graded, and a boot that cannot name its own
+    // scenario stops rather than falling back to an unscoped chain.
+    let resolve = COMMON
+        .find("serverdies_resolve_identity \"$log\" || return")
+        .expect("resolution is wired into RUN_B and fails closed");
+    let ordered = COMMON
+        .find("RUN_B marker out of order")
+        .expect("the ordered chain");
+    assert!(resolve < ordered, "the identity is resolved before grading");
+
+    // The two markers that EVERY task exit emits carry the witnessed server's identity, so
+    // an unrelated earlier exit can neither satisfy nor fail the chain.
+    for scoped in [
+        "IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID}",
+        "EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG} tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}",
+    ] {
+        assert!(COMMON.contains(scoped), "unscoped shared marker: {scoped}");
+    }
+    // The completion half is scoped by the caller and the reply record's generation.
+    for scoped in [
+        "caller_tid=${SD_CALLER_TID} caller_asid=${SD_CALLER_ASID}",
+        "record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION}",
+    ] {
+        assert!(
+            COMMON.contains(scoped),
+            "unscoped completion marker: {scoped}"
+        );
+    }
+
+    // Scoping must not cost duplicate detection, from either side.
+    assert!(
+        COMMON.contains("scoped marker seen $dup times (expected 1)"),
+        "a genuine repeat of the scenario's own exit must still fail"
+    );
+    assert!(
+        COMMON.contains(
+            "IPC_SERVER_DEATH_TRANSITION_AUDIT vector=[1, 1, 1, 1, 1, 1, 1, 1, 1] \
+             result_before_enqueue=1 result=ok"
+        ),
+        "the transition audit must be required to PASS, not merely to be present"
+    );
+    for forbidden in [
+        "IPC_SERVER_DEATH_DUPLICATE_TRANSITION",
+        "IPC_SERVER_DEATH_TRANSITION_COUNT",
+        "IPC_SERVER_DEATH_SCOPE_CONFLICT",
+        "IPC_SERVER_DEATH_SCOPE_UNARMED",
+    ] {
+        assert!(
+            COMMON.contains(forbidden),
+            "the accounting hard-fails must be forbidden: {forbidden}"
+        );
+    }
+}
+
 #[test]
 fn forbidden_markers_cover_every_hard_fail() {
     for forbidden in [

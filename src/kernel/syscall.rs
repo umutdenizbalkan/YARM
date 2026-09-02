@@ -952,6 +952,7 @@ pub(crate) fn plan_blocked_waiter_ordinary_cap_snapshot(
     msg: &Message,
     prelude: &BlockedWaiterDeliveryPrelude,
     transfer: (CapObject, CapRights, u64, CapId, CNodeId),
+    reply_continuation: Option<crate::kernel::dispatch_post_work::ReplyTerminalContinuation>,
 ) -> crate::kernel::dispatch_post_work::BlockedWaiterOrdinaryCapDeliverySnapshot {
     let (object, rights, source_tid, source_cap, receiver_cnode) = transfer;
     crate::kernel::dispatch_post_work::BlockedWaiterOrdinaryCapDeliverySnapshot {
@@ -972,6 +973,10 @@ pub(crate) fn plan_blocked_waiter_ordinary_cap_snapshot(
         source_cap,
         endpoint_idx,
         wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
+        // DIRECT3-CAP-FINAL: carried through the ONE assembler, so the snapshot still has a
+        // single construction site. An IpcSend-origin producer owns no reply record and passes
+        // `None`; the cap-bearing reply lane passes the lifecycle it must not settle itself.
+        reply_continuation,
     }
 }
 
@@ -1100,6 +1105,8 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
         msg,
         &prelude,
         transfer,
+        // IpcSend/legacy origin: this producer owns no reply record and no terminal.
+        None,
     );
     // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
     // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` store.

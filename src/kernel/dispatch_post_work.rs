@@ -42,6 +42,41 @@ use super::ipc::{Message, ThreadId};
 use super::task::RecvAbiVariant;
 use super::vm::Asid;
 
+/// DIRECT3-CAP-FINAL — the reply lifecycle a cap-bearing direct reply still owes when its
+/// delivery is deferred to the drain.
+///
+/// A cap-bearing reply cannot settle its terminal under the syscall. Materializing the
+/// transferred capability and copying the caller's payload and metadata are the last steps
+/// that may still fail, and both run in the executor; committing the terminal, revoking the
+/// one-shot authority or releasing the record before them would make a failure unrecoverable
+/// — the reply would be spent with nothing delivered.
+///
+/// So the syscall claims the terminal and hands the REST of the lifecycle here, by value,
+/// exactly like every other snapshot in this module. Holding a [`TerminalOwner`] across the
+/// drain is what makes the deferral safe rather than merely late: the token is minted only by
+/// a winning `try_claim_*`, cannot be forged outside `terminal_ownership`, and carries the
+/// exact epoch — so no competitor can settle this record while the continuation is in flight,
+/// and a stale token cannot settle it afterwards.
+///
+/// Present only on a reply-origin delivery. An `IpcSend`-origin ordinary-cap delivery carries
+/// `None` and behaves exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplyTerminalContinuation {
+    /// The exact reply-record incarnation this reply owns.
+    pub(crate) record_index: usize,
+    pub(crate) record_generation: u64,
+    /// The exclusive terminal claim the syscall won and did NOT settle. The executor
+    /// commits it on success and releases it on a retryable failure.
+    pub(crate) terminal_owner: crate::kernel::terminal_ownership::TerminalOwner,
+    /// The one-shot reply authority (both CNode slots), snapshotted before any mutation so a
+    /// recycled record can never hand out another transaction's identities.
+    pub(crate) authority: crate::kernel::boot::ReplyAuthoritySlots,
+    /// The replying server incarnation — the reverse-link owner and revoke subject.
+    pub(crate) replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    /// The blocked caller incarnation this reply settles.
+    pub(crate) caller: crate::kernel::boot::ReceiverWaiterIdentity,
+}
+
 /// Encoded recv-v2 metadata length (mirrors `IPC_RECV_META_V2_ENCODED_LEN`).
 pub(crate) const DISPATCH_POST_WORK_META_LEN: usize = 40;
 
@@ -344,6 +379,13 @@ pub(crate) struct BlockedWaiterOrdinaryCapDeliverySnapshot {
     pub(crate) endpoint_idx: usize,
     /// Optional task to wake exactly once after delivery completes.
     pub(crate) wake_tid: Option<ThreadId>,
+    /// DIRECT3-CAP-FINAL — the reply lifecycle still owed, for a REPLY-origin delivery.
+    ///
+    /// `None` for the `IpcSend`-origin deliveries this snapshot has always carried: they own
+    /// no reply record and no terminal, so the executor's behaviour for them is unchanged.
+    /// `Some` makes the executor responsible for settling the reply, and it may only do so
+    /// AFTER the materialize and both user copies have succeeded.
+    pub(crate) reply_continuation: Option<ReplyTerminalContinuation>,
 }
 
 /// By-value snapshot of a reply-cap blocked-waiter delivery (Stage 188D).

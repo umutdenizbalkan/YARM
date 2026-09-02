@@ -93,27 +93,28 @@ pub(crate) struct DirectReplyFacts {
     pub(crate) endpoint_admitted: bool,
     /// Whether the reply carries a **transferred capability** in `SYSCALL_ARG_TRANSFER_CAP`.
     ///
-    /// The direct transaction has no notion of capability transfer: it copies the payload and
-    /// metadata into the caller's address space and wakes it, with nothing that mints, stashes
-    /// or installs a capability. Legacy `ipc_reply` validates the transfer cap and stashes a
-    /// transfer handle that the caller's `recv` then installs. So a cap-bearing reply serviced
-    /// off-lock would deliver the payload and **silently drop the capability** — the receiver
-    /// sees a successful reply with `transferred_cap=0` and no way to tell it was robbed.
-    pub(crate) transfer_cap_present: bool,
-    /// Whether this reply-record incarnation participates in an **armed terminal-ownership /
-    /// reply-timeout race**, read from the authoritative `reply_terminal_ownership` cell and
-    /// exact in record index AND generation
-    /// (`SharedKernel::reply_record_terminal_arbitrated_split_read`).
+    /// DIRECT3-CAP-FINAL: this no longer decides eligibility, it selects a LANE. A cap-bearing
+    /// reply to a committed-blocked caller is serviced by the capability lane, which stashes the
+    /// transfer envelope through the same owner the split IpcSend boundary uses and hands the
+    /// delivery to the blocked-waiter ordinary-cap producer/executor pair. The one shape that
+    /// lane does not claim is a cap-bearing reply to an UNBLOCKED caller, which would need the
+    /// queued receive-side materialization; the route declines that pre-mutation.
     ///
-    /// Such a reply is arbitrated: it must reserve the terminal before its caller copy and
-    /// commit it after, so that a concurrent timeout claimant provably loses. That lease —
-    /// `reserve_reply_win_before_copy` → delivery → `commit_reply_win_after_delivery`, with
-    /// `rollback_reply_win` on a retryable copy fault — lives only on the legacy reply path.
-    /// The direct transaction neither takes it nor leaves the record in the state the legacy
-    /// path expects, so servicing an arbitrated reply off-lock loses the race the caller was
-    /// promised: live, the reply reserved, rolled back, and the timeout's deferred path
-    /// completed instead.
-    pub(crate) terminal_arbitrated: bool,
+    /// It stays a fact rather than becoming a mode here because the mode also depends on the
+    /// caller's blocked state, which this pure classifier does not — and must not — read.
+    pub(crate) transfer_cap_present: bool,
+    /// 199D-TRC — how this reply-record incarnation's terminal-ownership cell stands relative
+    /// to THIS reply, read from the authoritative cell and compared field-by-field against
+    /// live record state (`SharedKernel::classify_direct_reply_terminal_split_read`).
+    ///
+    /// This used to be a boolean "is the terminal arbitrated at all", which declined the
+    /// direct reply whenever the cell was armed. That was survivable only while production
+    /// armed nothing. It is now a typed classification: an armed-and-available terminal
+    /// ADMITS the direct reply, which then claims it exclusively at the mutation point and
+    /// competes with timeout, peer death, caller exit and endpoint destruction through the one
+    /// arbitration owner. Only a competitor-owned, already-settled or identity-mismatched cell
+    /// refuses, and each refuses before any mutation.
+    pub(crate) terminal: DirectReplyTerminal,
 }
 
 /// The exhaustive NR6 eligibility verdict.
@@ -140,6 +141,99 @@ pub(crate) enum DirectRequestEligibility {
     EndpointNotAdmitted,
 }
 
+/// 199D-TRC — how the reply-record's terminal-ownership cell stands **relative to this exact
+/// direct reply**.
+///
+/// This replaces a boolean (`terminal_arbitrated`) that collapsed two entirely different
+/// situations into one answer: "this reply's own terminal is armed and still available" and
+/// "a competitor already owns or settled this terminal". While nothing was ever armed in
+/// production the collapse was invisible; once production reply waits began arming their
+/// terminals, the boolean started declining EVERY direct reply, and 41 NR7 transactions per
+/// x86_64 boot fell back onto the terminal broad dispatcher.
+///
+/// A direct reply must not decline merely because the terminal is armed — being armed is the
+/// normal state of a live reply wait, and the reply is one of the five legitimate claimants of
+/// that cell. Nor may it proceed without claiming: it competes through the same exclusive
+/// arbitration as timeout, peer death, caller exit and endpoint destruction.
+///
+/// Every variant is decided from the cell's own published identity compared field-by-field
+/// against live record state. Being armed is never by itself sufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectReplyTerminal {
+    /// No terminal has ever been armed for this record incarnation (the cell's epoch is 0).
+    ///
+    /// Nothing can be racing this reply: a timeout claimant reaches a record only through a
+    /// deadline token, and a token can only be reserved against an ARMED cell
+    /// (`arm_deadline_token_locked` requires `is_open()` plus an exact identity match). So an
+    /// unarmed record has no registration, no claimant and no arbitration to join. The reply
+    /// proceeds without a claim, exactly as it did before production arming existed.
+    Unarmed,
+    /// The cell is armed for THIS record incarnation, its published identity matches the live
+    /// record field-by-field, and it is still `Open` — this direct reply may attempt the claim.
+    ///
+    /// Advisory only. The cell may be claimed by a competitor between this read and the
+    /// attempt; that is precisely why the attempt is a compare-exchange and not a re-check.
+    AvailableExact,
+    /// The cell is armed for this record but a competitor holds a `Reserved` claim.
+    OwnedByCompetitor,
+    /// The cell is armed for this record and a terminal outcome has already been committed —
+    /// the one-shot is spent.
+    Settled,
+    /// The cell is armed, but its published identity does not name this record incarnation,
+    /// this replier, or this reply-endpoint incarnation. A stale or foreign identity never
+    /// authorizes a claim.
+    IdentityMismatch,
+}
+
+impl DirectReplyTerminal {
+    /// Whether a direct reply may proceed to the claim step at all.
+    ///
+    /// `Unarmed` proceeds with no claim to take; `AvailableExact` proceeds to attempt one.
+    /// Everything else is a pre-mutation refusal.
+    pub(crate) fn admits_direct_reply(self) -> bool {
+        matches!(self, Self::Unarmed | Self::AvailableExact)
+    }
+
+    /// Whether this reply must take an exclusive terminal claim before delivering.
+    pub(crate) fn requires_claim(self) -> bool {
+        matches!(self, Self::AvailableExact)
+    }
+}
+
+/// DIRECT3-QUEUECAP §3 — WHICH of the two production reply modes this reply is.
+///
+/// A reply has always had two delivery shapes, and the direct route only ever implemented one.
+/// Treating the other's signature — no claimable blocked-caller acknowledgement — as a generic
+/// "decline, let the broad path have it" is what left a permanent legacy population.
+///
+/// The mode is decided BEFORE any mutation, from live state, and each mode then commits through
+/// its own owner with no fallback between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectReplyMode {
+    /// The caller is committed-blocked on its reply endpoint: there is a claimable
+    /// acknowledgement and an exact armed terminal. The reply claims that terminal and delivers
+    /// straight into the caller's address space.
+    DeliverBlocked,
+    /// DIRECT3-CAP-FINAL — as [`Self::DeliverBlocked`], but the reply also transfers a
+    /// capability. The reply claims its terminal and then hands BOTH the delivery and the rest
+    /// of its lifecycle to the blocked-waiter ordinary-cap producer/executor pair, because
+    /// materializing the capability is the last step that can still fail and the terminal must
+    /// not settle before it.
+    DeliverBlockedWithCap,
+    /// No caller is blocked on the reply endpoint: no acknowledgement to claim, and no terminal
+    /// armed for the record. The reply is enqueued into the exact reply-endpoint incarnation
+    /// for a later receive. No terminal claim is required — and none is possible, because a
+    /// terminal is armed only by the commit that also publishes the acknowledgement.
+    QueueUnblocked,
+}
+
+impl DirectReplyMode {
+    /// True for the two lanes that deliver into a committed-blocked caller.
+    pub(crate) fn delivers_blocked(self) -> bool {
+        matches!(self, Self::DeliverBlocked | Self::DeliverBlockedWithCap)
+    }
+}
+
 /// The exhaustive NR7 eligibility verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectReplyEligibility {
@@ -161,10 +255,10 @@ pub(crate) enum DirectReplyEligibility {
     /// deliver. The legacy path owns it; declining here is what stops the capability from
     /// being silently dropped.
     TransferCapUnsupported,
-    /// The reply participates in an armed terminal-ownership / reply-timeout race. The
-    /// terminal lease that makes the reply provably beat a concurrent timeout lives only on
-    /// the legacy path, so this reply is the legacy path's to service.
-    TerminalArbitrationUnsupported,
+    /// The reply-record's terminal cell cannot be claimed by this reply: a competitor owns it,
+    /// it is already settled, or its published identity does not name this exact reply. The
+    /// carried classification says which — a decline is never just "arbitrated".
+    TerminalUnavailable(DirectReplyTerminal),
     /// The endpoint is not admitted to the off-lock path (non-x86 oracle confinement).
     EndpointNotAdmitted,
 }
@@ -213,7 +307,15 @@ impl DirectReplyEligibility {
     /// of the legacy reply population is arbitrated — which is the size of the work that
     /// porting the terminal lease into the direct transaction would unlock.
     pub(crate) fn is_terminal_arbitration_decline(self) -> bool {
-        matches!(self, Self::TerminalArbitrationUnsupported)
+        matches!(self, Self::TerminalUnavailable(_))
+    }
+
+    /// The terminal classification behind a terminal decline, for exact accounting.
+    pub(crate) fn terminal_decline(self) -> Option<DirectReplyTerminal> {
+        match self {
+            Self::TerminalUnavailable(t) => Some(t),
+            _ => None,
+        }
     }
 }
 
@@ -287,22 +389,32 @@ pub(crate) fn classify_direct_reply_eligibility(
     if !facts.requester_available {
         return DirectReplyEligibility::RequesterUnavailable;
     }
-    // The direct transaction copies payload + metadata and wakes the caller. It mints,
-    // stashes and installs nothing, so it cannot carry a capability — decline before any
-    // mutation and let the legacy path do the transfer.
-    if facts.transfer_cap_present {
-        return DirectReplyEligibility::TransferCapUnsupported;
-    }
+    // DIRECT3-CAP-FINAL: a cap-bearing reply is no longer declined here.
+    //
+    // The direct route now has a capability lane: it stashes the transfer envelope through the
+    // same owner the split IpcSend boundary uses, produces a blocked-waiter ordinary-cap
+    // delivery, and carries its reply lifecycle to the executor as a typed continuation. So
+    // "this reply carries a capability" is a MODE question — which lane services it — not an
+    // eligibility question, and it is asked at the mode selection where the caller's blocked
+    // state is known. `TransferCapUnsupported` is still produced there, for the one shape this
+    // lane deliberately does not claim: a cap-bearing reply to an UNBLOCKED caller, which
+    // would need the queued receive-side materialization and is not witnessed in production.
     if let Err(err) = facts.reply_object {
         return DirectReplyEligibility::ReplyCapUnresolved(err);
     }
-    // The reply record's identity is now known, so the arbitration fact applies. It is checked
-    // BEFORE eligibility can be granted, and therefore before the acknowledgement claim, the
-    // record reservation or consumption, the payload/meta copy, any waiter mutation or wake,
-    // the reverse-link close, and any direct transaction call — every one of which happens
-    // only on the `Eligible` arm at the call site.
-    if facts.terminal_arbitrated {
-        return DirectReplyEligibility::TerminalArbitrationUnsupported;
+    // The reply record's identity is now known, so the terminal classification applies. It is
+    // checked BEFORE eligibility can be granted, and therefore before the acknowledgement
+    // claim, the record reservation or consumption, the payload/meta copy, any waiter mutation
+    // or wake, the reverse-link close, and any direct transaction call — every one of which
+    // happens only on the `Eligible` arm at the call site.
+    //
+    // 199D-TRC: an ARMED-and-available terminal is admitted, not refused. Being armed is the
+    // normal state of a live reply wait and the reply is one of the cell's five legitimate
+    // claimants; the exclusive claim happens at the mutation point, not here. Only a cell a
+    // competitor owns, one already settled, or one whose published identity does not name this
+    // exact reply refuses — and each refuses pre-mutation.
+    if !facts.terminal.admits_direct_reply() {
+        return DirectReplyEligibility::TerminalUnavailable(facts.terminal);
     }
     let (index, generation) = match facts.reply_endpoint {
         Some(pair) => pair,
@@ -342,7 +454,7 @@ mod tests {
             reply_endpoint: Some((4, 9)),
             endpoint_admitted: true,
             transfer_cap_present: false,
-            terminal_arbitrated: false,
+            terminal: DirectReplyTerminal::AvailableExact,
         }
     }
 
@@ -573,18 +685,34 @@ mod tests {
     /// direct transaction has no way to deliver the capability and would otherwise deliver the
     /// payload and drop it silently.
     #[test]
-    fn a_cap_bearing_reply_is_ineligible() {
+    fn a_cap_bearing_reply_is_eligible_and_its_lane_is_a_mode_question() {
+        // DIRECT3-CAP-FINAL: carrying a capability no longer ends a reply's direct
+        // eligibility. The direct route has a capability lane, so "which lane services this"
+        // is decided at mode selection — where the caller's blocked state is known — and not
+        // here, where it is not. Eligibility must therefore be INDIFFERENT to the fact.
         let mut facts = reply_facts();
         facts.transfer_cap_present = true;
-        let verdict = classify_direct_reply_eligibility(&facts);
-        assert_eq!(verdict, DirectReplyEligibility::TransferCapUnsupported);
-        assert!(verdict.is_transfer_cap_decline());
+        let cap_bearing = classify_direct_reply_eligibility(&facts);
+        facts.transfer_cap_present = false;
+        let plain = classify_direct_reply_eligibility(&facts);
         assert_eq!(
-            verdict.endpoint(),
-            None,
-            "a decline services nothing: no endpoint to claim an acknowledgement for"
+            cap_bearing, plain,
+            "the transfer-cap fact must not change the eligibility verdict"
         );
-        // And it is the ONLY transfer-cap decline.
+        assert_eq!(
+            cap_bearing,
+            DirectReplyEligibility::Eligible {
+                endpoint_index: 4,
+                endpoint_generation: 9,
+            }
+        );
+        assert!(
+            cap_bearing.endpoint().is_some(),
+            "an eligible cap-bearing reply names the endpoint incarnation its lane services"
+        );
+        // The variant still exists for the one shape the lane deliberately does not claim,
+        // but nothing in the classifier produces it any more.
+        assert!(!cap_bearing.is_transfer_cap_decline());
         for other in [
             DirectReplyEligibility::PayloadTooLong,
             DirectReplyEligibility::RequesterUnavailable,
@@ -598,6 +726,28 @@ mod tests {
         ] {
             assert!(!other.is_transfer_cap_decline(), "{other:?}");
         }
+        // Scoped to the classifier's own body: asserting over the whole file would match
+        // this very assertion's literal and pass for the wrong reason.
+        let src = include_str!("direct_eligibility.rs");
+        let body = src
+            .split("pub(crate) fn classify_direct_reply_eligibility(")
+            .nth(1)
+            .expect("the reply classifier");
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        // The RETURN, not the name: the classifier still documents the variant it no longer
+        // produces, and matching the bare name would fail on that comment.
+        assert!(
+            !body.contains("return DirectReplyEligibility::TransferCapUnsupported"),
+            "the blanket cap-bearing decline must be gone from the classifier body"
+        );
+        assert!(
+            !body.contains("if facts.transfer_cap_present {"),
+            "and the classifier must not branch on the transfer-cap fact at all"
+        );
+        assert!(
+            body.contains("facts.terminal"),
+            "and every other decline the classifier owns must still be there"
+        );
     }
 
     /// A reply with no transferred capability stays direct-eligible — the check narrows the
@@ -620,24 +770,32 @@ mod tests {
     /// no matter what else is true about it. This is what makes "cannot enter the direct
     /// transaction" a property of the ordering rather than of the call site's care.
     #[test]
-    fn a_cap_bearing_reply_declines_before_any_capability_resolution() {
+    fn a_cap_bearing_reply_is_still_judged_on_every_other_fact() {
+        // Admitting cap-bearing replies must widen NOTHING else: every decline that applied
+        // to a plain reply still applies, and each is still reported as itself rather than
+        // being masked by the capability.
         let mut facts = reply_facts();
         facts.transfer_cap_present = true;
-        // Perfectly valid reply object, live endpoint, admitted: still declined.
-        assert_eq!(
-            classify_direct_reply_eligibility(&facts),
-            DirectReplyEligibility::TransferCapUnsupported
-        );
-        // Broken reply object: the transfer-cap decline is still what is reported, so the
-        // classifier never even inspects the capability.
         facts.reply_object = Err(KernelError::InvalidCapability);
-        facts.reply_endpoint = None;
-        facts.endpoint_admitted = false;
         assert_eq!(
             classify_direct_reply_eligibility(&facts),
-            DirectReplyEligibility::TransferCapUnsupported
+            DirectReplyEligibility::ReplyCapUnresolved(KernelError::InvalidCapability),
+            "an unresolvable reply capability still declines, capability or not"
         );
-        // Only the two checks that need no capability at all outrank it.
+        let mut gone = reply_facts();
+        gone.transfer_cap_present = true;
+        gone.reply_endpoint = None;
+        assert_eq!(
+            classify_direct_reply_eligibility(&gone),
+            DirectReplyEligibility::ReplyEndpointGone
+        );
+        let mut unadmitted = reply_facts();
+        unadmitted.transfer_cap_present = true;
+        unadmitted.endpoint_admitted = false;
+        assert_eq!(
+            classify_direct_reply_eligibility(&unadmitted),
+            DirectReplyEligibility::EndpointNotAdmitted
+        );
         let mut too_long = reply_facts();
         too_long.transfer_cap_present = true;
         too_long.payload_len = IPC_DIRECT_PAYLOAD_MAX + 1;
@@ -651,6 +809,40 @@ mod tests {
         assert_eq!(
             classify_direct_reply_eligibility(&no_requester),
             DirectReplyEligibility::RequesterUnavailable
+        );
+        // And a competitor-owned terminal still refuses a cap-bearing reply exactly as it
+        // refuses a plain one: the capability lane claims through the same arbitration.
+        let mut owned = reply_facts();
+        owned.transfer_cap_present = true;
+        owned.terminal = DirectReplyTerminal::OwnedByCompetitor;
+        assert_eq!(
+            classify_direct_reply_eligibility(&owned),
+            DirectReplyEligibility::TerminalUnavailable(DirectReplyTerminal::OwnedByCompetitor)
+        );
+    }
+
+    /// THE shape the capability lane deliberately does not claim: a cap-bearing reply to a
+    /// caller that is NOT blocked. It would have to ride its transfer envelope in the queued
+    /// message and be materialized by the receive-side owner on a later receive — a class
+    /// production does not witness. The route must select neither blocked lane nor the queued
+    /// lane for it, so it declines pre-mutation and the legacy path owns it.
+    #[test]
+    fn a_cap_bearing_reply_to_an_unblocked_caller_is_not_claimed_by_either_lane() {
+        let route = include_str!("syscall_split.rs");
+        let body = route
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 route");
+        let mode = body.split("let mode = if").nth(1).expect("mode selection");
+        let mode = &mode[..mode.find("};").expect("mode selection ends")];
+        assert!(
+            mode.contains("DirectReplyMode::DeliverBlockedWithCap"),
+            "a blocked caller + a capability selects the capability lane"
+        );
+        assert!(
+            mode.contains("&& !facts.transfer_cap_present"),
+            "the queued lane must refuse a cap-bearing reply rather than enqueue a message \
+             carrying a capability nothing would materialize"
         );
     }
 
@@ -697,19 +889,44 @@ mod tests {
 
     // ── NR7 terminal-arbitration safety ────────────────────────────────────────────────
 
-    /// **The headline rule.** A reply whose record is arbitrated by an armed
-    /// terminal-ownership / reply-timeout race is ineligible, and declines for that reason
-    /// specifically. The terminal lease that makes such a reply provably beat a concurrent
-    /// timeout lives only on the legacy path.
+    /// **The headline rule, corrected (199D-TRC).** A reply is ineligible when the terminal
+    /// cannot be claimed BY IT — a competitor owns it, it is already settled, or its published
+    /// identity names something else. It is NOT ineligible merely for being armed: armed is the
+    /// normal state of a live reply wait, and treating it as a decline retired 41 direct NR7
+    /// transactions per x86_64 boot onto the broad dispatcher.
     #[test]
-    fn a_terminal_arbitrated_reply_is_ineligible() {
+    fn a_terminal_this_reply_cannot_claim_is_ineligible() {
+        for class in [
+            DirectReplyTerminal::OwnedByCompetitor,
+            DirectReplyTerminal::Settled,
+            DirectReplyTerminal::IdentityMismatch,
+        ] {
+            let mut facts = reply_facts();
+            facts.terminal = class;
+            let verdict = classify_direct_reply_eligibility(&facts);
+            assert_eq!(verdict, DirectReplyEligibility::TerminalUnavailable(class));
+            assert_eq!(verdict.terminal_decline(), Some(class));
+            assert!(verdict.is_terminal_arbitration_decline());
+            assert_eq!(verdict.endpoint(), None, "{class:?} services nothing");
+        }
+        // The two ADMITTING classes reach the transaction, which is the regression this fixes.
+        for class in [
+            DirectReplyTerminal::Unarmed,
+            DirectReplyTerminal::AvailableExact,
+        ] {
+            let mut facts = reply_facts();
+            facts.terminal = class;
+            assert!(
+                matches!(
+                    classify_direct_reply_eligibility(&facts),
+                    DirectReplyEligibility::Eligible { .. }
+                ),
+                "{class:?} must admit the direct reply"
+            );
+        }
         let mut facts = reply_facts();
-        facts.terminal_arbitrated = true;
+        facts.terminal = DirectReplyTerminal::OwnedByCompetitor;
         let verdict = classify_direct_reply_eligibility(&facts);
-        assert_eq!(
-            verdict,
-            DirectReplyEligibility::TerminalArbitrationUnsupported
-        );
         assert!(verdict.is_terminal_arbitration_decline());
         assert_eq!(
             verdict.endpoint(),
@@ -733,12 +950,11 @@ mod tests {
         }
     }
 
-    /// An ORDINARY unarmed reply stays direct-eligible — the check narrows the direct path to
-    /// exactly the arbitrated population, it does not close it.
+    /// An ORDINARY unarmed reply stays direct-eligible.
     #[test]
     fn an_unarmed_reply_remains_eligible() {
-        let facts = reply_facts();
-        assert!(!facts.terminal_arbitrated);
+        let mut facts = reply_facts();
+        facts.terminal = DirectReplyTerminal::Unarmed;
         assert_eq!(
             classify_direct_reply_eligibility(&facts),
             DirectReplyEligibility::Eligible {
@@ -754,10 +970,10 @@ mod tests {
     #[test]
     fn an_arbitrated_reply_declines_before_the_endpoint_is_even_resolved() {
         let mut facts = reply_facts();
-        facts.terminal_arbitrated = true;
+        facts.terminal = DirectReplyTerminal::OwnedByCompetitor;
         assert_eq!(
             classify_direct_reply_eligibility(&facts),
-            DirectReplyEligibility::TerminalArbitrationUnsupported
+            DirectReplyEligibility::TerminalUnavailable(DirectReplyTerminal::OwnedByCompetitor)
         );
         // Even with the endpoint gone and the endpoint unadmitted, arbitration is what is
         // reported — so the classifier never inspects them for an arbitrated reply.
@@ -765,19 +981,19 @@ mod tests {
         facts.endpoint_admitted = false;
         assert_eq!(
             classify_direct_reply_eligibility(&facts),
-            DirectReplyEligibility::TerminalArbitrationUnsupported
+            DirectReplyEligibility::TerminalUnavailable(DirectReplyTerminal::OwnedByCompetitor)
         );
         // Only the checks that need no record identity at all outrank it: an unresolvable
         // reply object has no record for the arbitration fact to be about.
         let mut unresolved = reply_facts();
-        unresolved.terminal_arbitrated = true;
+        unresolved.terminal = DirectReplyTerminal::OwnedByCompetitor;
         unresolved.reply_object = Err(KernelError::InvalidCapability);
         assert_eq!(
             classify_direct_reply_eligibility(&unresolved),
             DirectReplyEligibility::ReplyCapUnresolved(KernelError::InvalidCapability)
         );
         let mut too_long = reply_facts();
-        too_long.terminal_arbitrated = true;
+        too_long.terminal = DirectReplyTerminal::OwnedByCompetitor;
         too_long.payload_len = IPC_DIRECT_PAYLOAD_MAX + 1;
         assert_eq!(
             classify_direct_reply_eligibility(&too_long),
@@ -813,7 +1029,8 @@ mod tests {
     /// returns the real result.
     #[test]
     fn the_arbitration_decline_carries_no_error_and_no_endpoint() {
-        let verdict = DirectReplyEligibility::TerminalArbitrationUnsupported;
+        let verdict =
+            DirectReplyEligibility::TerminalUnavailable(DirectReplyTerminal::OwnedByCompetitor);
         assert_eq!(verdict.endpoint(), None);
         assert!(!matches!(
             verdict,

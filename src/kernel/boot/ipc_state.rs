@@ -1101,6 +1101,732 @@ pub(crate) enum BlockingSendProducerOutcome {
 /// off-lock `SharedKernel::publish_recv_waiter_split` runs the identical body under
 /// `with_ipc_split_mut`. Last-receiver-wins replacement is PRESERVED deliberately — whether YARM
 /// should keep replacement at all is WA3C2's question, and this must not answer it by accident.
+/// 199E-DL — the typed outcome of arming a committed reply wait.
+///
+/// Distinguishes the three cases the caller must treat differently, so "not a reply wait" can
+/// never be confused with "a reply wait whose deadline could not be reserved".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyWaitArm {
+    /// Not a reply/call wait at all — an ordinary receive, which owns no reply record. Nothing
+    /// was armed and nothing is owed.
+    NotAReplyWait,
+    /// Armed. `token` is `Some` only for a finite wait that reserved its deadline; the caller
+    /// still owes that token a rank-2 publication.
+    Armed {
+        identity: crate::kernel::terminal_ownership::TerminalIdentity,
+        token: Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
+    },
+    /// A finite reply wait whose terminal armed but whose deadline could not be reserved. The
+    /// caller must unwind the block rather than park with a deadline it cannot own.
+    DeadlineRefused {
+        identity: crate::kernel::terminal_ownership::TerminalIdentity,
+    },
+}
+
+/// 199E-DL — reserve one exact generation-bearing deadline token. Rank 3 only.
+///
+/// This is THE reservation policy; `KernelState::arm_deadline_token` is a thin broad-lock
+/// adapter over it, so the split route and the broad route cannot drift.
+///
+/// A reservation is NOT yet claimable. The timeout collector reaches a token only through the
+/// caller's TCB — it scans TCBs, requires `ipc_timeout_deadline`, and then follows
+/// `tcb.reply_timeout_token` — and every other touch of `reply_deadline_tokens` is keyed by a
+/// handle already read from a TCB. There is no free scan of the store. So the interval between
+/// this reservation and the TCB publication is one in which nothing can find the token, which is
+/// exactly the window a `Pending` state would otherwise have to close.
+pub(crate) fn arm_deadline_token_locked(
+    ipc: &mut IpcSubsystem,
+    record_index: usize,
+    record_generation: u64,
+    token_generation: u64,
+    terminal_epoch: u64,
+    terminal_identity: crate::kernel::terminal_ownership::TerminalIdentity,
+) -> Result<
+    crate::kernel::deadline_token::DeadlineTokenHandle,
+    crate::kernel::deadline_token::DeadlineArmError,
+> {
+    use crate::kernel::deadline_token::{DeadlineArmError, DeadlineTokenIdentity};
+    // Part 5 — validate the CURRENT terminal identity/epoch (Open, exact).
+    let terminal_ok = ipc
+        .reply_terminal_ownership
+        .get(record_index)
+        .is_some_and(|cell| {
+            cell.is_open()
+                && *cell.identity() == terminal_identity
+                && cell.current_epoch() == terminal_epoch
+                && terminal_identity.reply_record_index == record_index
+                && terminal_identity.reply_record_generation == record_generation
+        });
+    if !terminal_ok {
+        return Err(DeadlineArmError::TerminalNotOpen);
+    }
+    // One active registration per reply record (no silent overwrite).
+    let already = ipc.reply_deadline_tokens.iter().any(|t| {
+        (t.is_armed() || t.is_fire_claimed())
+            && t.identity().terminal_identity.reply_record_index == record_index
+            && t.identity().terminal_identity.reply_record_generation == record_generation
+    });
+    if already {
+        return Err(DeadlineArmError::AlreadyArmed);
+    }
+    // Reserve a free slot; bounded failure when the store is full.
+    let free = ipc.reply_deadline_tokens.iter().position(|t| t.is_free());
+    let Some(slot) = free else {
+        return Err(DeadlineArmError::StoreFull);
+    };
+    let identity = DeadlineTokenIdentity {
+        token_index: slot,
+        token_generation,
+        terminal_epoch,
+        terminal_identity,
+    };
+    ipc.reply_deadline_tokens[slot]
+        .arm(identity)
+        .ok_or(DeadlineArmError::AlreadyArmed)
+}
+
+/// 199E-ARM — arm the reply-terminal ownership cell for a COMMITTED blocking receive.
+///
+/// This is THE arming policy, and it is rank 3 only: everything it reads and writes lives in
+/// `IpcSubsystem`. It is called from inside the same rank-3 scope that publishes the endpoint
+/// waiter, so the waiter and its terminal owner become visible together and there is no window
+/// in which a committed reply wait exists with no owner to claim.
+///
+/// ## Why this had to move
+///
+/// `arm_reply_terminal` had exactly one production caller, `arm_production_reply_deadline`, and
+/// that had exactly one call site: the IN-LOCK `block_current_on_receive_with_deadline`. Blocking
+/// receives are serviced by the pre-lock split route, which publishes its own waiter and armed
+/// nothing — so in production NOTHING was ever armed. Server death then could not settle: the
+/// post-lock drain revalidates its work item against the ARMED identity and found the cell at its
+/// default `{tid 0, asid 0, generation 0}`, reported
+/// `IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY armed_tid=0 armed_asid=0`, took
+/// `outcome=stale_identity`, and the blocked caller was never woken with `ServerGone`.
+///
+/// ## Exactly which waits arm
+///
+/// Only a genuine reply/call wait: a live reply record whose reservation is `Available` must
+/// already name this exact `{caller_tid, caller_asid}` at this exact reply endpoint. An ordinary
+/// receive owns no such record and is untouched, so NR 2 / NR 5 timeout semantics are unchanged.
+/// A finite deadline is NOT required — the cell is the single authority for reply, timeout, peer
+/// death, caller exit and endpoint destruction, and only one of those five is a timeout.
+///
+/// ## Duplicate arming
+///
+/// An identity already armed EXACTLY is left alone rather than re-armed: `arm` bumps the cell's
+/// epoch, which would invalidate a deadline token keyed on the old epoch. A different identity is
+/// a different record incarnation and is armed normally.
+///
+/// Returns a typed [`ReplyWaitArm`].
+pub(crate) fn arm_reply_terminal_for_committed_block_locked(
+    ipc: &mut IpcSubsystem,
+    caller: ReceiverWaiterIdentity,
+    reply_eidx: usize,
+    wait_generation: u64,
+    has_finite_deadline: bool,
+) -> ReplyWaitArm {
+    // (1) The reply record this caller is waiting on, by EXACT incarnation and reply endpoint.
+    let mut found = None;
+    for idx in 0..super::MAX_REPLY_CAPS {
+        let Some(Some(record)) = ipc.reply_caps.get(idx) else {
+            continue;
+        };
+        if record.reservation != super::ReplyRecordReservation::Available {
+            continue;
+        }
+        if record.caller_tid != caller.tid || record.caller_asid != caller.asid {
+            continue;
+        }
+        if let CapObject::Endpoint { index, .. } = record.reply_endpoint
+            && index == reply_eidx
+        {
+            found = Some((idx, ipc.reply_cap_generations[idx], *record));
+            break;
+        }
+    }
+    let Some((record_index, record_generation, record)) = found else {
+        return ReplyWaitArm::NotAReplyWait;
+    };
+
+    // (2) The generation-bearing identity, built from the live record exactly as
+    // `reply_terminal_identity` builds it. The deadline-token generation is `Some` only for a
+    // finite wait, so an unregistered deadline is never implied.
+    let CapObject::Endpoint {
+        index: reply_endpoint_index,
+        generation: reply_endpoint_generation,
+    } = record.reply_endpoint
+    else {
+        return ReplyWaitArm::NotAReplyWait;
+    };
+    let identity = crate::kernel::terminal_ownership::TerminalIdentity {
+        reply_record_index: record_index,
+        reply_record_generation: record_generation,
+        caller_tid: record.caller_tid,
+        caller_asid: record.caller_asid,
+        replier_tid: record.responder_tid.unwrap_or(ThreadId(0)),
+        replier_asid: record.replier_asid.unwrap_or(Asid(0)),
+        reply_endpoint_index,
+        reply_endpoint_generation,
+        blocked_recv_generation: wait_generation,
+        deadline_token_generation: has_finite_deadline.then_some(wait_generation),
+    };
+
+    // (3) Arm, idempotently.
+    let Some(cell) = ipc.reply_terminal_ownership.get_mut(record_index) else {
+        return ReplyWaitArm::NotAReplyWait;
+    };
+    if *cell.identity() != identity {
+        cell.arm(identity);
+    }
+    let terminal_epoch = cell.current_epoch();
+
+    // (4) 199E-DL — for a FINITE wait, reserve the deadline token in this same rank-3 scope, so
+    // the terminal cell and its registration are decided together and cannot disagree. The token
+    // is not claimable yet: the collector reaches a token only through the caller's TCB, which
+    // the caller publishes next under rank 2. A refused reservation leaves the terminal armed and
+    // is reported to the caller, which unwinds the whole block.
+    let token = if has_finite_deadline {
+        match arm_deadline_token_locked(
+            ipc,
+            record_index,
+            record_generation,
+            wait_generation,
+            terminal_epoch,
+            identity,
+        ) {
+            Ok(handle) => Some(handle),
+            Err(_) => return ReplyWaitArm::DeadlineRefused { identity },
+        }
+    } else {
+        None
+    };
+    ReplyWaitArm::Armed { identity, token }
+}
+
+/// 199D-TRC — the ONE terminal-arbitration policy for a direct (NR7) reply, rank 3 only.
+///
+/// ## Why this exists
+///
+/// Production reply waits now arm their terminal cell (199E-ARM). Before that, nothing in a
+/// production boot was ever armed, so the direct reply route could ask a boolean — "is this
+/// record's terminal arbitrated at all?" — and treat any `true` as "the legacy path owns this".
+/// Once arming became live that boolean answered `true` for every reply, and 41 direct NR7
+/// transactions per x86_64 boot silently fell back onto the terminal broad dispatcher.
+///
+/// Being armed is the NORMAL state of a live reply wait, and the reply is one of the cell's five
+/// legitimate claimants — alongside timeout, peer death, caller exit and endpoint destruction.
+/// So a direct reply neither declines because the cell is armed nor proceeds without claiming
+/// it: it competes, exclusively, through the same `TerminalCell` every other claimant uses.
+///
+/// ## Exactness
+///
+/// The cell's published identity is compared field-by-field against the LIVE record — the same
+/// construction `arm_reply_terminal_for_committed_block_locked` used to build it — plus the
+/// reply-endpoint incarnation this transaction is actually servicing. `blocked_recv_generation`
+/// and `deadline_token_generation` are the cell's own and are carried forward into the claim
+/// rather than re-derived, so a claim can never be authorized by a reconstructed approximation.
+/// An armed cell is never sufficient on its own.
+/// 199A2D-RR — rank 3: PREPARE a vacant reply-record slot for reuse, then allocate it.
+///
+/// The single owner of reply-record allocation, driven by both the broad
+/// `KernelState::reserve_direct_reply_record` and the split
+/// `SharedKernel::reserve_direct_reply_record_split`. One implementation, two owners: the
+/// terminal-cell preparation below cannot be present on one route and missing on the other.
+///
+/// Since the reply-record slot became physically reclaimable, an allocation is usually a
+/// REUSE. The slot's terminal cell still names the previous incarnation, so preparing it is
+/// not optional — without it every recycled slot's next occupant is an identity mismatch
+/// forever, and the queued (unblocked-caller) reply mode, which requires an unarmed
+/// terminal, can never be selected again.
+///
+/// The preparation happens ATOMICALLY with the allocation: same rank-3 claim, before the new
+/// record is installed, so no observer ever sees a live record whose cell still names its
+/// predecessor. A cell that refuses to vacate still holds a live claimant or an unsettled
+/// arming; that slot is SKIPPED rather than taken, because recycling it would discard a
+/// claim or deadline that may still legitimately win.
+pub(crate) fn reserve_direct_reply_record_locked(
+    ipc: &mut IpcSubsystem,
+    caller: ReceiverWaiterIdentity,
+    replier: ReceiverWaiterIdentity,
+    reply_endpoint: CapObject,
+) -> Result<(usize, u64), KernelError> {
+    for idx in 0..super::MAX_REPLY_CAPS {
+        if ipc.reply_caps[idx].is_some() {
+            continue;
+        }
+        if !ipc
+            .reply_terminal_ownership
+            .get_mut(idx)
+            .is_some_and(|cell| cell.vacate_for_reuse())
+        {
+            continue;
+        }
+        let mut generation = ipc.reply_cap_generations[idx].wrapping_add(1);
+        if generation == 0 {
+            generation = 1;
+        }
+        ipc.reply_cap_generations[idx] = generation;
+        ipc.reply_caps[idx] = Some(ReplyCapRecord {
+            reservation: super::ReplyRecordReservation::Reserved,
+            caller_tid: caller.tid,
+            caller_asid: caller.asid,
+            reply_endpoint,
+            responder_tid: Some(replier.tid),
+            replier_asid: Some(replier.asid),
+            caller_cap_id: CapId(0),
+            waiter_cap_id: None,
+        });
+        return Ok((idx, generation));
+    }
+    Err(KernelError::CapabilityFull)
+}
+
+pub(crate) fn classify_direct_reply_terminal_locked(
+    ipc: &IpcSubsystem,
+    record_index: usize,
+    record_generation: u64,
+    replier: ReceiverWaiterIdentity,
+    reply_endpoint_index: usize,
+    reply_endpoint_generation: u64,
+) -> crate::kernel::direct_eligibility::DirectReplyTerminal {
+    use crate::kernel::direct_eligibility::DirectReplyTerminal as T;
+    // The record incarnation must be current: a recycled slot is a different reply entirely.
+    if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+        return T::IdentityMismatch;
+    }
+    let Some(cell) = ipc.reply_terminal_ownership.get(record_index) else {
+        return T::IdentityMismatch;
+    };
+    // A cell that names NO record is unarmed: never armed for any incarnation (epoch 0), or
+    // explicitly vacated by the allocation owner when this slot was recycled. Nothing can be
+    // racing this reply in either case, because a timeout, peer-death or caller-exit claimant
+    // reaches a record only through a token minted against an armed, open cell NAMING it.
+    //
+    // This is deliberately not `current_epoch() == 0`: vacating keeps the epoch monotonic on
+    // purpose, so that stale tokens fail on the epoch. Nor does it weaken the mismatch arm —
+    // a cell naming a DIFFERENT record still falls through to the exact comparison below and
+    // is still reported as `IdentityMismatch`.
+    if cell.names_no_record() {
+        return T::Unarmed;
+    }
+    let Some(Some(record)) = ipc.reply_caps.get(record_index) else {
+        return T::IdentityMismatch;
+    };
+    let CapObject::Endpoint {
+        index: bound_eidx,
+        generation: bound_egen,
+    } = record.reply_endpoint
+    else {
+        return T::IdentityMismatch;
+    };
+    // The transaction must be servicing the very endpoint incarnation the record binds.
+    if bound_eidx != reply_endpoint_index || bound_egen != reply_endpoint_generation {
+        return T::IdentityMismatch;
+    }
+    let id = cell.identity();
+    // DIRECT3 §1 — the replier fields of an armed identity are a SNAPSHOT of the record as it
+    // stood when the caller blocked, not a live view of it. For a QUEUED request the record is
+    // still unbound at that moment (the message was buffered before any receiver existed), so
+    // the arm records the unbound sentinel `{tid 0, asid 0}`; the responder is bound later, when
+    // the receiver materializes the one-shot cap. That `None → Some` step is the record's ONE
+    // legitimate identity advance, and comparing a snapshot taken before it against the record
+    // after it would reject the very reply the binding exists to enable.
+    //
+    // It is admitted here and nowhere else, and it weakens no authorization: whether this
+    // replier may claim at all is decided independently below, against the record's CURRENT
+    // binding. Any other difference — a different bound replier, a different caller, a different
+    // endpoint incarnation — is still an exact mismatch.
+    let replier_snapshot_ok = match (record.responder_tid, record.replier_asid) {
+        (Some(tid), Some(asid)) => {
+            (id.replier_tid == tid && id.replier_asid == asid)
+                || (id.replier_tid == ThreadId(0) && id.replier_asid == Asid(0))
+        }
+        _ => id.replier_tid == ThreadId(0) && id.replier_asid == Asid(0),
+    };
+    let exact = id.reply_record_index == record_index
+        && id.reply_record_generation == record_generation
+        && id.caller_tid == record.caller_tid
+        && id.caller_asid == record.caller_asid
+        && replier_snapshot_ok
+        && id.reply_endpoint_index == bound_eidx
+        && id.reply_endpoint_generation == bound_egen;
+    if !exact {
+        return T::IdentityMismatch;
+    }
+    // The record must additionally authorize THIS replier where it binds one. An unbound
+    // record is authorized by the one-shot capability the caller already resolved, which is
+    // why an absent binding is not a mismatch.
+    if let Some(bound) = record.responder_tid
+        && bound != replier.tid
+    {
+        return T::IdentityMismatch;
+    }
+    if cell.is_open() {
+        T::AvailableExact
+    } else if cell.committed_winner().is_some() {
+        T::Settled
+    } else if cell.reserved_claimant().is_some() {
+        T::OwnedByCompetitor
+    } else {
+        // No other phase exists; fail closed rather than assume claimability.
+        T::Settled
+    }
+}
+
+/// The outcome of a direct reply's exclusive terminal claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectReplyTerminalClaim {
+    /// No terminal was armed for this record: there is nothing to claim and nothing racing.
+    NotArmed,
+    /// This reply now holds the exclusive `Reserved(Reply)` claim at the cell's exact epoch.
+    Won(crate::kernel::terminal_ownership::TerminalOwner),
+    /// The claim was refused. The classification says why, re-read after the attempt so a
+    /// competitor that won between the advisory read and the compare-exchange is reported as
+    /// what it is rather than as the state we hoped for.
+    Lost(crate::kernel::direct_eligibility::DirectReplyTerminal),
+}
+
+/// 199D-TRC — classify and CLAIM in ONE rank-3 acquisition.
+///
+/// The preflight classification is advisory by construction: the cell can change phase between
+/// the read and the attempt. That is exactly why the attempt is a compare-exchange on the
+/// published `{epoch, phase}` word and not a re-check — a competitor that wins in between makes
+/// this CAS fail, and a losing claimant mutates nothing.
+pub(crate) fn claim_direct_reply_terminal_locked(
+    ipc: &IpcSubsystem,
+    record_index: usize,
+    record_generation: u64,
+    replier: ReceiverWaiterIdentity,
+    reply_endpoint_index: usize,
+    reply_endpoint_generation: u64,
+) -> DirectReplyTerminalClaim {
+    use crate::kernel::direct_eligibility::DirectReplyTerminal as T;
+    let class = classify_direct_reply_terminal_locked(
+        ipc,
+        record_index,
+        record_generation,
+        replier,
+        reply_endpoint_index,
+        reply_endpoint_generation,
+    );
+    match class {
+        T::Unarmed => DirectReplyTerminalClaim::NotArmed,
+        T::AvailableExact => {
+            let Some(cell) = ipc.reply_terminal_ownership.get(record_index) else {
+                return DirectReplyTerminalClaim::Lost(T::IdentityMismatch);
+            };
+            // The identity was just verified against the live record above, in this same
+            // acquisition. Claim with that verified identity — `try_claim` re-compares it and
+            // then CASes `Open → Reserved(Reply)` at the epoch it read, so neither a changed
+            // identity nor a changed epoch can be claimed through.
+            let expect = *cell.identity();
+            match cell.try_claim_reply_terminal(&expect) {
+                Some(owner) => DirectReplyTerminalClaim::Won(owner),
+                None => DirectReplyTerminalClaim::Lost(classify_direct_reply_terminal_locked(
+                    ipc,
+                    record_index,
+                    record_generation,
+                    replier,
+                    reply_endpoint_index,
+                    reply_endpoint_generation,
+                )),
+            }
+        }
+        other => DirectReplyTerminalClaim::Lost(other),
+    }
+}
+
+/// Commit a reply-record terminal claim after delivery succeeded. Only the exact owner
+/// wins. THE commit policy: the broad `KernelState::commit_reply_terminal_slot` delegates here
+/// too, so the split and broad reply paths cannot drift into contradictory arbitration rules.
+pub(crate) fn commit_reply_terminal_locked(
+    ipc: &IpcSubsystem,
+    record_index: usize,
+    owner: &crate::kernel::terminal_ownership::TerminalOwner,
+) -> bool {
+    ipc.reply_terminal_ownership
+        .get(record_index)
+        .is_some_and(|cell| cell.commit_terminal(owner))
+}
+
+/// DIRECT3-QUEUECAP §2 — THE endpoint-queue mutation for a reply whose caller is NOT blocked.
+///
+/// This is legacy `ipc_reply`'s Phase 3, extracted verbatim so the broad and split routes share
+/// one owner rather than growing a second reply implementation. Rank 3 only.
+///
+/// Three things happen together, under one acquisition, because they are one decision:
+/// the endpoint incarnation must still be live, the message must be admitted by the queue's own
+/// capacity rule, and any receiver that has appeared in the meantime is taken so the caller
+/// resuming becomes this transaction's responsibility. A queue refusal mutates nothing.
+///
+/// The returned identity is the waiter to wake, if any — the wake itself is the caller's, and
+/// happens outside every lock.
+pub(crate) fn enqueue_reply_into_endpoint_locked(
+    ipc: &mut IpcSubsystem,
+    endpoint_idx: usize,
+    msg: Message,
+) -> Result<Option<ReceiverWaiterIdentity>, KernelError> {
+    let ep_storage = ipc.endpoints[endpoint_idx]
+        .as_mut()
+        .ok_or(KernelError::WrongObject)?;
+    kernel_mut(ep_storage)
+        .send(msg)
+        .map_err(|_| KernelError::EndpointQueueFull)?;
+    Ok(ipc.take_endpoint_waiter(endpoint_idx))
+}
+
+/// DIRECT3-QUEUECAP §2 — the atomic QUEUED-REPLY commit, rank 3 only.
+///
+/// The split route reaches the queued mode having consumed nothing, so it can be strictly safer
+/// than the legacy ordering: legacy consumes the reply record and revokes both authority slots
+/// BEFORE its Phase 3, which means an `EndpointQueueFull` there leaves the reply unsendable.
+/// Here every refusal happens before any mutation, and the consume is bound to the enqueue in
+/// one acquisition — so a full queue leaves the reply exactly re-sendable.
+///
+/// `Unarmed` alone never authorizes this mode. The full precondition is checked here, against
+/// live state, in the same acquisition that mutates:
+///
+///   * the reply record still names this exact `{index, generation}` and is `Available`;
+///   * it is bound to THIS replier incarnation;
+///   * the reply endpoint it names is the one being serviced, at the same generation;
+///   * the endpoint incarnation is live and admits the message.
+///
+/// The absence of a claimable blocked-caller acknowledgement is the caller's to check before
+/// entering this owner — it lives in a different store — and the endpoint-waiter take inside
+/// `enqueue_reply_into_endpoint_locked` closes the race in the other direction: a caller that
+/// blocks between classification and commit is returned here as the waiter to wake.
+pub(crate) fn commit_queued_reply_locked(
+    ipc: &mut IpcSubsystem,
+    record_index: usize,
+    record_generation: u64,
+    replier: ReceiverWaiterIdentity,
+    reply_endpoint_index: usize,
+    reply_endpoint_generation: u64,
+    msg: Message,
+) -> Result<Option<ReceiverWaiterIdentity>, KernelError> {
+    if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+        return Err(KernelError::WrongObject);
+    }
+    let Some(Some(record)) = ipc.reply_caps.get(record_index) else {
+        return Err(KernelError::WrongObject);
+    };
+    if record.reservation != super::ReplyRecordReservation::Available {
+        return Err(KernelError::WrongObject);
+    }
+    if record.responder_tid != Some(replier.tid) || record.replier_asid != Some(replier.asid) {
+        return Err(KernelError::WrongObject);
+    }
+    let CapObject::Endpoint {
+        index: bound_eidx,
+        generation: bound_egen,
+    } = record.reply_endpoint
+    else {
+        return Err(KernelError::WrongObject);
+    };
+    if bound_eidx != reply_endpoint_index || bound_egen != reply_endpoint_generation {
+        return Err(KernelError::WrongObject);
+    }
+    if ipc.endpoint_generations.get(reply_endpoint_index).copied()
+        != Some(reply_endpoint_generation)
+    {
+        return Err(KernelError::WrongObject);
+    }
+    // Admission decided first: a refused enqueue must leave the record `Available`.
+    let woken = enqueue_reply_into_endpoint_locked(ipc, reply_endpoint_index, msg)?;
+    // The one-shot is spent only now, bound to the enqueue that succeeded. The record is left
+    // `Consumed` — PRESENT, not freed — which is the same post-state the blocked transaction
+    // leaves, so both reply modes end in one shape and share one release owner.
+    //
+    // The slot must still be freed: `MAX_REPLY_CAPS == MAX_TASKS` and the allocator reuses only
+    // absent slots, so a record left `Consumed` forever occupies its slot forever. But freeing
+    // it HERE is too early. The reverse link on the server TCB is closed by resolving the bound
+    // responder FROM this record; clearing the slot first makes that resolution find nothing,
+    // the link is never detached, and the server keeps a live link it does not owe. The very
+    // next `ipc_call` to that server then fails `install_server_reply_link` with a different
+    // live link, rolls the record allocation back, and surfaces as
+    // `IPC_CALL_FAIL stage=reply_cap_alloc err=CapabilityFull` — losing a request and its reply.
+    //
+    // So the caller closes the link while the record still resolves its replier, and only then
+    // releases the `Consumed` record through `release_consumed_reply_record_split`.
+    if let Some(Some(record)) = ipc.reply_caps.get_mut(record_index) {
+        record.reservation = super::ReplyRecordReservation::Consumed;
+    }
+    Ok(woken)
+}
+
+/// DIRECT3-CAP §2 — the exact identities of the ONE-SHOT reply authority for one record
+/// incarnation, snapshotted BEFORE any mutation.
+///
+/// The reply authority is exactly two CNode slots: the one-shot the replier holds and the alias
+/// `create_reply_cap_for_caller` minted into the caller's CNode. There is no third, and there
+/// are no delegation links to walk — a Reply cap is never delegated, which is why the legacy
+/// path uses the narrow `fast_revoke_reply_slot` rather than a delegation-tree revoke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplyAuthoritySlots {
+    /// The reply object both slots must still name for a revoke to be authorized.
+    pub(crate) reply_object: CapObject,
+    /// The replier's one-shot slot: the kernel-recorded `waiter_cap_id` when the record has one.
+    pub(crate) replier_cap: Option<CapId>,
+    /// The caller's alias slot. `CapId(0)` is the "never set" sentinel and is not reclaimed.
+    pub(crate) caller_cap: CapId,
+    pub(crate) caller_tid: ThreadId,
+}
+
+/// The outcome of reclaiming one record incarnation's reply authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ReplyAuthorityReclaim {
+    pub(crate) replier_revoked: bool,
+    pub(crate) caller_revoked: bool,
+    pub(crate) replier_attempted: bool,
+    pub(crate) caller_attempted: bool,
+}
+
+/// DIRECT3-CAP §2 — THE one-shot reply-authority reclamation policy.
+///
+/// ## Why this exists
+///
+/// The legacy `ipc_reply` reclaims both authority slots; the direct reply transaction did not.
+/// It relied on the record's `Consumed` barrier, which does revoke the AUTHORITY — a stale cap
+/// resolving to the same `{index, generation}` fails through the consumed record — but leaves
+/// the physical CNode slots occupied. That is a slot leak, and it pre-existed for every reply
+/// already taking the direct route: a boot showed 12 fast-revokes against 42 direct replies.
+/// `Consumed` is NOT physical reclamation and is not treated as such here.
+///
+/// ## One policy, two seams
+///
+/// The DECISION — which two slots, in which CNodes, against which expected object, and which
+/// sentinels mean "nothing to reclaim" — lives here once. Only the revoke SEAM differs: the
+/// broad path reaches `fast_revoke_reply_slot` through
+/// `KernelState::fast_revoke_reply_cap_in_cnode` (rank 4 directly), the direct path through
+/// `SharedKernel::sr_revoke_split` (rank 4 acquired and released on its own, never while an
+/// IPC rank-3 lock is held). Both end in the SAME `fast_revoke_reply_slot`, so there is no
+/// second capability-revocation implementation.
+///
+/// ## Exactness
+///
+/// `fast_revoke_reply_slot` refuses unless the slot's generation equals the CapId's generation
+/// AND the slot's entry names `expected_object`. A recycled slot therefore revokes nothing —
+/// an unrelated capability that happens to occupy the same index can never be destroyed — and a
+/// repeated reclamation is harmless, because the first bumped the slot generation past the
+/// CapId's.
+pub(crate) fn reclaim_reply_authority_with(
+    slots: ReplyAuthoritySlots,
+    replier_cnode: Option<crate::kernel::capabilities::CNodeId>,
+    caller_cnode: Option<crate::kernel::capabilities::CNodeId>,
+    mut revoke: impl FnMut(crate::kernel::capabilities::CNodeId, CapId, CapObject) -> bool,
+) -> ReplyAuthorityReclaim {
+    let mut out = ReplyAuthorityReclaim::default();
+    if let (Some(cap), Some(cnode)) = (slots.replier_cap, replier_cnode) {
+        out.replier_attempted = true;
+        out.replier_revoked = revoke(cnode, cap, slots.reply_object);
+    }
+    // `CapId(0)` is the "not yet set" sentinel `create_reply_cap_for_caller` starts from; it
+    // names no slot, so reclaiming it would be a revoke against an arbitrary index.
+    if slots.caller_cap.0 != 0
+        && let Some(cnode) = caller_cnode
+    {
+        out.caller_attempted = true;
+        out.caller_revoked = revoke(cnode, slots.caller_cap, slots.reply_object);
+    }
+    out
+}
+
+/// DIRECT3 §1 — THE reply-record waiter-cap/responder priming policy, rank 3 only.
+///
+/// There used to be two copies of this: `KernelState::try_set_reply_cap_waiter_cap` for the
+/// broad path and `SharedKernel::try_record_reply_waiter_cap_split` for the rank-3 seam, each
+/// re-implementing the same range, generation and slot checks. Both now delegate here, so the
+/// responder binding below cannot exist on one path and not the other — which is exactly how
+/// the live gap arose: production takes the split seam, and a repair applied only to the broad
+/// copies changed nothing.
+///
+/// ## The responder binding
+///
+/// A reply record minted for a QUEUED request carries no responder: the message is buffered
+/// before any receiver exists, so `create_reply_cap_for_caller` is called with `None`. The
+/// direct request transaction binds its receiver because it delivers straight into one; the
+/// queued path had no equivalent, so such a record reached the replier still unbound and
+/// `reserve_existing_reply_record_split` refused it — `responder_tid=None` fails
+/// `== Some(replier.tid)`. The direct reply then released its terminal claim and the legacy
+/// broad path completed the reply.
+///
+/// The receiver materializing the one-shot capability IS the responder: this is the moment the
+/// authority becomes exercisable, and by whom. Nothing is invented — it is the same fact
+/// `create_reply_cap_for_caller_in_cnode` records when the responder is known up front.
+///
+/// BIND-ONCE. An already-bound record is never re-bound: a second binding would be a different
+/// task acquiring an authority the first already holds, which is a defect to report rather than
+/// a state to overwrite.
+pub(crate) fn record_reply_waiter_cap_locked(
+    ipc: &mut IpcSubsystem,
+    reply_index: usize,
+    reply_generation: u64,
+    cap: CapId,
+    responder: Option<ReceiverWaiterIdentity>,
+) -> ReplyRecordSetOutcome {
+    if reply_index >= super::MAX_REPLY_CAPS {
+        return ReplyRecordSetOutcome::IndexOutOfRange;
+    }
+    if ipc.reply_cap_generations[reply_index] != reply_generation {
+        return ReplyRecordSetOutcome::GenerationMismatch;
+    }
+    let Some(record) = &mut ipc.reply_caps[reply_index] else {
+        return ReplyRecordSetOutcome::SlotEmpty;
+    };
+    record.waiter_cap_id = Some(cap);
+    if let Some(responder) = responder {
+        match (record.responder_tid, record.replier_asid) {
+            (None, None) => {
+                record.responder_tid = Some(responder.tid);
+                record.replier_asid = Some(responder.asid);
+                crate::yarm_log!(
+                    "IPC_RECV_REPLY_CAP_RESPONDER_BOUND reply_index={} reply_gen={} responder_tid={} responder_asid={} result=ok",
+                    reply_index,
+                    reply_generation,
+                    responder.tid.0,
+                    responder.asid.0
+                );
+            }
+            (Some(tid), _) if tid == responder.tid => {}
+            (tid, asid) => {
+                crate::yarm_log!(
+                    "IPC_RECV_REPLY_CAP_RESPONDER_CONFLICT reply_index={} reply_gen={} bound_tid={:?} bound_asid={:?} offered_tid={} result=fail",
+                    reply_index,
+                    reply_generation,
+                    tid.map(|t| t.0),
+                    asid.map(|a| a.0),
+                    responder.tid.0
+                );
+            }
+        }
+    }
+    crate::yarm_log!(
+        "IPC_RECV_REPLY_CAP_WAITER_CAP_SET reply_index={} reply_gen={} cap={}",
+        reply_index,
+        reply_generation,
+        cap.0
+    );
+    ReplyRecordSetOutcome::Set
+}
+
+/// Release a reply-record terminal claim back to `Open` after a PRE-DELIVERY failure.
+///
+/// THE release policy; the broad `KernelState::release_reply_terminal_slot_if_retryable`
+/// delegates here too.
+///
+/// Exact by the owner token, so a stale release mutates nothing: `release_terminal_if_retryable`
+/// compares the full `{epoch, claimant, Reserved}` word, and a cell some competitor has since
+/// won is left exactly as it is.
+pub(crate) fn release_reply_terminal_locked(
+    ipc: &IpcSubsystem,
+    record_index: usize,
+    owner: &crate::kernel::terminal_ownership::TerminalOwner,
+) -> bool {
+    ipc.reply_terminal_ownership
+        .get(record_index)
+        .is_some_and(|cell| cell.release_terminal_if_retryable(owner))
+}
+
 pub(crate) fn publish_recv_waiter_locked(
     ipc: &mut IpcSubsystem,
     endpoint_idx: usize,
@@ -1226,6 +1952,7 @@ impl KernelState {
         reply_index: usize,
         reply_generation: u64,
         cap: CapId,
+        responder: Option<ReceiverWaiterIdentity>,
     ) {
         // Stage 105 / D5: thin wrapper over try_set_reply_cap_waiter_cap that
         // discards the stale signal. The canonical reply arm of
@@ -1233,7 +1960,7 @@ impl KernelState {
         // duration of the reply materialization, so a stale outcome here is
         // unreachable on that path. The D5 split path uses the fallible form
         // directly to drive its mint rollback.
-        let _ = self.try_set_reply_cap_waiter_cap(reply_index, reply_generation, cap);
+        let _ = self.try_set_reply_cap_waiter_cap(reply_index, reply_generation, cap, responder);
     }
 
     /// Stage 105 / D5: fallible variant of [`set_reply_cap_waiter_cap`].
@@ -1255,26 +1982,10 @@ impl KernelState {
         reply_index: usize,
         reply_generation: u64,
         cap: CapId,
+        responder: Option<ReceiverWaiterIdentity>,
     ) -> ReplyRecordSetOutcome {
         let outcome = self.with_ipc_state_mut(|ipc| {
-            if reply_index >= super::MAX_REPLY_CAPS {
-                return ReplyRecordSetOutcome::IndexOutOfRange;
-            }
-            if ipc.reply_cap_generations[reply_index] != reply_generation {
-                return ReplyRecordSetOutcome::GenerationMismatch;
-            }
-            if let Some(record) = &mut ipc.reply_caps[reply_index] {
-                record.waiter_cap_id = Some(cap);
-                crate::yarm_log!(
-                    "IPC_RECV_REPLY_CAP_WAITER_CAP_SET reply_index={} reply_gen={} cap={}",
-                    reply_index,
-                    reply_generation,
-                    cap.0
-                );
-                ReplyRecordSetOutcome::Set
-            } else {
-                ReplyRecordSetOutcome::SlotEmpty
-            }
+            record_reply_waiter_cap_locked(ipc, reply_index, reply_generation, cap, responder)
         });
         if !matches!(outcome, ReplyRecordSetOutcome::Set) {
             let reason = match outcome {
@@ -1552,27 +2263,7 @@ impl KernelState {
         reply_endpoint: CapObject,
     ) -> Result<(usize, u64), KernelError> {
         self.with_ipc_state_mut(|ipc| {
-            for idx in 0..super::MAX_REPLY_CAPS {
-                if ipc.reply_caps[idx].is_none() {
-                    let mut generation = ipc.reply_cap_generations[idx].wrapping_add(1);
-                    if generation == 0 {
-                        generation = 1;
-                    }
-                    ipc.reply_cap_generations[idx] = generation;
-                    ipc.reply_caps[idx] = Some(ReplyCapRecord {
-                        reservation: super::ReplyRecordReservation::Reserved,
-                        caller_tid: caller.tid,
-                        caller_asid: caller.asid,
-                        reply_endpoint,
-                        responder_tid: Some(replier.tid),
-                        replier_asid: Some(replier.asid),
-                        caller_cap_id: CapId(0),
-                        waiter_cap_id: None,
-                    });
-                    return Ok((idx, generation));
-                }
-            }
-            Err(KernelError::CapabilityFull)
+            reserve_direct_reply_record_locked(ipc, caller, replier, reply_endpoint)
         })
     }
 
@@ -1998,11 +2689,9 @@ impl KernelState {
         index: usize,
         owner: &crate::kernel::terminal_ownership::TerminalOwner,
     ) -> bool {
-        self.with_ipc_state(|ipc| {
-            ipc.reply_terminal_ownership
-                .get(index)
-                .is_some_and(|cell| cell.commit_terminal(owner))
-        })
+        // 199D-TRC: a thin broad adapter over the ONE commit policy, so the broad reply path
+        // and the split direct-reply route can never disagree about what committing means.
+        self.with_ipc_state(|ipc| commit_reply_terminal_locked(ipc, index, owner))
     }
 
     /// Release the owner's claim on slot `index` back to `Open` for a retryable
@@ -2012,11 +2701,8 @@ impl KernelState {
         index: usize,
         owner: &crate::kernel::terminal_ownership::TerminalOwner,
     ) -> bool {
-        self.with_ipc_state(|ipc| {
-            ipc.reply_terminal_ownership
-                .get(index)
-                .is_some_and(|cell| cell.release_terminal_if_retryable(owner))
-        })
+        // 199D-TRC: a thin broad adapter over the ONE release policy — see the commit twin.
+        self.with_ipc_state(|ipc| release_reply_terminal_locked(ipc, index, owner))
     }
 
     /// The committed terminal winner of slot `index`, if any (for assertions).
@@ -2081,45 +2767,15 @@ impl KernelState {
         crate::kernel::deadline_token::DeadlineTokenHandle,
         crate::kernel::deadline_token::DeadlineArmError,
     > {
-        use crate::kernel::deadline_token::{DeadlineArmError, DeadlineTokenIdentity};
         self.with_ipc_state_mut(|ipc| {
-            // Part 5 — validate the CURRENT terminal identity/epoch (Open, exact).
-            let terminal_ok = ipc
-                .reply_terminal_ownership
-                .get(record_index)
-                .is_some_and(|cell| {
-                    cell.is_open()
-                        && *cell.identity() == terminal_identity
-                        && cell.current_epoch() == terminal_epoch
-                        && terminal_identity.reply_record_index == record_index
-                        && terminal_identity.reply_record_generation == record_generation
-                });
-            if !terminal_ok {
-                return Err(DeadlineArmError::TerminalNotOpen);
-            }
-            // One active registration per reply record (no silent overwrite).
-            let already = ipc.reply_deadline_tokens.iter().any(|t| {
-                (t.is_armed() || t.is_fire_claimed())
-                    && t.identity().terminal_identity.reply_record_index == record_index
-                    && t.identity().terminal_identity.reply_record_generation == record_generation
-            });
-            if already {
-                return Err(DeadlineArmError::AlreadyArmed);
-            }
-            // Reserve a free slot; bounded failure when the store is full.
-            let free = ipc.reply_deadline_tokens.iter().position(|t| t.is_free());
-            let Some(slot) = free else {
-                return Err(DeadlineArmError::StoreFull);
-            };
-            let identity = DeadlineTokenIdentity {
-                token_index: slot,
+            arm_deadline_token_locked(
+                ipc,
+                record_index,
+                record_generation,
                 token_generation,
                 terminal_epoch,
                 terminal_identity,
-            };
-            ipc.reply_deadline_tokens[slot]
-                .arm(identity)
-                .ok_or(DeadlineArmError::AlreadyArmed)
+            )
         })
     }
 
@@ -2414,6 +3070,11 @@ impl KernelState {
             );
             return;
         };
+        // 199D-SD3 (§4): the record's bound replier IS the scenario's dying server, resolved
+        // from live state here. Arming it is what lets the deferred RESERVATION — which has
+        // no record identity of its own — be attributed to this transaction instead of to
+        // whichever task happened to exit first in the boot.
+        let _ = c::arm_scenario_server(server_tid.0, server_asid.0);
         let present = self
             .server_reply_link_for(server_tid.0, server_asid)
             .is_some_and(|link| link.matches_record(record_index, record_generation));
@@ -2800,23 +3461,44 @@ impl KernelState {
     /// whose registration fails keeps its `ipc_timeout_deadline` and is therefore still served by
     /// the ordinary receive-timeout class; it never loses its timeout, it only loses the exact
     /// reply terminal claim.
+    ///
+    /// ## 199D-SD — ARMING is not the same decision as REGISTERING A DEADLINE
+    ///
+    /// This used to return immediately when the caller supplied no finite `timeout_ticks`, which
+    /// skipped `arm_reply_terminal` as well. But the terminal-ownership cell is documented as
+    /// "the SINGLE authority through which every terminal outcome (reply / timeout / peer death /
+    /// caller exit / endpoint destruction) of the blocked caller funnels", and only ONE of those
+    /// five is a timeout. A caller that blocks on a reply receive without a deadline left its cell
+    /// at the default identity `{tid 0, asid 0, generation 0}`.
+    ///
+    /// Server death then could not settle. `exit_task` captures the exact reverse reply link and
+    /// publishes a generation-bearing work item regardless of any deadline, and the post-lock
+    /// drain revalidates that item against the ARMED identity. Against an unarmed cell the compare
+    /// failed as `IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY armed_tid=0 armed_asid=0` and
+    /// `IPC_SERVER_DEATH_WRONG_RECORD_GENERATION armed_generation=0`, the drain took
+    /// `outcome=stale_identity`, and the blocked caller was never woken with `ServerGone` —
+    /// `caller_wakes=0`, `PeerDeath winners=0`. The item was not stale at all: the record was live
+    /// at the generation it named and the exiting incarnation was exact. The arming was missing.
+    ///
+    /// So the two decisions are now separate. The cell is armed for EVERY genuine reply receive,
+    /// which is what makes death, caller exit and endpoint destruction claimable. A deadline is
+    /// registered only when the caller actually asked for one, exactly as before — and the
+    /// `deadline_token_generation` carried in the armed identity is `Some(brg)` only in that case,
+    /// `None` otherwise, so an unarmed deadline is never implied. The death transaction does not
+    /// read that field (it revalidates endpoint generation, blocked-receive generation and the
+    /// exact waiter), so a `None` there widens nothing.
     pub(crate) fn arm_production_reply_deadline(
         &mut self,
         caller_tid: u64,
         reply_eidx: usize,
         deadline: Option<u64>,
     ) {
-        let Some(deadline_tick) = deadline else {
-            return;
-        };
-        if deadline_tick == 0 {
-            return;
-        }
         let Some(caller_asid) = self.task_asid(caller_tid) else {
             return;
         };
         // One registration per blocked receive. On an oracle boot the confined arm above has
-        // already installed its own token for its own endpoint; this must not double-register.
+        // already installed its own token for its own endpoint AND armed the cell from the same
+        // identity, so this must neither double-register nor re-arm over it.
         if self
             .reply_timeout_token_for_caller(caller_tid, caller_asid)
             .is_some()
@@ -2827,18 +3509,29 @@ impl KernelState {
         let Some((record_index, record_generation)) =
             self.find_reply_record_for_caller_endpoint(caller, reply_eidx)
         else {
-            // Not a reply receive — an ordinary one. Its deadline stays on the ordinary class.
+            // Not a reply receive — an ordinary one. It owns no reply record, so there is nothing
+            // to arm and its deadline stays on the ordinary class.
             return;
         };
         let Some(brg) = self.blocked_recv_generation_for(caller_tid, caller_asid) else {
             return;
         };
-        let Some(identity) =
-            self.reply_terminal_identity(record_index, record_generation, brg, Some(brg))
-        else {
+        // A finite, non-zero deadline is what distinguishes "also register a timeout" from
+        // "arm the terminal only".
+        let finite_deadline = deadline.filter(|tick| *tick != 0);
+        let Some(identity) = self.reply_terminal_identity(
+            record_index,
+            record_generation,
+            brg,
+            finite_deadline.map(|_| brg),
+        ) else {
             return;
         };
         self.arm_reply_terminal(record_index, identity);
+        // Armed. Everything below is the DEADLINE half and runs only for a caller that asked.
+        let Some(deadline_tick) = finite_deadline else {
+            return;
+        };
         match self.register_reply_receive_deadline(
             record_index,
             record_generation,
@@ -6154,18 +6847,14 @@ impl KernelState {
         }
         // Phase 3: enqueue reply and atomically snapshot receiver waiter under
         // ipc_state_lock (rank 3).  Lock released before Phase 4 scheduler mutation.
+        // DIRECT3-QUEUECAP §2: delegate to the ONE queued-reply mutation owner, so the broad
+        // and split routes cannot drift on what enqueueing a reply means.
         let wake_plan = self.with_ipc_state_mut(|ipc| {
-            let ep_storage = ipc.endpoints[endpoint_idx]
-                .as_mut()
-                .ok_or(KernelError::WrongObject)?;
-            kernel_mut(ep_storage)
-                .send(msg)
-                .map_err(|_| KernelError::EndpointQueueFull)?;
-            Ok::<_, KernelError>(
-                ipc.take_endpoint_waiter(endpoint_idx)
+            enqueue_reply_into_endpoint_locked(ipc, endpoint_idx, msg).map(|woken| {
+                woken
                     .map(|w| super::SchedulerWakePlan::Wake(w.tid))
-                    .unwrap_or(super::SchedulerWakePlan::None),
-            )
+                    .unwrap_or(super::SchedulerWakePlan::None)
+            })
         })?;
         // Phase 4: wake receiver outside all locks.
         self.apply_scheduler_wake_plan(wake_plan)?;
