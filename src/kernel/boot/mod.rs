@@ -56,9 +56,9 @@ mod orchestrator_state;
 mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
+pub(crate) mod shared_region_txn;
 /// U9-SPAWN1 SP-2: THE thread-incarnation lifecycle — allocate, register, undo.
 pub(crate) mod spawn_thread_core;
-pub(crate) mod shared_region_txn;
 mod task_core_state;
 mod task_policy_state;
 mod thread_state;
@@ -3252,7 +3252,8 @@ pub fn aarch64_terminal_fault_oracle_enabled() -> bool {
 
 /// The init startup-slot-5 selector for the terminal-fault oracle. Slot-5 values 1-8 and 20 are
 /// already claimed on AArch64, so this takes the next clearly free value.
-pub const AARCH64_TERMINAL_FAULT_ORACLE_SELECTOR: u64 = 21;
+pub const AARCH64_TERMINAL_FAULT_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::terminal_fault_oracle_abi::AARCH64_TERMINAL_FAULT_SELECTOR as u64;
 
 /// Stage 196A: default-off RISC-V post-lock-drain FOUNDATION oracle selector.
 /// When enabled, the RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`)
