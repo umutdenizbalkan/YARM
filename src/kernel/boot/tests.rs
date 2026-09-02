@@ -56901,6 +56901,9 @@ mod stage175_spawn_lifecycle {
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const EXEC_SRC: &str = include_str!("exec_state.rs");
     const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    /// U9-SPAWN1 SP-3: the phase markers moved with the phases, into the one compensated
+    /// transaction the four spawn syscalls now share.
+    const SPAWN_TXN_SRC: &str = include_str!("../syscall/spawn_image_txn.rs");
     const FAULT_SRC: &str = include_str!("fault_state.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
@@ -56953,22 +56956,37 @@ mod stage175_spawn_lifecycle {
     // The full documented marker set must exist verbatim across the instrumentation.
     #[test]
     fn stage175_all_marker_strings_exist() {
-        // Phase markers live in the syscall handler + spawn path.
+        // Request-shaped markers stay with the handler: they describe what the CALLER asked for
+        // and are emitted before any resource is acquired.
         for m in [
             "SPAWN_LIFECYCLE_REQUEST_BEGIN",
             "SPAWN_LIFECYCLE_IMAGE_RESOLVE_OK",
             "SPAWN_LIFECYCLE_IMAGE_RESOLVE_FAIL",
             "SPAWN_LIFECYCLE_ELF_PARSE_BEGIN",
             "SPAWN_LIFECYCLE_ELF_PARSE_OK",
+            "SPAWN_LIFECYCLE_BAD_IMAGE_ID",
+        ] {
+            assert!(PROCESS_SRC.contains(m), "process.rs must emit marker {m}");
+        }
+        // U9-SPAWN1 SP-3: transaction-phase markers moved WITH their phases into the one
+        // compensated owner. They must live there and nowhere else — a second copy in the
+        // handler would mean a second, uncompensated transcription of the phase itself.
+        for m in [
             "SPAWN_LIFECYCLE_ELF_LOAD_BEGIN",
             "SPAWN_LIFECYCLE_ELF_LOAD_OK",
             "SPAWN_LIFECYCLE_ZC_LOAD_OK",
             "SPAWN_LIFECYCLE_ASPACE_CREATE_OK",
             "SPAWN_LIFECYCLE_SERVICE_READY",
-            "SPAWN_LIFECYCLE_BAD_IMAGE_ID",
             "SPAWN_LIFECYCLE_SERVICE_ORDER_VIOLATION",
         ] {
-            assert!(PROCESS_SRC.contains(m), "process.rs must emit marker {m}");
+            assert!(
+                SPAWN_TXN_SRC.contains(m),
+                "the shared spawn transaction must emit marker {m}"
+            );
+            assert!(
+                !PROCESS_SRC.contains(m),
+                "{m} names a transaction phase; the handler must not emit it a second time"
+            );
         }
         for m in [
             "SPAWN_LIFECYCLE_TCB_ALLOC_OK",
@@ -121971,11 +121989,15 @@ mod stage199d_wa3b_spawn_reservation {
     /// through the `_for_test` convenience, so this set is exactly the production closure.
     #[test]
     fn the_production_spawn_caller_closure_is_pinned() {
+        // U9-SPAWN1 SP-3: the four syscall call sites collapsed into ONE. `process.rs` used to
+        // carry a spawn call per syscall, each with its own (absent) compensation; NR 23, 24, 26
+        // and 29 now all commit through `spawn_image_txn`, which is the only place a spawn can
+        // be committed from a syscall and the only place its failure is unwound.
         const EXPECTED: &[(&str, usize)] = &[
             ("src/arch/aarch64/boot.rs", 3),
             ("src/arch/riscv64/boot.rs", 3),
             ("src/arch/x86_64/boot.rs", 3),
-            ("src/kernel/syscall/process.rs", 4),
+            ("src/kernel/syscall/spawn_image_txn.rs", 1),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -121999,8 +122021,14 @@ mod stage199d_wa3b_spawn_reservation {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            13,
-            "13 production callers"
+            10,
+            "10 production callers: three per architecture's bootstrap, plus the one compensated \
+             syscall transaction"
+        );
+        // And no syscall handler may commit a spawn behind the transaction's back.
+        assert!(
+            !include_str!("../syscall/process.rs").contains("spawn_user_task_from_image("),
+            "the spawn syscalls commit through spawn_image_txn, which owns their compensation"
         );
         // None of them authorizes a spawn by TID alone.
         for (rel, src) in production_sources() {
@@ -151966,6 +151994,454 @@ mod a64depth_writeback_and_selector {
             assert!(
                 INIT_SRC.contains(expected),
                 "the exit oracle must still emit {expected}"
+            );
+        }
+    }
+}
+
+/// U9-SPAWN1 SP-3 — the spawn transaction's compensation ledger, proved by real failures.
+///
+/// Nothing here injects through a debug hook. Each phase is failed by arranging the condition
+/// that actually makes it fail — an exhausted task table, an exhausted ASID pool, a malformed
+/// image, an entry point of zero — so what is proved is the production owner's behaviour and not
+/// a test-only branch through it.
+#[cfg(test)]
+mod u9spawn1_sp3_spawn_ledger {
+    use super::*;
+    use crate::kernel::capabilities::{CNodeId, CapId};
+    use crate::kernel::syscall::spawn_image_txn::{
+        MAX_PROVISIONAL_SPAWN_RESOURCES, ProvisionalSpawnResource, SpawnImageRequest,
+        SpawnImageSource, SpawnLedger, run_image_spawn_transaction,
+    };
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::vm::{Asid, MAX_ADDRESS_SPACES};
+    use crate::runtime::SharedKernel;
+
+    const TXN_SRC: &str = include_str!("../syscall/spawn_image_txn.rs");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+
+    /// A real ELF64 image with one PT_LOAD segment, so the load phase runs the production loader
+    /// rather than a stub. `entry` is a parameter because an entry of zero is exactly how the
+    /// commit phase is made to fail.
+    pub(super) fn tiny_elf() -> alloc::vec::Vec<u8> {
+        const PAGE: usize = 0x1000;
+        let mut img = alloc::vec![0u8; PAGE + 0x40];
+        img[..4].copy_from_slice(b"\x7FELF");
+        img[4] = 2; // ELFCLASS64
+        img[5] = 1; // little endian
+        img[6] = 1; // EV_CURRENT
+        img[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        img[24..32].copy_from_slice(&0x40_0000u64.to_le_bytes()); // e_entry
+        img[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        img[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        img[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        img[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        let ph = 64;
+        img[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        img[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // R|X
+        img[ph + 8..ph + 16].copy_from_slice(&(PAGE as u64).to_le_bytes()); // p_offset
+        img[ph + 16..ph + 24].copy_from_slice(&0x40_0000u64.to_le_bytes()); // p_vaddr
+        img[ph + 24..ph + 32].copy_from_slice(&0x40_0000u64.to_le_bytes()); // p_paddr
+        img[ph + 32..ph + 40].copy_from_slice(&0x40u64.to_le_bytes()); // p_filesz
+        img[ph + 40..ph + 48].copy_from_slice(&(PAGE as u64).to_le_bytes()); // p_memsz
+        img[ph + 48..ph + 56].copy_from_slice(&(PAGE as u64).to_le_bytes()); // p_align
+        img
+    }
+
+    /// Everything a leak would move. Compared before and after each failing transaction.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Baseline {
+        tasks: usize,
+        address_spaces: usize,
+        free_frames: usize,
+        endpoints: usize,
+        spawner_caps: usize,
+    }
+
+    fn baseline(k: &SharedKernel) -> Baseline {
+        k.with(|s| {
+            let cnode = s.current_task_cnode();
+            Baseline {
+                tasks: s.with_tcbs(|tcbs| tcbs.iter().flatten().count()),
+                address_spaces: s.with_user_spaces(|spaces| {
+                    (0..MAX_ADDRESS_SPACES)
+                        .filter(|n| spaces.get(Asid(*n as u16)).is_some())
+                        .count()
+                }),
+                free_frames: s.with_memory_state(|m| m.frame_allocator.free_frames()),
+                endpoints: s.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count()),
+                spawner_caps: match cnode {
+                    Some(cnode) => s.with_capability_state(|cap| {
+                        cap.cnode_spaces
+                            .iter()
+                            .flatten()
+                            .filter(|space| space.id == cnode)
+                            .map(|space| {
+                                crate::kernel::boot::kernel_ref(&space.cspace).occupied_slots()
+                            })
+                            .sum::<usize>()
+                    }),
+                    None => 0,
+                },
+            }
+        })
+    }
+
+    /// A kernel with a live spawner, so the endpoint and capability phases mint into a real
+    /// cspace instead of being skipped.
+    fn fixture() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            assert!(
+                s.current_task_cnode().is_some(),
+                "the spawner must own a cspace, or the capability phases are not exercised"
+            );
+        });
+        k
+    }
+
+    fn run(
+        k: &SharedKernel,
+        elf: &[u8],
+        entry: usize,
+    ) -> Result<u64, crate::kernel::syscall::SyscallError> {
+        k.with(|s| {
+            run_image_spawn_transaction(
+                s,
+                SpawnImageRequest {
+                    image_id: 0,
+                    image_path: "init",
+                    source: SpawnImageSource::PtLoadSegments { elf, entry },
+                    class: TaskClass::SystemServer,
+                    parent_pid: 0,
+                    startup_args: [0u64; 18],
+                    extra_send_caps: [0u64; 4],
+                    map_initrd_window: false,
+                    lifecycle_markers: false,
+                },
+            )
+            .map(|c| c.tid)
+        })
+    }
+
+    /// The success path first, so the failure cases are known to be failing something that
+    /// otherwise works.
+    #[test]
+    fn a_committed_spawn_keeps_everything_it_acquired() {
+        let k = fixture();
+        let before = baseline(&k);
+        let elf = tiny_elf();
+        let tid = run(&k, &elf, 0x40_0000).expect("a well-formed spawn commits");
+        let after = baseline(&k);
+        assert_eq!(after.tasks, before.tasks + 1, "one live task");
+        assert_eq!(
+            after.address_spaces,
+            before.address_spaces + 1,
+            "one address space"
+        );
+        assert_eq!(after.endpoints, before.endpoints + 2, "two endpoints");
+        assert!(
+            after.spawner_caps > before.spawner_caps,
+            "the endpoint capabilities were minted into the spawner's cspace"
+        );
+        // The committed task is LIVE, not a leftover reservation.
+        let status = k.with(|s| s.task_status(tid));
+        assert!(
+            !matches!(status, Some(crate::kernel::task::TaskStatus::Reserved)),
+            "a committed spawn leaves a live task, not a reservation: {status:?}"
+        );
+    }
+
+    /// Phase 3 — the image. The transaction holds the reservation and the address space when the
+    /// loader refuses, and both must go back.
+    #[test]
+    fn a_failed_image_load_restores_the_baseline() {
+        let k = fixture();
+        let before = baseline(&k);
+        let junk = alloc::vec![0u8; 0x200];
+        let err = run(&k, &junk, 0x40_0000).expect_err("a malformed image cannot load");
+        assert_eq!(
+            baseline(&k),
+            before,
+            "failed load left something behind: {err:?}"
+        );
+    }
+
+    /// Phase 6 — the commit. This is the arm the old code could not undo at all: the reservation
+    /// is restored to `ReservedUnstarted` by `spawn_user_task_from_image` and then belonged to
+    /// nobody. By now the ledger is holding all eight provisional resources.
+    #[test]
+    fn a_failed_commit_restores_the_baseline() {
+        let k = fixture();
+        let before = baseline(&k);
+        let elf = tiny_elf();
+        // `spawn_image_after_claim` refuses an entry point of zero, AFTER the reservation has
+        // been claimed — so this fails at the last possible moment.
+        let err = run(&k, &elf, 0).expect_err("a zero entry point cannot be committed");
+        let after = baseline(&k);
+        assert_eq!(
+            (
+                after.tasks,
+                after.address_spaces,
+                after.endpoints,
+                after.spawner_caps
+            ),
+            (
+                before.tasks,
+                before.address_spaces,
+                before.endpoints,
+                before.spawner_caps
+            ),
+            "failed commit left something behind: {err:?}"
+        );
+
+        // Frames are the ONE thing that does not come back, and the reason is not the ledger.
+        // See `the_frame_the_unwind_cannot_reclaim_is_the_loaders_not_the_ledgers` below: the
+        // address-space teardown owner reclaims only MemoryObject-backed frames, so the page an
+        // ELF PT_LOAD lands in is lost whenever any address space is destroyed — spawn or not.
+        // The ledger calls the correct owner; the owner is incomplete.
+        assert_eq!(
+            before.free_frames - after.free_frames,
+            elf_load_frame_cost(),
+            "the only unrecovered frames are the loader's, and there is exactly one load here"
+        );
+    }
+
+    /// The frame the failed spawn does not get back is charged by the ELF loader and lost by the
+    /// address-space teardown owner — NOT by the compensation ledger. Proved by taking the ledger
+    /// out of the picture entirely: a bare create / load / destroy cycle, with no spawn, no
+    /// reservation, no endpoint and no transaction, loses exactly the same frame.
+    ///
+    /// The cause is that `destroy_user_address_space_by_asid` reclaims a drained mapping through
+    /// `note_mapping_removed` + `reclaim_memory_object_for_phys`, both of which are
+    /// MemoryObject-scoped. A page the loader took straight from the frame allocator has no
+    /// MemoryObject, so nothing ever returns it. Repairing that means teaching teardown which
+    /// drained frames are allocator-owned and which are borrowed — the zero-copy initramfs grants
+    /// are borrowed and freeing them would hand the boot initrd's own frames to the allocator —
+    /// which is a distinct backing-ownership repair, not a spawn compensation.
+    #[test]
+    fn the_frame_the_unwind_cannot_reclaim_is_the_loaders_not_the_ledgers() {
+        let k = fixture();
+        let elf = tiny_elf();
+        let free =
+            |k: &SharedKernel| k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        for _ in 0..3 {
+            let before = free(&k);
+            let (asid, cap) = k.with(|s| s.create_user_address_space().expect("an address space"));
+            k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("a load"));
+            k.with(|s| {
+                s.destroy_user_address_space_by_asid(asid)
+                    .expect("teardown");
+                let cnode = s.current_task_cnode().expect("spawner cspace");
+                let _ = s.revoke_capability_in_cnode(cnode, cap);
+            });
+            assert_eq!(
+                before - free(&k),
+                elf_load_frame_cost(),
+                "the cost is per address-space teardown and recurs, so it is a loader/teardown \
+                 defect rather than one-time capacity growth"
+            );
+        }
+    }
+
+    /// One PT_LOAD segment of one page. Named rather than inlined so the two tests above cannot
+    /// drift, and so raising it silently is impossible.
+    const fn elf_load_frame_cost() -> usize {
+        1
+    }
+
+    /// Phase 2 — the address space. With the ASID pool exhausted the transaction fails holding
+    /// only the reservation.
+    #[test]
+    fn a_failed_address_space_restores_the_baseline() {
+        let k = fixture();
+        // Exhaust the pool through the production owner.
+        k.with(|s| while s.create_user_address_space().is_ok() {});
+        let before = baseline(&k);
+        let elf = tiny_elf();
+        let err = run(&k, &elf, 0x40_0000).expect_err("no address space is available");
+        assert_eq!(
+            baseline(&k),
+            before,
+            "failed address-space phase left something behind: {err:?}"
+        );
+    }
+
+    /// Every ledger class is released by an owner that actually owns it. Built by hand so all
+    /// four variants are exercised in one unwind, including the reverse ordering.
+    #[test]
+    fn every_provisional_class_is_released_by_its_owner() {
+        let k = fixture();
+        let before = baseline(&k);
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let mut ledger = SpawnLedger::new();
+        k.with(|s| {
+            let token = s
+                .reserve_task_for_spawn_with_class(90_001, TaskClass::App)
+                .expect("a reservation");
+            ledger.record(ProvisionalSpawnResource::Reservation(token));
+            let (asid, aspace_cap) = s.create_user_address_space().expect("an address space");
+            ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
+            ledger.record(ProvisionalSpawnResource::Capability {
+                cnode,
+                cap: aspace_cap,
+            });
+            let (idx, send, recv) = s.create_endpoint(8).expect("an endpoint");
+            ledger.record(ProvisionalSpawnResource::Endpoint(idx));
+            ledger.record(ProvisionalSpawnResource::Capability { cnode, cap: send });
+            ledger.record(ProvisionalSpawnResource::Capability { cnode, cap: recv });
+        });
+        assert_eq!(ledger.len(), 6, "one entry per acquisition");
+        assert_ne!(baseline(&k), before, "the acquisitions must be observable");
+        k.with(|s| s.unwind_spawn_ledger(ledger));
+        assert_eq!(
+            baseline(&k),
+            before,
+            "every class went back through its owner"
+        );
+    }
+
+    /// Repeated cleanup is inert. The ledger cannot be unwound twice — it is consumed — so what
+    /// is proved here is the other half: a ledger naming resources that are ALREADY gone unwinds
+    /// without disturbing anything, which is what makes a stale entry harmless.
+    #[test]
+    fn unwinding_already_released_resources_is_inert() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let (token, asid, idx, send) = k.with(|s| {
+            let token = s
+                .reserve_task_for_spawn_with_class(90_002, TaskClass::App)
+                .expect("a reservation");
+            let (asid, _cap) = s.create_user_address_space().expect("an address space");
+            let (idx, send, _recv) = s.create_endpoint(8).expect("an endpoint");
+            (token, asid, idx, send)
+        });
+        // Release every one of them through its owner FIRST.
+        k.with(|s| {
+            s.cancel_spawn_reservation(token).expect("cancel");
+            s.destroy_user_address_space_by_asid(asid).expect("destroy");
+            s.destroy_endpoint(idx).expect("destroy");
+            let _ = s.revoke_capability_in_cnode(cnode, send);
+        });
+        let before = baseline(&k);
+        // Now unwind a ledger that still names them.
+        let mut ledger = SpawnLedger::new();
+        ledger.record(ProvisionalSpawnResource::Reservation(token));
+        ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
+        ledger.record(ProvisionalSpawnResource::Endpoint(idx));
+        ledger.record(ProvisionalSpawnResource::Capability { cnode, cap: send });
+        k.with(|s| s.unwind_spawn_ledger(ledger));
+        assert_eq!(
+            baseline(&k),
+            before,
+            "a stale ledger entry must release nothing — least of all a replacement occupant"
+        );
+    }
+
+    /// The capacity is exactly what one production spawn can hold, and the arithmetic is stated
+    /// where it can be checked rather than left as a magic number.
+    #[test]
+    fn the_ledger_capacity_covers_every_production_spawn_shape() {
+        // 1 reservation + 1 address space + 1 address-space capability + 2 endpoints
+        // + 2 × (send, recv) endpoint capabilities.
+        assert_eq!(MAX_PROVISIONAL_SPAWN_RESOURCES, 1 + 1 + 1 + 2 + 2 * 2);
+        let mut ledger = SpawnLedger::new();
+        for n in 0..MAX_PROVISIONAL_SPAWN_RESOURCES {
+            ledger.record(ProvisionalSpawnResource::Capability {
+                cnode: CNodeId(1),
+                cap: CapId(n as u64),
+            });
+        }
+        assert_eq!(
+            ledger.len(),
+            MAX_PROVISIONAL_SPAWN_RESOURCES,
+            "all recorded"
+        );
+    }
+
+    /// The reservation is the FIRST provisional resource. This is the ordering SP-3 changed: it
+    /// used to be taken just before the commit, which is why the commit's failure arm had no
+    /// token left to cancel with.
+    #[test]
+    fn the_reservation_precedes_the_first_address_space() {
+        let txn = TXN_SRC
+            .split("pub(crate) fn run_image_spawn_transaction(")
+            .nth(1)
+            .expect("the transaction body");
+        let reserve = txn
+            .find("reserve_task_for_spawn_with_class(tid, class)")
+            .expect("the reservation phase");
+        let aspace = txn
+            .find("create_user_address_space()")
+            .expect("the address-space phase");
+        let commit = txn
+            .find("spawn_user_task_from_image(")
+            .expect("the commit phase");
+        assert!(
+            reserve < aspace,
+            "the reservation must be taken before the first provisional address space"
+        );
+        assert!(
+            aspace < commit,
+            "and the commit stays last — it is the only step that publishes a reachable task"
+        );
+    }
+
+    /// No acquisition step may return through a bare `?`. That is precisely what leaked: a `?`
+    /// abandons whatever the transaction is already holding.
+    #[test]
+    fn no_acquisition_step_returns_through_a_bare_question_mark() {
+        let txn = TXN_SRC
+            .split("pub(crate) fn run_image_spawn_transaction(")
+            .nth(1)
+            .expect("the transaction body");
+        for acquisition in [
+            "reserve_task_for_spawn_with_class",
+            "create_user_address_space",
+            "load_elf_pt_load_segments",
+            "load_elf_with_mo_zero_copy",
+            "spawn_user_task_from_image",
+        ] {
+            let at = txn.find(acquisition).expect(acquisition);
+            let stmt: &str = &txn[at..txn[at..].find(";\n").map(|e| at + e).unwrap_or(txn.len())];
+            assert!(
+                stmt.starts_with(acquisition) || stmt.contains(acquisition),
+                "{acquisition} must be reachable"
+            );
+            assert!(
+                !stmt.contains(")?"),
+                "{acquisition} must hand its outcome to the ledger-aware `advance`, not to a \
+                 bare `?` that abandons everything already acquired"
+            );
+        }
+        // And every one of them goes through the one carrier.
+        assert!(
+            txn.matches("advance(kernel, ledger, outcome,").count() >= 5,
+            "each fallible acquisition is carried by the same ledger-aware step"
+        );
+    }
+
+    /// The four spawn syscalls delegate; none of them keeps a second, uncompensated copy of the
+    /// transaction.
+    #[test]
+    fn all_four_spawn_syscalls_delegate_to_the_one_transaction() {
+        assert_eq!(
+            PROCESS_SRC
+                .matches("spawn_image_txn::run_image_spawn_transaction(")
+                .count(),
+            4,
+            "NR 23, NR 24, NR 26 and NR 29 all commit through the one compensated transaction"
+        );
+        for abandoned in [
+            "create_user_address_space",
+            "reserve_task_for_spawn_with_class",
+            "spawn_user_task_from_image",
+            "create_endpoint(8)",
+        ] {
+            assert!(
+                !PROCESS_SRC.contains(abandoned),
+                "{abandoned} belongs to the transaction; a handler copy is an uncompensated \
+                 second acquisition"
             );
         }
     }
