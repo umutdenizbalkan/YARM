@@ -149660,3 +149660,420 @@ mod stage199a2drr_terminal_reuse {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DIRECT3-CAP-FINAL §4 — the CAP-BEARING reply lane.
+//
+// The lane's whole reason to exist is an ordering claim: materializing the transferred
+// capability and copying the caller's payload and metadata are the last steps that can still
+// fail, so the reply must not settle until both have succeeded. These pin that claim from
+// both ends — the settlement's internal order, and the fact that every failure arm hands the
+// reply back re-sendable instead of spending it.
+mod direct3_cap_final_reply_lane {
+    use super::*;
+    use crate::kernel::boot::{ReplyAuthoritySlots, ReplyRecordReservation};
+    use crate::kernel::capabilities::{CapId, CapObject};
+    use crate::kernel::dispatch_post_work::ReplyTerminalContinuation;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const POSTWORK: &str = include_str!("../dispatch_post_work.rs");
+
+    struct Fx {
+        k: SharedKernel,
+        index: usize,
+        generation: u64,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    }
+
+    /// A committed, externally-invokable reply record with its terminal armed — the state a
+    /// cap-bearing reply finds when its caller is committed-blocked.
+    fn fixture() -> Fx {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (index, generation, caller, replier) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("casid");
+            let (sasid, _sp) = s.create_user_address_space().expect("sasid");
+            s.bind_task_asid(1, casid).expect("bind1");
+            s.bind_task_asid(2, sasid).expect("bind2");
+            let (_e, _snd, _rcv) = s.create_endpoint(4).expect("ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            let (index, generation) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("record");
+            assert!(s.commit_direct_reply_record(index, generation));
+            (index, generation, caller, replier)
+        });
+        Fx {
+            k,
+            index,
+            generation,
+            caller,
+            replier,
+        }
+    }
+
+    impl Fx {
+        fn identity(&self) -> TerminalIdentity {
+            TerminalIdentity {
+                reply_record_index: self.index,
+                reply_record_generation: self.generation,
+                caller_tid: self.caller.tid,
+                caller_asid: self.caller.asid,
+                replier_tid: self.replier.tid,
+                replier_asid: self.replier.asid,
+                reply_endpoint_index: 0,
+                reply_endpoint_generation: 1,
+                blocked_recv_generation: 1,
+                deadline_token_generation: Some(1),
+            }
+        }
+
+        /// Reserve the record and win the terminal, exactly as the lane's syscall half does.
+        fn claim(&self) -> ReplyTerminalContinuation {
+            let id = self.identity();
+            self.k.with(|s| s.arm_reply_terminal(self.index, id));
+            assert!(self.k.reserve_existing_reply_record_split(
+                self.index,
+                self.generation,
+                self.replier
+            ));
+            let owner = self
+                .k
+                .with(|s| s.try_claim_reply_terminal_slot(self.index, TerminalClaimant::Reply, &id))
+                .expect("the reply wins its own armed terminal");
+            ReplyTerminalContinuation {
+                record_index: self.index,
+                record_generation: self.generation,
+                terminal_owner: owner,
+                authority: ReplyAuthoritySlots {
+                    reply_object: CapObject::Reply {
+                        index: self.index,
+                        generation: self.generation,
+                    },
+                    replier_cap: None,
+                    caller_cap: CapId(0),
+                    caller_tid: self.caller.tid,
+                },
+                replier: self.replier,
+                caller: self.caller,
+            }
+        }
+
+        fn reservation(&self) -> Option<ReplyRecordReservation> {
+            self.k.with(|s| s.reply_cap_record_reservation(self.index))
+        }
+        fn terminal_open(&self) -> bool {
+            self.k.with(|s| s.reply_terminal_is_open(self.index))
+        }
+        fn terminal_winner(&self) -> Option<TerminalClaimant> {
+            self.k
+                .with(|s| s.reply_terminal_committed_winner(self.index))
+        }
+        fn epoch(&self) -> u64 {
+            self.k
+                .with(|s| s.reply_terminal_epoch(self.index))
+                .expect("epoch")
+        }
+    }
+
+    /// SUCCESS: the reply settles only as a whole — record consumed, authority reclaimed,
+    /// terminal committed, slot released — leaving nothing for a second reply to claim.
+    #[test]
+    fn a_delivered_cap_reply_settles_its_record_terminal_and_slot_together() {
+        let fx = fixture();
+        let k = fx.claim();
+        assert_eq!(fx.reservation(), Some(ReplyRecordReservation::Reserved));
+
+        fx.k.settle_delivered_reply_continuation_split(&k);
+
+        assert_eq!(
+            fx.reservation(),
+            None,
+            "the slot must be released, not left Consumed: only an absent slot is reusable"
+        );
+        assert_eq!(
+            fx.terminal_winner(),
+            Some(TerminalClaimant::Reply),
+            "the terminal is committed by the exact owner the syscall claimed"
+        );
+    }
+
+    /// FAILURE: every executor failure hands the reply back RE-SENDABLE. Nothing is consumed,
+    /// revoked or released, so the replier may simply reply again — which is the entire reason
+    /// the lifecycle is deferred rather than settled under the syscall.
+    #[test]
+    fn a_failed_cap_reply_is_handed_back_re_sendable() {
+        let fx = fixture();
+        let k = fx.claim();
+        let epoch_before = fx.epoch();
+
+        fx.k.restore_retryable_reply_continuation_split(&k, "user_copy");
+
+        assert_eq!(
+            fx.reservation(),
+            Some(ReplyRecordReservation::Available),
+            "the reply authority must be externally invokable again"
+        );
+        assert!(fx.terminal_open(), "and its terminal claimable again");
+        assert_eq!(
+            fx.epoch(),
+            epoch_before,
+            "released at the SAME epoch — a release is not a re-arm"
+        );
+        assert_eq!(fx.terminal_winner(), None, "nothing was settled");
+
+        // Proof it is genuinely re-sendable: the whole claim succeeds a second time.
+        let again = fx.claim();
+        fx.k.settle_delivered_reply_continuation_split(&again);
+        assert_eq!(fx.reservation(), None);
+        assert_eq!(fx.terminal_winner(), Some(TerminalClaimant::Reply));
+    }
+
+    /// DUPLICATE REPLY: once settled, the record is gone and its terminal is Completed, so a
+    /// second reply naming the same incarnation can neither reserve it nor claim its terminal.
+    #[test]
+    fn a_duplicate_cap_reply_can_neither_reserve_nor_claim() {
+        let fx = fixture();
+        let k = fx.claim();
+        fx.k.settle_delivered_reply_continuation_split(&k);
+
+        assert!(
+            !fx.k
+                .reserve_existing_reply_record_split(fx.index, fx.generation, fx.replier),
+            "a released record cannot be reserved again"
+        );
+        let id = fx.identity();
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(fx.index, TerminalClaimant::Reply, &id))
+                .is_none(),
+            "and its terminal is settled, so no second claimant wins"
+        );
+    }
+
+    /// REUSED SLOT: a continuation from a previous incarnation cannot settle the record that
+    /// recycled its slot. Every step is exact on the record generation and on the terminal
+    /// owner's epoch, both of which advanced.
+    #[test]
+    fn a_stale_continuation_cannot_settle_a_recycled_slot() {
+        let fx = fixture();
+        let stale = fx.claim();
+        fx.k.settle_delivered_reply_continuation_split(&stale);
+        assert_eq!(fx.reservation(), None);
+
+        // The slot is recycled into a new incarnation and committed invokable.
+        let (new_index, new_generation) =
+            fx.k.with(|s| {
+                let r = s.reserve_direct_reply_record(
+                    fx.caller,
+                    fx.replier,
+                    CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                );
+                if let Ok((i, g)) = r {
+                    assert!(s.commit_direct_reply_record(i, g));
+                }
+                r
+            })
+            .expect("recycled");
+        assert_eq!(new_index, fx.index, "the freed slot is the one reused");
+        assert!(new_generation > fx.generation);
+
+        // The stale continuation settles NOTHING on the new incarnation.
+        fx.k.settle_delivered_reply_continuation_split(&stale);
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(new_index)),
+            Some(ReplyRecordReservation::Available),
+            "the new incarnation must be untouched by the old reply's continuation"
+        );
+        assert_eq!(
+            fx.terminal_winner(),
+            None,
+            "and its terminal must not be committed by a stale owner token"
+        );
+    }
+
+    /// The authority the lane reclaims is EXACT on the reply object, so settling one reply can
+    /// never revoke a capability that a recycled slot handed to somebody else.
+    #[test]
+    fn settlement_never_revokes_an_unrelated_reused_capability() {
+        let fx = fixture();
+        let mut k = fx.claim();
+        // Point the continuation's authority at a DIFFERENT reply object, as a stale
+        // continuation against a recycled slot would.
+        k.authority.reply_object = CapObject::Reply {
+            index: fx.index,
+            generation: fx.generation + 41,
+        };
+        k.authority.replier_cap = Some(CapId(4242));
+        let reclaim =
+            fx.k.reclaim_reply_authority_split(k.authority, fx.replier.tid.0);
+        assert!(
+            !reclaim.replier_revoked,
+            "a slot whose object does not match the expected reply object is never revoked"
+        );
+    }
+
+    /// SOURCE ORDER, executor: materialize → copy → settle. The settlement must sit after the
+    /// copy-success gate and before the wake, and every failure arm must restore.
+    #[test]
+    fn the_executor_settles_only_after_the_materialize_and_both_copies() {
+        let body = RUNTIME
+            .split("fn execute_blocked_waiter_ordinary_cap_delivery(")
+            .nth(1)
+            .expect("the ordinary-cap executor");
+        let body = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        let materialize = body
+            .find("materialize_received_message_cap_routed_with_delegation_split(")
+            .expect("the materialize");
+        let copy_gate = body.find("if !copy_ok {").expect("the copy gate");
+        let settle = body
+            .find("settle_delivered_reply_continuation_split(")
+            .expect("the settlement");
+        let wake = body
+            .find("complete_blocked_waiter_delivery_split(")
+            .expect("the wake");
+        assert!(materialize < copy_gate, "materialize precedes the copy");
+        assert!(
+            copy_gate < settle,
+            "the reply settles only after BOTH user copies have succeeded"
+        );
+        assert!(settle < wake, "and strictly before the caller is woken");
+
+        // Every failure arm restores: three in this executor (unexpected object, materialize,
+        // user copy). None of them may settle.
+        assert_eq!(
+            body.matches("restore_retryable_reply_continuation_split(")
+                .count(),
+            3,
+            "each of the three failure arms hands the reply back re-sendable"
+        );
+        assert_eq!(
+            body.matches("settle_delivered_reply_continuation_split(")
+                .count(),
+            1,
+            "and there is exactly one settlement, on the success path"
+        );
+    }
+
+    /// SOURCE ORDER, settlement: consume → reclaim → commit → link → release.
+    #[test]
+    fn the_settlement_orders_the_barrier_before_the_revoke_and_the_commit_before_the_release() {
+        let body = RUNTIME
+            .split("fn settle_delivered_reply_continuation_split(")
+            .nth(1)
+            .expect("the settlement owner");
+        let body = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        let consume = body
+            .find("consume_reply_record_split(")
+            .expect("the barrier");
+        let reclaim = body
+            .find("reclaim_reply_authority_split(")
+            .expect("the authority reclaim");
+        let commit = body
+            .find("commit_direct_reply_terminal_split(")
+            .expect("the terminal commit");
+        let link = body
+            .find("finalize_server_reply_link_for_record_split(")
+            .expect("the link close");
+        let release = body
+            .find("release_consumed_reply_record_split(")
+            .expect("the slot release");
+        assert!(
+            consume < reclaim,
+            "the barrier precedes the authority revoke"
+        );
+        assert!(
+            reclaim < commit,
+            "the authority is reclaimed before the commit"
+        );
+        assert!(
+            commit < release,
+            "the slot is released only after the commit"
+        );
+        assert!(
+            link < release,
+            "and the link closes while the record still resolves"
+        );
+    }
+
+    /// The syscall half claims and settles NOTHING: no commit, no revoke, no release before
+    /// the drain. That is the correction this lane exists to honour.
+    #[test]
+    fn the_syscall_half_never_settles_the_reply() {
+        let lane = SPLIT
+            .split("DirectReplyMode::DeliverBlockedWithCap {")
+            .nth(1)
+            .expect("the capability lane");
+        let lane = &lane[..lane
+            .find("} else if mode ==")
+            .expect("the lane ends at the queued branch")];
+        assert!(
+            lane.contains("claim_direct_reply_terminal_split("),
+            "the lane claims the terminal under the syscall"
+        );
+        for forbidden in [
+            "commit_direct_reply_terminal_split(",
+            "reclaim_reply_authority_split(",
+            "consume_reply_record_split(",
+            "release_consumed_reply_record_split(",
+            "finalize_server_reply_link_for_record_split(",
+        ] {
+            assert!(
+                !lane.contains(forbidden),
+                "the syscall half must not `{forbidden}` — materialization has not run yet"
+            );
+        }
+        // It hands the whole lifecycle over instead.
+        assert!(lane.contains("ReplyTerminalContinuation {"));
+        assert!(lane.contains("produce_blocked_waiter_ordinary_cap_delivery_split("));
+        // And it never falls back to the broad dispatcher after a consuming step.
+        assert!(
+            !lane.contains("with_cpu("),
+            "no broad fallback anywhere in the capability lane"
+        );
+    }
+
+    /// The continuation carries the identities the executor needs to be exact, and reaches it
+    /// through the ONE snapshot assembler rather than a second construction site.
+    #[test]
+    fn the_continuation_carries_exact_identities_through_one_assembler() {
+        let decl = POSTWORK
+            .split("pub(crate) struct ReplyTerminalContinuation {")
+            .nth(1)
+            .expect("the continuation");
+        let decl = &decl[..decl.find("\n}").expect("bounded")];
+        for field in [
+            "record_index",
+            "record_generation",
+            "terminal_owner",
+            "authority",
+            "replier",
+            "caller",
+        ] {
+            assert!(decl.contains(field), "the continuation must carry {field}");
+        }
+        // One construction site for the snapshot: the shared plan.
+        assert_eq!(
+            RUNTIME
+                .matches("BlockedWaiterOrdinaryCapDeliverySnapshot {")
+                .count(),
+            0,
+            "the split producer must not build the snapshot itself"
+        );
+    }
+}

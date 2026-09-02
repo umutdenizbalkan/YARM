@@ -7546,7 +7546,7 @@ impl SharedKernel {
     /// so the slot is handed back to the allocator only once its cell is `Completed` and can
     /// no longer be armed over a live claim. The reverse link closes while the record is still
     /// present, because closing it resolves the responder FROM that record.
-    fn settle_delivered_reply_continuation_split(
+    pub(crate) fn settle_delivered_reply_continuation_split(
         &self,
         k: &crate::kernel::dispatch_post_work::ReplyTerminalContinuation,
     ) {
@@ -7588,7 +7588,7 @@ impl SharedKernel {
     /// makes this a genuine retry rather than a lost reply. The transfer envelope was consumed
     /// by the producer, but the replier's own source capability was only ever RESOLVED, never
     /// taken — so it is still theirs to send.
-    fn restore_retryable_reply_continuation_split(
+    pub(crate) fn restore_retryable_reply_continuation_split(
         &self,
         k: &crate::kernel::dispatch_post_work::ReplyTerminalContinuation,
         reason: &str,
