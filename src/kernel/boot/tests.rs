@@ -43659,13 +43659,53 @@ mod stage160c_aarch64_trap_abi_bracketing {
     fn stage160c_exports_and_advances_on_handled_split() {
         assert_eq!(
             TRAP_ENTRY_SRC
-                .matches("finalize_split_handled_syscall(shared, cpu, entering, frame)")
-                .count(),
+                .matches("finalize_split_handled_syscall(")
+                .count()
+                - TRAP_ENTRY_SRC
+                    .matches("fn finalize_split_handled_syscall(")
+                    .count(),
             4,
             "finalize must run on the Ok, handled-error, queue-advance-committed and \
              post-work-committed arms — 199G-C4 §2 added the fourth, and it is CONDITIONAL: a \
              send that delivered or enqueued finished its caller's syscall, while one that is \
              about to park it must not advance its SVC or export a result on its behalf"
+        );
+        // A64-DEPTH: each arm now states WHY it finalizes, and that is the property that broke.
+        // The AArch64 gate used to be a hand-maintained list of syscall numbers while claiming to
+        // mean "the split dispatcher handled it"; a class admitted to the route and to the ABI
+        // import but forgotten here had its result silently discarded. The two COMPLETED arms
+        // must always commit; the two PUBLISHED-TRANSITION arms keep the per-class question,
+        // because for them a later drain may be the one that delivers the result.
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("SplitFinalizeReason::CompletedInThisTrap,")
+                .count(),
+            2,
+            "the Complete(Ok) and Complete(Err) arms finalize unconditionally — a completed \
+             syscall's result exists now and no later drain will deliver it"
+        );
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("SplitFinalizeReason::PublishedTransition,")
+                .count(),
+            2,
+            "the queue-advance and post-work arms published a transition, not a result"
+        );
+        // And the owner must branch on the REASON before it ever consults a syscall number.
+        let owner = TRAP_ENTRY_SRC
+            .split("fn finalize_split_handled_syscall(\n    shared:")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the aarch64 finalize owner");
+        let reason_gate = owner
+            .find("matches!(reason, SplitFinalizeReason::CompletedInThisTrap)")
+            .expect("the reason gate");
+        let nr_gate = owner
+            .find("frame.syscall_num() ==")
+            .expect("the per-class list");
+        assert!(
+            reason_gate < nr_gate,
+            "a completed syscall must commit its ABI before any syscall-number question is asked"
         );
         // Each of the three is reached from its own disposition arm, not from a shared prelude.
         let committed = TRAP_ENTRY_SRC
