@@ -151830,3 +151830,101 @@ mod u9spawn1_nr11_terminal_edges {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A64-DEPTH — the two boundaries that made AArch64's live evidence unobtainable.
+//
+// Both were mine, both silent, and both presented as something other than what they were: the
+// first as "a boot-depth fact about the workload", the second as a hang inside `spawn_thread`.
+mod a64depth_writeback_and_selector {
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const FT4_ABI: &str =
+        include_str!("../../../crates/yarm-ipc-abi/src/terminal_fault_oracle_abi.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const BOOT: &str = include_str!("mod.rs");
+
+    /// The writeback gate must ask WHY it was called, never WHICH syscall this is. An NR list
+    /// here is a second admission surface that every future class must remember to update, and
+    /// forgetting it discards the syscall's result in total silence.
+    #[test]
+    fn the_writeback_gate_is_keyed_on_the_reason_not_the_syscall_number() {
+        let owner = TRAP_ENTRY
+            .split("fn finalize_split_handled_syscall(\n    shared:")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the aarch64 finalize owner");
+        let reason = owner
+            .find("matches!(reason, SplitFinalizeReason::CompletedInThisTrap)")
+            .expect("the reason gate");
+        // A completed syscall commits before any syscall-number question is asked.
+        match owner.find("frame.syscall_num() ==") {
+            Some(nr) => assert!(
+                reason < nr,
+                "a completed syscall must commit its ABI before any per-class list is consulted"
+            ),
+            None => {}
+        }
+        // The per-class list that remains may only govern the DEFERRED case.
+        assert!(
+            owner[..reason].find("frame.syscall_num() ==").is_none(),
+            "no syscall-number test may precede the reason gate"
+        );
+    }
+
+    /// Every class the AArch64 ABI import admits must be able to reach a writeback. This is the
+    /// invariant whose absence broke NR 28: admitted to the route and to the import, forgotten
+    /// at the finalize, result discarded.
+    #[test]
+    fn every_imported_nr_can_reach_a_writeback() {
+        // The import list and the finalize gate are no longer parallel lists to keep in sync —
+        // the finalize is reason-keyed, so an imported NR that COMPLETES always writes back.
+        for nr in [
+            "SYSCALL_DEBUG_LOG_NR",
+            "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
+            "SYSCALL_SPAWN_THREAD_NR",
+        ] {
+            assert!(
+                TRAP_ENTRY.contains(&alloc::format!("raw_nr == crate::kernel::syscall::{nr}")),
+                "{nr} is imported on AArch64"
+            );
+        }
+        assert!(
+            TRAP_ENTRY.contains("SplitFinalizeReason::CompletedInThisTrap"),
+            "and a completed syscall's writeback is unconditional"
+        );
+    }
+
+    /// Slot 5 is mutually exclusive. Its two authoritative tables must not overlap, and no
+    /// production arm may match a slot-5 value with a bare literal — the exact shape that let
+    /// the terminal-fault oracle and the AArch64 ExitCurrentTask oracle both claim 21.
+    #[test]
+    fn the_slot5_selectors_have_owners_and_do_not_overlap() {
+        assert!(
+            FT4_ABI.contains("pub const AARCH64_TERMINAL_FAULT_SELECTOR: usize = 23;"),
+            "the terminal-fault selector has a single declared owner"
+        );
+        assert!(
+            BOOT.contains(
+                "yarm_ipc_abi::terminal_fault_oracle_abi::AARCH64_TERMINAL_FAULT_SELECTOR as u64"
+            ),
+            "and the kernel writes it from that owner, not from a literal"
+        );
+        // Userspace decodes rather than comparing a literal.
+        assert!(
+            INIT_SRC
+                .contains("yarm_ipc_abi::terminal_fault_oracle_abi::terminal_fault_scenario_for"),
+            "init must DECODE the terminal-fault selector"
+        );
+        assert!(
+            !INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(21)"),
+            "the bare literal that collided with the ExitCurrentTask block must not come back"
+        );
+        // And the two tables carry the cross-check between them.
+        assert!(
+            FT4_ABI.contains("fn it_does_not_collide_with_the_exit_block()"),
+            "the owner must assert it cannot collide with the reserved exit selectors"
+        );
+    }
+}
