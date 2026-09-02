@@ -304,7 +304,7 @@ logic.
 - Image IDs `7..=9` (`driver_manager`, `blkcache_srv`,
   `virtio_blk_srv`): after the bootstrap VFS chain is live, PM uses
   canonical initramfs paths and VFS `STATX → OPENAT → READ* → CLOSE`,
-  then spawns via `spawn_process_from_user_buf`.
+  then spawns via the MemoryObject zero-copy grant path.
 - PM performs VFS-backed `7..=9` loads only when explicitly given a
   `vfs_server` request SEND cap (passed from init in SpawnV5 service
   caps slot 0). Missing cap → truthful spawn failure.

@@ -7013,3 +7013,105 @@ process CNode, and no rank-4 owner can do that off the broad lock.**
 `ensure_cnode_space_with_slots` and `set_process_cnode_for_pid` have no split variant and no
 presence in `src/runtime.rs`. NR 11 is routed precisely because a thread joins its parent's
 EXISTING CNode and declines before mutating when it is absent; NR 23 always creates one.
+
+## U9-SPAWN2 — the byte-copy spawn fallback, the process-CNode transaction, and the NR 23 stop
+
+Base `origin/main = 63b1706`. Census `2 / 0 / 2` before and after. U9 remains OPEN.
+
+### §1 — the fallback, removed at its root
+
+`pm_vfs_spawn_inline` carved image 13 out of the mandatory zero-copy grant path and read the whole
+image through VFS into a user buffer for `SpawnProcessFromUserBuf` (NR 24). The carve-out's own
+runtime diagnostic named the cause: the kernel's image path table had no entry for image 13, so
+NR 29 could not spawn it. That is an omission, not a policy — so the repair is the table entry,
+not a deleted branch.
+
+| | before | after |
+|---|---|---|
+| `SUPERVISOR_CRASH_RESTART_BASELINE` | `result=ok` | `result=ok` |
+| `PM_VFS_SPAWN_RESULT` (NR 24 calls) | 4 | **0** |
+| `kernel-path-table-lacks-image13` | 4 | **0** |
+| `SPAWN_FROM_MO_ENTER` / `_OK` | 5 / 5 | **9 / 9** |
+| `PM_ELF_ZC_DONE` | 5 | **9** |
+| panics | 0 | 0 |
+
+The four byte-copy spawns became four grant spawns and the oracle's verdict is unchanged
+(`fault_observed=1 supervisor_notified=1 restart_observed=1 stale_reply_objects=0`). Default core
+smokes are untouched on all three architectures.
+
+What replaces the fallback is one typed `ProcessManagerError::Unsupported` with the existing
+`PM_ELF_ZC_REQUIRED_FAIL` / `BOOT_FATAL_ZC_ELF_LOAD_FAILED` diagnostics. No second syscall, no
+retry, and nothing to unwind: the refusal sits before any resource is requested.
+
+NR 24 then had zero production callers and was retired like 26 and 27 — number permanently
+reserved, invocation refused pre-lock. Four things died with it: PM's `pm_read_all_via_vfs`, the
+`kernel_spawn_policy_image_id_for_vfs_spawn` remap that existed only to give the byte-copy route a
+kernel-recognised image id, its constant, and the kernel's 128 KB `VFS_ELF_STAGING` static buffer,
+whose only two users were the two retired byte-copy syscalls.
+
+The guard U9-ASPACE1 §2 left behind is what forced this to be an audit rather than an assumption:
+it pinned PM as the caller retaining NR 24, so removing that caller broke the build and demanded a
+re-audit instead of a quiet deletion.
+
+### §2 — one process-CNode transaction
+
+Two mutations that must both happen or neither — create the CNode space, associate it with the
+owning PID — were two independent rank-4 entries. A `TaskTableFull` from the association left a
+space provisioned for a process that did not exist, and nothing removed it.
+
+They are now one rank-4 acquisition. That is the mechanism, and it is what makes the guarantees
+real: no observer can see a space belonging to nobody or an association naming a space that was
+never created, because the intermediate state has no observer rather than a brief one. The PID is
+a field of the request, taken from the caller's spawn arguments — no ambient `current_tid()`
+fallback, nothing fabricated.
+
+`ProcessCNodeGrant` records what was created, because "undo this" is not "remove the CNode": a
+thread joining its parent's process creates nothing, so its compensation removes nothing. A stale
+grant naming a CNode that now belongs to another process is refused. Capabilities minted into the
+space afterwards are deliberately not owned here — they belong to the spawn ledger's
+`revoke_capability_in_cnode`.
+
+The broad reservation delegates to it and compensates on every later failure, including the
+kernel-context provisioning failure that previously left both the reservation slot and the CNode
+behind.
+
+**Correction to SP-4.** Its blocker note said `ensure_cnode_space_with_slots` and
+`set_process_cnode_for_pid` "have no split variant and no presence in `runtime.rs`". The first
+half was wrong: `ensure_cnode_space_locked` already existed as a rank-4-only owner with an
+off-lock entry (`ensure_cnode_space_split`). The audit had grepped for the BROAD wrapper's name.
+Only the PID association genuinely lacked a rank-local sibling, which is why §2 is a bounded
+extraction rather than a subsystem.
+
+### §3 — the live NR 23 / NR 29 route: HARD STOP
+
+Recomputed after §2. Seven phases remain, and **none** has a rank-local owner — no `_locked`
+sibling taking its subsystem, no split entry:
+
+| phase | ranks | rank-local owner |
+|---|---|---|
+| `create_user_address_space` | VM 5 + capability 4 | none |
+| `load_elf_pt_load_segments` | VM 5 + memory 6 | none |
+| `load_elf_with_mo_zero_copy` | VM 5 + memory 6 | none |
+| `allocate_user_stack_with_guard` | VM 5 | none |
+| `create_endpoint` | IPC 3 + capability 4 | none |
+| `grant_capability_task_to_task_with_rights` | capability 4 | none |
+| `provision_default_kernel_context` | task 2 | none |
+
+They group into **four** genuinely new subsystems: an off-lock VM address-space / ELF-load /
+user-stack provisioner (with its frame allocation, page-table mutation and shootdown ordering),
+off-lock endpoint creation, off-lock cross-cspace delegation, and off-lock task
+reservation/commit. The stop condition was more than one.
+
+So the route was not started, and nothing was banked for it: the §2 split wrappers written in
+anticipation were removed rather than left as dormant API with no caller. A guard asserts they
+stay absent, and another asserts each of the seven phases still lacks a rank-local owner — so when
+one grows the shape §2's transaction has, the phase table gets recomputed instead of this note
+going stale.
+
+### The next exact residual owner
+
+An **off-lock VM address-space provisioner**: one rank-local owner able to create an address
+space, load an image into it and allocate its user stack, taking `&mut` its subsystem so an
+acquisition wrapper can drive it from either side. It is the largest of the four and gates three
+of the seven phases; the other three subsystems are smaller but none is a bounded extraction of
+existing policy today.

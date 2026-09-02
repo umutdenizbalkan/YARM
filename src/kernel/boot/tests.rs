@@ -27284,7 +27284,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -36430,7 +36430,7 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -38507,7 +38507,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38634,7 +38634,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38809,7 +38809,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38966,7 +38966,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39099,7 +39099,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39262,7 +39262,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39444,7 +39444,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39668,7 +39668,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39904,7 +39904,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40021,7 +40021,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40156,7 +40156,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40352,7 +40352,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40788,7 +40788,7 @@ mod stage148_decomposition_map {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 22,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41232,7 +41232,7 @@ mod stage150_ipc_abi_extraction {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 22,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41463,7 +41463,7 @@ mod stage151_ipc_abi_boundary_audit {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 22,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41599,7 +41599,7 @@ mod stage152_syscall_decomposition_completeness_audit {
         );
     }
 
-    // 5. Syscall::VARIANT_COUNT == 23 preserved.
+    // 5. Syscall::VARIANT_COUNT == 22 preserved.
     #[test]
     fn stage152_variant_count_is_23() {
         assert!(
@@ -74416,7 +74416,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -74829,7 +74829,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -74989,7 +74989,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -75058,7 +75058,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -75613,7 +75613,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -75847,7 +75847,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -76089,7 +76089,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -76142,7 +76142,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -76604,7 +76604,7 @@ mod stage197b_nr27_removed_zc_mandatory {
             Err(SyscallError::InvalidNumber)
         ));
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(Syscall::VARIANT_COUNT, 23);
+        assert_eq!(Syscall::VARIANT_COUNT, 22);
         // Needles are split so these assertions do not match themselves via include_str!.
         let variant_decl = concat!("InitramfsRead", "Chunk = ");
         let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
@@ -77010,7 +77010,7 @@ mod stage197b_riscv_typed_idle_outcome {
     #[test]
     fn baseline_and_cohort_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         assert!(matches!(
             crate::kernel::syscall::Syscall::decode(27),
             Err(crate::kernel::syscall::SyscallError::InvalidNumber)
@@ -98673,7 +98673,6 @@ mod stage200d0a_exit_foundation {
             (14, Syscall::VmBrk),
             (15, Syscall::DebugLog),
             (23, Syscall::SpawnProcess),
-            (24, Syscall::SpawnProcessFromUserBuf),
             (28, Syscall::CreateInitramfsFileSliceMo),
             (29, Syscall::SpawnFromMemoryObject),
             (30, Syscall::RecvSharedV3),
@@ -98687,7 +98686,7 @@ mod stage200d0a_exit_foundation {
     /// behaviour is unchanged. 26 joins 27 here: U9-ASPACE1 §2 retired it.
     #[test]
     fn d03_nr27_and_free_numbers_remain_unassigned() {
-        for free in [17usize, 18, 19, 20, 21, 22, 25, 26, 27] {
+        for free in [17usize, 18, 19, 20, 21, 22, 24, 25, 26, 27] {
             assert!(
                 Syscall::decode(free).is_err(),
                 "number {free} must remain unassigned"
@@ -98711,8 +98710,8 @@ mod stage200d0a_exit_foundation {
     /// enum's own declaration count parsed from source.
     #[test]
     fn d04_variant_list_is_exhaustive_and_derived() {
-        assert_eq!(Syscall::VARIANT_COUNT, 23);
-        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 23);
+        assert_eq!(Syscall::VARIANT_COUNT, 22);
+        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 22);
         assert!(
             SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
         );
@@ -99696,7 +99695,7 @@ mod stage200d0b3_x86_exit_corrected {
         assert!(b.contains("EXIT_TASK_RESTORE_OWNER_PREPARED"));
         assert!(b.contains("EXIT_TASK_ABSENCE_VALIDATED arch=x86_64"));
         // No new task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
     }
 
     // ── feature gating (22) ─────────────────────────────────────────────────────────
@@ -100813,7 +100812,7 @@ mod stage200d0c1_aarch64_exit_prep {
             "offline-CPU refusal is preserved by the transaction"
         );
         // No general-purpose task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
     }
 
     // ── U3 (canonical 203C): the validation reacquisition retirement ────────────────
@@ -101998,7 +101997,7 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(txn.contains("Some(bound) => bound == asid,"));
         assert!(c.contains("identity=tid_asid"));
         assert!(c.contains("frame_source=0"));
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
     }
 
     // ── 29–32: runner static contract and feature-off ───────────────────────────────
@@ -152418,15 +152417,15 @@ mod u9spawn1_sp3_spawn_ledger {
     }
 
     /// Every image-loading spawn syscall delegates; none keeps a second, uncompensated copy of
-    /// the transaction. Three since U9-ASPACE1 §2 retired NR 26.
+    /// the transaction. Two since U9-ASPACE1 §2 retired NR 26 and U9-SPAWN2 §1 retired NR 24.
     #[test]
     fn every_spawn_syscall_delegates_to_the_one_transaction() {
         assert_eq!(
             PROCESS_SRC
                 .matches("spawn_image_txn::run_image_spawn_transaction(")
                 .count(),
-            3,
-            "NR 23, NR 24 and NR 29 all commit through the one compensated transaction"
+            2,
+            "NR 23 and NR 29 both commit through the one compensated transaction"
         );
         for abandoned in [
             "create_user_address_space",
@@ -152844,23 +152843,33 @@ mod u9aspace1_nr26_retired {
         "../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
     );
 
-    /// NR 24 is RETAINED, and this is the dependency that retains it. If PM ever stops calling
-    /// it, this test is the place that says so out loud.
+    /// NR 24 is now retired too, and the guard that used to retain it is why.
+    ///
+    /// U9-ASPACE1 §2 kept NR 24 because PM's VFS spawn called it, and pinned that caller in an
+    /// assertion so the dependency could not quietly evaporate. U9-SPAWN2 §1 removed the caller —
+    /// and this test stopped compiling, which is exactly what it was for: the retirement got
+    /// re-audited rather than the assertion silently deleted.
     #[test]
-    fn nr24_is_retained_because_pm_still_calls_it() {
+    fn nr24_is_gone_along_with_the_caller_that_retained_it() {
+        assert!(Syscall::decode(24).is_err(), "NR 24 must not decode");
         assert!(
-            PM_SRC.contains("yarm_user_rt::syscall::spawn_process_from_user_buf("),
-            "NR 24's production caller is PM's VFS spawn fallback; if it is gone, re-run the \
-             retirement audit rather than deleting this assertion"
-        );
-        assert_eq!(
-            Syscall::decode(24),
-            Ok(Syscall::SpawnProcessFromUserBuf),
-            "NR 24 stays live"
+            !ALL_SYSCALL_VARIANTS.iter().any(|v| v.number() == 24),
+            "no variant may claim NR 24"
         );
         assert!(
-            USER_RT_SRC.contains("pub unsafe fn spawn_process_from_user_buf("),
-            "and its userspace wrapper stays"
+            !PM_SRC.contains("spawn_process_from_user_buf"),
+            "PM must not have regrown a byte-copy spawn caller"
+        );
+        assert!(
+            !USER_RT_SRC.contains("spawn_process_from_user_buf"),
+            "and the userspace wrapper that was the only way to name it must be gone"
+        );
+        // The carve-out that kept the fallback alive is gone at its root: the kernel image path
+        // table now resolves image 13, so PM has no reason to route it around the grant path.
+        const KERNEL_PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+        assert!(
+            KERNEL_PROCESS_SRC.contains("13 => Some(\"sbin/crash_test_srv\")"),
+            "image 13 must be grant-eligible, or the byte-copy fallback has a reason to return"
         );
     }
 
@@ -152929,7 +152938,10 @@ mod u9aspace1_nr26_retired {
         // Both retirements to date are listed, and a live number is never mistaken for one.
         let listed: alloc::vec::Vec<usize> =
             RETIRED_SYSCALL_NUMBERS.iter().map(|(nr, _)| *nr).collect();
-        assert!(listed.contains(&26) && listed.contains(&27), "26 and 27");
+        assert!(
+            listed.contains(&24) && listed.contains(&26) && listed.contains(&27),
+            "24, 26 and 27"
+        );
         for live in ALL_SYSCALL_VARIANTS.iter() {
             assert!(
                 retired_syscall_number(live.number()).is_none(),
@@ -152974,17 +152986,464 @@ mod u9aspace1_nr26_retired {
     fn the_shared_spawn_owners_survived_the_retirement() {
         const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
         for owner in [
-            "static VFS_ELF_STAGING",
             "fn spawn_image_path_for_image_id",
             "fn normalized_startup_args",
             "fn copy_spawn_startup_args",
             "fn handle_spawn_process(",
-            "fn handle_spawn_process_from_user_buf(",
             "fn handle_spawn_from_memory_object(",
         ] {
             assert!(
                 PROCESS_SRC.contains(owner),
-                "{owner} is shared with NR 23/24/29 and must not have been removed with NR 26"
+                "{owner} is shared with NR 23/29 and must not have been removed with a retirement"
+            );
+        }
+        // The 128 KB ELF staging buffer was NOT shared: its only two users were the byte-copy
+        // spawn syscalls, and with both retired the kernel no longer carries it.
+        assert!(
+            !PROCESS_SRC.contains("static VFS_ELF_STAGING"),
+            "the staging buffer outlived both of its users"
+        );
+    }
+}
+
+/// U9-SPAWN2 §1 — the byte-copy spawn fallback is gone, and so is the syscall it called.
+///
+/// The audit chain matters here. U9-ASPACE1 §2 kept NR 24 because PM's VFS spawn called it, and
+/// pinned that caller so the dependency could not quietly evaporate. This section removed the
+/// caller — at its root, not by deleting a branch: the carve-out existed only because the kernel
+/// image path table lacked image 13, so the table got the entry and image 13 joined the same
+/// mandatory grant path as every other gated image.
+#[cfg(test)]
+mod u9spawn2_nr24_fallback_removed {
+    use super::*;
+    use crate::kernel::syscall::{RETIRED_SYSCALL_NUMBERS, Syscall, retired_syscall_number};
+
+    const PM_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+    );
+    const KERNEL_PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+
+    /// The grant path is the ONLY spawn route out of `pm_vfs_spawn_inline`. Both of its exits —
+    /// a grant failure and a request that is not grant-eligible — end in a typed error, and
+    /// neither reaches for a second syscall.
+    #[test]
+    fn every_exit_is_a_typed_error_and_none_is_another_syscall() {
+        let body = PM_SRC
+            .split("unsafe fn pm_vfs_spawn_inline(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the VFS spawn body");
+
+        // Exit 1: the grant path failed. Propagate ITS error, with the fatal ZC diagnostics.
+        assert!(
+            body.contains("PM_ELF_ZC_REQUIRED_FAIL")
+                && body.contains("BOOT_FATAL_ZC_ELF_LOAD_FAILED"),
+            "a grant failure must stay attributable through the existing ZC diagnostic family"
+        );
+        // Exit 2: not grant-eligible. One typed error, same family of diagnostic.
+        assert!(
+            body.contains("err=not-grant-eligible"),
+            "a request that cannot use the grant path must say so, in the same marker family"
+        );
+        assert!(
+            body.contains("Err(ProcessManagerError::Unsupported)"),
+            "and it must be one clear typed error"
+        );
+        // Neither exit issues another spawn syscall. This is the property the fallback broke.
+        for second_syscall in [
+            "spawn_process_from_user_buf",
+            "spawn_from_initramfs_file",
+            "pm_read_all_via_vfs",
+        ] {
+            assert!(
+                !body.contains(second_syscall),
+                "the VFS spawn must not fall back to {second_syscall} — one route, one outcome"
+            );
+        }
+    }
+
+    /// Nothing is half-built when the refusal happens. The refusal sits before any resource is
+    /// requested, so there is no process, address space, capability, endpoint or task to unwind —
+    /// which is why the failure needs no compensation of its own.
+    #[test]
+    fn the_refusal_creates_nothing_to_unwind() {
+        let body = PM_SRC
+            .split("unsafe fn pm_vfs_spawn_inline(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the VFS spawn body");
+        let refusal = body
+            .find("err=not-grant-eligible")
+            .expect("the not-grant-eligible refusal");
+        // Everything that could create state lives in the grant attempt, which returns before it.
+        let grant = body
+            .find("pm_try_grant_ro_and_spawn(")
+            .expect("the grant attempt");
+        assert!(
+            grant < refusal,
+            "the grant attempt must return before the refusal is reachable"
+        );
+        assert!(
+            !body[refusal..].contains("pm_try_grant_ro_and_spawn("),
+            "and nothing may spawn after it"
+        );
+    }
+
+    /// The carve-out is gone at its root, not patched over.
+    #[test]
+    fn image_13_is_grant_eligible_so_the_fallback_has_no_reason_to_return() {
+        assert!(
+            KERNEL_PROCESS_SRC.contains("13 => Some(\"sbin/crash_test_srv\")"),
+            "the kernel image path table must resolve image 13"
+        );
+        assert!(
+            !PM_SRC.contains("kernel-path-table-lacks-image13"),
+            "the diagnostic that justified the fallback must be gone with it"
+        );
+        assert!(
+            !PM_SRC.contains("crash_test_vfs_image"),
+            "and so must the carve-out predicate"
+        );
+    }
+
+    /// NR 24 cannot be invoked at all any more, which makes "fails without invoking NR 24"
+    /// true by construction rather than by inspection.
+    #[test]
+    fn nr24_cannot_be_invoked() {
+        assert!(Syscall::decode(24).is_err(), "NR 24 must not decode");
+        assert_eq!(
+            retired_syscall_number(24),
+            Some("retired in U9-SPAWN2 §1"),
+            "and it must be recorded as retired, not merely absent"
+        );
+        let listed: alloc::vec::Vec<usize> =
+            RETIRED_SYSCALL_NUMBERS.iter().map(|(nr, _)| *nr).collect();
+        assert!(
+            listed.contains(&24) && listed.contains(&26) && listed.contains(&27),
+            "all three byte-copy-era numbers stay reserved: {listed:?}"
+        );
+    }
+}
+
+/// U9-SPAWN2 §2 — one process-CNode transaction, with broad and split acquisitions.
+#[cfg(test)]
+mod u9spawn2_process_cnode_txn {
+    use super::*;
+    use crate::kernel::boot::process_cnode_txn::{ProcessCNodeGrant, ProcessCNodeRequest};
+    use crate::kernel::capabilities::CNodeId;
+    use crate::kernel::task::TaskClass;
+    use crate::runtime::SharedKernel;
+
+    const TXN_SRC: &str = include_str!("process_cnode_txn.rs");
+    const RESERVE_SRC: &str = include_str!("task_policy_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn kernel() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    fn spaces(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_capability_state(|c| c.cnode_spaces.iter().flatten().count()))
+    }
+    fn associations(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_capability_state(|c| c.process_cnodes.iter().flatten().count()))
+    }
+    fn association_for(k: &SharedKernel, pid: u64) -> Option<CNodeId> {
+        k.with(|s| {
+            s.with_capability_state(|c| {
+                c.process_cnodes
+                    .iter()
+                    .flatten()
+                    .find(|r| r.pid == pid)
+                    .map(|r| r.cnode)
+            })
+        })
+    }
+
+    fn request(pid: u64) -> ProcessCNodeRequest {
+        ProcessCNodeRequest {
+            pid,
+            tid: pid,
+            class: TaskClass::SystemServer,
+        }
+    }
+
+    /// The transaction provisions the space AND the association, and reports creating both.
+    #[test]
+    fn a_new_process_gets_a_space_and_an_association_together() {
+        let k = kernel();
+        let (before_spaces, before_assoc) = (spaces(&k), associations(&k));
+        let req = request(50_001);
+        let grant = k
+            .with(|s| s.provision_process_cnode(&req))
+            .expect("provision");
+        assert!(grant.created_space && grant.created_association);
+        assert_eq!(spaces(&k), before_spaces + 1);
+        assert_eq!(associations(&k), before_assoc + 1);
+        assert_eq!(association_for(&k, 50_001), Some(grant.cnode));
+        // The CNode is named after the process, not after whatever task happened to be running.
+        assert_eq!(grant.cnode, CNodeId(50_001));
+    }
+
+    /// A second thread joining an existing process provisions nothing — and therefore its
+    /// compensation must remove nothing. This is what the two booleans are for.
+    #[test]
+    fn joining_an_existing_process_creates_nothing_and_so_releases_nothing() {
+        let k = kernel();
+        let req = request(50_002);
+        let first = k.with(|s| s.provision_process_cnode(&req)).expect("first");
+        assert!(first.created_space && first.created_association);
+        let settled = (spaces(&k), associations(&k));
+
+        let joiner = ProcessCNodeRequest {
+            pid: 50_002,
+            tid: 50_003,
+            class: TaskClass::App,
+        };
+        let second = k
+            .with(|s| s.provision_process_cnode(&joiner))
+            .expect("second");
+        assert_eq!(
+            second.cnode, first.cnode,
+            "the joiner shares the process CNode"
+        );
+        assert!(
+            !second.created_space && !second.created_association,
+            "a joiner creates nothing: {second:?}"
+        );
+        assert!(!second.owns_anything());
+        assert_eq!((spaces(&k), associations(&k)), settled);
+
+        // Releasing the joiner's grant must not strip the process of its capability space.
+        k.with(|s| s.release_process_cnode_grant(&joiner, &second));
+        assert_eq!(
+            (spaces(&k), associations(&k)),
+            settled,
+            "a grant that created nothing released something"
+        );
+        assert_eq!(association_for(&k, 50_002), Some(first.cnode));
+    }
+
+    /// Compensation removes exactly what was created, and repeating it is inert.
+    #[test]
+    fn release_is_exact_and_repeating_it_is_inert() {
+        let k = kernel();
+        let before = (spaces(&k), associations(&k));
+        let req = request(50_004);
+        let grant = k
+            .with(|s| s.provision_process_cnode(&req))
+            .expect("provision");
+        assert_ne!((spaces(&k), associations(&k)), before);
+
+        k.with(|s| s.release_process_cnode_grant(&req, &grant));
+        assert_eq!((spaces(&k), associations(&k)), before, "back to baseline");
+        assert_eq!(association_for(&k, 50_004), None);
+
+        for _ in 0..3 {
+            k.with(|s| s.release_process_cnode_grant(&req, &grant));
+            assert_eq!(
+                (spaces(&k), associations(&k)),
+                before,
+                "a repeated release must move nothing"
+            );
+        }
+    }
+
+    /// A stale grant naming a CNode that now belongs to a different process releases nothing.
+    #[test]
+    fn a_stale_grant_cannot_take_another_processs_space() {
+        let k = kernel();
+        let victim = request(50_005);
+        let victim_grant = k
+            .with(|s| s.provision_process_cnode(&victim))
+            .expect("victim");
+        let settled = (spaces(&k), associations(&k));
+
+        // A grant that claims to have created the victim's CNode, for a different process.
+        let stale_request = request(50_006);
+        let stale = ProcessCNodeGrant {
+            cnode: victim_grant.cnode,
+            created_space: true,
+            created_association: true,
+        };
+        k.with(|s| s.release_process_cnode_grant(&stale_request, &stale));
+        assert_eq!(
+            (spaces(&k), associations(&k)),
+            settled,
+            "a stale grant took a live process's capability space"
+        );
+        assert_eq!(association_for(&k, 50_005), Some(victim_grant.cnode));
+    }
+
+    /// The acquisition wrapper and the rank-4 body are separate, and the body carries the policy
+    /// — so an off-lock entry, when a route needs one, is a wrapper and not a second copy.
+    #[test]
+    fn the_policy_lives_in_the_acquisition_agnostic_body() {
+        assert_eq!(
+            TXN_SRC
+                .matches("pub(crate) fn provision_process_cnode_locked(")
+                .count(),
+            1,
+            "one rank-4 provisioning body"
+        );
+        assert!(
+            TXN_SRC.contains("fn provision_process_cnode("),
+            "the broad acquisition wrapper must exist"
+        );
+        // The rank-4 body is ACQUISITION-AGNOSTIC: it takes `&mut CapabilitySubsystem`, not
+        // `&mut self`. That is what keeps a future off-lock entry a wrapper rather than a
+        // reimplementation — and it is deliberately not accompanied by such an entry today,
+        // because U9-SPAWN2 §3 hard-stopped, and a split wrapper with no caller is banked
+        // dormant API.
+        assert!(
+            TXN_SRC.contains("capability: &mut CapabilitySubsystem"),
+            "the shared body must take the subsystem, so either acquisition can drive it"
+        );
+        assert!(
+            !RUNTIME_SRC.contains("provision_process_cnode_split"),
+            "no dormant split wrapper may be banked while the route that would call it does not \
+             exist"
+        );
+        // And the one capacity policy is the class policy, stated once.
+        assert!(
+            TXN_SRC.contains("requested_cnode_slot_capacity_for_class("),
+            "the transaction must use the existing class capacity policy"
+        );
+    }
+
+    /// The broad spawn reservation DELEGATES: it no longer calls the two independent entries,
+    /// which is what makes this a production owner rather than a helper-only API.
+    #[test]
+    fn the_broad_reservation_delegates_and_compensates() {
+        let body = RESERVE_SRC
+            .split("pub fn reserve_task_for_spawn_with_class_in_process(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("the reservation body");
+        assert!(
+            body.contains("self.provision_process_cnode(&cnode_request)"),
+            "the reservation must go through the transaction"
+        );
+        for bypassed in [
+            "ensure_cnode_space_with_slots(",
+            "set_process_cnode_for_pid(",
+        ] {
+            assert!(
+                !body.contains(bypassed),
+                "the reservation still calls {bypassed} directly, so the two halves can drift \
+                 apart again"
+            );
+        }
+        // Every later failure releases the grant.
+        assert!(
+            body.matches("release_process_cnode_grant(&cnode_request, &cnode_grant)")
+                .count()
+                >= 2,
+            "each failure after the CNode transaction must release it"
+        );
+        // And the PID is the caller's, never the current task's.
+        assert!(
+            body.contains("pid: process_pid"),
+            "the process identity must come from the request"
+        );
+        assert!(
+            !body.contains("current_tid()"),
+            "no ambient current-task fallback may decide which process this CNode belongs to"
+        );
+    }
+
+    /// The transaction owns the CNode and its association, and deliberately not the capabilities
+    /// minted into it afterwards — those have their own owner.
+    #[test]
+    fn the_transaction_does_not_grow_a_second_capability_policy() {
+        // Scoped to the CODE. The module doc names these owners deliberately, to say what this
+        // transaction defers to them — an explanation is not a second implementation.
+        let code = TXN_SRC
+            .split("\nuse super::*;\n")
+            .nth(1)
+            .expect("the module body after its doc comment");
+        for foreign in ["revoke_capability_in_cnode(", "mint_capability"] {
+            assert!(
+                !code.contains(foreign),
+                "{foreign} belongs to the capability lifecycle; the CNode transaction must not \
+                 grow a second copy of it"
+            );
+        }
+    }
+}
+
+/// U9-SPAWN2 §3 — the live NR 23/NR 29 split route is NOT built, and this pins why.
+///
+/// §2 removed one of the blockers SP-4 named. The recomputed phase table is what decides the
+/// rest, and it says four subsystems remain, not one — so the route is not started rather than
+/// half-started, and no wrapper is left behind waiting for it.
+#[cfg(test)]
+mod u9spawn2_nr23_route_blockers {
+    use super::*;
+
+    /// Every phase the NR 23 / NR 29 transaction still needs off the broad lock, and the fact
+    /// that none of them has a rank-local owner today.
+    ///
+    /// A rank-local owner is one that takes its subsystem (`&mut XSubsystem`) rather than
+    /// `&mut self`, so an acquisition wrapper can drive it from either side — the shape §2's
+    /// `provision_process_cnode_locked` has. When one of these grows that shape, this test fails
+    /// and the phase table gets recomputed instead of the note going stale.
+    #[test]
+    fn every_remaining_spawn_phase_still_lacks_a_rank_local_owner() {
+        const PHASES: &[(&str, &str)] = &[
+            ("create_user_address_space", "VM rank 5 + capability rank 4"),
+            ("load_elf_pt_load_segments", "VM rank 5 + memory rank 6"),
+            ("load_elf_with_mo_zero_copy", "VM rank 5 + memory rank 6"),
+            ("allocate_user_stack_with_guard", "VM rank 5"),
+            ("create_endpoint", "IPC rank 3 + capability rank 4"),
+            (
+                "grant_capability_task_to_task_with_rights",
+                "capability rank 4",
+            ),
+            ("provision_default_kernel_context", "task rank 2"),
+        ];
+        let sources = stage199d_wa2a_ownership_boundary::production_sources();
+        for (phase, ranks) in PHASES {
+            let locked = alloc::format!("fn {phase}_locked(");
+            let has_rank_local = sources.iter().any(|(_, src)| src.contains(&locked));
+            assert!(
+                !has_rank_local,
+                "{phase} ({ranks}) grew a rank-local owner — recompute the NR 23 phase table \
+                 before trusting the hard-stop note"
+            );
+        }
+    }
+
+    /// §2's transaction, by contrast, HAS that shape — which is how the difference between a
+    /// bounded extraction and a new subsystem was decided.
+    #[test]
+    fn the_cnode_phase_is_the_one_that_was_a_bounded_extraction() {
+        const TXN_SRC: &str = include_str!("process_cnode_txn.rs");
+        assert!(
+            TXN_SRC.contains("pub(crate) fn provision_process_cnode_locked(")
+                && TXN_SRC.contains("capability: &mut CapabilitySubsystem"),
+            "the CNode phase must have the rank-local shape the others lack"
+        );
+        // And the half SP-4 mistakenly reported as absent really did already exist.
+        const CAP_SRC: &str = include_str!("capability_lifecycle_state.rs");
+        assert!(
+            CAP_SRC.contains("pub(crate) fn ensure_cnode_space_locked("),
+            "ensure_cnode_space_locked predates this work; SP-4's blocker note was half wrong"
+        );
+    }
+
+    /// Nothing dormant was banked for the route that was not built.
+    #[test]
+    fn no_dormant_spawn_route_api_was_left_behind() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for dormant in [
+            "provision_process_cnode_split",
+            "release_process_cnode_grant_split",
+        ] {
+            assert!(
+                !RUNTIME_SRC.contains(dormant),
+                "{dormant} has no caller — a split wrapper built for a route that hard-stopped is \
+                 banked dormant API"
             );
         }
     }

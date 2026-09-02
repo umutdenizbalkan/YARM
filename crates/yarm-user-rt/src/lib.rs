@@ -72,7 +72,8 @@ pub mod syscall {
     /// proof's second execution context — it does NOT add a syscall.
     const SYSCALL_FORK_NR: usize = 12;
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
-    pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
+    // NR 24 (SpawnProcessFromUserBuf) retired in U9-SPAWN2 §1. The number stays unassigned:
+    // see `RETIRED_SYSCALL_NUMBERS` in the kernel's syscall table for why it is not reusable.
     // NR 26 (SpawnFromInitramfsFile) retired in U9-ASPACE1 §2. The number stays unassigned:
     // see `RETIRED_SYSCALL_NUMBERS` in the kernel's syscall table for why it is not reusable.
     // NR 27 (InitramfsReadChunk) removed in Stage 197A — the number is now unused.
@@ -1105,36 +1106,6 @@ pub mod syscall {
     ///
     /// Returns `(child_tid, caller_cap, spawner_cap)` on success.
     #[inline]
-    pub unsafe fn spawn_process_from_user_buf(
-        image_id: u64,
-        elf_ptr: *const u8,
-        elf_len: usize,
-        parent_pid: u64,
-        startup_args: &[u64; 18],
-    ) -> core::result::Result<(u64, u32, u32), SyscallError> {
-        let args = [
-            image_id as usize,              // arg0 = image_id
-            elf_ptr as usize,               // arg1 = elf_user_ptr
-            elf_len,                        // arg2 = elf_len
-            parent_pid as usize,            // arg3 = parent_pid
-            startup_args.as_ptr() as usize, // arg4 = startup_args_ptr
-            startup_args.len(),             // arg5 = startup_args_count
-        ];
-        // SAFETY: Uses architecture syscall ABI; elf_ptr lifetime covers the call.
-        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR, args) };
-        #[cfg(target_arch = "x86_64")]
-        if ret.error != 0 {
-            return Err(decode_syscall_error(ret.error));
-        }
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 {
-            return Err(decode_syscall_error(ret.ret0));
-        }
-        let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
-        let spawner_cap = (ret.ret2 >> 32) as u32;
-        Ok((ret.ret1 as u64, caller_cap, spawner_cap))
-    }
-
     #[inline]
     pub unsafe fn ipc_reply(
         reply_cap: u32,
@@ -1214,8 +1185,7 @@ pub mod syscall {
     ///
     /// Only callable by PM (TID=3).
     ///
-    /// Returns `(child_tid, caller_cap, spawner_cap)` on success, same layout as
-    /// `spawn_process_from_user_buf`.
+    /// Returns `(child_tid, caller_cap, spawner_cap)` on success.
     ///
     /// # Safety
     /// `startup_args` must be a valid array in the caller's address space.

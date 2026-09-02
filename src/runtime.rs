@@ -2279,8 +2279,7 @@ impl SharedKernel {
         // (2) rank 2, ONE acquisition: everything up to and including `Runnable`.
         let outcome = self.with_spawn_thread_split_mut(|tcbs, classes, cursor, tls| {
             let parent = core_::parent_facts_locked(tcbs, classes, parent_tid)?;
-            let (tid, delta) =
-                core_::allocate_dynamic_tid_locked(tcbs, cursor, policy, max_tasks)?;
+            let (tid, delta) = core_::allocate_dynamic_tid_locked(tcbs, cursor, policy, max_tasks)?;
             let idx = core_::register_thread_incarnation_locked(
                 tcbs,
                 classes,

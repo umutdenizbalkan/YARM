@@ -19,6 +19,39 @@ commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
 Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 `doc/KERNEL_UNLOCKING.md` §0.
 
+**U9-SPAWN2 — the byte-copy spawn fallback and NR 24 are gone; the process-CNode transaction is
+one owner; the live NR 23/NR 29 split route HARD-STOPS on four remaining subsystems. Census
+remains `2 / 0 / 2`. U9 remains OPEN.**
+
+*§1 — NR 24 retired.* PM's VFS spawn carved image 13 (the restart test's `crash_test_srv`) out of
+the mandatory MemoryObject grant path and into a `SpawnProcessFromUserBuf` byte-copy fallback, for
+one reason its own diagnostic stated: the kernel image path table had no entry for image 13. The
+table now has one, so image 13 spawns like every other gated image and the fallback is gone; what
+is not grant-eligible now gets one typed `Unsupported` with the existing fatal-ZC diagnostics, no
+second syscall and nothing half-built. The crash-restart oracle proves it: its four NR 24
+invocations became four grant spawns (`SPAWN_FROM_MO` 5 → 9) with the verdict unchanged. With zero
+callers left, NR 24 joins 26 and 27 as permanently reserved, refused pre-lock. The kernel's 128 KB
+`VFS_ELF_STAGING` buffer went with it — both of its users were the retired byte-copy syscalls.
+
+*§2 — one process-CNode transaction.* The CNode space and its PID association were two
+independent rank-4 entries, and a failed association left a space provisioned for a process that
+did not exist. They are now one transaction under one acquisition, so the intermediate state has
+no observer at all. The grant records what it created, which is what makes compensation exact
+(a thread joining its parent creates nothing and so releases nothing) and repetition inert. The
+broad spawn reservation delegates to it, and every later failure releases it.
+
+This also corrects U9-SPAWN1 SP-4's blocker note: `ensure_cnode_space_locked` already had an
+off-lock entry, and the earlier audit concluded otherwise by grepping for the broad wrapper's
+name. Only the PID association genuinely lacked a rank-local sibling.
+
+*§3 — the live NR 23/NR 29 route is NOT built.* The recomputed phase table shows seven remaining
+phases, none of which has a rank-local owner, grouping into **four** genuinely new subsystems: an
+off-lock VM address-space/ELF/user-stack provisioner, off-lock endpoint creation, off-lock
+cross-cspace delegation, and off-lock task reservation/commit. The directive's own condition is
+one; four is a stop. No route was started and no split wrapper was banked for it — the §2 split
+entry built in anticipation was removed rather than left dormant.
+
+
 **U9-ASPACE1 — the address-space teardown frame leak is closed, NR 26 is retired, and AArch64 is
 no longer shallower than the other two architectures. Census remains `2 / 0 / 2`. U9 remains
 OPEN.**
