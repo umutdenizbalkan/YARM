@@ -27284,7 +27284,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -36430,7 +36430,7 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -38507,7 +38507,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38634,7 +38634,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38809,7 +38809,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38966,7 +38966,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39099,7 +39099,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39262,7 +39262,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39444,7 +39444,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39668,7 +39668,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39904,7 +39904,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40021,7 +40021,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40156,7 +40156,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40352,7 +40352,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40788,7 +40788,7 @@ mod stage148_decomposition_map {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 24,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41232,7 +41232,7 @@ mod stage150_ipc_abi_extraction {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 24,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41463,7 +41463,7 @@ mod stage151_ipc_abi_boundary_audit {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 24,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41599,7 +41599,7 @@ mod stage152_syscall_decomposition_completeness_audit {
         );
     }
 
-    // 5. Syscall::VARIANT_COUNT == 24 preserved.
+    // 5. Syscall::VARIANT_COUNT == 23 preserved.
     #[test]
     fn stage152_variant_count_is_23() {
         assert!(
@@ -57071,9 +57071,12 @@ mod stage175_spawn_lifecycle {
         );
         // The spawn success markers (image resolve/parse/load) are preserved and the
         // spawn primitives are untouched (instrumentation only wraps error/phase edges).
+        // U9-ASPACE1 §2 retired NR 26; the lifecycle instrumentation moved to NR 23, which
+        // performs the same request/resolve/parse/load steps, so the diagnostic still has a live
+        // subject rather than dying with the syscall it happened to be attached to.
         assert!(
             EXEC_SRC.contains("fn spawn_user_task_from_image(")
-                && PROCESS_SRC.contains("fn handle_spawn_from_initramfs_file("),
+                && PROCESS_SRC.contains("fn handle_spawn_process("),
             "spawn primitives must remain"
         );
     }
@@ -74413,7 +74416,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -74826,7 +74829,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -74986,7 +74989,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -75055,7 +75058,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -75610,7 +75613,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -75844,7 +75847,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -76086,7 +76089,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -76139,7 +76142,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -76601,7 +76604,7 @@ mod stage197b_nr27_removed_zc_mandatory {
             Err(SyscallError::InvalidNumber)
         ));
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(Syscall::VARIANT_COUNT, 24);
+        assert_eq!(Syscall::VARIANT_COUNT, 23);
         // Needles are split so these assertions do not match themselves via include_str!.
         let variant_decl = concat!("InitramfsRead", "Chunk = ");
         let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
@@ -77007,7 +77010,7 @@ mod stage197b_riscv_typed_idle_outcome {
     #[test]
     fn baseline_and_cohort_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(matches!(
             crate::kernel::syscall::Syscall::decode(27),
             Err(crate::kernel::syscall::SyscallError::InvalidNumber)
@@ -98671,7 +98674,6 @@ mod stage200d0a_exit_foundation {
             (15, Syscall::DebugLog),
             (23, Syscall::SpawnProcess),
             (24, Syscall::SpawnProcessFromUserBuf),
-            (26, Syscall::SpawnFromInitramfsFile),
             (28, Syscall::CreateInitramfsFileSliceMo),
             (29, Syscall::SpawnFromMemoryObject),
             (30, Syscall::RecvSharedV3),
@@ -98681,11 +98683,11 @@ mod stage200d0a_exit_foundation {
         }
     }
 
-    /// (3) NR27 stays absent, the other free numbers stay unassigned, and unknown-number
-    /// behaviour is unchanged.
+    /// (3) the retired and never-assigned numbers stay unassigned, and unknown-number
+    /// behaviour is unchanged. 26 joins 27 here: U9-ASPACE1 §2 retired it.
     #[test]
     fn d03_nr27_and_free_numbers_remain_unassigned() {
-        for free in [17usize, 18, 19, 20, 21, 22, 25, 27] {
+        for free in [17usize, 18, 19, 20, 21, 22, 25, 26, 27] {
             assert!(
                 Syscall::decode(free).is_err(),
                 "number {free} must remain unassigned"
@@ -98709,8 +98711,8 @@ mod stage200d0a_exit_foundation {
     /// enum's own declaration count parsed from source.
     #[test]
     fn d04_variant_list_is_exhaustive_and_derived() {
-        assert_eq!(Syscall::VARIANT_COUNT, 24);
-        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 24);
+        assert_eq!(Syscall::VARIANT_COUNT, 23);
+        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 23);
         assert!(
             SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
         );
@@ -99694,7 +99696,7 @@ mod stage200d0b3_x86_exit_corrected {
         assert!(b.contains("EXIT_TASK_RESTORE_OWNER_PREPARED"));
         assert!(b.contains("EXIT_TASK_ABSENCE_VALIDATED arch=x86_64"));
         // No new task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
     }
 
     // ── feature gating (22) ─────────────────────────────────────────────────────────
@@ -100811,7 +100813,7 @@ mod stage200d0c1_aarch64_exit_prep {
             "offline-CPU refusal is preserved by the transaction"
         );
         // No general-purpose task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
     }
 
     // ── U3 (canonical 203C): the validation reacquisition retirement ────────────────
@@ -101996,7 +101998,7 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(txn.contains("Some(bound) => bound == asid,"));
         assert!(c.contains("identity=tid_asid"));
         assert!(c.contains("frame_source=0"));
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
     }
 
     // ── 29–32: runner static contract and feature-off ───────────────────────────────
@@ -152048,12 +152050,23 @@ mod u9spawn1_sp3_spawn_ledger {
         img
     }
 
-    /// Everything a leak would move. Compared before and after each failing transaction.
+    /// Everything a leak would move — one column per provisional-resource class the ledger
+    /// owns, so a restored baseline is a statement about all of them and not about a total.
+    ///
+    /// | column | class |
+    /// |---|---|
+    /// | `tasks` | the task reservation, and the task/process records it carries |
+    /// | `address_spaces` | the ASID |
+    /// | `free_frames` | ELF mappings and their backing (U9-ASPACE1 made this exact) |
+    /// | `memory_objects` | MemoryObject and refcount state |
+    /// | `endpoints` | the two service endpoints |
+    /// | `spawner_caps` | installed and delegated capabilities |
     #[derive(Debug, PartialEq, Eq)]
     struct Baseline {
         tasks: usize,
         address_spaces: usize,
         free_frames: usize,
+        memory_objects: usize,
         endpoints: usize,
         spawner_caps: usize,
     }
@@ -152069,6 +152082,7 @@ mod u9spawn1_sp3_spawn_ledger {
                         .count()
                 }),
                 free_frames: s.with_memory_state(|m| m.frame_allocator.free_frames()),
+                memory_objects: s.with_memory_state(|m| m.memory_objects.iter().flatten().count()),
                 endpoints: s.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count()),
                 spawner_caps: match cnode {
                     Some(cnode) => s.with_capability_state(|cap| {
@@ -152178,76 +152192,18 @@ mod u9spawn1_sp3_spawn_ledger {
         // `spawn_image_after_claim` refuses an entry point of zero, AFTER the reservation has
         // been claimed — so this fails at the last possible moment.
         let err = run(&k, &elf, 0).expect_err("a zero entry point cannot be committed");
-        let after = baseline(&k);
         assert_eq!(
-            (
-                after.tasks,
-                after.address_spaces,
-                after.endpoints,
-                after.spawner_caps
-            ),
-            (
-                before.tasks,
-                before.address_spaces,
-                before.endpoints,
-                before.spawner_caps
-            ),
+            baseline(&k),
+            before,
             "failed commit left something behind: {err:?}"
         );
 
-        // Frames are the ONE thing that does not come back, and the reason is not the ledger.
-        // See `the_frame_the_unwind_cannot_reclaim_is_the_loaders_not_the_ledgers` below: the
-        // address-space teardown owner reclaims only MemoryObject-backed frames, so the page an
-        // ELF PT_LOAD lands in is lost whenever any address space is destroyed — spawn or not.
-        // The ledger calls the correct owner; the owner is incomplete.
-        assert_eq!(
-            before.free_frames - after.free_frames,
-            elf_load_frame_cost(),
-            "the only unrecovered frames are the loader's, and there is exactly one load here"
-        );
-    }
-
-    /// The frame the failed spawn does not get back is charged by the ELF loader and lost by the
-    /// address-space teardown owner — NOT by the compensation ledger. Proved by taking the ledger
-    /// out of the picture entirely: a bare create / load / destroy cycle, with no spawn, no
-    /// reservation, no endpoint and no transaction, loses exactly the same frame.
-    ///
-    /// The cause is that `destroy_user_address_space_by_asid` reclaims a drained mapping through
-    /// `note_mapping_removed` + `reclaim_memory_object_for_phys`, both of which are
-    /// MemoryObject-scoped. A page the loader took straight from the frame allocator has no
-    /// MemoryObject, so nothing ever returns it. Repairing that means teaching teardown which
-    /// drained frames are allocator-owned and which are borrowed — the zero-copy initramfs grants
-    /// are borrowed and freeing them would hand the boot initrd's own frames to the allocator —
-    /// which is a distinct backing-ownership repair, not a spawn compensation.
-    #[test]
-    fn the_frame_the_unwind_cannot_reclaim_is_the_loaders_not_the_ledgers() {
-        let k = fixture();
-        let elf = tiny_elf();
-        let free =
-            |k: &SharedKernel| k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        // Repetition costs nothing either, which is what distinguishes a restored baseline from
+        // a one-time capacity acquisition that happens to look like one.
         for _ in 0..3 {
-            let before = free(&k);
-            let (asid, cap) = k.with(|s| s.create_user_address_space().expect("an address space"));
-            k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("a load"));
-            k.with(|s| {
-                s.destroy_user_address_space_by_asid(asid)
-                    .expect("teardown");
-                let cnode = s.current_task_cnode().expect("spawner cspace");
-                let _ = s.revoke_capability_in_cnode(cnode, cap);
-            });
-            assert_eq!(
-                before - free(&k),
-                elf_load_frame_cost(),
-                "the cost is per address-space teardown and recurs, so it is a loader/teardown \
-                 defect rather than one-time capacity growth"
-            );
+            let _ = run(&k, &elf, 0).expect_err("the same failure again");
+            assert_eq!(baseline(&k), before, "and again, and again");
         }
-    }
-
-    /// One PT_LOAD segment of one page. Named rather than inlined so the two tests above cannot
-    /// drift, and so raising it silently is impossible.
-    const fn elf_load_frame_cost() -> usize {
-        1
     }
 
     /// Phase 2 — the address space. With the ASID pool exhausted the transaction fails holding
@@ -152461,16 +152417,16 @@ mod u9spawn1_sp3_spawn_ledger {
         );
     }
 
-    /// The four spawn syscalls delegate; none of them keeps a second, uncompensated copy of the
-    /// transaction.
+    /// Every image-loading spawn syscall delegates; none keeps a second, uncompensated copy of
+    /// the transaction. Three since U9-ASPACE1 §2 retired NR 26.
     #[test]
-    fn all_four_spawn_syscalls_delegate_to_the_one_transaction() {
+    fn every_spawn_syscall_delegates_to_the_one_transaction() {
         assert_eq!(
             PROCESS_SRC
                 .matches("spawn_image_txn::run_image_spawn_transaction(")
                 .count(),
-            4,
-            "NR 23, NR 24, NR 26 and NR 29 all commit through the one compensated transaction"
+            3,
+            "NR 23, NR 24 and NR 29 all commit through the one compensated transaction"
         );
         for abandoned in [
             "create_user_address_space",
@@ -152482,6 +152438,553 @@ mod u9spawn1_sp3_spawn_ledger {
                 !PROCESS_SRC.contains(abandoned),
                 "{abandoned} belongs to the transaction; a handler copy is an uncompensated \
                  second acquisition"
+            );
+        }
+    }
+}
+
+/// U9-ASPACE1 §1 — address-space teardown returns the frames it drained.
+///
+/// The leak these proofs close was found by SP-3's failure injection and characterised there as
+/// "the loader's, not the ledger's". This is that repair, and the proofs work in frame
+/// IDENTITIES rather than in free counts: a count says a frame went missing, an identity says
+/// WHICH one and what it was for, which is the difference between noticing a leak and fixing it.
+#[cfg(test)]
+mod u9aspace1_teardown_frame_reclaim {
+    use super::*;
+    use crate::kernel::vm::{Asid, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const MEMORY_SRC: &str = include_str!("memory_state.rs");
+
+    fn kernel() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    fn free_frames(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()))
+    }
+
+    /// Is this exact physical frame still charged to somebody by the allocator?
+    fn tracked(k: &SharedKernel, phys: PhysAddr) -> bool {
+        k.with(|s| {
+            s.with_memory_state(|m| m.frame_allocator.frame_refcount(phys.0).unwrap_or(0) > 0)
+        })
+    }
+
+    /// Every page an address space maps, by identity: run head, physical base, page count.
+    fn mapped_frames(k: &SharedKernel, asid: Asid) -> alloc::vec::Vec<(VirtAddr, PhysAddr)> {
+        k.with(|s| {
+            s.with_user_spaces(|spaces| {
+                let mut out = alloc::vec::Vec::new();
+                let Some(space) = spaces.get(asid) else {
+                    return out;
+                };
+                for idx in 0..space.mappings() {
+                    if let Some((virt, mapping, pages)) = space.run_at(idx) {
+                        for p in 0..pages {
+                            let step = (p * crate::kernel::vm::PAGE_SIZE) as u64;
+                            out.push((VirtAddr(virt.0 + step), PhysAddr(mapping.phys.0 + step)));
+                        }
+                    }
+                }
+                out
+            })
+        })
+    }
+
+    /// A real ELF64 image with one PT_LOAD page, so the loader runs for real.
+    fn tiny_elf() -> alloc::vec::Vec<u8> {
+        super::u9spawn1_sp3_spawn_ledger::tiny_elf()
+    }
+
+    /// THE proof. The bare create → load → destroy cycle, with no spawn, no reservation and no
+    /// transaction anywhere near it, and every frame followed by identity through the cycle.
+    #[test]
+    fn one_cycle_returns_every_frame_it_took() {
+        let k = kernel();
+        let elf = tiny_elf();
+        let before_free = free_frames(&k);
+
+        let (asid, cap) = k.with(|s| s.create_user_address_space().expect("address space"));
+        k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("load"));
+
+        // Identity, not count: exactly which frames this address space holds, and the proof that
+        // the allocator agrees each one is charged to somebody.
+        let held = mapped_frames(&k, asid);
+        assert!(
+            !held.is_empty(),
+            "the loader must have installed at least one PT_LOAD page to reclaim"
+        );
+        for (virt, phys) in &held {
+            assert!(
+                tracked(&k, *phys),
+                "va 0x{:x} -> pa 0x{:x} is mapped but the allocator does not charge it to anyone",
+                virt.0,
+                phys.0
+            );
+        }
+
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(asid)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, cap);
+        });
+
+        // Each frame, by identity, must now be charged to nobody.
+        for (virt, phys) in &held {
+            assert!(
+                !tracked(&k, *phys),
+                "va 0x{:x} -> pa 0x{:x} survived teardown still charged — this is the leak",
+                virt.0,
+                phys.0
+            );
+        }
+        assert_eq!(
+            free_frames(&k),
+            before_free,
+            "and the allocator's inventory is whole again"
+        );
+        // The registry has no trace of the space either.
+        assert!(
+            k.with(|s| s.with_user_spaces(|spaces| spaces.get(asid).is_none())),
+            "the destroyed ASID must be gone from the registry"
+        );
+    }
+
+    /// Repetition is stable. This is the property the pre-repair kernel failed most visibly: the
+    /// cost recurred per teardown rather than being one-time capacity growth.
+    #[test]
+    fn repeated_cycles_are_stable() {
+        let k = kernel();
+        let elf = tiny_elf();
+        let baseline = free_frames(&k);
+        for round in 0..8 {
+            let (asid, cap) = k.with(|s| s.create_user_address_space().expect("address space"));
+            k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("load"));
+            k.with(|s| {
+                s.destroy_user_address_space_by_asid(asid)
+                    .expect("teardown");
+                let cnode = s.current_task_cnode().expect("spawner cspace");
+                let _ = s.revoke_capability_in_cnode(cnode, cap);
+            });
+            assert_eq!(
+                free_frames(&k),
+                baseline,
+                "round {round} did not return to the baseline"
+            );
+        }
+    }
+
+    /// A partial load restores the same baseline. The loader installs pages one at a time, so a
+    /// failure part-way leaves a half-populated address space; tearing that down must reclaim
+    /// exactly the pages that were installed and nothing else.
+    #[test]
+    fn a_partial_load_restores_the_same_baseline() {
+        let k = kernel();
+        let baseline = free_frames(&k);
+
+        // A well-formed header whose PT_LOAD claims file bytes past the end of the image: the
+        // loader accepts the program header, then refuses on bounds.
+        let mut truncated = tiny_elf();
+        let ph = 64;
+        truncated[ph + 32..ph + 40].copy_from_slice(&0xFFFF_0000u64.to_le_bytes()); // p_filesz
+        truncated[ph + 40..ph + 48].copy_from_slice(&0xFFFF_0000u64.to_le_bytes()); // p_memsz
+
+        let (asid, cap) = k.with(|s| s.create_user_address_space().expect("address space"));
+        let outcome = k.with(|s| s.load_elf_pt_load_segments(asid, &truncated));
+        assert!(outcome.is_err(), "a truncated segment must not load");
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(asid)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, cap);
+        });
+        assert_eq!(
+            free_frames(&k),
+            baseline,
+            "a failed load must leave the allocator exactly as it found it"
+        );
+    }
+
+    /// A live address space keeps every frame it owns. The sweep must never reach across to a
+    /// space that is still alive — this is the regression the repair would cause if the
+    /// reachability question were asked wrongly.
+    #[test]
+    fn a_live_address_space_retains_every_frame_it_owns() {
+        let k = kernel();
+        let elf = tiny_elf();
+        let (survivor, survivor_cap) = k.with(|s| s.create_user_address_space().expect("survivor"));
+        k.with(|s| s.load_elf_pt_load_segments(survivor, &elf).expect("load"));
+        let survivor_frames = mapped_frames(&k, survivor);
+        assert!(!survivor_frames.is_empty());
+
+        // Build and destroy a second space beside it.
+        let (doomed, doomed_cap) = k.with(|s| s.create_user_address_space().expect("doomed"));
+        k.with(|s| s.load_elf_pt_load_segments(doomed, &elf).expect("load"));
+        let doomed_frames = mapped_frames(&k, doomed);
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(doomed)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, doomed_cap);
+        });
+
+        for (virt, phys) in &survivor_frames {
+            assert!(
+                tracked(&k, *phys),
+                "the survivor's va 0x{:x} -> pa 0x{:x} was released by another space's teardown",
+                virt.0,
+                phys.0
+            );
+        }
+        // The two spaces held DIFFERENT frames, so the survivor's retention is not a coincidence
+        // of aliasing.
+        for (_, doomed_phys) in &doomed_frames {
+            assert!(
+                !survivor_frames.iter().any(|(_, p)| p == doomed_phys),
+                "the fixture needs the two spaces to hold disjoint frames"
+            );
+        }
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(survivor)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, survivor_cap);
+        });
+        for (_, phys) in &survivor_frames {
+            assert!(!tracked(&k, *phys), "and it releases them when it dies");
+        }
+    }
+
+    /// A frame two live spaces both map is released by the SECOND teardown, not the first. This
+    /// is the COW / shared-region / aliased-grant case, built directly so it does not depend on
+    /// whether any production path currently aliases.
+    #[test]
+    fn an_aliased_frame_is_released_only_by_the_last_space_to_drop_it() {
+        use crate::kernel::vm::{CachePolicy, Mapping, PageFlags};
+        let k = kernel();
+        let elf = tiny_elf();
+        let (first, first_cap) = k.with(|s| s.create_user_address_space().expect("first"));
+        k.with(|s| s.load_elf_pt_load_segments(first, &elf).expect("load"));
+        let shared = mapped_frames(&k, first)[0].1;
+
+        let (second, second_cap) = k.with(|s| s.create_user_address_space().expect("second"));
+        k.with(|s| {
+            s.map_user_page_in_asid_raw(
+                second,
+                VirtAddr(0x0080_0000),
+                Mapping {
+                    phys: shared,
+                    flags: PageFlags {
+                        read: true,
+                        write: false,
+                        execute: false,
+                        user: true,
+                        cache_policy: CachePolicy::WriteBack,
+                    },
+                },
+            )
+            .expect("alias the same frame into a second space");
+        });
+
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(first)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, first_cap);
+        });
+        assert!(
+            tracked(&k, shared),
+            "pa 0x{:x} is still mapped by a live space and must not be released",
+            shared.0
+        );
+
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(second)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, second_cap);
+        });
+        assert!(
+            !tracked(&k, shared),
+            "and the last space to drop it releases it"
+        );
+    }
+
+    /// Tearing down an ASID that is already gone changes nothing.
+    #[test]
+    fn repeated_teardown_is_inert() {
+        let k = kernel();
+        let elf = tiny_elf();
+        let (asid, cap) = k.with(|s| s.create_user_address_space().expect("address space"));
+        k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("load"));
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(asid)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, cap);
+        });
+        let settled = free_frames(&k);
+        for _ in 0..3 {
+            assert!(
+                k.with(|s| s.destroy_user_address_space_by_asid(asid))
+                    .is_err(),
+                "a destroyed ASID must be refused, not re-drained"
+            );
+            assert_eq!(free_frames(&k), settled, "and nothing may move");
+        }
+    }
+
+    /// The release is one owner inside the teardown owner, and it asks its four questions of
+    /// existing authorities rather than keeping a count of its own.
+    #[test]
+    fn the_release_is_gated_on_existing_authorities() {
+        let body = MEMORY_SRC
+            .split("fn release_unreferenced_user_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("the release owner");
+        for authority in ["memory_objects", "any_mapping_for_phys", "free_frame"] {
+            assert!(
+                body.contains(authority),
+                "the release must consult {authority} before returning a frame"
+            );
+        }
+        // The process-global range registries are NOT the authority here. They are never reset,
+        // so in a test binary that builds many kernels one kernel's ranges would answer another
+        // kernel's question — and in production they add nothing, because reserved ranges are
+        // sanitized out of the allocator before it is seeded and the PT pool is disjoint.
+        for wrong_authority in ["is_pa_reserved", "is_pa_in_pt_pool"] {
+            assert!(
+                !body.contains(wrong_authority),
+                "the release must ask the owning allocator, not the global {wrong_authority} \
+                 registry, whether a frame is user backing"
+            );
+        }
+        // And the invariant that makes the allocator sufficient must stay true.
+        const BOOTSTRAP_SRC: &str = include_str!("bootstrap_state.rs");
+        assert!(
+            BOOTSTRAP_SRC.contains("Self::apply_reserved_ranges(boot_regions, reserved_ranges)"),
+            "reserved ranges must still be sanitized out of the regions the allocator is seeded \
+             from, or the allocator stops being the authority on what is user backing"
+        );
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            assert!(
+                !src.contains(".reserve_frame("),
+                "{rel} tracks a frame the allocator never issued; the release's third condition \
+                 assumes nothing does"
+            );
+        }
+        // It is reached from the teardown owner's drain loop, and from nowhere else.
+        assert_eq!(
+            MEMORY_SRC
+                .matches("self.release_unreferenced_user_frame(phys)")
+                .count(),
+            1,
+            "exactly one call site, inside the teardown owner"
+        );
+        // And it never invents a physical address or edits a count.
+        assert!(
+            !body.contains("free_frames") && !body.contains("total_frames"),
+            "the release must not compensate by adjusting an allocator counter"
+        );
+    }
+
+    /// All three architectures reach the repaired owner through the same call, so none of them
+    /// carries a teardown of its own.
+    #[test]
+    fn every_architecture_uses_the_repaired_owner() {
+        let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            if rel == "src/kernel/boot/memory_state.rs" {
+                continue; // the definition
+            }
+            if src.contains("destroy_user_address_space_by_asid(") {
+                callers.push(rel);
+            }
+        }
+        callers.sort();
+        assert!(
+            !callers.is_empty(),
+            "the teardown owner must have production callers"
+        );
+        // No architecture may drain an address space by hand.
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            if rel == "src/kernel/vm.rs" || rel == "src/kernel/boot/memory_state.rs" {
+                continue;
+            }
+            assert!(
+                !src.contains("destroy_and_collect_mappings("),
+                "{rel} drains an address space without going through the teardown owner, so it \
+                 would miss the frame release"
+            );
+        }
+    }
+}
+
+/// U9-ASPACE1 §2 — NR 26 (`SpawnFromInitramfsFile`) is retired, and NR 24 is not.
+///
+/// The audit that produced this: NR 24 has a real production caller — PM's VFS spawn falls back
+/// to `spawn_process_from_user_buf` when the MemoryObject grant path returns `Unsupported` — so
+/// it stays. NR 26's userspace wrapper was never called by anything; PM reaches the same images
+/// through NR 29 and that NR 24 fallback. The ABI doc claimed PM used NR 26 "through
+/// `pm_vfs_spawn_inline`", and that claim was simply false: the function calls NR 24.
+#[cfg(test)]
+mod u9aspace1_nr26_retired {
+    use super::*;
+    use crate::kernel::syscall::{
+        ALL_SYSCALL_VARIANTS, RETIRED_SYSCALL_NUMBERS, Syscall, retired_syscall_number,
+    };
+
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const PM_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+    );
+
+    /// NR 24 is RETAINED, and this is the dependency that retains it. If PM ever stops calling
+    /// it, this test is the place that says so out loud.
+    #[test]
+    fn nr24_is_retained_because_pm_still_calls_it() {
+        assert!(
+            PM_SRC.contains("yarm_user_rt::syscall::spawn_process_from_user_buf("),
+            "NR 24's production caller is PM's VFS spawn fallback; if it is gone, re-run the \
+             retirement audit rather than deleting this assertion"
+        );
+        assert_eq!(
+            Syscall::decode(24),
+            Ok(Syscall::SpawnProcessFromUserBuf),
+            "NR 24 stays live"
+        );
+        assert!(
+            USER_RT_SRC.contains("pub unsafe fn spawn_process_from_user_buf("),
+            "and its userspace wrapper stays"
+        );
+    }
+
+    /// NR 26 is gone from every layer: the kernel table, the dispatcher, the handler, and the
+    /// userspace wrapper that was the only way to name it.
+    #[test]
+    fn nr26_is_gone_from_every_layer() {
+        assert!(Syscall::decode(26).is_err(), "NR 26 must not decode");
+        assert!(
+            !ALL_SYSCALL_VARIANTS.iter().any(|v| v.number() == 26),
+            "no variant may claim NR 26"
+        );
+        // Every code-bearing spelling is gone. The bare name survives in exactly one place —
+        // the retirement record itself — because a retirement that leaves no record is how a
+        // number quietly becomes reusable again.
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            for gone in [
+                "Syscall::SpawnFromInitramfsFile",
+                "handle_spawn_from_initramfs_file",
+                "SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR",
+            ] {
+                assert!(
+                    !src.contains(gone),
+                    "{rel} still references {gone} after the retirement"
+                );
+            }
+            if rel != "src/kernel/syscall.rs" {
+                assert!(
+                    !src.contains("SpawnFromInitramfsFile"),
+                    "{rel} names the retired syscall outside the retirement record"
+                );
+            }
+        }
+        for gone in [
+            "spawn_from_initramfs_file",
+            "SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR",
+        ] {
+            assert!(
+                !USER_RT_SRC.contains(gone),
+                "the user runtime still exposes {gone}, so userspace could still issue NR 26"
+            );
+        }
+    }
+
+    /// The number stays reserved. This is the part that matters most and is easiest to lose: a
+    /// numeric ABI cannot tell an old caller that a number changed meaning, so a reused number
+    /// turns a stale call into a silent, unrelated operation.
+    #[test]
+    fn a_retired_number_may_not_be_reused() {
+        for (nr, reason) in RETIRED_SYSCALL_NUMBERS {
+            assert!(
+                retired_syscall_number(*nr).is_some(),
+                "NR {nr} is listed retired ({reason}) but the lookup does not know it"
+            );
+            assert!(
+                Syscall::decode(*nr).is_err(),
+                "retired NR {nr} must not decode to a live syscall"
+            );
+            assert!(
+                !ALL_SYSCALL_VARIANTS.iter().any(|v| v.number() == *nr),
+                "retired NR {nr} was handed to a new variant — that silently changes what an \
+                 old caller's number means, which is the one thing a numeric ABI cannot recover \
+                 from"
+            );
+        }
+        // Both retirements to date are listed, and a live number is never mistaken for one.
+        let listed: alloc::vec::Vec<usize> =
+            RETIRED_SYSCALL_NUMBERS.iter().map(|(nr, _)| *nr).collect();
+        assert!(listed.contains(&26) && listed.contains(&27), "26 and 27");
+        for live in ALL_SYSCALL_VARIANTS.iter() {
+            assert!(
+                retired_syscall_number(live.number()).is_none(),
+                "live syscall {live:?} is also listed as retired"
+            );
+        }
+    }
+
+    /// A retired number is answered BEFORE the terminal broad dispatcher, not by it.
+    ///
+    /// Without this, retiring a class would make things worse rather than better: every caller
+    /// still naming the number would be handed a broad-lock acquisition to be told "no". The
+    /// answer needs no lock — it is a fixed table — so it is given pre-lock.
+    #[test]
+    fn a_retired_number_is_refused_before_the_broad_dispatcher() {
+        let route = SPLIT_SRC
+            .split("fn try_split_dispatch_nonswitching_into_frame(")
+            .nth(1)
+            .expect("the nonswitching split dispatcher");
+        let refusal = route
+            .find("retired_syscall_number(raw_nr)")
+            .expect("the retired-number refusal");
+        let decode = route.find("Syscall::decode(raw_nr)").expect("the decode");
+        assert!(
+            refusal < decode,
+            "the retired-number refusal must come before the decode whose failure falls back to \
+             the broad dispatcher"
+        );
+        let arm = &route[refusal..decode];
+        assert!(
+            arm.contains("SyscallError::InvalidNumber"),
+            "and it must return the SAME canonical error the broad path would have produced"
+        );
+        assert!(
+            arm.contains("return Some(Err("),
+            "terminally — a `None` here would fall through to the broad dispatcher after all"
+        );
+    }
+
+    /// The shared spawn owners NR 23, NR 24 and NR 29 still need are untouched.
+    #[test]
+    fn the_shared_spawn_owners_survived_the_retirement() {
+        const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+        for owner in [
+            "static VFS_ELF_STAGING",
+            "fn spawn_image_path_for_image_id",
+            "fn normalized_startup_args",
+            "fn copy_spawn_startup_args",
+            "fn handle_spawn_process(",
+            "fn handle_spawn_process_from_user_buf(",
+            "fn handle_spawn_from_memory_object(",
+        ] {
+            assert!(
+                PROCESS_SRC.contains(owner),
+                "{owner} is shared with NR 23/24/29 and must not have been removed with NR 26"
             );
         }
     }

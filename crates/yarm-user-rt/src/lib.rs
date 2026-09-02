@@ -73,7 +73,8 @@ pub mod syscall {
     const SYSCALL_FORK_NR: usize = 12;
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
     pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
-    pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
+    // NR 26 (SpawnFromInitramfsFile) retired in U9-ASPACE1 §2. The number stays unassigned:
+    // see `RETIRED_SYSCALL_NUMBERS` in the kernel's syscall table for why it is not reusable.
     // NR 27 (InitramfsReadChunk) removed in Stage 197A — the number is now unused.
     /// Phase 3A: Create a read-only MemoryObject for a named CPIO file slice.
     pub const SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR: usize = 28;
@@ -1124,100 +1125,6 @@ pub mod syscall {
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             return Err(decode_syscall_error(ret.error));
-        }
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 {
-            return Err(decode_syscall_error(ret.ret0));
-        }
-        let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
-        let spawner_cap = (ret.ret2 >> 32) as u32;
-        Ok((ret.ret1 as u64, caller_cap, spawner_cap))
-    }
-
-    /// Spawn a process directly from a named file inside the boot initramfs CPIO.
-    ///
-    /// The kernel reads the ELF into an internal staging buffer (no user-space
-    /// buffer required) and spawns the process, returning `(tid, caller_cap, spawner_cap)`.
-    pub unsafe fn spawn_from_initramfs_file(
-        image_id: u64,
-        name: &[u8],
-        parent_pid: u64,
-        startup_args: &[u64; 18],
-    ) -> core::result::Result<(u64, u32, u32), SyscallError> {
-        if name.is_empty() {
-            return Err(SyscallError::InvalidArgs);
-        }
-        let args = [
-            image_id as usize,              // arg0 = image_id
-            name.as_ptr() as usize,         // arg1 = name_ptr
-            name.len(),                     // arg2 = name_len
-            parent_pid as usize,            // arg3 = parent_pid
-            startup_args.as_ptr() as usize, // arg4 = startup_args_ptr
-            startup_args.len(),             // arg5 = startup_args_count
-        ];
-        #[cfg(all(target_arch = "aarch64", not(test)))]
-        {
-            let lr: usize;
-            let sp: usize;
-            let fp: usize;
-            let saved_lr: usize;
-            unsafe {
-                core::arch::asm!(
-                    "mov {lr}, x30",
-                    "mov {sp}, sp",
-                    "mov {fp}, x29",
-                    "ldr {slr}, [x29, #8]",
-                    lr = out(reg) lr,
-                    sp = out(reg) sp,
-                    fp = out(reg) fp,
-                    slr = out(reg) saved_lr,
-                    options(nostack, readonly),
-                );
-            }
-            crate::user_log!(
-                "SPAWN26_RTLIB_STACK_BEFORE sp=0x{:x} fp=0x{:x} lr=0x{:x} saved_lr=0x{:x}",
-                sp,
-                fp,
-                lr,
-                saved_lr
-            );
-        }
-        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR, args) };
-        #[cfg(all(target_arch = "aarch64", not(test)))]
-        {
-            let lr: usize;
-            let sp: usize;
-            let fp: usize;
-            let saved_lr: usize;
-            unsafe {
-                core::arch::asm!(
-                    "mov {lr}, x30",
-                    "mov {sp}, sp",
-                    "mov {fp}, x29",
-                    "ldr {slr}, [x29, #8]",
-                    lr = out(reg) lr,
-                    sp = out(reg) sp,
-                    fp = out(reg) fp,
-                    slr = out(reg) saved_lr,
-                    options(nostack, readonly),
-                );
-            }
-            crate::user_log!(
-                "SPAWN26_RTLIB_STACK_AFTER sp=0x{:x} fp=0x{:x} lr=0x{:x} saved_lr=0x{:x}",
-                sp,
-                fp,
-                lr,
-                saved_lr
-            );
-            crate::user_log!(
-                "AARCH64_SYSCALL26_RETURN x0={} x1={} x2={} x3={} x4={} x5={}",
-                ret.ret0,
-                ret.ret1,
-                ret.ret2,
-                ret.ret3,
-                ret.ret4,
-                ret.ret5
-            );
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         if ret.ret0 != 0 {

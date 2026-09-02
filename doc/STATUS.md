@@ -19,6 +19,42 @@ commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
 Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 `doc/KERNEL_UNLOCKING.md` §0.
 
+**U9-ASPACE1 — the address-space teardown frame leak is closed, NR 26 is retired, and AArch64 is
+no longer shallower than the other two architectures. Census remains `2 / 0 / 2`. U9 remains
+OPEN.**
+
+*§1 — the leak and its inverse.* `destroy_user_address_space_by_asid` reclaimed drained pages
+only through MemoryObject-scoped owners, so a page that no MemoryObject described — which is
+every ELF `PT_LOAD` page, since `alloc_user_data_frame` registers no object — was reclaimed by
+nothing. One frame was lost per such page on every address-space teardown, whether the space died
+from a task exiting or from a spawn failing. `release_unreferenced_user_frame` is the inverse: it
+frees only when no MemoryObject describes the frame, no live address space still maps it, and the
+allocator issued it. That third condition is exact rather than approximate, because reserved
+ranges are sanitized out of the boot regions before the allocator is seeded and the page-table
+pool is a disjoint allocator — so the main allocator's inventory is nothing but user-data frames
+it handed out.
+
+*§2 — NR 24 retained, NR 26 retired.* NR 24 has a live production caller: PM's VFS spawn falls
+back to it when the MemoryObject grant path returns `Unsupported`. NR 26 had none — its userspace
+wrapper was never called, and the ABI doc's claim that PM used it "through `pm_vfs_spawn_inline`"
+was wrong, since that function calls NR 24. The number stays unassigned and non-reusable, and
+invoking it is now refused **before** the terminal broad dispatcher rather than by it.
+
+*§3 — the AArch64 depth question is closed.* After the A64-DEPTH repairs, three fresh runs on each
+architecture produce an identical service-entry chain:
+
+| | NR 23 | NR 29 enter / ok | `PM_ELF_ZC_DONE` | ramfs mount | ext4 ready | panics |
+|---|---|---|---|---|---|---|
+| x86_64  | 3 | 5 / 5 | 5 | 1 | 2 | 0 |
+| AArch64 | 3 | 5 / 5 | 5 | 1 | 2 | 0 |
+| RISC-V  | 3 | 5 / 5 | 5 | 1 | 2 | 0 |
+
+**AArch64 now witnesses NR 29, five times per boot, and reaches the same terminal state as the
+other two.** There is no remaining missing service transition to name: the shallowness was the
+NR 28 writeback defect, and repairing that restored the whole chain. No workload was manufactured
+and nothing was routed to obtain this.
+
+
 **U9-SPAWN1 — NR 11 routed off all three terminal dispatchers; the spawn transaction gets a
 compensation ledger; NR 23 HARD-STOPS on a missing owner. Census remains `2 / 0 / 2`. U9 remains
 OPEN. Fork, ExitCurrentTask, NR 16, NR 23, NR 26 and NR 29 remain broad.**

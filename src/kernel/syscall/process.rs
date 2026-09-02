@@ -135,23 +135,60 @@ pub(super) fn handle_spawn_process(
         parent_pid,
         startup_args_count
     );
+    // Stage 175 (SPAWN-LIFECYCLE): default-off phase markers. U9-ASPACE1 §2 moved them here from
+    // the retired NR 26 handler — they instrument a SPAWN, not a particular syscall number, and
+    // NR 23 performs the same four steps (request, image resolve, ELF parse, load). Every
+    // resolve/parse/load/spawn step below is unchanged; these only expose the phase boundaries.
+    let spawn_lc = crate::kernel::boot::spawn_lifecycle_enabled();
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_REQUEST_BEGIN image_id={} parent_pid={}",
+            image_id,
+            parent_pid
+        );
+    }
     let (startup_args, extra_send_caps) =
         normalized_startup_args(kernel, startup_args_ptr, startup_args_count)?;
     // For initramfs_srv (image_id=4) the transaction maps the boot initrd read-only into its
     // address space after the load, publishing the user VA + length in startup slots 15/16.
     const INITRAMFS_IMAGE_ID: u64 = 4;
-    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
+    let Some(image_path) = spawn_image_path_for_image_id(image_id) else {
+        if spawn_lc {
+            crate::yarm_log!("SPAWN_LIFECYCLE_BAD_IMAGE_ID image_id={}", image_id);
+        }
+        return Err(SyscallError::InvalidArgs);
+    };
     crate::yarm_log!("KSPAWN_PATH path={}", image_path);
     let initrd =
         crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
-    let entry = CpioArchive::new(initrd)
-        .find(image_path)
-        .map_err(|_| SyscallError::InvalidArgs)?
-        .ok_or(SyscallError::InvalidArgs)?;
+    let entry = match CpioArchive::new(initrd).find(image_path) {
+        Ok(Some(entry)) => entry,
+        Ok(None) | Err(_) => {
+            if spawn_lc {
+                crate::yarm_log!("SPAWN_LIFECYCLE_IMAGE_RESOLVE_FAIL image_id={}", image_id);
+            }
+            return Err(SyscallError::InvalidArgs);
+        }
+    };
     let elf_bytes = entry.file_data();
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_IMAGE_RESOLVE_OK image_id={} bytes={}",
+            image_id,
+            elf_bytes.len()
+        );
+        crate::yarm_log!("SPAWN_LIFECYCLE_ELF_PARSE_BEGIN image_id={}", image_id);
+    }
     crate::yarm_log!("KSPAWN_ELF_FOUND size={}", elf_bytes.len());
     let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
     crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_ELF_PARSE_OK image_id={} entry=0x{:x}",
+            image_id,
+            elf.entry
+        );
+    }
     let committed = spawn_image_txn::run_image_spawn_transaction(
         kernel,
         spawn_image_txn::SpawnImageRequest {
@@ -166,15 +203,14 @@ pub(super) fn handle_spawn_process(
             startup_args,
             extra_send_caps,
             map_initrd_window: image_id == INITRAMFS_IMAGE_ID,
-            lifecycle_markers: false,
+            lifecycle_markers: spawn_lc,
         },
     )?;
     frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
     Ok(())
 }
 
-/// Kernel-side staging buffer for ELF images supplied via SpawnProcessFromUserBuf
-/// and SpawnFromInitramfsFile.
+/// Kernel-side staging buffer for ELF images supplied via SpawnProcessFromUserBuf.
 ///
 /// A proper per-call allocation would require a kernel heap; the static buffer
 /// avoids that dependency at the cost of exclusivity.  Rather than rely on an
@@ -301,131 +337,6 @@ pub(super) fn handle_spawn_process_from_user_buf(
             lifecycle_markers: false,
         },
     )?;
-    frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
-    Ok(())
-}
-
-/// Spawn a process directly from a named file in the boot initramfs CPIO.
-///
-/// ABI: arg0=image_id, arg1=name_ptr, arg2=name_len, arg3=parent_pid,
-///      arg4=startup_args_ptr, arg5=startup_args_count
-///
-/// Reads the ELF into the kernel-side staging buffer (no user-space buffer),
-/// then spawns exactly like `SpawnProcessFromUserBuf`.
-pub(super) fn handle_spawn_from_initramfs_file(
-    kernel: &mut KernelState,
-    frame: &mut TrapFrame,
-) -> Result<(), SyscallError> {
-    let image_id = frame.arg(0) as u64;
-    let name_ptr = frame.arg(1);
-    let name_len = frame.arg(2);
-    let parent_pid = frame.arg(3) as u64;
-    let startup_args_ptr = frame.arg(4);
-    let startup_args_count = frame.arg(5);
-
-    // Stage 175 (SPAWN-LIFECYCLE): default-off phase markers. Every resolve/parse/
-    // load/spawn step is UNCHANGED — these only expose the phase boundaries.
-    let spawn_lc = crate::kernel::boot::spawn_lifecycle_enabled();
-    if spawn_lc {
-        crate::yarm_log!(
-            "SPAWN_LIFECYCLE_REQUEST_BEGIN image_id={} parent_pid={}",
-            image_id,
-            parent_pid
-        );
-    }
-
-    if name_len == 0 || name_len > 128 {
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    let name_buf = kernel
-        .copy_from_current_user(name_ptr, name_len)
-        .map_err(|_| SyscallError::InvalidArgs)?;
-    let name =
-        core::str::from_utf8(&name_buf[..name_len]).map_err(|_| SyscallError::InvalidArgs)?;
-    let name = name.strip_prefix('/').unwrap_or(name);
-
-    let initrd =
-        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
-    let entry = match CpioArchive::new(initrd).find(name) {
-        Ok(Some(entry)) => entry,
-        Ok(None) | Err(_) => {
-            if spawn_lc {
-                crate::yarm_log!("SPAWN_LIFECYCLE_IMAGE_RESOLVE_FAIL image_id={}", image_id);
-            }
-            return Err(SyscallError::InvalidArgs);
-        }
-    };
-    let data = entry.file_data();
-    if spawn_lc {
-        crate::yarm_log!(
-            "SPAWN_LIFECYCLE_IMAGE_RESOLVE_OK image_id={} bytes={}",
-            image_id,
-            data.len()
-        );
-    }
-
-    crate::yarm_log!(
-        "KSPAWN_FROM_CPIO image_id={} name={} file_size={}",
-        image_id,
-        name,
-        data.len()
-    );
-
-    // Exclusive, type-checked access to the shared ELF staging buffer; the claim
-    // is released when `staging_claim` drops at end of handler.
-    let mut staging_claim = VFS_ELF_STAGING.try_take().ok_or(SyscallError::Internal)?;
-    let staging = staging_claim.as_mut_slice();
-    let elf_len = data.len();
-    if elf_len == 0 || elf_len > staging.len() {
-        return Err(SyscallError::InvalidArgs);
-    }
-    staging[..elf_len].copy_from_slice(data);
-    let elf_bytes = &staging[..elf_len];
-
-    let image_path = match spawn_image_path_for_image_id(image_id) {
-        Some(path) => path,
-        None => {
-            if spawn_lc {
-                crate::yarm_log!("SPAWN_LIFECYCLE_BAD_IMAGE_ID image_id={}", image_id);
-            }
-            return Err(SyscallError::InvalidArgs);
-        }
-    };
-    crate::yarm_log!("KSPAWN_FROM_CPIO path={}", image_path);
-    if spawn_lc {
-        crate::yarm_log!("SPAWN_LIFECYCLE_ELF_PARSE_BEGIN image_id={}", image_id);
-    }
-    let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
-    crate::yarm_log!("KSPAWN_FROM_CPIO entry=0x{:x}", elf.entry);
-    if spawn_lc {
-        crate::yarm_log!(
-            "SPAWN_LIFECYCLE_ELF_PARSE_OK image_id={} entry=0x{:x}",
-            image_id,
-            elf.entry
-        );
-    }
-
-    let (startup_args, extra_send_caps) =
-        normalized_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    let committed = spawn_image_txn::run_image_spawn_transaction(
-        kernel,
-        spawn_image_txn::SpawnImageRequest {
-            image_id,
-            image_path,
-            source: spawn_image_txn::SpawnImageSource::PtLoadSegments {
-                elf: elf_bytes,
-                entry: elf.entry as usize,
-            },
-            class: TaskClass::SystemServer,
-            parent_pid,
-            startup_args,
-            extra_send_caps,
-            map_initrd_window: false,
-            lifecycle_markers: spawn_lc,
-        },
-    )?;
-    crate::yarm_log!("KSPAWN_FROM_CPIO spawned_tid={}", committed.tid);
     frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
     Ok(())
 }
@@ -597,7 +508,7 @@ pub(super) fn handle_reap_faulted_task(
 ///      arg3=startup_args_ptr, arg4=startup_args_count
 ///
 /// Resolves the MemoryObject → reads initrd slice → loads ELF via load_elf_with_mo_zero_copy
-/// → spawns exactly like SpawnFromInitramfsFile.
+/// → spawns through the same compensated transaction as every other image-loading spawn.
 ///
 /// Returns: ret0=0, ret1=spawned_tid, ret2=packed_send_caps on success.
 pub(super) fn handle_spawn_from_memory_object(
