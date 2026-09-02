@@ -1010,10 +1010,34 @@ impl KernelState {
             Self::create_memory_object_slot_locked(memory, phys, len, kind, max_objects)
         })?;
 
-        let cap = self.mint_capability_for_current_context(Capability::new(
+        // U9-MO2 — TRANSACTIONAL. The mint used to be a bare `?` straight after the install,
+        // so a `CapabilityFull` cspace left the object behind with all three refcounts at zero
+        // and nothing referencing it: an orphan for the rest of the boot. It has not been
+        // observed because the mint has not been observed to fail here, but the object is the
+        // first mutation and the mint is the first thing after it that can fail.
+        //
+        // The compensation is the SAME release owner every other reclaim uses, so it obeys the
+        // backing-ownership rule: an anonymous object returns its exact extent, a borrowed
+        // initramfs slice returns nothing to the allocator. The original mint error is
+        // propagated unchanged — the caller sees exactly what it saw before, minus the orphan.
+        let cap = match self.mint_capability_for_current_context(Capability::new(
             CapObject::MemoryObject { id },
             Self::memory_object_rights_for_kind(kind),
-        ))?;
+        )) {
+            Ok(cap) => cap,
+            Err(mint_err) => {
+                self.with_memory_state_mut(|memory| {
+                    if let Some(slot) = memory
+                        .memory_objects
+                        .iter()
+                        .position(|entry| entry.is_some_and(|mem| mem.id == id))
+                    {
+                        Self::release_memory_object_slot_locked(memory, slot);
+                    }
+                });
+                return Err(mint_err);
+            }
+        };
 
         Ok((id, cap))
     }

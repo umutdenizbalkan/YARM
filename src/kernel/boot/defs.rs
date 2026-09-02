@@ -50,6 +50,44 @@ pub(crate) enum MemoryObjectKind {
     InitramfsFileSlice { initrd_offset: u64, file_len: u64 },
 }
 
+/// U9-MO2 — who owns the physical backing of a [`MemoryObject`], and therefore what releasing
+/// one is allowed to do to the frame allocator.
+///
+/// This distinction was implicit and unstated, and every reclaim path acted as though it were
+/// always [`Self::AllocatorOwned`]: they called `free_frame(object.phys)` with no reference to
+/// the kind. That is latent corruption rather than a leak — an initramfs slice's physical
+/// address is inside the boot initrd, memory the allocator never handed out, so freeing it
+/// would insert someone else's memory into the free list. It has never fired only because no
+/// `InitramfsFileSlice` object is reclaimed in production today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryBacking {
+    /// The frame allocator handed this extent out and must get it back — exactly once, and
+    /// exactly the extent that was taken.
+    AllocatorOwned,
+    /// The extent belongs to something else that outlives the object (the boot initrd blob).
+    /// Releasing the object removes it from the registry and touches the allocator NEVER.
+    Borrowed,
+}
+
+impl MemoryObjectKind {
+    /// THE backing-ownership rule, stated once for every kind.
+    ///
+    /// Exhaustive by construction: there is no wildcard arm, so a new `MemoryObjectKind`
+    /// variant fails to compile until somebody decides who owns its backing. That is the
+    /// point — the previous model let a new kind silently inherit "allocator-owned" and be
+    /// freed into an allocator that never owned it.
+    pub(crate) const fn backing(self) -> MemoryBacking {
+        match self {
+            // Both constructors (`alloc_anonymous_memory_object_with_len` and the COW
+            // private-copy route) take the frame from `frame_allocator` before wrapping it.
+            Self::Anonymous => MemoryBacking::AllocatorOwned,
+            // The only constructor is NR 28, whose phys is `initrd_phys_base + offset` rounded
+            // down to a page. Nothing allocated it; the initrd outlives every object over it.
+            Self::InitramfsFileSlice { .. } => MemoryBacking::Borrowed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MemoryObject {
     pub(crate) id: u64,

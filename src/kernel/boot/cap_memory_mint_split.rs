@@ -266,8 +266,10 @@ impl crate::runtime::SharedKernel {
                 && mem.map_refcount == 0
                 && mem.pin_refcount == 0
             {
-                let _ = kernel_mut(&mut memory.frame_allocator).free_frame(mem.phys.0);
-                memory.memory_objects[slot] = None;
+                // U9-MO2: through the one release owner, so this rollback obeys the same
+                // backing-ownership rule as every other reclaim. It used to free the frame
+                // unconditionally, which for a borrowed extent is not a leak but corruption.
+                KernelState::release_memory_object_slot_locked(memory, slot);
             }
         });
     }

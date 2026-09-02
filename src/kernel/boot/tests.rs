@@ -150336,3 +150336,254 @@ mod direct3_cap_final_prelock_refusal {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// U9-MO2 — backing-aware MemoryObject reclaim.
+//
+// Every reclaim path used to call `free_frame(object.phys)` with no reference to the object's
+// kind. For an allocator-owned object that is right but under-frees a multi-page extent; for a
+// BORROWED one — an initramfs slice, whose phys is inside the boot initrd — it is not a leak
+// but corruption, handing the allocator memory it never owned. These pin the rule.
+mod u9mo2_backing_aware_reclaim {
+    use super::*;
+    use crate::kernel::boot::{MemoryBacking, MemoryObjectKind};
+    use crate::kernel::vm::PAGE_SIZE;
+    use crate::runtime::SharedKernel;
+
+    const DEFS: &str = include_str!("defs.rs");
+    const LIFECYCLE: &str = include_str!("memory_lifecycle_state.rs");
+    const MEM_STATE: &str = include_str!("memory_state.rs");
+    const MINT_SPLIT: &str = include_str!("cap_memory_mint_split.rs");
+
+    /// THE rule, stated once and exhaustively.
+    #[test]
+    fn every_kind_has_a_derived_backing_and_a_new_one_cannot_default() {
+        assert_eq!(
+            MemoryObjectKind::Anonymous.backing(),
+            MemoryBacking::AllocatorOwned
+        );
+        assert_eq!(
+            MemoryObjectKind::InitramfsFileSlice {
+                initrd_offset: 4096,
+                file_len: 32944,
+            }
+            .backing(),
+            MemoryBacking::Borrowed
+        );
+        // No wildcard arm: a new variant fails to compile until it is classified. That is the
+        // whole guarantee — the previous model let a new kind inherit "allocator-owned"
+        // silently, which is the direction that corrupts rather than leaks.
+        let body = DEFS
+            .split("pub(crate) const fn backing(self) -> MemoryBacking {")
+            .nth(1)
+            .expect("the backing rule");
+        let body = &body[..body.find("\n    }").expect("bounded")];
+        assert!(
+            !body.contains("_ =>") && !body.contains("_=>"),
+            "the backing match must stay exhaustive — no wildcard arm"
+        );
+        assert_eq!(
+            body.matches("Self::").count(),
+            2,
+            "exactly the two production kinds are classified"
+        );
+    }
+
+    /// A BORROWED extent is never handed to the allocator — even when its physical address
+    /// lies numerically inside an allocator span, which is the case the old code got wrong.
+    #[test]
+    fn a_borrowed_slice_inside_an_allocator_span_is_never_freed() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        // An address the allocator demonstrably manages: take a frame, note it, give it back.
+        let owned = k
+            .with(|s| {
+                s.with_memory_state_mut(|m| {
+                    crate::kernel::boot::kernel_mut(&mut m.frame_allocator).alloc_contiguous(1)
+                })
+            })
+            .expect("a frame the allocator owns");
+        let free_before = k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+
+        // Install a BORROWED object at that very address, then release it.
+        let max = k.with(|s| s.runtime_capacity_config().max_memory_objects);
+        let id = k
+            .with(|s| {
+                s.with_memory_state_mut(|m| {
+                    crate::kernel::boot::KernelState::create_memory_object_slot_locked(
+                        m,
+                        crate::kernel::vm::PhysAddr(owned),
+                        PAGE_SIZE,
+                        MemoryObjectKind::InitramfsFileSlice {
+                            initrd_offset: 0,
+                            file_len: 16,
+                        },
+                        max,
+                    )
+                })
+            })
+            .expect("slot");
+        k.with(|s| {
+            s.reclaim_memory_object_if_unreferenced(
+                crate::kernel::capabilities::CapObject::MemoryObject { id },
+            )
+        });
+
+        let free_after = k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        assert_eq!(
+            free_after, free_before,
+            "releasing a BORROWED object must not change the free list, even at an address \
+             the allocator owns — the object never owned that extent"
+        );
+        assert!(
+            k.with(|s| s.memory_object_refcounts_by_id(id)).is_none(),
+            "but the registry slot is released"
+        );
+    }
+
+    /// An ALLOCATOR-OWNED object returns its exact extent, once.
+    #[test]
+    fn an_allocator_owned_object_returns_its_exact_extent_exactly_once() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let pages = 3usize;
+        let free_before = k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        let (id, _cap) = k
+            .with(|s| s.alloc_anonymous_memory_object_with_len(pages * PAGE_SIZE))
+            .expect("anonymous object");
+        let after_alloc = k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        assert_eq!(
+            free_before - after_alloc,
+            pages,
+            "the constructor took exactly {pages} pages"
+        );
+
+        // Drop the mint's cap reference so the object is unreferenced, then release it.
+        k.with(|s| {
+            s.adjust_memory_object_cap_refcount(
+                crate::kernel::capabilities::CapObject::MemoryObject { id },
+                -1,
+            );
+            s.reclaim_memory_object_if_unreferenced(
+                crate::kernel::capabilities::CapObject::MemoryObject { id },
+            )
+        });
+        let after_free = k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        assert_eq!(
+            after_free, free_before,
+            "the EXACT extent came back — the old `free_frame` returned one page and \
+             under-freed every multi-page object"
+        );
+        // Repeating is inert: the slot is gone, so nothing is double-freed.
+        k.with(|s| {
+            s.reclaim_memory_object_if_unreferenced(
+                crate::kernel::capabilities::CapObject::MemoryObject { id },
+            )
+        });
+        assert_eq!(
+            k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames())),
+            free_before,
+            "a repeated release frees nothing a second time"
+        );
+    }
+
+    /// A live reference prevents release, of either backing.
+    #[test]
+    fn a_live_reference_prevents_release() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (id, _cap) = k
+            .with(|s| s.alloc_anonymous_memory_object_with_len(PAGE_SIZE))
+            .expect("object");
+        // The mint left cap_refcount = 1.
+        assert_eq!(
+            k.with(|s| s.memory_object_refcounts_by_id(id)).map(|r| r.0),
+            Some(1)
+        );
+        let free_before = k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        k.with(|s| {
+            s.reclaim_memory_object_if_unreferenced(
+                crate::kernel::capabilities::CapObject::MemoryObject { id },
+            )
+        });
+        assert!(
+            k.with(|s| s.memory_object_refcounts_by_id(id)).is_some(),
+            "a referenced object is not released"
+        );
+        assert_eq!(
+            k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames())),
+            free_before,
+            "and nothing is freed"
+        );
+    }
+
+    /// A stale identity releases nothing.
+    #[test]
+    fn a_stale_identity_mutates_nothing() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let free_before = k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        k.with(|s| {
+            s.reclaim_memory_object_if_unreferenced(
+                crate::kernel::capabilities::CapObject::MemoryObject { id: 999_999 },
+            )
+        });
+        assert_eq!(
+            k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames())),
+            free_before
+        );
+    }
+
+    /// ONE release owner: no reclaim path may call the frame allocator directly any more.
+    #[test]
+    fn every_reclaim_path_goes_through_the_one_release_owner() {
+        for (name, src) in [
+            ("memory_lifecycle_state.rs", LIFECYCLE),
+            ("cap_memory_mint_split.rs", MINT_SPLIT),
+        ] {
+            for banned in ["free_frame(memory_object.phys", "free_frame(mem.phys"] {
+                assert!(
+                    !src.contains(banned),
+                    "{name} still frees a MemoryObject's frame directly: {banned}"
+                );
+            }
+        }
+        // The owner itself is the only place the rule is applied.
+        assert_eq!(
+            LIFECYCLE
+                .matches("fn release_memory_object_slot_locked(")
+                .count(),
+            1,
+            "exactly one release owner"
+        );
+        let owner = LIFECYCLE
+            .split("pub(crate) fn release_memory_object_slot_locked(")
+            .nth(1)
+            .expect("the owner");
+        let owner = &owner[..owner.find("\n    /// ").unwrap_or(owner.len())];
+        assert!(
+            owner.contains("MemoryBacking::AllocatorOwned")
+                && owner.contains("MemoryBacking::Borrowed")
+                && owner.contains("free_contiguous(object.phys.0, pages)"),
+            "the owner applies the backing rule and returns the exact extent"
+        );
+    }
+
+    /// §3 — the broad creator is transactional: a failed mint leaves no orphan.
+    #[test]
+    fn the_broad_creator_compensates_a_failed_mint_through_the_same_owner() {
+        let body = MEM_STATE
+            .split("fn create_memory_object_with_len_and_kind(")
+            .nth(1)
+            .expect("the broad creator");
+        let body = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(
+            !body.contains("))?;\n\n        Ok((id, cap))"),
+            "the mint must no longer be a bare `?` after the object install"
+        );
+        assert!(
+            body.contains("Err(mint_err) =>") && body.contains("return Err(mint_err);"),
+            "the original mint error is propagated unchanged"
+        );
+        assert!(
+            body.contains("Self::release_memory_object_slot_locked(memory, slot)"),
+            "and the object is compensated through the SAME release owner"
+        );
+    }
+}
