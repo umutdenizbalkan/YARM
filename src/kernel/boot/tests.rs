@@ -151927,4 +151927,46 @@ mod a64depth_writeback_and_selector {
             "the owner must assert it cannot collide with the reserved exit selectors"
         );
     }
+
+    /// The NR 11 witness counter must not be able to go blind on an architecture again.
+    ///
+    /// The original counter lived in a scratch file and required the marker name and
+    /// `disposable_tid=` to be ADJACENT. x86_64 and AArch64 satisfy that; RISC-V interposes
+    /// `arch=riscv64`, so a healthy RISC-V boot scored zero split successes and a NEGATIVE broad
+    /// count. Nothing could have caught it, because the counter and the markers it read shared
+    /// only a hand-copied literal.
+    ///
+    /// Two structural properties close that, and both are pinned here rather than reimplemented
+    /// — a Rust copy of the matcher would be the very drift this guards against.
+    #[test]
+    fn the_nr11_witness_counter_is_committed_and_architecture_field_proof() {
+        const EVAL: &str = include_str!("../../../scripts/nr11-spawn-thread-oracle-eval.sh");
+        // (1) The architecture field is OPTIONAL in the pattern, so a marker that carries one and
+        //     a marker that does not both count.
+        assert!(
+            EVAL.contains("EXIT_TASK_ORACLE_SPAWNED( arch=[A-Za-z0-9_]+)? disposable_tid=([0-9]+)"),
+            "the witness pattern must tolerate an architecture field between the marker name and \
+             the TID"
+        );
+        // (2) The self-test derives the spellings it exercises FROM the userspace source that
+        //     emits them, so a new or changed marker is covered automatically instead of
+        //     silently zeroing its count.
+        assert!(
+            EVAL.contains("grep -aoE '\"EXIT_TASK_ORACLE_SPAWNED[^\"]*\"' \"$INIT_SRC\""),
+            "the self-test must derive marker spellings from the emitting source, not from \
+             literals typed into the evaluator"
+        );
+        // The three spellings that exist today, so a silent DELETION of an architecture's oracle
+        // marker is also caught.
+        for expected in [
+            "\"EXIT_TASK_ORACLE_SPAWNED disposable_tid={}\"",
+            "\"EXIT_TASK_ORACLE_SPAWNED arch=aarch64 disposable_tid={}\"",
+            "\"EXIT_TASK_ORACLE_SPAWNED arch=riscv64 disposable_tid={}\"",
+        ] {
+            assert!(
+                INIT_SRC.contains(expected),
+                "the exit oracle must still emit {expected}"
+            );
+        }
+    }
 }
