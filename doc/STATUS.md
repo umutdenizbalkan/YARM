@@ -3780,3 +3780,199 @@ The x86_64 reply-timeout retirement profile is red at `a3aa7cb` and remains red.
 oracle never arms its identity cell, so it creates no reply-wins race. Four of base's five failures
 are now fixed and the seal moved `timeout_wins=0 → 1`, with `reply_wins=0` unchanged. The oracle is
 neither weakened, conditionalized nor deleted.
+
+## U9-MO2 — backing-aware MemoryObject reclaim, and NR 28 off the terminal dispatchers
+
+Production `CreateInitramfsFileSliceMo` (NR 28) no longer reaches the broad dispatcher on any
+architecture. **NR 28 terminal edges 3 → 0.** The census is unchanged at **2 / 0 / 2**, so this is
+CENSUS-DELTA 0.
+
+### The obstacle was never the mint
+
+Stage 191C excluded NR 28 from the split whitelist under the heading "capability-minting classes
+stay global-lock-only". That heading named the wrong property. The mint was never what blocked the
+class; the **unclassified backing** was. `MemoryObject` had two kinds and one reclaim rule, and the
+rule was `free_frame(object.phys)` with no reference to the kind:
+
+- for an `Anonymous` object that is right in direction but **under-frees**: it returns one page of
+  a multi-page extent;
+- for an `InitramfsFileSlice` — whose `phys` lies **inside the boot initrd blob** — it is not a
+  leak but **corruption**: it inserts memory the object never owned into the allocator's free
+  list, from where it is handed out again while the initrd is still mapped and still being read.
+
+So an off-lock NR 28 route had no exact compensation to call for a failed mint. §1–§3 supplied one.
+
+### §1 — one exhaustive backing rule
+
+`MemoryBacking { AllocatorOwned, Borrowed }` with `MemoryObjectKind::backing()` a total `match` —
+no wildcard arm, so a future kind **fails compilation until it is classified**. Both existing kinds
+are derived from source, not assumed: `Anonymous` is `AllocatorOwned` (its `phys` comes from
+`alloc_contiguous`); `InitramfsFileSlice` is `Borrowed` (its `phys` is the containing page of an
+extent inside the immutable boot initrd, which no allocator ever handed out).
+
+### §2/§3 — one release owner, and a transactional broad creator
+
+`release_memory_object_slot_locked` is the single reclaim owner. It applies the rule, and for an
+`AllocatorOwned` object returns the **exact extent** (`free_contiguous(phys, len / PAGE_SIZE)`),
+repairing the multi-page under-free at the same time. All four reclaim sites route through it.
+`create_memory_object_with_len_and_kind` became transactional: a failed mint releases the object it
+had already installed through that same owner and propagates the original error, instead of
+orphaning a registry slot.
+
+### §4 — the route, and the three gates
+
+`create_initramfs_file_slice_mo_split` composes existing owners only — the pure geometry rule
+(extracted so the broad creator and the route compute the same object from the same inputs), the
+rank-6 slot installer, the rank-6/rank-4 mint, and the backing-aware release owner — in rank order,
+in disjoint (never nested) critical sections.
+
+The pre-lock route's disposition is exhaustive by construction:
+
+```
+pre-mutation   PM/SystemServer gate, name bounds, user copy, UTF-8, prefix strip,
+               CPIO lookup, empty-file check, offset derivation, cspace resolve
+               → may still return None (unchanged broad fallback)
+── first mutation: the object slot ────────────────────────────────────────────
+post-mutation  success → set_ok(0, cap_id, file_len)
+               failure → object released through the backing-aware owner,
+                         mint's own refcount already rolled back,
+                         caller sees the EXACT error the broad handler would return
+               → never None
+```
+
+A post-mutation fallback is forbidden because it would let the broad handler build a **second**
+object for a request it never saw refused.
+
+Each architecture's gate is named rather than inferred, because an admission that stops at the
+classifier while the arch ingress still zeroes `nr` is not an edge closed, it is an edge hidden:
+
+| edge | gate | before | after |
+|---|---|---|---|
+| x86_64  | number-only classifier + dispatch arm (ABI already in frame) | broad | pre-lock |
+| AArch64 | pre-split ABI import in `trap_entry.rs`, unconditional | broad | pre-lock |
+| RISC-V  | `split_eligible` whitelist in `riscv64/trap.rs` | broad | pre-lock |
+
+### Guards repointed, not relaxed
+
+Four guards named NR 28 as permanently locked. Each was re-derived with its reason recorded:
+
+- **`stage191c non_selected_classes_remain_locked`** — the list's heading was corrected to what the
+  seam actually cannot serve (blocking, task-switching, page-table mutation), and a companion guard
+  pins the mint exemption at **exactly one class wide**: no other minting or mapping class rides in
+  on NR 28's admission.
+- **`stage191e split_whitelist_unchanged_no_new_class`** — the candidate seam never owned the
+  whitelist's contents; NR 28's admission came from §4 and is pinned by §4's own guards.
+- **`stage199d feature_off_remains_marker_clean`** — this one was a **latent defect, not a bound**.
+  It sliced a fixed 500 characters of the RISC-V whitelist, so once a member carried a comment the
+  window stopped covering the tail of the expression, and a newly admitted NR could satisfy the
+  "nothing else was added" count while escaping the membership assertions entirely. Widened to the
+  whole `split_eligible` expression (`;` to `;`), as the sibling NR 5 guard already does, and the
+  literal-NR count re-derived 5 → 6.
+- **`stage29_whitelist_exhaustive`** — an exhaustive sweep of the whole NR space, widened by
+  exactly one NR.
+
+### §5 — qualification
+
+**Hosted failure injection, every phase.** Each phase of the transaction is driven to failure and
+the kernel checked for the three things a partial transaction would leave behind — an orphan
+`MemoryObject` slot, a published capability, or a frame-allocator free list that moved:
+
+| injected failure | phase | typed error | objects | caps | free list |
+|---|---|---|---|---|---|
+| zero-length file | pure geometry | `Vm(Misaligned)` | unchanged | unchanged | unchanged |
+| range past end of initrd | pure geometry | `WrongObject` | unchanged | unchanged | unchanged |
+| `offset + len` overflow | pure geometry | `WrongObject` | unchanged | unchanged | unchanged |
+| MemoryObject table full | at first mutation | `MemoryObjectFull` | unchanged | unchanged | unchanged |
+| destination cspace full | **after** the mutation | `CapabilityFull` | **rolled back** | unchanged | unchanged |
+| cspace not provisioned | **after** the mutation | `TaskMissing` | **rolled back** | unchanged | unchanged |
+
+The two post-mutation rows are the ones that matter, and each is proved to have genuinely reached
+the rollback: `next_memory_object_id` advanced, so an object really was installed and then
+compensated rather than the call short-circuiting before the mutation. A retry after a rolled-back
+attempt then succeeds — the operational meaning of "compensated" is that the kernel can still serve
+the request, not merely that it has not obviously corrupted itself. The success control pins the
+exact unrounded extent in the kind, `Borrowed` backing, the containing-page physical base, the
+one-page rounding of `7 + 100`, and `READ | MAP` with **no `WRITE`**. A separate test drives the
+broad creator and the split transaction with the same inputs and asserts they produce the identical
+kind, length and physical base.
+
+**Live: three fresh clean boots per architecture.**
+
+| | NR 28 calls | served pre-lock | **broad** | borrowed backing | distinct objects / caps | compensated failures |
+|---|---|---|---|---|---|---|
+| x86_64  | 5 / 5 / 5 | 5 / 5 / 5 | **0** | 5 / 5 / 5 | 5 / 5 | 0 |
+| AArch64 | 1 / 1 / 1 | 1 / 1 / 1 | **0** | 1 / 1 / 1 | 1 / 1 | 0 |
+| RISC-V  | 5 / 5 / 5 | 5 / 5 / 5 | **0** | 5 / 5 / 5 | 5 / 5 | 0 |
+
+AArch64 issues **one** NR 28 rather than five because its boot reaches a shallower spawn depth
+(`sbin/driver_manager` only). That is a boot-depth fact about the workload, not a route fact: the
+one call it does issue is served pre-lock with `broad = 0`, which is what the edge claim is about.
+
+The AArch64 column is the three consecutive clean boots taken **after** the U9-RX4 witness repair
+below; six were run in total and all six are green, one of which exercised the timeout branch that
+had been misreported. The three boots taken before the repair carried identical NR 28 evidence —
+`ok=1 split_ok=1 broad=0 borrowed=1` on every one — and the single smoke failure among them was the
+witness, not the kernel.
+`broad` is derived, not assumed — the broad handler and the pre-lock route both emit
+`CREATE_INITRAMFS_FILE_SLICE_MO_OK`, and only the pre-lock route additionally emits
+`..._SPLIT_OK`, so `broad = ok − split_ok`. The same evaluator run against the **pre-pass** boot log
+reports `ok=5 split_ok=0 broad=5`, which is both the live "before" state of the 3 → 0 claim and the
+proof that the evaluator is not vacuous.
+
+**End to end, the borrowed object survives its whole life.** All five x86_64 objects are relayed to
+PM as capability-bearing direct replies and consumed by `SpawnFromMemoryObject`: zero
+`SPAWN_FROM_MO_WRONG_CAP`, zero `SPAWN_FROM_MO_BOUNDS_ERR`, five ELF parses, five
+`PM_ELF_ZC_DONE` with non-zero `zc_pages` — the initrd extent is still intact and still mapped
+*from the initrd*. Had the old unconditional `free_frame` handed those pages to the allocator, this
+is precisely where it would surface. Zero `PMEM_ALLOC_PT_POOL_BUG`, zero double-frees, zero panics.
+
+### The U9-RX4 witness had a second owner it did not know about
+
+An AArch64 boot that lost the reply/timeout race failed the witness with
+`a reply attempted after the timeout must be refused (refusals=0)`. The refusal had happened:
+
+```
+IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut
+                     caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0
+IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=0 record_generation=1 replier_tid=3
+                     terminal=Settled reply_copies=0 caller_wakes=0 mutations=0
+                     err=WrongObject result=ok
+```
+
+Since DIRECT3-CAP-FINAL §7 a spent-authority reply is refused **pre-lock** with the identical typed
+error, rather than entering the broad dispatcher to be refused there. Two changes from the same
+programme were never reconciled: both the U9-RX4 evaluator and the boot-blocker scanner knew only
+the legacy `IPC_REPLY_FAIL … err=WrongObject` spelling, so a refusal that **happened** was reported
+as a refusal that **did not**. It surfaced only now because the reply usually wins the race, and the
+runs that first exercised the arm all won.
+
+Neither fix weakens anything. The refusal is still required, and it is now additionally required to
+be **inert** (`reply_copies=0 caller_wakes=0 mutations=0`) — a check the old form could not perform
+at all, and which distinguishes a refusal from a partial reply wearing a refusal's marker. The
+scanner exclusion is narrower than the legacy one beside it for the same reason. The evaluator's
+self-test grows from 2 accepted / 8 rejected to **3 accepted / 10 rejected**: the pre-lock refusal
+is accepted; a non-inert one and one naming a different record are rejected. Replayed against the
+three saved logs, the two reply-wins still accept and the timeout-win now accepts. The four-tick
+deadline, the workload and every causal assertion are untouched.
+
+### Residual terminal-dispatch matrix (source-recomputed)
+
+| edge | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| NR 28 production terminal edges | 0 | 0 | 0 |
+| NR 28 broad-handler fallback (pre-mutation refusals) | retained | retained | retained |
+| NR 6 / NR 7 production terminal edges | 0 | 0 | 0 |
+| broad-lock census (`with_cpu / with_broad / TOTAL`) | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+The census is unchanged at **2 / 0 / 2**. Both terminal acquisitions still exist, so **U9 remains
+OPEN**: this increment empties the NR 28 population that reached them, it does not delete them.
+`Spawn` / `Fork` / `Exit` remain broad, and no syscall or userspace ABI changed.
+
+### What this does NOT claim
+
+- No DmaRegion, shared-region or pin path is exercised or classified beyond the two kinds that
+  exist. The rule is exhaustive over `MemoryObjectKind` **as it is**; a third kind fails
+  compilation until someone classifies it, which is the point.
+- The mint exemption is one class wide. `SpawnFromMemoryObject`, `VmAnonMap`, `TransferRelease`
+  and the endpoint/notification constructors are still broad-lock-only and are guarded as such:
+  NR 28's admission rests on its object's backing being borrowed, and nothing else inherits it.
