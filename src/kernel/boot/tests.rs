@@ -27284,7 +27284,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -36430,7 +36430,7 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -38507,7 +38507,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38634,7 +38634,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38809,7 +38809,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38966,7 +38966,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39099,7 +39099,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39262,7 +39262,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39444,7 +39444,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39668,7 +39668,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39904,7 +39904,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40021,7 +40021,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40156,7 +40156,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40352,7 +40352,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40788,7 +40788,7 @@ mod stage148_decomposition_map {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 24,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41232,7 +41232,7 @@ mod stage150_ipc_abi_extraction {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 24,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41463,7 +41463,7 @@ mod stage151_ipc_abi_boundary_audit {
             // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
             // guard targets the derivation rather than a literal that could drift again.
             SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
-                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 24,
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 23,
             "VARIANT_COUNT must be derived and equal 24"
         );
     }
@@ -41599,7 +41599,7 @@ mod stage152_syscall_decomposition_completeness_audit {
         );
     }
 
-    // 5. Syscall::VARIANT_COUNT == 24 preserved.
+    // 5. Syscall::VARIANT_COUNT == 23 preserved.
     #[test]
     fn stage152_variant_count_is_23() {
         assert!(
@@ -57071,9 +57071,12 @@ mod stage175_spawn_lifecycle {
         );
         // The spawn success markers (image resolve/parse/load) are preserved and the
         // spawn primitives are untouched (instrumentation only wraps error/phase edges).
+        // U9-ASPACE1 §2 retired NR 26; the lifecycle instrumentation moved to NR 23, which
+        // performs the same request/resolve/parse/load steps, so the diagnostic still has a live
+        // subject rather than dying with the syscall it happened to be attached to.
         assert!(
             EXEC_SRC.contains("fn spawn_user_task_from_image(")
-                && PROCESS_SRC.contains("fn handle_spawn_from_initramfs_file("),
+                && PROCESS_SRC.contains("fn handle_spawn_process("),
             "spawn primitives must remain"
         );
     }
@@ -74413,7 +74416,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -74826,7 +74829,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -74986,7 +74989,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -75055,7 +75058,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -75610,7 +75613,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -75844,7 +75847,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -76086,7 +76089,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -76139,7 +76142,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -76601,7 +76604,7 @@ mod stage197b_nr27_removed_zc_mandatory {
             Err(SyscallError::InvalidNumber)
         ));
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(Syscall::VARIANT_COUNT, 24);
+        assert_eq!(Syscall::VARIANT_COUNT, 23);
         // Needles are split so these assertions do not match themselves via include_str!.
         let variant_decl = concat!("InitramfsRead", "Chunk = ");
         let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
@@ -77007,7 +77010,7 @@ mod stage197b_riscv_typed_idle_outcome {
     #[test]
     fn baseline_and_cohort_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(matches!(
             crate::kernel::syscall::Syscall::decode(27),
             Err(crate::kernel::syscall::SyscallError::InvalidNumber)
@@ -98671,7 +98674,6 @@ mod stage200d0a_exit_foundation {
             (15, Syscall::DebugLog),
             (23, Syscall::SpawnProcess),
             (24, Syscall::SpawnProcessFromUserBuf),
-            (26, Syscall::SpawnFromInitramfsFile),
             (28, Syscall::CreateInitramfsFileSliceMo),
             (29, Syscall::SpawnFromMemoryObject),
             (30, Syscall::RecvSharedV3),
@@ -98681,11 +98683,11 @@ mod stage200d0a_exit_foundation {
         }
     }
 
-    /// (3) NR27 stays absent, the other free numbers stay unassigned, and unknown-number
-    /// behaviour is unchanged.
+    /// (3) the retired and never-assigned numbers stay unassigned, and unknown-number
+    /// behaviour is unchanged. 26 joins 27 here: U9-ASPACE1 §2 retired it.
     #[test]
     fn d03_nr27_and_free_numbers_remain_unassigned() {
-        for free in [17usize, 18, 19, 20, 21, 22, 25, 27] {
+        for free in [17usize, 18, 19, 20, 21, 22, 25, 26, 27] {
             assert!(
                 Syscall::decode(free).is_err(),
                 "number {free} must remain unassigned"
@@ -98709,8 +98711,8 @@ mod stage200d0a_exit_foundation {
     /// enum's own declaration count parsed from source.
     #[test]
     fn d04_variant_list_is_exhaustive_and_derived() {
-        assert_eq!(Syscall::VARIANT_COUNT, 24);
-        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 24);
+        assert_eq!(Syscall::VARIANT_COUNT, 23);
+        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 23);
         assert!(
             SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
         );
@@ -99694,7 +99696,7 @@ mod stage200d0b3_x86_exit_corrected {
         assert!(b.contains("EXIT_TASK_RESTORE_OWNER_PREPARED"));
         assert!(b.contains("EXIT_TASK_ABSENCE_VALIDATED arch=x86_64"));
         // No new task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
     }
 
     // ── feature gating (22) ─────────────────────────────────────────────────────────
@@ -100811,7 +100813,7 @@ mod stage200d0c1_aarch64_exit_prep {
             "offline-CPU refusal is preserved by the transaction"
         );
         // No general-purpose task-inspection syscall was added for the oracle.
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
     }
 
     // ── U3 (canonical 203C): the validation reacquisition retirement ────────────────
@@ -101996,7 +101998,7 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(txn.contains("Some(bound) => bound == asid,"));
         assert!(c.contains("identity=tid_asid"));
         assert!(c.contains("frame_source=0"));
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
     }
 
     // ── 29–32: runner static contract and feature-off ───────────────────────────────
@@ -152415,16 +152417,16 @@ mod u9spawn1_sp3_spawn_ledger {
         );
     }
 
-    /// The four spawn syscalls delegate; none of them keeps a second, uncompensated copy of the
-    /// transaction.
+    /// Every image-loading spawn syscall delegates; none keeps a second, uncompensated copy of
+    /// the transaction. Three since U9-ASPACE1 §2 retired NR 26.
     #[test]
-    fn all_four_spawn_syscalls_delegate_to_the_one_transaction() {
+    fn every_spawn_syscall_delegates_to_the_one_transaction() {
         assert_eq!(
             PROCESS_SRC
                 .matches("spawn_image_txn::run_image_spawn_transaction(")
                 .count(),
-            4,
-            "NR 23, NR 24, NR 26 and NR 29 all commit through the one compensated transaction"
+            3,
+            "NR 23, NR 24 and NR 29 all commit through the one compensated transaction"
         );
         for abandoned in [
             "create_user_address_space",
@@ -152817,6 +152819,172 @@ mod u9aspace1_teardown_frame_reclaim {
                 !src.contains("destroy_and_collect_mappings("),
                 "{rel} drains an address space without going through the teardown owner, so it \
                  would miss the frame release"
+            );
+        }
+    }
+}
+
+/// U9-ASPACE1 §2 — NR 26 (`SpawnFromInitramfsFile`) is retired, and NR 24 is not.
+///
+/// The audit that produced this: NR 24 has a real production caller — PM's VFS spawn falls back
+/// to `spawn_process_from_user_buf` when the MemoryObject grant path returns `Unsupported` — so
+/// it stays. NR 26's userspace wrapper was never called by anything; PM reaches the same images
+/// through NR 29 and that NR 24 fallback. The ABI doc claimed PM used NR 26 "through
+/// `pm_vfs_spawn_inline`", and that claim was simply false: the function calls NR 24.
+#[cfg(test)]
+mod u9aspace1_nr26_retired {
+    use super::*;
+    use crate::kernel::syscall::{
+        ALL_SYSCALL_VARIANTS, RETIRED_SYSCALL_NUMBERS, Syscall, retired_syscall_number,
+    };
+
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const PM_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+    );
+
+    /// NR 24 is RETAINED, and this is the dependency that retains it. If PM ever stops calling
+    /// it, this test is the place that says so out loud.
+    #[test]
+    fn nr24_is_retained_because_pm_still_calls_it() {
+        assert!(
+            PM_SRC.contains("yarm_user_rt::syscall::spawn_process_from_user_buf("),
+            "NR 24's production caller is PM's VFS spawn fallback; if it is gone, re-run the \
+             retirement audit rather than deleting this assertion"
+        );
+        assert_eq!(
+            Syscall::decode(24),
+            Ok(Syscall::SpawnProcessFromUserBuf),
+            "NR 24 stays live"
+        );
+        assert!(
+            USER_RT_SRC.contains("pub unsafe fn spawn_process_from_user_buf("),
+            "and its userspace wrapper stays"
+        );
+    }
+
+    /// NR 26 is gone from every layer: the kernel table, the dispatcher, the handler, and the
+    /// userspace wrapper that was the only way to name it.
+    #[test]
+    fn nr26_is_gone_from_every_layer() {
+        assert!(Syscall::decode(26).is_err(), "NR 26 must not decode");
+        assert!(
+            !ALL_SYSCALL_VARIANTS.iter().any(|v| v.number() == 26),
+            "no variant may claim NR 26"
+        );
+        // Every code-bearing spelling is gone. The bare name survives in exactly one place —
+        // the retirement record itself — because a retirement that leaves no record is how a
+        // number quietly becomes reusable again.
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            for gone in [
+                "Syscall::SpawnFromInitramfsFile",
+                "handle_spawn_from_initramfs_file",
+                "SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR",
+            ] {
+                assert!(
+                    !src.contains(gone),
+                    "{rel} still references {gone} after the retirement"
+                );
+            }
+            if rel != "src/kernel/syscall.rs" {
+                assert!(
+                    !src.contains("SpawnFromInitramfsFile"),
+                    "{rel} names the retired syscall outside the retirement record"
+                );
+            }
+        }
+        for gone in [
+            "spawn_from_initramfs_file",
+            "SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR",
+        ] {
+            assert!(
+                !USER_RT_SRC.contains(gone),
+                "the user runtime still exposes {gone}, so userspace could still issue NR 26"
+            );
+        }
+    }
+
+    /// The number stays reserved. This is the part that matters most and is easiest to lose: a
+    /// numeric ABI cannot tell an old caller that a number changed meaning, so a reused number
+    /// turns a stale call into a silent, unrelated operation.
+    #[test]
+    fn a_retired_number_may_not_be_reused() {
+        for (nr, reason) in RETIRED_SYSCALL_NUMBERS {
+            assert!(
+                retired_syscall_number(*nr).is_some(),
+                "NR {nr} is listed retired ({reason}) but the lookup does not know it"
+            );
+            assert!(
+                Syscall::decode(*nr).is_err(),
+                "retired NR {nr} must not decode to a live syscall"
+            );
+            assert!(
+                !ALL_SYSCALL_VARIANTS.iter().any(|v| v.number() == *nr),
+                "retired NR {nr} was handed to a new variant — that silently changes what an \
+                 old caller's number means, which is the one thing a numeric ABI cannot recover \
+                 from"
+            );
+        }
+        // Both retirements to date are listed, and a live number is never mistaken for one.
+        let listed: alloc::vec::Vec<usize> =
+            RETIRED_SYSCALL_NUMBERS.iter().map(|(nr, _)| *nr).collect();
+        assert!(listed.contains(&26) && listed.contains(&27), "26 and 27");
+        for live in ALL_SYSCALL_VARIANTS.iter() {
+            assert!(
+                retired_syscall_number(live.number()).is_none(),
+                "live syscall {live:?} is also listed as retired"
+            );
+        }
+    }
+
+    /// A retired number is answered BEFORE the terminal broad dispatcher, not by it.
+    ///
+    /// Without this, retiring a class would make things worse rather than better: every caller
+    /// still naming the number would be handed a broad-lock acquisition to be told "no". The
+    /// answer needs no lock — it is a fixed table — so it is given pre-lock.
+    #[test]
+    fn a_retired_number_is_refused_before_the_broad_dispatcher() {
+        let route = SPLIT_SRC
+            .split("fn try_split_dispatch_nonswitching_into_frame(")
+            .nth(1)
+            .expect("the nonswitching split dispatcher");
+        let refusal = route
+            .find("retired_syscall_number(raw_nr)")
+            .expect("the retired-number refusal");
+        let decode = route.find("Syscall::decode(raw_nr)").expect("the decode");
+        assert!(
+            refusal < decode,
+            "the retired-number refusal must come before the decode whose failure falls back to \
+             the broad dispatcher"
+        );
+        let arm = &route[refusal..decode];
+        assert!(
+            arm.contains("SyscallError::InvalidNumber"),
+            "and it must return the SAME canonical error the broad path would have produced"
+        );
+        assert!(
+            arm.contains("return Some(Err("),
+            "terminally — a `None` here would fall through to the broad dispatcher after all"
+        );
+    }
+
+    /// The shared spawn owners NR 23, NR 24 and NR 29 still need are untouched.
+    #[test]
+    fn the_shared_spawn_owners_survived_the_retirement() {
+        const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+        for owner in [
+            "static VFS_ELF_STAGING",
+            "fn spawn_image_path_for_image_id",
+            "fn normalized_startup_args",
+            "fn copy_spawn_startup_args",
+            "fn handle_spawn_process(",
+            "fn handle_spawn_process_from_user_buf(",
+            "fn handle_spawn_from_memory_object(",
+        ] {
+            assert!(
+                PROCESS_SRC.contains(owner),
+                "{owner} is shared with NR 23/24/29 and must not have been removed with NR 26"
             );
         }
     }

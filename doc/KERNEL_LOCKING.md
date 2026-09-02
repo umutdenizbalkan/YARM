@@ -651,7 +651,7 @@ collector, and does **not** flow through the shared reply-timeout drain.
       scheduler wait/run-queue state (and `FutexWait` blocks), needing a scheduler
       split-mut + wake-order proof.
     - *Global-lock-only, DANGEROUS (untouched):* `VmMap`, `VmAnonMap`, `Fork`,
-      `SpawnThread`, `SpawnProcess`/`SpawnProcessFromUserBuf`/`SpawnFromInitramfsFile`/
+      `SpawnThread`, `SpawnProcess`/`SpawnProcessFromUserBuf`/
       `SpawnFromMemoryObject`, `ReapFaultedTask`, `TransferRelease`, `RecvSharedV3`,
       `IpcSend`/`IpcCall`/`IpcReply` (broad), `IpcRecvTimeout`, `InitramfsReadChunk`,
       `CreateInitramfsFileSliceMo`.
@@ -5774,7 +5774,7 @@ Classification key:
 | 15 | DebugLog | E | scheduler (tid read), user memory | User memory copy required; keep globally locked. |
 | 23 | SpawnProcess | D | task, scheduler, memory, vm, capability, ipc | Six domains; keep globally locked. |
 | 24 | SpawnProcessFromUserBuf | D+E | all domains + user memory copy | Keep globally locked. |
-| 26 | SpawnFromInitramfsFile | D+E | all domains + user memory copy | Keep globally locked. |
+| 26 | *(retired U9-ASPACE1 §2)* | — | — | Refused pre-lock; reaches no dispatcher. |
 | 27 | InitramfsReadChunk | E | memory (chunk bounds), user memory | User memory copy; keep globally locked. |
 | 28 | CreateInitramfsFileSliceMo | D+G | memory, capability, task | Cap mint + memory. Keep globally locked. |
 | 29 | SpawnFromMemoryObject | D+G | task, scheduler, memory, vm, capability, ipc | Six domains + cap lookup. Keep globally locked. |
@@ -9723,7 +9723,7 @@ See §41.8. Stage 23 accepted, audit-only, no production code changed,
 
 **Before.** `src/kernel/syscall.rs` defined the ELF staging buffer as a raw
 `static mut VFS_ELF_STAGING: [u8; 128 * 1024]`. Two handlers
-(`handle_spawn_process_from_user_buf`, `handle_spawn_from_initramfs_file`)
+(`handle_spawn_process_from_user_buf`)
 obtained a `&mut` to it via `&raw mut` + `unsafe { &mut * }`. The exclusivity
 invariant ("only PM calls this, serialised") lived **only in a comment** — there
 was no machine-checked guard against two overlapping `&mut` references, which is

@@ -44,12 +44,43 @@ pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;
 pub const EXIT_STATUS_SELF_REQUESTED: u64 = 0;
 pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
 pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
-pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
-// NR 27 (formerly `InitramfsReadChunk`, a Phase-2 bulk-copy byte-copy bridge) was removed in
-// Stage 197A once the MemoryObject zero-copy (ZC) grant loader (`CreateInitramfsFileSliceMo`
-// NR 28 + `SpawnFromMemoryObject` NR 29) became the sole, mandatory ELF-load path on every
-// architecture. NR 27 is now an unused syscall number (no tombstone constant) and is reusable
-// by a future syscall; `Syscall::decode(27)` returns the canonical `InvalidNumber` error.
+/// Syscall numbers that once meant something and no longer do.
+///
+/// A retired number is NOT free for reuse, and U9-ASPACE1 §2 corrects the earlier note that said
+/// NR 27 was. The hazard is specific: a numeric ABI has no way to tell a caller that the number
+/// it is holding changed meaning. Anything still naming a retired number — a shipped binary
+/// built against an older header, a script, a test, a doc example — would silently receive a new
+/// and unrelated operation rather than an error. Refusing forever costs one table entry;
+/// reusing costs a silent wrong call that looks like a success.
+///
+/// So the numbers stay listed here. `decode` rejects them through its `_` arm with the canonical
+/// [`SyscallError::InvalidNumber`], [`retired_syscall_number`] lets the pre-lock dispatcher
+/// refuse them without ever reaching the broad dispatcher, and a guard refuses to let one
+/// re-enter the live table.
+pub const RETIRED_SYSCALL_NUMBERS: &[(usize, &str)] = &[
+    // A Phase-2 bulk-copy byte-copy bridge, retired once the MemoryObject zero-copy grant loader
+    // (`CreateInitramfsFileSliceMo` NR 28 + `SpawnFromMemoryObject` NR 29) became the sole,
+    // mandatory ELF-load path on every architecture.
+    (27, "InitramfsReadChunk, removed in Stage 197A"),
+    // The kernel-side CPIO spawn. Its userspace wrapper was never called: PM reaches the same
+    // images through the MemoryObject grant path (NR 29) and falls back to
+    // `SpawnProcessFromUserBuf` (NR 24), so nothing ever issued NR 26.
+    (26, "SpawnFromInitramfsFile, removed in U9-ASPACE1 §2"),
+];
+
+/// The reason a syscall number is retired, or `None` if it was never assigned or is still live.
+#[must_use]
+pub fn retired_syscall_number(nr: usize) -> Option<&'static str> {
+    let mut i = 0;
+    while i < RETIRED_SYSCALL_NUMBERS.len() {
+        let (retired, reason) = RETIRED_SYSCALL_NUMBERS[i];
+        if retired == nr {
+            return Some(reason);
+        }
+        i += 1;
+    }
+    None
+}
 /// Phase 3A: Create a read-only MemoryObject backed by a named CPIO file slice.
 /// Only callable by SystemServer tasks (initramfs_srv).
 pub const SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR: usize = 28;
@@ -328,7 +359,7 @@ pub enum Syscall {
     DebugLog = SYSCALL_DEBUG_LOG_NR,
     SpawnProcess = SYSCALL_SPAWN_PROCESS_NR,
     SpawnProcessFromUserBuf = SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR,
-    SpawnFromInitramfsFile = SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR,
+    // NR 26 (SpawnFromInitramfsFile) removed in U9-ASPACE1 §2 — the number is now unused.
     // NR 27 (InitramfsReadChunk) removed in Stage 197A — the number is now unused.
     /// Phase 3A: Create a read-only MemoryObject for a named CPIO file slice.
     CreateInitramfsFileSliceMo = SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR,
@@ -371,7 +402,6 @@ pub const ALL_SYSCALL_VARIANTS: &[Syscall] = &[
     Syscall::ExitCurrentTask,
     Syscall::SpawnProcess,
     Syscall::SpawnProcessFromUserBuf,
-    Syscall::SpawnFromInitramfsFile,
     Syscall::CreateInitramfsFileSliceMo,
     Syscall::SpawnFromMemoryObject,
     Syscall::RecvSharedV3,
@@ -407,7 +437,6 @@ impl Syscall {
             SYSCALL_DEBUG_LOG_NR => Ok(Self::DebugLog),
             SYSCALL_SPAWN_PROCESS_NR => Ok(Self::SpawnProcess),
             SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR => Ok(Self::SpawnProcessFromUserBuf),
-            SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR => Ok(Self::SpawnFromInitramfsFile),
             SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR => Ok(Self::CreateInitramfsFileSliceMo),
             SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR => Ok(Self::SpawnFromMemoryObject),
             SYSCALL_RECV_SHARED_V3_NR => Ok(Self::RecvSharedV3),
@@ -2166,14 +2195,6 @@ fn handle_spawn_process_from_user_buf(
     self::process::handle_spawn_process_from_user_buf(kernel, frame)
 }
 
-/// Spawn a process directly from a named file in the boot initramfs CPIO.
-fn handle_spawn_from_initramfs_file(
-    kernel: &mut KernelState,
-    frame: &mut TrapFrame,
-) -> Result<(), SyscallError> {
-    self::process::handle_spawn_from_initramfs_file(kernel, frame)
-}
-
 /// Phase 3A: Spawn a process from an InitramfsFileSlice MemoryObject capability.
 fn handle_spawn_from_memory_object(
     kernel: &mut KernelState,
@@ -2338,7 +2359,6 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::DebugLog => handle_debug_log(kernel, frame),
         Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
         Syscall::SpawnProcessFromUserBuf => handle_spawn_process_from_user_buf(kernel, frame),
-        Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame),
         Syscall::CreateInitramfsFileSliceMo => handle_create_initramfs_file_slice_mo(kernel, frame),
         Syscall::SpawnFromMemoryObject => handle_spawn_from_memory_object(kernel, frame),
         Syscall::RecvSharedV3 => handle_recv_shared_v3(kernel, frame),
@@ -5630,7 +5650,6 @@ mod tests {
                 && process_src.contains("pub(super) fn handle_fork")
                 && process_src.contains("pub(super) fn handle_spawn_process")
                 && process_src.contains("pub(super) fn handle_spawn_process_from_user_buf")
-                && process_src.contains("pub(super) fn handle_spawn_from_initramfs_file")
                 && process_src.contains("pub(super) fn handle_spawn_from_memory_object"),
             "process.rs must host the moved process syscall handlers"
         );
@@ -5641,20 +5660,21 @@ mod tests {
                 && syscall_src
                     .contains("self::process::handle_spawn_process_from_user_buf(kernel, frame)")
                 && syscall_src
-                    .contains("self::process::handle_spawn_from_initramfs_file(kernel, frame)")
-                && syscall_src
                     .contains("self::process::handle_spawn_from_memory_object(kernel, frame)"),
             "syscall.rs must keep minimal process delegation shims"
         );
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 2 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "D4 step 2 must not change syscall variant count"
         );
         assert!(
             process_src.contains("KSPAWN_ENTER")
-                && process_src.contains("KSPAWN_FROM_CPIO")
+                // KSPAWN_FROM_CPIO belonged to NR 26, retired in U9-ASPACE1 §2. NR 23 still
+                // resolves an image from the CPIO and logs its own path/size markers.
+                && process_src.contains("KSPAWN_PATH")
+                && process_src.contains("KSPAWN_ELF_FOUND")
                 && process_src.contains("SPAWN_FROM_MO_ENTER"),
             "process syscall marker strings must remain in the process module"
         );
@@ -5673,7 +5693,6 @@ mod tests {
                 && syscall_src.contains("Syscall::Fork => handle_fork(kernel, frame)")
                 && syscall_src.contains("Syscall::SpawnProcess => handle_spawn_process(kernel, frame)")
                 && syscall_src.contains("Syscall::SpawnProcessFromUserBuf => handle_spawn_process_from_user_buf(kernel, frame)")
-                && syscall_src.contains("Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame)")
                 && syscall_src.contains("Syscall::SpawnFromMemoryObject => handle_spawn_from_memory_object(kernel, frame)"),
             "process syscall dispatch arms must stay textually stable"
         );
@@ -5713,7 +5732,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 3 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "D4 step 3 must not change syscall variant count"
         );
         assert!(
@@ -5782,7 +5801,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 4 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            24,
+            23,
             "D4 step 4 must not change syscall variant count"
         );
         assert!(
