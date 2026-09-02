@@ -3484,17 +3484,31 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 ///
 /// # Why this is architecture-scoped, and what "production-default" means here
 ///
-/// `true` on x86_64 only. That is not a knob and not a selector: it is the architecture whose
-/// direct request, direct reply, cross-CPU and saved-return paths have live profiles, including
-/// SMP=2 in both directions. AArch64 and RISC-V keep the legacy path until their own profiles
-/// qualify — a scope statement, not a gate to re-open.
+/// The term is `true` for an architecture whose direct request, direct reply, cross-CPU and
+/// saved-return paths have LIVE PROFILES — never as a knob or a selector, and never ahead of
+/// the evidence. It is `true` where that has been demonstrated and false where it has not.
 ///
-/// On x86_64 the default is **unconfined**: because this term is `true`, every consumer below
-/// (`admission`, `publication`, and both endpoint-admission predicates) short-circuits before
-/// consulting any oracle endpoint or knob. Ordinary production endpoints are admitted. The
-/// existing selectors still START their workloads; they no longer decide admission.
+/// DIRECT3-CAP-FINAL adds AArch64. What NR6/NR7 need from an architecture is not their own
+/// machinery: it is the machinery the classes already live here use. AArch64 imports their
+/// six-argument ABI through the same `ipccall_direct_admission_enabled()` predicate the split
+/// dispatcher asks (`pre_split_import_syscall_abi`); it captures the entering context and skips
+/// the broad dispatch through the same shared `trap_entry` seam x86_64 uses; it drains the
+/// SAME `DispatchPostWork` stash that owns the ordinary-cap materialization executor and the
+/// reply continuation; it settles parked resumes through the same D2-recv/D2-send drains and
+/// `direct_dispatch_resume_incoming_core` (TTBR0/ASID activation, exact EL0 context, exact
+/// parked completion) that have settled NR 1/2/5/9 here since U4/U6; and NR6/NR7 publish
+/// completion through the arch-neutral `DirectDisposition` frame write. There is no NR6/NR7
+/// resume consumer, materialization owner, queue owner or terminal policy that is not already
+/// shared — which is why this is a scope extension backed by profiles rather than a gate flip.
+///
+/// RISC-V keeps the legacy path until its own profiles qualify.
+///
+/// Where the term is `true` the default is **unconfined**: every consumer below (`admission`,
+/// `publication`, and both endpoint-admission predicates) short-circuits before consulting any
+/// oracle endpoint or knob. Ordinary production endpoints are admitted. The existing selectors
+/// still START their workloads; they no longer decide admission.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    cfg!(target_arch = "x86_64")
+    cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.

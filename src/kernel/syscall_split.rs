@@ -1440,25 +1440,25 @@ fn try_split_blocking_ipc_recv_into_frame(
         );
         return D::NotHandled;
     }
-    // NON-x86_64: UNCHANGED from before WA3C2. The narrowing is scoped to x86_64 because that is
-    // the architecture WA3C2 qualified — the default core boot, the four AP cross-CPU profiles
-    // and the SMP=2 bidirectional seal are all x86_64 witnesses. On AArch64 direct publication is
-    // armed only by its oracle knob, and that oracle's live round-trip depends on blocked-recv
-    // work this route does not reproduce, so it keeps yielding exactly as it did at `894cc5a`.
-    // Widening it is a separate increment with its own AArch64 witness, not a side effect here.
-    #[cfg(not(target_arch = "x86_64"))]
-    if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled() {
-        crate::yarm_log!(
-            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=ack_publication_armed",
-            cpu.0
-        );
-        return D::NotHandled;
-    }
-    // x86_64: the yield is scoped to an ARMED SELECTOR, never to the production default. The
-    // policy has ONE owner — the `boot` predicate called just below — and it is not an admission
-    // question, so the split dispatcher's admission logic stays free of proof-gate terms. See
-    // that predicate for which blocked-recv work only the broad arm performs.
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    // DIRECT3-CAP-FINAL §5 — ONE owner for this yield, on every architecture.
+    //
+    // The yield is scoped to an ARMED SELECTOR, never to the production default: a selector's
+    // profile depends on blocked-recv work this route does not reproduce, while the ordinary
+    // production configuration needs the route to keep the receive and publish its own
+    // acknowledgements at step (10). It is not an admission question, so the split dispatcher's
+    // admission logic stays free of proof-gate terms.
+    //
+    // This used to be TWO owners. Non-x86_64 yielded on `ipccall_direct_publication_enabled()`,
+    // written when only the broad arm could publish the NR6/NR7 acknowledgements. Step (10) has
+    // published them unconditionally since WA3C2 made the publication bodies shared — both
+    // publishers are strict no-ops when publication is off — so that branch had become a stale
+    // duplicate of this policy. Live on AArch64 it was the §5 gap: with direct production on,
+    // `publication_enabled()` turned true, the branch fired on EVERY blocking recv-v2, and the
+    // whole receive was handed to the broad arm. That reopened the window this route exists to
+    // close — the caller's block was published late, so a reply could arrive with no claimable
+    // acknowledgement and an armed terminal, be declined as mode-indeterminate, fall to legacy,
+    // and be LOST (`IPC_REPLY_FAIL err=WrongObject`, caller never resumed, `resume=0`).
+    #[cfg(not(feature = "hosted-dev"))]
     if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm() {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=direct_oracle_selector_armed",
