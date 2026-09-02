@@ -4274,10 +4274,13 @@ mod tests {
     #[test]
     fn stage29_whitelist_exhaustive() {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
-        // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A), and
-        // NR 10 (FutexWake, Stage 191B) may pass the NR-only split-eligibility gate.
+        // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A),
+        // NR 10 (FutexWake, Stage 191B) and NR 28 (CreateInitramfsFileSliceMo,
+        // U9-MO2 §4) may pass the NR-only split-eligibility gate.
         // (Stage 197A removed NR 27 InitramfsReadChunk from the whitelist and the ABI.)
-        // Every other syscall stays global-lock-only.
+        // Every other syscall stays global-lock-only. This is an EXHAUSTIVE sweep of the
+        // whole NR space, so it is the guard that would catch a sixth admission arriving
+        // without its own justification — it is widened by exactly one NR, never relaxed.
         for nr in 0..SYSCALL_COUNT {
             let Ok(syscall) = Syscall::decode(nr) else {
                 continue;
@@ -4288,6 +4291,7 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
                 || nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
                 || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+                || nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {

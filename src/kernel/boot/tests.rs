@@ -61860,13 +61860,22 @@ mod stage191c_split_user_copy_seam {
         );
     }
 
-    // The dangerous / capability-minting classes stay global-lock-only (default-deny
+    // The dangerous / blocking / task-switching classes stay global-lock-only (default-deny
     // `_ => None`; none appears as a split-eligible `=> Some` arm). The removed NR 27
     // InitramfsReadChunk must not reappear either.
+    //
+    // U9-MO2 §4 removed NR 28 (`CreateInitramfsFileSliceMo`) from this list, and the list's own
+    // heading with it: the criterion was never "capability-minting". Stage 191C wrote it that
+    // way because at the time a mint had no exact off-lock compensation — the only reclaim path
+    // would have handed the boot initrd's frames to the frame allocator. With
+    // `MemoryObjectKind::backing()` exhaustive and the reclaim owner backing-aware that is no
+    // longer true, so the class is admitted and its own §4 guards pin it. What still belongs
+    // here is what this seam actually cannot serve: classes that BLOCK, SWITCH TASKS, or mutate
+    // page tables. `non_minting_classes_are_not_admitted_by_accident` below keeps the mint
+    // itself honest — NR 28 is the ONLY minting class admitted.
     #[test]
     fn non_selected_classes_remain_locked() {
         for locked in [
-            "Syscall::CreateInitramfsFileSliceMo => Some",
             "Syscall::InitramfsReadChunk => Some",
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
@@ -61883,6 +61892,31 @@ mod stage191c_split_user_copy_seam {
             assert!(
                 !SPLIT_SRC.contains(locked),
                 "{locked} must NOT be split-eligible (stays global-lock-only)"
+            );
+        }
+    }
+
+    /// U9-MO2 §4 — the mint exemption is exactly ONE class wide.
+    ///
+    /// NR 28's admission rests on a property specific to it: its object's backing is BORROWED,
+    /// so a failed mint compensates without touching the frame allocator. No other minting
+    /// class has been shown to have that property, so none may ride in on NR 28's admission.
+    #[test]
+    fn nr28_is_the_only_minting_class_admitted() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some(syscall),"),
+            "NR 28 is admitted, with its own §4 guards"
+        );
+        for still_locked in [
+            "Syscall::SpawnFromMemoryObject => Some",
+            "Syscall::VmAnonMap => Some",
+            "Syscall::TransferRelease => Some",
+            "Syscall::CreateEndpoint => Some",
+            "Syscall::CreateNotification => Some",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(still_locked),
+                "{still_locked} mints or maps and has NOT been shown to compensate off-lock"
             );
         }
     }
@@ -62173,7 +62207,9 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::SpawnThread => Some",
             "Syscall::SpawnProcess => Some",
             "Syscall::SpawnFromMemoryObject => Some",
-            "Syscall::CreateInitramfsFileSliceMo => Some",
+            // U9-MO2 §4 removed NR 28 from this list. Stage 191E's claim is that the CANDIDATE
+            // SEAM adds no live class — it does not, and did not, own the whitelist's contents;
+            // NR 28's admission came from §4 and is pinned by its own guards.
             "Syscall::RecvSharedV3 => Some",
             "Syscall::ReapFaultedTask => Some",
         ] {
@@ -113568,10 +113604,17 @@ mod stage199d_riscv_canonical_admission {
     #[test]
     fn feature_off_remains_marker_clean() {
         let w = wrapper();
-        let at = w
-            .find("let split_eligible = is_syscall")
+        // U9-MO2 §4: slice the WHOLE `split_eligible` expression, terminating `;` to terminating
+        // `;`, rather than a fixed character window. The window was a latent defect, not a
+        // bound: it silently stopped covering the tail of the expression once a member carried a
+        // comment, so a newly admitted NR could satisfy the "nothing else was added" count while
+        // escaping the membership assertions entirely. The sibling NR 5 guard already slices
+        // this way.
+        let whitelist = w
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
             .expect("the whitelist");
-        let whitelist = &w[at..at + 500];
         for nr in [
             "SYSCALL_DEBUG_LOG_NR",
             "SYSCALL_FUTEX_WAKE_NR",
@@ -113585,6 +113628,9 @@ mod stage199d_riscv_canonical_admission {
             // settles through the post-work drain and, when it parks a sender, through the
             // homologous D2-SEND drain this bridge has driven since U4/U6.
             "SYSCALL_IPC_SEND_NR",
+            // U9-MO2 §4: the one NON-switching member added since — NR 28 finalizes through the
+            // same same-task ecall writeback DebugLog uses.
+            "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -113596,8 +113642,9 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            5,
-            "exactly five literal NRs plus the gated direct-IPC term"
+            6,
+            "exactly six literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+             FutexWait, IpcRecvTimeout, IpcSend and (U9-MO2 §4) CreateInitramfsFileSliceMo"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -150584,6 +150631,514 @@ mod u9mo2_backing_aware_reclaim {
         assert!(
             body.contains("Self::release_memory_object_slot_locked(memory, slot)"),
             "and the object is compensated through the SAME release owner"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// U9-MO2 §4 — NR 28 terminal edges: 3 → 0.
+//
+// An "edge" here is the same thing 199G-B counted for NR 5 and 199G-C4 counted for NR 1: an
+// ARCHITECTURE on which `CreateInitramfsFileSliceMo` has no pre-lock owner at all, so every NR 28
+// trap necessarily reaches the terminal broad dispatcher. Before this pass that was all three.
+// These recompute it from source, naming each architecture's gate explicitly rather than
+// inferring it from the shared route — an admission that stops at the classifier while the arch
+// ingress still zeroes `nr` is not an edge closed, it is an edge hidden.
+mod u9mo2_nr28_terminal_edges {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn route_body() -> &'static str {
+        SPLIT_SRC
+            .split("fn try_split_create_initramfs_mo_into_frame(\n    shared: &SharedKernel,")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the NR 28 route body")
+    }
+
+    /// Edge 1 of 3 — x86_64. Its ABI is already in the frame at the split seam, so the only two
+    /// gates are the number-only classifier and the dispatch arm that reaches the route.
+    #[test]
+    fn x86_64_has_a_pre_lock_owner() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some(syscall),"),
+            "the number-only classifier must admit NR 28"
+        );
+        assert!(
+            SPLIT_SRC.contains(
+                "if matches!(syscall, Syscall::CreateInitramfsFileSliceMo) {\n        return try_split_create_initramfs_mo_into_frame(shared, cpu, frame);"
+            ),
+            "the split dispatcher must route NR 28 to its own pre-lock owner"
+        );
+        // And the classifier's old exclusion note is gone: it claimed the capability MINT forced
+        // NR 28 onto the global lock. Leaving it would leave a second, contradicting policy
+        // statement standing right next to the admission.
+        assert!(
+            !SPLIT_SRC.contains("(NR 28) MINTS a capability (cap-state mutation)\n        // and stays global-lock-only."),
+            "the retired global-lock-only claim must not survive beside the admission"
+        );
+    }
+
+    /// Edge 2 of 3 — AArch64. Without the pre-split ABI import `nr` stays 0 and the split
+    /// dispatcher declines whatever the classifier says, so this gate is load-bearing.
+    #[test]
+    fn aarch64_imports_the_nr28_abi_before_the_split_dispatch() {
+        assert!(
+            TRAP_ENTRY.contains(
+                "raw_nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR"
+            ),
+            "AArch64 must import the NR 28 ABI before the split dispatch inspects it"
+        );
+        // Unconditional, like DebugLog's — NOT folded into a proof or production predicate,
+        // which would leave the edge closed only in a gated configuration.
+        let after = TRAP_ENTRY
+            .split("|| raw_nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR")
+            .nth(1)
+            .expect("the NR 28 import term");
+        assert!(
+            after.trim_start().starts_with("||"),
+            "the NR 28 import must be its own unconditional term, not a conjunct of a gate"
+        );
+    }
+
+    /// Edge 3 of 3 — RISC-V. The whitelist is the gate; NR 2 must stay out of it.
+    #[test]
+    fn riscv_admits_nr28_into_the_split_dispatcher() {
+        let whitelist = RISCV
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("the RISC-V whitelist");
+        assert!(
+            whitelist.contains("SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR"),
+            "RISC-V must admit NR 28 into the split dispatcher"
+        );
+        assert!(
+            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "NR 2's RISC-V admission is a separate class and stays untouched"
+        );
+    }
+
+    /// The broad handler is still THERE — this pass retires the *edge*, not the fallback. Every
+    /// pre-mutation refusal may still reach it, and it must produce the same answer.
+    #[test]
+    fn the_broad_handler_survives_as_the_fallback() {
+        assert!(
+            SYSCALL_SRC.contains(
+                "Syscall::CreateInitramfsFileSliceMo => handle_create_initramfs_file_slice_mo(kernel, frame)"
+            ),
+            "the broad arm must remain reachable for anything the pre-lock route declines"
+        );
+    }
+
+    /// The route's disposition is exhaustive in the direction that matters: `None` (fall back to
+    /// the broad handler) is reachable ONLY before the first mutation. After the object install
+    /// every outcome is `Some(..)`, because a post-mutation fallback would let the broad handler
+    /// build a SECOND object for a request it never saw refused.
+    #[test]
+    fn no_fallback_survives_the_first_mutation() {
+        let body = route_body();
+        let mutation = body
+            .find("shared.create_initramfs_file_slice_mo_split(")
+            .expect("the one mutating call");
+        // Nothing after the mutation returns `None`, in any spelling: no bare `None`, no `?`
+        // (which returns `None` from an `Option`-returning function), no let-else that could.
+        let tail = &body[mutation..];
+        for escape in [
+            "return None",
+            "None\n",
+            "?;",
+            ")?",
+            "else {\n        return",
+        ] {
+            assert!(
+                !tail.contains(escape),
+                "no fallback may escape after the mutation: found `{escape}`"
+            );
+        }
+        // Both post-mutation arms are terminal and typed.
+        assert!(
+            tail.contains("frame.set_ok(0, cap_id.0 as usize, file_len);")
+                && tail.contains("Some(Ok(()))")
+                && tail.contains("fail(SyscallError::from(err))"),
+            "success sets the exact frame lanes; failure returns the exact typed error"
+        );
+        // And the failure arm records its compensation, rather than leaving the caller to retry
+        // into the broad handler.
+        assert!(
+            tail.contains("result=compensated"),
+            "the post-mutation failure arm must record its compensation"
+        );
+        // The pre-mutation half is where fallback lives, and it is still allowed there — this is
+        // what makes the assertion above a BOUNDARY and not a blanket ban.
+        assert!(
+            body[..mutation].contains("shared.current_tid_authoritative(cpu)?"),
+            "the pre-mutation half may still decline to the broad handler"
+        );
+    }
+
+    /// The route composes EXISTING owners. It must not have grown a second object installer, a
+    /// second mint, a second geometry rule or a frame-allocator call of its own — the U9-MO1 hard
+    /// stop, restated mechanically.
+    #[test]
+    fn the_route_creates_no_second_owner() {
+        let body = route_body();
+        for forbidden in [
+            "alloc_contiguous",
+            "free_contiguous",
+            "free_frame",
+            "memory_objects[",
+            "MemoryObjectKind::InitramfsFileSlice",
+            "with_memory_split_mut",
+            "PhysAddr(",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the route must compose existing owners, not re-implement `{forbidden}`"
+            );
+        }
+        // Exactly one call into the transaction owner.
+        assert_eq!(
+            body.matches("create_initramfs_file_slice_mo_split(")
+                .count(),
+            1,
+            "one transaction owner, called once"
+        );
+        // And the geometry rule has exactly one definition, shared by both creators.
+        const MEM_STATE: &str = include_str!("memory_state.rs");
+        assert_eq!(
+            MEM_STATE
+                .matches("fn initramfs_slice_object_geometry(")
+                .count(),
+            1,
+            "one geometry owner"
+        );
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        assert!(
+            RUNTIME_SRC.contains(
+                "KS::initramfs_slice_object_geometry(initrd, file_data_offset, file_len)?"
+            ),
+            "the split transaction must call the shared geometry owner, not re-derive it"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// U9-MO2 §5 — NR 28 transaction qualification by failure injection.
+//
+// Every phase of `create_initramfs_file_slice_mo_split` is driven to failure and the kernel is
+// checked afterwards for the three things a partial transaction would leave behind: an orphan
+// MemoryObject slot, a published capability, or a frame-allocator free list that moved. A
+// BORROWED object must never move the free list in EITHER direction — not on create (it takes
+// nothing) and not on rollback (it owns nothing).
+mod u9mo2_nr28_transaction_failure_injection {
+    use super::*;
+    use crate::kernel::boot::{MemoryBacking, MemoryObjectKind};
+    use crate::kernel::capabilities::{CNodeId, CapObject, CapRights, Capability};
+    use crate::kernel::vm::{PAGE_SIZE, PhysAddr};
+    use crate::runtime::SharedKernel;
+
+    /// A synthetic "initrd" blob. The transaction takes the slice as an argument — it does not
+    /// reach for the boot initrd itself — so hosted can exercise the real owner end to end.
+    const BLOB_LEN: usize = 4 * PAGE_SIZE;
+
+    struct Fx {
+        k: SharedKernel,
+        cnode: CNodeId,
+        blob: alloc::boxed::Box<[u8; BLOB_LEN]>,
+    }
+
+    impl Fx {
+        fn new(cnode_slots: usize) -> Self {
+            let k = SharedKernel::new(Bootstrap::init().expect("init"));
+            let cnode = CNodeId(0x9E28);
+            k.with(|s| {
+                s.ensure_cnode_space_with_slots(cnode, cnode_slots)
+                    .expect("a destination cspace")
+            });
+            Self {
+                k,
+                cnode,
+                blob: alloc::boxed::Box::new([0u8; BLOB_LEN]),
+            }
+        }
+        fn objects(&self) -> usize {
+            self.k
+                .with(|s| s.with_memory_state(|m| m.memory_objects.iter().flatten().count()))
+        }
+        fn free_frames(&self) -> usize {
+            self.k
+                .with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()))
+        }
+        fn caps(&self) -> usize {
+            self.k.with(|s| {
+                s.with_capability_state(|cap| {
+                    cap.cnode_spaces
+                        .iter()
+                        .flatten()
+                        .filter(|space| space.id == self.cnode)
+                        .map(|space| {
+                            crate::kernel::boot::kernel_ref(&space.cspace).occupied_slots()
+                        })
+                        .sum::<usize>()
+                })
+            })
+        }
+        fn run(
+            &self,
+            offset: usize,
+            len: usize,
+        ) -> Result<(u64, crate::kernel::capabilities::CapId), KernelError> {
+            self.k
+                .create_initramfs_file_slice_mo_split(self.cnode, &self.blob[..], offset, len)
+        }
+    }
+
+    /// A three-way "nothing moved" assertion, taken before and after every injected failure.
+    macro_rules! unchanged {
+        ($fx:expr, $objects:expr, $caps:expr, $free:expr, $why:expr) => {{
+            assert_eq!($fx.objects(), $objects, "{}: object slots moved", $why);
+            assert_eq!($fx.caps(), $caps, "{}: a capability was published", $why);
+            assert_eq!($fx.free_frames(), $free, "{}: the free list moved", $why);
+        }};
+    }
+
+    /// The success lane, stated first so every failure lane has a positive control.
+    #[test]
+    fn success_installs_exactly_one_borrowed_object_and_one_read_only_cap() {
+        let fx = Fx::new(8);
+        let (o0, c0, f0) = (fx.objects(), fx.caps(), fx.free_frames());
+        let (id, cap) = fx
+            .run(PAGE_SIZE + 7, 100)
+            .expect("the transaction succeeds");
+
+        assert_eq!(fx.objects(), o0 + 1, "exactly one object");
+        assert_eq!(fx.caps(), c0 + 1, "exactly one capability");
+        assert_eq!(
+            fx.free_frames(),
+            f0,
+            "a BORROWED object takes nothing from the allocator"
+        );
+        // The object records the EXACT unrounded extent and is classified BORROWED.
+        let (kind, len, phys) =
+            fx.k.with(|s| {
+                s.with_memory_state(|m| {
+                    m.memory_objects
+                        .iter()
+                        .flatten()
+                        .find(|mem| mem.id == id)
+                        .map(|mem| (mem.kind, mem.len, mem.phys))
+                })
+            })
+            .expect("the installed object");
+        assert_eq!(
+            kind,
+            MemoryObjectKind::InitramfsFileSlice {
+                initrd_offset: (PAGE_SIZE + 7) as u64,
+                file_len: 100,
+            },
+            "the kind carries the exact unrounded extent"
+        );
+        assert_eq!(
+            kind.backing(),
+            MemoryBacking::Borrowed,
+            "an initramfs slice is borrowed"
+        );
+        assert_eq!(len, PAGE_SIZE, "7 + 100 rounds up to exactly one page");
+        assert_eq!(
+            phys,
+            PhysAddr((fx.blob.as_ptr() as u64 + PAGE_SIZE as u64) & !(PAGE_SIZE as u64 - 1)),
+            "the object starts at the containing page"
+        );
+        // The minted cap is READ|MAP — never WRITE, for a file-backed slice.
+        let rights =
+            fx.k.with(|s| {
+                s.with_capability_state(|c| {
+                    c.cnode_spaces
+                        .iter()
+                        .flatten()
+                        .find(|space| space.id == fx.cnode)
+                        .and_then(|space| crate::kernel::boot::kernel_ref(&space.cspace).get(cap))
+                })
+            })
+            .expect("the minted cap resolves")
+            .rights();
+        assert_eq!(rights, CapRights::READ | CapRights::MAP);
+        assert!(!rights.contains(CapRights::WRITE), "never writable");
+    }
+
+    /// Phase 1, malformed input: a zero-length file. Refused by the pure geometry owner, so
+    /// nothing was ever touched.
+    #[test]
+    fn a_zero_length_file_is_refused_before_any_mutation() {
+        let fx = Fx::new(8);
+        let (o, c, f) = (fx.objects(), fx.caps(), fx.free_frames());
+        assert_eq!(
+            fx.run(0, 0).unwrap_err(),
+            KernelError::Vm(crate::kernel::vm::VmError::Misaligned)
+        );
+        unchanged!(fx, o, c, f, "zero-length");
+    }
+
+    /// Phase 1, invalid range: the slice runs past the end of the blob.
+    #[test]
+    fn a_range_past_the_end_of_the_initrd_is_refused_before_any_mutation() {
+        let fx = Fx::new(8);
+        let (o, c, f) = (fx.objects(), fx.caps(), fx.free_frames());
+        assert_eq!(
+            fx.run(BLOB_LEN - 8, 9).unwrap_err(),
+            KernelError::WrongObject,
+            "one byte past the end is still past the end"
+        );
+        unchanged!(fx, o, c, f, "over-long range");
+        // The exact boundary IS admissible, which is what makes the refusal a bound rather than
+        // an off-by-one.
+        assert!(fx.run(BLOB_LEN - 8, 8).is_ok(), "the exact end is in range");
+    }
+
+    /// Phase 1, invalid range: the offset+length addition overflows.
+    #[test]
+    fn an_overflowing_range_is_refused_before_any_mutation() {
+        let fx = Fx::new(8);
+        let (o, c, f) = (fx.objects(), fx.caps(), fx.free_frames());
+        assert_eq!(
+            fx.run(usize::MAX, 2).unwrap_err(),
+            KernelError::WrongObject,
+            "the bounds check must not wrap"
+        );
+        unchanged!(fx, o, c, f, "overflowing range");
+    }
+
+    /// Phase 2, the MemoryObject table is full. The refusal happens AT the first mutation, so
+    /// there is nothing to roll back — but there must also be no capability and no frame churn.
+    #[test]
+    fn a_full_memory_object_table_refuses_at_the_first_mutation() {
+        let fx = Fx::new(8);
+        let max =
+            fx.k.with(|s| s.runtime_capacity_config().max_memory_objects);
+        // Fill the table through the owner's own rule, with BORROWED placeholders so the fill
+        // itself cannot move the free list and confuse the measurement.
+        fx.k.with(|s| {
+            s.with_memory_state_mut(|m| {
+                while m.memory_objects.iter().flatten().count() < max {
+                    crate::kernel::boot::KernelState::create_memory_object_slot_locked(
+                        m,
+                        PhysAddr(0x1000),
+                        PAGE_SIZE,
+                        MemoryObjectKind::InitramfsFileSlice {
+                            initrd_offset: 0,
+                            file_len: 1,
+                        },
+                        max,
+                    )
+                    .expect("fill");
+                }
+            })
+        });
+        let (o, c, f) = (fx.objects(), fx.caps(), fx.free_frames());
+        assert_eq!(o, max, "the table is genuinely full");
+        assert_eq!(fx.run(0, 64).unwrap_err(), KernelError::MemoryObjectFull);
+        unchanged!(fx, o, c, f, "table full");
+    }
+
+    /// Phase 3, the destination cspace is full — the interesting one. The object EXISTS when the
+    /// mint fails, so this is the path that either compensates exactly or leaves an orphan.
+    #[test]
+    fn a_full_cspace_rolls_the_installed_object_back_exactly() {
+        let fx = Fx::new(1);
+        // Consume the single slot with an unrelated capability.
+        fx.k.with(|s| {
+            s.with_capability_state_mut(|cap| {
+                let space = cap
+                    .cnode_spaces
+                    .iter_mut()
+                    .flatten()
+                    .find(|space| space.id == fx.cnode)
+                    .expect("the cspace");
+                crate::kernel::boot::kernel_mut(&mut space.cspace)
+                    .mint(Capability::new(CapObject::Kernel, CapRights::READ))
+                    .expect("the one slot");
+            })
+        });
+        let (o, c, f) = (fx.objects(), fx.caps(), fx.free_frames());
+        let next_id =
+            fx.k.with(|s| s.with_memory_state(|m| m.next_memory_object_id));
+
+        assert_eq!(fx.run(0, 64).unwrap_err(), KernelError::CapabilityFull);
+        unchanged!(fx, o, c, f, "cspace full");
+        // The id counter DID advance — the object was really created, so this failure genuinely
+        // exercised the rollback rather than short-circuiting before the mutation.
+        assert!(
+            fx.k.with(|s| s.with_memory_state(|m| m.next_memory_object_id)) > next_id,
+            "an object was installed and then compensated, not skipped"
+        );
+        // And no orphan survives: the object id that was created is simply gone.
+        assert!(
+            fx.k.with(|s| s.memory_object_refcounts_by_id(next_id))
+                .is_none(),
+            "the compensated object leaves no registry entry"
+        );
+    }
+
+    /// Phase 3, the destination cspace does not exist. Same post-mutation rollback, different
+    /// typed error — the mint reports the unmet precondition rather than hiding it.
+    #[test]
+    fn an_unprovisioned_cspace_rolls_the_installed_object_back_exactly() {
+        let fx = Fx::new(8);
+        let (o, c, f) = (fx.objects(), fx.caps(), fx.free_frames());
+        let err =
+            fx.k.create_initramfs_file_slice_mo_split(CNodeId(0xDEAD), &fx.blob[..], 0, 64)
+                .unwrap_err();
+        assert_eq!(err, KernelError::TaskMissing);
+        unchanged!(fx, o, c, f, "unprovisioned cspace");
+    }
+
+    /// Repeating the whole transaction after one of those failures still succeeds, which is the
+    /// operational meaning of "compensated": the kernel is back in a state that can serve the
+    /// request, not merely one that has not obviously corrupted itself.
+    #[test]
+    fn the_kernel_still_serves_the_request_after_a_rolled_back_attempt() {
+        let fx = Fx::new(8);
+        assert_eq!(
+            fx.k.create_initramfs_file_slice_mo_split(CNodeId(0xDEAD), &fx.blob[..], 0, 64)
+                .unwrap_err(),
+            KernelError::TaskMissing
+        );
+        let (o, c, f) = (fx.objects(), fx.caps(), fx.free_frames());
+        let (_id, _cap) = fx.run(0, 64).expect("the retry succeeds");
+        assert_eq!(fx.objects(), o + 1);
+        assert_eq!(fx.caps(), c + 1);
+        assert_eq!(fx.free_frames(), f, "still borrowed, still no frame churn");
+    }
+
+    /// The broad creator and the split transaction produce the SAME object from the same inputs.
+    /// This is the guard that would catch the two drifting — a second geometry rule, a different
+    /// rounding, a different kind.
+    #[test]
+    fn the_broad_and_split_creators_agree_exactly() {
+        let fx = Fx::new(8);
+        let (broad_id, _c) =
+            fx.k.with(|s| s.create_initramfs_file_slice_mo(&fx.blob[..], PAGE_SIZE + 7, 100))
+                .expect("broad");
+        let (split_id, _c) = fx.run(PAGE_SIZE + 7, 100).expect("split");
+        let shape = |id: u64| {
+            fx.k.with(|s| {
+                s.with_memory_state(|m| {
+                    m.memory_objects
+                        .iter()
+                        .flatten()
+                        .find(|mem| mem.id == id)
+                        .map(|mem| (mem.kind, mem.len, mem.phys))
+                })
+            })
+            .expect("object")
+        };
+        assert_eq!(
+            shape(broad_id),
+            shape(split_id),
+            "same inputs, same object — kind, length and physical base"
         );
     }
 }
