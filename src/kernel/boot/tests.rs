@@ -152421,6 +152421,46 @@ mod u9spawn1_sp3_spawn_ledger {
         );
     }
 
+    /// U9-SPAWN1 SP-4 stopped here, and this pins WHY so the boundary cannot go stale.
+    ///
+    /// Routing NR 23 off the terminal dispatchers needs every phase to run under one rank-local
+    /// lock. A process spawn creates a NEW process CNode, and the two capability-domain owners
+    /// that do it have no split variant at all — not a partial one, no presence in `runtime.rs`.
+    ///
+    /// This is the same boundary SP-2 stopped at, approached from the other side: the NR 11 route
+    /// is admissible precisely BECAUSE a thread joins its parent's EXISTING CNode, and its
+    /// pre-mutation gate declines outright when that CNode is absent rather than creating one.
+    ///
+    /// When someone builds those owners, this test fails and the blocker is genuinely gone.
+    #[test]
+    fn nr23_is_blocked_on_an_absent_process_cnode_owner() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for missing in ["ensure_cnode_space_with_slots", "set_process_cnode_for_pid"] {
+            assert!(
+                !RUNTIME_SRC.contains(missing),
+                "{missing} now has an off-lock caller — the SP-4 blocker may be gone; re-derive \
+                 the NR 23 phase table before trusting this note"
+            );
+        }
+        // And the NR 11 route still declines rather than creating one, which is what keeps it
+        // sound while NR 23 waits.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        let route = SPLIT_SRC
+            .split("fn try_split_spawn_thread_into_frame(")
+            .nth(1)
+            .expect("the NR 11 route");
+        let gate = route
+            .find("task_cnode_split(parent_tid)?")
+            .expect("the CNode gate");
+        let mutation = route
+            .find("try_spawn_thread_split(")
+            .expect("the first mutation");
+        assert!(
+            gate < mutation,
+            "the NR 11 route must decline on an absent process CNode BEFORE it mutates anything"
+        );
+    }
+
     /// The four spawn syscalls delegate; none of them keeps a second, uncompensated copy of the
     /// transaction.
     #[test]

@@ -19,6 +19,61 @@ commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
 Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 `doc/KERNEL_UNLOCKING.md` §0.
 
+**U9-SPAWN1 — NR 11 routed off all three terminal dispatchers; the spawn transaction gets a
+compensation ledger; NR 23 HARD-STOPS on a missing owner. Census remains `2 / 0 / 2`. U9 remains
+OPEN. Fork, ExitCurrentTask, NR 16, NR 23, NR 26 and NR 29 remain broad.**
+
+Four checkpoints landed, and one did not.
+
+*SP-1 — one task-enqueue owner.* Eleven transcriptions of "put this task on a run queue"
+collapsed into `src/kernel/task_enqueue.rs`. Queue selection, the driver-affinity pin,
+class→priority and the duplicate-enqueue refusal are unchanged and now stated once; the broad and
+split paths delegate to it rather than each carrying a copy. Task-domain locks are released before
+the enqueue, and rank 1 is strictly last.
+
+*SP-2 — NR 11 (`SpawnThread`) terminal edges 3 → 0.* Validate → allocate the exact thread
+incarnation → register and initialize its TCB under rank 2 → release rank 2 → enqueue through SP-1
+→ return through `try_split_dispatch_nonswitching_into_frame`. Every post-registration failure
+undoes the exact incarnation before returning, and the broad path's pre-existing enqueue-failure
+leak is repaired through the same owner. No address-space, ELF, endpoint, capability, VM or switch
+work was introduced. Live witness on all three architectures: exactly one
+`SPAWN_THREAD_SPLIT_OK`, zero broad executions, kernel TID matching the TID userspace observed.
+
+*A64-DEPTH — two defects, both mine, both repaired.* See the NR 28 correction in §0's U9-MO2
+entry for the first. The second: startup slot 5 is a mutually exclusive oracle selector, and two
+oracles had both been given the value 21 — the U9-FT4 terminal-fault oracle as a bare literal, and
+the AArch64 `ExitCurrentTask` oracle through `exit_current_task_abi`'s reserved 20/21/22 block.
+Init's terminal-fault arm is checked first and diverges, so it always won: the AArch64 exit oracle
+had been unreachable since the day it landed, and its failure looked like a hang inside
+`spawn_thread`. The terminal-fault oracle moved to 23 with a single declared owner
+(`terminal_fault_oracle_abi`) that both ends now encode and decode through, and that owner asserts
+it cannot collide with the exit block.
+
+*SP-3 — the spawn transaction's provisional-resource ledger.* All four image-loading spawn
+syscalls (NR 23, 24, 26, 29) acquired the same resources in the same order and returned through a
+bare `?` at every step, abandoning whatever was already held. `src/kernel/syscall/spawn_image_txn.rs`
+is now the one place a spawn syscall can commit and the one place its failure is unwound: it
+acquires in ledger order and releases in exactly the reverse, each through the resource's ACTUAL
+owner. That last word carries the weight — `cancel_spawn_reservation` owns the reserved TCB, its
+class slot, its kernel context and (conditionally) its process CNode, and nothing else. The
+reservation moves ahead of the first provisional address space, so the arm that used to be
+unrecoverable (a failed commit, whose restored reservation belonged to nobody) now has a token to
+cancel with. Two findings from the hosted failure-injection proofs are recorded in
+`doc/KERNEL_UNLOCK_AUDIT.md`: a leaked address-space capability on every failure arm, now a ledger
+row; and a frame lost on every address-space teardown that belongs to the loader, not the ledger.
+
+*SP-4 — NR 23 (`SpawnProcess`) is NOT routed. HARD STOP.* The first exact blocker is that a
+process spawn creates a NEW process CNode, and there is no rank-4 owner that can do so off the
+broad lock: `ensure_cnode_space_with_slots` and `set_process_cnode_for_pid` have no split variant
+and no presence in `src/runtime.rs` at all. This is the same boundary SP-2 stopped at deliberately
+and from the other side — the NR 11 route is admissible precisely *because* a thread joins its
+parent's existing CNode and declines before mutating if it is absent. Six of NR 23's seven steps
+have no rank-local owner today (reservation, address space, image load, endpoint creation,
+cross-cspace delegation, and the commit's stack allocation and foreign-ASID argument write); only
+the enqueue (SP-1) and `copy_to_user` do. Building the rest is a subsystem, not a slice, so no
+NR 23 route was written and nothing was left half-built.
+
+
 **U3 (canonical 203C) — the AArch64 `CurrentTaskExited` VALIDATION reacquisition is retired.
 CENSUS-DELTA 13 → 12. CANONICAL 203C — still OPEN.**
 The AArch64 post-lock exit consumer in `src/arch/trap_entry.rs` re-acquired the broad guard to
@@ -3904,9 +3959,22 @@ kind, length and physical base.
 | AArch64 | 1 / 1 / 1 | 1 / 1 / 1 | **0** | 1 / 1 / 1 | 1 / 1 | 0 |
 | RISC-V  | 5 / 5 / 5 | 5 / 5 / 5 | **0** | 5 / 5 / 5 | 5 / 5 | 0 |
 
-AArch64 issues **one** NR 28 rather than five because its boot reaches a shallower spawn depth
-(`sbin/driver_manager` only). That is a boot-depth fact about the workload, not a route fact: the
-one call it does issue is served pre-lock with `broad = 0`, which is what the edge claim is about.
+AArch64 issues **one** NR 28 rather than five. **The explanation originally given here — that
+this was "a boot-depth fact about the workload, not a route fact" — was wrong, and the A64-DEPTH
+work that followed found the real cause.** The AArch64 boot was genuinely shallower, but not
+because of the workload: U9-MO2 §4 added NR 28 to the AArch64 ABI *import* list without adding it
+to the finalize *writeback* gate, so the kernel did the work and discarded the return. Userspace
+resumed with `x0` still holding its own `arg0`, decoded that as an error, and stopped before the
+SpawnV5 chain. Measured at the two commits: `2aab8b7` boots fully (`PM_ELF_ZC_DONE`=5,
+`SPAWN_FROM_MO_ENTER`=5) and `14db9ee` reaches 0/0.
+
+The NR 28 evidence in the table above is still accurate — the one call AArch64 issued was served
+pre-lock with `broad = 0` — but it was not the whole picture, because the evaluator counted only
+kernel-side markers and so scored `result=ok` for a syscall whose *return* never arrived. That is
+the second lesson recorded here: an edge claim needs the return, not just the work. The writeback
+gate is now keyed on WHY finalize was called (`SplitFinalizeReason`) rather than on a syscall-number
+allowlist a future class must remember to join, and both defects are repaired and qualified —
+three consecutive green AArch64 exit-oracle, default-core and FT4 runs.
 
 The AArch64 column is the three consecutive clean boots taken **after** the U9-RX4 witness repair
 below; six were run in total and all six are green, one of which exercised the timeout branch that
