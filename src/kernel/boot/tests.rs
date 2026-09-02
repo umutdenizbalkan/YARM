@@ -85211,11 +85211,16 @@ mod stage199d_delivery_projection_differential {
                 split
                     .matches("COUNTERS.note_declined_pre_transaction();")
                     .count(),
-                11,
+                20,
                 "NR6 has three (copy, snapshot, ack claim); 199D-TRC gave NR7 three more — the \
                  unresolved-record fail-close, the mode-indeterminate refusal and the lost \
                  terminal claim; DIRECT3-QUEUECAP gave it two more on the queued mode — the \
-                 message-framing refusal and the pre-mutation queue refusal"
+                 message-framing refusal and the pre-mutation queue refusal; DIRECT3-CAP-FINAL \
+                 gave the capability lane nine, one per way it can refuse having mutated \
+                 nothing it cannot undo — absent transfer cap, unreadable caller, unreadable \
+                 authority slots, refused record reservation, an unarmed terminal, a LOST \
+                 terminal claim, a refused envelope stash, a refused message framing, and a \
+                 producer that declined or failed"
             );
             for (direction, sites, what) in [
                 (
@@ -85225,9 +85230,15 @@ mod stage199d_delivery_projection_differential {
                 ),
                 (
                     "REPLY_COUNTERS",
-                    8,
+                    17,
                     "copy, snapshot, ack-claim, unresolved-record, mode-indeterminate, \
-                     lost-claim, queued-framing and queued-refusal declines are all counted",
+                     lost-claim, queued-framing and queued-refusal declines are all counted, \
+                     plus the capability lane's nine — absent transfer cap, unreadable caller, \
+                     unreadable authority slots, refused record reservation, unarmed terminal, \
+                     lost terminal claim, refused envelope stash, refused message framing, and \
+                     a producer that declined or failed. The lane uses THIS counter rather than \
+                     a second alias for it, so a cap-bearing refusal is never accounted apart \
+                     from every other NR7 refusal",
                 ),
             ] {
                 assert_eq!(
@@ -85244,8 +85255,10 @@ mod stage199d_delivery_projection_differential {
                 split
                     .matches("direct_ipc_counters::note_disposition(")
                     .count(),
-                2,
-                "both directions count their terminal disposition"
+                3,
+                "NR6, the plain NR7 lanes, and the capability lane each count their terminal \
+                 disposition — the capability lane needs its own because it returns from the \
+                 route before the shared tail, having handed its delivery to the drain"
             );
             // Only the NR6 direction can report a MODE decline; NR7 has no mode requirement.
             // Whitespace-collapsed so rustfmt's line breaking cannot break the guard.

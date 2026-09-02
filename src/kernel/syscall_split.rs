@@ -1095,6 +1095,8 @@ fn try_split_ipc_send_into_frame(
                         waiter_tid.0,
                         endpoint_idx,
                         &msg,
+                        // IpcSend origin: no reply record, no terminal, nothing owed.
+                        None,
                     )
                     .map(|done| {
                         if done {
@@ -3014,11 +3016,25 @@ fn try_split_ipcreply_direct_into_frame(
     // queued commit re-validates the record, its binding and the endpoint incarnation against
     // live state in the same acquisition that mutates.
     let mode = if crate::kernel::boot::ipcreply_direct_ack::is_claimable(reply_eidx, reply_egen) {
-        crate::kernel::direct_eligibility::DirectReplyMode::DeliverBlocked
+        // DIRECT3-CAP-FINAL: the caller IS blocked, so the cap-bearing lane applies when the
+        // reply carries a capability. Both lanes claim the same terminal through the same
+        // arbitration; they differ only in who performs the delivery and when the reply
+        // settles.
+        if facts.transfer_cap_present {
+            crate::kernel::direct_eligibility::DirectReplyMode::DeliverBlockedWithCap
+        } else {
+            crate::kernel::direct_eligibility::DirectReplyMode::DeliverBlocked
+        }
     } else if matches!(
         facts.terminal,
         crate::kernel::direct_eligibility::DirectReplyTerminal::Unarmed
-    ) {
+    ) && !facts.transfer_cap_present
+    {
+        // A cap-bearing reply to an UNBLOCKED caller would have to ride its transfer envelope
+        // in the queued message and be materialized by the receive-side owner on a later
+        // receive. That class is not witnessed in production and this lane does not claim it:
+        // it declines pre-mutation and the legacy path owns it, rather than being enqueued
+        // with a capability nothing would materialize.
         crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked
     } else {
         // An armed terminal with no claimable acknowledgement is neither mode: the record is
@@ -3026,7 +3042,163 @@ fn try_split_ipcreply_direct_into_frame(
         REPLY_COUNTERS.note_declined_pre_transaction();
         return None;
     };
-    if mode == crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked {
+    // ── DIRECT3-CAP-FINAL — the CAP-BEARING blocked lane ────────────────────────────────
+    //
+    // Composed entirely from owners that already exist and are already live on the split
+    // IpcSend boundary: the transfer-envelope stash, the blocked-waiter ordinary-cap producer,
+    // its executor's materialize/rollback seams, and the reply's own terminal, authority,
+    // record and reverse-link owners. Nothing here is a second implementation of any of them.
+    //
+    // The reply claims its terminal HERE and settles it NOWHERE here. Materializing the
+    // capability and copying the caller's payload and metadata are the last steps that can
+    // still fail, and both run in the executor; so the claim, the record reservation and the
+    // authority identities travel to it as a typed continuation. Committing the terminal or
+    // revoking the authority at this point would make a materialization failure unrecoverable.
+    if mode == crate::kernel::direct_eligibility::DirectReplyMode::DeliverBlockedWithCap {
+        let Some(transfer_cap) = crate::kernel::syscall::ipc_abi::transfer_cap_arg_value(frame)
+        else {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        // The caller this reply settles, read from the record itself — never re-derived.
+        let Some(caller) = shared.reply_record_caller_split_read(rec_idx, rec_gen) else {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        // (1) The one-shot authority identities, snapshotted BEFORE any mutation so a recycled
+        // record can never hand out another transaction's slots.
+        let Some(authority) = shared.reply_authority_slots_split_read(rec_idx, rec_gen) else {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        // (2) Reserve the record for this exact replier: `Available → Reserved`. Refused
+        // pre-mutation if the record is not this replier's to answer.
+        if !shared.reserve_existing_reply_record_split(rec_idx, rec_gen, replier) {
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        }
+        // (3) THE EXCLUSIVE CLAIM, through the same single authority every other terminal
+        // claimant uses. A loser mutates nothing and does NOT fall back to the broad
+        // dispatcher: the record has an owner and that owner will complete it.
+        let claim = shared
+            .claim_direct_reply_terminal_split(rec_idx, rec_gen, replier, reply_eidx, reply_egen);
+        let terminal_owner = match claim {
+            crate::kernel::boot::DirectReplyTerminalClaim::Won(owner) => owner,
+            crate::kernel::boot::DirectReplyTerminalClaim::NotArmed => {
+                // The ack was claimable, so a terminal must be armed. Restore and refuse.
+                let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+                REPLY_COUNTERS.note_declined_pre_transaction();
+                return None;
+            }
+            crate::kernel::boot::DirectReplyTerminalClaim::Lost(class) => {
+                let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+                REPLY_COUNTERS.note_declined_pre_transaction();
+                crate::yarm_log!(
+                    "IPCREPLY_DIRECT_TERMINAL_LOST record_index={} record_generation={} replier_tid={} reason={:?} reply_copies=0 caller_wakes=0 result=ok",
+                    rec_idx,
+                    rec_gen,
+                    tid,
+                    class
+                );
+                frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
+                return Some(Ok(()));
+            }
+        };
+        // (4) Stash the transfer envelope through the SAME owner the split IpcSend route uses.
+        // It only RESOLVES the replier's source capability — it never takes it — which is why
+        // a later failure can hand the reply back genuinely re-sendable.
+        let reply_endpoint_object = crate::kernel::capabilities::CapObject::Endpoint {
+            index: reply_eidx,
+            generation: reply_egen,
+        };
+        let stashed = shared.stash_transfer_envelope_split(
+            crate::kernel::ipc::ThreadId(tid),
+            transfer_cap,
+            reply_endpoint_object,
+            Some(caller.tid),
+            None,
+        );
+        let Ok(stashed) = stashed else {
+            let _ = shared.release_direct_reply_terminal_split(rec_idx, &terminal_owner);
+            let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        crate::yarm_log!(
+            "IPC_REPLY_DIRECT_CAP_STASH tid={} transfer_cap={} handle={} endpoint={} endpoint_generation={} caller_tid={}",
+            tid,
+            transfer_cap.0,
+            stashed.handle,
+            reply_eidx,
+            reply_egen,
+            caller.tid.0
+        );
+        // (5) The message the caller receives, framed exactly as the legacy reply frames it:
+        // FLAG_CAP_TRANSFER_PLAIN, so the receiver does not strip an opcode prefix a reply
+        // never prepends.
+        let Ok(msg) = crate::kernel::syscall::ipc_abi::frame_reply_message_with_cap(
+            tid,
+            &payload[..len],
+            stashed.handle,
+        ) else {
+            let _ = shared.release_direct_reply_terminal_split(rec_idx, &terminal_owner);
+            let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+            REPLY_COUNTERS.note_declined_pre_transaction();
+            return None;
+        };
+        // (6) The delivery, produced by the existing owner, carrying the reply lifecycle.
+        let continuation = crate::kernel::dispatch_post_work::ReplyTerminalContinuation {
+            record_index: rec_idx,
+            record_generation: rec_gen,
+            terminal_owner,
+            authority,
+            replier,
+            caller,
+        };
+        match shared.produce_blocked_waiter_ordinary_cap_delivery_split(
+            caller.tid.0,
+            reply_eidx,
+            &msg,
+            Some(continuation),
+        ) {
+            Ok(true) => {
+                crate::yarm_log!(
+                    "IPC_REPLY_DIRECT_CAP_PRODUCED record_index={} record_generation={} replier_tid={} caller_tid={} endpoint={} result=ok",
+                    rec_idx,
+                    rec_gen,
+                    tid,
+                    caller.tid.0,
+                    reply_eidx
+                );
+                // The acknowledgement published for this exact endpoint incarnation is spent
+                // by this delivery; consume it so no second reply can claim the same caller.
+                let _ = crate::kernel::boot::ipcreply_direct_ack::claim(reply_eidx, reply_egen);
+                crate::kernel::direct_ipc_counters::note_disposition(
+                    &REPLY_COUNTERS,
+                    crate::kernel::direct_disposition::DirectDisposition::Completed,
+                );
+                return crate::kernel::direct_disposition::apply_direct_disposition(
+                    frame,
+                    crate::kernel::direct_disposition::DirectDisposition::Completed,
+                )
+                .map(|()| Ok(()));
+            }
+            // Declined or failed having consumed nothing irreversible: hand the reply back
+            // re-sendable. The envelope is dropped with it, and the replier still holds the
+            // source capability it only ever resolved.
+            Ok(false) | Err(_) => {
+                let _ = shared.take_transfer_envelope_facts_split(
+                    stashed.handle,
+                    reply_eidx,
+                    caller.tid,
+                );
+                let _ = shared.release_direct_reply_terminal_split(rec_idx, &terminal_owner);
+                let _ = shared.release_reply_record_split(rec_idx, rec_gen);
+                REPLY_COUNTERS.note_declined_pre_transaction();
+                return None;
+            }
+        }
+    } else if mode == crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked {
         // The queued mode carries no capability today: a cap-bearing reply declined at the
         // transfer-cap fact above, before the mode was chosen, so the envelope-bearing message
         // shape cannot reach here. Plain framing, exactly as the broad path builds it when it

@@ -7531,6 +7531,81 @@ impl SharedKernel {
     /// refcount drop) exactly as the legacy §58 meta-fault path, so nothing leaks.
     /// The receiver-local CapId is minted fresh by the seam; the source CapId is
     /// used ONLY as the delegation-link parent edge, never as authority.
+    /// DIRECT3-CAP-FINAL — settle a cap-bearing reply that DELIVERED, in the one order that is
+    /// safe once materialization and both user copies have already succeeded.
+    ///
+    /// Nothing here can fail in a way the reply could retry, which is precisely why it may run
+    /// only at this point. The order is the blocked lane's order, deferred whole rather than
+    /// split across the syscall and the drain:
+    ///
+    ///   consume the record (THE one-shot barrier) → reclaim the reply authority →
+    ///   commit the terminal → close the reverse link → release the record slot
+    ///
+    /// The barrier precedes the authority revoke, so no window exists in which the record
+    /// would still authorize a second reply. The terminal commit precedes the record release,
+    /// so the slot is handed back to the allocator only once its cell is `Completed` and can
+    /// no longer be armed over a live claim. The reverse link closes while the record is still
+    /// present, because closing it resolves the responder FROM that record.
+    fn settle_delivered_reply_continuation_split(
+        &self,
+        k: &crate::kernel::dispatch_post_work::ReplyTerminalContinuation,
+    ) {
+        let (idx, rgen) = (k.record_index, k.record_generation);
+        // (1) THE BARRIER. After this a stale or aliased reply capability resolving to this
+        // same incarnation fails through the record, before any slot is reclaimed.
+        let consumed = self.consume_reply_record_split(idx, rgen);
+        // (2) the one-shot authority: both CNode slots, through the single reclamation owner.
+        // The TRANSFERRED cap is a different object in a different slot and is untouched here.
+        let reclaim = self.reclaim_reply_authority_split(k.authority, k.replier.tid.0);
+        // (3) the terminal, settled by the exact owner the syscall claimed and never released.
+        let committed = self.commit_direct_reply_terminal_split(idx, &k.terminal_owner);
+        // (4) the reverse link, while the record still resolves its bound replier.
+        let _ = self.finalize_server_reply_link_for_record_split(idx, rgen);
+        // (5) the slot, last, exact on generation and on the `Consumed` state.
+        self.release_consumed_reply_record_split(idx, rgen);
+        crate::yarm_log!(
+            "IPC_REPLY_DIRECT_CAP_SETTLED record_index={} record_generation={} replier_tid={} caller_tid={} consumed={} replier_revoked={} caller_revoked={} terminal_committed={} result=ok",
+            idx,
+            rgen,
+            k.replier.tid.0,
+            k.caller.tid.0,
+            u8::from(consumed),
+            u8::from(reclaim.replier_revoked),
+            u8::from(reclaim.caller_revoked),
+            u8::from(committed)
+        );
+    }
+
+    /// DIRECT3-CAP-FINAL — hand a cap-bearing reply BACK to its replier, re-sendable.
+    ///
+    /// Used for every executor failure. The freshly-minted receiver cap has already been
+    /// rolled back by the caller of this helper, so the only state still held is the reply's
+    /// own: the record sits `Reserved` and the terminal sits `Reserved(Reply)` at this owner's
+    /// exact epoch. Releasing the terminal reopens the cell at the SAME epoch and restoring
+    /// the record makes it externally invokable again, so the replier may simply reply again.
+    ///
+    /// Nothing is consumed, revoked or released: the one-shot is still unspent, which is what
+    /// makes this a genuine retry rather than a lost reply. The transfer envelope was consumed
+    /// by the producer, but the replier's own source capability was only ever RESOLVED, never
+    /// taken — so it is still theirs to send.
+    fn restore_retryable_reply_continuation_split(
+        &self,
+        k: &crate::kernel::dispatch_post_work::ReplyTerminalContinuation,
+        reason: &str,
+    ) {
+        let released = self.release_direct_reply_terminal_split(k.record_index, &k.terminal_owner);
+        let restored = self.release_reply_record_split(k.record_index, k.record_generation);
+        crate::yarm_log!(
+            "IPC_REPLY_DIRECT_CAP_RESTORED record_index={} record_generation={} replier_tid={} reason={} terminal_released={} record_available={} reply_copies=0 caller_wakes=0 result=rolled_back",
+            k.record_index,
+            k.record_generation,
+            k.replier.tid.0,
+            reason,
+            u8::from(released),
+            u8::from(restored)
+        );
+    }
+
     fn execute_blocked_waiter_ordinary_cap_delivery(
         &self,
         cpu: CpuId,
@@ -7614,6 +7689,11 @@ impl SharedKernel {
                 crate::yarm_log!(
                     "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap reason=unexpected_reply_object"
                 );
+                // Nothing was minted, so there is nothing to roll back — but the reply's
+                // terminal and record are still held and must go back to the replier.
+                if let Some(k) = snap.reply_continuation.as_ref() {
+                    self.restore_retryable_reply_continuation_split(k, "unexpected_reply_object");
+                }
                 return Err(TrapHandleError::Syscall(SyscallError::WrongObject));
             }
             Err(e) => {
@@ -7629,6 +7709,13 @@ impl SharedKernel {
                 crate::yarm_log!(
                     "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap reason=materialize"
                 );
+                // THE reason the reply lifecycle is deferred: a materialization failure here
+                // must leave the reply unspent. Committing the terminal or revoking the
+                // authority under the syscall would have made this unrecoverable — the reply
+                // would be gone with nothing delivered and no cap.
+                if let Some(k) = snap.reply_continuation.as_ref() {
+                    self.restore_retryable_reply_continuation_split(k, "materialize");
+                }
                 return Err(TrapHandleError::Syscall(SyscallError::from(e)));
             }
         };
@@ -7688,6 +7775,12 @@ impl SharedKernel {
             crate::yarm_log!(
                 "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap reason=user_copy"
             );
+            // The minted cap is fully rolled back above (revoke + delegation-link removal +
+            // refcount drop), so the ONLY state left is the reply's own. Hand it back
+            // re-sendable: no payload landed, no cap landed, and the one-shot is unspent.
+            if let Some(k) = snap.reply_continuation.as_ref() {
+                self.restore_retryable_reply_continuation_split(k, "user_copy");
+            }
             return Err(TrapHandleError::Syscall(SyscallError::InvalidArgs));
         }
         crate::yarm_log!("DISPATCH_POST_WORK_USER_COPY_OK kind=blocked_waiter_ordinary_cap");
@@ -7698,6 +7791,15 @@ impl SharedKernel {
                 "IPC_SEND_CAP_BOUNDARY_USER_COPY_OK waiter_tid={}",
                 snap.waiter_tid
             );
+        }
+
+        // DIRECT3-CAP-FINAL — the cap and both user copies have landed, and nothing after
+        // this point can fail in a way the reply could retry. Only NOW may the reply settle:
+        // consume the record, reclaim the one-shot authority, commit the terminal, close the
+        // reverse link and release the slot. Strictly before the wake below, so the caller is
+        // never running while its record would still authorize a second reply.
+        if let Some(k) = snap.reply_continuation.as_ref() {
+            self.settle_delivered_reply_continuation_split(k);
         }
 
         // Phase C — completion via a brief global re-entry (no seam inside),
@@ -8402,11 +8504,17 @@ impl SharedKernel {
     /// `endpoint_idx` from a live, generation-checked endpoint capability during this very send,
     /// which is also the send that stashed the envelope.
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    ///
+    /// DIRECT3-CAP-FINAL — `reply_continuation` is the reply lifecycle this delivery still
+    /// owes, attached to the stashed snapshot so the executor settles it only after the
+    /// materialize and both user copies have succeeded. `None` for the IpcSend-origin callers
+    /// this producer has always served, whose behaviour is unchanged.
     pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery_split(
         &self,
         waiter_tid: u64,
         endpoint_idx: usize,
         msg: &crate::kernel::ipc::Message,
+        reply_continuation: Option<crate::kernel::dispatch_post_work::ReplyTerminalContinuation>,
     ) -> Result<bool, crate::kernel::syscall::SyscallError> {
         use crate::kernel::capabilities::CapObject;
         use crate::kernel::dispatch_post_work::DispatchPostWork;
@@ -8512,6 +8620,7 @@ impl SharedKernel {
                 facts.source_cap,
                 receiver_cnode,
             ),
+            reply_continuation,
         );
         // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
         // identical discipline to the broad producer's store.
@@ -9758,6 +9867,29 @@ impl SharedKernel {
     /// requires the exact endpoint INCARNATION — index alone cannot distinguish a recycled
     /// endpoint slot from the one the acknowledgement was published for.
     /// `None` when absent or generation-mismatched.
+    /// DIRECT3-CAP-FINAL — rank 3 read: the exact caller incarnation a reply record binds.
+    ///
+    /// The cap-bearing lane delivers into this caller and carries it through the drain, so it
+    /// is read FROM the record rather than re-derived from the endpoint's current waiter: a
+    /// waiter slot can change under a recycled endpoint, while the record's `{tid, asid}` names
+    /// the incarnation this reply authority was minted for. `None` when the slot no longer
+    /// holds that incarnation.
+    pub(crate) fn reply_record_caller_split_read(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> Option<crate::kernel::boot::ReceiverWaiterIdentity> {
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get(index) {
+            Some(Some(record)) if ipc.reply_cap_generations[index] == generation => {
+                Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    record.caller_tid,
+                    record.caller_asid,
+                ))
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn reply_record_endpoint_ref_split_read(
         &self,
         index: usize,

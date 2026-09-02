@@ -52,6 +52,34 @@ pub(crate) fn transfer_cap_arg_present(frame: &TrapFrame) -> bool {
     frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64 != SYSCALL_NO_TRANSFER_CAP
 }
 
+/// The same decode as [`transfer_cap_arg`], without the unused `KernelState` the broad
+/// signature carries, so the pre-lock reply route can ask it too. Both go through
+/// [`transfer_cap_arg_present`], so there is still exactly ONE sentinel rule.
+pub(crate) fn transfer_cap_arg_value(frame: &TrapFrame) -> Option<CapId> {
+    transfer_cap_arg_present(frame).then(|| CapId(frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64))
+}
+
+/// THE cap-bearing reply message framing, shared by the legacy reply handler and the direct
+/// reply lane so the two cannot frame the same reply differently.
+///
+/// `FLAG_CAP_TRANSFER_PLAIN` (bit 2), never `FLAG_CAP_TRANSFER` (bit 0): the latter makes the
+/// receiver strip a two-byte inline opcode prefix that the ipc_send/ipc_call protocol prepends
+/// and a reply never does, which would silently truncate the caller's payload.
+pub(crate) fn frame_reply_message_with_cap(
+    sender_tid: u64,
+    payload: &[u8],
+    transfer_handle: u64,
+) -> Result<Message, SyscallError> {
+    Message::with_header(
+        sender_tid,
+        super::OPCODE_INLINE,
+        Message::FLAG_CAP_TRANSFER_PLAIN,
+        Some(transfer_handle),
+        payload,
+    )
+    .map_err(|_| SyscallError::InvalidArgs)
+}
+
 pub(super) fn transfer_cap_arg(
     _kernel: &KernelState,
     frame: &TrapFrame,

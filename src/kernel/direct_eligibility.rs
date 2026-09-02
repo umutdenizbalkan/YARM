@@ -93,12 +93,15 @@ pub(crate) struct DirectReplyFacts {
     pub(crate) endpoint_admitted: bool,
     /// Whether the reply carries a **transferred capability** in `SYSCALL_ARG_TRANSFER_CAP`.
     ///
-    /// The direct transaction has no notion of capability transfer: it copies the payload and
-    /// metadata into the caller's address space and wakes it, with nothing that mints, stashes
-    /// or installs a capability. Legacy `ipc_reply` validates the transfer cap and stashes a
-    /// transfer handle that the caller's `recv` then installs. So a cap-bearing reply serviced
-    /// off-lock would deliver the payload and **silently drop the capability** — the receiver
-    /// sees a successful reply with `transferred_cap=0` and no way to tell it was robbed.
+    /// DIRECT3-CAP-FINAL: this no longer decides eligibility, it selects a LANE. A cap-bearing
+    /// reply to a committed-blocked caller is serviced by the capability lane, which stashes the
+    /// transfer envelope through the same owner the split IpcSend boundary uses and hands the
+    /// delivery to the blocked-waiter ordinary-cap producer/executor pair. The one shape that
+    /// lane does not claim is a cap-bearing reply to an UNBLOCKED caller, which would need the
+    /// queued receive-side materialization; the route declines that pre-mutation.
+    ///
+    /// It stays a fact rather than becoming a mode here because the mode also depends on the
+    /// caller's blocked state, which this pure classifier does not — and must not — read.
     pub(crate) transfer_cap_present: bool,
     /// 199D-TRC — how this reply-record incarnation's terminal-ownership cell stands relative
     /// to THIS reply, read from the authoritative cell and compared field-by-field against
@@ -211,11 +214,24 @@ pub(crate) enum DirectReplyMode {
     /// acknowledgement and an exact armed terminal. The reply claims that terminal and delivers
     /// straight into the caller's address space.
     DeliverBlocked,
+    /// DIRECT3-CAP-FINAL — as [`Self::DeliverBlocked`], but the reply also transfers a
+    /// capability. The reply claims its terminal and then hands BOTH the delivery and the rest
+    /// of its lifecycle to the blocked-waiter ordinary-cap producer/executor pair, because
+    /// materializing the capability is the last step that can still fail and the terminal must
+    /// not settle before it.
+    DeliverBlockedWithCap,
     /// No caller is blocked on the reply endpoint: no acknowledgement to claim, and no terminal
     /// armed for the record. The reply is enqueued into the exact reply-endpoint incarnation
     /// for a later receive. No terminal claim is required — and none is possible, because a
     /// terminal is armed only by the commit that also publishes the acknowledgement.
     QueueUnblocked,
+}
+
+impl DirectReplyMode {
+    /// True for the two lanes that deliver into a committed-blocked caller.
+    pub(crate) fn delivers_blocked(self) -> bool {
+        matches!(self, Self::DeliverBlocked | Self::DeliverBlockedWithCap)
+    }
 }
 
 /// The exhaustive NR7 eligibility verdict.
@@ -373,12 +389,16 @@ pub(crate) fn classify_direct_reply_eligibility(
     if !facts.requester_available {
         return DirectReplyEligibility::RequesterUnavailable;
     }
-    // The direct transaction copies payload + metadata and wakes the caller. It mints,
-    // stashes and installs nothing, so it cannot carry a capability — decline before any
-    // mutation and let the legacy path do the transfer.
-    if facts.transfer_cap_present {
-        return DirectReplyEligibility::TransferCapUnsupported;
-    }
+    // DIRECT3-CAP-FINAL: a cap-bearing reply is no longer declined here.
+    //
+    // The direct route now has a capability lane: it stashes the transfer envelope through the
+    // same owner the split IpcSend boundary uses, produces a blocked-waiter ordinary-cap
+    // delivery, and carries its reply lifecycle to the executor as a typed continuation. So
+    // "this reply carries a capability" is a MODE question — which lane services it — not an
+    // eligibility question, and it is asked at the mode selection where the caller's blocked
+    // state is known. `TransferCapUnsupported` is still produced there, for the one shape this
+    // lane deliberately does not claim: a cap-bearing reply to an UNBLOCKED caller, which
+    // would need the queued receive-side materialization and is not witnessed in production.
     if let Err(err) = facts.reply_object {
         return DirectReplyEligibility::ReplyCapUnresolved(err);
     }
@@ -665,18 +685,34 @@ mod tests {
     /// direct transaction has no way to deliver the capability and would otherwise deliver the
     /// payload and drop it silently.
     #[test]
-    fn a_cap_bearing_reply_is_ineligible() {
+    fn a_cap_bearing_reply_is_eligible_and_its_lane_is_a_mode_question() {
+        // DIRECT3-CAP-FINAL: carrying a capability no longer ends a reply's direct
+        // eligibility. The direct route has a capability lane, so "which lane services this"
+        // is decided at mode selection — where the caller's blocked state is known — and not
+        // here, where it is not. Eligibility must therefore be INDIFFERENT to the fact.
         let mut facts = reply_facts();
         facts.transfer_cap_present = true;
-        let verdict = classify_direct_reply_eligibility(&facts);
-        assert_eq!(verdict, DirectReplyEligibility::TransferCapUnsupported);
-        assert!(verdict.is_transfer_cap_decline());
+        let cap_bearing = classify_direct_reply_eligibility(&facts);
+        facts.transfer_cap_present = false;
+        let plain = classify_direct_reply_eligibility(&facts);
         assert_eq!(
-            verdict.endpoint(),
-            None,
-            "a decline services nothing: no endpoint to claim an acknowledgement for"
+            cap_bearing, plain,
+            "the transfer-cap fact must not change the eligibility verdict"
         );
-        // And it is the ONLY transfer-cap decline.
+        assert_eq!(
+            cap_bearing,
+            DirectReplyEligibility::Eligible {
+                endpoint_index: 4,
+                endpoint_generation: 9,
+            }
+        );
+        assert!(
+            cap_bearing.endpoint().is_some(),
+            "an eligible cap-bearing reply names the endpoint incarnation its lane services"
+        );
+        // The variant still exists for the one shape the lane deliberately does not claim,
+        // but nothing in the classifier produces it any more.
+        assert!(!cap_bearing.is_transfer_cap_decline());
         for other in [
             DirectReplyEligibility::PayloadTooLong,
             DirectReplyEligibility::RequesterUnavailable,
@@ -690,6 +726,28 @@ mod tests {
         ] {
             assert!(!other.is_transfer_cap_decline(), "{other:?}");
         }
+        // Scoped to the classifier's own body: asserting over the whole file would match
+        // this very assertion's literal and pass for the wrong reason.
+        let src = include_str!("direct_eligibility.rs");
+        let body = src
+            .split("pub(crate) fn classify_direct_reply_eligibility(")
+            .nth(1)
+            .expect("the reply classifier");
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        // The RETURN, not the name: the classifier still documents the variant it no longer
+        // produces, and matching the bare name would fail on that comment.
+        assert!(
+            !body.contains("return DirectReplyEligibility::TransferCapUnsupported"),
+            "the blanket cap-bearing decline must be gone from the classifier body"
+        );
+        assert!(
+            !body.contains("if facts.transfer_cap_present {"),
+            "and the classifier must not branch on the transfer-cap fact at all"
+        );
+        assert!(
+            body.contains("facts.terminal"),
+            "and every other decline the classifier owns must still be there"
+        );
     }
 
     /// A reply with no transferred capability stays direct-eligible — the check narrows the
@@ -712,24 +770,32 @@ mod tests {
     /// no matter what else is true about it. This is what makes "cannot enter the direct
     /// transaction" a property of the ordering rather than of the call site's care.
     #[test]
-    fn a_cap_bearing_reply_declines_before_any_capability_resolution() {
+    fn a_cap_bearing_reply_is_still_judged_on_every_other_fact() {
+        // Admitting cap-bearing replies must widen NOTHING else: every decline that applied
+        // to a plain reply still applies, and each is still reported as itself rather than
+        // being masked by the capability.
         let mut facts = reply_facts();
         facts.transfer_cap_present = true;
-        // Perfectly valid reply object, live endpoint, admitted: still declined.
-        assert_eq!(
-            classify_direct_reply_eligibility(&facts),
-            DirectReplyEligibility::TransferCapUnsupported
-        );
-        // Broken reply object: the transfer-cap decline is still what is reported, so the
-        // classifier never even inspects the capability.
         facts.reply_object = Err(KernelError::InvalidCapability);
-        facts.reply_endpoint = None;
-        facts.endpoint_admitted = false;
         assert_eq!(
             classify_direct_reply_eligibility(&facts),
-            DirectReplyEligibility::TransferCapUnsupported
+            DirectReplyEligibility::ReplyCapUnresolved(KernelError::InvalidCapability),
+            "an unresolvable reply capability still declines, capability or not"
         );
-        // Only the two checks that need no capability at all outrank it.
+        let mut gone = reply_facts();
+        gone.transfer_cap_present = true;
+        gone.reply_endpoint = None;
+        assert_eq!(
+            classify_direct_reply_eligibility(&gone),
+            DirectReplyEligibility::ReplyEndpointGone
+        );
+        let mut unadmitted = reply_facts();
+        unadmitted.transfer_cap_present = true;
+        unadmitted.endpoint_admitted = false;
+        assert_eq!(
+            classify_direct_reply_eligibility(&unadmitted),
+            DirectReplyEligibility::EndpointNotAdmitted
+        );
         let mut too_long = reply_facts();
         too_long.transfer_cap_present = true;
         too_long.payload_len = IPC_DIRECT_PAYLOAD_MAX + 1;
@@ -743,6 +809,40 @@ mod tests {
         assert_eq!(
             classify_direct_reply_eligibility(&no_requester),
             DirectReplyEligibility::RequesterUnavailable
+        );
+        // And a competitor-owned terminal still refuses a cap-bearing reply exactly as it
+        // refuses a plain one: the capability lane claims through the same arbitration.
+        let mut owned = reply_facts();
+        owned.transfer_cap_present = true;
+        owned.terminal = DirectReplyTerminal::OwnedByCompetitor;
+        assert_eq!(
+            classify_direct_reply_eligibility(&owned),
+            DirectReplyEligibility::TerminalUnavailable(DirectReplyTerminal::OwnedByCompetitor)
+        );
+    }
+
+    /// THE shape the capability lane deliberately does not claim: a cap-bearing reply to a
+    /// caller that is NOT blocked. It would have to ride its transfer envelope in the queued
+    /// message and be materialized by the receive-side owner on a later receive — a class
+    /// production does not witness. The route must select neither blocked lane nor the queued
+    /// lane for it, so it declines pre-mutation and the legacy path owns it.
+    #[test]
+    fn a_cap_bearing_reply_to_an_unblocked_caller_is_not_claimed_by_either_lane() {
+        let route = include_str!("syscall_split.rs");
+        let body = route
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("the NR7 route");
+        let mode = body.split("let mode = if").nth(1).expect("mode selection");
+        let mode = &mode[..mode.find("};").expect("mode selection ends")];
+        assert!(
+            mode.contains("DirectReplyMode::DeliverBlockedWithCap"),
+            "a blocked caller + a capability selects the capability lane"
+        );
+        assert!(
+            mode.contains("&& !facts.transfer_cap_present"),
+            "the queued lane must refuse a cap-bearing reply rather than enqueue a message \
+             carrying a capability nothing would materialize"
         );
     }
 
