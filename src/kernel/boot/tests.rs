@@ -153124,3 +153124,246 @@ mod u9spawn2_nr24_fallback_removed {
         );
     }
 }
+
+/// U9-SPAWN2 §2 — one process-CNode transaction, with broad and split acquisitions.
+#[cfg(test)]
+mod u9spawn2_process_cnode_txn {
+    use super::*;
+    use crate::kernel::boot::process_cnode_txn::{ProcessCNodeGrant, ProcessCNodeRequest};
+    use crate::kernel::capabilities::CNodeId;
+    use crate::kernel::task::TaskClass;
+    use crate::runtime::SharedKernel;
+
+    const TXN_SRC: &str = include_str!("process_cnode_txn.rs");
+    const RESERVE_SRC: &str = include_str!("task_policy_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn kernel() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    fn spaces(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_capability_state(|c| c.cnode_spaces.iter().flatten().count()))
+    }
+    fn associations(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_capability_state(|c| c.process_cnodes.iter().flatten().count()))
+    }
+    fn association_for(k: &SharedKernel, pid: u64) -> Option<CNodeId> {
+        k.with(|s| {
+            s.with_capability_state(|c| {
+                c.process_cnodes
+                    .iter()
+                    .flatten()
+                    .find(|r| r.pid == pid)
+                    .map(|r| r.cnode)
+            })
+        })
+    }
+
+    fn request(pid: u64) -> ProcessCNodeRequest {
+        ProcessCNodeRequest {
+            pid,
+            tid: pid,
+            class: TaskClass::SystemServer,
+        }
+    }
+
+    /// The transaction provisions the space AND the association, and reports creating both.
+    #[test]
+    fn a_new_process_gets_a_space_and_an_association_together() {
+        let k = kernel();
+        let (before_spaces, before_assoc) = (spaces(&k), associations(&k));
+        let req = request(50_001);
+        let grant = k
+            .with(|s| s.provision_process_cnode(&req))
+            .expect("provision");
+        assert!(grant.created_space && grant.created_association);
+        assert_eq!(spaces(&k), before_spaces + 1);
+        assert_eq!(associations(&k), before_assoc + 1);
+        assert_eq!(association_for(&k, 50_001), Some(grant.cnode));
+        // The CNode is named after the process, not after whatever task happened to be running.
+        assert_eq!(grant.cnode, CNodeId(50_001));
+    }
+
+    /// A second thread joining an existing process provisions nothing — and therefore its
+    /// compensation must remove nothing. This is what the two booleans are for.
+    #[test]
+    fn joining_an_existing_process_creates_nothing_and_so_releases_nothing() {
+        let k = kernel();
+        let req = request(50_002);
+        let first = k.with(|s| s.provision_process_cnode(&req)).expect("first");
+        assert!(first.created_space && first.created_association);
+        let settled = (spaces(&k), associations(&k));
+
+        let joiner = ProcessCNodeRequest {
+            pid: 50_002,
+            tid: 50_003,
+            class: TaskClass::App,
+        };
+        let second = k
+            .with(|s| s.provision_process_cnode(&joiner))
+            .expect("second");
+        assert_eq!(
+            second.cnode, first.cnode,
+            "the joiner shares the process CNode"
+        );
+        assert!(
+            !second.created_space && !second.created_association,
+            "a joiner creates nothing: {second:?}"
+        );
+        assert!(!second.owns_anything());
+        assert_eq!((spaces(&k), associations(&k)), settled);
+
+        // Releasing the joiner's grant must not strip the process of its capability space.
+        k.with(|s| s.release_process_cnode_grant(&joiner, &second));
+        assert_eq!(
+            (spaces(&k), associations(&k)),
+            settled,
+            "a grant that created nothing released something"
+        );
+        assert_eq!(association_for(&k, 50_002), Some(first.cnode));
+    }
+
+    /// Compensation removes exactly what was created, and repeating it is inert.
+    #[test]
+    fn release_is_exact_and_repeating_it_is_inert() {
+        let k = kernel();
+        let before = (spaces(&k), associations(&k));
+        let req = request(50_004);
+        let grant = k
+            .with(|s| s.provision_process_cnode(&req))
+            .expect("provision");
+        assert_ne!((spaces(&k), associations(&k)), before);
+
+        k.with(|s| s.release_process_cnode_grant(&req, &grant));
+        assert_eq!((spaces(&k), associations(&k)), before, "back to baseline");
+        assert_eq!(association_for(&k, 50_004), None);
+
+        for _ in 0..3 {
+            k.with(|s| s.release_process_cnode_grant(&req, &grant));
+            assert_eq!(
+                (spaces(&k), associations(&k)),
+                before,
+                "a repeated release must move nothing"
+            );
+        }
+    }
+
+    /// A stale grant naming a CNode that now belongs to a different process releases nothing.
+    #[test]
+    fn a_stale_grant_cannot_take_another_processs_space() {
+        let k = kernel();
+        let victim = request(50_005);
+        let victim_grant = k
+            .with(|s| s.provision_process_cnode(&victim))
+            .expect("victim");
+        let settled = (spaces(&k), associations(&k));
+
+        // A grant that claims to have created the victim's CNode, for a different process.
+        let stale_request = request(50_006);
+        let stale = ProcessCNodeGrant {
+            cnode: victim_grant.cnode,
+            created_space: true,
+            created_association: true,
+        };
+        k.with(|s| s.release_process_cnode_grant(&stale_request, &stale));
+        assert_eq!(
+            (spaces(&k), associations(&k)),
+            settled,
+            "a stale grant took a live process's capability space"
+        );
+        assert_eq!(association_for(&k, 50_005), Some(victim_grant.cnode));
+    }
+
+    /// The broad and split entries share ONE rank-4 body — neither carries its own policy.
+    #[test]
+    fn broad_and_split_share_one_policy() {
+        assert_eq!(
+            TXN_SRC
+                .matches("pub(crate) fn provision_process_cnode_locked(")
+                .count(),
+            1,
+            "one rank-4 provisioning body"
+        );
+        assert!(
+            TXN_SRC.contains("fn provision_process_cnode(")
+                && RUNTIME_SRC.contains("fn provision_process_cnode_split("),
+            "both acquisitions must exist"
+        );
+        for entry in [
+            "provision_process_cnode_locked(",
+            "release_process_cnode_grant_locked(",
+        ] {
+            assert!(
+                RUNTIME_SRC.contains(entry),
+                "the split entry must call the shared rank-4 owner {entry}, not reimplement it"
+            );
+        }
+        // The split entry adds no second capacity policy.
+        assert!(
+            RUNTIME_SRC
+                .contains("requested_cnode_slot_capacity_for_class(request.class, limits, None)"),
+            "the split entry must use the same class capacity policy as the broad one"
+        );
+    }
+
+    /// The broad spawn reservation DELEGATES: it no longer calls the two independent entries,
+    /// which is what makes this a production owner rather than a helper-only API.
+    #[test]
+    fn the_broad_reservation_delegates_and_compensates() {
+        let body = RESERVE_SRC
+            .split("pub fn reserve_task_for_spawn_with_class_in_process(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("the reservation body");
+        assert!(
+            body.contains("self.provision_process_cnode(&cnode_request)"),
+            "the reservation must go through the transaction"
+        );
+        for bypassed in [
+            "ensure_cnode_space_with_slots(",
+            "set_process_cnode_for_pid(",
+        ] {
+            assert!(
+                !body.contains(bypassed),
+                "the reservation still calls {bypassed} directly, so the two halves can drift \
+                 apart again"
+            );
+        }
+        // Every later failure releases the grant.
+        assert!(
+            body.matches("release_process_cnode_grant(&cnode_request, &cnode_grant)")
+                .count()
+                >= 2,
+            "each failure after the CNode transaction must release it"
+        );
+        // And the PID is the caller's, never the current task's.
+        assert!(
+            body.contains("pid: process_pid"),
+            "the process identity must come from the request"
+        );
+        assert!(
+            !body.contains("current_tid()"),
+            "no ambient current-task fallback may decide which process this CNode belongs to"
+        );
+    }
+
+    /// The transaction owns the CNode and its association, and deliberately not the capabilities
+    /// minted into it afterwards — those have their own owner.
+    #[test]
+    fn the_transaction_does_not_grow_a_second_capability_policy() {
+        // Scoped to the CODE. The module doc names these owners deliberately, to say what this
+        // transaction defers to them — an explanation is not a second implementation.
+        let code = TXN_SRC
+            .split("\nuse super::*;\n")
+            .nth(1)
+            .expect("the module body after its doc comment");
+        for foreign in ["revoke_capability_in_cnode(", "mint_capability"] {
+            assert!(
+                !code.contains(foreign),
+                "{foreign} belongs to the capability lifecycle; the CNode transaction must not \
+                 grow a second copy of it"
+            );
+        }
+    }
+}

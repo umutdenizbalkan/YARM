@@ -2279,8 +2279,7 @@ impl SharedKernel {
         // (2) rank 2, ONE acquisition: everything up to and including `Runnable`.
         let outcome = self.with_spawn_thread_split_mut(|tcbs, classes, cursor, tls| {
             let parent = core_::parent_facts_locked(tcbs, classes, parent_tid)?;
-            let (tid, delta) =
-                core_::allocate_dynamic_tid_locked(tcbs, cursor, policy, max_tasks)?;
+            let (tid, delta) = core_::allocate_dynamic_tid_locked(tcbs, cursor, policy, max_tasks)?;
             let idx = core_::register_thread_incarnation_locked(
                 tcbs,
                 classes,
@@ -9019,6 +9018,49 @@ impl SharedKernel {
                 max_total_cnode_slots,
             )
         })
+    }
+
+    /// U9-SPAWN2 §2 — the OFF-LOCK process-CNode transaction: the split entry to the SAME
+    /// policy the broad `provision_process_cnode` calls.
+    ///
+    /// One bounded rank-4 acquisition covering both mutations, so the split route gets the same
+    /// guarantee the broad one does: no observer can see a CNode space that belongs to nobody,
+    /// or an association naming a space that was never created.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn provision_process_cnode_split(
+        &self,
+        request: &crate::kernel::boot::process_cnode_txn::ProcessCNodeRequest,
+    ) -> Result<crate::kernel::boot::process_cnode_txn::ProcessCNodeGrant, KernelError> {
+        let limits = self.runtime_capacity_config_split_read();
+        let max_total_cnode_slots = limits.max_total_cnode_slots;
+        let requested =
+            KernelState::requested_cnode_slot_capacity_for_class(request.class, limits, None)?;
+        let bounded = KernelState::normalize_requested_cnode_slots(requested, limits)?;
+        self.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::process_cnode_txn::provision_process_cnode_locked(
+                capability,
+                request,
+                bounded,
+                max_total_cnode_slots,
+            )
+        })
+    }
+
+    /// U9-SPAWN2 §2 — the OFF-LOCK compensation, through the same rank-4 owner.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn release_process_cnode_grant_split(
+        &self,
+        request: &crate::kernel::boot::process_cnode_txn::ProcessCNodeRequest,
+        grant: &crate::kernel::boot::process_cnode_txn::ProcessCNodeGrant,
+    ) {
+        if !grant.owns_anything() {
+            return;
+        }
+        self.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::process_cnode_txn::release_process_cnode_grant_locked(
+                capability, request, grant,
+            );
+        });
     }
 
     /// 199G-C4 §3 — the OFF-LOCK REPLY-CAP blocked-waiter delivery producer: the split

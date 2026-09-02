@@ -103,12 +103,20 @@ impl KernelState {
         if self.with_tcbs(|tcbs| tcbs.iter().flatten().count()) >= limits.max_tasks {
             return Err(KernelError::TaskTableFull);
         }
-        let cnode = self
-            .process_cnode_for_pid(process_pid)
-            .unwrap_or(CNodeId(process_pid));
-        let cnode_slots = Self::requested_cnode_slot_capacity_for_class(class, limits, None)?;
-        self.ensure_cnode_space_with_slots(cnode, cnode_slots)?;
-        self.set_process_cnode_for_pid(process_pid, cnode)?;
+        // U9-SPAWN2 §2: the CNode space and its PID association are ONE transaction, taken
+        // through the shared owner. They used to be two independent rank-4 entries, and a
+        // failure of the second left the first behind: a capability space provisioned for a
+        // process that did not exist, which nothing ever removed.
+        //
+        // The PID is passed explicitly and comes from this reservation's own argument — there is
+        // no ambient current-task fallback here, and the split route states it the same way.
+        let cnode_request = crate::kernel::boot::process_cnode_txn::ProcessCNodeRequest {
+            pid: process_pid,
+            tid,
+            class,
+        };
+        let cnode_grant = self.provision_process_cnode(&cnode_request)?;
+        let cnode = cnode_grant.cnode;
         // Monotonic, never derived from the TID: a token for an earlier occupant of this numeric
         // TID cannot match this reservation.
         let generation = self.spawn_reservation_generation;
@@ -128,10 +136,20 @@ impl KernelState {
             }
         });
         let Some(inserted_idx) = inserted_idx else {
+            // U9-SPAWN2 §2: the CNode transaction happened; this reservation did not. Release
+            // exactly what it created, through the owner that holds it.
+            self.release_process_cnode_grant(&cnode_request, &cnode_grant);
             return Err(KernelError::TaskTableFull);
         };
         super::kernel_mut(&mut self.task_classes)[inserted_idx] = Some(class);
-        self.provision_default_kernel_context(tid)?;
+        if let Err(err) = self.provision_default_kernel_context(tid) {
+            self.with_tcbs_mut(|tcbs| {
+                crate::kernel::spawn_reservation::clear_reservation_slot(tcbs, inserted_idx)
+            });
+            super::kernel_mut(&mut self.task_classes)[inserted_idx] = None;
+            self.release_process_cnode_grant(&cnode_request, &cnode_grant);
+            return Err(err);
+        }
         crate::yarm_log!(
             "SPAWN_RESERVE_OK tid={} class={:?} pid={} generation={}",
             tid,
@@ -314,7 +332,7 @@ impl KernelState {
         }
     }
 
-    fn requested_cnode_slot_capacity_for_class(
+    pub(crate) fn requested_cnode_slot_capacity_for_class(
         class: TaskClass,
         limits: RuntimeCapacityConfig,
         requested: Option<usize>,
