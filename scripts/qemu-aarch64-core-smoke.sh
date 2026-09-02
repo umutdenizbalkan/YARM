@@ -766,7 +766,16 @@ BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_CO
 # and every other WrongObject still blocks the boot. Nor is it unguarded: the U9-RX4 evaluator
 # REQUIRES this refusal on a timeout win (and requires `late_reply_successes=0` with it), so the
 # line is positively asserted where it belongs rather than merely tolerated here.
-BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=WrongObject|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295'
+# The exclusions are deliberate, benign lines the generic blocker scanner would otherwise flag
+# on their `err=` token alone. Two of them are the SAME event: a reply whose authority is already
+# spent is refused with `WrongObject`, by the legacy broad handler (`IPC_REPLY_FAIL ... `) or,
+# since DIRECT3-CAP-FINAL §7, PRE-LOCK (`IPCREPLY_DIRECT_REFUSED_PRE_LOCK ... `). The legacy
+# spelling was excused when the timeout-wins branch was first witnessed; the pre-lock spelling
+# was not, so a boot that lost the race failed here on a refusal that is the CORRECT outcome.
+# The pre-lock exclusion is the narrower of the two: it excuses only an INERT refusal
+# (`reply_copies=0 caller_wakes=0 mutations=0`). One that copied a payload, woke the caller or
+# mutated state stays a blocker, because that would be a partial reply wearing a refusal's marker.
+BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=WrongObject|IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=[0-9]+ record_generation=[0-9]+ replier_tid=[0-9]+ terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295'
 
 if [[ -f "$LOGFILE" ]]; then
   blocker_lines="$(tr '\r' '\n' <"$LOGFILE" | rg -a -n "$BLOCKER_REGEX" || true)"
