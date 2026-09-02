@@ -104,6 +104,42 @@ impl KernelState {
         }
     }
 
+    /// U9-MO2 — THE release of one MemoryObject slot whose refcounts are already zero.
+    ///
+    /// Every reclaim path funnels here, so the backing-ownership rule is applied once instead
+    /// of four times. Before this existed all four sites called `free_frame(object.phys)`
+    /// unconditionally, which is correct only for allocator-owned backing:
+    ///
+    /// * `AllocatorOwned` — return the EXACT extent that was taken. The constructors allocate
+    ///   `len / PAGE_SIZE` pages contiguously, so that is what is returned. The previous
+    ///   `free_frame` returned a single page and under-freed every multi-page object.
+    /// * `Borrowed` — remove the registry slot and touch the allocator NEVER. An initramfs
+    ///   slice's phys is inside the boot initrd; handing it to the allocator would insert
+    ///   memory it never owned into the free list.
+    ///
+    /// The caller has already verified exact identity and all three zero refcounts; this
+    /// performs the release and nothing else, so the "may I?" and "do it" halves stay separate.
+    pub(crate) fn release_memory_object_slot_locked(
+        memory: &mut MemorySubsystem,
+        slot_index: usize,
+    ) {
+        let Some(object) = memory.memory_objects[slot_index] else {
+            return;
+        };
+        match object.kind.backing() {
+            crate::kernel::boot::MemoryBacking::AllocatorOwned => {
+                let pages = object.len / crate::kernel::vm::PAGE_SIZE;
+                if pages > 0 {
+                    let _ = kernel_mut(&mut memory.frame_allocator)
+                        .free_contiguous(object.phys.0, pages);
+                }
+            }
+            // Borrowed: the extent outlives this object and belongs to something else.
+            crate::kernel::boot::MemoryBacking::Borrowed => {}
+        }
+        memory.memory_objects[slot_index] = None;
+    }
+
     /// U9-D3 §6: `&mut MemorySubsystem` sibling of [`Self::reclaim_memory_object_if_unreferenced`]
     /// for use inside `SharedKernel::with_memory_split_mut` (rank 6 only). Same class gate, same
     /// all-three-refcounts-zero condition, same `free_frame` + slot clear.
@@ -132,8 +168,7 @@ impl KernelState {
         {
             return;
         }
-        let _ = kernel_mut(&mut memory.frame_allocator).free_frame(memory_object.phys.0);
-        memory.memory_objects[slot_index] = None;
+        Self::release_memory_object_slot_locked(memory, slot_index);
     }
 
     pub(crate) fn adjust_memory_object_pin_refcount(&mut self, object: CapObject, delta: i32) {
@@ -354,8 +389,7 @@ impl KernelState {
             {
                 return;
             }
-            let _ = kernel_mut(&mut memory.frame_allocator).free_frame(memory_object.phys.0);
-            memory.memory_objects[slot_index] = None;
+            Self::release_memory_object_slot_locked(memory, slot_index);
         });
     }
 
@@ -403,8 +437,7 @@ impl KernelState {
         {
             return;
         }
-        let _ = kernel_mut(&mut memory.frame_allocator).free_frame(memory_object.phys.0);
-        memory.memory_objects[slot_index] = None;
+        Self::release_memory_object_slot_locked(memory, slot_index);
     }
 
     /// U6/199C test accessor: `(cap_refcount, map_refcount, pin_refcount)` for the MemoryObject

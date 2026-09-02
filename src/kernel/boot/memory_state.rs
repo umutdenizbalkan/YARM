@@ -1010,10 +1010,34 @@ impl KernelState {
             Self::create_memory_object_slot_locked(memory, phys, len, kind, max_objects)
         })?;
 
-        let cap = self.mint_capability_for_current_context(Capability::new(
+        // U9-MO2 — TRANSACTIONAL. The mint used to be a bare `?` straight after the install,
+        // so a `CapabilityFull` cspace left the object behind with all three refcounts at zero
+        // and nothing referencing it: an orphan for the rest of the boot. It has not been
+        // observed because the mint has not been observed to fail here, but the object is the
+        // first mutation and the mint is the first thing after it that can fail.
+        //
+        // The compensation is the SAME release owner every other reclaim uses, so it obeys the
+        // backing-ownership rule: an anonymous object returns its exact extent, a borrowed
+        // initramfs slice returns nothing to the allocator. The original mint error is
+        // propagated unchanged — the caller sees exactly what it saw before, minus the orphan.
+        let cap = match self.mint_capability_for_current_context(Capability::new(
             CapObject::MemoryObject { id },
             Self::memory_object_rights_for_kind(kind),
-        ))?;
+        )) {
+            Ok(cap) => cap,
+            Err(mint_err) => {
+                self.with_memory_state_mut(|memory| {
+                    if let Some(slot) = memory
+                        .memory_objects
+                        .iter()
+                        .position(|entry| entry.is_some_and(|mem| mem.id == id))
+                    {
+                        Self::release_memory_object_slot_locked(memory, slot);
+                    }
+                });
+                return Err(mint_err);
+            }
+        };
 
         Ok((id, cap))
     }
@@ -1086,6 +1110,24 @@ impl KernelState {
         file_data_offset: usize,
         file_len: usize,
     ) -> Result<(u64, CapId), KernelError> {
+        let (phys, len_pages, kind) =
+            Self::initramfs_slice_object_geometry(initrd, file_data_offset, file_len)?;
+        self.create_memory_object_with_len_and_kind(phys, len_pages, kind)
+    }
+
+    /// U9-MO2 §4 — THE pure geometry of an initramfs file-slice object: bounds check, virtual
+    /// to physical translation, page-aligned start and rounded length, and the kind that records
+    /// the exact unrounded file extent.
+    ///
+    /// Extracted so the broad creator above and the pre-lock NR 28 route compute the SAME object
+    /// from the same inputs. It touches no kernel state and takes no lock — every input is either
+    /// an argument or the immutable boot initrd blob — which is why the split route can run it
+    /// before acquiring anything, and why a refusal from here has mutated nothing.
+    pub(crate) fn initramfs_slice_object_geometry(
+        initrd: &[u8],
+        file_data_offset: usize,
+        file_len: usize,
+    ) -> Result<(PhysAddr, usize, MemoryObjectKind), KernelError> {
         use crate::kernel::vm::PAGE_SIZE;
         if file_len == 0 {
             return Err(KernelError::Vm(VmError::Misaligned));
@@ -1097,8 +1139,7 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
         // Compute physical address: translate initrd virtual pointer → physical.
-        let initrd_virt_raw = initrd.as_ptr() as u64;
-        let initrd_phys_base = Self::normalize_initrd_phys_ptr_static(initrd_virt_raw)
+        let initrd_phys_base = Self::normalize_initrd_phys_ptr_static(initrd.as_ptr() as u64)
             .map_err(|_| KernelError::WrongObject)?;
         let file_phys_raw = initrd_phys_base
             .checked_add(file_data_offset as u64)
@@ -1108,13 +1149,15 @@ impl KernelState {
         let phys_page_start = file_phys_raw & !(page_size - 1);
         // Length: from page-aligned start through end of file data, rounded up.
         let offset_within_page = (file_phys_raw - phys_page_start) as usize;
-        let len_pages = (offset_within_page + file_len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
-
-        let kind = MemoryObjectKind::InitramfsFileSlice {
-            initrd_offset: file_data_offset as u64,
-            file_len: file_len as u64,
-        };
-        self.create_memory_object_with_len_and_kind(PhysAddr(phys_page_start), len_pages, kind)
+        let len_pages = (offset_within_page + file_len).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        Ok((
+            PhysAddr(phys_page_start),
+            len_pages,
+            MemoryObjectKind::InitramfsFileSlice {
+                initrd_offset: file_data_offset as u64,
+                file_len: file_len as u64,
+            },
+        ))
     }
 
     /// Translate an initrd virtual pointer to a physical address.
