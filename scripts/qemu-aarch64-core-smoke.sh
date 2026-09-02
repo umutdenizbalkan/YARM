@@ -531,13 +531,29 @@ u9rx4_eval_terminal() {
   replier_revoke="$(_u9_c 'IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538')"
   caller_revoke="$(_u9_c 'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2')"
 
-  local timeout_ok timeout_commit timeout_wake aliases late_ok late_refused
+  local timeout_ok timeout_commit timeout_wake aliases late_ok
+  local late_refused=0
   timeout_ok="$(_u9_cre '^IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut')"
   timeout_commit="$(_u9_c 'IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok')"
   timeout_wake="$(_u9_field '^IPC_REPLY_TIMEOUT_OK ' 'caller_wakes')"
   aliases="$(_u9_field '^IPC_REPLY_TIMEOUT_OK ' 'reply_aliases_invalid')"
   late_ok="$(_u9_field '^IPC_REPLY_TIMEOUT_OK ' 'late_reply_successes')"
-  late_refused="$(_u9_c 'IPC_REPLY_FAIL tid=3 reply_cap=65538 err=WrongObject')"
+  # A late reply is refused by ONE of TWO owners, and the evaluator must know both or it will
+  # report a refusal that happened as a refusal that did not:
+  #   * the LEGACY refusal, raised inside the broad handler after `resolve_reply_index` finds the
+  #     record no longer externally invokable -- `IPC_REPLY_FAIL ... err=WrongObject`;
+  #   * the PRE-LOCK refusal that DIRECT3-CAP-FINAL §7 added, which answers the identical typed
+  #     error at the verdict WITHOUT entering the broad dispatcher at all --
+  #     `IPCREPLY_DIRECT_REFUSED_PRE_LOCK ... err=WrongObject`.
+  # §7 moved WHERE this refusal is emitted for exactly the spent-authority case this arm is
+  # about, so counting only the legacy spelling made a timeout win look like an unrefused late
+  # reply. Both are scoped to the witnessed record and replier; neither is a wildcard.
+  local late_refused_legacy late_refused_prelock prelock_inert
+  late_refused_legacy="$(_u9_c 'IPC_REPLY_FAIL tid=3 reply_cap=65538 err=WrongObject')"
+  late_refused_prelock="$(_u9_cre "^IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=${rec} record_generation=1 replier_tid=3 .*err=WrongObject")"
+  # The pre-lock refusal must be INERT -- it is a refusal, not a partial reply.
+  prelock_inert="$(_u9_cre "^IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=${rec} record_generation=1 replier_tid=3 terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject")"
+  late_refused=$(( late_refused_legacy + late_refused_prelock ))
   : "${timeout_wake:=0}" ; : "${aliases:=0}" ; : "${late_ok:=0}"
 
   local reply_win=0 timeout_win=0
@@ -580,11 +596,15 @@ u9rx4_eval_terminal() {
     (( reply_commit == 0 ))   || { echo "[error] $tag: timeout owns the terminal, so no reply commit may exist (got ${reply_commit})"; bad=1; }
     (( reply_resolve == 0 ))  || { echo "[error] $tag: a reply succeeded after the timeout won (resolve=${reply_resolve})"; bad=1; }
     (( late_ok == 0 ))        || { echo "[error] $tag: late_reply_successes must be 0 (got ${late_ok})"; bad=1; }
-    (( late_refused >= 1 ))   || { echo "[error] $tag: a reply attempted after the timeout must be refused (refusals=${late_refused})"; bad=1; }
+    (( late_refused >= 1 ))   || { echo "[error] $tag: a reply attempted after the timeout must be refused (legacy=${late_refused_legacy} prelock=${late_refused_prelock})"; bad=1; }
+    # Whichever owner refused, the refusal must have mutated nothing. A pre-lock refusal that
+    # copied a payload, woke the caller or mutated state would be a partial reply wearing a
+    # refusal's marker, and the count above alone cannot tell those apart.
+    (( late_refused_prelock == prelock_inert )) || { echo "[error] $tag: a pre-lock refusal was not inert (refusals=${late_refused_prelock} inert=${prelock_inert})"; bad=1; }
     # The one-shot must not be half-revoked behind a timeout win: either the alias
     # invalidation owns it, or nothing does.
     (( replier_revoke == 0 )) || { echo "[error] $tag: timeout won yet the replier one-shot slot was revoked by a reply (got ${replier_revoke})"; bad=1; }
-    (( bad == 0 )) && echo "[ok] $tag: TIMEOUT won the terminal — commit=1 caller_wakes=1 aliases_invalid=1 late reply refused (${late_refused}), no reply completion"
+    (( bad == 0 )) && echo "[ok] $tag: TIMEOUT won the terminal — commit=1 caller_wakes=1 aliases_invalid=1 late reply refused (legacy=${late_refused_legacy} prelock=${late_refused_prelock}, inert), no reply completion"
   fi
 
   # Neither outcome may leak, on any path.
@@ -648,11 +668,30 @@ IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut calle
 IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok"
 _u9_expect 1 "leaked alias/record/link" "${_u9_replywin}
 IPC_REPLY_FAST_REVOKE_FAIL tid=3"
+# The late refusal has TWO owners since DIRECT3-CAP-FINAL §7. A timeout win whose late reply was
+# refused PRE-LOCK is the same valid outcome as one refused in the broad handler, and the
+# evaluator must accept it -- counting only the legacy spelling reported a refusal that HAPPENED
+# as a refusal that did NOT, which is exactly how this arm failed live.
+_u9_expect 0 "timeout-win accepted when the late reply is refused PRE-LOCK" "${_u9_arm}
+IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok
+IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok
+IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=0 record_generation=1 replier_tid=3 terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok"
+# ...but only when it is INERT. A pre-lock "refusal" that copied a payload or mutated state is a
+# partial reply wearing a refusal's marker, and the count alone cannot tell those apart.
+_u9_expect 1 "pre-lock refusal that mutated state" "${_u9_arm}
+IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok
+IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok
+IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=0 record_generation=1 replier_tid=3 terminal=Settled reply_copies=1 caller_wakes=0 mutations=1 err=WrongObject result=ok"
+# A pre-lock refusal naming a DIFFERENT record is not this scenario's refusal.
+_u9_expect 1 "pre-lock refusal on another record" "${_u9_arm}
+IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok
+IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok
+IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=7 record_generation=1 replier_tid=3 terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok"
 if (( _u9_selftest_fail )); then
   echo "[error] U9-RX4 terminal-outcome evaluator self-test FAILED"
   exit 1
 fi
-echo "[ok] U9-RX4: terminal-outcome evaluator self-test passed (2 accepted, 8 rejected)"
+echo "[ok] U9-RX4: terminal-outcome evaluator self-test passed (3 accepted, 10 rejected)"
 
 if ! u9rx4_eval_terminal "$u9rx4_log" "U9-RX4"; then
   u9rx4_fail=1
@@ -727,7 +766,16 @@ BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_CO
 # and every other WrongObject still blocks the boot. Nor is it unguarded: the U9-RX4 evaluator
 # REQUIRES this refusal on a timeout win (and requires `late_reply_successes=0` with it), so the
 # line is positively asserted where it belongs rather than merely tolerated here.
-BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=WrongObject|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295'
+# The exclusions are deliberate, benign lines the generic blocker scanner would otherwise flag
+# on their `err=` token alone. Two of them are the SAME event: a reply whose authority is already
+# spent is refused with `WrongObject`, by the legacy broad handler (`IPC_REPLY_FAIL ... `) or,
+# since DIRECT3-CAP-FINAL §7, PRE-LOCK (`IPCREPLY_DIRECT_REFUSED_PRE_LOCK ... `). The legacy
+# spelling was excused when the timeout-wins branch was first witnessed; the pre-lock spelling
+# was not, so a boot that lost the race failed here on a refusal that is the CORRECT outcome.
+# The pre-lock exclusion is the narrower of the two: it excuses only an INERT refusal
+# (`reply_copies=0 caller_wakes=0 mutations=0`). One that copied a payload, woke the caller or
+# mutated state stays a blocker, because that would be a partial reply wearing a refusal's marker.
+BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=WrongObject|IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=[0-9]+ record_generation=[0-9]+ replier_tid=[0-9]+ terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295'
 
 if [[ -f "$LOGFILE" ]]; then
   blocker_lines="$(tr '\r' '\n' <"$LOGFILE" | rg -a -n "$BLOCKER_REGEX" || true)"

@@ -9860,6 +9860,69 @@ impl SharedKernel {
         self.consume_reply_record_split(index, generation)
     }
 
+    /// U9-MO2 §4 — THE off-lock NR 28 transaction: install one initramfs-slice `MemoryObject`
+    /// and mint one capability for it, or leave the kernel exactly as it was.
+    ///
+    /// This composes the SAME owners the broad creator drives — the pure geometry rule, the
+    /// rank-6 object-slot installer, the rank-6/rank-4 mint, and the backing-aware release owner
+    /// — rather than re-deriving any of them. It is not a second object policy; it is the same
+    /// policy reached without the broad lock.
+    ///
+    /// Ordering and compensation:
+    /// 1. **Pure.** Geometry and bounds. A refusal here has touched nothing.
+    /// 2. **rank 6 — FIRST MUTATION.** The object slot.
+    /// 3. **rank 6 then rank 4.** The mint. On failure the mint has already rolled back its own
+    ///    `cap_refcount` bump, so the object is the only thing outstanding, and it is released
+    ///    through the one backing-aware owner — which, for a BORROWED initramfs slice, returns
+    ///    nothing to the frame allocator because the object never owned that extent.
+    ///
+    /// The two locks are taken in disjoint critical sections, never nested, and in rank order.
+    /// Every error is the caller's to see: nothing here converts a failure into `Ok`.
+    pub(crate) fn create_initramfs_file_slice_mo_split(
+        &self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        initrd: &[u8],
+        file_data_offset: usize,
+        file_len: usize,
+    ) -> Result<(u64, CapId), KernelError> {
+        use crate::kernel::boot::KernelState as KS;
+        use crate::kernel::capabilities::{CapObject, Capability};
+
+        // (1) Pure — no lock, no mutation. A refusal here has touched nothing.
+        let (phys, len_pages, kind) =
+            KS::initramfs_slice_object_geometry(initrd, file_data_offset, file_len)?;
+
+        // (2) rank 6 — the object slot, through the owner the broad creator also drives.
+        //     FIRST MUTATION.
+        let max_objects = self.runtime_capacity_config_split_read().max_memory_objects;
+        let id = self.with_memory_split_mut(|memory| {
+            KS::create_memory_object_slot_locked(memory, phys, len_pages, kind, max_objects)
+        })?;
+
+        // (3) rank 6 then rank 4 — the cap, with the rights rule the broad creator uses.
+        match self.mint_capability_with_memory_ref_split(
+            cnode,
+            Capability::new(
+                CapObject::MemoryObject { id },
+                KS::memory_object_rights_for_kind(kind),
+            ),
+        ) {
+            Ok(cap) => Ok((id, cap)),
+            Err(mint_err) => {
+                self.with_memory_split_mut(|memory| {
+                    if let Some(slot) = memory
+                        .memory_objects
+                        .iter()
+                        .position(|entry| entry.is_some_and(|mem| mem.id == id))
+                    {
+                        KS::release_memory_object_slot_locked(memory, slot);
+                    }
+                });
+                Err(mint_err)
+            }
+        }
+    }
+
     /// rank 3 — read the reply endpoint SLOT INDEX **and GENERATION** bound in a present,
     /// generation-matched reply record. Used by the Stage 199A2B4 NR7 gate to confine the
     /// off-lock reply path to the oracle's reply endpoint (every other reply stays on the
