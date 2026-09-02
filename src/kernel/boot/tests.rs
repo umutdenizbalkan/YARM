@@ -152048,12 +152048,23 @@ mod u9spawn1_sp3_spawn_ledger {
         img
     }
 
-    /// Everything a leak would move. Compared before and after each failing transaction.
+    /// Everything a leak would move — one column per provisional-resource class the ledger
+    /// owns, so a restored baseline is a statement about all of them and not about a total.
+    ///
+    /// | column | class |
+    /// |---|---|
+    /// | `tasks` | the task reservation, and the task/process records it carries |
+    /// | `address_spaces` | the ASID |
+    /// | `free_frames` | ELF mappings and their backing (U9-ASPACE1 made this exact) |
+    /// | `memory_objects` | MemoryObject and refcount state |
+    /// | `endpoints` | the two service endpoints |
+    /// | `spawner_caps` | installed and delegated capabilities |
     #[derive(Debug, PartialEq, Eq)]
     struct Baseline {
         tasks: usize,
         address_spaces: usize,
         free_frames: usize,
+        memory_objects: usize,
         endpoints: usize,
         spawner_caps: usize,
     }
@@ -152069,6 +152080,7 @@ mod u9spawn1_sp3_spawn_ledger {
                         .count()
                 }),
                 free_frames: s.with_memory_state(|m| m.frame_allocator.free_frames()),
+                memory_objects: s.with_memory_state(|m| m.memory_objects.iter().flatten().count()),
                 endpoints: s.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count()),
                 spawner_caps: match cnode {
                     Some(cnode) => s.with_capability_state(|cap| {
@@ -152178,76 +152190,18 @@ mod u9spawn1_sp3_spawn_ledger {
         // `spawn_image_after_claim` refuses an entry point of zero, AFTER the reservation has
         // been claimed — so this fails at the last possible moment.
         let err = run(&k, &elf, 0).expect_err("a zero entry point cannot be committed");
-        let after = baseline(&k);
         assert_eq!(
-            (
-                after.tasks,
-                after.address_spaces,
-                after.endpoints,
-                after.spawner_caps
-            ),
-            (
-                before.tasks,
-                before.address_spaces,
-                before.endpoints,
-                before.spawner_caps
-            ),
+            baseline(&k),
+            before,
             "failed commit left something behind: {err:?}"
         );
 
-        // Frames are the ONE thing that does not come back, and the reason is not the ledger.
-        // See `the_frame_the_unwind_cannot_reclaim_is_the_loaders_not_the_ledgers` below: the
-        // address-space teardown owner reclaims only MemoryObject-backed frames, so the page an
-        // ELF PT_LOAD lands in is lost whenever any address space is destroyed — spawn or not.
-        // The ledger calls the correct owner; the owner is incomplete.
-        assert_eq!(
-            before.free_frames - after.free_frames,
-            elf_load_frame_cost(),
-            "the only unrecovered frames are the loader's, and there is exactly one load here"
-        );
-    }
-
-    /// The frame the failed spawn does not get back is charged by the ELF loader and lost by the
-    /// address-space teardown owner — NOT by the compensation ledger. Proved by taking the ledger
-    /// out of the picture entirely: a bare create / load / destroy cycle, with no spawn, no
-    /// reservation, no endpoint and no transaction, loses exactly the same frame.
-    ///
-    /// The cause is that `destroy_user_address_space_by_asid` reclaims a drained mapping through
-    /// `note_mapping_removed` + `reclaim_memory_object_for_phys`, both of which are
-    /// MemoryObject-scoped. A page the loader took straight from the frame allocator has no
-    /// MemoryObject, so nothing ever returns it. Repairing that means teaching teardown which
-    /// drained frames are allocator-owned and which are borrowed — the zero-copy initramfs grants
-    /// are borrowed and freeing them would hand the boot initrd's own frames to the allocator —
-    /// which is a distinct backing-ownership repair, not a spawn compensation.
-    #[test]
-    fn the_frame_the_unwind_cannot_reclaim_is_the_loaders_not_the_ledgers() {
-        let k = fixture();
-        let elf = tiny_elf();
-        let free =
-            |k: &SharedKernel| k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()));
+        // Repetition costs nothing either, which is what distinguishes a restored baseline from
+        // a one-time capacity acquisition that happens to look like one.
         for _ in 0..3 {
-            let before = free(&k);
-            let (asid, cap) = k.with(|s| s.create_user_address_space().expect("an address space"));
-            k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("a load"));
-            k.with(|s| {
-                s.destroy_user_address_space_by_asid(asid)
-                    .expect("teardown");
-                let cnode = s.current_task_cnode().expect("spawner cspace");
-                let _ = s.revoke_capability_in_cnode(cnode, cap);
-            });
-            assert_eq!(
-                before - free(&k),
-                elf_load_frame_cost(),
-                "the cost is per address-space teardown and recurs, so it is a loader/teardown \
-                 defect rather than one-time capacity growth"
-            );
+            let _ = run(&k, &elf, 0).expect_err("the same failure again");
+            assert_eq!(baseline(&k), before, "and again, and again");
         }
-    }
-
-    /// One PT_LOAD segment of one page. Named rather than inlined so the two tests above cannot
-    /// drift, and so raising it silently is impossible.
-    const fn elf_load_frame_cost() -> usize {
-        1
     }
 
     /// Phase 2 — the address space. With the ASID pool exhausted the transaction fails holding
@@ -152482,6 +152436,387 @@ mod u9spawn1_sp3_spawn_ledger {
                 !PROCESS_SRC.contains(abandoned),
                 "{abandoned} belongs to the transaction; a handler copy is an uncompensated \
                  second acquisition"
+            );
+        }
+    }
+}
+
+/// U9-ASPACE1 §1 — address-space teardown returns the frames it drained.
+///
+/// The leak these proofs close was found by SP-3's failure injection and characterised there as
+/// "the loader's, not the ledger's". This is that repair, and the proofs work in frame
+/// IDENTITIES rather than in free counts: a count says a frame went missing, an identity says
+/// WHICH one and what it was for, which is the difference between noticing a leak and fixing it.
+#[cfg(test)]
+mod u9aspace1_teardown_frame_reclaim {
+    use super::*;
+    use crate::kernel::vm::{Asid, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const MEMORY_SRC: &str = include_str!("memory_state.rs");
+
+    fn kernel() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    fn free_frames(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()))
+    }
+
+    /// Is this exact physical frame still charged to somebody by the allocator?
+    fn tracked(k: &SharedKernel, phys: PhysAddr) -> bool {
+        k.with(|s| {
+            s.with_memory_state(|m| m.frame_allocator.frame_refcount(phys.0).unwrap_or(0) > 0)
+        })
+    }
+
+    /// Every page an address space maps, by identity: run head, physical base, page count.
+    fn mapped_frames(k: &SharedKernel, asid: Asid) -> alloc::vec::Vec<(VirtAddr, PhysAddr)> {
+        k.with(|s| {
+            s.with_user_spaces(|spaces| {
+                let mut out = alloc::vec::Vec::new();
+                let Some(space) = spaces.get(asid) else {
+                    return out;
+                };
+                for idx in 0..space.mappings() {
+                    if let Some((virt, mapping, pages)) = space.run_at(idx) {
+                        for p in 0..pages {
+                            let step = (p * crate::kernel::vm::PAGE_SIZE) as u64;
+                            out.push((VirtAddr(virt.0 + step), PhysAddr(mapping.phys.0 + step)));
+                        }
+                    }
+                }
+                out
+            })
+        })
+    }
+
+    /// A real ELF64 image with one PT_LOAD page, so the loader runs for real.
+    fn tiny_elf() -> alloc::vec::Vec<u8> {
+        super::u9spawn1_sp3_spawn_ledger::tiny_elf()
+    }
+
+    /// THE proof. The bare create → load → destroy cycle, with no spawn, no reservation and no
+    /// transaction anywhere near it, and every frame followed by identity through the cycle.
+    #[test]
+    fn one_cycle_returns_every_frame_it_took() {
+        let k = kernel();
+        let elf = tiny_elf();
+        let before_free = free_frames(&k);
+
+        let (asid, cap) = k.with(|s| s.create_user_address_space().expect("address space"));
+        k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("load"));
+
+        // Identity, not count: exactly which frames this address space holds, and the proof that
+        // the allocator agrees each one is charged to somebody.
+        let held = mapped_frames(&k, asid);
+        assert!(
+            !held.is_empty(),
+            "the loader must have installed at least one PT_LOAD page to reclaim"
+        );
+        for (virt, phys) in &held {
+            assert!(
+                tracked(&k, *phys),
+                "va 0x{:x} -> pa 0x{:x} is mapped but the allocator does not charge it to anyone",
+                virt.0,
+                phys.0
+            );
+        }
+
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(asid)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, cap);
+        });
+
+        // Each frame, by identity, must now be charged to nobody.
+        for (virt, phys) in &held {
+            assert!(
+                !tracked(&k, *phys),
+                "va 0x{:x} -> pa 0x{:x} survived teardown still charged — this is the leak",
+                virt.0,
+                phys.0
+            );
+        }
+        assert_eq!(
+            free_frames(&k),
+            before_free,
+            "and the allocator's inventory is whole again"
+        );
+        // The registry has no trace of the space either.
+        assert!(
+            k.with(|s| s.with_user_spaces(|spaces| spaces.get(asid).is_none())),
+            "the destroyed ASID must be gone from the registry"
+        );
+    }
+
+    /// Repetition is stable. This is the property the pre-repair kernel failed most visibly: the
+    /// cost recurred per teardown rather than being one-time capacity growth.
+    #[test]
+    fn repeated_cycles_are_stable() {
+        let k = kernel();
+        let elf = tiny_elf();
+        let baseline = free_frames(&k);
+        for round in 0..8 {
+            let (asid, cap) = k.with(|s| s.create_user_address_space().expect("address space"));
+            k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("load"));
+            k.with(|s| {
+                s.destroy_user_address_space_by_asid(asid)
+                    .expect("teardown");
+                let cnode = s.current_task_cnode().expect("spawner cspace");
+                let _ = s.revoke_capability_in_cnode(cnode, cap);
+            });
+            assert_eq!(
+                free_frames(&k),
+                baseline,
+                "round {round} did not return to the baseline"
+            );
+        }
+    }
+
+    /// A partial load restores the same baseline. The loader installs pages one at a time, so a
+    /// failure part-way leaves a half-populated address space; tearing that down must reclaim
+    /// exactly the pages that were installed and nothing else.
+    #[test]
+    fn a_partial_load_restores_the_same_baseline() {
+        let k = kernel();
+        let baseline = free_frames(&k);
+
+        // A well-formed header whose PT_LOAD claims file bytes past the end of the image: the
+        // loader accepts the program header, then refuses on bounds.
+        let mut truncated = tiny_elf();
+        let ph = 64;
+        truncated[ph + 32..ph + 40].copy_from_slice(&0xFFFF_0000u64.to_le_bytes()); // p_filesz
+        truncated[ph + 40..ph + 48].copy_from_slice(&0xFFFF_0000u64.to_le_bytes()); // p_memsz
+
+        let (asid, cap) = k.with(|s| s.create_user_address_space().expect("address space"));
+        let outcome = k.with(|s| s.load_elf_pt_load_segments(asid, &truncated));
+        assert!(outcome.is_err(), "a truncated segment must not load");
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(asid)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, cap);
+        });
+        assert_eq!(
+            free_frames(&k),
+            baseline,
+            "a failed load must leave the allocator exactly as it found it"
+        );
+    }
+
+    /// A live address space keeps every frame it owns. The sweep must never reach across to a
+    /// space that is still alive — this is the regression the repair would cause if the
+    /// reachability question were asked wrongly.
+    #[test]
+    fn a_live_address_space_retains_every_frame_it_owns() {
+        let k = kernel();
+        let elf = tiny_elf();
+        let (survivor, survivor_cap) = k.with(|s| s.create_user_address_space().expect("survivor"));
+        k.with(|s| s.load_elf_pt_load_segments(survivor, &elf).expect("load"));
+        let survivor_frames = mapped_frames(&k, survivor);
+        assert!(!survivor_frames.is_empty());
+
+        // Build and destroy a second space beside it.
+        let (doomed, doomed_cap) = k.with(|s| s.create_user_address_space().expect("doomed"));
+        k.with(|s| s.load_elf_pt_load_segments(doomed, &elf).expect("load"));
+        let doomed_frames = mapped_frames(&k, doomed);
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(doomed)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, doomed_cap);
+        });
+
+        for (virt, phys) in &survivor_frames {
+            assert!(
+                tracked(&k, *phys),
+                "the survivor's va 0x{:x} -> pa 0x{:x} was released by another space's teardown",
+                virt.0,
+                phys.0
+            );
+        }
+        // The two spaces held DIFFERENT frames, so the survivor's retention is not a coincidence
+        // of aliasing.
+        for (_, doomed_phys) in &doomed_frames {
+            assert!(
+                !survivor_frames.iter().any(|(_, p)| p == doomed_phys),
+                "the fixture needs the two spaces to hold disjoint frames"
+            );
+        }
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(survivor)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, survivor_cap);
+        });
+        for (_, phys) in &survivor_frames {
+            assert!(!tracked(&k, *phys), "and it releases them when it dies");
+        }
+    }
+
+    /// A frame two live spaces both map is released by the SECOND teardown, not the first. This
+    /// is the COW / shared-region / aliased-grant case, built directly so it does not depend on
+    /// whether any production path currently aliases.
+    #[test]
+    fn an_aliased_frame_is_released_only_by_the_last_space_to_drop_it() {
+        use crate::kernel::vm::{CachePolicy, Mapping, PageFlags};
+        let k = kernel();
+        let elf = tiny_elf();
+        let (first, first_cap) = k.with(|s| s.create_user_address_space().expect("first"));
+        k.with(|s| s.load_elf_pt_load_segments(first, &elf).expect("load"));
+        let shared = mapped_frames(&k, first)[0].1;
+
+        let (second, second_cap) = k.with(|s| s.create_user_address_space().expect("second"));
+        k.with(|s| {
+            s.map_user_page_in_asid_raw(
+                second,
+                VirtAddr(0x0080_0000),
+                Mapping {
+                    phys: shared,
+                    flags: PageFlags {
+                        read: true,
+                        write: false,
+                        execute: false,
+                        user: true,
+                        cache_policy: CachePolicy::WriteBack,
+                    },
+                },
+            )
+            .expect("alias the same frame into a second space");
+        });
+
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(first)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, first_cap);
+        });
+        assert!(
+            tracked(&k, shared),
+            "pa 0x{:x} is still mapped by a live space and must not be released",
+            shared.0
+        );
+
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(second)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, second_cap);
+        });
+        assert!(
+            !tracked(&k, shared),
+            "and the last space to drop it releases it"
+        );
+    }
+
+    /// Tearing down an ASID that is already gone changes nothing.
+    #[test]
+    fn repeated_teardown_is_inert() {
+        let k = kernel();
+        let elf = tiny_elf();
+        let (asid, cap) = k.with(|s| s.create_user_address_space().expect("address space"));
+        k.with(|s| s.load_elf_pt_load_segments(asid, &elf).expect("load"));
+        k.with(|s| {
+            s.destroy_user_address_space_by_asid(asid)
+                .expect("teardown");
+            let cnode = s.current_task_cnode().expect("spawner cspace");
+            let _ = s.revoke_capability_in_cnode(cnode, cap);
+        });
+        let settled = free_frames(&k);
+        for _ in 0..3 {
+            assert!(
+                k.with(|s| s.destroy_user_address_space_by_asid(asid))
+                    .is_err(),
+                "a destroyed ASID must be refused, not re-drained"
+            );
+            assert_eq!(free_frames(&k), settled, "and nothing may move");
+        }
+    }
+
+    /// The release is one owner inside the teardown owner, and it asks its four questions of
+    /// existing authorities rather than keeping a count of its own.
+    #[test]
+    fn the_release_is_gated_on_existing_authorities() {
+        let body = MEMORY_SRC
+            .split("fn release_unreferenced_user_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("the release owner");
+        for authority in ["memory_objects", "any_mapping_for_phys", "free_frame"] {
+            assert!(
+                body.contains(authority),
+                "the release must consult {authority} before returning a frame"
+            );
+        }
+        // The process-global range registries are NOT the authority here. They are never reset,
+        // so in a test binary that builds many kernels one kernel's ranges would answer another
+        // kernel's question — and in production they add nothing, because reserved ranges are
+        // sanitized out of the allocator before it is seeded and the PT pool is disjoint.
+        for wrong_authority in ["is_pa_reserved", "is_pa_in_pt_pool"] {
+            assert!(
+                !body.contains(wrong_authority),
+                "the release must ask the owning allocator, not the global {wrong_authority} \
+                 registry, whether a frame is user backing"
+            );
+        }
+        // And the invariant that makes the allocator sufficient must stay true.
+        const BOOTSTRAP_SRC: &str = include_str!("bootstrap_state.rs");
+        assert!(
+            BOOTSTRAP_SRC.contains("Self::apply_reserved_ranges(boot_regions, reserved_ranges)"),
+            "reserved ranges must still be sanitized out of the regions the allocator is seeded \
+             from, or the allocator stops being the authority on what is user backing"
+        );
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            assert!(
+                !src.contains(".reserve_frame("),
+                "{rel} tracks a frame the allocator never issued; the release's third condition \
+                 assumes nothing does"
+            );
+        }
+        // It is reached from the teardown owner's drain loop, and from nowhere else.
+        assert_eq!(
+            MEMORY_SRC
+                .matches("self.release_unreferenced_user_frame(phys)")
+                .count(),
+            1,
+            "exactly one call site, inside the teardown owner"
+        );
+        // And it never invents a physical address or edits a count.
+        assert!(
+            !body.contains("free_frames") && !body.contains("total_frames"),
+            "the release must not compensate by adjusting an allocator counter"
+        );
+    }
+
+    /// All three architectures reach the repaired owner through the same call, so none of them
+    /// carries a teardown of its own.
+    #[test]
+    fn every_architecture_uses_the_repaired_owner() {
+        let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            if rel == "src/kernel/boot/memory_state.rs" {
+                continue; // the definition
+            }
+            if src.contains("destroy_user_address_space_by_asid(") {
+                callers.push(rel);
+            }
+        }
+        callers.sort();
+        assert!(
+            !callers.is_empty(),
+            "the teardown owner must have production callers"
+        );
+        // No architecture may drain an address space by hand.
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            if rel == "src/kernel/vm.rs" || rel == "src/kernel/boot/memory_state.rs" {
+                continue;
+            }
+            assert!(
+                !src.contains("destroy_and_collect_mappings("),
+                "{rel} drains an address space without going through the teardown owner, so it \
+                 would miss the frame release"
             );
         }
     }
