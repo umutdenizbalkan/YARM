@@ -56,6 +56,8 @@ mod orchestrator_state;
 mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
+/// U9-SPAWN1 SP-2: THE thread-incarnation lifecycle — allocate, register, undo.
+mod spawn_thread_core;
 pub(crate) mod shared_region_txn;
 mod task_core_state;
 mod task_policy_state;

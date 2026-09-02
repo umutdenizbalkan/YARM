@@ -118311,7 +118311,10 @@ mod stage199d_wa2a_ownership_boundary {
             ("src/kernel/boot/ipc_state.rs", 9),
             ("src/kernel/boot/restart_state.rs", 4),
             ("src/kernel/boot/scheduler_state.rs", 1),
-            ("src/kernel/boot/thread_state.rs", 4),
+            // U9-SPAWN1 SP-2: `spawn_user_thread`'s Runnable write moved to the shared
+            // thread-incarnation owner, so thread_state.rs falls 4 -> 3 and the owner gains 1.
+            ("src/kernel/boot/spawn_thread_core.rs", 1),
+            ("src/kernel/boot/thread_state.rs", 3),
             ("src/kernel/spawn_reservation.rs", 2),
             ("src/kernel/task.rs", 2),
             ("src/kernel/task_transition.rs", 1),
@@ -118393,8 +118396,6 @@ mod stage199d_wa2a_ownership_boundary {
                 "&mut t.status",
                 "mem::replace(&mut tcb.status",
                 "mem::swap(&mut tcb.status",
-                "tcbs[idx] = None",
-                "tcbs[i] = None",
             ] {
                 assert!(
                     !src.contains(forbidden),
@@ -118402,17 +118403,64 @@ mod stage199d_wa2a_ownership_boundary {
                 );
             }
         }
-        // The single write into the TCB array only fills a slot proven vacant.
-        let policy = std::fs::read_to_string(
+        // U9-SPAWN1 SP-2: "no production path removes a TCB from the array" was previously
+        // asserted by forbidding three IDENTIFIER SPELLINGS of the write (`tcbs[idx] = None`,
+        // `tcbs[i] = None`). That is not the operation — `spawn_reservation::clear_reservation_slot`
+        // has always written `tcbs[index] = None` and passed. The closure argument is restated
+        // here as what it actually is: clearing a TCB slot has exactly ONE owner, and its callers
+        // are enumerated.
+        for (rel, src) in production_sources() {
+            for (at, _) in src.match_indices("] = None;") {
+                let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let line = &src[line_start..at];
+                if !line.trim_start().starts_with("tcbs[") {
+                    continue;
+                }
+                assert_eq!(
+                    rel, "src/kernel/spawn_reservation.rs",
+                    "clearing a TCB slot has one owner; {rel} must delegate to it"
+                );
+            }
+        }
+        let reservation = std::fs::read_to_string(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/kernel/boot/task_policy_state.rs"),
+                .join("src/kernel/spawn_reservation.rs"),
         )
         .expect("read");
-        let at = policy
+        assert_eq!(
+            reservation.matches("tcbs[index] = None;").count(),
+            1,
+            "and that owner clears exactly one slot, in one place"
+        );
+        // Its callers, enumerated. Each removes a task that CANNOT be Blocked: a reservation has
+        // never been runnable, and a failed thread spawn has never reached a run queue.
+        let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for (rel, src) in production_sources() {
+            if src.contains("clear_reservation_slot(") && rel != "src/kernel/spawn_reservation.rs" {
+                callers.push(rel);
+            }
+        }
+        callers.sort();
+        assert_eq!(
+            callers,
+            alloc::vec![
+                alloc::string::String::from("src/kernel/boot/spawn_thread_core.rs"),
+                alloc::string::String::from("src/kernel/boot/task_policy_state.rs"),
+            ],
+            "the slot-clearing owner's callers must stay enumerated"
+        );
+
+        // The single write INTO the TCB array only fills a slot proven vacant.
+        let core = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/kernel/boot/spawn_thread_core.rs"),
+        )
+        .expect("read");
+        let at = core
             .find("tcbs[idx] = Some(tcb);")
             .expect("the only slot write");
         assert!(
-            policy[..at].contains("position(|slot| slot.is_none())"),
+            core[..at].contains(".position(Option::is_none)"),
             "the only TCB-array write targets a vacant slot, so it can never displace a blocked \
              receiver"
         );
@@ -118624,6 +118672,7 @@ mod stage199d_wa2b_wake_owner_census {
     const FAULT: &str = include_str!("fault_state.rs");
     const THREAD: &str = include_str!("thread_state.rs");
     const POLICY: &str = include_str!("task_policy_state.rs");
+    const SPAWN_CORE: &str = include_str!("spawn_thread_core.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
@@ -118818,9 +118867,14 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Cannot,
         ),
+        // U9-SPAWN1 SP-2: `spawn_user_thread`'s status write moved into the shared
+        // thread-incarnation owner, so the site is enumerated at its new home. The verdict is
+        // unchanged and for the same reason: the TCB it writes sits at a slot index that was
+        // EMPTY when registration claimed it, so it can never be some other task's — least of
+        // all a Blocked one's.
         (
-            "src/kernel/boot/thread_state.rs",
-            "spawn_user_thread",
+            "src/kernel/boot/spawn_thread_core.rs",
+            "initialize_thread_incarnation_locked",
             1,
             Verdict::Cannot,
         ),
@@ -119279,6 +119333,14 @@ mod stage199d_wa2b_wake_owner_census {
             "Ok(CrossCpuWakeApplyResult::Applied)",
         ),
         (
+            "src/kernel/boot/spawn_thread_core.rs",
+            "initialize_thread_incarnation_locked",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "};",
+            "Ok(())",
+        ),
+        (
             "src/kernel/boot/thread_state.rs",
             "join_thread",
             "joiner.status",
@@ -119293,14 +119355,6 @@ mod stage199d_wa2b_wake_owner_census {
             "TaskStatus::Runnable",
             "}",
             "if wake_count < wake_tids.len() {",
-        ),
-        (
-            "src/kernel/boot/thread_state.rs",
-            "spawn_user_thread",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            "};",
-            "Ok::<_, KernelError>(())",
         ),
         (
             "src/kernel/boot/thread_state.rs",
@@ -119997,11 +120051,13 @@ mod stage199d_wa2b_wake_owner_census {
                 "for tcb in tcbs.iter_mut().flatten() {",
             ),
             (
-                "thread_state.rs",
-                "spawn_user_thread",
-                "let tid = self.allocate_thread_id()?;",
-                // the signature takes a PARENT tid, never the tid being written
-                "pub fn spawn_user_thread(",
+                "spawn_thread_core.rs",
+                "initialize_thread_incarnation_locked",
+                // it writes ONLY the slot index registration handed it...
+                ".get_mut(idx)",
+                // ...and registration only ever claims a slot that was EMPTY, so the index can
+                // never name a live task, let alone a Blocked one.
+                ".position(Option::is_none)",
             ),
             (
                 "thread_state.rs",
@@ -120054,6 +120110,7 @@ mod stage199d_wa2b_wake_owner_census {
             let src = match *file {
                 "exec_state.rs" => EXEC,
                 "thread_state.rs" => THREAD,
+                "spawn_thread_core.rs" => SPAWN_CORE,
                 "runtime.rs" => RUNTIME,
                 other => panic!("unknown census source {other}"),
             };
@@ -120073,10 +120130,16 @@ mod stage199d_wa2b_wake_owner_census {
 
         // The two spawn CANNOTs additionally depend on the allocator never handing back a live
         // TID. If that stopped being fail-closed, both would become CAN.
+        // U9-SPAWN1 SP-2: the allocation rule moved into the shared owner, so the fail-closed
+        // property is asserted where it now lives. It is the same property, stated the same way:
+        // a candidate is returned only when NO live TCB holds it, and the bounded probe ends in
+        // `TaskTableFull` rather than in a wrap-around that could hand back a live TID.
         assert!(
-            POLICY.contains("if self.task_status(candidate).is_none() {")
-                && POLICY.contains("Err(KernelError::TaskTableFull)"),
-            "allocate_thread_id must only return an unused TID, and fail closed otherwise"
+            SPAWN_CORE
+                .contains("let taken = tcbs.iter().flatten().any(|tcb| tcb.tid.0 == candidate);")
+                && SPAWN_CORE.contains("if !taken {")
+                && SPAWN_CORE.contains("Err(KernelError::TaskTableFull)"),
+            "the TID allocator must only return an unused TID, and fail closed otherwise"
         );
         // Neither spawn function accepts the TID it writes.
         assert!(
