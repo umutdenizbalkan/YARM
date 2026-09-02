@@ -1436,26 +1436,15 @@ impl SharedKernel {
             let requeued = if !restorable {
                 true
             } else {
-                // `enqueue_on_cpu`'s task-domain policy, in one nested rank-2 acquisition.
+                // `enqueue_on_cpu`'s task-domain policy, in one nested rank-2 acquisition,
+                // through THE shared planner (U9-SPAWN1 SP-1) rather than a transcription.
                 let priority: Option<TaskPriority> =
                     self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
-                        let idx = tcbs
-                            .iter()
-                            .position(|slot| slot.as_ref().is_some_and(|t| t.tid.0 == tid))?;
-                        if tcbs[idx].as_ref().is_some_and(|t| t.is_spawn_reservation()) {
-                            crate::yarm_log!(
-                                "ENQUEUE_REFUSED tid={} reason=spawn_reservation_not_live",
-                                tid
-                            );
-                            return None;
-                        }
-                        if tid == 0 {
-                            return Some(TaskPriority::Normal);
-                        }
-                        Some(match classes[idx]? {
-                            TaskClass::SystemServer => TaskPriority::High,
-                            TaskClass::Driver | TaskClass::App => TaskPriority::Normal,
-                        })
+                        crate::kernel::task_enqueue::plan_pinned_enqueue_locked(
+                            tcbs, classes, tid, cpu,
+                        )
+                        .ok()
+                        .map(|plan| plan.priority)
                     });
                 match priority {
                     None => false,
@@ -2222,7 +2211,7 @@ impl SharedKernel {
     /// caller was the x86_64 AP enqueue→dispatch transaction; U3's class-neutral blocked-waiter
     /// completion transaction is reached on every architecture, so the gate is gone. Nothing
     /// about the seam itself was x86-specific — the projector it wraps never carried a gate.
-    fn with_task_enqueue_policy_split_mut<R>(
+    pub(crate) fn with_task_enqueue_policy_split_mut<R>(
         &self,
         f: impl FnOnce(
             &mut [Option<crate::kernel::task::ThreadControlBlock>],
@@ -2242,6 +2231,30 @@ impl SharedKernel {
             kernel_mut(tcbs).as_mut_slice(),
             kernel_mut(classes).as_mut_slice(),
         )
+    }
+
+    /// U9-SPAWN1 SP-1 — THE off-lock task enqueue: plan under rank 2, RELEASE rank 2, commit
+    /// under rank 1.
+    ///
+    /// This is the split twin of `KernelState::enqueue_task` and shares its entire policy with
+    /// it through [`crate::kernel::task_enqueue`] — reservation refusal, driver-affinity pin,
+    /// class→priority, affinity read, and the `SmpScheduler` primitives that own queue selection
+    /// and the duplicate-enqueue refusal.
+    ///
+    /// The two guards never overlap: the plan is a plain `Copy` value carrying no borrow of task
+    /// storage, so the rank-2 guard is dropped before the rank-1 guard is taken. Rank 1 is
+    /// strictly the last lock this transition acquires, which is what lets a caller treat the
+    /// enqueue as the commit point of a longer transaction.
+    pub(crate) fn enqueue_task_split(&self, cpu: CpuId, tid: u64) -> Result<CpuId, KernelError> {
+        let plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+            crate::kernel::task_enqueue::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)
+        })?;
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::task_enqueue::commit_enqueue_locked(
+                kernel_mut(&mut sched.scheduler),
+                &plan,
+            )
+        })
     }
 
     /// Stage 108: task/TCB (rank 2) split-mut seam.
@@ -3661,17 +3674,20 @@ impl SharedKernel {
             // release runs after this section drops, never nested inside it.
             let retire = tcb.reply_timeout_token.take();
             let affinity = tcb.cpu_affinity;
-            let reserved = tcb.is_spawn_reservation();
+            // U9-SPAWN1 SP-1: the refusal comes from THE owner, evaluated here under rank 2
+            // like every other caller's. It is unreachable on this path — a `Reserved` TCB is
+            // not `Blocked|Runnable|Running`, so the status gate above has already returned —
+            // but sourcing it here is what keeps the rule single-owner rather than transcribed.
+            let reserved =
+                crate::kernel::task_enqueue::refuse_reservation_locked(tcbs, tid.0).is_err();
             // `task_priority`: TID 0 is the idle/supervisor sentinel and is Normal WITHOUT a
             // class lookup; every other TID needs a class, and a missing one is `TaskMissing`.
             let priority = if tid.0 == 0 {
                 TaskPriority::Normal
             } else {
-                match classes[idx] {
-                    Some(TaskClass::SystemServer) => TaskPriority::High,
-                    Some(TaskClass::Driver) | Some(TaskClass::App) => TaskPriority::Normal,
-                    None => return Err(KernelError::TaskMissing),
-                }
+                crate::kernel::task_enqueue::priority_for_class(
+                    classes[idx].ok_or(KernelError::TaskMissing)?,
+                )
             };
             Ok((
                 WakeState {
@@ -3716,10 +3732,7 @@ impl SharedKernel {
             // `enqueue_on_cpu`'s refusals, in its order: spawn reservation first, then the queue
             // primitive's own mapped error.
             if state.reserved {
-                crate::yarm_log!(
-                    "ENQUEUE_REFUSED tid={} reason=spawn_reservation_not_live",
-                    tid.0
-                );
+                // The owner already logged the refusal when it was evaluated under rank 2.
                 return Err(KernelError::WrongObject);
             }
             // First-user CPU pinning: TID 1 must only ever be placed on the bootstrap CPU.
@@ -4040,32 +4053,10 @@ impl SharedKernel {
             // `task_priority`: TID 0 is the idle/supervisor sentinel and is Normal WITHOUT a
             // TCB lookup; every other TID needs a class, and a missing class is `TaskMissing`.
             // `refuse_enqueue_of_spawn_reservation`: a reservation is not a live task.
-            let policy_result: Result<TaskPriority, KernelError> =
-                self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
-                    let slot = tcbs.iter().position(|slot| {
-                        slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid)
-                    });
-                    if let Some(idx) = slot
-                        && tcbs[idx]
-                            .as_ref()
-                            .is_some_and(|tcb| tcb.is_spawn_reservation())
-                    {
-                        crate::yarm_log!(
-                            "ENQUEUE_REFUSED tid={} reason=spawn_reservation_not_live",
-                            tid
-                        );
-                        return Err(KernelError::WrongObject);
-                    }
-                    if tid == 0 {
-                        return Ok(TaskPriority::Normal);
-                    }
-                    let class = slot
-                        .and_then(|idx| classes[idx])
-                        .ok_or(KernelError::TaskMissing)?;
-                    Ok(match class {
-                        TaskClass::SystemServer => TaskPriority::High,
-                        TaskClass::Driver | TaskClass::App => TaskPriority::Normal,
-                    })
+            let policy_result: Result<TaskPriority, KernelError> = self
+                .with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                    crate::kernel::task_enqueue::plan_pinned_enqueue_locked(tcbs, classes, tid, cpu)
+                        .map(|plan| plan.priority)
                 });
 
             // (5) The scheduler primitives, under the rank-1 guard already held. The enqueue
@@ -8234,30 +8225,28 @@ impl SharedKernel {
             }
             n
         });
-        // 2. Enqueue each woken task, mirroring `enqueue_task` (driver-affinity pin +
-        //    class priority + the SAME SmpScheduler enqueue).
-        for &(tid, mut affinity) in woken.iter().take(count) {
-            let class = self.task_class_split_read(tid);
-            let priority = match class {
-                Some(TaskClass::SystemServer) => TaskPriority::High,
-                _ => TaskPriority::Normal,
+        // 2. Enqueue each woken task through THE shared owner (U9-SPAWN1 SP-1).
+        //
+        //    This was a fourth hand-written transcription of `enqueue_task`'s policy, and it had
+        //    already drifted: it omitted `refuse_enqueue_of_spawn_reservation` entirely and
+        //    silently defaulted a class-less task to `Normal` instead of refusing it. Both
+        //    divergences are unreachable here — the wake scan only finds tasks BLOCKED on a
+        //    futex, and a `Reserved` TCB has never been runnable, let alone blocked — so
+        //    delegating changes no live behaviour while ending the drift.
+        //
+        //    Rank 2 is taken and RELEASED per task, then rank 1 is taken to commit: rank 1 is
+        //    strictly last, and the two guards never overlap.
+        for &(tid, _prior_affinity) in woken.iter().take(count) {
+            let Ok(plan) = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                crate::kernel::task_enqueue::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)
+            }) else {
+                continue;
             };
-            if class == Some(TaskClass::Driver) && affinity.is_none() {
-                self.with_task_tcbs_split_mut(|tcbs| {
-                    if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
-                        if tcb.cpu_affinity.is_none() {
-                            tcb.cpu_affinity = Some(cpu);
-                        }
-                        affinity = tcb.cpu_affinity;
-                    }
-                });
-            }
             self.with_scheduler_split_mut(|sched| {
-                let sm = kernel_mut(&mut sched.scheduler);
-                let _ = match affinity {
-                    Some(c) => sm.enqueue_on_with_priority(c, ThreadId(tid), priority),
-                    None => sm.enqueue_balanced(ThreadId(tid), priority).map(|_| ()),
-                };
+                let _ = crate::kernel::task_enqueue::commit_enqueue_locked(
+                    kernel_mut(&mut sched.scheduler),
+                    &plan,
+                );
             });
         }
         count as u32
@@ -10245,8 +10234,10 @@ impl SharedKernel {
         // Phase 2 (rank 1): enqueue on the pinned CPU, else the current CPU (mirrors
         // `enqueue_woken_task`). Priority is class-derived (SystemServer=High else Normal).
         let priority = match self.task_class_split_read(tid) {
-            Some(TaskClass::SystemServer) => TaskPriority::High,
-            _ => TaskPriority::Normal,
+            Some(class) => crate::kernel::task_enqueue::priority_for_class(class),
+            // A woken task is already known live, so an absent class is Normal here rather than
+            // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
+            None => TaskPriority::Normal,
         };
         self.with_scheduler_split_mut(|sched| {
             let cpu = affinity.unwrap_or(sched.current_cpu);
@@ -10578,8 +10569,10 @@ impl SharedKernel {
         use crate::kernel::scheduler::TaskPriority;
         use crate::kernel::task::TaskClass;
         let priority = match self.task_class_split_read(tid) {
-            Some(TaskClass::SystemServer) => TaskPriority::High,
-            _ => TaskPriority::Normal,
+            Some(class) => crate::kernel::task_enqueue::priority_for_class(class),
+            // A woken task is already known live, so an absent class is Normal here rather than
+            // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
+            None => TaskPriority::Normal,
         };
         self.enqueue_committed_receiver_inner(tid, priority, affinity, false)
     }
@@ -10604,8 +10597,10 @@ impl SharedKernel {
         use crate::kernel::scheduler::TaskPriority;
         use crate::kernel::task::TaskClass;
         let priority = match self.task_class_split_read(tid) {
-            Some(TaskClass::SystemServer) => TaskPriority::High,
-            _ => TaskPriority::Normal,
+            Some(class) => crate::kernel::task_enqueue::priority_for_class(class),
+            // A woken task is already known live, so an absent class is Normal here rather than
+            // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
+            None => TaskPriority::Normal,
         };
         self.enqueue_committed_receiver_inner(tid, priority, affinity, true)
     }
@@ -11552,8 +11547,10 @@ impl SharedKernel {
         use crate::kernel::scheduler::TaskPriority;
         use crate::kernel::task::TaskClass;
         let priority = match self.task_class_split_read(tid) {
-            Some(TaskClass::SystemServer) => TaskPriority::High,
-            _ => TaskPriority::Normal,
+            Some(class) => crate::kernel::task_enqueue::priority_for_class(class),
+            // A woken task is already known live, so an absent class is Normal here rather than
+            // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
+            None => TaskPriority::Normal,
         };
         let affinity = self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()

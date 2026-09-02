@@ -1897,6 +1897,27 @@ impl KernelState {
         f(kernel_mut(&mut self.tcbs))
     }
 
+    /// U9-SPAWN1 SP-1 — the BROAD twin of `SharedKernel::with_task_enqueue_policy_split_mut`:
+    /// the TCB array and the task-class table under ONE acquisition of the task lock.
+    ///
+    /// `task_classes` lives in the task domain alongside `tcbs` — `KernelState::task_class`
+    /// reads it from inside `with_tcbs`, i.e. already under this lock — so exposing both here
+    /// adds no new sharing. The class table is copied out (it is `Copy` and slot-indexed
+    /// identically to `tcbs`) purely so the two disjoint fields can be handed to one closure.
+    pub(crate) fn with_task_enqueue_policy_mut<R>(
+        &mut self,
+        f: impl FnOnce(
+            &mut [Option<ThreadControlBlock>; MAX_TASKS],
+            &[Option<TaskClass>; MAX_TASKS],
+        ) -> R,
+    ) -> R {
+        // Lock-order domain: task
+        Self::debug_lock_order_note("task");
+        let _task_guard = self.task_state_lock.lock();
+        let classes = *kernel_ref(&self.task_classes);
+        f(kernel_mut(&mut self.tcbs), &classes)
+    }
+
     pub(crate) fn with_memory_state<R>(&self, f: impl FnOnce(&MemorySubsystem) -> R) -> R {
         // Lock-order domain: memory
         Self::debug_lock_order_note("memory");

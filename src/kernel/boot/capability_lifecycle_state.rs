@@ -1168,56 +1168,51 @@ impl crate::runtime::SharedKernel {
     /// `refuse_enqueue_of_spawn_reservation`, since a spawn reservation is `TaskStatus::Reserved`
     /// and can never be `Blocked(_)`.
     ///
-    /// Placement mirrors `KernelState::enqueue_task` in full, INCLUDING `ensure_driver_affinity`:
+    /// Placement mirrors `KernelState::enqueue_task` in full, INCLUDING the driver-affinity pin:
     /// an unpinned `Driver`-class task is pinned to the current CPU before placement, so it is
     /// enqueued on that CPU rather than balanced. The existing `enqueue_reply_timeout_wake_split`
     /// seam is deliberately NOT reused here — it mirrors only the pinned/balanced placement and
     /// omits that pin, which for a driver parked on an IRQ notification is a real difference in
     /// where the woken task lands.
+    ///
+    /// U9-SPAWN1 SP-1: "mirrors `enqueue_task` in full" is now literal rather than aspirational —
+    /// the placement decision comes from the shared planner and the queue mutation from the
+    /// shared committer, so this can no longer drift from the broad path it claims to mirror.
+    /// The Blocked-only status transition stays in the SAME rank-2 acquisition as the plan,
+    /// which is what the broad path had under its single guard.
     fn wake_destroyed_notification_waiter_split(
         &self,
         waiter_tid: crate::kernel::ipc::ThreadId,
     ) -> bool {
-        use crate::kernel::ipc::ThreadId;
-        use crate::kernel::scheduler::TaskPriority;
-        use crate::kernel::task::{TaskClass, TaskStatus};
+        use crate::kernel::task::TaskStatus;
         let tid = waiter_tid.0;
-        // Phase 1 (rank 1): the CPU `ensure_driver_affinity` would pin to, read and released
-        // before the task domain is entered.
+        // Phase 1 (rank 1): the CPU the driver pin would use, read and released before the task
+        // domain is entered.
         let current_cpu = self.with_scheduler_split_mut(|sched| sched.current_cpu);
-        let class = self.task_class_split_read(tid);
-        // Phase 2 (rank 2): the Blocked-only transition, the driver-affinity pin, and the
-        // resulting placement affinity — one acquisition, as the broad path had under its guard.
-        let plan = self.with_task_tcbs_split_mut(|tcbs| {
+        // Phase 2 (rank 2): the Blocked-only transition and the placement plan, one acquisition.
+        let plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
             let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
             if !matches!(tcb.status, TaskStatus::Blocked(_)) {
                 return None;
             }
             tcb.status = TaskStatus::Runnable;
-            if tid != 0 && class == Some(TaskClass::Driver) && tcb.cpu_affinity.is_none() {
-                tcb.cpu_affinity = Some(current_cpu);
-            }
-            Some(tcb.cpu_affinity)
+            crate::kernel::task_enqueue::plan_balanced_enqueue_locked(
+                tcbs,
+                classes,
+                tid,
+                current_cpu,
+            )
+            .ok()
         });
-        let Some(affinity) = plan else {
+        let Some(plan) = plan else {
             return false;
         };
-        // Phase 3 (rank 1): the same class-derived priority and pinned/balanced placement
-        // `enqueue_task` performs.
-        let priority = match class {
-            Some(TaskClass::SystemServer) => TaskPriority::High,
-            _ => TaskPriority::Normal,
-        };
+        // Phase 3 (rank 1): the shared committer.
         self.with_scheduler_split_mut(|sched| {
-            let s = kernel_mut(&mut sched.scheduler);
-            match affinity {
-                Some(cpu) => {
-                    let _ = s.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
-                }
-                None => {
-                    let _ = s.enqueue_balanced(ThreadId(tid), priority);
-                }
-            }
+            let _ = crate::kernel::task_enqueue::commit_enqueue_locked(
+                kernel_mut(&mut sched.scheduler),
+                &plan,
+            );
         });
         true
     }
