@@ -2221,6 +2221,21 @@ fn try_split_dispatch_nonswitching_into_frame(
         crate::yarm_log!("YARM_SPLIT_DISPATCH_ENTER nr={}", raw_nr);
     }
 
+    // U9-ASPACE1 §2: a RETIRED number is answered here, not by the broad dispatcher.
+    //
+    // An undecodable number normally falls through to the terminal broad acquisition, which
+    // decodes it a second time under the whole kernel and returns the same error this returns.
+    // For a number that USED to be a syscall that is worse than pointless: retiring a class
+    // would hand every caller still naming it a broad-lock acquisition, so the retirement would
+    // add terminal broad work rather than remove it. The answer is knowable with no lock at all
+    // — the number is on a fixed table — so it is given here, and it is exactly the error the
+    // broad path would have produced.
+    if let Some(reason) = crate::kernel::syscall::retired_syscall_number(raw_nr) {
+        crate::yarm_log!("SYSCALL_RETIRED_REFUSED nr={} reason={}", raw_nr, reason);
+        return Some(Err(TrapHandleError::Syscall(
+            crate::kernel::syscall::SyscallError::InvalidNumber,
+        )));
+    }
     // Default-deny by syscall number first (cheap, no lock).
     let Ok(syscall) = Syscall::decode(raw_nr) else {
         if probe {

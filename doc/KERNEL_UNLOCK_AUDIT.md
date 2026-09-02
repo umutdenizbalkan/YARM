@@ -6892,3 +6892,124 @@ Six of NR 23's seven steps have no rank-local owner today:
 Building the remainder is a subsystem, not a slice, so no NR 23 route was written: nothing was left
 half-built, and no broad fallback after a reservation was introduced. NR 16, NR 23, NR 26, NR 29,
 Fork and ExitCurrentTask all remain broad.
+
+## U9-ASPACE1 — the teardown frame leak, and a dead syscall number
+
+Base `origin/main = 8b4e1b2`. Census `2 / 0 / 2` before and after. U9 remains OPEN.
+
+### §1 — the exact leak, and its owning inverse
+
+SP-3's failure injection recorded a frame that never came back and characterised it as "the
+loader's, not the ledger's". This is that repair, and the diagnosis was done in frame IDENTITIES
+rather than free counts — a count says a frame went missing, an identity says which one and what
+it was for.
+
+**The leak.** `destroy_user_address_space_by_asid` reclaimed each drained page through
+`note_mapping_removed` and `reclaim_memory_object_for_phys`. Both are MemoryObject-scoped: they
+find the object whose `phys` matches and act on its refcount. A page no MemoryObject described was
+reclaimed by nothing. That is the ordinary case: `alloc_user_data_frame` takes a bare frame from
+the allocator and registers no object, so every ELF `PT_LOAD` page has this shape. One frame lost
+per such page, per address-space teardown, for the life of the boot.
+
+**Classified.** Mapped ELF/user backing. Not page-table backing — the PT pool is a separate
+allocator seeded from a disjoint slice, and `alloc_user_data_frame` panics if the main allocator
+ever returns a PT-pool page. Not address-space metadata — the ASID slot was already freed
+correctly. Not capability/refcount state — SP-3 gave the address-space capability an owner.
+
+**The inverse.** `release_unreferenced_user_frame`, called once per drained page from inside the
+teardown owner, after the MemoryObject reclaim has had its say. Three conditions, each asked of an
+authority that already existed:
+
+| condition | authority | why |
+|---|---|---|
+| no MemoryObject describes the frame | `memory_objects` | otherwise the frame is the MemoryObject lifecycle's to release, and a still-referenced object keeps its page |
+| no live address space still maps it | `AddressSpaceManager::any_mapping_for_phys` | COW children, shared regions and aliased grants map one frame from several spaces; the dying space is already out of the registry, so this answers about everyone else, and the last to drop it frees it |
+| the allocator issued it | `PhysicalFrameAllocator::free_frame` | it refuses any frame it has no tracking slot for, and `AlreadyFree` means "not mine" |
+
+`any_mapping_for_phys` had zero callers before this — written for exactly this question and never
+asked, the same pattern as `cancel_spawn_reservation` and `retain_frame`.
+
+**Why the third condition is exact.** `Bootstrap::init_state_into` sanitizes every reserved range
+out of the boot regions BEFORE seeding the allocator, and seeds the page-table pool from a strictly
+disjoint slice. `reserve_frame` — the one way to track a frame the allocator did not issue — has no
+production caller. So the main allocator's inventory is by construction nothing but user-data
+frames it handed out, and a borrowed initramfs page is not in it and never was.
+
+**What was tried and rejected.** `is_pa_reserved` / `is_pa_in_pt_pool` look like the obvious guard.
+They read process-global registries that are never reset, so in a test binary that builds many
+kernels one kernel's ranges answer another kernel's question — the first draft passed alone and
+failed in the full suite for exactly that reason. In production they add nothing over the third
+condition. A guard now pins both halves: the release must not consult them, and the
+sanitize-before-seed invariant that makes the allocator sufficient must hold.
+
+**Proofs.** One cycle returns every frame it took, by identity. Eight repeated cycles stay at the
+baseline. A partial load restores it. A live address space keeps every frame it owns while a
+neighbour is destroyed, and the two hold provably disjoint frames. An aliased frame is released by
+the SECOND space to drop it, not the first. Repeated teardown is refused and moves nothing.
+
+**SP-3 requalified.** Its baseline gained a MemoryObject column, so all six provisional-resource
+classes are compared: reservation and task/process records, ASID, ELF mappings and backing,
+MemoryObject/refcount state, endpoints, and installed/delegated capabilities. The frame carve-out
+is gone and the failed-commit arm asserts full baseline equality, three attempts running.
+
+### §2 — NR 24 retained, NR 26 retired
+
+| | production caller | live dispatches | verdict |
+|---|---|---|---|
+| NR 24 `SpawnProcessFromUserBuf` | `pm_vfs_spawn_inline`, as the fallback when the NR 29 grant path returns `Unsupported` | 0 in the default boot (the grant path succeeds) | **RETAINED** — a live error-recovery path is a dependency whether or not the happy path exercises it |
+| NR 26 `SpawnFromInitramfsFile` | none; the wrapper `spawn_from_initramfs_file` was never called | 0 on every architecture | **REMOVED** |
+
+The search covered kernel decode and dispatch, the userspace runtime wrapper, every production
+caller, raw numeric `raw_syscall(26, ..)`, shipped userspace sources, scripts, tests, docs and the
+ABI contract. Every binary in the initramfs is a cargo build product of this workspace — the
+staging script copies compiler output and there are no prebuilt blobs — so the source search is
+exhaustive, and the live boots confirm it: `KSPAWN_FROM_CPIO` is 0 everywhere.
+
+**The one claimed dependency was false.** `doc/SYSCALL_ABI.md` and `doc/PROCESS_AND_SPAWN.md` both
+said PM used NR 26 "for image IDs >= 4 through `pm_vfs_spawn_inline`". That function calls NR 24.
+The docs described a design that had already moved, and both are corrected.
+
+**The number stays reserved.** `RETIRED_SYSCALL_NUMBERS` lists 26 and 27, which corrects an earlier
+note calling NR 27 "reusable by a future syscall". A numeric ABI cannot tell a caller that a number
+changed meaning: anything still naming a retired number would silently receive a new and unrelated
+operation instead of an error. One table entry against a wrong call that looks like a success.
+
+**Refused before the broad dispatcher.** An undecodable number normally falls through to the
+terminal broad acquisition, which decodes it again under the whole kernel to produce the same
+error. For a retired number that is worse than pointless — the retirement would ADD terminal broad
+work for every caller still naming it. The answer is a fixed-table lookup needing no lock, so the
+split dispatcher gives it: `SYSCALL_RETIRED_REFUSED`, then `InvalidNumber`, terminally, pre-lock.
+This fixes NR 27's behaviour too. Census is unchanged — this removes broad work, it does not add a
+route.
+
+**What moved rather than died.** NR 26's handler carried the Stage 175 `SPAWN_LIFECYCLE_*`
+request-side markers, and NR 26 was the only caller that set the transaction's `lifecycle_markers`
+flag, so retiring it would have made the whole default-off diagnostic dead code. It instruments a
+SPAWN, not a syscall number, and NR 23 performs the same four steps, so the markers moved there.
+
+### §3 — the AArch64 depth question, closed
+
+| | NR 23 | NR 29 enter / ok | `PM_ELF_ZC_DONE` | ramfs | ext4 | panics |
+|---|---|---|---|---|---|---|
+| x86_64  | 3 | 5 / 5 | 5 | 1 | 2 | 0 |
+| AArch64 | 3 | 5 / 5 | 5 | 1 | 2 | 0 |
+| RISC-V  | 3 | 5 / 5 | 5 | 1 | 2 | 0 |
+
+Three fresh runs each, identical every time. **AArch64 witnesses NR 29 and is no longer shallower**;
+there is no remaining missing service transition to name. The shallowness was the NR 28 writeback
+defect, and repairing it restored the whole chain — no workload was manufactured and nothing was
+routed to obtain this.
+
+The artifact integrity gate earned its keep here. The first build after §2 failed on all three
+architectures because `RETIRED_SYSCALL_NUMBERS` embedded the removed class names as runtime
+strings, and the gate greps a fresh kernel for exactly those names as staleness evidence.
+Weakening it would have disabled it permanently for the classes it exists to catch, so the strings
+moved into comments and the gate learned the newly retired name instead.
+
+### The next missing owner for a live process-spawn route
+
+Unchanged by this work, and still the blocker SP-4 stopped at: **a process spawn creates a NEW
+process CNode, and no rank-4 owner can do that off the broad lock.**
+`ensure_cnode_space_with_slots` and `set_process_cnode_for_pid` have no split variant and no
+presence in `src/runtime.rs`. NR 11 is routed precisely because a thread joins its parent's
+EXISTING CNode and declines before mutating when it is absent; NR 23 always creates one.

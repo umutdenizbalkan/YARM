@@ -5,9 +5,10 @@
 //!
 //! # The defect this repairs
 //!
-//! All four image-loading spawn handlers — `SpawnProcess` (NR 23), `SpawnProcessFromUserBuf`
-//! (NR 24), `SpawnFromInitramfsFile` (NR 26) and `SpawnFromMemoryObject` (NR 29) — acquired the
-//! same resources in the same order and returned through a bare `?` at each step:
+//! Every image-loading spawn handler — `SpawnProcess` (NR 23), `SpawnProcessFromUserBuf`
+//! (NR 24) and `SpawnFromMemoryObject` (NR 29), plus the NR 26 handler that U9-ASPACE1 §2 later
+//! retired — acquired the same resources in the same order and returned through a bare `?` at
+//! each step:
 //!
 //! ```text
 //!   allocate_thread_id → create_user_address_space → load ELF → create_endpoint ×2

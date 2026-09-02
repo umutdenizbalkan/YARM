@@ -339,10 +339,87 @@ impl KernelState {
                 let phys = PhysAddr(dm.mapping.phys.0 + (page as u64 * PAGE_SIZE as u64));
                 self.note_mapping_removed(phys);
                 self.reclaim_memory_object_for_phys(phys);
+                // U9-ASPACE1: and the frames no MemoryObject ever described.
+                self.release_unreferenced_user_frame(phys);
             }
         }
 
         Ok(())
+    }
+
+    /// U9-ASPACE1 — return a drained user frame to the allocator once nothing can reach it.
+    ///
+    /// # The leak this closes
+    ///
+    /// Address-space teardown reclaimed a drained page through [`Self::note_mapping_removed`] and
+    /// [`Self::reclaim_memory_object_for_phys`], and both are MemoryObject-scoped: they find the
+    /// object whose `phys` matches and act on its refcount. A page that no MemoryObject ever
+    /// described was therefore never reclaimed by anything.
+    ///
+    /// That is not an exotic case — it is the ordinary one. `alloc_user_data_frame` takes a bare
+    /// frame from the allocator and registers no object, so every ELF `PT_LOAD` page an image
+    /// loads is exactly this shape. Each address space destroyed lost one frame per such page,
+    /// for the life of the boot, whether the space died from a task exiting or from a spawn
+    /// failing.
+    ///
+    /// # Why it is safe to free here
+    ///
+    /// Four independent conditions have to hold, and each is checked against an owner that
+    /// already exists rather than against a count this function maintains:
+    ///
+    /// 1. **No MemoryObject describes the frame.** If one does, the frame belongs to the
+    ///    MemoryObject lifecycle, which has just had its say one line above. A still-referenced
+    ///    object keeps its page; that decision is its refcount's to make, not this teardown's.
+    /// 2. **No live address space still maps it.** A COW child, a shared region and an aliased
+    ///    zero-copy grant all map a frame from more than one space. The dying space has already
+    ///    been taken out of the registry by `destroy_and_collect_mappings`, so
+    ///    [`AddressSpaceManager::any_mapping_for_phys`] answers about everyone *else*: whoever
+    ///    drops the last mapping is the one that frees it.
+    /// 3. **The allocator handed it out in the first place.** This is the condition that makes
+    ///    the other kinds of physical memory safe, and it is exact rather than approximate.
+    ///    `Bootstrap::init_state_into` sanitizes every reserved range out of the boot regions
+    ///    BEFORE the allocator is seeded, and seeds the page-table pool from a strictly disjoint
+    ///    slice, so the main allocator's inventory is by construction nothing but user-data
+    ///    frames it issued: a borrowed initramfs page, a reserved range and a PT-pool page are
+    ///    not in it and never were. `reserve_frame`, which would be the one way to track a frame
+    ///    the allocator did not issue, has no production caller. `free_frame` refuses any frame
+    ///    it has no tracking slot for, so those pages are declined rather than freed, and
+    ///    `AlreadyFree` here means "not mine" — a correct outcome, not an error.
+    ///
+    /// Deliberately NOT consulted: `is_pa_reserved` and `is_pa_in_pt_pool`. They look like the
+    /// obvious guard and they are the wrong authority — they read process-global registries that
+    /// are never reset, so in a test binary that builds many kernels one kernel's ranges answer
+    /// another kernel's question. Condition 3 asks the allocator that actually owns the frame.
+    ///
+    /// Condition 3 also makes repetition inert: a second teardown naming the same page finds it
+    /// untracked and declines. And because `free_frame` decrements a shared frame's refcount
+    /// rather than releasing it outright, a frame that some future path retains stays safe even
+    /// before condition 2 could see it.
+    fn release_unreferenced_user_frame(&mut self, phys: PhysAddr) {
+        let described_by_memory_object = self.with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .any(|object| object.phys == phys)
+        });
+        if described_by_memory_object {
+            return;
+        }
+        if self.with_user_spaces(|spaces| spaces.any_mapping_for_phys(phys)) {
+            return;
+        }
+        let released = self.with_memory_state_mut(|memory| {
+            kernel_mut(&mut memory.frame_allocator)
+                .free_frame(phys.0)
+                .is_ok()
+        });
+        if released {
+            crate::yarm_log!(
+                "ASPACE_FRAME_RELEASED phys=0x{:x} owner=user_backing",
+                phys.0
+            );
+        }
     }
 
     pub(crate) fn clone_user_address_space_cow(

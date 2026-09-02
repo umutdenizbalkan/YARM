@@ -71,6 +71,10 @@ common_verify_kernel_markers() {
     # The shared-region ENQUEUE class is forbidden in EVERY build (never enabled).
     "class=IpcSendSharedRegionEnqueue"
     "InitramfsReadChunk"
+    # U9-ASPACE1 §2 retired NR 26. A freshly built kernel must not contain its class name or its
+    # handler; a hit means the artifact predates the retirement.
+    "SpawnFromInitramfsFile"
+    "handle_spawn_from_initramfs_file"
   )
   # Stage 198E3C1/198E3C2B: the shared-region DIRECT retirement literal is permitted ONLY in an
   # explicitly armed live-oracle build (the smoke runner sets YARM_SHARED_REGION_DIRECT_ORACLE_BUILD=1

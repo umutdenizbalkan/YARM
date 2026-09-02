@@ -60,14 +60,21 @@ must remain frozen.**
 | 12 | `sbin/ext4_srv` | `pm_vfs_spawn_inline` |
 | ≥13 | (future) | `pm_vfs_spawn_inline` |
 
-`image_ids >= 4` use `SpawnFromInitramfsFile` (syscall `nr=26`) via
+`image_ids >= 4` use `SpawnProcessFromUserBuf` (syscall `nr=24`) via
 `pm_vfs_spawn_inline`. `image_ids 1..=3` use the direct kernel spawn
 backend. `image_id = 0` is rejected by PM — it is never spawned from
 userspace.
 
-`SpawnFromInitramfsFile` is a **privileged kernel-extension slot**, not
+`SpawnProcessFromUserBuf` is a **privileged kernel-extension slot**, not
 part of the public user syscall count/range. See `doc/SYSCALL_ABI.md` for
 the public ABI vs. kernel dispatch-table split.
+
+`SpawnFromInitramfsFile` (`nr=26`) was a second such slot. U9-ASPACE1 §2
+retired it: its userspace wrapper had no caller anywhere in the workspace,
+no boot ever dispatched it, and the earlier claim in this file and in
+`doc/SYSCALL_ABI.md` that `pm_vfs_spawn_inline` used it was simply wrong —
+that function calls `nr=24`. The number stays unassigned and is **not**
+reusable; invoking it returns `InvalidNumber` pre-lock.
 
 Image IDs 7–12 are **frozen** (see `doc/KERNEL_UNLOCKING.md` §3).
 
@@ -183,7 +190,7 @@ that service.
 init_server ──PROC_OP_SPAWN_V5_CAP──► PM
     │
     ├─ pm_vfs_spawn_inline(image_id, parent_pid=0, startup_args)
-    │   └─ SpawnFromInitramfsFile syscall → (tid, caller_cap, spawner_cap)
+    │   └─ SpawnProcessFromUserBuf syscall → (tid, caller_cap, spawner_cap)
     │       spawner_cap = PM's send cap to new service
     │       caller_cap  = init's send cap to new service
     │
@@ -198,7 +205,7 @@ init_server ──PROC_OP_SPAWN_V5_CAP──► PM
 init_server ──PROC_OP_SPAWN_V5_CAP──► PM
     │
     ├─ pm_vfs_spawn_inline(image_id, parent_pid, startup_args)
-    │   └─ SpawnFromInitramfsFile syscall
+    │   └─ SpawnProcessFromUserBuf syscall
     │       spawner_cap may be 0 (kernel delegates to parent)
     │       caller_cap = send cap to new service
     │
