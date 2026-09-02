@@ -12813,3 +12813,71 @@ are red at `5680287` and remain red. RISC-V server-death is byte-identical to ba
 failure set changed once the service chain began working, surfacing forbidden wrong-identity and
 wrong-generation markers in the server-death path. That is outside this owner set and needs its own
 increment — see `doc/KERNEL_UNLOCK_AUDIT.md`.
+
+---
+
+## DIRECT3-CAP-FINAL — capability-bearing direct replies, and NR6/NR7 on all three architectures
+
+Production NR7 no longer reaches the broad dispatcher on any architecture.
+
+### The ledger, three consecutive clean runs per architecture
+
+| | total NR7 | blocked plain | blocked cap-bearing | queued | broad/legacy | refused pre-lock |
+|---|---|---|---|---|---|---|
+| x86_64  | 54 | 42 | 10 | 2 | **0** | 0 |
+| AArch64 | 54 | 42 | 10 | 2 | **0** | 0 |
+| RISC-V  | 54 | 41 | 10 | 2 | **0** | 1 |
+
+`settled=10 restored=0 CapabilityFull=0 link failures=0 terminal losses=0 panic=0` on every run.
+RISC-V's boot deterministically loses one reply to its own reply deadline; that reply is refused
+pre-lock rather than entering the broad dispatcher to be refused there (see the residual matrix).
+
+### The capability lane
+
+The ten cap-bearing replies are one class: MemoryObject initramfs file-slice grants relayed
+`tid 3 → VFS backend → initramfs server`, every one delivered through the `ordinary_cap`
+materialization class to a committed-blocked caller. Rights verified at both relay hops
+(`dst_rights=5 expected_rights=5 rights_ok=1`), object identity `match=1`. No DmaRegion,
+shared-region or pin path is exercised, and none is claimed live.
+
+The lane composes existing owners only — the transfer-envelope stash, the blocked-waiter
+ordinary-cap producer and executor, the materialize/rollback seams, and the reply's own terminal,
+authority, record and reverse-link owners. The full producer preference chain is retained so a
+future class lands correctly rather than silently.
+
+**Materialization cannot happen under the syscall, so the reply does not settle there.**
+`ReplyTerminalContinuation` carries the exact reply-record identity, the `TerminalOwner` the
+syscall won and deliberately did not settle, the one-shot authority identities and both
+incarnations through `DispatchPostWork`. The executor then orders:
+
+```
+materialize → payload + meta copy
+  ├─ failure → roll the minted cap fully back, then restore RETRYABLE reply ownership:
+  │            terminal released at the SAME epoch, record back to Available, one-shot unspent
+  └─ success → consume the record (THE one-shot barrier) → reclaim the reply authority
+               → commit the terminal → close the reverse link → release the slot
+               → complete and wake exactly once
+```
+
+Nothing is consumed, revoked, committed or released before the last step that may still require a
+retry, and there is no broad fallback after any consuming step.
+
+### Residual terminal-dispatch matrix (source-recomputed)
+
+| edge | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| NR6 production terminal edges | 0 | 0 | 0 |
+| NR7 production terminal edges | 0 | 0 | 0 |
+| NR7 deterministic refusal (spent authority) | pre-lock | pre-lock | pre-lock |
+| broad-lock census (`with_cpu / with_broad / TOTAL`) | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+The census is unchanged at **2 / 0 / 2**. Both terminal acquisitions still exist, so **U9 remains
+OPEN**: this increment empties the NR6/NR7 population that reached them, it does not delete them.
+
+### Known red, unchanged and not weakened
+
+The x86_64 reply-timeout retirement profile is red at `a3aa7cb` and remains red. Its first failure —
+`oracle-identity ARMED count != 1 (got 0) for caller_tid=1` — reproduces identically at base; the
+oracle never arms its identity cell, so it creates no reply-wins race. Four of base's five failures
+are now fixed and the seal moved `timeout_wins=0 → 1`, with `reply_wins=0` unchanged. The oracle is
+neither weakened, conditionalized nor deleted.
