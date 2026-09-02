@@ -60,14 +60,22 @@ must remain frozen.**
 | 12 | `sbin/ext4_srv` | `pm_vfs_spawn_inline` |
 | ≥13 | (future) | `pm_vfs_spawn_inline` |
 
-`image_ids >= 4` use `SpawnProcessFromUserBuf` (syscall `nr=24`) via
-`pm_vfs_spawn_inline`. `image_ids 1..=3` use the direct kernel spawn
+`image_ids >= 4` are spawned through the mandatory MemoryObject zero-copy
+grant (`CreateInitramfsFileSliceMo` `nr=28` + `SpawnFromMemoryObject` `nr=29`)
+via `pm_vfs_spawn_inline`. `image_ids 1..=3` use the direct kernel spawn
 backend. `image_id = 0` is rejected by PM — it is never spawned from
 userspace.
 
-`SpawnProcessFromUserBuf` is a **privileged kernel-extension slot**, not
-part of the public user syscall count/range. See `doc/SYSCALL_ABI.md` for
+`SpawnFromMemoryObject` (`nr=29`) is a **privileged kernel-extension slot**,
+not part of the public user syscall count/range. See `doc/SYSCALL_ABI.md` for
 the public ABI vs. kernel dispatch-table split.
+
+`SpawnProcessFromUserBuf` (`nr=24`) was another. U9-SPAWN2 §1 retired it: its
+last caller was a carve-out that routed the restart test's image 13 around the
+grant path because the kernel image path table had no entry for it. The table
+now has one, so image 13 takes the same mandatory route as every other gated
+image and nothing issues `nr=24`. The number stays unassigned and is **not**
+reusable.
 
 `SpawnFromInitramfsFile` (`nr=26`) was a second such slot. U9-ASPACE1 §2
 retired it: its userspace wrapper had no caller anywhere in the workspace,
@@ -190,7 +198,7 @@ that service.
 init_server ──PROC_OP_SPAWN_V5_CAP──► PM
     │
     ├─ pm_vfs_spawn_inline(image_id, parent_pid=0, startup_args)
-    │   └─ SpawnProcessFromUserBuf syscall → (tid, caller_cap, spawner_cap)
+    │   └─ SpawnFromMemoryObject syscall → (tid, caller_cap, spawner_cap)
     │       spawner_cap = PM's send cap to new service
     │       caller_cap  = init's send cap to new service
     │
@@ -205,7 +213,7 @@ init_server ──PROC_OP_SPAWN_V5_CAP──► PM
 init_server ──PROC_OP_SPAWN_V5_CAP──► PM
     │
     ├─ pm_vfs_spawn_inline(image_id, parent_pid, startup_args)
-    │   └─ SpawnProcessFromUserBuf syscall
+    │   └─ SpawnFromMemoryObject syscall
     │       spawner_cap may be 0 (kernel delegates to parent)
     │       caller_cap = send cap to new service
     │

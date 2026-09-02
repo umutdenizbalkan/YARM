@@ -651,7 +651,7 @@ collector, and does **not** flow through the shared reply-timeout drain.
       scheduler wait/run-queue state (and `FutexWait` blocks), needing a scheduler
       split-mut + wake-order proof.
     - *Global-lock-only, DANGEROUS (untouched):* `VmMap`, `VmAnonMap`, `Fork`,
-      `SpawnThread`, `SpawnProcess`/`SpawnProcessFromUserBuf`/
+      `SpawnThread`, `SpawnProcess`/
       `SpawnFromMemoryObject`, `ReapFaultedTask`, `TransferRelease`, `RecvSharedV3`,
       `IpcSend`/`IpcCall`/`IpcReply` (broad), `IpcRecvTimeout`, `InitramfsReadChunk`,
       `CreateInitramfsFileSliceMo`.
@@ -5773,7 +5773,7 @@ Classification key:
 | 14 | VmBrk | B+C | task (rank 2) read, memory (rank 6) mut | Two sequential domains; plan-first feasible. Deferred Stage 5B. |
 | 15 | DebugLog | E | scheduler (tid read), user memory | User memory copy required; keep globally locked. |
 | 23 | SpawnProcess | D | task, scheduler, memory, vm, capability, ipc | Six domains; keep globally locked. |
-| 24 | SpawnProcessFromUserBuf | D+E | all domains + user memory copy | Keep globally locked. |
+| 24 | *(retired U9-SPAWN2 §1)* | — | — | Refused pre-lock; reaches no dispatcher. |
 | 26 | *(retired U9-ASPACE1 §2)* | — | — | Refused pre-lock; reaches no dispatcher. |
 | 27 | InitramfsReadChunk | E | memory (chunk bounds), user memory | User memory copy; keep globally locked. |
 | 28 | CreateInitramfsFileSliceMo | D+G | memory, capability, task | Cap mint + memory. Keep globally locked. |
@@ -9723,7 +9723,7 @@ See §41.8. Stage 23 accepted, audit-only, no production code changed,
 
 **Before.** `src/kernel/syscall.rs` defined the ELF staging buffer as a raw
 `static mut VFS_ELF_STAGING: [u8; 128 * 1024]`. Two handlers
-(`handle_spawn_process_from_user_buf`)
+(`handle_spawn_from_memory_object`)
 obtained a `&mut` to it via `&raw mut` + `unsafe { &mut * }`. The exclusivity
 invariant ("only PM calls this, serialised") lived **only in a comment** — there
 was no machine-checked guard against two overlapping `&mut` references, which is
@@ -9754,7 +9754,7 @@ unsafe impl<const N: usize> Sync for TakeOnceStagingBuffer<N> {}
 note).** The Stage 24 design sketch suggested "no Drop release; the buffer stays
 claimed after use." That cannot be used here: **both** spawn handlers share this
 one buffer and the system spawns many processes over its lifetime (PM calls
-`SpawnProcessFromUserBuf` once per process). A permanently-claimed buffer would
+the byte-copy spawn once per process, before U9-SPAWN2 §1 retired it). A permanently-claimed buffer would
 make every spawn after the first fail. The real soundness invariant is **mutual
 exclusion per call**, not "used exactly once ever". `StagingBufferClaim`
 therefore **releases the claim on `Drop`** (a `Release` store), so the next spawn

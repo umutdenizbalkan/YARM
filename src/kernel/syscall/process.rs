@@ -210,20 +210,6 @@ pub(super) fn handle_spawn_process(
     Ok(())
 }
 
-/// Kernel-side staging buffer for ELF images supplied via SpawnProcessFromUserBuf.
-///
-/// A proper per-call allocation would require a kernel heap; the static buffer
-/// avoids that dependency at the cost of exclusivity.  Rather than rely on an
-/// out-of-band "single caller" comment guarding a `static mut`, the buffer is
-/// wrapped in [`TakeOnceStagingBuffer`], which encodes exclusive access in the
-/// type system: the only way to obtain a mutable view is via `try_take`, which
-/// uses an atomic claim flag.  The claim is released when the returned
-/// [`StagingBufferClaim`] guard is dropped, so the buffer can be reused by the
-/// next spawn syscall (PM issues one spawn at a time, and a syscall handler runs
-/// to completion before the next is dispatched).  If a claim is somehow already
-/// outstanding the handler returns a stable error instead of aliasing the buffer.
-static VFS_ELF_STAGING: TakeOnceStagingBuffer<{ 128 * 1024 }> = TakeOnceStagingBuffer::new();
-
 /// A statically-allocated byte buffer that hands out at most one outstanding
 /// mutable claim at a time.
 ///
@@ -233,6 +219,13 @@ static VFS_ELF_STAGING: TakeOnceStagingBuffer<{ 128 * 1024 }> = TakeOnceStagingB
 /// guard resets the flag, allowing reuse on the next call.  This replaces a raw
 /// `static mut` and the `static_mut_refs` lint exposure with a type whose only
 /// safe access path is exclusive by construction.
+///
+/// U9-SPAWN2 §1: no production instance remains. Its only two were the ELF staging buffers for
+/// the byte-copy spawn syscalls NR 24 and NR 26, both retired once the MemoryObject zero-copy
+/// grant became the sole image-load route — a 128 KB static buffer the kernel no longer needs.
+/// The type is kept because it is a general primitive with its own exclusive-claim tests in
+/// `syscall.rs`, not because anything is expected to reuse it.
+#[allow(dead_code)]
 pub(super) struct TakeOnceStagingBuffer<const N: usize> {
     claimed: core::sync::atomic::AtomicBool,
     data: core::cell::UnsafeCell<[u8; N]>,
@@ -286,61 +279,6 @@ impl<'a, const N: usize> Drop for StagingBufferClaim<'a, N> {
     }
 }
 
-pub(super) fn handle_spawn_process_from_user_buf(
-    kernel: &mut KernelState,
-    frame: &mut TrapFrame,
-) -> Result<(), SyscallError> {
-    let image_id = frame.arg(0) as u64;
-    let elf_user_ptr = frame.arg(1);
-    let elf_len = frame.arg(2);
-    let parent_pid = frame.arg(3) as u64;
-    let startup_args_ptr = frame.arg(4);
-    let startup_args_count = frame.arg(5);
-    crate::yarm_log!(
-        "KSPAWN_ENTER image_id={} parent_pid={} args_count={}",
-        image_id,
-        parent_pid,
-        startup_args_count
-    );
-    if elf_len == 0 || elf_len > 128 * 1024 || elf_user_ptr == 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    validate_user_region(elf_user_ptr as u64, elf_len as u64)?;
-    // Exclusive, type-checked access to the shared ELF staging buffer; the claim
-    // is released when `staging_claim` drops at end of handler.
-    let mut staging_claim = VFS_ELF_STAGING.try_take().ok_or(SyscallError::Internal)?;
-    let staging = staging_claim.as_mut_slice();
-    kernel
-        .copy_from_current_user_into_slice(elf_user_ptr, elf_len, staging)
-        .map_err(SyscallError::from)?;
-    let elf_bytes = &staging[..elf_len];
-    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
-    crate::yarm_log!("KSPAWN_PATH path={}", image_path);
-    let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
-    crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
-    let (startup_args, extra_send_caps) =
-        normalized_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    let committed = spawn_image_txn::run_image_spawn_transaction(
-        kernel,
-        spawn_image_txn::SpawnImageRequest {
-            image_id,
-            image_path,
-            source: spawn_image_txn::SpawnImageSource::PtLoadSegments {
-                elf: elf_bytes,
-                entry: elf.entry as usize,
-            },
-            class: TaskClass::SystemServer,
-            parent_pid,
-            startup_args,
-            extra_send_caps,
-            map_initrd_window: false,
-            lifecycle_markers: false,
-        },
-    )?;
-    frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
-    Ok(())
-}
-
 fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
     match image_id {
         0 => Some("init"),
@@ -359,6 +297,16 @@ fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
         10 => Some("sbin/fat_srv"),
         11 => Some("sbin/ramfs_srv"),
         12 => Some("sbin/ext4_srv"),
+        // U9-SPAWN2 §1: the supervisor restart test's crash_test_srv. Its absence here was the
+        // ONLY reason PM carved image 13 out of the mandatory zero-copy grant path and sent it
+        // down the NR 24 byte-copy fallback — the runtime diagnostic said so literally. With the
+        // entry present, image 13 spawns exactly like every other gated image and the fallback
+        // has nothing left to justify it.
+        //
+        // This does not make image 13 spawnable on an ordinary boot: `crash_test_srv` is staged
+        // into the initramfs only when the restart test is enabled, so without it the CPIO
+        // lookup fails and the spawn is refused with the same error as any unknown image.
+        13 => Some("sbin/crash_test_srv"),
         _ => None,
     }
 }

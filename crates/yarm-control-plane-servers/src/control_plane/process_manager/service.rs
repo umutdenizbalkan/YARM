@@ -30,7 +30,6 @@ use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::Message;
 
-const PM_VFS_READ_APPEND_TRACE: bool = false;
 use yarm_user_rt::process::{
     ProcessError as ProcessManagerError, ProcessId, ProcessManagerOps, WaitResult,
 };
@@ -219,8 +218,6 @@ const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6;
 const SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
 const PM_RESTART_MAX_IN_PROGRESS: usize = 4;
 const CRASH_TEST_SRV_IMAGE_ID: u64 = 13;
-#[cfg(not(test))]
-const CRASH_TEST_KERNEL_SPAWN_POLICY_IMAGE_ID: u64 = 12;
 const CRASH_TEST_SRV_PATH: &[u8] = b"/initramfs/sbin/crash_test_srv";
 #[allow(dead_code)]
 const CRASH_TEST_SRV_NAME: &[u8] = b"crash_test_srv";
@@ -236,24 +233,6 @@ fn supervisor_restart_test_build_gate_enabled() -> bool {
 
 fn crash_test_restart_token_for_tid(tid: u64) -> u64 {
     PM_CRASH_TEST_RESTART_TOKEN_TAG | (tid & 0xffff)
-}
-
-#[cfg(not(test))]
-fn kernel_spawn_policy_image_id_for_vfs_spawn(
-    image_id: u64,
-    supervisor_restart_test_enabled: bool,
-) -> Result<u64, ProcessManagerError> {
-    if image_id == CRASH_TEST_SRV_IMAGE_ID {
-        if supervisor_restart_test_enabled {
-            yarm_user_rt::user_log!(
-                "PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=1 reason=restart-test-gate"
-            );
-            return Ok(CRASH_TEST_KERNEL_SPAWN_POLICY_IMAGE_ID);
-        }
-        yarm_user_rt::user_log!("PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=0 reason=gate-off");
-        return Err(ProcessManagerError::Unsupported);
-    }
-    Ok(image_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3027,23 +3006,12 @@ unsafe fn pm_vfs_spawn_inline(
         vfs_send_cap,
         reply_recv_cap
     );
-    // For image_id 7-9: try Phase 3A (MemoryObject cap grant) first, then fall
-    // back to Phase 2B (transfer-buffer bulk read) only on Unsupported.
-    // For image_id 4-6: fall through to the existing inline 112-byte path.
-    let crash_test_vfs_image =
-        supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID;
-    if crash_test_vfs_image {
-        yarm_user_rt::user_log!("PM_SPAWN_FROM_MO_ENTER image_id=13");
-        yarm_user_rt::user_log!(
-            "PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=1 reason=restart-test-gate"
-        );
-        yarm_user_rt::user_log!(
-            "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id=13 site=policy err=kernel-path-table-lacks-image13 fallback=user_buf"
-        );
-    }
-    if !crash_test_vfs_image
-        && pm_image_cpio_name_for_gate(image_id, supervisor_restart_test_enabled).is_some()
-    {
+    // U9-SPAWN2 §1: the MemoryObject zero-copy grant is the ONLY spawn route from here. Image 13
+    // (the restart test's `crash_test_srv`) used to be carved out of it and sent down a byte-copy
+    // fallback, for one reason its own diagnostic stated: the kernel's image path table had no
+    // entry for it. The table now has one, so the carve-out has nothing left to justify it and
+    // image 13 takes the same mandatory path as every other gated image.
+    if pm_image_cpio_name_for_gate(image_id, supervisor_restart_test_enabled).is_some() {
         // Phase 3A attempt: VFS_OP_FILE_GRANT_RO → SpawnFromMemoryObject.
         let phase3a_result = unsafe {
             pm_try_grant_ro_and_spawn(
@@ -3083,111 +3051,27 @@ unsafe fn pm_vfs_spawn_inline(
         }
     }
 
-    // Non-gated images (4-6 are kernel direct-initrd loaded and never reach here; image 13 is
-    // the crash-restart test) use the inline VFS read path. Gated late services (7-12) always
-    // return above via the mandatory zero-copy grant.
-    let image = unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, path_label) }?;
-    let first4 = [
-        image.first().copied().unwrap_or(0),
-        image.get(1).copied().unwrap_or(0),
-        image.get(2).copied().unwrap_or(0),
-        image.get(3).copied().unwrap_or(0),
-    ];
+    // U9-SPAWN2 §1: everything that is not grant-eligible stops here with ONE typed error.
+    //
+    // What used to follow was a byte-copy fallback: read the whole image through VFS into a user
+    // buffer and hand it to `SpawnProcessFromUserBuf` (NR 24). Stage 197A had already made the
+    // zero-copy grant mandatory for every gated image; this tail was the last route that
+    // contradicted that, and it survived only because image 13 could not use the grant path. It
+    // can now, so nothing reaches here that has any business spawning.
+    //
+    // The refusal is deliberate about what it does NOT do: no second syscall, no silent retry,
+    // no partially built process. Nothing has been created at this point — the grant path either
+    // returned a fully spawned task above or propagated its own failure — so there is no address
+    // space, capability, endpoint, task or reservation to unwind.
     yarm_user_rt::user_log!(
-        "PM_VFS_SPAWN_LOAD_REPLY image_id={} status=ok len={}",
-        image_id,
-        image.len()
+        "PM_ELF_ZC_REQUIRED_FAIL image_id={} err=not-grant-eligible",
+        image_id
     );
     yarm_user_rt::user_log!(
-        "PM_VFS_SPAWN_LOAD_FIRST4 image_id={} bytes=[{:02x} {:02x} {:02x} {:02x}]",
-        image_id,
-        first4[0],
-        first4[1],
-        first4[2],
-        first4[3]
+        "BOOT_FATAL_ZC_ELF_LOAD_FAILED image_id={} err=not-grant-eligible",
+        image_id
     );
-    if image.is_empty() {
-        yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err=empty-elf", image_id);
-        yarm_user_rt::user_log!(
-            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=reply_decode err=empty-elf",
-            image_id
-        );
-        return Err(ProcessManagerError::Malformed);
-    }
-    // Verify ELF magic before attempting spawn.
-    if image.len() < 4 || &image[..4] != b"\x7fELF" {
-        let first4_end = core::cmp::min(image.len(), 4);
-        yarm_user_rt::user_log!(
-            "PM_VFS_SPAWN_FAIL image_id={} err=bad-elf-magic first4={:x?}",
-            image_id,
-            &image[..first4_end]
-        );
-        yarm_user_rt::user_log!(
-            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=elf_parse err=bad-elf-magic",
-            image_id
-        );
-        return Err(ProcessManagerError::Malformed);
-    }
-    yarm_user_rt::user_log!("PM_VFS_SPAWN_ELF_MAGIC_OK image_id={}", image_id);
-    yarm_user_rt::user_log!(
-        "PM_VFS_SPAWN_FROM_VFS_BYTES image_id={} len={} first4={:x?}",
-        image_id,
-        image.len(),
-        &image[..4]
-    );
-    let image_len = image.len();
-    let kernel_spawn_image_id =
-        kernel_spawn_policy_image_id_for_vfs_spawn(image_id, supervisor_restart_test_enabled)?;
-    let result = unsafe {
-        yarm_user_rt::syscall::spawn_process_from_user_buf(
-            kernel_spawn_image_id,
-            image.as_ptr(),
-            image_len,
-            parent_pid,
-            startup_args,
-        )
-    };
-    drop(image);
-    yarm_user_rt::user_log!(
-        "PM_VFS_EXEC_BUFFER_DROPPED image_id={} len={}",
-        image_id,
-        image_len
-    );
-    match result {
-        Ok((tid, caller_cap, spawner_cap)) => {
-            yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_RESULT image_id={} tid={} caller_cap={} spawner_cap={}",
-                image_id,
-                tid,
-                caller_cap,
-                spawner_cap
-            );
-            yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_IMAGE_SELECTED image_id={} source=vfs",
-                image_id
-            );
-            Ok((tid, caller_cap, spawner_cap))
-        }
-        Err(e) => {
-            yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err={:?}", image_id, e);
-            yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=spawn_from_mo err={:?}",
-                image_id,
-                e
-            );
-            yarm_user_rt::user_log!(
-                "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id={} site=spawn_from_mo err={:?}",
-                image_id,
-                e
-            );
-            match e {
-                yarm_user_rt::syscall::SyscallError::InvalidArgs => {
-                    Err(ProcessManagerError::Unsupported)
-                }
-                _ => Err(ProcessManagerError::TableFull),
-            }
-        }
-    }
+    Err(ProcessManagerError::Unsupported)
 }
 
 #[cfg(not(test))]
@@ -3539,203 +3423,6 @@ fn pm_image_cpio_name_for_gate(
         CRASH_TEST_SRV_IMAGE_ID if supervisor_restart_test_enabled => Some(b"sbin/crash_test_srv"),
         _ => None,
     }
-}
-
-#[cfg(not(test))]
-unsafe fn pm_read_all_via_vfs(
-    image_id: u64,
-    vfs_send_cap: u32,
-    reply_recv_cap: u32,
-    path: &[u8],
-) -> Result<Vec<u8>, ProcessManagerError> {
-    let path_str = core::str::from_utf8(path).unwrap_or("<path-bytes>");
-    let stat_msg = build_statx_message(path).map_err(|_| ProcessManagerError::Malformed)?;
-    yarm_user_rt::user_log!("PM_VFS_CALL op=STATX path={}", path_str);
-    let stat_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &stat_msg) }?;
-    let stat_payload = stat_reply.as_slice();
-    if stat_payload.len() != 8 {
-        let preview_len = core::cmp::min(stat_payload.len(), 32);
-        yarm_user_rt::user_log!(
-            "PM_VFS_REPLY_DECODE_FAIL op=STATX reason=bad_len expected=8 actual={} bytes={:x?}",
-            stat_payload.len(),
-            &stat_payload[..preview_len]
-        );
-        return Err(ProcessManagerError::Malformed);
-    }
-    let file_len = decode_u64(stat_payload).ok_or(ProcessManagerError::Malformed)? as usize;
-    yarm_user_rt::user_log!(
-        "PM_VFS_REPLY_DECODE op=STATX expected_len=8 actual_len={} value={}",
-        stat_payload.len(),
-        file_len
-    );
-
-    let open_msg = build_openat_message(path, 0).map_err(|_| ProcessManagerError::Malformed)?;
-    yarm_user_rt::user_log!("PM_VFS_CALL op=OPENAT path={}", path_str);
-
-    // Capture OPENAT result before propagating so we can log the exact failure.
-    let open_reply = match unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &open_msg) } {
-        Ok(reply) => {
-            yarm_user_rt::user_log!(
-                "PM_VFS_OPENAT_RETURN image_id={} path={} result=ok len={}",
-                image_id,
-                path_str,
-                reply.len
-            );
-            reply
-        }
-        Err(err) => {
-            yarm_user_rt::user_log!(
-                "PM_VFS_OPENAT_RETURN image_id={} path={} result=err err={:?}",
-                image_id,
-                path_str,
-                err
-            );
-            yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_FAIL image_id={} stage=after-openat reason=openat_call_fail",
-                image_id
-            );
-            return Err(err);
-        }
-    };
-
-    // Decode fd from the 8-byte LE reply payload.
-    let fd = match decode_u64(open_reply.as_slice()) {
-        Some(v) => {
-            let slice = open_reply.as_slice();
-            let preview_len = core::cmp::min(slice.len(), 8);
-            yarm_user_rt::user_log!(
-                "PM_VFS_OPENAT_DECODE image_id={} path={} fd={} raw_len={} raw_bytes={:x?}",
-                image_id,
-                path_str,
-                v,
-                open_reply.len,
-                &slice[..preview_len]
-            );
-            v
-        }
-        None => {
-            yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_FAIL image_id={} stage=after-openat reason=bad_fd_decode raw_len={}",
-                image_id,
-                open_reply.len
-            );
-            return Err(ProcessManagerError::Malformed);
-        }
-    };
-
-    let mut out = Vec::with_capacity(file_len);
-    // Log before entering the READ loop so any OOM or other failure between
-    // OPENAT-decode and first READ is bracketed by PM_VFS_READ_BEGIN.
-    yarm_user_rt::user_log!(
-        "PM_VFS_READ_BEGIN image_id={} path={} fd={} expected={} chunk={}",
-        image_id,
-        path_str,
-        fd,
-        file_len,
-        Message::MAX_PAYLOAD - 16
-    );
-
-    // READ loop: accumulate file_len bytes in chunks.  Each iteration must make
-    // forward progress; zero-length reads before reaching file_len are treated
-    // as a fatal protocol error (premature EOF or format mismatch).
-    while out.len() < file_len {
-        let prev_len = out.len();
-        // Request at most MAX_PAYLOAD-16 bytes: 16 bytes are used for the u64
-        // read-length header that the VFS reply prepends before the data.
-        // Requesting 512 caused the VFS reply payload (header + data) to exceed
-        // Message::MAX_PAYLOAD (128), truncating the data silently.
-        let to_read = core::cmp::min(Message::MAX_PAYLOAD - 16, file_len - out.len());
-        let read_msg = match build_read_message(fd, to_read) {
-            Ok(msg) => msg,
-            Err(err) => {
-                yarm_user_rt::user_log!(
-                    "PM_VFS_SPAWN_FAIL image_id={} stage=after-openat reason=build_read_msg_fail fd={} err={:?}",
-                    image_id,
-                    fd,
-                    err
-                );
-                return Err(ProcessManagerError::Malformed);
-            }
-        };
-        yarm_user_rt::user_log!("PM_VFS_CALL op=READ fd={} len={}", fd, to_read);
-        let read_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &read_msg) }?;
-        let payload = read_reply.as_slice();
-
-        {
-            let preview_len = core::cmp::min(payload.len(), 16);
-            yarm_user_rt::user_log!(
-                "PM_VFS_READ_REPLY_RAW fd={} requested={} len={} first16={:x?}",
-                fd,
-                to_read,
-                payload.len(),
-                &payload[..preview_len]
-            );
-        }
-
-        let read_len = decode_u64(payload).ok_or(ProcessManagerError::Malformed)? as usize;
-
-        if read_len == 0 {
-            // Premature EOF: backend signalled zero bytes before file_len reached.
-            yarm_user_rt::user_log!("PM_VFS_READ_EOF total={} expected={}", out.len(), file_len);
-            yarm_user_rt::user_log!(
-                "PM_VFS_READ_NO_PROGRESS fd={} total={} expected={} reason=premature_eof",
-                fd,
-                out.len(),
-                file_len
-            );
-            let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
-            let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
-            return Err(ProcessManagerError::Malformed);
-        }
-
-        let inline = payload.get(16..).unwrap_or(&[]);
-        let copy_len = core::cmp::min(read_len, inline.len());
-        if copy_len > 0 {
-            let first4_end = core::cmp::min(copy_len, 4);
-            let first4 = &inline[..first4_end];
-            out.extend_from_slice(&inline[..copy_len]);
-            if PM_VFS_READ_APPEND_TRACE {
-                yarm_user_rt::user_log!(
-                    "PM_VFS_READ_APPEND bytes={} total={} expected={} first4={:x?}",
-                    copy_len,
-                    out.len(),
-                    file_len,
-                    first4
-                );
-            }
-        }
-
-        if out.len() == prev_len {
-            // Got a positive read_len but no inline bytes — format mismatch or
-            // placeholder backend.  No progress means we can never complete.
-            yarm_user_rt::user_log!(
-                "PM_VFS_READ_NO_PROGRESS fd={} total={} expected={} read_len={} inline_len={}",
-                fd,
-                prev_len,
-                file_len,
-                read_len,
-                inline.len()
-            );
-            let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
-            let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
-            return Err(ProcessManagerError::Malformed);
-        }
-    }
-
-    {
-        let first4_end = core::cmp::min(out.len(), 4);
-        yarm_user_rt::user_log!(
-            "PM_VFS_READ_DONE image_id={} total={} first4={:x?}",
-            image_id,
-            out.len(),
-            &out[..first4_end]
-        );
-    }
-
-    let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
-    yarm_user_rt::user_log!("PM_VFS_CALL op=CLOSE fd={}", fd);
-    let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
-    Ok(out)
 }
 
 #[cfg(test)]

@@ -8132,7 +8132,7 @@ knob is arch-neutral diagnostics / no-op behavior); no RPi5 change.
 
 **Audit (paths).** All confirmed already transactional — no bug fixed, diagnostics
 only:
-- **Spawn request handling** (`SpawnV5` / `SpawnProcessFromUserBuf`): the kernel
+- **Spawn request handling** (`SpawnV5` / `SpawnFromMemoryObject`): the kernel
   validates the request, resolves the image, parses+loads the ELF, creates the
   address space + TCB + CNode, materializes bootstrap caps, and marks the thread
   runnable — with a single rollback path that unwinds every partial resource

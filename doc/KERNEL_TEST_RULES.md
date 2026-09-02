@@ -4644,7 +4644,7 @@ after dispatch and translate it back to `Err(TrapHandleError::Syscall(...))` usi
 **Applies to:** `spawn_image_path_for_image_id()` in `src/kernel/syscall.rs`.
 
 **Rule:** Image IDs 10 (`fat_srv`), 11 (`ramfs_srv`), 12 (`ext4_srv`) must have path-table entries
-so that Phase 2B (`handle_spawn_process_from_user_buf`, NR=24) and Phase 3A
+so that the retired Phase 2B byte-copy route (NR=24, removed in U9-SPAWN2 §1) and Phase 3A
 (`handle_spawn_from_memory_object`, NR=29) return valid CPIO paths instead of `InvalidArgs` when
 optional FS spawning is enabled. IDs ≥ 13 MUST still return `None`.
 
