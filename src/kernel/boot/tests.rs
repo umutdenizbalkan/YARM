@@ -85814,7 +85814,7 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
             "the whole condition is the target architecture: x86_64 is production-default, \
              every other architecture is not"
         );
@@ -85890,15 +85890,23 @@ mod stage199d_production_default_guards {
         // AArch64 and RISC-V are explicitly unchanged.
         // WA3C2-DOC-SEAL: WA1-GATE's universal fall-back wording is retired with the gate. The
         // record now names the architecture split, which is what the predicate actually says.
+        // DIRECT3-CAP-FINAL §5: the record must still name which architectures are
+        // production-default and which are not, and must still say WHY — the term is true
+        // where live profiles exist and false where they do not. Repointed to the current
+        // split (x86_64 + AArch64 on, RISC-V off), not relaxed: the doc is still required to
+        // state the scope explicitly rather than merely assert it.
         assert!(
-            doc.contains("`true` on x86_64 only")
-                && doc.contains("AArch64 and RISC-V keep the legacy path"),
+            doc.contains("never as a knob or a selector, and never ahead of")
+                && doc.contains("RISC-V keeps the legacy path until its own profiles qualify"),
             "the record states which architectures are production-default and which are not"
         );
-        // Stage 199D-WA3C2: the default is ON for x86_64 and OFF elsewhere.
+        assert!(
+            doc.contains("DIRECT3-CAP-FINAL adds AArch64"),
+            "and names the architecture the scope most recently gained, with its evidence"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64")
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
         );
         // Where production is off, admission and publication are EXACTLY the proof gate: the
         // ordinary configuration reaches neither, and the explicit selector reaches both. Where
@@ -108957,7 +108965,7 @@ mod stage199d_aarch64_readiness_audit {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
             "AArch64 stays off until its blockers are closed — the predicate names x86_64 and \
              nothing else, so no AArch64 term can hide in it"
         );
@@ -109411,7 +109419,10 @@ mod stage199d_split_return_without_broad_lock {
             .split("\n}\n")
             .next()
             .expect("body bounded");
-        assert_eq!(body.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            body.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+        );
     }
 }
 
@@ -110158,10 +110169,13 @@ mod stage199d_aarch64_offlock_dispatch {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
         assert_eq!(
@@ -111736,7 +111750,7 @@ mod stage199d_closure_matrix {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
             "x86_64 ON, every other architecture OFF"
         );
     }
@@ -113271,10 +113285,13 @@ mod stage199d_riscv_narrow_trap_snapshots {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -113464,7 +113481,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
             "production is x86_64-only, so it is compile-time false on RISC-V"
         );
         assert!(
@@ -113508,7 +113525,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
             "production is x86_64-only, so on RISC-V admission adds no term beyond proof"
         );
     }
@@ -113647,10 +113664,13 @@ mod stage199d_riscv_canonical_admission {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
         let admission = MOD_SRC
@@ -114196,10 +114216,13 @@ mod stage199d_riscv_remote_wake_readiness {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -114874,10 +114897,13 @@ mod stage199d_riscv_link2_wake_only_online {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -115315,10 +115341,13 @@ mod stage199d_runqueue_withdrawal_foundation {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -115637,10 +115666,13 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
         // is authoritative, so `WAITER_OWNERSHIP_EXCLUSIVE` no longer blocks it. This guard is
         // REPOINTED, not weakened: it pins the enabled predicate exactly as it pinned the
         // disabled one, and it still pins every OTHER architecture off.
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
             "the predicate is true on x86_64 and false on every other architecture"
         );
     }
@@ -116885,7 +116917,7 @@ mod stage199d_wa1_gate {
         use crate::kernel::boot::*;
         assert_eq!(
             ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64")
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
         );
         set_ipccall_direct_proof_enabled(false);
         assert_eq!(
@@ -116931,7 +116963,7 @@ mod stage199d_wa1_gate {
             .expect("the predicate");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")",
             "the whole body is the architecture test"
         );
         // Stage 199D-WA3C2: `target_arch` / `cfg!` ARE the body now, so they leave the
@@ -116939,23 +116971,39 @@ mod stage199d_wa1_gate {
         // something other than a compile-time architecture fact — a second disjunct, a runtime
         // load, or a call to any other predicate, which is what an oracle/knob dependency
         // would have to look like.
-        for forbidden in [
-            "||",
-            "&&",
-            "load(",
-            "enabled()",
-            "oracle",
-            "proof",
-            "feature = ",
-        ] {
+        for forbidden in ["&&", "load(", "enabled()", "oracle", "proof", "feature = "] {
             assert!(
                 !body.contains(forbidden),
                 "the predicate must carry no `{forbidden}` term"
             );
         }
-        // …and it names exactly one architecture.
-        assert_eq!(body.matches("target_arch").count(), 1);
-        assert!(!body.contains("aarch64") && !body.contains("riscv"));
+        // …and it is NOTHING BUT architecture tests.
+        //
+        // `||` is admitted now that production spans two architectures, but only between
+        // `cfg!(target_arch = ...)` operands: the property this guard exists for is that the
+        // predicate is a pure compile-time architecture constant, never that it names exactly
+        // one. Splitting on `||` and requiring every operand to be such a test keeps that
+        // property exactly — a runtime term smuggled in as a third operand still fails, and so
+        // does one substituted for either existing operand.
+        let operands: alloc::vec::Vec<&str> = body.split("||").map(|o| o.trim()).collect();
+        assert_eq!(
+            operands.len(),
+            body.matches("target_arch").count(),
+            "every `||` operand must be an architecture test and nothing else"
+        );
+        for operand in &operands {
+            assert!(
+                operand.starts_with("cfg!(target_arch = \"") && operand.ends_with("\")"),
+                "operand `{operand}` is not a bare compile-time architecture test"
+            );
+        }
+        // RISC-V is still off, and the predicate must not name it. AArch64 IS named now, so
+        // the check is scoped to the architecture that has not qualified rather than to "any
+        // architecture but x86_64" — which is what it always meant.
+        assert!(
+            !body.contains("riscv"),
+            "RISC-V keeps the legacy path until its own profiles qualify"
+        );
         // Admission keeps its form: production OR proof, with production now true on x86_64.
         let adm = MODRS
             .split("pub fn ipccall_direct_admission_enabled() -> bool {")
@@ -118365,7 +118413,10 @@ mod stage199d_wa2a_ownership_boundary {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the predicate");
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")"
+        );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
             cfg!(target_arch = "x86_64")
@@ -126821,7 +126872,7 @@ mod u3_ordinary_cap_sender_wake {
         let mod_rs = include_str!("mod.rs");
         assert!(
             mod_rs.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")\n}"
             ),
             "direct production is the target architecture and nothing else"
         );
@@ -126948,11 +126999,11 @@ mod u4_cross_arch_queue_advancing_dispatch {
     fn direct_production_cannot_affect_the_predicate() {
         assert_eq!(
             ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64")
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
         );
         assert!(
             MOD_SRC.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")\n}"
             ),
             "direct production is the target architecture and nothing else"
         );
@@ -129727,7 +129778,7 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 }
                 assert!(
                     MOD_SRC.contains(
-                        "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
+                        "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")\n}"
                     ),
                     "direct production is the target architecture and nothing else"
                 );
@@ -141268,13 +141319,13 @@ mod u9qa_not_retired {
     fn direct_production_remains_a_compile_time_architecture_constant() {
         assert!(
             MOD_SRC.contains(
-                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\")\n}"
+                "pub const fn ipccall_direct_production_enabled() -> bool {\n    cfg!(target_arch = \"x86_64\") || cfg!(target_arch = \"aarch64\")\n}"
             ),
             "direct-IpcCall production must remain a compile-time architecture constant"
         );
         assert_eq!(
             crate::kernel::boot::ipccall_direct_production_enabled(),
-            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
             "and must evaluate to the target architecture"
         );
     }
@@ -141488,7 +141539,6 @@ mod u9qa_apply_convention {
         // yields are scoped to NR 2, whose handler owns the hooks they protect.
         for yielded in [
             "if !recv_timeout && cfg!(feature = \"shared-region-direct-oracle\")",
-            "if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled()",
             "if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm()",
         ] {
             assert!(
@@ -141496,6 +141546,19 @@ mod u9qa_apply_convention {
                 "every broad-arm yield must be scoped to NR 2: {yielded}"
             );
         }
+        // DIRECT3-CAP-FINAL §5: there used to be a THIRD yield, scoped to non-x86_64 and keyed
+        // on `ipccall_direct_publication_enabled()`. It was written when only the broad arm
+        // could publish the NR6/NR7 acknowledgements; step (10) has published them
+        // unconditionally since the publication bodies became shared, so it had become a stale
+        // second owner of the policy the predicate above owns. It must not come back: with a
+        // production term on, it fires on EVERY blocking recv-v2 and hands the whole receive to
+        // the broad arm.
+        assert!(
+            !SPLIT_SRC.contains(
+                "if !recv_timeout && crate::kernel::boot::ipccall_direct_publication_enabled()"
+            ),
+            "the blocked-recv yield has ONE owner; the publication-keyed duplicate is retired"
+        );
     }
 
     /// `X86FirstResume` has ONE policy owner and ONE apply owner, and neither is duplicated in
