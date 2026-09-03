@@ -10,10 +10,14 @@ mod capability_service_state;
 mod capability_state;
 mod capacity_state;
 pub(crate) mod cnode_state;
+/// U9-FORK1 §2 — THE copy-on-write address-space clone, as one rank-local transaction.
+pub(crate) mod cow_clone;
 pub(crate) mod defs;
 mod delegation_state;
 mod driver_state;
 pub(crate) mod exec_state;
+/// U9-FORK1 §4 — the broad acquisitions behind the seven fork owners.
+pub(crate) mod fork_owners;
 // U9-QA §1: the queue-advance apply convention is named by callers outside this module (the
 // pre-lock split route), so it is re-exported alongside the transaction it parameterises.
 pub(crate) use exec_state::{

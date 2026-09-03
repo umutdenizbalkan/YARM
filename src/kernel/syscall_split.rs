@@ -2316,6 +2316,13 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_spawn_from_mo_into_frame(shared, cpu, frame);
     }
 
+    // U9-FORK1 §4: Fork (NR 12), before the terminal acquisition. Every refusal it makes is
+    // pre-mutation and returns `None`, which propagates UNCHANGED to the global-lock fallback;
+    // once the transaction begins it never declines.
+    if matches!(syscall, Syscall::Fork) {
+        return try_split_fork_into_frame(shared, cpu, frame);
+    }
+
     // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) — a pure read
     // serviced off the global lock. The helper returns `None` for any case it cannot
     // service (hosted-dev, unavailable requester), which propagates UNCHANGED back to
@@ -3784,6 +3791,51 @@ fn spawn_owners_for(
     })
 }
 
+/// U9-FORK1 §4 — NR 12 `Fork`, before the terminal acquisition.
+///
+/// The whole route is: resolve the caller, run THE fork transaction through `SharedSpawnOwners`,
+/// place the child TID in the parent's return lane. There is no argument to validate — Fork takes
+/// none — and nothing is read from user memory, which is why this route (unlike the two spawn
+/// routes) is not `cfg`-gated and is exercised by the hosted suite as well as the three targets.
+///
+/// The child's return lane is not set here. It was installed by the publication, from
+/// `fork_child_context`, which is the single owner of that decision on every path.
+fn try_split_fork_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    // PRE-MUTATION refusal: no resolvable caller means no fork. Declining here returns `None` and
+    // the broad handler re-derives the same answer.
+    let Some(parent_tid) = shared.current_tid_authoritative(cpu) else {
+        return None;
+    };
+    let mut owners = spawn_owners_for(shared, cpu)?;
+    let parent_context = frame.capture_user_context();
+    match crate::kernel::syscall::fork_txn::fork_process_cow(
+        &mut owners,
+        parent_tid,
+        Some(parent_context),
+    ) {
+        Ok(child_tid) => {
+            let Ok(ret0) = usize::try_from(child_tid) else {
+                // Unreachable for any TID this kernel allocates, and NOT a place to fall back to
+                // the broad path: the fork has committed, so a second attempt would fork twice.
+                frame.set_err(crate::kernel::syscall::SyscallError::Internal as usize);
+                return Some(Ok(()));
+            };
+            frame.set_ok(ret0, 0, 0);
+            Some(Ok(()))
+        }
+        // A refused fork has already unwound itself completely; reporting the error is the whole
+        // remaining work, and re-running it on the broad path would repeat the attempt.
+        Err(err) => {
+            frame.set_err(crate::kernel::syscall::SyscallError::from(err) as usize);
+            Some(Ok(()))
+        }
+    }
+}
+
 /// Read and normalise the caller's startup-args array, off-lock.
 ///
 /// Freestanding only: the off-lock user-read seam reads through the direct map, which exists
@@ -4133,6 +4185,11 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // `try_split_spawn_from_mo_into_frame` decide the rest.
         Syscall::SpawnProcess => Some(syscall),
         Syscall::SpawnFromMemoryObject => Some(syscall),
+        // U9-FORK1 §4: Fork (NR 12). It runs the SAME generic fork transaction the broad path
+        // runs, over the same `SharedSpawnOwners`, and unlike the two spawn classes it reads
+        // NOTHING from user memory — no startup-args array, no ELF — so the route needs no
+        // off-lock user-read seam and exists identically on every profile.
+        Syscall::Fork => Some(syscall),
         // Stage 197A removed the former NR 27 InitramfsReadChunk split class along with the
         // syscall. Its sibling note — that NR 28 MINTS a capability and therefore "stays
         // global-lock-only" — was retired by U9-MO2 §4: the mint was never the obstacle, the
@@ -4764,6 +4821,7 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
                 || nr == SYSCALL_SPAWN_PROCESS_NR
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
+                || nr == crate::kernel::syscall::SYSCALL_FORK_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {

@@ -372,58 +372,52 @@ impl KernelState {
         Ok(())
     }
 
+    /// U9-FORK1 §2 — the broad acquisition around THE copy-on-write clone.
+    ///
+    /// The whole clone body moved to [`super::cow_clone::clone_address_space_cow_locked`], which
+    /// holds VM (rank 5) and memory (rank 6) for its entire duration. What used to happen here —
+    /// `map_user_page_in_asid_raw` (vm→memory), `with_user_spaces_mut` (vm), then `mark_cow_page`
+    /// (memory) twice, PER PAGE — took and released both locks O(pages) times. That is invisible
+    /// under the broad lock and wrong off it, so the acquisition count is now one.
+    ///
+    /// This wrapper owns exactly three things the body may not: the monotonic clone generation
+    /// (rank 2, taken and released BEFORE rank 5), the `VM_COW_*` / `FORK_PROOF_COW_*` marker
+    /// vocabulary — emitted from the returned token after both locks release, so nothing logs
+    /// under a domain lock — and the parent's owed TLB shootdown, which it hands to its caller.
+    ///
+    /// The historical signature is preserved for callers that only want the child ASID. The fork
+    /// transaction takes [`Self::clone_user_address_space_cow_token`] instead, because it needs
+    /// the token to unwind.
     pub(crate) fn clone_user_address_space_cow(
         &mut self,
         parent_asid: Asid,
     ) -> Result<Asid, KernelError> {
-        // Stage 163E: transactional, run-preserving COW clone.
-        //
-        // The prior algorithm iterated the LIVE parent table while re-mapping each
-        // page write-protected; re-mapping a page inside a multi-page run SPLIT that
-        // run, so the loop walked the split-off tails and ballooned the parent table
-        // to MAX_MAPPINGS — failing with `Vm(Full)` at map_parent and (worse) leaving
-        // the parent mutated (80 -> 128 entries) with no rollback.
-        //
-        // Fix: snapshot the parent's runs first, iterate the snapshot (never the live
-        // table), map whole runs into the child (adjacent same-flag pages MERGE, so
-        // the child stays run-compact), and write-protect each parent run IN PLACE
-        // (flags updated, NO split — entry count unchanged). The per-page split now
-        // happens lazily in `try_handle_cow_fault` on the first write. A preflight
-        // rejects an over-capacity clone before ANY mutation, and every parent
-        // write-protect is recorded for full rollback — so a failed clone leaves the
-        // parent byte-identical. Proof-gated diagnostics are active only under the
-        // sender-wake sub-knob.
+        // Rank 2 for the stamp, released before rank 5 is taken — the legal order, and the only
+        // reach below VM this path makes.
+        let generation = self.with_task_spawn_generation_mut(|_tcbs, generation| {
+            let issued = *generation;
+            *generation = generation.saturating_add(1);
+            issued
+        });
+        self.clone_user_address_space_cow_token(parent_asid, generation)
+            .map(|token| token.child_asid)
+            .map_err(|e| e.err)
+    }
+
+    /// The clone, with its provisional token — everything needed to commit the child or restore
+    /// the parent.
+    ///
+    /// The caller MUST complete `token.shootdown` once it holds no domain lock and BEFORE the
+    /// child becomes observable, and MUST roll the token back if any later step fails.
+    pub(crate) fn clone_user_address_space_cow_token(
+        &mut self,
+        parent_asid: Asid,
+        generation: u64,
+    ) -> Result<super::cow_clone::CowCloneToken, super::cow_clone::CowCloneError> {
         let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
-        // Stage 172 (VM-COW): default-off fork phase markers. Diagnostic only — the
-        // transactional preflight + `rollback_cow_clone` below are UNCHANGED.
         let vm_cow = crate::kernel::boot::vm_cow_enabled();
-        if self.with_user_spaces(|spaces| spaces.get(parent_asid).is_none()) {
-            return Err(KernelError::Vm(VmError::InvalidAsid));
-        }
-        if vm_cow {
-            crate::yarm_log!("VM_COW_FORK_BEGIN parent_asid={}", parent_asid.0);
-        }
-
-        // Snapshot the parent's runs BEFORE any mutation: (head virt, phys, flags, pages).
-        let snapshot: alloc::vec::Vec<(VirtAddr, PhysAddr, PageFlags, usize)> = self
-            .with_user_spaces(|spaces| {
-                let mut runs = alloc::vec::Vec::new();
-                if let Some(aspace) = spaces.get(parent_asid) {
-                    let mut i = 0usize;
-                    while let Some((virt, mapping, pages)) = aspace.run_at(i) {
-                        runs.push((virt, mapping.phys, mapping.flags, pages));
-                        i += 1;
-                    }
-                }
-                runs
-            });
-
         let parent_used = self
             .with_user_spaces(|spaces| spaces.get(parent_asid).map(|a| a.mappings()).unwrap_or(0));
-        // The child needs at most one entry per parent run (merges only reduce); the
-        // parent is write-protected in place (entry count unchanged).
-        let required_child = snapshot.len();
-        let available_child = crate::kernel::vm::MAX_MAPPINGS;
         if proof {
             let (live, cap, retired) = self.with_user_spaces(|spaces| {
                 (
@@ -448,298 +442,120 @@ impl KernelState {
                 cap,
                 retired
             );
-            crate::yarm_log!(
-                "FORK_PROOF_COW_PREFLIGHT required_parent={} available_parent={} required_child={} available_child={}",
-                parent_used,
-                crate::kernel::vm::MAX_MAPPINGS,
-                required_child,
-                available_child
-            );
         }
-        if required_child > available_child {
-            // Reject BEFORE any mutation — the parent is left untouched.
-            if proof {
-                crate::yarm_log!(
-                    "FORK_PROOF_COW_FAIL_DETAIL site=preflight_child used={} cap={} reason=Vm(Full)",
-                    required_child,
-                    available_child
-                );
-                crate::yarm_log!(
-                    "FORK_PROOF_COW_STATS_AFTER_FAIL parent_used={} cap={}",
-                    parent_used,
-                    crate::kernel::vm::MAX_MAPPINGS
-                );
-            }
-            return Err(KernelError::Vm(VmError::Full));
+        if vm_cow {
+            crate::yarm_log!("VM_COW_FORK_BEGIN parent_asid={}", parent_asid.0);
         }
-
-        let child_asid = match self.with_user_spaces_mut(|spaces| spaces.create_user_space()) {
-            Ok(asid) => asid,
-            Err(e) => {
+        let result = self.with_vm_then_memory_mut(|vm, memory| {
+            super::cow_clone::clone_address_space_cow_locked(vm, memory, parent_asid, generation)
+        });
+        let token = match result {
+            Ok(token) => token,
+            Err(failure) => {
                 if proof {
-                    let (live, cap) = self
-                        .with_user_spaces(|spaces| (spaces.live_count(), spaces.slot_capacity()));
+                    // The site is the body's own typed value, so this line cannot name a step the
+                    // clone does not have. Sites: preflight_child, create_user_space, map_child,
+                    // write_protect_parent, mark_cow_parent, mark_cow_child,
+                    // mark_cow_child_inherited.
                     crate::yarm_log!(
-                        "FORK_PROOF_COW_FAIL_DETAIL site=create_user_space used={} cap={} reason=Vm({:?})",
-                        live,
-                        cap,
-                        e
+                        "FORK_PROOF_COW_FAIL_DETAIL site={} va=0x{:x} reason={:?}",
+                        failure.site,
+                        failure.va,
+                        failure.err
                     );
-                }
-                return Err(KernelError::Vm(e));
-            }
-        };
-
-        // Parent runs we write-protected, with their original flags + page count, for
-        // byte-identical rollback on any later failure.
-        let mut wp_runs: alloc::vec::Vec<(VirtAddr, PageFlags, usize)> = alloc::vec::Vec::new();
-        let page_sz = crate::kernel::vm::PAGE_SIZE as u64;
-
-        for (virt, phys, flags, pages) in &snapshot {
-            let (virt, phys, flags, pages) = (*virt, *phys, *flags, *pages);
-            let mut shared_flags = flags;
-            if flags.write {
-                shared_flags.write = false;
-            }
-            // Map every page of the run into the child (read-only / shared). Adjacent
-            // same-flag pages merge, so the child table stays run-compact.
-            for p in 0..pages {
-                let pv = VirtAddr(virt.0 + p as u64 * page_sz);
-                let pp = PhysAddr(phys.0 + p as u64 * page_sz);
-                if let Err(err) = self.map_user_page_in_asid_raw(
-                    child_asid,
-                    pv,
-                    Mapping {
-                        phys: pp,
-                        flags: shared_flags,
-                    },
-                ) {
-                    if proof {
-                        crate::yarm_log!(
-                            "FORK_PROOF_COW_FAIL_DETAIL site=map_child va=0x{:x} reason={:?}",
-                            pv.0,
-                            err
-                        );
-                    }
-                    self.rollback_cow_clone(child_asid, parent_asid, &wp_runs, proof);
-                    return Err(err);
-                }
-                #[cfg(feature = "hosted-dev")]
-                self.with_memory_state_mut(|memory| {
-                    for offset in 0..page_sz {
-                        let from = (parent_asid.0, pp.0 + offset);
-                        let to = (child_asid.0, pp.0 + offset);
-                        if let Some(value) = memory.user_memory.get(&from).copied() {
-                            memory.user_memory.insert(to, value);
-                        }
-                    }
-                });
-            }
-            if vm_cow {
-                crate::yarm_log!("VM_COW_FORK_CHILD_MAP va=0x{:x} pages={}", virt.0, pages);
-            }
-            if flags.write {
-                if proof {
-                    crate::yarm_log!(
-                        "FORK_PROOF_COW_MAP_PARENT_BEGIN va=0x{:x} pages={} parent_used={} cap={}",
-                        virt.0,
-                        pages,
-                        self.with_user_spaces(|s| s
-                            .get(parent_asid)
-                            .map(|a| a.mappings())
-                            .unwrap_or(0)),
-                        crate::kernel::vm::MAX_MAPPINGS
-                    );
-                }
-                // Write-protect the parent run IN PLACE — no split, entry count fixed.
-                let old = match self.with_user_spaces_mut(|spaces| {
-                    spaces
-                        .get_mut(parent_asid)
-                        .ok_or(VmError::InvalidAsid)
-                        .and_then(|a| a.write_protect_run_head_in_place(virt))
-                }) {
-                    Ok(old) => old,
-                    Err(e) => {
-                        if proof {
-                            let pu = self.with_user_spaces(|s| {
-                                s.get(parent_asid).map(|a| a.mappings()).unwrap_or(0)
-                            });
-                            crate::yarm_log!(
-                                "FORK_PROOF_COW_MAP_PARENT_FAIL va=0x{:x} parent_used={} cap={} reason=Vm({:?})",
-                                virt.0,
-                                pu,
-                                crate::kernel::vm::MAX_MAPPINGS,
-                                e
-                            );
-                        }
-                        self.rollback_cow_clone(child_asid, parent_asid, &wp_runs, proof);
-                        return Err(KernelError::Vm(e));
-                    }
-                };
-                wp_runs.push((virt, old, pages));
-                if proof {
                     let pu = self.with_user_spaces(|s| {
                         s.get(parent_asid).map(|a| a.mappings()).unwrap_or(0)
                     });
                     crate::yarm_log!(
-                        "FORK_PROOF_COW_MAP_PARENT_OK va=0x{:x} parent_used={}",
-                        virt.0,
-                        pu
+                        "FORK_PROOF_COW_STATS_AFTER_FAIL parent_used={} cap={}",
+                        pu,
+                        crate::kernel::vm::MAX_MAPPINGS
                     );
                 }
-                if vm_cow {
-                    crate::yarm_log!(
-                        "VM_COW_FORK_PARENT_WRITE_PROTECT va=0x{:x} pages={}",
-                        virt.0,
-                        pages
-                    );
-                }
-                // Mark each page COW in both parent and child.
-                for p in 0..pages {
-                    let pv = VirtAddr(virt.0 + p as u64 * page_sz);
-                    if let Err(err) = self.mark_cow_page(parent_asid, pv) {
-                        if proof {
-                            crate::yarm_log!(
-                                "FORK_PROOF_COW_FAIL_DETAIL site=mark_cow_parent va=0x{:x} reason={:?}",
-                                pv.0,
-                                err
-                            );
-                        }
-                        self.rollback_cow_clone(child_asid, parent_asid, &wp_runs, proof);
-                        return Err(err);
-                    }
-                    if let Err(err) = self.mark_cow_page(child_asid, pv) {
-                        if proof {
-                            crate::yarm_log!(
-                                "FORK_PROOF_COW_FAIL_DETAIL site=mark_cow_child va=0x{:x} reason={:?}",
-                                pv.0,
-                                err
-                            );
-                        }
-                        self.rollback_cow_clone(child_asid, parent_asid, &wp_runs, proof);
-                        return Err(err);
-                    }
-                }
-                if vm_cow {
-                    crate::yarm_log!("VM_COW_FORK_REFCOUNT_OK va=0x{:x} pages={}", virt.0, pages);
-                }
-            } else {
-                // Stage 163G fix: a run can be READ-ONLY in the parent yet still be
-                // copy-on-write *shared* — e.g. a page write-protected by an EARLIER
-                // fork that the parent has not written since. Such a parent page
-                // carries a COW mark; the new child shares it read-only and MUST also
-                // be COW-marked, otherwise the child's first write finds the page
-                // present+RO but NOT a COW page, so `try_handle_cow_fault` declines
-                // and the fault loops (the observed x86_64 error=0x7 present/write
-                // loop). Genuinely read-only runs (code/rodata, no parent COW mark)
-                // are shared directly with no COW mark — a write there is a real
-                // protection fault, as intended.
-                for p in 0..pages {
-                    let pv = VirtAddr(virt.0 + p as u64 * page_sz);
-                    if self.is_cow_page(parent_asid, pv) {
-                        if let Err(err) = self.mark_cow_page(child_asid, pv) {
-                            if proof {
-                                crate::yarm_log!(
-                                    "FORK_PROOF_COW_FAIL_DETAIL site=mark_cow_child_inherited va=0x{:x} reason={:?}",
-                                    pv.0,
-                                    err
-                                );
-                            }
-                            self.rollback_cow_clone(child_asid, parent_asid, &wp_runs, proof);
-                            return Err(err);
-                        }
-                        if proof {
-                            crate::yarm_log!("FORK_PROOF_COW_INHERIT_SHARED va=0x{:x}", pv.0);
-                        }
-                    }
-                }
+                return Err(failure);
             }
+        };
+        if vm_cow {
+            for run in &token.child_runs {
+                crate::yarm_log!(
+                    "VM_COW_FORK_CHILD_MAP va=0x{:x} phys=0x{:x} pages={}",
+                    run.virt.0,
+                    run.phys.0,
+                    run.pages
+                );
+            }
+            for run in &token.wp {
+                crate::yarm_log!(
+                    "VM_COW_FORK_PARENT_WRITE_PROTECT va=0x{:x} pages={}",
+                    run.virt.0,
+                    run.pages
+                );
+                crate::yarm_log!(
+                    "VM_COW_FORK_REFCOUNT_OK va=0x{:x} pages={}",
+                    run.virt.0,
+                    run.pages
+                );
+            }
+            crate::yarm_log!(
+                "VM_COW_FORK_DONE parent_asid={} child_asid={}",
+                token.parent_asid.0,
+                token.child_asid.0
+            );
         }
-
         if proof {
+            for pv in &token.inherited_cow {
+                crate::yarm_log!("FORK_PROOF_COW_INHERIT_SHARED va=0x{:x}", pv.0);
+            }
             let pu =
                 self.with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()).unwrap_or(0));
-            let cu =
-                self.with_user_spaces(|s| s.get(child_asid).map(|a| a.mappings()).unwrap_or(0));
+            let cu = self
+                .with_user_spaces(|s| s.get(token.child_asid).map(|a| a.mappings()).unwrap_or(0));
             crate::yarm_log!(
                 "FORK_PROOF_COW_STATS_AFTER_OK parent_used={} child_used={}",
                 pu,
                 cu
             );
         }
-        if vm_cow {
-            crate::yarm_log!(
-                "VM_COW_FORK_DONE parent_asid={} child_asid={}",
-                parent_asid.0,
-                child_asid.0
-            );
-        }
-        Ok(child_asid)
+        Ok(token)
     }
 
-    /// Stage 163E: roll back a failed COW clone so the parent is left byte-identical.
-    /// Destroy the partially-built child address space, then restore the write flag
-    /// (software + hardware) and clear the COW marks of every parent run we had
-    /// write-protected. `parent_used` must equal its pre-clone value afterward.
-    fn rollback_cow_clone(
+    /// U9-FORK1 §2/§3 — the broad acquisition around the clone's exact inverse.
+    ///
+    /// One VM→memory acquisition, like the forward direction. The parent's restoration shootdown
+    /// is owed to the caller afterwards, for the same reason the forward direction owes one.
+    pub(crate) fn rollback_cow_clone_token(
         &mut self,
-        child_asid: Asid,
-        parent_asid: Asid,
-        wp_runs: &[(VirtAddr, PageFlags, usize)],
-        proof: bool,
-    ) {
-        let page_sz = crate::kernel::vm::PAGE_SIZE as u64;
-        if proof {
-            let pu =
-                self.with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()).unwrap_or(0));
-            let cu =
-                self.with_user_spaces(|s| s.get(child_asid).map(|a| a.mappings()).unwrap_or(0));
-            crate::yarm_log!(
-                "FORK_PROOF_COW_ROLLBACK_BEGIN parent_used={} child_used={}",
-                pu,
-                cu
-            );
-        }
+        token: &super::cow_clone::CowCloneToken,
+    ) -> super::cow_clone::CowCloneRollback {
         let vm_cow = crate::kernel::boot::vm_cow_enabled();
         if vm_cow {
             crate::yarm_log!(
                 "VM_COW_FORK_ROLLBACK_BEGIN parent_asid={} child_asid={} wp_runs={}",
-                parent_asid.0,
-                child_asid.0,
-                wp_runs.len()
+                token.parent_asid.0,
+                token.child_asid.0,
+                token.wp.len()
             );
         }
-        let _ = self.destroy_user_address_space_by_asid(child_asid);
-        for &(virt, old, pages) in wp_runs {
-            self.with_user_spaces_mut(|spaces| {
-                if let Some(a) = spaces.get_mut(parent_asid) {
-                    a.restore_run_head_flags_in_place(virt, old);
-                }
-            });
-            for p in 0..pages {
-                self.clear_cow_page(parent_asid, VirtAddr(virt.0 + p as u64 * page_sz));
-            }
-        }
+        let outcome = self.with_vm_then_memory_mut(|vm, memory| {
+            super::cow_clone::rollback_cow_clone_locked(vm, memory, token)
+        });
         if vm_cow {
             crate::yarm_log!(
-                "VM_COW_FORK_ROLLBACK_OK parent_asid={} child_asid={}",
-                parent_asid.0,
-                child_asid.0
+                "VM_COW_FORK_ROLLBACK_OK parent_asid={} child_asid={} outcome={:?}",
+                token.parent_asid.0,
+                token.child_asid.0,
+                outcome
             );
         }
-        if proof {
-            let pu =
-                self.with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()).unwrap_or(0));
+        if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+            let pu = self
+                .with_user_spaces(|s| s.get(token.parent_asid).map(|a| a.mappings()).unwrap_or(0));
             crate::yarm_log!(
                 "FORK_PROOF_COW_ROLLBACK_DONE parent_used={} child_used=0",
                 pu
             );
-            crate::yarm_log!(
-                "FORK_PROOF_COW_STATS_AFTER_FAIL parent_used={} cap={}",
-                pu,
-                crate::kernel::vm::MAX_MAPPINGS
-            );
         }
+        outcome
     }
 
     fn copy_frame_contents_for_cow(
