@@ -502,6 +502,9 @@ impl KernelState {
             );
         }
         if proof {
+            for pv in &token.inherited_cow {
+                crate::yarm_log!("FORK_PROOF_COW_INHERIT_SHARED va=0x{:x}", pv.0);
+            }
             let pu =
                 self.with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()).unwrap_or(0));
             let cu = self

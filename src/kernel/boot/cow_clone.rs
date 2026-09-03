@@ -64,6 +64,7 @@ use crate::kernel::vm::{
 /// [`clone_address_space_cow_locked`], so a diagnostic names a step that provably exists rather
 /// than a string that once matched one.
 pub(crate) mod site {
+    pub(crate) const PARENT_MISSING: &str = "parent_missing";
     pub(crate) const PREFLIGHT_CHILD: &str = "preflight_child";
     pub(crate) const CREATE_USER_SPACE: &str = "create_user_space";
     pub(crate) const MAP_CHILD: &str = "map_child";
@@ -75,7 +76,8 @@ pub(crate) mod site {
 
 /// Every failure site the clone body can report, in body order. Exhaustive by construction: the
 /// guard in `kernel/boot/tests.rs` counts the body's `CowCloneError::new(` arms against this list.
-pub(crate) const ALL_COW_CLONE_SITES: [&str; 7] = [
+pub(crate) const ALL_COW_CLONE_SITES: [&str; 8] = [
+    site::PARENT_MISSING,
     site::PREFLIGHT_CHILD,
     site::CREATE_USER_SPACE,
     site::MAP_CHILD,
@@ -167,6 +169,11 @@ pub(crate) struct CowCloneToken {
     pub(crate) wp: Vec<CowWpRun>,
     /// Runs mapped into the child by THIS attempt.
     pub(crate) child_runs: Vec<CowRun>,
+    /// Pages that were already read-only AND already copy-on-write in the parent — inherited from
+    /// an EARLIER fork — and whose mark this attempt propagated to the child. Recorded so the
+    /// caller can report them: without the propagated mark the child's first write finds the page
+    /// present and read-only but not COW, the handler declines, and the fault loops.
+    pub(crate) inherited_cow: Vec<VirtAddr>,
     /// The parent's mapping count before the clone. A rollback proves it comes back to this.
     pub(crate) parent_mappings_before: usize,
     /// The TLB work the write-protection owes.
@@ -256,7 +263,7 @@ pub(crate) fn clone_address_space_cow_locked(
 ) -> Result<CowCloneToken, CowCloneError> {
     let Some(snapshot) = snapshot_parent_runs(vm, parent_asid) else {
         return Err(CowCloneError::new(
-            site::PREFLIGHT_CHILD,
+            site::PARENT_MISSING,
             0,
             KernelError::Vm(VmError::InvalidAsid),
         ));
@@ -283,6 +290,7 @@ pub(crate) fn clone_address_space_cow_locked(
         generation,
         wp: Vec::new(),
         child_runs: Vec::new(),
+        inherited_cow: Vec::new(),
         parent_mappings_before,
         shootdown: CowShootdownPlan {
             asid: parent_asid,
@@ -380,15 +388,16 @@ pub(crate) fn clone_address_space_cow_locked(
             // parent mark and is shared directly — a write there is a real protection fault.
             for p in 0..pages {
                 let pv = VirtAddr(virt.0 + p as u64 * page_sz);
-                if is_cow_page_locked(memory, parent_asid, pv)
-                    && let Err(err) = mark_cow_page_locked(memory, child_asid, pv)
-                {
-                    rollback_cow_clone_locked(vm, memory, &token);
-                    return Err(CowCloneError::new(
-                        site::MARK_COW_CHILD_INHERITED,
-                        pv.0,
-                        err,
-                    ));
+                if is_cow_page_locked(memory, parent_asid, pv) {
+                    if let Err(err) = mark_cow_page_locked(memory, child_asid, pv) {
+                        rollback_cow_clone_locked(vm, memory, &token);
+                        return Err(CowCloneError::new(
+                            site::MARK_COW_CHILD_INHERITED,
+                            pv.0,
+                            err,
+                        ));
+                    }
+                    token.inherited_cow.push(pv);
                 }
             }
         }

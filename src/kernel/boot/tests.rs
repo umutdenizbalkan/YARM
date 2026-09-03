@@ -45030,13 +45030,52 @@ mod stage163_sender_wake_proven {
     //     sub-knob (never in a normal boot).
     #[test]
     fn stage163d_cow_failure_diagnostics_have_site_and_counts() {
+        const COW_CLONE_SRC: &str = include_str!("cow_clone.rs");
         assert!(
             MEMORY_STATE_SRC.contains("FORK_PROOF_COW_STATS")
                 && MEMORY_STATE_SRC.contains("FORK_PROOF_COW_STATS_ASID")
-                && MEMORY_STATE_SRC.contains("FORK_PROOF_COW_FAIL_DETAIL site=create_user_space")
-                && MEMORY_STATE_SRC.contains("FORK_PROOF_COW_FAIL_DETAIL site=map_child"),
+                && MEMORY_STATE_SRC.contains("FORK_PROOF_COW_FAIL_DETAIL site={} va=0x{:x}"),
             "the COW clone must log COW_STATS + per-site COW_FAIL_DETAIL with used/cap"
         );
+        // U9-FORK1 §2 re-derivation. The clone body moved into `cow_clone.rs` and holds VM+memory
+        // for its whole duration, so it may not log — the caller does, from a TYPED site the body
+        // returned. That makes the old two-literal check strictly weaker than what is now
+        // provable: the vocabulary is a closed list, and EVERY failure arm of the body reports a
+        // member of it. A new fallible step cannot be added without extending the list.
+        assert!(
+            COW_CLONE_SRC
+                .contains("pub(crate) const CREATE_USER_SPACE: &str = \"create_user_space\";")
+                && COW_CLONE_SRC.contains("pub(crate) const MAP_CHILD: &str = \"map_child\";"),
+            "the historical create_user_space / map_child sites must survive the move"
+        );
+        let declared = COW_CLONE_SRC
+            .split("pub(crate) const ALL_COW_CLONE_SITES: [&str; ")
+            .nth(1)
+            .expect("the exhaustive site list");
+        let declared_len: usize = declared
+            .split(']')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("the site-list length");
+        let body = COW_CLONE_SRC
+            .split("pub(crate) fn clone_address_space_cow_locked(")
+            .nth(1)
+            .expect("the clone body")
+            .split("\n/// THE exact inverse")
+            .next()
+            .expect("the clone body end");
+        assert_eq!(
+            body.matches("CowCloneError::new(").count(),
+            declared_len,
+            "every failure arm of the clone body must report one declared site, and every declared \
+             site must be reported by one arm"
+        );
+        for site in crate::kernel::boot::cow_clone::ALL_COW_CLONE_SITES {
+            assert!(
+                body.contains(&alloc::format!("site::{}", site.to_uppercase())),
+                "declared site `{site}` is never reported by the clone body"
+            );
+        }
         assert!(
             MEMORY_STATE_SRC.contains("ipc_recv_proof_sender_wake_active()")
                 && MEMORY_STATE_SRC.contains("if proof {"),
@@ -45131,47 +45170,84 @@ mod stage163_sender_wake_proven {
     //     mid-clone failure. The before/after parent-count diagnostics are present.
     #[test]
     fn stage163e_cow_clone_is_transactional() {
-        // Preflight + before/after stats + rollback markers exist.
+        const COW_CLONE_SRC: &str = include_str!("cow_clone.rs");
+        // The failure/rollback diagnostic vocabulary. U9-FORK1 §2 moved the per-run
+        // `FORK_PROOF_COW_MAP_PARENT_*` lines into the `VM_COW_FORK_PARENT_WRITE_PROTECT` run
+        // report, which is emitted from the token for EVERY write-protected run rather than only
+        // under the second sub-knob — so the coverage went up, not down.
         for marker in &[
             "FORK_PROOF_COW_STATS_BEFORE parent_used=",
-            "FORK_PROOF_COW_PREFLIGHT required_parent=",
-            "FORK_PROOF_COW_FAIL_DETAIL site=preflight_child",
-            "FORK_PROOF_COW_ROLLBACK_BEGIN parent_used=",
+            "FORK_PROOF_COW_FAIL_DETAIL site=",
             "FORK_PROOF_COW_ROLLBACK_DONE parent_used=",
             "FORK_PROOF_COW_STATS_AFTER_FAIL parent_used=",
-            "FORK_PROOF_COW_MAP_PARENT_BEGIN",
-            "FORK_PROOF_COW_MAP_PARENT_OK",
-            "FORK_PROOF_COW_MAP_PARENT_FAIL",
+            "VM_COW_FORK_ROLLBACK_BEGIN parent_asid=",
+            "VM_COW_FORK_PARENT_WRITE_PROTECT va=",
         ] {
             assert!(
                 MEMORY_STATE_SRC.contains(marker),
                 "COW clone must emit `{marker}`"
             );
         }
-        // Preflight rejects BEFORE mutating: within the clone function, the
-        // over-capacity check returns before create_user_space is called.
-        let clone_fn = MEMORY_STATE_SRC
-            .split("fn clone_user_address_space_cow(")
+        // Preflight rejects BEFORE mutating. This is now checkable in the body itself rather than
+        // in the wrapper: both pre-mutation refusals precede the one call that creates anything.
+        let body = COW_CLONE_SRC
+            .split("pub(crate) fn clone_address_space_cow_locked(")
             .nth(1)
-            .and_then(|s| s.split("\n    fn rollback_cow_clone(").next())
-            .expect("clone fn");
-        let i_preflight = clone_fn
-            .find("if required_child > available_child {")
-            .expect("preflight check");
-        let i_create = clone_fn
-            .find("spaces.create_user_space()")
+            .expect("the clone body")
+            .split("\n/// THE exact inverse")
+            .next()
+            .expect("the clone body end");
+        let i_parent = body
+            .find("site::PARENT_MISSING")
+            .expect("parent-missing refusal");
+        let i_preflight = body
+            .find("site::PREFLIGHT_CHILD")
+            .expect("over-capacity refusal");
+        let i_create = body
+            .find(".create_user_space()")
             .expect("create_user_space");
         assert!(
-            i_preflight < i_create,
-            "preflight must run before create_user_space (no mutation on reject)"
+            i_parent < i_create && i_preflight < i_create,
+            "both preflight refusals must precede create_user_space (no mutation on reject)"
         );
-        // The clone uses a snapshot + rollback helper, not the live-table walk.
+        // The clone snapshots the parent instead of walking the live table, and unwinds through
+        // ONE helper — the same one the caller uses, so there is no second unwind policy.
         assert!(
-            MEMORY_STATE_SRC.contains("fn rollback_cow_clone(")
-                && MEMORY_STATE_SRC.contains(
-                    "let snapshot: alloc::vec::Vec<(VirtAddr, PhysAddr, PageFlags, usize)>"
-                ),
-            "the clone must snapshot the parent and have a rollback helper"
+            COW_CLONE_SRC.contains("fn snapshot_parent_runs(")
+                && COW_CLONE_SRC.contains("Vec<(VirtAddr, PhysAddr, PageFlags, usize)>"),
+            "the clone must snapshot the parent's runs before mutating it"
+        );
+        assert_eq!(
+            COW_CLONE_SRC
+                .matches("pub(crate) fn rollback_cow_clone_locked(")
+                .count(),
+            1,
+            "exactly one rollback body"
+        );
+        // Three of the eight arms are pre-mutation and have nothing to unwind: the parent is
+        // missing, the child would not fit, and `create_user_space` itself failed — that one
+        // confirms a free registry slot BEFORE allocating an ASID or registering a page-table
+        // root, so a full manager performs neither. Every one of the remaining five unwinds
+        // through the single rollback body.
+        assert_eq!(
+            body.matches("rollback_cow_clone_locked(vm, memory, &token)")
+                .count(),
+            body.matches("CowCloneError::new(").count() - 3,
+            "every post-mutation failure arm must unwind through that one body"
+        );
+        let first_mutation = body
+            .find(".create_user_space()")
+            .expect("create_user_space");
+        for pre in ["site::PARENT_MISSING", "site::PREFLIGHT_CHILD"] {
+            assert!(
+                body.find(pre).expect(pre) < first_mutation,
+                "`{pre}` must refuse before the first mutation"
+            );
+        }
+        assert!(
+            MEMORY_STATE_SRC
+                .contains("super::cow_clone::rollback_cow_clone_locked(vm, memory, token)"),
+            "the broad rollback must reach the same body, not a copy"
         );
     }
 
@@ -45196,12 +45272,38 @@ mod stage163_sender_wake_proven {
             !wp.contains("self.len"),
             "in-place write-protect must not modify the entry count (no split)"
         );
-        // The clone drives the parent write-protect via the in-place helper, not via
-        // a second map_user_page_in_asid_raw on the parent.
-        assert!(
-            MEMORY_STATE_SRC.contains("write_protect_run_head_in_place(virt)"),
-            "the clone must write-protect the parent run in place"
-        );
+        // The clone drives the parent write-protect via the in-place helper, not via a second
+        // `map_user_page_in_asid_raw` on the parent. U9-FORK1 §2 moved the body into
+        // `cow_clone.rs`; the claim is unchanged and gains a second half, because the body can now
+        // be read in isolation: the mapper it calls names the CHILD ASID and never the parent.
+        {
+            const COW_CLONE_SRC: &str = include_str!("cow_clone.rs");
+            let body = COW_CLONE_SRC
+                .split("pub(crate) fn clone_address_space_cow_locked(")
+                .nth(1)
+                .expect("the clone body")
+                .split("\n/// THE exact inverse")
+                .next()
+                .expect("the clone body end");
+            assert!(
+                body.contains("write_protect_run_head_in_place(virt)"),
+                "the clone must write-protect the parent run in place"
+            );
+            assert_eq!(
+                body.matches("map_user_page_in_asid_raw_locked(").count(),
+                1,
+                "the clone installs pages through exactly one mapper call"
+            );
+            let map_call = body
+                .split("map_user_page_in_asid_raw_locked(")
+                .nth(1)
+                .expect("the mapper call");
+            let args = map_call.split(')').next().unwrap_or("");
+            assert!(
+                args.contains("child_asid") && !args.contains("parent_asid"),
+                "the clone may only MAP into the child; the parent is downgraded in place"
+            );
+        }
         // Regression tests exist (data-structure level + integration level).
         assert!(
             VM_SRC.contains("fn write_protect_run_head_in_place_does_not_split_or_grow"),
@@ -45314,16 +45416,28 @@ mod stage163g_cow_pagefault {
     //    earlier fork (the inherited-shared branch), keeping write-protect in place.
     #[test]
     fn stage163g_clone_propagates_inherited_cow_marks() {
-        let clone = MEMORY_STATE_SRC
-            .split("fn clone_user_address_space_cow(")
+        const COW_CLONE_SRC: &str = include_str!("cow_clone.rs");
+        let clone = COW_CLONE_SRC
+            .split("pub(crate) fn clone_address_space_cow_locked(")
             .nth(1)
-            .and_then(|s| s.split("\n    fn rollback_cow_clone(").next())
-            .expect("clone fn");
+            .and_then(|s| s.split("\n/// THE exact inverse").next())
+            .expect("clone body");
         assert!(
-            clone.contains("is_cow_page(parent_asid, pv)")
-                && clone.contains("mark_cow_page(child_asid, pv)")
-                && clone.contains("FORK_PROOF_COW_INHERIT_SHARED"),
+            clone.contains("is_cow_page_locked(memory, parent_asid, pv)")
+                && clone.contains("mark_cow_page_locked(memory, child_asid, pv)"),
             "clone must COW-mark the child for RO-COW-inherited parent pages"
+        );
+        // U9-FORK1 §2: the body holds VM+memory and may not log, so the marker is emitted by the
+        // caller from a list the body RECORDED. That is stronger than the old in-body log: the
+        // reported page set is now the same value the propagation walked, not a separate print.
+        assert!(
+            clone.contains("token.inherited_cow.push(pv);"),
+            "every inherited COW page the clone propagates must be recorded on the token"
+        );
+        assert!(
+            MEMORY_STATE_SRC.contains("for pv in &token.inherited_cow {")
+                && MEMORY_STATE_SRC.contains("FORK_PROOF_COW_INHERIT_SHARED va=0x{:x}"),
+            "the caller must report exactly the pages the token recorded"
         );
         // Stage 163E in-place write-protect is preserved (no eager per-page split).
         assert!(
@@ -45867,11 +45981,29 @@ mod stage163j_fork_return_lane {
     //    PF / intermediate-permission behavior remains intact.
     #[test]
     fn stage163j_preserves_163e_cow_and_163i_pf() {
-        assert!(
-            MEM_SRC.contains("write_protect_run_head_in_place")
-                && MEM_SRC.contains("required_child"),
-            "Stage 163E transactional/run-preserving COW clone must remain"
-        );
+        // U9-FORK1 §2 moved the clone body to `cow_clone.rs`, so this checks the two Stage 163E
+        // properties where they now live: the run-preserving in-place write-protect, and the
+        // capacity preflight that refuses before anything is created. The second is now checked as
+        // an ORDER rather than as the presence of a `required_child` local, which is what the
+        // property always meant.
+        {
+            const COW_CLONE_SRC: &str = include_str!("cow_clone.rs");
+            let body = COW_CLONE_SRC
+                .split("pub(crate) fn clone_address_space_cow_locked(")
+                .nth(1)
+                .and_then(|s| s.split("\n/// THE exact inverse").next())
+                .expect("clone body");
+            assert!(
+                body.contains("write_protect_run_head_in_place"),
+                "Stage 163E run-preserving in-place parent write-protect must remain"
+            );
+            assert!(
+                body.contains("snapshot.len() > crate::kernel::vm::MAX_MAPPINGS")
+                    && body.find("site::PREFLIGHT_CHILD").expect("preflight")
+                        < body.find(".create_user_space()").expect("create"),
+                "Stage 163E capacity preflight must remain, and must refuse before any mutation"
+            );
+        }
         assert!(
             X86_PT_SRC.contains("pub fn repair_user_path_intermediates")
                 && FAULT_SRC.contains("eff_present && eff_user && (!need_write || eff_writable)"),
@@ -46005,11 +46137,29 @@ mod stage163k_no_smoke_interference {
     //    remain intact.
     #[test]
     fn stage163k_preserves_163e_cow_and_163i_pf() {
-        assert!(
-            MEM_SRC.contains("write_protect_run_head_in_place")
-                && MEM_SRC.contains("required_child"),
-            "Stage 163E transactional/run-preserving COW clone must remain"
-        );
+        // U9-FORK1 §2 moved the clone body to `cow_clone.rs`, so this checks the two Stage 163E
+        // properties where they now live: the run-preserving in-place write-protect, and the
+        // capacity preflight that refuses before anything is created. The second is now checked as
+        // an ORDER rather than as the presence of a `required_child` local, which is what the
+        // property always meant.
+        {
+            const COW_CLONE_SRC: &str = include_str!("cow_clone.rs");
+            let body = COW_CLONE_SRC
+                .split("pub(crate) fn clone_address_space_cow_locked(")
+                .nth(1)
+                .and_then(|s| s.split("\n/// THE exact inverse").next())
+                .expect("clone body");
+            assert!(
+                body.contains("write_protect_run_head_in_place"),
+                "Stage 163E run-preserving in-place parent write-protect must remain"
+            );
+            assert!(
+                body.contains("snapshot.len() > crate::kernel::vm::MAX_MAPPINGS")
+                    && body.find("site::PREFLIGHT_CHILD").expect("preflight")
+                        < body.find(".create_user_space()").expect("create"),
+                "Stage 163E capacity preflight must remain, and must refuse before any mutation"
+            );
+        }
         assert!(
             X86_PT_SRC.contains("pub fn repair_user_path_intermediates")
                 && FAULT_SRC.contains("eff_present && eff_user && (!need_write || eff_writable)"),
