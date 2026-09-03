@@ -156784,3 +156784,528 @@ mod u9spawnic1_endpoint_cap_txn {
         );
     }
 }
+
+/// U9-FORK1 §5 — the fork transaction, its one clone owner, and its exact rollback.
+///
+/// Every guard here binds BOTH routes at once, because both execute the same generic policy over
+/// the same owner interface. That is the property the whole increment rests on, and the first
+/// three tests establish it before anything else asserts against "the" body.
+mod u9fork1_cow_fork_transaction {
+    use super::*;
+    use crate::kernel::boot::cow_clone::{ALL_COW_CLONE_SITES, CowCloneRollback};
+    use crate::kernel::boot::{Bootstrap, KernelState};
+    use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, VirtAddr};
+
+    const COW_CLONE: &str = include_str!("cow_clone.rs");
+    const FORK_TXN: &str = include_str!("../syscall/fork_txn.rs");
+    const FORK_OWNERS: &str = include_str!("fork_owners.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const MEM_STATE: &str = include_str!("memory_state.rs");
+    const THREAD_STATE: &str = include_str!("thread_state.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    fn txn_body() -> &'static str {
+        FORK_TXN
+            .split("pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(")
+            .nth(1)
+            .and_then(|s| s.split("\n/// The PT-pool and per-owner").next())
+            .expect("the fork transaction body")
+    }
+
+    fn clone_body() -> &'static str {
+        COW_CLONE
+            .split("pub(crate) fn clone_address_space_cow_locked(")
+            .nth(1)
+            .and_then(|s| s.split("\n/// THE exact inverse").next())
+            .expect("the clone body")
+    }
+
+    // ── One implementation, reached by both routes ──────────────────────────────────────
+
+    /// There is exactly ONE copy-on-write clone body and exactly ONE inverse, and every caller
+    /// reaches them rather than repeating them.
+    #[test]
+    fn there_is_one_cow_clone_implementation_and_one_inverse() {
+        assert_eq!(
+            COW_CLONE
+                .matches("pub(crate) fn clone_address_space_cow_locked(")
+                .count(),
+            1,
+            "one clone body"
+        );
+        assert_eq!(
+            COW_CLONE
+                .matches("pub(crate) fn rollback_cow_clone_locked(")
+                .count(),
+            1,
+            "one inverse"
+        );
+        // The two acquisitions — broad and split — call in; neither reimplements.
+        assert!(
+            MEM_STATE.contains("super::cow_clone::clone_address_space_cow_locked(vm, memory, parent_asid, generation)")
+                || MEM_STATE.contains("clone_address_space_cow_locked("),
+            "the broad acquisition must call the shared body"
+        );
+        assert!(
+            RUNTIME.contains("crate::kernel::boot::cow_clone::clone_address_space_cow_locked("),
+            "the split acquisition must call the shared body"
+        );
+        // Nothing outside `cow_clone.rs` may write-protect a parent run for a fork.
+        for (name, src) in [
+            ("memory_state.rs", MEM_STATE),
+            ("thread_state.rs", THREAD_STATE),
+            ("runtime.rs", RUNTIME),
+            ("fork_txn.rs", FORK_TXN),
+        ] {
+            assert!(
+                !src.contains("write_protect_run_head_in_place"),
+                "{name} must not write-protect: that is the clone body's job alone"
+            );
+        }
+    }
+
+    /// There is exactly ONE fork policy, and both production routes execute it.
+    #[test]
+    fn both_routes_execute_the_one_fork_transaction() {
+        assert_eq!(
+            FORK_TXN
+                .matches("pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(")
+                .count(),
+            1,
+            "one fork policy"
+        );
+        assert!(
+            THREAD_STATE.contains("crate::kernel::syscall::fork_txn::fork_process_cow(")
+                && SPLIT.contains("crate::kernel::syscall::fork_txn::fork_process_cow("),
+            "the broad and split routes must both call the one policy"
+        );
+        // And neither route re-derives any of the transaction's own steps.
+        let route = SPLIT
+            .split("fn try_split_fork_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n/// Read and normalise").next())
+            .expect("the split fork route");
+        for forbidden in [
+            "reserve_task_for_spawn",
+            "clone_address_space_cow",
+            "publish_forked_child",
+            "enqueue_on_cpu",
+        ] {
+            assert!(
+                !route.contains(forbidden),
+                "the split route must not re-derive `{forbidden}` — the policy owns it"
+            );
+        }
+    }
+
+    // ── The rollback ────────────────────────────────────────────────────────────────────
+
+    /// A never-resident child is torn down through the never-resident teardown, which consumes no
+    /// retired-ASID slot. Using the LIVE teardown would burn one slot per failed fork until
+    /// `destroy_and_collect_mappings` correctly refused — an exact rollback turned into a leak.
+    #[test]
+    fn a_never_resident_child_is_never_torn_down_as_a_live_one() {
+        let inverse = COW_CLONE
+            .split("pub(crate) fn rollback_cow_clone_locked(")
+            .nth(1)
+            .expect("the inverse");
+        assert!(
+            inverse.contains("destroy_unresident_address_space_locked("),
+            "the child must go through the never-resident teardown"
+        );
+        assert!(
+            !COW_CLONE.contains("destroy_user_address_space_by_asid"),
+            "the clone module must never reach the live teardown"
+        );
+        assert!(
+            !FORK_TXN.contains("destroy_live_address_space"),
+            "the fork transaction must never reach the live teardown"
+        );
+    }
+
+    /// Children before the source, and the parent restored in REVERSE order.
+    #[test]
+    fn the_inverse_runs_in_reverse_order() {
+        let inverse = COW_CLONE
+            .split("pub(crate) fn rollback_cow_clone_locked(")
+            .nth(1)
+            .expect("the inverse");
+        let child = inverse
+            .find("destroy_unresident_address_space_locked(")
+            .expect("child teardown");
+        let parent = inverse
+            .find("restore_run_head_flags_in_place(")
+            .expect("parent restore");
+        assert!(child < parent, "the child goes before the parent restore");
+        assert!(
+            inverse.contains("token.wp.iter().rev()"),
+            "parent runs must be restored in reverse order"
+        );
+    }
+
+    /// Every failure arm of the transaction compensates, and the two compensations are the only
+    /// ones. A new `return Err` that forgot to unwind fails here.
+    #[test]
+    fn every_failure_arm_of_the_transaction_compensates() {
+        let body = txn_body();
+        // Arms that return an error WITHOUT unwinding are exactly the pre-mutation ones: the
+        // parent snapshot, the parent ASID check, the TID allocation and the reservation itself
+        // (whose own compensation is internal), plus the claim, which cancels.
+        let unwinds = body.matches("unwind(").count() + body.matches("unwind_published(").count();
+        assert_eq!(
+            unwinds, 6,
+            "five pre-publication arms and the one post-publication arm must each compensate"
+        );
+        assert!(
+            body.contains("unwind_published(owners, child_tid, &clone, &grants, err);"),
+            "the enqueue arm — the only failure after the commit — needs its own compensation"
+        );
+        // The post-publication compensation removes the TASK before anything it names.
+        let published = FORK_TXN
+            .split("fn unwind_published<O: SpawnTxnOwners>(")
+            .nth(1)
+            .expect("the published unwind");
+        let remove = published
+            .find("remove_published_fork_child(child_tid)")
+            .expect("task removal");
+        let rollback = published
+            .find("rollback_cow_clone(clone)")
+            .expect("clone rollback");
+        assert!(
+            remove < rollback,
+            "the task must be removed BEFORE its address space — the reverse is what left a \
+             runnable TCB naming a freed ASID"
+        );
+    }
+
+    // ── The shootdown ───────────────────────────────────────────────────────────────────
+
+    /// The write-protection's TLB obligation is PLANNED under the locks and PERFORMED outside
+    /// them. Nothing waits for an ACK while holding a domain lock.
+    #[test]
+    fn no_domain_lock_is_held_across_the_shootdown() {
+        // The locked body plans, and cannot reach the coordinator.
+        for forbidden in [
+            "complete_unmap_shootdown_split",
+            "submit_cross_cpu_work",
+            "request_live_asid_shootdown",
+            "await_tlb_shootdown_ack",
+        ] {
+            assert!(
+                !COW_CLONE.contains(forbidden),
+                "the locked clone body must not reach `{forbidden}`"
+            );
+        }
+        // The split owner performs it, and does so outside every acquisition closure.
+        let performer = RUNTIME
+            .split("pub(crate) fn complete_cow_write_protect_shootdown_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// rank 5 → 6, ONE acquisition").next())
+            .expect("the split shootdown owner");
+        assert!(
+            performer.contains("self.complete_unmap_shootdown_split(plan.asid, va)"),
+            "the split route must drive the existing generation-matched coordinator"
+        );
+        for forbidden in [
+            "with_vm_then_memory_split_mut",
+            "with_vm_user_spaces_split_mut",
+            "with_memory_split_mut",
+            "with_task_tcbs_split_mut",
+        ] {
+            assert!(
+                !performer.contains(forbidden),
+                "the shootdown must hold no domain lock (`{forbidden}` present)"
+            );
+        }
+        // And the transaction calls it BETWEEN the clone and everything that follows.
+        let body = txn_body();
+        let clone_at = body
+            .find("owners.clone_address_space_cow(parent.asid, clone_generation)")
+            .expect("the clone");
+        let shoot_at = body
+            .find("owners.complete_cow_shootdown(&clone.shootdown)")
+            .expect("the shootdown");
+        let publish_at = body
+            .find("owners.publish_forked_child(&reservation, &publication)")
+            .expect("the publication");
+        assert!(
+            clone_at < shoot_at && shoot_at < publish_at,
+            "the shootdown must follow the write-protection and precede the publication"
+        );
+    }
+
+    /// A rollback owes the restoration shootdown, and only when it actually restored something.
+    #[test]
+    fn a_rollback_owes_its_restoration_shootdown() {
+        assert_eq!(
+            FORK_TXN
+                .matches("owners.complete_cow_shootdown(&clone.restoration_shootdown())")
+                .count(),
+            2,
+            "both compensations owe the restoration shootdown"
+        );
+        assert_eq!(
+            FORK_TXN
+                .matches("matches!(rollback, CowCloneRollback::Restored { .. })")
+                .count()
+                + FORK_TXN
+                    .matches("matches!(outcome, CowCloneRollback::Restored { .. })")
+                    .count(),
+            2,
+            "and each owes it only when the rollback actually restored permissions"
+        );
+    }
+
+    // ── The ABI ─────────────────────────────────────────────────────────────────────────
+
+    /// Parent gets the child identity, child gets zero, on every architecture and both routes.
+    #[test]
+    fn the_fork_return_abi_is_exact_and_shared() {
+        let ctx = FORK_TXN
+            .split("pub(crate) fn fork_child_context(parent: &UserRegisterContext)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("fork_child_context");
+        assert!(
+            ctx.contains("context.user_gprs[0] = 0;") && ctx.contains("context.arg0 = 0;"),
+            "both return lanes are zeroed for the child"
+        );
+        assert_eq!(
+            FORK_TXN
+                .matches("pub(crate) fn fork_child_context(")
+                .count(),
+            1,
+            "one owner decides the child's context"
+        );
+        assert_eq!(
+            FORK_TXN.matches("fork_child_context(&").count(),
+            1,
+            "and the publication is its only consumer"
+        );
+    }
+
+    /// NR 12 is admitted on all three architectures — the routing is architecture-neutral but
+    /// admission is not, and an unlisted NR keeps `nr = 0` so the dispatcher would decline.
+    #[test]
+    fn nr12_is_admitted_on_all_three_architectures() {
+        assert!(
+            SPLIT.contains("Syscall::Fork => Some(syscall),"),
+            "x86_64 reaches the route through the shared classifier"
+        );
+        assert!(
+            TRAP_ENTRY.contains("raw_nr == crate::kernel::syscall::SYSCALL_FORK_NR"),
+            "AArch64 must import NR 12's ABI or the dispatcher never sees it"
+        );
+        assert!(
+            RISCV_TRAP.contains("nr == crate::kernel::syscall::SYSCALL_FORK_NR"),
+            "RISC-V must admit NR 12 in `split_eligible`"
+        );
+    }
+
+    /// The split route never falls back to the broad path after the transaction has begun: a
+    /// second attempt would fork twice.
+    #[test]
+    fn the_split_route_never_falls_back_after_mutation() {
+        let route = SPLIT
+            .split("fn try_split_fork_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n/// Read and normalise").next())
+            .expect("the split fork route");
+        let txn_at = route
+            .find("fork_txn::fork_process_cow(")
+            .expect("the transaction");
+        assert_eq!(
+            route[txn_at..].matches("return None").count()
+                + route[txn_at..].matches("None\n").count(),
+            0,
+            "no path after the transaction may decline to the broad route"
+        );
+        assert!(
+            route[..txn_at].contains("return None"),
+            "the pre-mutation refusal must decline to the broad route"
+        );
+    }
+
+    /// The clone's failure-site vocabulary is closed and exhaustive.
+    #[test]
+    fn the_clone_reports_only_declared_failure_sites() {
+        let body = clone_body();
+        assert_eq!(
+            body.matches("CowCloneError::new(").count(),
+            ALL_COW_CLONE_SITES.len(),
+            "every arm reports a declared site and every declared site has an arm"
+        );
+    }
+
+    // ── Behaviour: failure injection with a full before/after comparison ────────────────
+
+    /// A fixture with a writable parent whose clone can be forced to fail mid-way.
+    fn parent_with_writable_pages(pages: usize) -> (KernelState, Asid, u64) {
+        let mut state = Bootstrap::init().expect("init");
+        let (parent_asid, _cap) = state.create_user_address_space().expect("asid");
+        state.register_task(36).expect("parent");
+        state.bind_task_asid(36, parent_asid).expect("bind");
+        let (_mo, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let phys = state
+            .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+            .expect("phys");
+        for page in 0..pages {
+            let va = VirtAddr(0x20_0000 + (page * PAGE_SIZE) as u64);
+            state
+                .map_user_page_in_asid_raw(
+                    parent_asid,
+                    va,
+                    Mapping {
+                        phys,
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map");
+        }
+        (state, parent_asid, 36)
+    }
+
+    /// Everything a failed clone must leave exactly as it found it.
+    #[derive(Debug, PartialEq, Eq)]
+    struct VmSnapshot {
+        parent_mappings: usize,
+        parent_flags: alloc::vec::Vec<(u64, bool, bool, bool)>,
+        parent_phys: alloc::vec::Vec<u64>,
+        cow_pages_total: usize,
+        cow_pages_parent: usize,
+        cow_buckets: usize,
+        live_address_spaces: usize,
+        live_tasks: usize,
+    }
+
+    fn snapshot(state: &KernelState, parent: Asid) -> VmSnapshot {
+        let (parent_mappings, parent_flags, parent_phys, live_address_spaces) = state
+            .with_user_spaces(|spaces| {
+                let aspace = spaces.get(parent);
+                let mut flags = alloc::vec::Vec::new();
+                let mut phys = alloc::vec::Vec::new();
+                let mut count = 0usize;
+                if let Some(aspace) = aspace {
+                    count = aspace.mappings();
+                    let mut i = 0usize;
+                    while let Some((virt, mapping, _pages)) = aspace.run_at(i) {
+                        flags.push((
+                            virt.0,
+                            mapping.flags.read,
+                            mapping.flags.write,
+                            mapping.flags.execute,
+                        ));
+                        phys.push(mapping.phys.0);
+                        i += 1;
+                    }
+                }
+                (count, flags, phys, spaces.live_count())
+            });
+        VmSnapshot {
+            parent_mappings,
+            parent_flags,
+            parent_phys,
+            cow_pages_total: state.cow_page_count(),
+            cow_pages_parent: state.cow_page_count_for_asid(parent),
+            cow_buckets: state.cow_asid_bucket_count(),
+            live_address_spaces,
+            live_tasks: state.with_tcbs(|tcbs| tcbs.iter().flatten().count()),
+        }
+    }
+
+    /// A clone that fails mid-way leaves the parent BYTE-IDENTICAL — every PTE, every permission,
+    /// every physical identity, every COW mark, the mapping count, the address-space table and
+    /// the task table.
+    #[test]
+    fn a_failed_clone_leaves_the_parent_byte_identical() {
+        let (mut state, parent_asid, _tid) = parent_with_writable_pages(3);
+        let before = snapshot(&state, parent_asid);
+        // Force `mark_cow_page` to fail partway: parent0, child0, parent1, child1, parent2 = 5.
+        state.with_memory_state_mut(|m| m.cow_page_capacity_limit = Some(5));
+        assert_eq!(
+            state.clone_user_address_space_cow(parent_asid),
+            Err(KernelError::MemoryObjectFull),
+            "the injected capacity failure must surface"
+        );
+        state.with_memory_state_mut(|m| m.cow_page_capacity_limit = None);
+        let after = snapshot(&state, parent_asid);
+        assert_eq!(
+            before, after,
+            "a failed clone must leave the parent and every table it touched unchanged"
+        );
+    }
+
+    /// The same injection through the WHOLE fork transaction: no TCB, TID, CNode, address space,
+    /// COW mark or run-queue entry survives.
+    #[test]
+    fn a_failed_fork_leaves_no_residue_anywhere() {
+        let (mut state, parent_asid, parent_tid) = parent_with_writable_pages(3);
+        state.enqueue_current_cpu(parent_tid).expect("enqueue");
+        let before = snapshot(&state, parent_asid);
+        state.with_memory_state_mut(|m| m.cow_page_capacity_limit = Some(5));
+        let result = state.fork_user_process_cow(parent_tid, None);
+        state.with_memory_state_mut(|m| m.cow_page_capacity_limit = None);
+        assert!(result.is_err(), "the injected failure must refuse the fork");
+        let after = snapshot(&state, parent_asid);
+        assert_eq!(
+            before, after,
+            "a failed fork must leave no TCB, address space, COW mark or mapping behind"
+        );
+    }
+
+    /// The rollback is repeat-inert and refuses a stale token without mutating.
+    #[test]
+    fn the_rollback_is_repeat_inert_and_refuses_a_stale_token() {
+        let (mut state, parent_asid, _tid) = parent_with_writable_pages(2);
+        let generation = 7;
+        let token = state
+            .clone_user_address_space_cow_token(parent_asid, generation)
+            .expect("clone");
+        assert!(!token.wp.is_empty(), "the parent had writable runs");
+        let first = state.rollback_cow_clone_token(&token);
+        assert!(
+            matches!(first, CowCloneRollback::Restored { .. }),
+            "the first rollback restores"
+        );
+        let restored = snapshot(&state, parent_asid);
+        // Repeat: inert, because the child is already gone.
+        assert_eq!(
+            state.rollback_cow_clone_token(&token),
+            CowCloneRollback::AlreadyGone,
+            "a repeated rollback must be inert"
+        );
+        assert_eq!(
+            snapshot(&state, parent_asid),
+            restored,
+            "and must change nothing"
+        );
+    }
+
+    /// The child maps the parent's EXACT backing — no frame is copied during the fork.
+    #[test]
+    fn the_child_shares_the_parents_frames_and_copies_none() {
+        let (mut state, parent_asid, _tid) = parent_with_writable_pages(2);
+        let parent_phys = snapshot(&state, parent_asid).parent_phys;
+        let token = state
+            .clone_user_address_space_cow_token(parent_asid, 1)
+            .expect("clone");
+        let child_phys: alloc::vec::Vec<u64> =
+            token.child_runs.iter().map(|run| run.phys.0).collect();
+        assert_eq!(
+            child_phys, parent_phys,
+            "every child run must name the parent's own physical backing"
+        );
+        // And the parent is now read-only where it was writable.
+        let after = snapshot(&state, parent_asid);
+        assert!(
+            after.parent_flags.iter().all(|(_, _, write, _)| !*write),
+            "every writable parent run must have been downgraded"
+        );
+        assert_eq!(
+            after.parent_mappings, token.parent_mappings_before,
+            "the parent's entry count must not change: the downgrade is in place, not a split"
+        );
+    }
+}
