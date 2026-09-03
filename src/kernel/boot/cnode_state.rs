@@ -131,7 +131,7 @@ impl KernelState {
                 .process_id(record.source_tid)
                 .unwrap_or(record.source_tid);
             let dest_pid = self.process_id(record.dest_tid).unwrap_or(record.dest_tid);
-            if source_pid == pid || dest_pid == pid {
+            if link_names_process(source_pid, dest_pid, pid) {
                 self.with_capability_state_mut(|capability| {
                     capability.delegated_capability_links[idx] = None;
                 });
@@ -258,27 +258,10 @@ impl KernelState {
             }
         }
 
-        let mut removed_cnode_space = false;
-        let mut removed_process_record = false;
-        self.with_capability_state_mut(|capability| {
-            if let Some(slot) = capability
-                .cnode_spaces
-                .iter_mut()
-                .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
-            {
-                *slot = None;
-                removed_cnode_space = true;
-            }
-
-            if let Some(slot) = capability
-                .process_cnodes
-                .iter_mut()
-                .find(|slot| slot.is_some_and(|record| record.pid == pid))
-            {
-                *slot = None;
-                removed_process_record = true;
-            }
-        });
+        let (removed_cnode_space, removed_process_record) = self
+            .with_capability_state_mut(|capability| {
+                reap_process_cspace_locked(capability, pid, cnode)
+            });
 
         crate::yarm_log!(
             "YARM_PROC_CNODE_CLEANUP_NOALLOC pid={} cnode={} slots={} removed_links={} removed_cspace={} removed_record={}",
@@ -397,4 +380,44 @@ pub(crate) fn set_process_cnode_for_pid_locked(
         return Ok(());
     }
     Err(KernelError::TaskTableFull)
+}
+
+/// U9-SPAWN-TXN3 §3 — THE reap's delegation-link predicate, stated once.
+///
+/// A link is the process's business if the process is on either end of it. Both the broad reap
+/// and the split reap ask this, so the two cannot disagree about which links a dying process
+/// takes with it.
+pub(crate) fn link_names_process(source_pid: u64, dest_pid: u64, pid: u64) -> bool {
+    source_pid == pid || dest_pid == pid
+}
+
+/// U9-SPAWN-TXN3 §3 — THE reap's capability-domain removal: the cspace, then the process record.
+///
+/// Capability rank 4 and nothing else. Returns `(removed_cnode_space, removed_process_record)`
+/// so the caller can log exactly what went, which is what the `YARM_PROC_CNODE_CLEANUP_NOALLOC`
+/// marker reports.
+pub(crate) fn reap_process_cspace_locked(
+    capability: &mut CapabilitySubsystem,
+    pid: u64,
+    cnode: CNodeId,
+) -> (bool, bool) {
+    let mut removed_cnode_space = false;
+    let mut removed_process_record = false;
+    if let Some(slot) = capability
+        .cnode_spaces
+        .iter_mut()
+        .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
+    {
+        *slot = None;
+        removed_cnode_space = true;
+    }
+    if let Some(slot) = capability
+        .process_cnodes
+        .iter_mut()
+        .find(|slot| slot.is_some_and(|record| record.pid == pid))
+    {
+        *slot = None;
+        removed_process_record = true;
+    }
+    (removed_cnode_space, removed_process_record)
 }

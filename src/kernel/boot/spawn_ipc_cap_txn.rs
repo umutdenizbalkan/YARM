@@ -103,7 +103,7 @@ pub(crate) struct CnodeGrowthLimits {
 /// object except `MemoryObject` and `DmaRegion`, so an endpoint capability needs none — and a
 /// caller minting one of those two through this body owes the adjustment after releasing rank 4.
 /// [`delegate_capability_locked`] returns exactly that fact for that reason.
-fn mint_in_cnode_locked(
+pub(crate) fn mint_in_cnode_locked(
     capability: &mut CapabilitySubsystem,
     cnode: CNodeId,
     cap: Capability,

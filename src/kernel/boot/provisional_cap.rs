@@ -384,6 +384,19 @@ pub(crate) fn pid_for_cnode_locked(
         .map(|record| record.pid)
 }
 
+/// The inverse of [`pid_for_cnode_locked`]: the cspace a process owns, at capability rank 4.
+pub(crate) fn process_cnode_for_pid_locked(
+    capability: &CapabilitySubsystem,
+    pid: u64,
+) -> Option<CNodeId> {
+    capability
+        .process_cnodes
+        .iter()
+        .flatten()
+        .find(|record| record.pid == pid)
+        .map(|record| record.cnode)
+}
+
 /// Build the token for a capability this spawn minted, at capability rank 4.
 ///
 /// Returns `None` when the cspace has no process association — which means the capability cannot

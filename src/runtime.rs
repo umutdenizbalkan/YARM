@@ -2452,6 +2452,120 @@ impl SharedKernel {
         })
     }
 
+    /// U9-SPAWN-TXN3 §3 — the split twin of the no-alloc process-CNode reap.
+    ///
+    /// The broad reap is a five-domain sweep: it checks for live threads (task 2), destroys any
+    /// address space the process still carried (vm 5), purges its transfer envelopes and active
+    /// transfer mappings (ipc 3, and vm 5 again for the unmap), then removes its delegation links,
+    /// its cspace and its process record (capability 4).
+    ///
+    /// For a spawn rollback three of those phases are provably empty, and this twin **refuses
+    /// rather than implementing them**, because reaching one would mean the ledger's own contract
+    /// was already violated:
+    ///
+    /// * the reserved TCB is cleared by `clear_reservation_at` BEFORE the reap, so no TCB carries
+    ///   the pid at all — hence no live thread and no address space to reclaim;
+    /// * the child never ran, so it owns no transfer envelope and no active transfer mapping.
+    ///
+    /// Refusing keeps the D3 fence intact: the address-space arm would need the shootdown
+    /// coordinator, and `AI_AGENT_RULES` §14.4's own fail-safe direction is to leave frames
+    /// unavailable rather than recycle memory a remote CPU may still translate.
+    ///
+    /// The phases that DO run reach the same two shared owners the broad reap reaches —
+    /// `link_names_process` for the predicate and `reap_process_cspace_locked` for the removal —
+    /// so neither path can decide differently about which links a dying process takes with it.
+    pub(crate) fn reap_process_cnode_split(&self, pid: u64) -> bool {
+        // ── task 2: nothing of this process may still be alive. ────────────────────────
+        let (has_live_threads, carries_asid) = self.with_task_tcbs_split_mut(|tcbs| {
+            let live = tcbs.iter().flatten().any(|tcb| {
+                tcb.thread_group_id.0 == pid
+                    && tcb.status != crate::kernel::task::TaskStatus::Dead
+            });
+            let asid = tcbs
+                .iter()
+                .flatten()
+                .any(|tcb| tcb.thread_group_id.0 == pid && tcb.asid.is_some());
+            (live, asid)
+        });
+        if has_live_threads {
+            return false;
+        }
+        if carries_asid {
+            crate::yarm_log!(
+                "SPAWN_SPLIT_OWNER_REFUSED op=reap_process_cnode pid={}                  reason=process_still_carries_an_asid",
+                pid
+            );
+            return false;
+        }
+        // ── ipc 3: and it may own no transfer state, which would need a vm-5 unmap. ─────
+        let owns_transfer_state = self.with_ipc_split_mut(|ipc| {
+            let envelope = ipc
+                .transfer_envelopes
+                .iter()
+                .flatten()
+                .any(|envelope| envelope.source_tid.0 == pid);
+            let mapping = ipc
+                .active_transfer_mappings
+                .iter()
+                .flatten()
+                .any(|mapping| mapping.owner_tid.0 == pid);
+            envelope || mapping
+        });
+        if owns_transfer_state {
+            crate::yarm_log!(
+                "SPAWN_SPLIT_OWNER_REFUSED op=reap_process_cnode pid={}                  reason=process_still_owns_transfer_state",
+                pid
+            );
+            return false;
+        }
+        let Some(cnode) = self.task_cnode_split(pid).or_else(|| {
+            self.with_capability_state_split_mut(|capability| {
+                crate::kernel::boot::provisional_cap::process_cnode_for_pid_locked(capability, pid)
+            })
+        }) else {
+            return true;
+        };
+        // ── capability 4, per link slot, with the tid → pid resolution at rank 2 between
+        //    acquisitions, exactly as the broad reap splits it. ──────────────────────────
+        let mut removed_delegation_links = 0usize;
+        for idx in 0..crate::kernel::boot::max_delegated_capability_links() {
+            let Some(record) = self.with_capability_state_split_mut(|capability| {
+                crate::kernel::boot::kernel_ref(&capability.delegated_capability_links)[idx]
+            }) else {
+                continue;
+            };
+            let source_pid = self
+                .process_id_split_read(record.source_tid)
+                .unwrap_or(record.source_tid);
+            let dest_pid = self
+                .process_id_split_read(record.dest_tid)
+                .unwrap_or(record.dest_tid);
+            if crate::kernel::boot::cnode_state::link_names_process(source_pid, dest_pid, pid) {
+                self.with_capability_state_split_mut(|capability| {
+                    crate::kernel::boot::kernel_mut(
+                        &mut capability.delegated_capability_links,
+                    )[idx] = None;
+                });
+                removed_delegation_links = removed_delegation_links.saturating_add(1);
+            }
+        }
+        let (removed_cnode_space, removed_process_record) =
+            self.with_capability_state_split_mut(|capability| {
+                crate::kernel::boot::cnode_state::reap_process_cspace_locked(
+                    capability, pid, cnode,
+                )
+            });
+        crate::yarm_log!(
+            "YARM_PROC_CNODE_CLEANUP_NOALLOC pid={} cnode={} slots=0 removed_links={} removed_cspace={} removed_record={}",
+            pid,
+            cnode.0,
+            removed_delegation_links,
+            removed_cnode_space as u8,
+            removed_process_record as u8
+        );
+        true
+    }
+
     /// U9-SPAWN-TXN2 §3 — the split twin of `KernelState::set_process_cnode_for_pid`.
     pub(crate) fn set_process_cnode_for_pid_split(
         &self,

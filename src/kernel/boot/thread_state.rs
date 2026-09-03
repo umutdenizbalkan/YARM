@@ -2251,19 +2251,7 @@ impl KernelState {
     }
 
     pub(crate) fn release_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.kernel_context.stack_base = None;
-            tcb.kernel_context.stack_top = None;
-            tcb.kernel_context.frame = Default::default();
-            tcb.kernel_context.initialized = false;
-            tcb.kernel_context.owns_stack = false;
-            Ok(())
-        })
+        self.with_tcbs_mut(|tcbs| release_kernel_context_locked(tcbs, tid))
     }
 
     pub fn set_thread_user_context(
@@ -3086,4 +3074,27 @@ pub(crate) fn provision_default_kernel_context_locked(
         stack_base,
         stack_top,
     })
+}
+
+/// U9-SPAWN-TXN3 §3 — THE kernel-context release, under task rank 2 and nothing else.
+///
+/// The exact inverse of [`provision_default_kernel_context_locked`]: it gives back everything
+/// that owner installed, and nothing else. It was an inline closure inside
+/// `KernelState::release_kernel_context`; as a named owner both the broad and the split
+/// reservation-cancel reach the same body, so the two cannot give back different fields.
+pub(crate) fn release_kernel_context_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+) -> Result<(), KernelError> {
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|tcb| tcb.tid.0 == tid)
+        .ok_or(KernelError::TaskMissing)?;
+    tcb.kernel_context.stack_base = None;
+    tcb.kernel_context.stack_top = None;
+    tcb.kernel_context.frame = Default::default();
+    tcb.kernel_context.initialized = false;
+    tcb.kernel_context.owns_stack = false;
+    Ok(())
 }

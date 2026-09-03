@@ -1355,3 +1355,505 @@ impl SpawnTxnOwners for BroadSpawnOwners<'_> {
         self.kernel.copy_to_user(asid, va, bytes)
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// The SPLIT adapter: one acquisition per method, taken through `SharedKernel` seams, with no
+// broad lock held anywhere.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// [`SpawnTxnOwners`] over `SharedKernel` — the pre-lock spawn route's acquisition layer.
+///
+/// Every method is one acquisition of one domain through a seam that already existed, wrapping
+/// the same rank-local body its broad twin wraps. The adapter contributes acquisitions and
+/// nothing else: no phase order, no validation sequencing, no rollback decision — those are the
+/// generic policy's, which is why the two adapters cannot disagree about them.
+///
+/// # Three methods refuse rather than act, and that is deliberate
+///
+/// `allocate_user_stack_with_guard`, `initialize_thread_kernel_switch_frame` and
+/// `destroy_live_address_space` are unreachable from the split route by construction, and each
+/// refuses loudly instead of carrying a second, unexercised implementation of something delicate:
+///
+/// * the stack allocator is reached only when `provisioned_stack_top` is `None`, and the
+///   transaction always provisions one (that is what makes a stack failure rollable-back);
+/// * the x86_64 switch-frame init is reached only for TID 1 or 2, and NR 23 / NR 29 allocate
+///   dynamic TIDs, never a bootstrap one;
+/// * the live address-space teardown is reached only through the ledger's
+///   `SPAWN_LEDGER_ASID_STILL_BOUND` arm, which cannot happen because the reservation restore
+///   un-binds the ASID before the ledger unwinds.
+///
+/// Refusing is also the direction `AI_AGENT_RULES` §14.4 requires of the third one: a teardown
+/// that cannot complete its shootdown must leave the frame UNAVAILABLE rather than recycle memory
+/// a remote CPU may still translate. A guard pins that the split route cannot reach any of them.
+pub(crate) struct SharedSpawnOwners<'a> {
+    pub(crate) shared: &'a crate::runtime::SharedKernel,
+    /// The spawning task, snapshotted ONCE before the transaction begins.
+    ///
+    /// U9-SPAWN-IC1's rule: the caller identity is established up front and passed explicitly,
+    /// never re-read from an ambient current-task lookup partway through, because between two
+    /// phases the current task can change.
+    pub(crate) spawner_tid: Option<u64>,
+    pub(crate) spawner_cnode: Option<CNodeId>,
+    pub(crate) cpu: CpuId,
+}
+
+impl SpawnTxnOwners for SharedSpawnOwners<'_> {
+    fn current_cpu(&self) -> CpuId {
+        self.cpu
+    }
+    fn current_tid(&self) -> Option<u64> {
+        self.spawner_tid
+    }
+    fn current_task_cnode(&self) -> Option<CNodeId> {
+        self.spawner_cnode
+    }
+    fn capacity_limits(&self) -> RuntimeCapacityConfig {
+        self.shared.runtime_capacity_config_split_read()
+    }
+
+    fn task_status(&self, tid: u64) -> Option<TaskStatus> {
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.status)
+        })
+    }
+    fn live_task_count(&self) -> usize {
+        self.shared
+            .with_task_tcbs_split_mut(|tcbs| tcbs.iter().flatten().count())
+    }
+    fn allocate_thread_id(&mut self) -> Result<u64, KernelError> {
+        let max_tasks = self.capacity_limits().max_tasks;
+        let policy = self.shared.tid_allocation_policy_split_read();
+        let (tid, delta) = self.shared.with_spawn_thread_split_mut(
+            |tcbs, _classes, cursor, _tls| {
+                crate::kernel::boot::spawn_thread_core::allocate_dynamic_tid_locked(
+                    tcbs,
+                    cursor,
+                    policy,
+                    max_tasks,
+                )
+            },
+        )?;
+        // Telemetry is rank 10 and is applied with the task lock released, exactly as the broad
+        // twin does — which is what keeps 2 → 10 from ever being held nested.
+        self.shared.apply_tid_allocation_delta_split(delta);
+        Ok(tid)
+    }
+    fn stamp_spawn_generation(&mut self) -> u64 {
+        self.shared
+            .with_task_spawn_generation_split_mut(|_tcbs, generation| {
+                let issued = *generation;
+                *generation = generation.saturating_add(1);
+                issued
+            })
+    }
+    fn insert_reservation(
+        &mut self,
+        tid: u64,
+        reservation: crate::kernel::task::SpawnReservation,
+    ) -> Option<usize> {
+        self.shared
+            .with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                let class = reservation.class;
+                let idx = tcbs.iter().position(|slot| slot.is_none())?;
+                tcbs[idx] = Some(crate::kernel::task::ThreadControlBlock::reserved(
+                    crate::kernel::ipc::ThreadId(tid),
+                    reservation,
+                ));
+                classes[idx] = Some(class);
+                Some(idx)
+            })
+    }
+    fn clear_reservation_at(&mut self, index: usize) {
+        self.shared
+            .with_task_enqueue_policy_split_mut(|tcbs, classes| {
+                crate::kernel::spawn_reservation::clear_reservation_slot(tcbs, index);
+                classes[index] = None;
+            });
+    }
+    fn provision_default_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
+        self.shared
+            .provision_default_kernel_context_split(tid)
+            .map(|_| ())
+    }
+    fn release_kernel_context(&mut self, tid: u64) {
+        let _ = self.shared.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::thread_state::release_kernel_context_locked(tcbs, tid)
+        });
+    }
+    fn validate_cancellable(
+        &mut self,
+        token: &SpawnReservationToken,
+    ) -> Result<(usize, u64), ReservationRefusal> {
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::spawn_reservation::validate_cancellable(tcbs, token)
+        })
+    }
+    fn claim_reservation(
+        &mut self,
+        token: &SpawnReservationToken,
+    ) -> Result<SpawnBaseline, ReservationRefusal> {
+        self.shared
+            .with_task_tcbs_split_mut(|tcbs| {
+                crate::kernel::spawn_reservation::claim_for_spawn(tcbs, token)
+            })
+    }
+    fn restore_after_failed_spawn(
+        &mut self,
+        token: &SpawnReservationToken,
+        baseline: SpawnBaseline,
+    ) -> bool {
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::spawn_reservation::restore_after_failed_spawn(tcbs, token, baseline)
+                .is_ok()
+        })
+    }
+    fn bind_spawned_task_asid(&mut self, tid: u64, asid: Asid) -> Result<(), KernelError> {
+        self.shared.bind_spawned_task_asid_split(tid, asid)
+    }
+    fn publish_spawned_image(
+        &mut self,
+        reservation: &SpawnReservationToken,
+        publication: &SpawnedImagePublication,
+    ) -> Result<(), ReservationRefusal> {
+        self.shared
+            .publish_spawned_image_split(reservation, publication)
+    }
+    fn live_tcb_count_for(&self, tid: u64) -> usize {
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter().flatten().filter(|tcb| tcb.tid.0 == tid).count()
+        })
+    }
+    fn is_zombie(&self, tid: u64) -> bool {
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| matches!(tcb.status, TaskStatus::Exited(_) | TaskStatus::Dead))
+                .unwrap_or(false)
+        })
+    }
+    fn thread_kernel_stack_top(&self, tid: u64) -> u64 {
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.kernel_context.stack_top)
+                .map(|t| t.0)
+                .unwrap_or(0)
+        })
+    }
+    fn thread_kernel_context_initialized(&self, tid: u64) -> bool {
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .is_some_and(|tcb| tcb.kernel_context.initialized)
+        })
+    }
+    fn initialize_thread_kernel_switch_frame(
+        &mut self,
+        tid: u64,
+        _entry: usize,
+    ) -> Result<(), KernelError> {
+        // UNREACHABLE from the split route: only TID 1 / TID 2 reach this, and NR 23 / NR 29
+        // allocate dynamic TIDs. Refuse loudly rather than carry a second implementation of the
+        // switch-frame publication. The policy already tolerates this failure — it logs
+        // `D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED` and continues — so a refusal is behaviourally
+        // identical to the failure arm the broad path already has.
+        crate::yarm_log!(
+            "SPAWN_SPLIT_OWNER_REFUSED op=initialize_thread_kernel_switch_frame tid={} \
+             reason=bootstrap_only",
+            tid
+        );
+        Err(KernelError::WrongObject)
+    }
+
+    fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<CpuId, KernelError> {
+        self.shared.enqueue_on_cpu_split(cpu, tid)
+    }
+    fn enqueue_balanced(&mut self, tid: u64) -> Result<CpuId, KernelError> {
+        self.shared.enqueue_task_split(self.cpu, tid)
+    }
+
+    fn provision_process_cnode(
+        &mut self,
+        request: &ProcessCNodeRequest,
+    ) -> Result<ProcessCNodeGrant, KernelError> {
+        // The growth limits are derived from the capacity profile OUTSIDE the capability lock,
+        // exactly as the broad twin derives them, so the rank-4 body reads no config domain.
+        let limits = self.capacity_limits();
+        let max_total_cnode_slots = limits.max_total_cnode_slots;
+        let requested = crate::kernel::boot::KernelState::requested_cnode_slot_capacity_for_class(
+            request.class,
+            limits,
+            None,
+        )?;
+        let bounded =
+            crate::kernel::boot::KernelState::normalize_requested_cnode_slots(requested, limits)?;
+        self.shared.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::process_cnode_txn::provision_process_cnode_locked(
+                capability,
+                request,
+                bounded,
+                max_total_cnode_slots,
+            )
+        })
+    }
+    fn release_process_cnode_grant(
+        &mut self,
+        request: &ProcessCNodeRequest,
+        grant: &ProcessCNodeGrant,
+    ) {
+        self.shared.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::process_cnode_txn::release_process_cnode_grant_locked(
+                capability, request, grant,
+            );
+        });
+    }
+    fn reap_process_cnode_if_unused(&mut self, pid: u64) -> bool {
+        self.shared.reap_process_cnode_split(pid)
+    }
+    fn task_cnode(&self, tid: u64) -> Option<CNodeId> {
+        self.shared.task_cnode_split(tid)
+    }
+    fn set_process_cnode_for_pid(&mut self, pid: u64, cnode: CNodeId) -> Result<(), KernelError> {
+        self.shared.set_process_cnode_for_pid_split(pid, cnode)
+    }
+    fn mint_capability_in_cnode(
+        &mut self,
+        cnode: CNodeId,
+        capability: Capability,
+    ) -> Result<CapId, KernelError> {
+        let limits = self.capacity_limits();
+        let growth = crate::kernel::boot::spawn_ipc_cap_txn::CnodeGrowthLimits {
+            slot_capacity: crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE
+                .min(limits.max_capability_slots),
+            max_total_cnode_slots: limits.max_total_cnode_slots,
+        };
+        self.shared.with_capability_state_split_mut(|state| {
+            crate::kernel::boot::spawn_ipc_cap_txn::mint_in_cnode_locked(
+                state,
+                cnode,
+                capability,
+                growth.slot_capacity,
+                growth.max_total_cnode_slots,
+            )
+        })
+    }
+
+    fn provisional_cap_token(
+        &mut self,
+        cnode: CNodeId,
+        cap: CapId,
+    ) -> Result<ProvisionalCap, KernelError> {
+        self.shared.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::provisional_cap::provisional_cap_token_locked(
+                capability, cnode, cap,
+            )
+        })
+    }
+    fn collect_cap_link_closure(&mut self, cap: CapId) -> Option<(LinkClosure, usize)> {
+        self.shared.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::provisional_cap::collect_link_closure_locked(capability, cap)
+        })
+    }
+    fn resolve_link_pids(&self, links: &LinkClosure) -> ResolvedLinkPids {
+        let mut out: ResolvedLinkPids = [None; MAX_PROVISIONAL_DESCENDANTS];
+        for (slot, link) in out.iter_mut().zip(links.iter()) {
+            if let Some(link) = link {
+                *slot = Some((
+                    self.shared
+                        .process_id_split_read(link.source_tid)
+                        .unwrap_or(link.source_tid),
+                    self.shared
+                        .process_id_split_read(link.dest_tid)
+                        .unwrap_or(link.dest_tid),
+                ));
+            }
+        }
+        out
+    }
+    fn release_provisional_cap(
+        &mut self,
+        token: &ProvisionalCap,
+        links: &LinkClosure,
+        resolved: &ResolvedLinkPids,
+    ) -> ProvisionalCapRelease {
+        self.shared.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::provisional_cap::release_provisional_cap_locked(
+                capability, token, links, resolved,
+            )
+        })
+    }
+    fn delegate_capability(
+        &mut self,
+        source_tid: u64,
+        source_cap: CapId,
+        dest_tid: u64,
+        rights: CapRights,
+    ) -> Result<DelegationGrant, KernelError> {
+        // Identities and the object being delegated are resolved FIRST, at ranks 2/3, and the
+        // rank-4 body revalidates the object before it mints — so a slot recycled in the gap is
+        // refused with `StaleCapability` rather than delegated.
+        let capability = self
+            .shared
+            .resolve_capability_for_task_split(source_tid, source_cap)?;
+        let source_cnode = self
+            .shared
+            .task_cnode_split(source_tid)
+            .ok_or(KernelError::TaskMissing)?;
+        let dest_cnode = self
+            .shared
+            .task_cnode_split(dest_tid)
+            .ok_or(KernelError::TaskMissing)?;
+        let identity = crate::kernel::boot::spawn_ipc_cap_txn::DelegationIdentity {
+            source_tid,
+            source_cnode,
+            dest_tid,
+            dest_cnode,
+        };
+        let limits = self.capacity_limits();
+        let cnode_limits = crate::kernel::boot::spawn_ipc_cap_txn::CnodeGrowthLimits {
+            slot_capacity: crate::kernel::boot::KernelState::normalize_requested_cnode_slots(
+                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                limits,
+            )?,
+            max_total_cnode_slots: limits.max_total_cnode_slots,
+        };
+        let grant = self.shared.with_capability_state_split_mut(|state| {
+            crate::kernel::boot::spawn_ipc_cap_txn::delegate_capability_locked(
+                state,
+                &identity,
+                source_cap,
+                rights,
+                capability.object,
+                cnode_limits,
+            )
+        })?;
+        // The memory-object refcount is rank 6 and runs with rank 4 RELEASED. §1 proved this is
+        // never owed for a spawn's capabilities — they are `Endpoint`/`AddressSpace` — but the
+        // owner returns the fact rather than assuming it, so a future caller delegating a
+        // MemoryObject through this adapter still gets the tail.
+        if grant.owes_memory_refcount {
+            self.shared.with_memory_split_mut(|memory| {
+                crate::kernel::boot::KernelState::adjust_memory_object_cap_refcount_locked(
+                    memory,
+                    grant.object,
+                    1,
+                );
+            });
+        }
+        Ok(grant)
+    }
+    fn release_delegation(&mut self, grant: &DelegationGrant) -> bool {
+        let released = self.shared.with_capability_state_split_mut(|state| {
+            crate::kernel::boot::spawn_ipc_cap_txn::release_delegation_grant_locked(state, grant)
+        });
+        if released && grant.owes_memory_refcount {
+            self.shared.with_memory_split_mut(|memory| {
+                crate::kernel::boot::KernelState::adjust_memory_object_cap_refcount_locked(
+                    memory,
+                    grant.object,
+                    -1,
+                );
+            });
+        }
+        crate::yarm_log!(
+            "SPAWN_DELEGATE_RELEASED dest_cnode={} dest_cap={} released={}",
+            grant.identity.dest_cnode.0,
+            grant.dest_cap.0,
+            u8::from(released)
+        );
+        released
+    }
+
+    fn provision_service_endpoint(
+        &mut self,
+        request: &ServiceEndpointRequest,
+    ) -> Result<ServiceEndpointGrant, KernelError> {
+        self.shared
+            .with_ipc_then_capability_split_mut(|ipc, capability| {
+                crate::kernel::boot::spawn_ipc_cap_txn::provision_service_endpoint_locked(
+                    ipc, capability, request,
+                )
+            })
+    }
+    fn remove_unpublished_endpoint(&mut self, index: usize, generation: u64) -> EndpointRemoval {
+        self.shared.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::spawn_ipc_cap_txn::remove_unpublished_endpoint_locked(
+                ipc, index, generation,
+            )
+        })
+    }
+
+    fn provision_image(
+        &mut self,
+        request: &ImageProvisionRequest<'_>,
+    ) -> Result<ProvisionToken, KernelError> {
+        self.shared.with_vm_then_memory_split_mut(|vm, memory| {
+            crate::kernel::boot::spawn_image_provision::provision_image_locked(vm, memory, request)
+        })
+    }
+    fn rollback_provision(&mut self, asid: Asid, phase: &'static str, err: KernelError) {
+        self.shared.with_vm_then_memory_split_mut(|vm, memory| {
+            crate::kernel::boot::spawn_image_provision::rollback_provision_locked(
+                vm, memory, asid, phase, err,
+            )
+        });
+    }
+    fn address_space_exists(&self, asid: Asid) -> bool {
+        self.shared
+            .with_vm_user_spaces_split_mut(|spaces| spaces.get(asid).is_some())
+    }
+    fn destroy_unresident_address_space(&mut self, asid: Asid) -> bool {
+        self.shared
+            .with_vm_then_memory_split_mut(|vm, memory| {
+                crate::kernel::boot::vm_image_locked::destroy_unresident_address_space_locked(
+                    vm, memory, asid,
+                )
+            })
+            .is_ok()
+    }
+    fn destroy_live_address_space(&mut self, asid: Asid) -> bool {
+        // UNREACHABLE from the split route: the ledger reaches this only through its
+        // `SPAWN_LEDGER_ASID_STILL_BOUND` arm, and the reservation restore un-binds the ASID
+        // before the ledger unwinds, so no TCB carries it. Refusing is also the direction
+        // `AI_AGENT_RULES` §14.4 requires: a teardown that cannot complete its shootdown must
+        // leave the frames UNAVAILABLE rather than recycle memory a remote CPU may translate.
+        crate::yarm_log!(
+            "SPAWN_SPLIT_OWNER_REFUSED op=destroy_live_address_space asid={} \
+             reason=ledger_contract_violated",
+            asid.0
+        );
+        false
+    }
+    fn asid_carrier_tid(&self, asid: Asid) -> Option<u64> {
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.asid == Some(asid))
+                .map(|tcb| tcb.tid.0)
+        })
+    }
+    fn allocate_user_stack_with_guard(
+        &mut self,
+        tid: u64,
+        _pages: usize,
+    ) -> Result<VirtAddr, KernelError> {
+        // UNREACHABLE from the split route: the transaction always provisions the stack before
+        // the commit — that is precisely what makes a stack-allocation failure rollable-back — so
+        // `provisioned_stack_top` is always `Some` here.
+        crate::yarm_log!(
+            "SPAWN_SPLIT_OWNER_REFUSED op=allocate_user_stack_with_guard tid={} \
+             reason=stack_is_pre_provisioned",
+            tid
+        );
+        Err(KernelError::WrongObject)
+    }
+    fn copy_to_user(&mut self, asid: Asid, va: VirtAddr, bytes: &[u8]) -> Result<(), KernelError> {
+        self.shared.copy_to_user_split(asid, va, bytes)
+    }
+}

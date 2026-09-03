@@ -8553,6 +8553,14 @@ pub(crate) const MAX_DEADLINE_TOKENS: usize = 4;
 const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_DELEGATED_CAPABILITY_LINKS: usize = 2048;
+
+/// U9-SPAWN-TXN3 §3: the delegation-link table's bound, for the split reap's per-slot loop.
+///
+/// Exposed as a function rather than the constant because the constant is capacity-profile
+/// gated, and a caller outside this module must get the same bound the broad reap iterates.
+pub(crate) fn max_delegated_capability_links() -> usize {
+    MAX_DELEGATED_CAPABILITY_LINKS
+}
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 const STATIC_TID_UPPER_BOUND: u64 = INITIAL_DYNAMIC_TID - 1;
 
