@@ -2226,65 +2226,32 @@ impl KernelState {
         })
     }
 
+    /// Provision the default kernel context (stack region + switch frame) for a reserved
+    /// incarnation — broad entry.
+    ///
+    /// U9-SPAWN-TXN §2 moved the body to [`provision_default_kernel_context_locked`], which takes
+    /// the TCB storage directly. This is the last of U9-SPAWN2 §3's seven phases to get a
+    /// rank-local owner.
+    ///
+    /// The old shape was three separate task-lock acquisitions — a slot-index read, a
+    /// `set_thread_kernel_stack` write, and a switch-frame write — so a TCB could be observed
+    /// with a stack assigned and no switch frame, or vice versa. One acquisition removes that
+    /// window, and the body's all-or-nothing refusal removes the partially initialized TCB it
+    /// could otherwise leave behind.
     pub(crate) fn provision_default_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
-        let idx = self
-            .with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid))
-            })
-            .ok_or(KernelError::TaskMissing)?;
-
-        // Stage 134: compute region_base separately so the guard page offset
-        // (KERNEL_STACK_GUARD_SIZE) can be applied.  The region layout is:
-        //   [region_base,  region_base + GUARD)  → unmapped guard page
-        //   [region_base + GUARD, region_base + REGION_SIZE)  → mapped stack
-        let region_base = KERNEL_STACK_REGION_BASE
-            .checked_add(idx.saturating_mul(KERNEL_STACK_REGION_SIZE))
-            .ok_or(KernelError::VmFull)?;
-        let stack_base = region_base
-            .checked_add(KERNEL_STACK_GUARD_SIZE)
-            .ok_or(KernelError::VmFull)?;
-        let stack_top = region_base
-            .checked_add(KERNEL_STACK_REGION_SIZE)
-            .ok_or(KernelError::VmFull)?;
-        self.set_thread_kernel_stack(tid, stack_base, stack_top)?;
+        let outcome =
+            self.with_tcbs_mut(|tcbs| provision_default_kernel_context_locked(tcbs, tid))?;
         crate::yarm_log!(
             "KERNEL_STACK_RANGE tid={} base=0x{:x} top=0x{:x}",
             tid,
-            stack_base,
-            stack_top
+            outcome.stack_base,
+            outcome.stack_top
         );
-
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
-            tcb.kernel_context
-                .frame
-                .set_instruction_ptr(kernel_switch_frame_trampoline_ip());
-            tcb.kernel_context.initialized = false;
-            tcb.kernel_context.owns_stack = true;
-            Ok(())
-        })
+        Ok(())
     }
 
     pub(crate) fn release_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.kernel_context.stack_base = None;
-            tcb.kernel_context.stack_top = None;
-            tcb.kernel_context.frame = Default::default();
-            tcb.kernel_context.initialized = false;
-            tcb.kernel_context.owns_stack = false;
-            Ok(())
-        })
+        self.with_tcbs_mut(|tcbs| release_kernel_context_locked(tcbs, tid))
     }
 
     pub fn set_thread_user_context(
@@ -3031,4 +2998,103 @@ impl KernelState {
         }
         Ok(child_tid)
     }
+}
+
+/// U9-SPAWN-TXN §2 — the kernel-stack region one reserved incarnation gets, and the facts a
+/// caller needs to report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DefaultKernelContext {
+    pub(crate) stack_base: usize,
+    pub(crate) stack_top: usize,
+}
+
+/// THE default-kernel-context owner: task rank 2, one acquisition, all or nothing.
+///
+/// This is the last of U9-SPAWN2 §3's seven spawn phases to become rank-local. It takes the TCB
+/// storage explicitly and reaches nothing else — no scheduler, no VM, no capability state, no
+/// `KernelState` — so its rank-locality is readable from its signature.
+///
+/// # Exact identity, and no partial TCB on refusal
+///
+/// The stack region is derived from the TCB's SLOT INDEX, not from the TID: kernel stacks are a
+/// fixed array of regions indexed by slot, so two tasks in the same slot at different times share
+/// a region and two tasks in different slots never collide. The index is located by exact TID
+/// match, and a TID with no live TCB is refused before anything is written.
+///
+/// Every arithmetic step is checked, and — this is the part the old three-acquisition shape got
+/// wrong — all of it happens BEFORE the first field is written. The old body computed the region,
+/// called `set_thread_kernel_stack` (which took the task lock, validated, and wrote two fields and
+/// `initialized = false`), released, then took the lock again to write the frame's stack pointer,
+/// instruction pointer and `owns_stack`. A failure between those two acquisitions left a TCB with
+/// a kernel stack assigned and no switch frame — a partially initialized incarnation that nothing
+/// removed. Here the only fallible steps are the index lookup and the address arithmetic, both of
+/// which complete before any write, so a refusal leaves the TCB exactly as it was found.
+pub(crate) fn provision_default_kernel_context_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+) -> Result<DefaultKernelContext, KernelError> {
+    let idx = tcbs
+        .iter()
+        .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid))
+        .ok_or(KernelError::TaskMissing)?;
+
+    // Stage 134: compute region_base separately so the guard page offset
+    // (KERNEL_STACK_GUARD_SIZE) can be applied. The region layout is:
+    //   [region_base,  region_base + GUARD)              → unmapped guard page
+    //   [region_base + GUARD, region_base + REGION_SIZE) → mapped stack
+    let region_base = KERNEL_STACK_REGION_BASE
+        .checked_add(idx.saturating_mul(KERNEL_STACK_REGION_SIZE))
+        .ok_or(KernelError::VmFull)?;
+    let stack_base = region_base
+        .checked_add(KERNEL_STACK_GUARD_SIZE)
+        .ok_or(KernelError::VmFull)?;
+    let stack_top = region_base
+        .checked_add(KERNEL_STACK_REGION_SIZE)
+        .ok_or(KernelError::VmFull)?;
+    // `set_thread_kernel_stack`'s validation, applied here so this body enforces the same
+    // contract rather than trusting a caller to have called it first.
+    if stack_base == 0 || stack_top == 0 || stack_base >= stack_top {
+        return Err(KernelError::WrongObject);
+    }
+
+    // FIRST WRITE. Everything fallible is behind us, so the whole set lands or none of it does.
+    let tcb = tcbs
+        .get_mut(idx)
+        .and_then(Option::as_mut)
+        .ok_or(KernelError::TaskMissing)?;
+    tcb.kernel_context.stack_base = Some(crate::kernel::vm::VirtAddr(stack_base as u64));
+    tcb.kernel_context.stack_top = Some(crate::kernel::vm::VirtAddr(stack_top as u64));
+    tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
+    tcb.kernel_context
+        .frame
+        .set_instruction_ptr(kernel_switch_frame_trampoline_ip());
+    tcb.kernel_context.initialized = false;
+    tcb.kernel_context.owns_stack = true;
+    Ok(DefaultKernelContext {
+        stack_base,
+        stack_top,
+    })
+}
+
+/// U9-SPAWN-TXN3 §3 — THE kernel-context release, under task rank 2 and nothing else.
+///
+/// The exact inverse of [`provision_default_kernel_context_locked`]: it gives back everything
+/// that owner installed, and nothing else. It was an inline closure inside
+/// `KernelState::release_kernel_context`; as a named owner both the broad and the split
+/// reservation-cancel reach the same body, so the two cannot give back different fields.
+pub(crate) fn release_kernel_context_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+) -> Result<(), KernelError> {
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|tcb| tcb.tid.0 == tid)
+        .ok_or(KernelError::TaskMissing)?;
+    tcb.kernel_context.stack_base = None;
+    tcb.kernel_context.stack_top = None;
+    tcb.kernel_context.frame = Default::default();
+    tcb.kernel_context.initialized = false;
+    tcb.kernel_context.owns_stack = false;
+    Ok(())
 }

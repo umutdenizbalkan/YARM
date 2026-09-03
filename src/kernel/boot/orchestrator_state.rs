@@ -61,6 +61,23 @@ pub(crate) type TaskEnqueuePolicySplitPtrs = (
     *mut KernelStorage<[Option<TaskClass>; MAX_TASKS]>,
 );
 
+/// U9-SPAWN-TXN2 §3 — `(task_state_lock, tcbs, spawn_reservation_generation)`.
+///
+/// The split twin of [`KernelState::with_task_spawn_generation_mut`]'s projection. The
+/// generation counter's whole correctness rule is that no two reservations are ever stamped
+/// with the same value, and that rule is only enforceable if the read-modify-write happens
+/// under the lock that also serializes the TCB insert it stamps. The broad path took the
+/// counter under `task_state_lock`; the split path must take it under the SAME lock, or the
+/// two paths would not be serialized against each other at all.
+// Names the return type of a projector whose callers are arch-gated; a hosted `lib` build
+// compiles no route to it, exactly like the sibling `*_from_raw` projectors.
+#[allow(dead_code)]
+pub(crate) type TaskSpawnGenerationSplitPtrs = (
+    *const crate::kernel::lock::SpinLockIrq<()>,
+    *mut KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
+    *mut u64,
+);
+
 impl KernelState {
     fn lock_domain_rank(domain: &'static str) -> u8 {
         match domain {
@@ -1499,6 +1516,28 @@ impl KernelState {
         }
     }
 
+    /// U9-SPAWN-TXN2 §3 — task (rank 2) seam projector for the SPAWN-RESERVATION GENERATION.
+    ///
+    /// Returns [`TaskSpawnGenerationSplitPtrs`]: `(task_state_lock, tcbs,
+    /// spawn_reservation_generation)` — the exact projection
+    /// [`KernelState::with_task_spawn_generation_mut`] takes, so the broad and split reservation
+    /// paths stamp generations from the same counter under the same lock.
+    pub(crate) unsafe fn task_spawn_generation_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> TaskSpawnGenerationSplitPtrs {
+        // SAFETY: see module pattern note above. `spawn_reservation_generation` was given the
+        // task domain in U9-SPAWN-TXN §3b precisely so it could be projected here: it is only
+        // ever consumed in the same breath as the TCB insert it stamps, and both storages are
+        // serialized by this same lock.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).task_state_lock),
+                core::ptr::addr_of_mut!((*state).tcbs),
+                core::ptr::addr_of_mut!((*state).spawn_reservation_generation),
+            )
+        }
+    }
+
     /// U9-SPAWN1 SP-2 — task (rank 2) seam projector for the SPAWN-THREAD transaction.
     ///
     /// Returns `(task_state_lock, tcbs, task_classes, tid_allocation_cursor,
@@ -2038,6 +2077,33 @@ impl KernelState {
     /// would have raced the very table it consults. Placing the two behind the same lock is a
     /// lock-DOMAIN assignment, not a policy change: `allocate_thread_id` is the only production
     /// reader or writer of the cursor, and it always read `tcbs` in the same breath.
+    /// U9-SPAWN-TXN §3 — the TCB array and the spawn-reservation generation counter under ONE
+    /// acquisition of the task lock.
+    ///
+    /// `spawn_reservation_generation` was a bare `KernelState` field with no lock domain at all:
+    /// `reserve_task_for_spawn_with_class_in_process` read-modify-wrote it with nothing held,
+    /// serialized only by the broad lock that happened to surround the whole reservation. Its one
+    /// correctness rule is that no two reservations ever receive the same value — which is what
+    /// makes a token for an earlier occupant of a numeric TID unable to match a later one — and
+    /// that rule is unenforceable off-lock without a domain.
+    ///
+    /// Placing it in the task domain is an assignment, not a policy change, and it is the same
+    /// repair U9-SPAWN1 SP-2 made for the dynamic-TID cursor: the counter is only ever consumed in
+    /// the same breath as the TCB insert it stamps, so the two belong behind the same lock.
+    pub(crate) fn with_task_spawn_generation_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut [Option<ThreadControlBlock>; MAX_TASKS], &mut u64) -> R,
+    ) -> R {
+        // Lock-order domain: task
+        Self::debug_lock_order_note("task");
+        let _task_guard = self.task_state_lock.lock();
+        let generation = core::ptr::addr_of_mut!(self.spawn_reservation_generation);
+        // SAFETY: `spawn_reservation_generation` and `tcbs` are disjoint fields of the same
+        // `KernelState`, both now serialized by `task_state_lock`, which is held for the whole
+        // closure.
+        f(kernel_mut(&mut self.tcbs), unsafe { &mut *generation })
+    }
+
     pub(crate) fn with_task_tid_alloc_mut<R>(
         &mut self,
         f: impl FnOnce(

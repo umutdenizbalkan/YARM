@@ -34792,6 +34792,11 @@ mod stage117_global_lock_drop_before_switch {
 #[cfg(test)]
 mod stage118_production_switch_frame_init {
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
@@ -34864,36 +34869,36 @@ mod stage118_production_switch_frame_init {
     #[test]
     fn stage118_exec_state_emits_switch_frame_init_begin() {
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
-            "exec_state.rs must emit D6_KERNEL_SWITCH_FRAME_INIT_BEGIN in spawn_user_task_from_image"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
+            "the spawn publication policy must emit D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"
         );
     }
 
     #[test]
     fn stage118_exec_state_emits_switch_frame_init_done() {
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
-            "exec_state.rs must emit D6_KERNEL_SWITCH_FRAME_INIT_DONE on success"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            "the spawn publication policy must emit D6_KERNEL_SWITCH_FRAME_INIT_DONE on success"
         );
     }
 
     #[test]
     fn stage118_exec_state_emits_switch_frame_init_deferred() {
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
-            "exec_state.rs must emit D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED on failure"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
+            "the spawn publication policy must emit D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED on failure"
         );
     }
 
     #[test]
     fn stage118_exec_state_switch_frame_init_gated_on_x86_64_and_tid1() {
         assert!(
-            EXEC_STATE_SRC.contains("target_arch = \"x86_64\""),
-            "exec_state.rs switch-frame init must be gated on #[cfg(target_arch = \"x86_64\")]"
+            SPAWN_PUBLISH_SRC.contains("target_arch = \"x86_64\""),
+            "switch-frame init must be gated on #[cfg(target_arch = \"x86_64\")]"
         );
         assert!(
-            EXEC_STATE_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
-            "exec_state.rs switch-frame init must be gated on spec.tid == BOOTSTRAP_FIRST_USER_TID"
+            SPAWN_PUBLISH_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
+            "switch-frame init must be gated on spec.tid == BOOTSTRAP_FIRST_USER_TID"
         );
     }
 
@@ -35045,6 +35050,11 @@ mod stage118_production_switch_frame_init {
 #[cfg(test)]
 mod stage119_minimal_task_pair {
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
@@ -35076,43 +35086,43 @@ mod stage119_minimal_task_pair {
     #[test]
     fn stage119_exec_state_init_gate_covers_supervisor_tid() {
         assert!(
-            EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
-            "exec_state.rs switch-frame init must be gated on BOOTSTRAP_SUPERVISOR_TID (tid=2)"
+            SPAWN_PUBLISH_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
+            "switch-frame init must be gated on BOOTSTRAP_SUPERVISOR_TID (tid=2)"
         );
     }
 
     #[test]
     fn stage119_exec_state_init_gate_uses_or_for_both_tids() {
         assert!(
-            EXEC_STATE_SRC
+            SPAWN_PUBLISH_SRC
                 .contains("BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID")
-                || EXEC_STATE_SRC
+                || SPAWN_PUBLISH_SRC
                     .contains("BOOTSTRAP_SUPERVISOR_TID || spec.tid == BOOTSTRAP_FIRST_USER_TID"),
-            "exec_state.rs switch-frame init must use || to OR tid=1 and tid=2 conditions"
+            "switch-frame init must use || to OR tid=1 and tid=2 conditions"
         );
     }
 
     #[test]
     fn stage119_exec_state_init_gate_still_covers_first_user_tid() {
         assert!(
-            EXEC_STATE_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
-            "exec_state.rs switch-frame init must still cover BOOTSTRAP_FIRST_USER_TID (tid=1)"
+            SPAWN_PUBLISH_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
+            "switch-frame init must still cover BOOTSTRAP_FIRST_USER_TID (tid=1)"
         );
     }
 
     #[test]
     fn stage119_exec_state_switch_frame_init_markers_still_present() {
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
-            "exec_state.rs D6_KERNEL_SWITCH_FRAME_INIT_BEGIN marker must be preserved in Stage 119"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
+            "D6_KERNEL_SWITCH_FRAME_INIT_BEGIN marker must be preserved in Stage 119"
         );
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
-            "exec_state.rs D6_KERNEL_SWITCH_FRAME_INIT_DONE marker must be preserved in Stage 119"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            "D6_KERNEL_SWITCH_FRAME_INIT_DONE marker must be preserved in Stage 119"
         );
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
-            "exec_state.rs D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED marker must be preserved in Stage 119"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
+            "D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED marker must be preserved in Stage 119"
         );
     }
 
@@ -35265,6 +35275,11 @@ mod stage119_minimal_task_pair {
 #[cfg(test)]
 mod stage120_controlled_switch_proof {
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -35372,14 +35387,15 @@ mod stage120_controlled_switch_proof {
         ] {
             assert!(
                 EXEC_STATE_SRC.contains(marker)
+                    || SPAWN_PUBLISH_SRC.contains(marker)
                     || TRAP_ENTRY_SRC.contains(marker)
                     || MOD_SRC.contains(marker),
                 "Stage 120 marker missing: {marker}"
             );
         }
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE")
-                && EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE")
+                && SPAWN_PUBLISH_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
             "Stage 119 tid=1/tid=2 initialization must remain intact"
         );
         assert!(
@@ -35409,6 +35425,11 @@ mod stage121_first_resume_abi_diagnostics {
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
     const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
@@ -35470,8 +35491,8 @@ mod stage121_first_resume_abi_diagnostics {
     fn stage121_initialized_frame_uses_trampoline_ip_and_sysv_stack_shape() {
         assert!(
             THREAD_STATE_SRC.contains("set_instruction_ptr(switch_entry)")
-                && EXEC_STATE_SRC.contains("kernel_switch_frame_trampoline_ip")
-                || EXEC_STATE_SRC
+                && SPAWN_PUBLISH_SRC.contains("kernel_switch_frame_trampoline_ip")
+                || SPAWN_PUBLISH_SRC
                     .contains("yarm_kernel_thread_switch_trampoline as *const () as usize"),
             "initialized production frames must still use the first-resume entry symbol"
         );
@@ -35546,6 +35567,11 @@ mod stage121_first_resume_abi_diagnostics {
 mod stage122_first_instruction_proof {
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -35565,8 +35591,8 @@ mod stage122_first_instruction_proof {
             "kernel_switch_frame_trampoline_ip must return the assembly shim symbol, not the Rust handler"
         );
         assert!(
-            EXEC_STATE_SRC.contains("kernel_switch_frame_trampoline_ip()")
-                && EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            SPAWN_PUBLISH_SRC.contains("kernel_switch_frame_trampoline_ip()")
+                && SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
             "initialized switch frames must log/use the shim entry address"
         );
         assert!(
@@ -35995,6 +36021,11 @@ mod stage125_first_resume_rust_entry_bridge {
 mod stage126_kernel_switch_stack_mapping_backing {
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
     const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
     const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
@@ -36094,8 +36125,8 @@ mod stage126_kernel_switch_stack_mapping_backing {
             "initialized x86_64 switch stacks must be backed/mapped or fail initialization"
         );
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED")
-                && EXEC_STATE_SRC.contains("initialize_thread_kernel_switch_frame"),
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED")
+                && SPAWN_PUBLISH_SRC.contains("initialize_thread_kernel_switch_frame"),
             "production frame initialization must still surface explicit deferral on failure"
         );
     }
@@ -36153,6 +36184,11 @@ mod stage126_kernel_switch_stack_mapping_backing {
 mod stage127_target_asid_switch_stack_mapping {
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
     const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
     const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
@@ -36199,20 +36235,40 @@ mod stage127_target_asid_switch_stack_mapping {
 
     #[test]
     fn stage127_retry_runs_after_target_asid_is_bound() {
-        let bind = EXEC_STATE_SRC
-            .find("tcb.asid = Some(asid);")
+        // U9-SPAWN-TXN2 §2: the bind is no longer an inline `tcb.asid = Some(asid)` closure —
+        // it is `bind_spawned_task_asid_locked`, a named rank-2 owner, reached from the one
+        // publication policy. The ORDER invariant is unchanged and is asserted over that policy,
+        // where both the bind call and the retry now live. This is strictly more precise than the
+        // old spelling: it anchors on the call that performs the bind rather than on one possible
+        // way of writing the field.
+        let bind = SPAWN_PUBLISH_SRC
+            .find(".bind_spawned_task_asid(spec.tid, asid)")
             .expect("target ASID bind");
-        let retry = EXEC_STATE_SRC
+        let retry = SPAWN_PUBLISH_SRC
             .find("D6_KERNEL_SWITCH_FRAME_INIT_RETRY tid={}")
             .expect("retry marker");
         assert!(
             bind < retry,
             "Stage 127 retry must happen after the target task ASID/root is bound"
         );
+        // And the owner it calls really is the one that writes the field — once, in a body that
+        // reaches nothing but the TCB storage.
+        let body = EXEC_STATE_SRC
+            .split("pub(crate) fn bind_spawned_task_asid_locked(")
+            .nth(1)
+            .expect("the rank-2 owner")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert_eq!(
+            body.matches("tcb.asid = Some(asid);").count(),
+            1,
+            "the spawn ASID bind writes the field exactly once, inside its rank-2 owner"
+        );
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid={}")
-                && EXEC_STATE_SRC.contains("reason=retry_failed")
-                && EXEC_STATE_SRC
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid={}")
+                && SPAWN_PUBLISH_SRC.contains("reason=retry_failed")
+                && SPAWN_PUBLISH_SRC
                     .contains("initialize_thread_kernel_switch_frame(spec.tid, entry)"),
             "Stage 127 must expose retry success/failure markers"
         );
@@ -39949,15 +40005,30 @@ mod stage144_arch_safe_trampoline_ip {
     // 2. Common initialization must use kernel_switch_frame_trampoline_ip(), not the raw symbol.
     #[test]
     fn stage144_provision_uses_trampoline_ip_helper() {
+        // U9-SPAWN-TXN §2 moved the initialization into the rank-local owner, so the guard
+        // follows it there. The broad entry now only acquires and delegates.
         let fn_start = THREAD_STATE_SRC
-            .find("fn provision_default_kernel_context")
-            .expect("provision_default_kernel_context must exist");
-        // The function spans ~50 lines; search from its start to the next `pub(crate) fn`.
+            .find("pub(crate) fn provision_default_kernel_context_locked")
+            .expect("provision_default_kernel_context_locked must exist");
         let fn_end = THREAD_STATE_SRC[fn_start..]
-            .find("\n    pub(crate) fn release_kernel_context")
+            .find("\n}\n")
             .map(|rel| fn_start + rel)
             .unwrap_or(THREAD_STATE_SRC.len());
         let fn_body = &THREAD_STATE_SRC[fn_start..fn_end];
+        // And the broad entry really does delegate rather than keeping a second copy.
+        let broad_start = THREAD_STATE_SRC
+            .find("pub(crate) fn provision_default_kernel_context(&mut self")
+            .expect("the broad entry must exist");
+        let broad_end = THREAD_STATE_SRC[broad_start..]
+            .find("\n    }\n")
+            .map(|rel| broad_start + rel)
+            .unwrap_or(THREAD_STATE_SRC.len());
+        let broad = &THREAD_STATE_SRC[broad_start..broad_end];
+        assert!(
+            broad.contains("provision_default_kernel_context_locked(tcbs, tid)")
+                && !broad.contains("kernel_switch_frame_trampoline_ip()"),
+            "the broad entry must delegate, never re-initialize"
+        );
         assert!(
             fn_body.contains("kernel_switch_frame_trampoline_ip()"),
             "provision_default_kernel_context must call kernel_switch_frame_trampoline_ip()"
@@ -53308,10 +53379,11 @@ mod stage165j_kernel_stack_128k {
     #[test]
     fn stage165j_derived_logic_uses_constant_and_supervisor_only() {
         // provision_default_kernel_context derives region/base/top from the const.
+        // U9-SPAWN-TXN §2: the math lives in the rank-local owner now.
         let prov_start = THREAD_STATE_SRC
-            .find("fn provision_default_kernel_context")
+            .find("pub(crate) fn provision_default_kernel_context_locked")
             .expect("provision fn");
-        let prov = &THREAD_STATE_SRC[prov_start..prov_start + 1200];
+        let prov = &THREAD_STATE_SRC[prov_start..prov_start + 2000];
         assert!(
             prov.contains("idx.saturating_mul(KERNEL_STACK_REGION_SIZE)")
                 && prov.contains("checked_add(KERNEL_STACK_REGION_SIZE)"),
@@ -56900,6 +56972,11 @@ mod stage175_spawn_lifecycle {
     const MOD_SRC: &str = include_str!("mod.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const EXEC_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
     /// U9-SPAWN1 SP-3: the phase markers moved with the phases, into the one compensated
     /// transaction the four spawn syscalls now share.
@@ -57004,7 +57081,10 @@ mod stage175_spawn_lifecycle {
             "SPAWN_LIFECYCLE_ZOMBIE_LEAK",
             "SPAWN_LIFECYCLE_DUPLICATE_TID",
         ] {
-            assert!(EXEC_SRC.contains(m), "exec_state.rs must emit marker {m}");
+            assert!(
+                EXEC_SRC.contains(m) || SPAWN_PUBLISH_SRC.contains(m) || SPAWN_TXN_SRC.contains(m),
+                "the spawn path must emit marker {m}"
+            );
         }
         // Enabled marker is emitted by the cmdline apply.
         assert!(
@@ -57134,6 +57214,11 @@ fn stage175b_single_registration_is_not_a_duplicate_tid() {
 // gone and DUPLICATE_TID is emitted only from the true `tcb_count > 1` invariant.
 mod stage175b_duplicate_tid_gate {
     const EXEC_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
 
@@ -57141,16 +57226,26 @@ mod stage175b_duplicate_tid_gate {
     // `tcb_count > 1` invariant — and NOT from a pre-register presence scan.
     #[test]
     fn stage175b_duplicate_tid_only_from_count_invariant() {
+        // U9-SPAWN-TXN2 §2: the post-spawn invariant moved with the publication policy. It is
+        // still ONE site — and now it is one site in the ONE policy both acquisitions execute,
+        // which is stronger than one site in one of two possible implementations.
         assert_eq!(
-            EXEC_SRC.matches("SPAWN_LIFECYCLE_DUPLICATE_TID").count(),
+            SPAWN_PUBLISH_SRC
+                .matches("SPAWN_LIFECYCLE_DUPLICATE_TID")
+                .count(),
             1,
             "DUPLICATE_TID must be emitted from exactly one site"
         );
+        assert_eq!(
+            EXEC_SRC.matches("SPAWN_LIFECYCLE_DUPLICATE_TID").count(),
+            0,
+            "and exec_state.rs must not have kept a second copy of the detector"
+        );
         // That single site is the post-register invariant guarded by tcb_count > 1.
-        let idx = EXEC_SRC
+        let idx = SPAWN_PUBLISH_SRC
             .find("SPAWN_LIFECYCLE_DUPLICATE_TID")
             .expect("duplicate-tid emission");
-        let before = &EXEC_SRC[idx.saturating_sub(120)..idx];
+        let before = &SPAWN_PUBLISH_SRC[idx.saturating_sub(120)..idx];
         assert!(
             before.contains("tcb_count > 1"),
             "the DUPLICATE_TID emission must be guarded by the tcb_count > 1 invariant"
@@ -57158,8 +57253,8 @@ mod stage175b_duplicate_tid_gate {
         // The removed pre-register presence scan (`any(... tid.0 == spec.tid ...)`
         // immediately emitting DUPLICATE_TID) must NOT be present anymore.
         assert!(
-            EXEC_SRC.contains("Stage 175B"),
-            "exec_state must carry the Stage 175B rationale for the narrowed detector"
+            SPAWN_PUBLISH_SRC.contains("Stage 175B"),
+            "the policy must carry the Stage 175B rationale for the narrowed detector"
         );
     }
 
@@ -61561,7 +61656,11 @@ mod stage191a_lock_retire_inventory {
                 && SPLIT_SRC.contains("Syscall::VmBrk => Some(syscall),")
                 && SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
                 // Stage 191B added FutexWake as the fifth split class.
-                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
+                // U9-SPAWN-TXN3 §4 added the two image-loading spawn classes, the last live
+                // production classes with a terminal broad edge.
+                && SPLIT_SRC.contains("Syscall::SpawnProcess => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::SpawnFromMemoryObject => Some(syscall),"),
             "the NR-only split gate must whitelist exactly the accepted classes"
         );
         // Dangerous classes must NOT appear as split-eligible (default-deny `_ => None`).
@@ -61574,8 +61673,11 @@ mod stage191a_lock_retire_inventory {
             // family was, not because NR 11 shares the family's obstacles: it creates no address
             // space, loads no ELF, mints nothing, maps nothing and never switches tasks. Its
             // siblings below still do, and stay.
-            "Syscall::SpawnProcess => Some",
-            "Syscall::SpawnFromMemoryObject => Some",
+            // U9-SPAWN-TXN3 §4 removed NR 23 and NR 29 from this list. They were here because
+            // their rollback went through the kernel's GENERAL revocation, whose sixteen-substep
+            // cascade cannot run off-lock. §1 proved eleven of those substeps unreachable for the
+            // capabilities a spawn creates — by object kind — and §2 replaced the rollback with
+            // exactly the reachable closure, which is capability rank 4 plus one rank-2 read.
             "Syscall::ReapFaultedTask => Some",
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
@@ -61982,7 +62084,9 @@ mod stage191c_split_user_copy_seam {
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
             "Syscall::Fork => Some",
-            "Syscall::SpawnProcess => Some",
+            // U9-SPAWN-TXN3 §4: NR 23 left this list, for the same kind of reason NR 11 did —
+            // the obstacle was never the seam, it was the rollback, and §2 replaced it with the
+            // exact provisional-capability closure.
             "Syscall::ReapFaultedTask => Some",
             "Syscall::FutexWait => Some",
             "Syscall::Yield => Some",
@@ -62000,13 +62104,32 @@ mod stage191c_split_user_copy_seam {
     /// so a failed mint compensates without touching the frame allocator. No other minting
     /// class has been shown to have that property, so none may ride in on NR 28's admission.
     #[test]
-    fn nr28_is_the_only_minting_class_admitted() {
+    fn every_minting_class_admitted_has_an_exact_off_lock_rollback() {
         assert!(
             SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some(syscall),"),
             "NR 28 is admitted, with its own §4 guards"
         );
+        // U9-SPAWN-TXN3 §4: NR 23 and NR 29 mint too, and are now admitted. The property this
+        // guard actually protects is not "only NR 28 mints" — it is that a minting class may only
+        // be admitted once its mint has an EXACT off-lock rollback. Both spawn classes get theirs
+        // from §2's provisional-capability contract, which is asserted here rather than assumed.
+        for spawn_class in [
+            "Syscall::SpawnProcess => Some(syscall),",
+            "Syscall::SpawnFromMemoryObject => Some(syscall),",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(spawn_class),
+                "{spawn_class} is admitted by §4"
+            );
+        }
+        const PROVCAP: &str = include_str!("provisional_cap.rs");
+        assert!(
+            PROVCAP.contains("pub(crate) fn release_provisional_cap_locked(")
+                && PROVCAP.contains("ProvisionalCapRelease::StaleObject")
+                && PROVCAP.contains("ProvisionalCapRelease::Residue"),
+            "the admitted spawn classes must have an exact, refusing, bounded rollback owner"
+        );
         for still_locked in [
-            "Syscall::SpawnFromMemoryObject => Some",
             "Syscall::VmAnonMap => Some",
             "Syscall::TransferRelease => Some",
             "Syscall::CreateEndpoint => Some",
@@ -62287,6 +62410,9 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::VmBrk => Some(syscall),",
             "Syscall::DebugLog => Some(syscall),",
             "Syscall::FutexWake => Some(syscall),",
+            // U9-SPAWN-TXN3 §4.
+            "Syscall::SpawnProcess => Some(syscall),",
+            "Syscall::SpawnFromMemoryObject => Some(syscall),",
         ] {
             assert!(
                 SPLIT_SRC.contains(accepted),
@@ -62304,10 +62430,9 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::VmAnonMap => Some",
             "Syscall::TransferRelease => Some",
             "Syscall::Fork => Some",
-            // U9-SPAWN1 SP-2 removed NR 11: the candidate seam never owned the whitelist's
-            // contents, and NR 11's admission came from SP-2 with its own guards.
-            "Syscall::SpawnProcess => Some",
-            "Syscall::SpawnFromMemoryObject => Some",
+            // U9-SPAWN1 SP-2 removed NR 11, and U9-SPAWN-TXN3 §4 removed NR 23 and NR 29: the
+            // candidate seam never owned the whitelist's contents, and each admission came from
+            // its own stage with its own guards.
             // U9-MO2 §4 removed NR 28 from this list. Stage 191E's claim is that the CANDIDATE
             // SEAM adds no live class — it does not, and did not, own the whitelist's contents;
             // NR 28's admission came from §4 and is pinned by its own guards.
@@ -74641,13 +74766,27 @@ mod stage196a_riscv_shared_trap_foundation {
         // total has been exactly one over the sum of the other four. The companion check below
         // pins NR 1 to that exact disposition, so admitting it did not admit an early-returning
         // send.
+        //
+        // U9-SPAWN-TXN3 §4 widened it a final time, to SpawnProcess (NR 23) and
+        // SpawnFromMemoryObject (NR 29) — a real retirement this time, not an oracle correction.
+        // Both are pinned below to the NON-SWITCHING `result=ok` disposition and to their exact
+        // boot counts, so widening the membership did not widen the contract.
         assert!(
             RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15")
-                && RISCV_SMOKE
-                    .contains("non-DebugLog/FutexWake/FutexWait/IpcRecvTimeout/IpcSend syscall"),
-            "smoke must assert DebugLog+FutexWake+FutexWait+IpcRecvTimeout+IpcSend-only split \
-             dispatch"
+                && RISCV_SMOKE.contains("serviced a syscall outside the retired set"),
+            "smoke must assert the split dispatcher services only the retired set"
         );
+        for pin in [
+            "RISC-V SpawnProcess split serviced a switching disposition",
+            "RISC-V SpawnFromMemoryObject split serviced a switching disposition",
+            "RISC-V SpawnProcess split count is",
+            "RISC-V SpawnFromMemoryObject split count is",
+        ] {
+            assert!(
+                RISCV_SMOKE.contains(pin),
+                "smoke must pin the newly retired spawn classes: {pin}"
+            );
+        }
         assert!(
             RISCV_SMOKE.contains("RISC-V IpcSend split serviced a non-post-work disposition"),
             "smoke must pin every NR 1 split line to the post-work committed disposition"
@@ -113794,6 +113933,12 @@ mod stage199d_riscv_canonical_admission {
             // U9-SPAWN1 SP-2: the second NON-switching member — NR 11 finalizes through the
             // same same-task ecall writeback DebugLog and NR 28 use.
             "SYSCALL_SPAWN_THREAD_NR",
+            // U9-SPAWN-TXN3 §4: the third and fourth NON-switching members — NR 23 and NR 29,
+            // the last two live production classes with a terminal broad edge. Each runs the one
+            // generic spawn transaction and returns the child TID in the caller's own frame, so
+            // both finalize through that same writeback.
+            "SYSCALL_SPAWN_PROCESS_NR",
+            "SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -113805,10 +113950,11 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            7,
-            "exactly seven literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
-             FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo and \
-             (U9-SPAWN1 SP-2) SpawnThread"
+            9,
+            "exactly nine literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+             FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
+             (U9-SPAWN1 SP-2) SpawnThread and (U9-SPAWN-TXN3 §4) SpawnProcess + \
+             SpawnFromMemoryObject"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -118536,7 +118682,12 @@ mod stage199d_wa2a_ownership_boundary {
             callers,
             alloc::vec![
                 alloc::string::String::from("src/kernel/boot/spawn_thread_core.rs"),
-                alloc::string::String::from("src/kernel/boot/task_policy_state.rs"),
+                // U9-SPAWN-TXN2 §2: was `task_policy_state.rs`. The reservation policy moved into
+                // the ONE generic transaction, so its compensation arms moved with it. The
+                // argument is unchanged and still holds: the only slot this clears is the
+                // reservation the same policy inserted moments earlier, which is `Reserved` and
+                // has therefore never been runnable, never been enqueued, and never been Blocked.
+                alloc::string::String::from("src/kernel/syscall/spawn_txn.rs"),
             ],
             "the slot-clearing owner's callers must stay enumerated"
         );
@@ -119793,15 +119944,20 @@ mod stage199d_wa2b_wake_owner_census {
         // The ninth Group-3 site HARD-STOPPED: the absence precondition is not satisfiable by
         // the current boot sequence, so the gate was reverted rather than weakened. Pin the
         // reason so the finding cannot be lost, and pin that no weaker predicate crept in.
+        // U9-SPAWN-TXN2 §2: the reservation-consuming body moved into the one generic policy.
+        // The predicate is asserted there, where the only implementation now lives — and the
+        // broad entry in `exec_state.rs` is checked to be a delegation, so it cannot have kept a
+        // weaker copy.
         let exec = production_source("src/kernel/boot/exec_state.rs");
-        let spawn = exec
-            .split("pub fn spawn_user_task_from_image(")
+        let policy = production_source("src/kernel/syscall/spawn_txn.rs");
+        let spawn = policy
+            .split("pub(crate) fn spawn_user_task_from_image<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("spawn");
-        let spawn = &spawn[..spawn.find("\n    fn ").unwrap_or(spawn.len())];
+        let spawn = &spawn[..spawn.find("\nfn ").unwrap_or(spawn.len())];
         for needle in [
-            "reservation: crate::kernel::spawn_reservation::SpawnReservationToken",
-            "claim_for_spawn",
+            "reservation: SpawnReservationToken",
+            "claim_reservation",
             "restore_after_failed_spawn",
         ] {
             assert!(
@@ -119809,19 +119965,37 @@ mod stage199d_wa2b_wake_owner_census {
                 "spawn must consume an exact reservation (`{needle}`)"
             );
         }
+        // The rank-2 bodies those two owner methods wrap are the reservation module's own.
+        for needle in ["claim_for_spawn", "restore_after_failed_spawn"] {
+            assert!(
+                policy.contains(needle),
+                "the broad adapter must reach the reservation module's `{needle}`"
+            );
+        }
+        assert!(
+            exec.contains("crate::kernel::syscall::spawn_txn::spawn_user_task_from_image("),
+            "the broad entry must delegate rather than keep a second reservation consumer"
+        );
         assert!(
             !exec.contains("Stage 199D-WA3A HARD-STOP"),
             "the WA3A hard-stop note must be gone now that the site is closed"
         );
-        // Registration idempotence is no longer spawn authorization anywhere in the body.
-        let body = exec
-            .split("fn spawn_image_after_claim(")
+        // Registration idempotence is no longer spawn authorization anywhere in the body. The
+        // body is `commit_spawned_image` in the one policy now, and it reaches domains only
+        // through the owner interface — which has no registration method at all, so the check is
+        // stated over the interface as well as the body.
+        let body = policy
+            .split("fn commit_spawned_image<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("spawn body");
         assert!(
             !body[..body.find("SPAWN_TASK_CONTEXT_OK").unwrap_or(body.len())]
-                .contains("self.register_task_with_class("),
+                .contains("register_task_with_class"),
             "the spawn body must not register — the reservation already provisioned the TCB"
+        );
+        assert!(
+            !policy.contains("fn register_task_with_class"),
+            "and the owner interface must expose no registration operation to reach"
         );
         // The boot sequence is pinned in its NEW shape: reserve, grant, consume. If any boot
         // path regresses to register-then-overwrite, this fails.
@@ -121991,19 +122165,59 @@ mod stage199d_wa3b_spawn_reservation {
             "enqueued exactly once"
         );
         // Structural: the live commit precedes the enqueue in the source, so a partial spawn can
-        // never be scheduler-visible.
+        // never be scheduler-visible. U9-SPAWN-TXN §3 moved the commit into
+        // `publish_spawned_image_locked`, so the ordering is asserted against the CALL to that
+        // owner — and, one level down, against the owner's own validate → install → commit order.
         let exec = production_source("src/kernel/boot/exec_state.rs");
-        let body = exec
-            .split("fn spawn_image_after_claim(")
+        let policy = production_source("src/kernel/syscall/spawn_txn.rs");
+        // U9-SPAWN-TXN2 §2: the body is `commit_spawned_image` in the ONE generic policy now.
+        // Bound the split to that function: the same file also holds the broad adapter, whose
+        // `publish_spawned_image` method legitimately names the owner, and an unbounded split
+        // would sweep it in.
+        let body = policy
+            .split("fn commit_spawned_image<O: SpawnTxnOwners>(")
             .nth(1)
+            .and_then(|rest| rest.split("\npub(crate) struct BroadSpawnOwners").next())
             .expect("spawn body");
-        let commit = body.find("commit_live_spawn").expect("live commit");
+        let publish = body
+            .find(".publish_spawned_image(")
+            .expect("the publication owner call");
         let enqueue = body
-            .find("self.enqueue_on_cpu(chosen_cpu")
+            .find("owners.enqueue_on_cpu(chosen_cpu")
             .expect("enqueue");
         assert!(
-            commit < enqueue,
+            publish < enqueue,
             "the live commit must precede the enqueue: nothing partial may be schedulable"
+        );
+        let owner = exec
+            .split("pub(crate) fn publish_spawned_image_locked(")
+            .nth(1)
+            .expect("the publication owner")
+            .split("\n}\n")
+            .next()
+            .expect("owner body");
+        let validate = owner.find("validate_commit_ready").expect("validation");
+        let install = owner
+            .find("tcb.user_context =")
+            .expect("the context install");
+        let commit = owner.find("commit_live_spawn").expect("live commit");
+        assert!(
+            validate < install && install < commit,
+            "the owner must validate before it writes, and commit last"
+        );
+        // And there is exactly ONE task-lock acquisition around the pair, so no observer can see
+        // a published context on a task that never became runnable.
+        assert_eq!(
+            body.matches("commit_live_spawn").count(),
+            0,
+            "the commit belongs to the publication owner, not to a second acquisition"
+        );
+        // The policy reaches the publication ONLY through the owner interface, so neither
+        // acquisition can smuggle in a second publication of its own.
+        assert_eq!(
+            body.matches("publish_spawned_image_locked(").count(),
+            0,
+            "the policy must not call the rank-local owner directly; that is the adapter's job"
         );
     }
 
@@ -152092,6 +152306,11 @@ mod u9spawn1_sp3_spawn_ledger {
     /// U9-SPAWN-VM1 moved the address space, the image load and the user stack behind THE
     /// provisioner, so the ordering and no-bare-`?` guards below follow them there.
     const PROVISION_SRC: &str = include_str!("spawn_image_provision.rs");
+    /// U9-SPAWN-TXN2 §2: the ONE generic spawn transaction policy, over `SpawnTxnOwners`.
+    /// Both the broad and the split acquisition execute this body, so an assertion here binds
+    /// both paths at once — which is strictly stronger than asserting over one of two possible
+    /// implementations.
+    const SPAWN_POLICY_SRC: &str = include_str!("../syscall/spawn_txn.rs");
 
     /// A real ELF64 image with one PT_LOAD segment, so the load phase runs the production loader
     /// rather than a stub. `entry` is a parameter because an entry of zero is exactly how the
@@ -152212,7 +152431,7 @@ mod u9spawn1_sp3_spawn_ledger {
     ) -> Result<u64, crate::kernel::syscall::SyscallError> {
         k.with(|s| {
             run_image_spawn_transaction(
-                s,
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
                 SpawnImageRequest {
                     image_id: 0,
                     image_path: "init",
@@ -152342,7 +152561,12 @@ mod u9spawn1_sp3_spawn_ledger {
         });
         assert_eq!(ledger.len(), 4, "one entry per acquisition");
         assert_ne!(baseline(&k), before, "the acquisitions must be observable");
-        k.with(|s| s.unwind_spawn_ledger(ledger));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                ledger,
+            )
+        });
         assert_eq!(
             baseline(&k),
             before,
@@ -152371,7 +152595,10 @@ mod u9spawn1_sp3_spawn_ledger {
         k.with(|s| {
             s.cancel_spawn_reservation(token).expect("cancel");
             s.destroy_user_address_space_by_asid(asid).expect("destroy");
-            s.release_service_endpoint_grant(&grant);
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &grant,
+            );
         });
         let before = baseline(&k);
         // Now unwind a ledger that still names them.
@@ -152379,7 +152606,12 @@ mod u9spawn1_sp3_spawn_ledger {
         ledger.record(ProvisionalSpawnResource::Reservation(token));
         ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
         ledger.record(ProvisionalSpawnResource::Endpoint(grant));
-        k.with(|s| s.unwind_spawn_ledger(ledger));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                ledger,
+            )
+        });
         assert_eq!(
             baseline(&k),
             before,
@@ -152415,11 +152647,11 @@ mod u9spawn1_sp3_spawn_ledger {
     #[test]
     fn the_reservation_precedes_the_first_address_space() {
         let txn = TXN_SRC
-            .split("pub(crate) fn run_image_spawn_transaction(")
+            .split("pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("the transaction body");
         let reserve = txn
-            .find("reserve_task_for_spawn_with_class(tid, class)")
+            .find("reserve_task_for_spawn(owners, tid, class, tid)")
             .expect("the reservation phase");
         // U9-SPAWN-VM1: the address space is no longer created inline. `provision_spawn_image` is
         // the step that creates it — together with the image and the stack — so it is the step
@@ -152459,21 +152691,34 @@ mod u9spawn1_sp3_spawn_ledger {
             plan < create && create < load && load < stack,
             "provisioning order must stay plan → address space → image → stack"
         );
-        // U9-SPAWN-VM2 §2: the capability is published by the BROAD wrapper, strictly after the
-        // rank-local body returned and both locks were released — never while rank 5/6 is held.
-        let broad = PROVISION_SRC
-            .split("pub(crate) fn provision_spawn_image(")
+        // U9-SPAWN-VM2 §2 / U9-SPAWN-TXN2 §2: the capability is published by the COMPOSITION,
+        // strictly after the rank-local body returned and both locks were released — never while
+        // rank 5/6 is held. The composition is now in the one policy, and it reaches both steps
+        // through the owner interface, so this ordering binds the broad and split paths alike.
+        let compose = SPAWN_POLICY_SRC
+            .split("pub(crate) fn provision_spawn_image<O: SpawnTxnOwners>(")
             .nth(1)
-            .expect("the broad wrapper");
-        let provisioned = broad
-            .find("provision_image_locked(vm, memory, &request)")
+            .and_then(|rest| rest.split("\n// ─").next())
+            .expect("the provisioning composition");
+        let provisioned = compose
+            .find("provision_image(&request)")
             .expect("the provisioning step");
-        let mint = broad
-            .find("mint_capability_for_current_context(")
+        let mint = compose
+            .find("mint_capability_in_cnode(")
             .expect("the capability publication step");
         assert!(
             provisioned < mint,
             "the address-space capability must be minted after provisioning, not during it"
+        );
+        // And the cspace it mints into is resolved EXPLICITLY, not through an ambient
+        // current-task lookup buried inside the mint — which is what lets the split path state
+        // the same identity the broad one does.
+        let cnode = compose
+            .find("current_task_cnode()")
+            .expect("the explicit caller cspace");
+        assert!(
+            cnode < mint,
+            "the caller's cspace must be resolved before the mint, as an explicit argument"
         );
     }
 
@@ -152482,11 +152727,11 @@ mod u9spawn1_sp3_spawn_ledger {
     #[test]
     fn no_acquisition_step_returns_through_a_bare_question_mark() {
         let txn = TXN_SRC
-            .split("pub(crate) fn run_image_spawn_transaction(")
+            .split("pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("the transaction body");
         for acquisition in [
-            "reserve_task_for_spawn_with_class",
+            "reserve_task_for_spawn",
             "provision_spawn_image",
             "spawn_user_task_from_image",
         ] {
@@ -152504,7 +152749,7 @@ mod u9spawn1_sp3_spawn_ledger {
         }
         // And every one of them goes through the one carrier.
         assert!(
-            txn.matches("advance(kernel, ledger, outcome,").count() >= 3,
+            txn.matches("advance(owners, ledger, outcome,").count() >= 3,
             "each fallible acquisition is carried by the same ledger-aware step"
         );
 
@@ -152539,42 +152784,79 @@ mod u9spawn1_sp3_spawn_ledger {
             2,
             "exactly the two owning phases (load, stack) unwind, and both through the one rollback"
         );
-        // The broad wrapper adds exactly one more: the capability-mint failure, which owns a whole
-        // provisioned image and must give it back.
-        let broad = PROVISION_SRC
-            .split("pub(crate) fn provision_spawn_image(")
+        // U9-SPAWN-TXN2 §2: the composition around the rank-local body moved into the one
+        // policy, so the third rollback arm — the capability-mint failure, which owns a whole
+        // provisioned image and must give it back — is asserted there. It now reaches the
+        // rollback through the owner interface, which is why the spelling changed and not the
+        // rule.
+        let compose = SPAWN_POLICY_SRC
+            .split("pub(crate) fn provision_spawn_image<O: SpawnTxnOwners>(")
             .nth(1)
-            .expect("the broad wrapper");
+            .and_then(|rest| rest.split("\n// ─").next())
+            .expect("the provisioning composition");
         assert_eq!(
-            broad
-                .matches("rollback_provision_locked(vm, memory, token.asid,")
+            compose
+                .matches("rollback_provision(token.asid, \"aspace_cap_mint\", err)")
                 .count(),
             1,
             "the mint failure rolls the exact token back, exactly once"
         );
+        let mint = compose.find("mint_capability_in_cnode(").expect("the mint");
+        let rollback = compose
+            .find("rollback_provision(token.asid")
+            .expect("the rollback");
+        assert!(
+            mint < rollback,
+            "the rollback is the mint's failure arm, not a step that runs before it"
+        );
     }
 
-    /// U9-SPAWN1 SP-4 stopped here, and this pins WHY so the boundary cannot go stale.
+    /// U9-SPAWN1 SP-4's blocker, RE-DERIVED after U9-SPAWN-TXN2 §3 discharged half of it.
     ///
-    /// Routing NR 23 off the terminal dispatchers needs every phase to run under one rank-local
-    /// lock. A process spawn creates a NEW process CNode, and the two capability-domain owners
-    /// that do it have no split variant at all — not a partial one, no presence in `runtime.rs`.
+    /// SP-4 stopped because the capability-domain owner that associates a NEW process CNode had
+    /// no split variant at all. That is no longer true: `set_process_cnode_for_pid_split` exists
+    /// and is a real off-lock caller, which is precisely the condition the old blocker note said
+    /// would retire it ("when someone builds those owners, this test fails and the blocker is
+    /// genuinely gone").
     ///
-    /// This is the same boundary SP-2 stopped at, approached from the other side: the NR 11 route
-    /// is admissible precisely BECAUSE a thread joins its parent's EXISTING CNode, and its
-    /// pre-mutation gate declines outright when that CNode is absent rather than creating one.
+    /// So the assertion inverts rather than disappearing. What SP-4 actually cared about was not
+    /// "no off-lock caller exists" but "there is ONE association policy, and both acquisitions
+    /// reach it" — a blocker note in its pre-discharge form. That is what is pinned now, and it
+    /// is strictly stronger than the absence check it replaces: absence permitted a split caller
+    /// with a transcribed second policy, and this does not.
     ///
-    /// When someone builds those owners, this test fails and the blocker is genuinely gone.
+    /// `ensure_cnode_space_with_slots` keeps its absence check: no off-lock caller reaches it,
+    /// and the split path grows a CNode through `ensure_cnode_space_split` instead.
+    ///
+    /// The NR 11 half is unchanged and still load-bearing: a thread joins its parent's EXISTING
+    /// CNode, and its pre-mutation gate declines outright when that CNode is absent rather than
+    /// creating one.
     #[test]
-    fn nr23_is_blocked_on_an_absent_process_cnode_owner() {
+    fn the_process_cnode_association_has_one_policy_and_two_acquisitions() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
-        for missing in ["ensure_cnode_space_with_slots", "set_process_cnode_for_pid"] {
-            assert!(
-                !RUNTIME_SRC.contains(missing),
-                "{missing} now has an off-lock caller — the SP-4 blocker may be gone; re-derive \
-                 the NR 23 phase table before trusting this note"
-            );
-        }
+        const CNODE_SRC: &str = include_str!("cnode_state.rs");
+        assert!(
+            !RUNTIME_SRC.contains("ensure_cnode_space_with_slots"),
+            "ensure_cnode_space_with_slots gained an off-lock caller — re-derive the NR 23 \
+             phase table before trusting this note"
+        );
+        // Exactly one body states the association rule...
+        assert_eq!(
+            CNODE_SRC
+                .matches("pub(crate) fn set_process_cnode_for_pid_locked(")
+                .count(),
+            1,
+            "the association policy is written once, as a rank-4 body over CapabilitySubsystem"
+        );
+        // ...and BOTH acquisitions delegate to it rather than restating it.
+        assert!(
+            CNODE_SRC.contains("set_process_cnode_for_pid_locked(capability, pid, cnode)"),
+            "the broad entry must delegate to the rank-4 body"
+        );
+        assert!(
+            RUNTIME_SRC.contains("cnode_state::set_process_cnode_for_pid_locked("),
+            "the split entry must delegate to the SAME rank-4 body, not a transcription"
+        );
         // And the NR 11 route still declines rather than creating one, which is what keeps it
         // sound while NR 23 waits.
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
@@ -153340,6 +153622,11 @@ mod u9spawn2_process_cnode_txn {
 
     const TXN_SRC: &str = include_str!("process_cnode_txn.rs");
     const RESERVE_SRC: &str = include_str!("task_policy_state.rs");
+    /// U9-SPAWN-TXN2 §2: the ONE generic spawn transaction policy, over `SpawnTxnOwners`.
+    /// Both the broad and the split acquisition execute this body, so an assertion here binds
+    /// both paths at once — which is strictly stronger than asserting over one of two possible
+    /// implementations.
+    const SPAWN_POLICY_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
 
     fn kernel() -> SharedKernel {
@@ -153519,13 +153806,21 @@ mod u9spawn2_process_cnode_txn {
     /// which is what makes this a production owner rather than a helper-only API.
     #[test]
     fn the_broad_reservation_delegates_and_compensates() {
-        let body = RESERVE_SRC
-            .split("pub fn reserve_task_for_spawn_with_class_in_process(")
+        // U9-SPAWN-TXN2 §2: the reservation body moved into the ONE generic policy, so this now
+        // binds both acquisitions rather than the broad one alone. The broad entry in
+        // `task_policy_state.rs` is separately checked to be a pure delegation, so it cannot have
+        // kept a second, uncompensated copy.
+        assert!(
+            RESERVE_SRC.contains("crate::kernel::syscall::spawn_txn::reserve_task_for_spawn("),
+            "the broad entry must delegate to the one reservation policy"
+        );
+        let body = SPAWN_POLICY_SRC
+            .split("pub(crate) fn reserve_task_for_spawn<O: SpawnTxnOwners>(")
             .nth(1)
-            .and_then(|s| s.split("\n    }\n").next())
+            .and_then(|s| s.split("\n/// ").next())
             .expect("the reservation body");
         assert!(
-            body.contains("self.provision_process_cnode(&cnode_request)"),
+            body.contains("owners.provision_process_cnode(&cnode_request)"),
             "the reservation must go through the transaction"
         );
         for bypassed in [
@@ -153544,6 +153839,31 @@ mod u9spawn2_process_cnode_txn {
                 .count()
                 >= 2,
             "each failure after the CNode transaction must release it"
+        );
+        // Exhaustive, not merely present. The reservation has exactly four failure returns: two
+        // occupancy/capacity refusals BEFORE the CNode transaction (which own nothing yet), and
+        // two arms AFTER it — a full task table and a kernel-context failure. Both of the latter
+        // release the grant, which is what the `>= 2` count above pins; this pins that there is
+        // no third post-transaction arm that could have been missed.
+        assert_eq!(
+            body.matches("return Err(").count(),
+            4,
+            "the reservation has exactly four failure returns"
+        );
+        let cnode_txn = body
+            .find("owners.provision_process_cnode(&cnode_request)")
+            .expect("the CNode transaction");
+        assert_eq!(
+            body[cnode_txn..].matches("return Err(").count(),
+            2,
+            "exactly two failure arms exist after the CNode transaction"
+        );
+        assert_eq!(
+            body[cnode_txn..]
+                .matches("release_process_cnode_grant(&cnode_request, &cnode_grant)")
+                .count(),
+            2,
+            "and each of them releases the grant — one release per post-transaction arm"
         );
         // And the PID is the caller's, never the current task's.
         assert!(
@@ -153585,45 +153905,283 @@ mod u9spawn2_process_cnode_txn {
 mod u9spawn2_nr23_route_blockers {
     use super::*;
 
-    /// Every phase the NR 23 / NR 29 transaction still needs off the broad lock, and the fact
-    /// that none of them has a rank-local owner today.
+    /// U9-SPAWN-TXN §3 — two task-domain fields that had no lock domain, and must not lose one
+    /// again.
     ///
-    /// A rank-local owner is one that takes its subsystem (`&mut XSubsystem`) rather than
-    /// `&mut self`, so an acquisition wrapper can drive it from either side — the shape §2's
-    /// `provision_process_cnode_locked` has. When one of these grows that shape, this test fails
-    /// and the phase table gets recomputed instead of the note going stale.
+    /// `task_classes` and `spawn_reservation_generation` were both written from
+    /// `task_policy_state.rs` with NO lock held: the first through a bare
+    /// `kernel_mut(&mut self.task_classes)[idx] = ..`, the second as a plain read-modify-write of
+    /// a `KernelState` field. Under the broad lock both were serialized by the broad lock and
+    /// nothing else — so a spawn phase driven off-lock would have raced them, and the generation
+    /// counter's entire correctness rule (no two reservations ever share a value, which is what
+    /// stops a token for an earlier occupant of a numeric TID matching a later one) was
+    /// unenforceable.
+    ///
+    /// Both are task-domain state and are now written through the seams that own them. This
+    /// asserts they stay there.
     #[test]
-    fn every_remaining_spawn_phase_still_lacks_a_rank_local_owner() {
-        const PHASES: &[(&str, &str)] = &[
-            ("create_user_address_space", "VM rank 5 + capability rank 4"),
-            ("load_elf_pt_load_segments", "VM rank 5 + memory rank 6"),
-            ("load_elf_with_mo_zero_copy", "VM rank 5 + memory rank 6"),
-            // U9-SPAWN-VM1 renamed the stack phase's body to `allocate_user_stack_in_asid` and
-            // left `allocate_user_stack_with_guard` as the TID-resolving wrapper. Both are named
-            // so the table tracks the call the provisioner actually makes AND the one the
-            // architecture bring-up sites still make.
-            ("allocate_user_stack_in_asid", "VM rank 5 + memory rank 6"),
-            (
-                "allocate_user_stack_with_guard",
-                "VM rank 5 + memory rank 6",
-            ),
-            ("create_endpoint", "IPC rank 3 + capability rank 4"),
-            (
-                "grant_capability_task_to_task_with_rights",
-                "capability rank 4",
-            ),
-            ("provision_default_kernel_context", "task rank 2"),
-        ];
-        let sources = stage199d_wa2a_ownership_boundary::production_sources();
-        for (phase, ranks) in PHASES {
-            let locked = alloc::format!("fn {phase}_locked(");
-            let has_rank_local = sources.iter().any(|(_, src)| src.contains(&locked));
+    fn the_reservation_task_domain_fields_are_never_written_lockless() {
+        // Comment-stripped, so the guard reads CODE and not the prose that explains the rule.
+        let code = |src: &str| -> alloc::string::String {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .fold(alloc::string::String::new(), |mut acc, l| {
+                    acc.push_str(l);
+                    acc.push('\n');
+                    acc
+                })
+        };
+        for (rel, raw) in stage199d_wa2a_ownership_boundary::production_sources() {
+            if rel == "src/kernel/boot/orchestrator_state.rs" {
+                // The seams themselves legitimately name the fields, under their guards.
+                continue;
+            }
+            let src = code(&raw);
             assert!(
-                !has_rank_local,
-                "{phase} ({ranks}) grew a rank-local owner — recompute the NR 23 phase table \
-                 before trusting the hard-stop note"
+                !src.contains("kernel_mut(&mut self.task_classes)"),
+                "{rel} writes the class table with no lock held; it is task-domain state and \
+                 belongs inside `with_task_enqueue_policy_mut`"
+            );
+            assert!(
+                !src.contains("self.spawn_reservation_generation ="),
+                "{rel} writes the spawn-reservation generation with no lock held; it belongs \
+                 inside `with_task_spawn_generation_mut`"
             );
         }
+        // And the reservation really pairs each write with the TCB mutation it stamps, so the
+        // slot and its class can never be observed out of step.
+        //
+        // U9-SPAWN-TXN2 §2: the reservation POLICY moved into the one generic transaction, which
+        // reaches the task domain only through `insert_reservation` / `stamp_spawn_generation`.
+        // The pairing is therefore a property of the ADAPTERS, and it is asserted on each of
+        // them — the broad one here, and the split one by the same names in `runtime.rs`.
+        const POLICY: &str = include_str!("../syscall/spawn_txn.rs");
+        let broad_insert = POLICY
+            .split("fn insert_reservation(")
+            .nth(2)
+            .expect("the broad adapter's insert")
+            .split("\n    fn ")
+            .next()
+            .expect("body");
+        assert!(
+            broad_insert.contains("with_task_enqueue_policy_mut(|tcbs, classes|")
+                && broad_insert.contains("classes[idx] = Some(class);"),
+            "the TCB insert and its class entry must land under one acquisition"
+        );
+        let broad_stamp = POLICY
+            .split("fn stamp_spawn_generation(&mut self) -> u64 {")
+            .nth(1)
+            .expect("the broad adapter's generation stamp")
+            .split("\n    fn ")
+            .next()
+            .expect("body");
+        assert!(
+            broad_stamp.contains("with_task_spawn_generation_mut("),
+            "the generation must be issued under the task lock"
+        );
+        // The policy itself must not reach either storage directly — it has no way to, and this
+        // pins that the interface is what it depends on.
+        let reserve = POLICY
+            .split("pub(crate) fn reserve_task_for_spawn<O: SpawnTxnOwners>(")
+            .nth(1)
+            .expect("the reservation policy")
+            .split("\n/// ")
+            .next()
+            .expect("body");
+        for direct in [
+            "with_task_enqueue_policy_mut",
+            "with_task_spawn_generation_mut",
+        ] {
+            assert!(
+                !reserve.contains(direct),
+                "the generic reservation policy must reach the task domain only through the \
+                 owner interface, never through `{direct}` directly"
+            );
+        }
+    }
+
+    /// The production corpus every ownership guard scans must actually CONTAIN the production
+    /// code, and this pins the one way it silently stops doing so.
+    ///
+    /// `production_sources()` truncates each file at its `#[cfg(test)] mod tests` marker, which is
+    /// correct — a guard must not match a test's own literals. The trap is that anything appended
+    /// AFTER that marker is production code the corpus never sees, so every forbidden-pattern and
+    /// ownership guard silently exempts it.
+    ///
+    /// That is not hypothetical: U9-SPAWN-VM2 appended the two rank-local ELF loaders to the end
+    /// of `exec_state.rs`, past its test module, and roughly 600 lines of production code were
+    /// invisible to every corpus scan until U9-SPAWN-TXN moved them above it. This test would have
+    /// caught that the moment it happened.
+    ///
+    /// `#[cfg(test)]` items are exempt by definition: they ship in no kernel, so a guard has no
+    /// reason to see them.
+    #[test]
+    fn no_production_item_hides_after_a_files_test_module() {
+        for (rel, _) in stage199d_wa2a_ownership_boundary::production_sources() {
+            let full = std::fs::read_to_string(&rel).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            let Some(at) = full.find("\n#[cfg(test)]\nmod tests") else {
+                continue;
+            };
+            let tail = &full[at + 1..];
+            let mut hidden: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+            let mut cfg_test = false;
+            for line in tail.lines() {
+                if line.starts_with("#[cfg(test)]") {
+                    cfg_test = true;
+                    continue;
+                }
+                let is_item = line.starts_with("pub fn ")
+                    || line.starts_with("pub(crate) fn ")
+                    || line.starts_with("pub struct ")
+                    || line.starts_with("pub(crate) struct ")
+                    || line.starts_with("pub enum ")
+                    || line.starts_with("pub(crate) enum ")
+                    || line.starts_with("pub const ")
+                    || line.starts_with("pub(crate) const ")
+                    || line.starts_with("pub static ")
+                    || line.starts_with("pub(crate) static ");
+                if is_item {
+                    if !cfg_test {
+                        hidden.push(line.into());
+                    }
+                    cfg_test = false;
+                } else if !line.trim_start().starts_with("//")
+                    && !line.trim_start().starts_with("#[")
+                    && !line.trim().is_empty()
+                {
+                    cfg_test = false;
+                }
+            }
+            assert!(
+                hidden.is_empty(),
+                "{rel} has production items after its `#[cfg(test)] mod tests` marker, so every \
+                 corpus-scanning guard silently exempts them — move them above it: {hidden:?}"
+            );
+        }
+    }
+
+    /// The recomputed NR 23 / NR 29 phase table.
+    ///
+    /// U9-SPAWN2 §3 wrote this as "none of these seven has a rank-local owner". Each later pass
+    /// closed some of them, and U9-SPAWN-TXN §2 closed the last, at which point the old assertion
+    /// fired — which was its job. The table is therefore INVERTED here rather than deleted: every
+    /// one of the seven must now HAVE a rank-local owner, so a regression that removed one is
+    /// caught just as loudly as the growth was.
+    ///
+    /// A rank-local owner takes its subsystem (`&mut XSubsystem`, or the TCB/class storage for
+    /// task rank 2) rather than `&mut self`, so an acquisition wrapper can drive it from either
+    /// side.
+    #[test]
+    fn every_spawn_phase_now_has_a_rank_local_owner() {
+        const PHASES: &[(&str, &str, &str)] = &[
+            (
+                "create_user_address_space",
+                "create_address_space_locked",
+                "VM rank 5 (the capability mint moved out — U9-SPAWN-VM2 §2)",
+            ),
+            (
+                "load_elf_pt_load_segments",
+                "load_elf_pt_load_segments_locked",
+                "VM rank 5 + memory rank 6",
+            ),
+            (
+                "load_elf_with_mo_zero_copy",
+                "load_elf_with_mo_zero_copy_locked",
+                "VM rank 5 + memory rank 6",
+            ),
+            (
+                "allocate_user_stack_in_asid",
+                "allocate_user_stack_locked",
+                "VM rank 5 + memory rank 6",
+            ),
+            (
+                "create_endpoint",
+                "provision_service_endpoint_locked",
+                "IPC rank 3 + capability rank 4",
+            ),
+            (
+                "grant_capability_task_to_task_with_rights",
+                "delegate_capability_locked",
+                "capability rank 4",
+            ),
+            (
+                "provision_default_kernel_context",
+                "provision_default_kernel_context_locked",
+                "task rank 2",
+            ),
+        ];
+        let sources = stage199d_wa2a_ownership_boundary::production_sources();
+        for (phase, owner, ranks) in PHASES {
+            let decl = alloc::format!("fn {owner}(");
+            assert!(
+                sources.iter().any(|(_, src)| src.contains(&decl)),
+                "{phase} ({ranks}) lost its rank-local owner `{owner}`"
+            );
+        }
+    }
+
+    /// The seven-phase table was never the COMPLETE routing ledger, and this records what it
+    /// omitted so the omission cannot be rediscovered as a surprise.
+    ///
+    /// U9-SPAWN-IC1 closed the last of the seven and reported that fact accurately. But routing
+    /// NR 23 / NR 29 off the broad lock needs the PUBLICATION phase too — everything
+    /// `spawn_image_after_claim` does after the reservation is claimed — and that phase has two
+    /// owners of its own which the seven-phase table never listed:
+    ///
+    /// | publication step | rank | rank-local owner |
+    /// |---|---|---|
+    /// | `set_process_cnode_for_pid` | capability 4 | `set_process_cnode_for_pid_locked` |
+    /// | the TCB write-set + `Spawning -> LiveSpawned` commit | task 2 | `publish_spawned_image_locked` |
+    ///
+    /// Neither was a new subsystem: the first is capability-state-only, and the commit already had
+    /// a rank-2-local free function in `spawn_reservation`. U9-SPAWN-TXN §3 built both, so this
+    /// test — which pinned the gap while it existed — now requires them, and fails if either is
+    /// removed.
+    #[test]
+    fn the_publication_phase_owners_now_exist() {
+        const PUBLICATION: &[(&str, &str, &str)] = &[
+            (
+                "set_process_cnode_for_pid",
+                "set_process_cnode_for_pid_locked",
+                "capability rank 4",
+            ),
+            (
+                "spawn_image_after_claim (TCB write-set + commit)",
+                "publish_spawned_image_locked",
+                "task rank 2",
+            ),
+        ];
+        let sources = stage199d_wa2a_ownership_boundary::production_sources();
+        for (step, owner, ranks) in PUBLICATION {
+            let decl = alloc::format!("fn {owner}(");
+            assert!(
+                sources.iter().any(|(_, src)| src.contains(&decl)),
+                "{step} ({ranks}) lost its rank-local owner `{owner}`"
+            );
+        }
+        // Both broad entries delegate rather than keeping a second copy of the policy.
+        const CNODE: &str = include_str!("cnode_state.rs");
+        let broad = CNODE
+            .split("pub(crate) fn set_process_cnode_for_pid(")
+            .nth(1)
+            .expect("the broad entry")
+            .split("\n    }\n")
+            .next()
+            .expect("body");
+        assert!(
+            broad.contains("set_process_cnode_for_pid_locked(capability, pid, cnode)")
+                && !broad.contains("ProcessCNodeRecord {"),
+            "the broad CNode binding must delegate, never re-implement"
+        );
+        // And the commit half really is already rank-local, which is why this is an extraction
+        // rather than a new subsystem.
+        const RESERVATION: &str = include_str!("../spawn_reservation.rs");
+        assert!(
+            RESERVATION.contains(
+                "pub(crate) fn commit_live_spawn(\n    tcbs: &mut [Option<ThreadControlBlock>]"
+            ),
+            "the Spawning -> LiveSpawned commit must stay a rank-2-local function over the TCBs"
+        );
     }
 
     /// §2's transaction, by contrast, HAS that shape — which is how the difference between a
@@ -153747,7 +154305,7 @@ mod u9spawnvm1_provision_rollback {
     ) -> Result<u64, crate::kernel::syscall::SyscallError> {
         k.with(|s| {
             run_image_spawn_transaction(
-                s,
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
                 SpawnImageRequest {
                     image_id: 0,
                     image_path: "init",
@@ -154043,6 +154601,11 @@ mod u9spawnvm2_rank_local_body {
 
     const VM_LOCKED: &str = include_str!("vm_image_locked.rs");
     const PROVISION: &str = include_str!("spawn_image_provision.rs");
+    /// U9-SPAWN-TXN2 §2: the ONE generic spawn transaction policy, over `SpawnTxnOwners`.
+    /// Both the broad and the split acquisition execute this body, so an assertion here binds
+    /// both paths at once — which is strictly stronger than asserting over one of two possible
+    /// implementations.
+    const SPAWN_POLICY_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const EXEC: &str = include_str!("exec_state.rs");
     const ORCHESTRATOR: &str = include_str!("orchestrator_state.rs");
 
@@ -154303,9 +154866,12 @@ mod u9spawnvm2_rank_local_body {
                 }
             }
         }
+        // U9-SPAWN-TXN2 §2: the `with_vm_then_memory_mut` acquisitions moved out of the
+        // provisioner's broad wrapper (which is gone) and into the broad ADAPTER, which is where
+        // acquisition now lives. The anchor follows them, so the guard still checks something.
         assert!(
-            !vm_memory_closures(&code(PROVISION)).is_empty(),
-            "the provisioner must actually use the seam, or this guard checks nothing"
+            !vm_memory_closures(&code(SPAWN_POLICY_SRC)).is_empty(),
+            "the broad adapter must actually use the seam, or this guard checks nothing"
         );
         // And the token the body returns carries no capability at all, which is what makes that
         // structurally true rather than a convention.
@@ -154476,7 +155042,8 @@ mod u9spawnvm2_provision_failure_injection {
     ) -> Result<crate::kernel::boot::spawn_image_provision::ImageProvision, KernelError> {
         let mut startup = [0u64; 18];
         k.with(|s| {
-            s.provision_spawn_image(
+            crate::kernel::syscall::spawn_txn::provision_spawn_image(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
                 90_100,
                 "test/image",
                 ImageSource::PtLoadSegments { elf, entry },
@@ -154754,6 +155321,392 @@ mod u9spawnvm2_provision_failure_injection {
 /// Structural guards first (what the code CANNOT do), then failure injection at every endpoint,
 /// capability, delegation and cleanup boundary (what it actually restores).
 #[cfg(test)]
+/// U9-SPAWN-TXN3 §5 — the provisional-capability rollback contract, and the proof that the split
+/// acquisition layer is live rather than dormant.
+mod u9spawntxn3_provisional_rollback {
+    use super::*;
+    use crate::kernel::boot::provisional_cap::{
+        MAX_PROVISIONAL_DESCENDANTS, ProvisionalCap, ProvisionalCapRelease,
+        collect_link_closure_locked, pid_for_cnode_locked, provisional_cap_token_locked,
+        release_provisional_cap_locked,
+    };
+    use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
+    use crate::kernel::syscall::spawn_txn::{SharedSpawnOwners, SpawnTxnOwners};
+    use crate::runtime::SharedKernel;
+
+    const PROVCAP: &str = include_str!("provisional_cap.rs");
+    const POLICY: &str = include_str!("../syscall/spawn_txn.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+
+    fn fixture() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    fn endpoint_cap(index: usize, generation: u64) -> Capability {
+        Capability::new(CapObject::Endpoint { index, generation }, CapRights::SEND)
+    }
+
+    /// Run the four-step rollback the way the policy composes it, through the BROAD adapter.
+    fn release(k: &SharedKernel, cnode: CNodeId, cap: CapId) -> ProvisionalCapRelease {
+        k.with(|s| {
+            let mut owners = crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s };
+            crate::kernel::syscall::spawn_txn::release_provisional_capability(
+                &mut owners,
+                cnode,
+                cap,
+            )
+        })
+    }
+
+    fn cap_present(k: &SharedKernel, cnode: CNodeId, cap: CapId) -> bool {
+        k.with(|s| s.capability_for_cnode_local(cnode, cap).is_some())
+    }
+
+    fn link_count(k: &SharedKernel) -> usize {
+        k.with(|s| {
+            s.with_capability_state(|capability| {
+                crate::kernel::boot::kernel_ref(&capability.delegated_capability_links)
+                    .iter()
+                    .flatten()
+                    .count()
+            })
+        })
+    }
+
+    // ── The reachable closure, exercised ─────────────────────────────────────────────────
+
+    /// The ordinary case: a minted provisional capability with no descendants is removed, and the
+    /// rollback reports exactly that.
+    #[test]
+    fn a_childless_provisional_cap_is_removed_and_reported() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(3, 7)))
+            .expect("mint");
+        assert!(cap_present(&k, cnode, cap));
+        assert_eq!(
+            release(&k, cnode, cap),
+            ProvisionalCapRelease::Released { descendants: 0 }
+        );
+        assert!(!cap_present(&k, cnode, cap), "the source slot is gone");
+    }
+
+    /// Repeat-inert: a second rollback of the same token finds nothing and touches nothing.
+    #[test]
+    fn the_rollback_is_repeat_inert() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(4, 9)))
+            .expect("mint");
+        assert!(release(&k, cnode, cap).released());
+        let links_before = link_count(&k);
+        assert_eq!(release(&k, cnode, cap), ProvisionalCapRelease::AlreadyGone);
+        assert_eq!(link_count(&k), links_before, "a repeat touched nothing");
+    }
+
+    /// A stale token whose slot now holds a DIFFERENT object must refuse WITHOUT mutation. This
+    /// is the hazard §1 refused to assume away: a fresh CapId is guessable and siblings share the
+    /// cspace, so the replacement must survive a stale rollback intact.
+    #[test]
+    fn a_recycled_slot_is_refused_and_left_intact() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(5, 11)))
+            .expect("mint");
+        // Build the token for the ORIGINAL incarnation, then replace the slot's contents.
+        let token = k
+            .with(|s| {
+                s.with_capability_state(|capability| {
+                    provisional_cap_token_locked(capability, cnode, cap)
+                })
+            })
+            .expect("token");
+        k.with(|s| {
+            s.with_capability_state_mut(|capability| {
+                if let Some(space) = capability
+                    .cnode_spaces
+                    .iter_mut()
+                    .flatten()
+                    .find(|space| space.id == cnode)
+                {
+                    let cspace = crate::kernel::boot::kernel_mut(&mut space.cspace);
+                    let _ = cspace.revoke(cap);
+                }
+            });
+        });
+        // A DIFFERENT object now occupies the same numeric slot.
+        let replacement = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(6, 12)))
+            .expect("replacement mint");
+        let outcome = k.with(|s| {
+            s.with_capability_state_mut(|capability| {
+                let empty = [None; MAX_PROVISIONAL_DESCENDANTS];
+                let none = [None; MAX_PROVISIONAL_DESCENDANTS];
+                release_provisional_cap_locked(capability, &token, &empty, &none)
+            })
+        });
+        assert!(
+            matches!(
+                outcome,
+                ProvisionalCapRelease::StaleObject { .. } | ProvisionalCapRelease::AlreadyGone
+            ),
+            "a stale token must refuse, not destroy: {outcome:?}"
+        );
+        assert!(
+            cap_present(&k, cnode, replacement),
+            "the replacement capability must survive a stale rollback"
+        );
+    }
+
+    /// The token really is generation-bearing: `CapId` packs the slot generation and `CapSpace`
+    /// refuses a mismatch, so a token naming a recycled slot resolves to nothing at all.
+    #[test]
+    fn the_token_carries_the_slot_generation() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(1, 1)))
+            .expect("mint");
+        let forged = CapId::new(cap.index(), cap.generation().wrapping_add(1));
+        assert_ne!(forged, cap, "the forged token names another generation");
+        assert!(
+            !cap_present(&k, cnode, forged),
+            "a wrong-generation CapId resolves to nothing"
+        );
+        assert_eq!(
+            release(&k, cnode, forged),
+            ProvisionalCapRelease::AlreadyGone
+        );
+        assert!(cap_present(&k, cnode, cap), "the real capability is intact");
+    }
+
+    /// The pid the token carries comes from the CAPABILITY domain's own process association, not
+    /// from an ambient current-task read.
+    #[test]
+    fn the_token_pid_comes_from_the_capability_domain() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let from_domain = k.with(|s| s.with_capability_state(|c| pid_for_cnode_locked(c, cnode)));
+        assert!(
+            from_domain.is_some(),
+            "the cspace has a process association"
+        );
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(2, 2)))
+            .expect("mint");
+        let token = k
+            .with(|s| s.with_capability_state(|c| provisional_cap_token_locked(c, cnode, cap)))
+            .expect("token");
+        assert_eq!(token.pid, from_domain.unwrap());
+        assert_eq!(token.cnode, cnode);
+        assert_eq!(token.cap, cap);
+    }
+
+    /// The link closure is bounded and reports overflow rather than truncating: a partial
+    /// descendant sweep would remove some authority and leave the rest with no provenance.
+    #[test]
+    fn an_overwide_link_closure_refuses_rather_than_truncating() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(8, 3)))
+            .expect("mint");
+        // Record more links rooted at this cap than the bound admits.
+        k.with(|s| {
+            for i in 0..(MAX_PROVISIONAL_DESCENDANTS + 4) {
+                let _ = s.record_delegated_capability_link(
+                    1,
+                    cap,
+                    2000 + i as u64,
+                    CapId::new(900 + i, 1),
+                );
+            }
+        });
+        let closure = k.with(|s| {
+            s.with_capability_state(|capability| collect_link_closure_locked(capability, cap))
+        });
+        assert!(
+            closure.is_none(),
+            "a closure wider than the bound must report overflow"
+        );
+        assert_eq!(
+            release(&k, cnode, cap),
+            ProvisionalCapRelease::Residue,
+            "and the rollback must refuse rather than partially sweep"
+        );
+        assert!(
+            cap_present(&k, cnode, cap),
+            "a refused rollback leaves the source slot alone"
+        );
+    }
+
+    // ── The split acquisition layer is LIVE, not dormant ────────────────────────────────
+
+    /// `SharedSpawnOwners` is constructed and driven here, so the deliverable contains no dormant
+    /// split adapter. (In the freestanding builds the two syscall routes construct it; the hosted
+    /// build has no off-lock user-read seam, so this is where it is exercised.)
+    #[test]
+    fn the_split_acquisition_layer_is_constructed_and_answers() {
+        let k = fixture();
+        let cpu = k.current_cpu_split_read();
+        let tid = k.current_tid_split_read(cpu);
+        let owners = SharedSpawnOwners {
+            shared: &k,
+            spawner_tid: tid,
+            spawner_cnode: tid.and_then(|t| k.task_cnode_split(t)),
+            cpu,
+        };
+        // Snapshot reads answer from the identity it was handed, not from an ambient lookup.
+        assert_eq!(owners.current_tid(), tid);
+        assert_eq!(owners.current_cpu(), cpu);
+        // And a domain read really reaches the live kernel through its seam.
+        assert_eq!(
+            owners.live_task_count(),
+            k.with(|s| s.with_tcbs(|tcbs| tcbs.iter().flatten().count())),
+            "the split adapter reads the same task table the broad one does"
+        );
+    }
+
+    /// Both adapters reach the SAME rank-local rollback body — the property that makes broad and
+    /// split semantics impossible to diverge.
+    #[test]
+    fn both_adapters_reach_the_same_rollback_body() {
+        assert_eq!(
+            POLICY
+                .matches("provisional_cap::release_provisional_cap_locked(")
+                .count(),
+            2,
+            "exactly two acquisition adapters wrap the one rank-4 rollback body"
+        );
+        assert_eq!(
+            POLICY
+                .matches("pub(crate) fn release_provisional_capability<O: SpawnTxnOwners>(")
+                .count(),
+            1,
+            "and the four-step composition around it is stated once"
+        );
+    }
+
+    // ── The unreachable branches cannot silently become reachable ───────────────────────
+
+    /// §1 classified eleven substeps of the general revocation as unreachable BY OBJECT KIND. If
+    /// a future change made a spawn capability name a memory object or a notification, that
+    /// classification would be wrong — so the rollback owner is pinned to reach none of the
+    /// machinery those substeps need.
+    #[test]
+    fn the_rollback_owner_reaches_no_unreachable_substep() {
+        for forbidden in [
+            "active_transfer_mappings",
+            "adjust_memory_object_cap_refcount",
+            "reclaim_memory_object",
+            "destroy_notification",
+            "unmap_range_two_phase",
+            "report_transfer_revoke_to_supervisor",
+            "with_memory",
+            "with_ipc",
+            "with_scheduler",
+            "with_tcbs",
+        ] {
+            assert!(
+                !PROVCAP.contains(forbidden),
+                "the provisional-cap rollback must not reach {forbidden}: §1 proved it \
+                 unreachable for an AddressSpace/Endpoint capability, and reaching it would mean \
+                 the closure was mis-derived"
+            );
+        }
+    }
+
+    /// The rollback performs NO object destruction: the endpoint incarnation and the address
+    /// space are the ledger's, held as their own generation-bearing tokens.
+    #[test]
+    fn the_rollback_destroys_no_object() {
+        for forbidden in [
+            "remove_unpublished_endpoint",
+            "destroy_user_address_space",
+            "destroy_unresident_address_space",
+        ] {
+            assert!(
+                !PROVCAP.contains(forbidden),
+                "object teardown stays ledger-owned; {forbidden} must not appear in the \
+                 capability rollback"
+            );
+        }
+        // And the endpoint composition really does the capabilities first, then the object.
+        let compose = POLICY
+            .split("pub(crate) fn release_service_endpoint_grant<O: SpawnTxnOwners>(")
+            .nth(1)
+            .expect("the endpoint release composition");
+        let send = compose.find("grant.send_cap").expect("send cap release");
+        let recv = compose.find("grant.recv_cap").expect("recv cap release");
+        let object = compose
+            .find("remove_unpublished_endpoint(")
+            .expect("the endpoint incarnation removal");
+        assert!(
+            send < object && recv < object,
+            "both capabilities must go before the object they name"
+        );
+    }
+
+    /// Child before source, in the body itself: a child is authority derived from the source, so
+    /// removing the source first would leave live authority whose provenance is gone.
+    #[test]
+    fn the_body_removes_children_before_the_source() {
+        let body = PROVCAP
+            .split("pub(crate) fn release_provisional_cap_locked(")
+            .nth(1)
+            .expect("the rollback body");
+        let children = body
+            .find("remove_delegated_child_locked(")
+            .expect("the child removal");
+        let source = body
+            .find("── 3. The source slot, last.")
+            .expect("the source removal");
+        assert!(children < source, "children are removed before the source");
+    }
+
+    // ── The routes decline pre-mutation ─────────────────────────────────────────────────
+
+    /// Every refusal in either route happens before the transaction, which is the first mutation.
+    #[test]
+    fn every_route_refusal_precedes_the_first_mutation() {
+        for route in [
+            "fn try_split_spawn_process_into_frame(",
+            "fn try_split_spawn_from_mo_into_frame(",
+        ] {
+            // The hosted stub carries the same signature, so take the LAST definition — the
+            // freestanding route that actually runs the transaction.
+            assert_eq!(
+                SPLIT.matches(route).count(),
+                2,
+                "{route} is exactly one hosted stub plus one freestanding route"
+            );
+            let body = SPLIT
+                .rsplit(route)
+                .next()
+                .expect(route)
+                .split("\n}\n")
+                .next()
+                .expect("route body");
+            let txn = body
+                .find("spawn_image_txn::run_image_spawn_transaction(")
+                .expect("the transaction");
+            // Every `fail(` and every `?`-style decline is textually before the transaction.
+            let last_fail = body[..txn].rfind("return fail(");
+            assert!(
+                last_fail.is_some(),
+                "{route} must have pre-mutation refusals"
+            );
+            assert!(
+                body[txn..].matches("return fail(").count() == 0,
+                "{route} must not decline after the transaction has begun"
+            );
+        }
+    }
+}
+
 mod u9spawnic1_endpoint_cap_txn {
     use super::*;
     use crate::kernel::boot::spawn_ipc_cap_txn::{
@@ -154769,6 +155722,11 @@ mod u9spawnic1_endpoint_cap_txn {
     const CAP_STATE: &str = include_str!("capability_state.rs");
     const ORCHESTRATOR: &str = include_str!("orchestrator_state.rs");
     const SPAWN_TXN: &str = include_str!("../syscall/spawn_image_txn.rs");
+    /// U9-SPAWN-TXN2 §2: the ONE generic spawn transaction policy, over `SpawnTxnOwners`.
+    /// Both the broad and the split acquisition execute this body, so an assertion here binds
+    /// both paths at once — which is strictly stronger than asserting over one of two possible
+    /// implementations.
+    const SPAWN_POLICY_SRC: &str = include_str!("../syscall/spawn_txn.rs");
 
     /// Comment-stripped source, so a guard reads CODE and never the prose explaining its rule.
     fn code(src: &str) -> alloc::string::String {
@@ -154963,10 +155921,10 @@ mod u9spawnic1_endpoint_cap_txn {
     #[test]
     fn the_two_asid_release_cases_are_never_conflated() {
         let release = SPAWN_TXN
-            .split("fn release_provisional_spawn_resource(")
+            .split("fn release_provisional_spawn_resource<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("the release")
-            .split("\n    /// Undo an in-flight spawn")
+            .split("\n/// Undo an in-flight spawn")
             .next()
             .expect("body");
         let arm = code(release)
@@ -154974,19 +155932,36 @@ mod u9spawnic1_endpoint_cap_txn {
             .nth(1)
             .map(alloc::string::String::from)
             .expect("the address-space arm");
-        // The decision is made from live state, not assumed.
+        // The decision is made from live state, not assumed. U9-SPAWN-TXN2 §2 moved the ledger
+        // into the one generic policy, so the arm asks the owner interface who carries the ASID
+        // and the ADAPTER answers from the live TCB table — checked one level down.
         assert!(
-            arm.contains("tcb.asid == Some(asid)"),
+            arm.contains("owners.asid_carrier_tid(asid)"),
             "the release must CHECK whether any task carries the ASID"
+        );
+        assert!(
+            SPAWN_POLICY_SRC
+                .split("fn asid_carrier_tid(&self, asid: Asid) -> Option<u64> {")
+                .nth(1)
+                .expect("the broad adapter's carrier lookup")
+                .contains("tcb.asid == Some(asid)"),
+            "and the adapter must answer it from the live TCB table"
         );
         // Two owners, one per case, and both present.
         assert!(
-            arm.contains("destroy_unresident_address_space_locked"),
+            arm.contains("owners.destroy_unresident_address_space(asid)"),
             "a never-resident ASID must use the never-resident owner"
         );
         assert!(
-            arm.contains("destroy_user_address_space_by_asid"),
+            arm.contains("owners.destroy_live_address_space(asid)"),
             "a carried ASID must fall back to the live teardown"
+        );
+        // The two adapter methods really are the two different teardowns, not one aliased twice.
+        assert!(
+            SPAWN_POLICY_SRC.contains("destroy_unresident_address_space_locked(")
+                && SPAWN_POLICY_SRC.contains("destroy_user_address_space_by_asid("),
+            "the broad adapter must reach the never-resident owner and the live teardown \
+             respectively, so the two cases stay distinct at the acquisition layer too"
         );
         // And the fallback is loud, because it means the ledger's own contract was violated.
         assert!(
@@ -154995,7 +155970,7 @@ mod u9spawnic1_endpoint_cap_txn {
         );
         // The variant has exactly one construction site, and it precedes the commit.
         let txn = SPAWN_TXN
-            .split("pub(crate) fn run_image_spawn_transaction(")
+            .split("pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("the transaction");
         assert_eq!(
@@ -155245,7 +156220,12 @@ mod u9spawnic1_endpoint_cap_txn {
             .with(|s| s.provision_service_endpoint(&req))
             .expect("a grant");
         assert_ne!(baseline(&k), before, "the acquisition must be observable");
-        let removal = k.with(|s| s.release_service_endpoint_grant(&grant));
+        let removal = k.with(|s| {
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &grant,
+            )
+        });
         assert_eq!(removal, EndpointRemoval::Removed);
         let after = baseline(&k);
         assert_eq!(
@@ -155262,7 +156242,12 @@ mod u9spawnic1_endpoint_cap_txn {
             "the destroy must advance the incarnation past the one it removed"
         );
         for repeat in 0..3 {
-            let again = k.with(|s| s.release_service_endpoint_grant(&grant));
+            let again = k.with(|s| {
+                crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                    &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                    &grant,
+                )
+            });
             assert_eq!(
                 again,
                 EndpointRemoval::Stale,
@@ -155286,7 +156271,12 @@ mod u9spawnic1_endpoint_cap_txn {
         let first = k
             .with(|s| s.provision_service_endpoint(&req))
             .expect("first grant");
-        k.with(|s| s.release_service_endpoint_grant(&first));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &first,
+            )
+        });
         let second = k
             .with(|s| s.provision_service_endpoint(&req))
             .expect("second grant");
@@ -155315,7 +156305,12 @@ mod u9spawnic1_endpoint_cap_txn {
             with_second,
             "a stale grant must not touch the replacement occupying its slot"
         );
-        k.with(|s| s.release_service_endpoint_grant(&second));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &second,
+            )
+        });
     }
 
     /// A PUBLISHED endpoint is refused by the unpublished removal, so the rollback can never
@@ -155428,7 +156423,10 @@ mod u9spawnic1_endpoint_cap_txn {
         );
         k.with(|s| {
             let _ = s.revoke_capability_in_cnode(cnode, squatter);
-            s.release_service_endpoint_grant(&grant);
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &grant,
+            );
         });
     }
 
@@ -155457,7 +156455,10 @@ mod u9spawnic1_endpoint_cap_txn {
                 let mut ledger = SpawnLedger::new();
                 ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
                 ledger.record(ProvisionalSpawnResource::Capability { cnode, cap });
-                s.unwind_spawn_ledger(ledger);
+                crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+                    &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                    ledger,
+                );
             });
             assert_eq!(baseline(&k), before, "cycle {cycle} drifted");
         }
@@ -155502,7 +156503,12 @@ mod u9spawnic1_endpoint_cap_txn {
         });
         assert_eq!(ledger.len(), 5, "one entry per acquisition");
         assert_ne!(baseline(&k), before, "the acquisitions must be observable");
-        k.with(|s| s.unwind_spawn_ledger(ledger));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                ledger,
+            )
+        });
         assert_eq!(
             baseline(&k).resources_only(),
             before.clone_resources_only(),

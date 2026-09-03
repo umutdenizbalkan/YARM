@@ -9,11 +9,11 @@ mod capability_lifecycle_state;
 mod capability_service_state;
 mod capability_state;
 mod capacity_state;
-mod cnode_state;
-mod defs;
+pub(crate) mod cnode_state;
+pub(crate) mod defs;
 mod delegation_state;
 mod driver_state;
-mod exec_state;
+pub(crate) mod exec_state;
 // U9-QA §1: the queue-advance apply convention is named by callers outside this module (the
 // pre-lock split route), so it is re-exported alongside the transaction it parameterises.
 pub(crate) use exec_state::{
@@ -54,6 +54,7 @@ mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;
 pub(crate) mod process_cnode_txn;
+pub(crate) mod provisional_cap;
 mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
@@ -66,7 +67,7 @@ pub(crate) mod spawn_ipc_cap_txn;
 pub(crate) mod spawn_thread_core;
 mod task_core_state;
 mod task_policy_state;
-mod thread_state;
+pub(crate) mod thread_state;
 mod tid_allocation_policy;
 mod transfer_state;
 pub(crate) use transfer_state::transfer_shared_region_bounds_ok;
@@ -8552,6 +8553,14 @@ pub(crate) const MAX_DEADLINE_TOKENS: usize = 4;
 const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_DELEGATED_CAPABILITY_LINKS: usize = 2048;
+
+/// U9-SPAWN-TXN3 §3: the delegation-link table's bound, for the split reap's per-slot loop.
+///
+/// Exposed as a function rather than the constant because the constant is capacity-profile
+/// gated, and a caller outside this module must get the same bound the broad reap iterates.
+pub(crate) fn max_delegated_capability_links() -> usize {
+    MAX_DELEGATED_CAPABILITY_LINKS
+}
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 const STATIC_TID_UPPER_BOUND: u64 = INITIAL_DYNAMIC_TID - 1;
 

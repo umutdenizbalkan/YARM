@@ -7006,49 +7006,6 @@ impl KernelState {
         })
     }
 
-    /// Give a service-endpoint grant back, in the exact reverse of how it was acquired.
-    ///
-    /// Two steps, and the order is required rather than stylistic:
-    ///
-    /// 1. **the capabilities first**, through `revoke_capability_in_cnode` — the broad owner, not
-    ///    the narrow rank-4 form. By the time a spawn unwinds, the send capability may have been
-    ///    delegated to the parent, and only the broad owner cascades to that descendant. It also
-    ///    reaches memory rank 6 and IPC rank 3, which is exactly why this step cannot be folded
-    ///    into the rank-local body.
-    /// 2. **the endpoint incarnation second**, and only if it is still that incarnation and still
-    ///    unpublished. Removing it first would leave two capabilities naming a dead generation.
-    ///
-    /// Returns the endpoint's removal outcome. `Stale` and `Published` are both correct, inert
-    /// answers — the first means this token owns nothing any more, the second means the endpoint
-    /// became externally visible and belongs to the live teardown.
-    pub(crate) fn release_service_endpoint_grant(
-        &mut self,
-        grant: &super::spawn_ipc_cap_txn::ServiceEndpointGrant,
-    ) -> super::spawn_ipc_cap_txn::EndpointRemoval {
-        let send_revoked = self
-            .revoke_capability_in_cnode(grant.owner_cnode, grant.send_cap)
-            .is_ok();
-        let recv_revoked = self
-            .revoke_capability_in_cnode(grant.owner_cnode, grant.recv_cap)
-            .is_ok();
-        let removal = self.with_ipc_state_mut(|ipc| {
-            super::spawn_ipc_cap_txn::remove_unpublished_endpoint_locked(
-                ipc,
-                grant.endpoint_index,
-                grant.endpoint_generation,
-            )
-        });
-        crate::yarm_log!(
-            "SPAWN_EP_TXN_RELEASED slot={} generation={} send_revoked={} recv_revoked={} endpoint={:?}",
-            grant.endpoint_index,
-            grant.endpoint_generation,
-            u8::from(send_revoked),
-            u8::from(recv_revoked),
-            removal
-        );
-        removal
-    }
-
     pub fn create_notification(
         &mut self,
         max_depth: usize,
