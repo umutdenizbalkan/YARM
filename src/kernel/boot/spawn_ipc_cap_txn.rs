@@ -134,7 +134,9 @@ fn mint_in_cnode_locked(
 /// `revoke_capability_in_cnode` performs. Every one of those reaches another rank, and none is
 /// owed by a capability that was minted moments ago inside this transaction and has never been
 /// delegated, transferred or object-linked. A capability that HAS been delegated is released by
-/// the broad owner instead — see [`KernelState::release_service_endpoint_grant`].
+/// the provisional-capability rollback instead — see
+/// [`crate::kernel::boot::provisional_cap::release_provisional_cap_locked`], which removes a
+/// delegated child and its link before the source slot.
 fn revoke_fresh_cap_locked(
     capability: &mut CapabilitySubsystem,
     cnode: CNodeId,

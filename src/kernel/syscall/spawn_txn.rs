@@ -50,6 +50,9 @@
 
 use crate::kernel::boot::exec_state::SpawnedImagePublication;
 use crate::kernel::boot::process_cnode_txn::{ProcessCNodeGrant, ProcessCNodeRequest};
+use crate::kernel::boot::provisional_cap::{
+    MAX_PROVISIONAL_DESCENDANTS, ProvisionalCap, ProvisionalCapRelease,
+};
 use crate::kernel::boot::spawn_image_provision::{
     ImageProvision, ImageProvisionRequest, ImageSource, ProvisionToken,
 };
@@ -57,6 +60,7 @@ use crate::kernel::boot::spawn_ipc_cap_txn::{
     DelegationGrant, EndpointRemoval, ServiceEndpointGrant, ServiceEndpointRequest,
 };
 use crate::kernel::boot::{KernelError, RuntimeCapacityConfig, SpawnedUserTask, UserImageSpec};
+use crate::kernel::boot::defs::DelegatedCapabilityLink;
 use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::spawn_reservation::{ReservationRefusal, SpawnBaseline, SpawnReservationToken};
@@ -179,10 +183,25 @@ pub(crate) trait SpawnTxnOwners {
         cnode: CNodeId,
         capability: Capability,
     ) -> Result<CapId, KernelError>;
-    /// Revoke a capability with the full cascade — descendants, delegation links, transfer
-    /// mappings, object refcount and notification teardown.
-    fn revoke_capability_in_cnode(&mut self, cnode: CNodeId, cap: CapId)
-    -> Result<(), KernelError>;
+    /// Build the exact identity token for a capability this spawn minted. Capability rank 4.
+    fn provisional_cap_token(
+        &mut self,
+        cnode: CNodeId,
+        cap: CapId,
+    ) -> Result<ProvisionalCap, KernelError>;
+    /// Phase A of the rollback: the numeric-cap link closure, read at capability rank 4.
+    /// `None` means it is wider than the bound and the rollback must refuse.
+    fn collect_cap_link_closure(&mut self, cap: CapId) -> Option<(LinkClosure, usize)>;
+    /// Phase B: resolve each candidate link's `source_tid` / `dest_tid` to its process, at task
+    /// rank 2 — between the two capability acquisitions, never inside one.
+    fn resolve_link_pids(&self, links: &LinkClosure) -> ResolvedLinkPids;
+    /// Phase C: remove the delegated children, then the source slot. Capability rank 4.
+    fn release_provisional_cap(
+        &mut self,
+        token: &ProvisionalCap,
+        links: &LinkClosure,
+        resolved: &ResolvedLinkPids,
+    ) -> ProvisionalCapRelease;
     /// Delegate an attenuated copy, returning the exact rollback token. Refuses if the source
     /// slot no longer holds the object the caller resolved, so a recycled slot cannot be
     /// delegated by mistake.
@@ -204,9 +223,10 @@ pub(crate) trait SpawnTxnOwners {
         &mut self,
         request: &ServiceEndpointRequest,
     ) -> Result<ServiceEndpointGrant, KernelError>;
-    /// Release the whole grant — both capabilities, then the endpoint, and only if it is still
-    /// the same unpublished incarnation the generation names.
-    fn release_service_endpoint_grant(&mut self, grant: &ServiceEndpointGrant) -> EndpointRemoval;
+    /// Remove the endpoint INCARNATION, and only if it is still the same unpublished one the
+    /// generation names. IPC rank 3. The capabilities naming it are removed separately, by the
+    /// provisional-cap rollback, because that is where their delegation graph lives.
+    fn remove_unpublished_endpoint(&mut self, index: usize, generation: u64) -> EndpointRemoval;
 
     // ── VM (rank 5) then memory (rank 6). ───────────────────────────────────────────────
     /// Create the address space, load the image, map NR 23's initrd window and allocate the user
@@ -458,6 +478,80 @@ pub(crate) fn provision_spawn_image<O: SpawnTxnOwners>(
         zc_pages: token.zc_pages,
         copied_pages: token.copied_pages,
     })
+}
+
+/// The bounded numeric-cap link closure phase A produces.
+pub(crate) type LinkClosure = [Option<DelegatedCapabilityLink>; MAX_PROVISIONAL_DESCENDANTS];
+/// Each candidate link's `(source_pid, dest_pid)`, resolved at task rank 2.
+pub(crate) type ResolvedLinkPids = [Option<(u64, u64)>; MAX_PROVISIONAL_DESCENDANTS];
+
+/// THE provisional-capability rollback, composed once for both adapters.
+///
+/// Four steps, three acquisitions, none held across another:
+///
+/// ```text
+///   cap 4   token: the exact cnode/pid/CapId+generation/object incarnation
+///   cap 4   phase A: the numeric-cap link closure (a superset; needs no pid)
+///   task 2  phase B: resolve each candidate link's tids to processes
+///   cap 4   phase C: remove delegated children, then the source slot
+/// ```
+///
+/// Phase B sits BETWEEN two capability acquisitions rather than inside one, which is what keeps
+/// rank 4 and rank 2 from ever being held together. Phase A deliberately over-collects so that
+/// the only thing phase B has to do is interpret tids — phase C then narrows the superset with
+/// the resolved pids, and treats an unresolvable tid as a non-match (fail closed).
+///
+/// Performs NO object destruction. The endpoint incarnation and the address space are the
+/// ledger's, held as their own generation-bearing tokens.
+pub(crate) fn release_provisional_capability<O: SpawnTxnOwners>(
+    owners: &mut O,
+    cnode: CNodeId,
+    cap: CapId,
+) -> ProvisionalCapRelease {
+    let Ok(token) = owners.provisional_cap_token(cnode, cap) else {
+        return ProvisionalCapRelease::AlreadyGone;
+    };
+    let Some((links, _len)) = owners.collect_cap_link_closure(cap) else {
+        crate::yarm_log!(
+            "SPAWN_PROVCAP_RELEASE cnode={} cap={} outcome=residue reason=closure_too_wide",
+            cnode.0,
+            cap.0
+        );
+        return ProvisionalCapRelease::Residue;
+    };
+    let resolved = owners.resolve_link_pids(&links);
+    let outcome = owners.release_provisional_cap(&token, &links, &resolved);
+    crate::yarm_log!(
+        "SPAWN_PROVCAP_RELEASE cnode={} cap={} object={:?} outcome={}",
+        cnode.0,
+        cap.0,
+        token.object,
+        outcome.tag()
+    );
+    outcome
+}
+
+/// Release one whole service-endpoint grant: both capabilities through the provisional-cap
+/// rollback, THEN the endpoint incarnation through its own rank-3 owner.
+///
+/// Capabilities before the object, and each capability's delegated children before it. Removing
+/// the endpoint first would leave capabilities naming an object that no longer exists.
+pub(crate) fn release_service_endpoint_grant<O: SpawnTxnOwners>(
+    owners: &mut O,
+    grant: &ServiceEndpointGrant,
+) -> EndpointRemoval {
+    let send = release_provisional_capability(owners, grant.owner_cnode, grant.send_cap);
+    let recv = release_provisional_capability(owners, grant.owner_cnode, grant.recv_cap);
+    let removal = owners.remove_unpublished_endpoint(grant.endpoint_index, grant.endpoint_generation);
+    crate::yarm_log!(
+        "SPAWN_EP_TXN_RELEASED slot={} generation={} send_revoked={} recv_revoked={} endpoint={:?}",
+        grant.endpoint_index,
+        grant.endpoint_generation,
+        u8::from(send.released()),
+        u8::from(recv.released()),
+        removal
+    );
+    removal
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1136,12 +1230,52 @@ impl SpawnTxnOwners for BroadSpawnOwners<'_> {
     ) -> Result<CapId, KernelError> {
         self.kernel.mint_capability_in_cnode(cnode, capability)
     }
-    fn revoke_capability_in_cnode(
+    fn provisional_cap_token(
         &mut self,
         cnode: CNodeId,
         cap: CapId,
-    ) -> Result<(), KernelError> {
-        self.kernel.revoke_capability_in_cnode(cnode, cap)
+    ) -> Result<ProvisionalCap, KernelError> {
+        self.kernel.with_capability_state(|capability| {
+            crate::kernel::boot::provisional_cap::provisional_cap_token_locked(
+                capability, cnode, cap,
+            )
+        })
+    }
+    fn collect_cap_link_closure(&mut self, cap: CapId) -> Option<(LinkClosure, usize)> {
+        self.kernel.with_capability_state(|capability| {
+            crate::kernel::boot::provisional_cap::collect_link_closure_locked(capability, cap)
+        })
+    }
+    fn resolve_link_pids(&self, links: &LinkClosure) -> ResolvedLinkPids {
+        let mut out: ResolvedLinkPids = [None; MAX_PROVISIONAL_DESCENDANTS];
+        for (slot, link) in out.iter_mut().zip(links.iter()) {
+            if let Some(link) = link {
+                let source = self.kernel.process_id(link.source_tid);
+                let dest = self.kernel.process_id(link.dest_tid);
+                *slot = match (source, dest) {
+                    (Some(s), Some(d)) => Some((s, d)),
+                    // A tid with no TCB is its own process by the same convention the link
+                    // walkers have always used (`process_id(tid).unwrap_or(tid)`).
+                    _ => Some((
+                        source.unwrap_or(link.source_tid),
+                        dest.unwrap_or(link.dest_tid),
+                    )),
+                };
+            }
+        }
+        out
+    }
+    fn release_provisional_cap(
+        &mut self,
+        token: &ProvisionalCap,
+        links: &LinkClosure,
+        resolved: &ResolvedLinkPids,
+    ) -> ProvisionalCapRelease {
+        self.kernel.with_capability_state_mut(|capability| {
+            crate::kernel::boot::provisional_cap::release_provisional_cap_locked(
+                capability, token, links, resolved,
+            )
+        })
     }
     fn delegate_capability(
         &mut self,
@@ -1163,8 +1297,12 @@ impl SpawnTxnOwners for BroadSpawnOwners<'_> {
     ) -> Result<ServiceEndpointGrant, KernelError> {
         self.kernel.provision_service_endpoint(request)
     }
-    fn release_service_endpoint_grant(&mut self, grant: &ServiceEndpointGrant) -> EndpointRemoval {
-        self.kernel.release_service_endpoint_grant(grant)
+    fn remove_unpublished_endpoint(&mut self, index: usize, generation: u64) -> EndpointRemoval {
+        self.kernel.with_ipc_state_mut(|ipc| {
+            crate::kernel::boot::spawn_ipc_cap_txn::remove_unpublished_endpoint_locked(
+                ipc, index, generation,
+            )
+        })
     }
 
     fn provision_image(

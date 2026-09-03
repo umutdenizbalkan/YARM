@@ -152544,7 +152544,10 @@ mod u9spawn1_sp3_spawn_ledger {
         k.with(|s| {
             s.cancel_spawn_reservation(token).expect("cancel");
             s.destroy_user_address_space_by_asid(asid).expect("destroy");
-            s.release_service_endpoint_grant(&grant);
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &grant,
+            );
         });
         let before = baseline(&k);
         // Now unwind a ledger that still names them.
@@ -155780,7 +155783,10 @@ mod u9spawnic1_endpoint_cap_txn {
             .with(|s| s.provision_service_endpoint(&req))
             .expect("a grant");
         assert_ne!(baseline(&k), before, "the acquisition must be observable");
-        let removal = k.with(|s| s.release_service_endpoint_grant(&grant));
+        let removal = k.with(|s| crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &grant,
+            ));
         assert_eq!(removal, EndpointRemoval::Removed);
         let after = baseline(&k);
         assert_eq!(
@@ -155797,7 +155803,10 @@ mod u9spawnic1_endpoint_cap_txn {
             "the destroy must advance the incarnation past the one it removed"
         );
         for repeat in 0..3 {
-            let again = k.with(|s| s.release_service_endpoint_grant(&grant));
+            let again = k.with(|s| crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &grant,
+            ));
             assert_eq!(
                 again,
                 EndpointRemoval::Stale,
@@ -155821,7 +155830,10 @@ mod u9spawnic1_endpoint_cap_txn {
         let first = k
             .with(|s| s.provision_service_endpoint(&req))
             .expect("first grant");
-        k.with(|s| s.release_service_endpoint_grant(&first));
+        k.with(|s| crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+            &first,
+        ));
         let second = k
             .with(|s| s.provision_service_endpoint(&req))
             .expect("second grant");
@@ -155850,7 +155862,10 @@ mod u9spawnic1_endpoint_cap_txn {
             with_second,
             "a stale grant must not touch the replacement occupying its slot"
         );
-        k.with(|s| s.release_service_endpoint_grant(&second));
+        k.with(|s| crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+            &second,
+        ));
     }
 
     /// A PUBLISHED endpoint is refused by the unpublished removal, so the rollback can never
@@ -155963,7 +155978,10 @@ mod u9spawnic1_endpoint_cap_txn {
         );
         k.with(|s| {
             let _ = s.revoke_capability_in_cnode(cnode, squatter);
-            s.release_service_endpoint_grant(&grant);
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &grant,
+            );
         });
     }
 

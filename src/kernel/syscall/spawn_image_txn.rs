@@ -259,9 +259,10 @@ fn release_provisional_spawn_resource<O: SpawnTxnOwners>(
             }
         }
         ProvisionalSpawnResource::Endpoint(grant) => {
-            // Capabilities first, then the endpoint — and only if it is still the same
-            // unpublished incarnation. See `KernelState::release_service_endpoint_grant`.
-            let removal = owners.release_service_endpoint_grant(&grant);
+            // Capabilities first — each with its delegated children — then the endpoint
+            // incarnation, and only if it is still the same unpublished one the generation
+            // names. U9-SPAWN-TXN3 §2: composed once, in the policy, for both adapters.
+            let removal = super::spawn_txn::release_service_endpoint_grant(owners, &grant);
             crate::yarm_log!(
                 "SPAWN_LEDGER_RELEASE class=endpoint index={} generation={} outcome={:?}",
                 grant.endpoint_index,
@@ -279,12 +280,19 @@ fn release_provisional_spawn_resource<O: SpawnTxnOwners>(
             );
         }
         ProvisionalSpawnResource::Capability { cnode, cap } => {
-            let ok = owners.revoke_capability_in_cnode(cnode, cap).is_ok();
+            // U9-SPAWN-TXN3 §2: the EXACT provisional-capability rollback, not the general
+            // sixteen-substep revocation. §1 proved eleven of those substeps unreachable for an
+            // `AddressSpace` or `Endpoint` capability — by object kind, not by timing — and this
+            // owner is precisely the reachable closure: delegated children and their links, then
+            // the source slot, with no object destruction (the address space is a separate ledger
+            // entry carrying its own exact token).
+            let outcome = super::spawn_txn::release_provisional_capability(owners, cnode, cap);
             crate::yarm_log!(
-                "SPAWN_LEDGER_RELEASE class=capability cnode={} cap={} ok={}",
+                "SPAWN_LEDGER_RELEASE class=capability cnode={} cap={} ok={} outcome={}",
                 cnode.0,
                 cap.0,
-                u8::from(ok)
+                u8::from(outcome.released()),
+                outcome.tag()
             );
         }
     }
