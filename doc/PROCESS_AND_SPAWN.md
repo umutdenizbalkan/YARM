@@ -84,6 +84,42 @@ no boot ever dispatched it, and the earlier claim in this file and in
 that function calls `nr=24`. The number stays unassigned and is **not**
 reusable; invoking it returns `InvalidNumber` pre-lock.
 
+### The service endpoints and the parent delegation (U9-SPAWN-IC1)
+
+After the image, the shared transaction creates two service endpoints and
+delegates one capability to the parent. Both are rank-local transactions now.
+
+**Each endpoint and its two capabilities are one transaction.**
+`provision_service_endpoint_locked` (`src/kernel/boot/spawn_ipc_cap_txn.rs`)
+holds IPC rank 3 and capability rank 4 together — the legal order — and
+validates the target CNode, installs the incarnation `(index, generation)`,
+mints its `SEND` and `RECEIVE` capabilities, and returns a token naming all of
+it. A failure restores the endpoint slot and puts the generation back before
+releasing either owner. Before this, the endpoint was installed under rank 3,
+rank 3 was released, and a failing mint returned with the endpoint stranded.
+
+The token carries the GENERATION, not just the index: endpoint slots are
+recycled, and a rollback naming only an index could destroy a replacement
+endpoint. `remove_unpublished_endpoint_locked` refuses unless the incarnation
+still matches and the endpoint is still unpublished — no waiting receiver, no
+parked sender, no IRQ route. A published endpoint belongs to `destroy_endpoint`,
+which wakes and settles what it strands and needs ranks the rank-local body does
+not hold.
+
+**The parent delegation** goes through `delegate_capability`, which snapshots
+both cnodes at task rank 2, checks the object's liveness at IPC rank 3, and then
+runs a capability-only rank-4 body that re-validates both cspaces and the source
+object under the lock and mints exactly the rights intersection. It returns a
+rollback token naming the destination cspace, the capability and the object it
+carries; releasing it refuses unless that slot still holds that exact object, so
+a stale rollback cannot revoke an unrelated recycled capability.
+
+Both grants are recorded in the spawn ledger and released in reverse acquisition
+order: the delegation first, then each endpoint grant (capabilities before the
+incarnation).
+
+---
+
 ### The image provisioner (U9-SPAWN-VM1)
 
 Both surviving image-loading spawns — `SpawnProcess` (`nr=23`) and

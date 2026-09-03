@@ -1793,6 +1793,34 @@ impl KernelState {
         f(&self.capability)
     }
 
+    /// U9-SPAWN-IC1 — the IPC subsystem (rank 3) and the capability subsystem (rank 4) under ONE
+    /// acquisition each, taken in that order.
+    ///
+    /// This is the composition seam the rank-local endpoint transaction needs. Creating a service
+    /// endpoint is two mutations in two domains — install the incarnation, then mint the
+    /// capabilities that name it — and the existing code did them under two SEPARATE acquisitions
+    /// precisely because rank 3 must precede rank 4 and it had no way to hold both. The cost was
+    /// stated in its own comment and never paid off: a failed mint left an endpoint installed that
+    /// nothing named and nothing removed. Holding both makes the pair one transaction.
+    ///
+    /// IPC before capability is the only legal order (`doc/KERNEL_LOCKING.md`), fixed here rather
+    /// than in each caller. Nothing inside the closure may call back into `KernelState`: both
+    /// locks are held, so a re-entrant acquisition would deadlock.
+    pub(crate) fn with_ipc_then_capability_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut IpcSubsystem, &mut CapabilitySubsystem) -> R,
+    ) -> R {
+        // Multi-lock helper order (must match doc/KERNEL_LOCKING.md): ipc -> capability
+        Self::debug_lock_order_note("ipc");
+        let _ipc_guard = self.ipc_state_lock.lock();
+        Self::debug_lock_order_note("capability");
+        let _capability_guard = self.capability_state_lock.lock();
+        let capability = core::ptr::addr_of_mut!(self.capability);
+        // SAFETY: `ipc` and `capability` are disjoint fields of the same `KernelState`,
+        // serialized by the two distinct guards held for the whole closure.
+        f(kernel_mut(&mut self.ipc), unsafe { &mut *capability })
+    }
+
     pub(crate) fn with_capability_state_mut<R>(
         &mut self,
         f: impl FnOnce(&mut CapabilitySubsystem) -> R,

@@ -19,6 +19,62 @@ commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
 Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 `doc/KERNEL_UNLOCKING.md` §0.
 
+**U9-SPAWN-IC1 — the spawn's endpoint and capability phases are rank-local and exactly
+reversible, and the stale RISC-V smoke expectation is corrected. Census remains `2 / 0 / 2`.
+U9 remains OPEN.**
+
+*§2 — one endpoint+capability transaction.* `create_endpoint_with_mode` installed the endpoint
+under IPC rank 3, RELEASED rank 3, then minted its two capabilities under capability rank 4. Its
+own comment explained why — "acquiring both simultaneously would invert lock order" — which is
+correct about ORDER and was solved by giving up ATOMICITY: a `CapabilityFull` on either mint
+returned an error with the endpoint installed, named by nothing and removed by nobody, and the
+spawn ledger could not compensate because it only learned the index on success. Holding rank 3
+then rank 4 is not an inversion, it is the legal order; `with_ipc_then_capability_mut` takes them
+that way and `provision_service_endpoint_locked` does all four steps inside. A failure restores the
+endpoint slot AND puts the generation back — leaving it bumped would be "safe" but would consume an
+incarnation on every failure and drift the census.
+
+*Identities, not indices.* The ledger recorded `Endpoint(usize)`, and an index is not an identity:
+endpoint slots are recycled, so a stale unwind naming a reused index would have destroyed a
+REPLACEMENT endpoint. It now records the whole grant — index, generation, owning cspace and both
+capability ids — and `remove_unpublished_endpoint_locked` refuses unless the incarnation still
+matches AND no receiver waits, no sender is parked and no IRQ routes to it. Destroying a LIVE
+endpoint wakes a stranded receiver and settles orphaned envelopes; that work is real, stays in
+`destroy_endpoint`, and is owed only by a published endpoint.
+
+*§3 — the delegation owner, split into its three ranks.* A rank-2 snapshot of both cnodes; the
+rank-3 object-liveness check kept ahead of rank 4 so the order is 2→3→4 and never 4→3; and a
+capability-only body that re-validates both cspaces and the source OBJECT under the lock — refusing
+a slot recycled between snapshot and lock — and mints exactly the rights intersection. The
+MemoryObject refcount the old body applied inline is rank 6, so the token says whether it is owed
+and the wrapper applies it after rank 4 releases. Release refuses unless the destination slot still
+holds the exact object the token recorded, so a stale rollback can never revoke an unrelated
+recycled capability.
+
+*§4 — the provisional-ASID correction.* The ledger's address-space entry names a space never
+published to a TCB: constructed at one site, and still unpublished at every point the ledger can
+unwind — including after a failed commit, because `restore_after_failed_spawn` replays a
+`SpawnBaseline` that captures `tcb.asid`. The release re-checks the TCB table rather than trusting
+that, uses the never-resident owner when nothing carries the ASID, and on a carrier says so loudly
+and falls back to the live teardown. Failure sweeps past `MAX_ADDRESS_SPACES` now consume zero
+retired-ASID slots.
+
+*§5 — the RISC-V oracle correction.* The core smoke's unaccounted split-dispatch syscall,
+identified in U9-SPAWN-VM2, was **NR 1 (`IpcSend`)** taking the `PostWorkCommitted` disposition —
+the U6 blocking-send lifecycle doing what Stage 199G-C4 §2 built it to do, on an allow-list that
+was never widened. Only the expectation changed; no kernel behavior was touched, and NR 1 is pinned
+to that exact disposition so admitting it did not admit an early-returning send. The RISC-V core
+smoke now passes.
+
+*Proof.* 14 new tests: seven structural (no lock acquired or lower-rank name reachable in the
+layer, the delegation body takes liveness as an input, IPC-before-capability in one seam, the
+removal refuses rather than guesses, the ledger records identities, the two ASID cases use
+different owners and are never conflated) and seven by injection across eleven columns checked by
+identity — including a stale grant proved not to destroy the replacement occupying its recycled
+slot, and a sweep of 3 × `MAX_ADDRESS_SPACES` rollbacks. Live: three fresh runs per architecture,
+NR 23 = 3, NR 29 = 5/5, `SPAWN_IMAGE_PROVISIONED` = 8, `PM_ELF_ZC_DONE` = 5, 22 endpoint
+transactions and zero failures per boot, full service chain, zero unwind residue, panic or fault.
+
 **U9-SPAWN-VM2 — the image provisioner depends only on explicit VM and memory owners, and
 publishes its capability outside them. Census remains `2 / 0 / 2`. U9 remains OPEN.**
 

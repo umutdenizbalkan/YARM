@@ -9,7 +9,7 @@ use super::{
     SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
-use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
+use crate::kernel::ipc::{EndpointMode, Message, ThreadId};
 use crate::kernel::syscall::complete_blocked_recv_for_waiter;
 use crate::kernel::task::{RecvAbiVariant, TaskStatus, WaitReason};
 use crate::kernel::vm::Asid;
@@ -6960,46 +6960,93 @@ impl KernelState {
         self.create_endpoint_with_mode(max_depth, EndpointMode::Buffered)
     }
 
+    /// Create an endpoint and mint its send/receive capabilities into the CURRENT task's cspace.
+    ///
+    /// U9-SPAWN-IC1 moved the body to
+    /// [`spawn_ipc_cap_txn::provision_service_endpoint_locked`], which holds IPC rank 3 and
+    /// capability rank 4 together — the legal order — so the endpoint and its capabilities are now
+    /// created together or not at all. Before that split this function installed the endpoint,
+    /// released rank 3, and minted under rank 4; a `CapabilityFull` on either mint returned an
+    /// error with the endpoint installed, named by nothing and removed by nobody.
+    ///
+    /// The current task's CNode is resolved HERE, under task rank 2, before either owner is
+    /// acquired — the body takes it as a parameter and has no ambient current-task read of its own.
     pub fn create_endpoint_with_mode(
         &mut self,
         max_depth: usize,
         mode: EndpointMode,
     ) -> Result<(usize, CapId, CapId), KernelError> {
-        let max_endpoints = self.runtime_capacity_config().max_endpoints;
-        // Atomic under ipc_state_lock: find free slot, assign generation, store endpoint.
-        // Capability minting happens outside the lock (capability rank 4 > ipc rank 3).
-        let (endpoint_idx, generation) = self.with_ipc_state_mut(|ipc| {
-            let slot = ipc
-                .endpoints
-                .iter()
-                .take(max_endpoints)
-                .position(Option::is_none)
-                .ok_or(KernelError::EndpointFull)?;
-            let mut next_gen = ipc.endpoint_generations[slot].wrapping_add(1);
-            if next_gen == 0 {
-                next_gen = 1;
-            }
-            ipc.endpoint_generations[slot] = next_gen;
-            ipc.endpoints[slot] = Some(super::store_kernel_value(
-                Endpoint::new_with_mode(max_depth, mode).map_err(map_ipc_error)?,
-            ));
-            Ok::<_, KernelError>((slot, next_gen))
-        })?;
-        let send_cap = self.mint_capability_for_active_cnode(Capability::new(
-            CapObject::Endpoint {
-                index: endpoint_idx,
-                generation,
-            },
-            CapRights::SEND,
-        ))?;
-        let recv_cap = self.mint_capability_for_active_cnode(Capability::new(
-            CapObject::Endpoint {
-                index: endpoint_idx,
-                generation,
-            },
-            CapRights::RECEIVE,
-        ))?;
-        Ok((endpoint_idx, send_cap, recv_cap))
+        let owner_cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
+        let limits = self.runtime_capacity_config();
+        let grant =
+            self.provision_service_endpoint(&super::spawn_ipc_cap_txn::ServiceEndpointRequest {
+                owner_cnode,
+                max_depth,
+                mode,
+                max_endpoints: limits.max_endpoints,
+                cnode_limits: super::spawn_ipc_cap_txn::CnodeGrowthLimits {
+                    slot_capacity: Self::normalize_requested_cnode_slots(
+                        crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                        limits,
+                    )?,
+                    max_total_cnode_slots: limits.max_total_cnode_slots,
+                },
+            })?;
+        Ok((grant.endpoint_index, grant.send_cap, grant.recv_cap))
+    }
+
+    /// The broad acquisition wrapper for the endpoint transaction: rank 3 then rank 4, released
+    /// together. Every field of the request is settled before this is called.
+    pub(crate) fn provision_service_endpoint(
+        &mut self,
+        request: &super::spawn_ipc_cap_txn::ServiceEndpointRequest,
+    ) -> Result<super::spawn_ipc_cap_txn::ServiceEndpointGrant, KernelError> {
+        self.with_ipc_then_capability_mut(|ipc, capability| {
+            super::spawn_ipc_cap_txn::provision_service_endpoint_locked(ipc, capability, request)
+        })
+    }
+
+    /// Give a service-endpoint grant back, in the exact reverse of how it was acquired.
+    ///
+    /// Two steps, and the order is required rather than stylistic:
+    ///
+    /// 1. **the capabilities first**, through `revoke_capability_in_cnode` — the broad owner, not
+    ///    the narrow rank-4 form. By the time a spawn unwinds, the send capability may have been
+    ///    delegated to the parent, and only the broad owner cascades to that descendant. It also
+    ///    reaches memory rank 6 and IPC rank 3, which is exactly why this step cannot be folded
+    ///    into the rank-local body.
+    /// 2. **the endpoint incarnation second**, and only if it is still that incarnation and still
+    ///    unpublished. Removing it first would leave two capabilities naming a dead generation.
+    ///
+    /// Returns the endpoint's removal outcome. `Stale` and `Published` are both correct, inert
+    /// answers — the first means this token owns nothing any more, the second means the endpoint
+    /// became externally visible and belongs to the live teardown.
+    pub(crate) fn release_service_endpoint_grant(
+        &mut self,
+        grant: &super::spawn_ipc_cap_txn::ServiceEndpointGrant,
+    ) -> super::spawn_ipc_cap_txn::EndpointRemoval {
+        let send_revoked = self
+            .revoke_capability_in_cnode(grant.owner_cnode, grant.send_cap)
+            .is_ok();
+        let recv_revoked = self
+            .revoke_capability_in_cnode(grant.owner_cnode, grant.recv_cap)
+            .is_ok();
+        let removal = self.with_ipc_state_mut(|ipc| {
+            super::spawn_ipc_cap_txn::remove_unpublished_endpoint_locked(
+                ipc,
+                grant.endpoint_index,
+                grant.endpoint_generation,
+            )
+        });
+        crate::yarm_log!(
+            "SPAWN_EP_TXN_RELEASED slot={} generation={} send_revoked={} recv_revoked={} endpoint={:?}",
+            grant.endpoint_index,
+            grant.endpoint_generation,
+            u8::from(send_revoked),
+            u8::from(recv_revoked),
+            removal
+        );
+        removal
     }
 
     pub fn create_notification(
