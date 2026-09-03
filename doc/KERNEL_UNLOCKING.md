@@ -12881,3 +12881,100 @@ The x86_64 reply-timeout retirement profile is red at `a3aa7cb` and remains red.
 oracle never arms its identity cell, so it creates no reply-wins race. Four of base's five failures
 are now fixed and the seal moved `timeout_wins=0 → 1`, with `reply_wins=0` unchanged. The oracle is
 neither weakened, conditionalized nor deleted.
+
+### U9-SPAWN-TXN3 — the minimal capability rollback closure, the finished split acquisition, and both spawn families off the terminal dispatchers. CENSUS-DELTA 0.
+
+**U9-SPAWN-TXN3 — the blocker two earlier reports named was never real.** Those reports concluded
+that routing spawn off the terminal dispatchers required decomposing `revoke_capability_in_cnode`
+across fourteen owners and five domains, and that the decomposition was blocked by a supervisor IPC
+send inside one rollback arm and by the AI_AGENT_RULES §14.4 D3 shootdown fence. Classifying each of
+the sixteen substeps against source instead of against the function's shape shows that **eleven are
+unreachable for every capability a spawn can create**, and the two named complications live entirely
+inside unreachable substeps.
+
+#### The exact rollback closure
+
+Every capability a spawn creates provisionally is one of exactly two object kinds — an
+`AddressSpace` cap for the new process, or an `Endpoint` SEND/RECEIVE cap for its service endpoint
+plus the delegated copies of those. `CapSpace::mint` routes through `mint_with_parent(cap, None)`;
+only `mint_derived` sets a parent and it has **no production callers**, so a provisional spawn
+capability never has an in-cspace child. The memory-object substeps
+(`resolve_memory_object_phys`, `adjust_memory_object_cap_refcount`,
+`reclaim_memory_object_if_unreferenced`) and `destroy_notification_for_revoked_cap` each reject both
+kinds through an exhaustive match, and the substeps downstream of them are reached only on their
+success.
+
+| substep | classification |
+|---|---|
+| resolve the slot and revalidate identity + generation | REQUIRED |
+| enumerate the delegation-link closure | REQUIRED |
+| remove each delegated child slot | REQUIRED |
+| remove each delegation link record | REQUIRED |
+| clear the source slot | REQUIRED |
+| resolve the owning pid from the CNode | REQUIRED (one rank-2 read) |
+| in-cspace child (derived-cap) recursion | UNREACHABLE — `mint_derived` has no production callers |
+| memory-object phys resolution | UNREACHABLE — rejects `AddressSpace`/`Endpoint` |
+| memory-object refcount adjust | UNREACHABLE — same exhaustive match |
+| memory-object reclaim | UNREACHABLE — gated on the refcount substep |
+| frame free / unmap | UNREACHABLE — gated on the reclaim substep |
+| TLB shootdown fence (§14.4 D3) | UNREACHABLE — gated on the unmap substep |
+| notification destruction | UNREACHABLE — rejects `AddressSpace`/`Endpoint` |
+| notification waiter wake | UNREACHABLE — gated on the destruction substep |
+| supervisor IPC send on reclaim | UNREACHABLE — gated on the reclaim substep |
+| endpoint incarnation teardown | UNREACHABLE FROM HERE — the ledger owns endpoint objects |
+
+The reachable closure is therefore **capability rank 4 plus one rank-2 read**, not fourteen owners
+across five domains. No nested acquisition, no rank inversion, no shootdown fence, no supervisor IPC.
+
+#### The token and the one policy
+
+`src/kernel/boot/provisional_cap.rs` carries the whole contract. `ProvisionalCap` is minted inside
+the capability domain and names `{cnode, pid, cap, object}`; because `CapId` packs the slot
+generation and `CapSpace::get` refuses a generation mismatch, a token cannot name a recycled slot —
+`release_provisional_cap_locked` answers `StaleObject { found }` **without mutating anything**. A
+token for a slot already gone answers `AlreadyGone`, which makes the rollback repeat-inert. The body
+removes delegated children in reverse enumeration order and the source slot last, so authority never
+outlives its provenance; it destroys no endpoint and no address space, because the ledger owns those
+tokens; and it returns the cross-domain work it owes after releasing the capability lock.
+`MAX_PROVISIONAL_DESCENDANTS` is a fixed 24 and an over-wide closure **refuses rather than
+truncating**, so a partial sweep is not representable.
+
+There is exactly one rollback implementation. `BroadSpawnOwners` and `SharedSpawnOwners` are thin
+acquisition adapters over `SpawnTxnOwners`; the policy core never receives `&mut KernelState`.
+
+#### The finished split acquisition
+
+`SharedSpawnOwners` implements all 46 owner methods as single-domain acquisitions. Three operations
+have no off-lock seam and **refuse fail-closed** rather than acquiring a second implementation:
+`initialize_thread_kernel_switch_frame` (bootstrap TIDs only), `allocate_user_stack_with_guard`
+(the stack is pre-provisioned on this path) and `destroy_live_address_space` (reaching it means the
+ledger contract was already violated, and §14.4's own direction is to fail safe). Each emits
+`SPAWN_SPLIT_OWNER_REFUSED`; the live matrix below records that count as zero on all nine runs.
+
+#### The admission gates the earlier increments had missed
+
+The split dispatcher is architecture-neutral, but admission is not. AArch64 gates on
+`pre_split_import_syscall_abi`'s NR allow-list — an unlisted NR keeps `nr=0` and the dispatcher
+declines — and RISC-V gates on `split_eligible` in `src/arch/riscv64/trap.rs`. Both NRs are now
+listed in both gates, which is why the two families route on all three architectures rather than on
+x86_64 alone.
+
+### Residual terminal-dispatch matrix (source-recomputed)
+
+| edge | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| NR23 `SpawnProcess` production terminal edges | 0 | 0 | 0 |
+| NR29 `SpawnFromMemoryObject` production terminal edges | 0 | 0 | 0 |
+| NR23 split route (`result=ok`) per boot | 3 | 3 | 3 |
+| NR29 split route (`result=ok`) per boot | 5 | 5 | 5 |
+| broad-lock census (`with_cpu / with_broad / TOTAL`) | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+Three consecutive boots per architecture are bit-identical in every counter: `split23=3`,
+`split29=5`, `provisioned=8`, `ready=8`, `ledger_committed=8`, `zero_copy_reply=8`, `unwind=0`,
+`provcap_release=0`, `split_owner_refused=0`, tids `10000..10007`, `panic=0`. The eight spawns of a
+boot are `3 + 5`, so the split routes account for **every** spawn and none reaches the terminal
+acquisition.
+
+The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still exist
+for their other residual classes, so ***U9 remains OPEN***: this increment empties the NR23/NR29
+population that reached them, it does not delete them.
