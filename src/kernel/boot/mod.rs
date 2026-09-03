@@ -9,11 +9,11 @@ mod capability_lifecycle_state;
 mod capability_service_state;
 mod capability_state;
 mod capacity_state;
-mod cnode_state;
+pub(crate) mod cnode_state;
 mod defs;
 mod delegation_state;
 mod driver_state;
-mod exec_state;
+pub(crate) mod exec_state;
 // U9-QA §1: the queue-advance apply convention is named by callers outside this module (the
 // pre-lock split route), so it is re-exported alongside the transaction it parameterises.
 pub(crate) use exec_state::{
@@ -66,7 +66,7 @@ pub(crate) mod spawn_ipc_cap_txn;
 pub(crate) mod spawn_thread_core;
 mod task_core_state;
 mod task_policy_state;
-mod thread_state;
+pub(crate) mod thread_state;
 mod tid_allocation_policy;
 mod transfer_state;
 pub(crate) use transfer_state::transfer_shared_region_bounds_ok;

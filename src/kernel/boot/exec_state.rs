@@ -2216,18 +2216,10 @@ impl KernelState {
             // The bootstrap/service caps were delegated into this cnode above.
             crate::yarm_log!("SPAWN_LIFECYCLE_BOOTSTRAP_CAPS_OK tid={}", spec.tid);
         }
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == spec.tid)
-                .ok_or(task_missing_with_site(
-                    "spawn_user_task_from_image/set_asid_tcb_lookup",
-                    cpu.0,
-                ))?;
-            tcb.asid = Some(asid);
-            Ok::<_, KernelError>(())
-        })?;
+        self.with_tcbs_mut(|tcbs| bind_spawned_task_asid_locked(tcbs, spec.tid, asid))
+            .map_err(|_| {
+                task_missing_with_site("spawn_user_task_from_image/set_asid_tcb_lookup", cpu.0)
+            })?;
 
         // Stage 127: Stage 126 correctly refused to publish x86_64 initialized
         // switch frames without a mapped kernel switch-stack page, but the first
@@ -4221,6 +4213,31 @@ pub(crate) struct SpawnedImagePublication {
     pub(crate) startup_slots_start: usize,
     pub(crate) startup_slots_len: usize,
     pub(crate) startup_args: [u64; 18],
+}
+
+/// U9-SPAWN-TXN2 §3 — THE spawn ASID binding, under task rank 2 and nothing else.
+///
+/// Binding `tcb.asid` is the step that makes an address space *attributable* to a task, which is
+/// what `live_cpu_bitmap_for_asid` consults to decide whether a teardown owes a TLB shootdown and
+/// what the spawn ledger's address-space arm consults to decide between the never-resident and
+/// the live teardown. It was an inline `with_tcbs_mut` closure inside `spawn_image_after_claim`;
+/// as a named owner it can be reached identically by the broad and split adapters, and the
+/// ledger's "is this ASID still carried by a TCB?" question has exactly one answer to invert.
+///
+/// Fallible only in the "no such TID" direction, and that check happens before the write, so a
+/// refusal leaves the TCB byte-for-byte unchanged.
+pub(crate) fn bind_spawned_task_asid_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+    asid: Asid,
+) -> Result<(), KernelError> {
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|tcb| tcb.tid.0 == tid)
+        .ok_or(KernelError::TaskMissing)?;
+    tcb.asid = Some(asid);
+    Ok(())
 }
 
 /// THE spawn publication owner: task rank 2, one acquisition, all or nothing.

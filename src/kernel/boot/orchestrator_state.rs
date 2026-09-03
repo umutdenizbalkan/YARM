@@ -61,6 +61,23 @@ pub(crate) type TaskEnqueuePolicySplitPtrs = (
     *mut KernelStorage<[Option<TaskClass>; MAX_TASKS]>,
 );
 
+/// U9-SPAWN-TXN2 §3 — `(task_state_lock, tcbs, spawn_reservation_generation)`.
+///
+/// The split twin of [`KernelState::with_task_spawn_generation_mut`]'s projection. The
+/// generation counter's whole correctness rule is that no two reservations are ever stamped
+/// with the same value, and that rule is only enforceable if the read-modify-write happens
+/// under the lock that also serializes the TCB insert it stamps. The broad path took the
+/// counter under `task_state_lock`; the split path must take it under the SAME lock, or the
+/// two paths would not be serialized against each other at all.
+// Names the return type of a projector whose callers are arch-gated; a hosted `lib` build
+// compiles no route to it, exactly like the sibling `*_from_raw` projectors.
+#[allow(dead_code)]
+pub(crate) type TaskSpawnGenerationSplitPtrs = (
+    *const crate::kernel::lock::SpinLockIrq<()>,
+    *mut KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
+    *mut u64,
+);
+
 impl KernelState {
     fn lock_domain_rank(domain: &'static str) -> u8 {
         match domain {
@@ -1495,6 +1512,28 @@ impl KernelState {
                 core::ptr::addr_of!((*state).task_state_lock),
                 core::ptr::addr_of_mut!((*state).tcbs),
                 core::ptr::addr_of_mut!((*state).task_classes),
+            )
+        }
+    }
+
+    /// U9-SPAWN-TXN2 §3 — task (rank 2) seam projector for the SPAWN-RESERVATION GENERATION.
+    ///
+    /// Returns [`TaskSpawnGenerationSplitPtrs`]: `(task_state_lock, tcbs,
+    /// spawn_reservation_generation)` — the exact projection
+    /// [`KernelState::with_task_spawn_generation_mut`] takes, so the broad and split reservation
+    /// paths stamp generations from the same counter under the same lock.
+    pub(crate) unsafe fn task_spawn_generation_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> TaskSpawnGenerationSplitPtrs {
+        // SAFETY: see module pattern note above. `spawn_reservation_generation` was given the
+        // task domain in U9-SPAWN-TXN §3b precisely so it could be projected here: it is only
+        // ever consumed in the same breath as the TCB insert it stamps, and both storages are
+        // serialized by this same lock.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).task_state_lock),
+                core::ptr::addr_of_mut!((*state).tcbs),
+                core::ptr::addr_of_mut!((*state).spawn_reservation_generation),
             )
         }
     }

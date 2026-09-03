@@ -152600,27 +152600,52 @@ mod u9spawn1_sp3_spawn_ledger {
         );
     }
 
-    /// U9-SPAWN1 SP-4 stopped here, and this pins WHY so the boundary cannot go stale.
+    /// U9-SPAWN1 SP-4's blocker, RE-DERIVED after U9-SPAWN-TXN2 §3 discharged half of it.
     ///
-    /// Routing NR 23 off the terminal dispatchers needs every phase to run under one rank-local
-    /// lock. A process spawn creates a NEW process CNode, and the two capability-domain owners
-    /// that do it have no split variant at all — not a partial one, no presence in `runtime.rs`.
+    /// SP-4 stopped because the capability-domain owner that associates a NEW process CNode had
+    /// no split variant at all. That is no longer true: `set_process_cnode_for_pid_split` exists
+    /// and is a real off-lock caller, which is precisely the condition the old blocker note said
+    /// would retire it ("when someone builds those owners, this test fails and the blocker is
+    /// genuinely gone").
     ///
-    /// This is the same boundary SP-2 stopped at, approached from the other side: the NR 11 route
-    /// is admissible precisely BECAUSE a thread joins its parent's EXISTING CNode, and its
-    /// pre-mutation gate declines outright when that CNode is absent rather than creating one.
+    /// So the assertion inverts rather than disappearing. What SP-4 actually cared about was not
+    /// "no off-lock caller exists" but "there is ONE association policy, and both acquisitions
+    /// reach it" — a blocker note in its pre-discharge form. That is what is pinned now, and it
+    /// is strictly stronger than the absence check it replaces: absence permitted a split caller
+    /// with a transcribed second policy, and this does not.
     ///
-    /// When someone builds those owners, this test fails and the blocker is genuinely gone.
+    /// `ensure_cnode_space_with_slots` keeps its absence check: no off-lock caller reaches it,
+    /// and the split path grows a CNode through `ensure_cnode_space_split` instead.
+    ///
+    /// The NR 11 half is unchanged and still load-bearing: a thread joins its parent's EXISTING
+    /// CNode, and its pre-mutation gate declines outright when that CNode is absent rather than
+    /// creating one.
     #[test]
-    fn nr23_is_blocked_on_an_absent_process_cnode_owner() {
+    fn the_process_cnode_association_has_one_policy_and_two_acquisitions() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
-        for missing in ["ensure_cnode_space_with_slots", "set_process_cnode_for_pid"] {
-            assert!(
-                !RUNTIME_SRC.contains(missing),
-                "{missing} now has an off-lock caller — the SP-4 blocker may be gone; re-derive \
-                 the NR 23 phase table before trusting this note"
-            );
-        }
+        const CNODE_SRC: &str = include_str!("cnode_state.rs");
+        assert!(
+            !RUNTIME_SRC.contains("ensure_cnode_space_with_slots"),
+            "ensure_cnode_space_with_slots gained an off-lock caller — re-derive the NR 23 \
+             phase table before trusting this note"
+        );
+        // Exactly one body states the association rule...
+        assert_eq!(
+            CNODE_SRC
+                .matches("pub(crate) fn set_process_cnode_for_pid_locked(")
+                .count(),
+            1,
+            "the association policy is written once, as a rank-4 body over CapabilitySubsystem"
+        );
+        // ...and BOTH acquisitions delegate to it rather than restating it.
+        assert!(
+            CNODE_SRC.contains("set_process_cnode_for_pid_locked(capability, pid, cnode)"),
+            "the broad entry must delegate to the rank-4 body"
+        );
+        assert!(
+            RUNTIME_SRC.contains("cnode_state::set_process_cnode_for_pid_locked("),
+            "the split entry must delegate to the SAME rank-4 body, not a transcription"
+        );
         // And the NR 11 route still declines rather than creating one, which is what keeps it
         // sound while NR 23 waits.
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");

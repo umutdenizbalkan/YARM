@@ -2233,6 +2233,32 @@ impl SharedKernel {
         )
     }
 
+    /// U9-SPAWN-TXN2 §3 — task (rank 2) split-mut seam for the SPAWN-RESERVATION GENERATION.
+    ///
+    /// The split twin of `KernelState::with_task_spawn_generation_mut`, over the identical
+    /// projection. The generation counter's only rule is that no two reservations ever receive
+    /// the same value; that is what makes a token naming an earlier occupant of a numeric TID
+    /// unable to match a later one. Both paths must therefore stamp it under the SAME lock —
+    /// a split path with a lock of its own would serialize against nothing.
+    ///
+    /// Callers must not already hold a lock of rank ≥ 2.
+    pub(crate) fn with_task_spawn_generation_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut [Option<crate::kernel::task::ThreadControlBlock>], &mut u64) -> R,
+    ) -> R {
+        // SAFETY: same pattern as `with_task_enqueue_policy_split_mut` — `tcbs` and
+        // `spawn_reservation_generation` are disjoint fields of the same `KernelState`, both
+        // serialized by `task_state_lock`, which is held for the whole closure.
+        let (task_lock, tcbs, generation) = unsafe {
+            KernelState::task_spawn_generation_split_mut_ptrs_from_raw(self.state.data_ptr())
+        };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let tcbs = unsafe { &mut *tcbs };
+        let generation = unsafe { &mut *generation };
+        f(kernel_mut(tcbs).as_mut_slice(), generation)
+    }
+
     /// U9-SPAWN1 SP-2 — THE off-lock `SpawnThread` (NR 11) transaction.
     ///
     /// Composes the shared thread-incarnation owner and the SP-1 enqueue owner, in the order the
@@ -2355,6 +2381,86 @@ impl SharedKernel {
             crate::kernel::task_enqueue::commit_enqueue_locked(
                 kernel_mut(&mut sched.scheduler),
                 &plan,
+            )
+        })
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the PINNED off-lock task enqueue: the split twin of
+    /// `KernelState::enqueue_on_cpu`.
+    ///
+    /// Identical in shape to [`Self::enqueue_task_split`] and differing from it in exactly the
+    /// way the two broad twins differ: it plans through `plan_pinned_enqueue_locked`, which
+    /// enqueues where it is told and deliberately neither pins driver affinity nor reads
+    /// `cpu_affinity`. Both halves of the policy are the shared `task_enqueue` owners, so the
+    /// pinned pair cannot drift from the balanced pair or from their broad twins.
+    ///
+    /// The spawn transaction needs this one because NR 23 spawns `SystemServer` tasks, which the
+    /// authoritative policy pins to the bootstrap CPU so the supervisor and PM reach their
+    /// receives before init runs.
+    pub(crate) fn enqueue_on_cpu_split(&self, cpu: CpuId, tid: u64) -> Result<CpuId, KernelError> {
+        let plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+            crate::kernel::task_enqueue::plan_pinned_enqueue_locked(tcbs, classes, tid, cpu)
+        })?;
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::task_enqueue::commit_enqueue_locked(
+                kernel_mut(&mut sched.scheduler),
+                &plan,
+            )
+        })
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the split twin of `KernelState::provision_default_kernel_context`.
+    ///
+    /// Both wrap the SAME rank-2 owner, which validates the whole kernel-stack derivation before
+    /// its first write, so a refusal leaves no partially initialized TCB on either path.
+    pub(crate) fn provision_default_kernel_context_split(
+        &self,
+        tid: u64,
+    ) -> Result<crate::kernel::boot::thread_state::DefaultKernelContext, KernelError> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::thread_state::provision_default_kernel_context_locked(tcbs, tid)
+        })
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the split twin of the spawn ASID binding.
+    pub(crate) fn bind_spawned_task_asid_split(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Result<(), KernelError> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::exec_state::bind_spawned_task_asid_locked(tcbs, tid, asid)
+        })
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the split twin of the spawn publication.
+    ///
+    /// One rank-2 acquisition spanning validate → install → commit, exactly as the broad path
+    /// takes it, so neither path can be observed with a published user context on a task whose
+    /// reservation never committed.
+    pub(crate) fn publish_spawned_image_split(
+        &self,
+        reservation: &crate::kernel::spawn_reservation::SpawnReservationToken,
+        publication: &crate::kernel::boot::exec_state::SpawnedImagePublication,
+    ) -> Result<(), crate::kernel::spawn_reservation::ReservationRefusal> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::exec_state::publish_spawned_image_locked(
+                tcbs,
+                reservation,
+                publication,
+            )
+        })
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the split twin of `KernelState::set_process_cnode_for_pid`.
+    pub(crate) fn set_process_cnode_for_pid_split(
+        &self,
+        pid: u64,
+        cnode: crate::kernel::capabilities::CNodeId,
+    ) -> Result<(), KernelError> {
+        self.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::cnode_state::set_process_cnode_for_pid_locked(
+                capability, pid, cnode,
             )
         })
     }
