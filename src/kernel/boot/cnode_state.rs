@@ -35,30 +35,15 @@ impl KernelState {
         })
     }
 
+    /// Bind a process id to its CNode — broad entry.
+    /// Body: [`set_process_cnode_for_pid_locked`], capability rank 4.
     pub(crate) fn set_process_cnode_for_pid(
         &mut self,
         pid: u64,
         cnode: CNodeId,
     ) -> Result<(), KernelError> {
         self.with_capability_state_mut(|capability| {
-            if let Some(record) = capability
-                .process_cnodes
-                .iter_mut()
-                .flatten()
-                .find(|record| record.pid == pid)
-            {
-                record.cnode = cnode;
-                return Ok(());
-            }
-            if let Some(slot) = capability
-                .process_cnodes
-                .iter_mut()
-                .find(|slot| slot.is_none())
-            {
-                *slot = Some(ProcessCNodeRecord { pid, cnode });
-                return Ok(());
-            }
-            Err(KernelError::TaskTableFull)
+            set_process_cnode_for_pid_locked(capability, pid, cnode)
         })
     }
 
@@ -379,4 +364,37 @@ impl KernelState {
         }
         count
     }
+}
+
+/// U9-SPAWN-TXN §3 — THE process-id → CNode binding, under capability rank 4 and nothing else.
+///
+/// One of the two publication-phase owners the U9-SPAWN2 seven-phase table never listed. It reads
+/// and writes only `process_cnodes`, so its rank-locality is readable from its signature.
+///
+/// Update-or-insert, exactly as before: an existing record for `pid` is retargeted, otherwise a
+/// free slot takes a new one, and a full table refuses with `TaskTableFull` having written
+/// nothing.
+pub(crate) fn set_process_cnode_for_pid_locked(
+    capability: &mut CapabilitySubsystem,
+    pid: u64,
+    cnode: CNodeId,
+) -> Result<(), KernelError> {
+    if let Some(record) = capability
+        .process_cnodes
+        .iter_mut()
+        .flatten()
+        .find(|record| record.pid == pid)
+    {
+        record.cnode = cnode;
+        return Ok(());
+    }
+    if let Some(slot) = capability
+        .process_cnodes
+        .iter_mut()
+        .find(|slot| slot.is_none())
+    {
+        *slot = Some(ProcessCNodeRecord { pid, cnode });
+        return Ok(());
+    }
+    Err(KernelError::TaskTableFull)
 }

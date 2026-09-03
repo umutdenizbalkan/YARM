@@ -2357,71 +2357,38 @@ impl KernelState {
             startup_slots_len
         );
 
+        // U9-SPAWN-TXN §3 — the publication: the whole user context AND the one-shot
+        // `Spawning -> LiveSpawned` commit, under ONE task-lock acquisition.
+        //
+        // These were two separate acquisitions. Between them a TCB could be observed with a
+        // fully installed user context and a still-`Spawning` reservation, and a commit refusal
+        // left exactly that: a published context on a task that never became runnable, which
+        // nothing removed. The owner validates the reservation BEFORE it writes anything, so a
+        // refusal costs no partial publication and the commit that follows cannot fail.
         self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == spec.tid)
-                .ok_or(task_missing_with_site(
-                    "spawn_user_task_from_image/set_context_tcb_lookup",
-                    cpu.0,
-                ))?;
-            tcb.thread_group_id = ThreadGroupId(spec.tid);
-            tcb.asid = Some(asid);
-            tcb.user_entry = Some(VirtAddr(spec.entry as u64));
-            tcb.user_stack_top = Some(stack_top);
-            tcb.user_context = UserRegisterContext {
-                instruction_ptr: VirtAddr(spec.entry as u64),
-                stack_ptr: VirtAddr(startup_stack_ptr as u64),
-                user_gprs: [0; 32],
-                // Startup entry ABI args:
-                //   arg0 => task_id / tid
-                //   arg1 => process-manager request-send cap
-                //   arg2 => process-manager reply-recv cap
-                arg0: spec.startup_args[0] as usize,
-                arg1: spec.startup_args[1] as usize,
-                arg2: spec.startup_args[2] as usize,
-                // Extended startup delivery ABI:
-                //   arg3 => pointer to [u64; 18] startup slot block in userspace memory
-                //   arg4 => startup slot count
-                //   arg5 => reserved (0)
-                arg3: startup_slots_start,
-                arg4: startup_slots_len,
-                arg5: 0,
-            };
-            crate::yarm_log!(
-                "USER_INITIAL_CONTEXT tid={} pc=0x{:016x} sp=0x{:016x} arg0=0x{:016x} arg1=0x{:016x} gpr29=0x{:016x} gpr30=0x{:016x} ctx_ptr=0x{:x}",
-                spec.tid,
-                tcb.user_context.instruction_ptr.0,
-                tcb.user_context.stack_ptr.0,
-                tcb.user_context.arg0 as u64,
-                tcb.user_context.arg1 as u64,
-                tcb.user_context.user_gprs[29] as u64,
-                tcb.user_context.user_gprs[30] as u64,
-                &tcb.user_context as *const _ as usize
-            );
-            if matches!(spec.class, crate::kernel::task::TaskClass::SystemServer)
-                || spec.tid == BOOTSTRAP_FIRST_USER_TID
-            {
-                tcb.cpu_affinity = Some(CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID));
-            }
-            Ok::<_, KernelError>(())
-        })?;
-        // Stage 199D-WA3B: the EXACT one-shot commit `Spawning -> LiveSpawned`. This is the only
-        // place a reserved TCB becomes `Runnable`, it clears the reservation record so the token
-        // can never be consumed again, and it runs strictly BEFORE the enqueue below — so the
-        // task becomes scheduler-visible only after a fully successful image construction.
-        self.with_tcbs_mut(|tcbs| {
-            crate::kernel::spawn_reservation::commit_live_spawn(tcbs, reservation).map_err(
-                |refusal| {
-                    crate::kernel::spawn_reservation::log_reservation_refusal(
-                        "spawn_user_task_from_image/commit",
-                        spec.tid,
-                        refusal,
-                    );
-                    KernelError::WrongObject
+            publish_spawned_image_locked(
+                tcbs,
+                reservation,
+                &SpawnedImagePublication {
+                    tid: spec.tid,
+                    class: spec.class,
+                    asid,
+                    entry: spec.entry,
+                    stack_top,
+                    startup_stack_ptr,
+                    startup_slots_start,
+                    startup_slots_len,
+                    startup_args: spec.startup_args,
                 },
             )
+            .map_err(|refusal| {
+                crate::kernel::spawn_reservation::log_reservation_refusal(
+                    "spawn_user_task_from_image/publish",
+                    spec.tid,
+                    refusal,
+                );
+                KernelError::WrongObject
+            })
         })?;
         crate::yarm_log!("SPAWN_TASK_LIVE_COMMIT_OK tid={}", spec.tid);
         crate::yarm_log!("SPAWN_TASK_CONTEXT_OK tid={}", spec.tid);
@@ -3541,6 +3508,7 @@ unsafe fn d6_read_pte(table_phys: u64, idx: u64, virt_offset: u64) -> Option<u64
 }
 
 use crate::kernel::boot::MemorySubsystem;
+use crate::kernel::task::ThreadControlBlock;
 use crate::kernel::vm::AddressSpaceManager;
 
 // ── U9-SPAWN-VM2: the rank-local ELF loaders ────────────────────────────────────────────────
@@ -4236,6 +4204,107 @@ pub(crate) fn load_elf_with_mo_zero_copy_locked(
         zc_pages,
         copied_pages,
     ))
+}
+
+/// U9-SPAWN-TXN §3 — everything the publication writes into the child's TCB, as one value.
+///
+/// Passed by reference rather than reached through `&mut KernelState`, which is what lets the
+/// publication be rank-local: the owner needs the TCB storage and these facts, and nothing else.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpawnedImagePublication {
+    pub(crate) tid: u64,
+    pub(crate) class: crate::kernel::task::TaskClass,
+    pub(crate) asid: Asid,
+    pub(crate) entry: usize,
+    pub(crate) stack_top: VirtAddr,
+    pub(crate) startup_stack_ptr: usize,
+    pub(crate) startup_slots_start: usize,
+    pub(crate) startup_slots_len: usize,
+    pub(crate) startup_args: [u64; 18],
+}
+
+/// THE spawn publication owner: task rank 2, one acquisition, all or nothing.
+///
+/// The second of the two publication-phase owners the U9-SPAWN2 seven-phase table never listed.
+/// It takes the TCB storage and a `SpawnedImagePublication` and reaches nothing else.
+///
+/// # Order, and why the commit cannot fail here
+///
+/// 1. **Validate.** `validate_commit_ready` runs the EXACT checks `commit_live_spawn` makes —
+///    through the same `resolve` authority, not a copy — while the TCB is still untouched. Exact
+///    TID, `Reserved` status, a present reservation record, matching generation, class and
+///    process, and phase `Spawning`. A refusal here writes nothing.
+/// 2. **Install** the thread group, ASID, entry, stack top, the full initial user register
+///    context and the bootstrap CPU pin.
+/// 3. **Commit** `Spawning -> LiveSpawned`, the single step that makes the task `Runnable` and
+///    clears the reservation record so its token can never be consumed again.
+///
+/// Step 3 re-validates and therefore *could* refuse in principle — but it cannot here: step 1
+/// checked every one of those conditions, and the task lock is held across all three, so no other
+/// CPU can move the reservation in between. That is why this needs no undo for step 2, and why it
+/// had to become one acquisition to be safe: as two, a commit refusal left a fully published user
+/// context on a task that never became runnable.
+///
+/// The child is still not scheduler-visible when this returns. The enqueue is rank 1, separate,
+/// and last.
+pub(crate) fn publish_spawned_image_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    reservation: &crate::kernel::spawn_reservation::SpawnReservationToken,
+    publication: &SpawnedImagePublication,
+) -> Result<(), crate::kernel::spawn_reservation::ReservationRefusal> {
+    // ── 1. Validate, before a single field is written. ──────────────────────────────────
+    crate::kernel::spawn_reservation::validate_commit_ready(tcbs, reservation)?;
+
+    // ── 2. Install. `resolve` already proved this TCB exists and is the right incarnation. ──
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|tcb| tcb.tid.0 == publication.tid)
+        .ok_or(crate::kernel::spawn_reservation::ReservationRefusal::TaskMissing)?;
+    tcb.thread_group_id = ThreadGroupId(publication.tid);
+    tcb.asid = Some(publication.asid);
+    tcb.user_entry = Some(VirtAddr(publication.entry as u64));
+    tcb.user_stack_top = Some(publication.stack_top);
+    tcb.user_context = UserRegisterContext {
+        instruction_ptr: VirtAddr(publication.entry as u64),
+        stack_ptr: VirtAddr(publication.startup_stack_ptr as u64),
+        user_gprs: [0; 32],
+        // Startup entry ABI args:
+        //   arg0 => task_id / tid
+        //   arg1 => process-manager request-send cap
+        //   arg2 => process-manager reply-recv cap
+        arg0: publication.startup_args[0] as usize,
+        arg1: publication.startup_args[1] as usize,
+        arg2: publication.startup_args[2] as usize,
+        // Extended startup delivery ABI:
+        //   arg3 => pointer to [u64; 18] startup slot block in userspace memory
+        //   arg4 => startup slot count
+        //   arg5 => reserved (0)
+        arg3: publication.startup_slots_start,
+        arg4: publication.startup_slots_len,
+        arg5: 0,
+    };
+    crate::yarm_log!(
+        "USER_INITIAL_CONTEXT tid={} pc=0x{:016x} sp=0x{:016x} arg0=0x{:016x} arg1=0x{:016x} gpr29=0x{:016x} gpr30=0x{:016x} ctx_ptr=0x{:x}",
+        publication.tid,
+        tcb.user_context.instruction_ptr.0,
+        tcb.user_context.stack_ptr.0,
+        tcb.user_context.arg0 as u64,
+        tcb.user_context.arg1 as u64,
+        tcb.user_context.user_gprs[29] as u64,
+        tcb.user_context.user_gprs[30] as u64,
+        &tcb.user_context as *const _ as usize
+    );
+    if matches!(
+        publication.class,
+        crate::kernel::task::TaskClass::SystemServer
+    ) || publication.tid == BOOTSTRAP_FIRST_USER_TID
+    {
+        tcb.cpu_affinity = Some(CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID));
+    }
+
+    // ── 3. Commit. Step 1 proved every condition this re-checks. ────────────────────────
+    crate::kernel::spawn_reservation::commit_live_spawn(tcbs, reservation)
 }
 
 #[cfg(test)]

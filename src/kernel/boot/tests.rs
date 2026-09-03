@@ -122007,19 +122007,47 @@ mod stage199d_wa3b_spawn_reservation {
             "enqueued exactly once"
         );
         // Structural: the live commit precedes the enqueue in the source, so a partial spawn can
-        // never be scheduler-visible.
+        // never be scheduler-visible. U9-SPAWN-TXN §3 moved the commit into
+        // `publish_spawned_image_locked`, so the ordering is asserted against the CALL to that
+        // owner — and, one level down, against the owner's own validate → install → commit order.
         let exec = production_source("src/kernel/boot/exec_state.rs");
+        // Bound the body to the method itself: the file also holds the rank-local owner, which
+        // legitimately contains `commit_live_spawn`, and an unbounded split would sweep it in.
         let body = exec
             .split("fn spawn_image_after_claim(")
             .nth(1)
+            .and_then(|rest| rest.split("\n    pub fn dispatch_ready_task(").next())
             .expect("spawn body");
-        let commit = body.find("commit_live_spawn").expect("live commit");
+        let publish = body
+            .find("publish_spawned_image_locked(")
+            .expect("the publication owner call");
         let enqueue = body
             .find("self.enqueue_on_cpu(chosen_cpu")
             .expect("enqueue");
         assert!(
-            commit < enqueue,
+            publish < enqueue,
             "the live commit must precede the enqueue: nothing partial may be schedulable"
+        );
+        let owner = exec
+            .split("pub(crate) fn publish_spawned_image_locked(")
+            .nth(1)
+            .expect("the publication owner")
+            .split("\n}\n")
+            .next()
+            .expect("owner body");
+        let validate = owner.find("validate_commit_ready").expect("validation");
+        let install = owner.find("tcb.user_context =").expect("the context install");
+        let commit = owner.find("commit_live_spawn").expect("live commit");
+        assert!(
+            validate < install && install < commit,
+            "the owner must validate before it writes, and commit last"
+        );
+        // And there is exactly ONE task-lock acquisition around the pair, so no observer can see
+        // a published context on a task that never became runnable.
+        assert_eq!(
+            body.matches("commit_live_spawn").count(),
+            0,
+            "the commit belongs to the publication owner, not to a second acquisition"
         );
     }
 
@@ -153732,15 +153760,15 @@ mod u9spawn2_nr23_route_blockers {
     ///
     /// | publication step | rank | rank-local owner |
     /// |---|---|---|
-    /// | `set_process_cnode_for_pid` | capability 4 | none |
-    /// | the TCB write-set + `Spawning -> LiveSpawned` commit | task 2 | none |
+    /// | `set_process_cnode_for_pid` | capability 4 | `set_process_cnode_for_pid_locked` |
+    /// | the TCB write-set + `Spawning -> LiveSpawned` commit | task 2 | `publish_spawned_image_locked` |
     ///
-    /// Neither is a new subsystem: the first is capability-state-only, and the commit already has
-    /// a rank-2-local free function in `spawn_reservation`. This test pins the gap until they are
-    /// built, and fails when either grows an owner — the same recompute-rather-than-go-stale
-    /// discipline the seven-phase table had.
+    /// Neither was a new subsystem: the first is capability-state-only, and the commit already had
+    /// a rank-2-local free function in `spawn_reservation`. U9-SPAWN-TXN §3 built both, so this
+    /// test — which pinned the gap while it existed — now requires them, and fails if either is
+    /// removed.
     #[test]
-    fn the_publication_phase_owners_are_the_remaining_gap() {
+    fn the_publication_phase_owners_now_exist() {
         const PUBLICATION: &[(&str, &str, &str)] = &[
             (
                 "set_process_cnode_for_pid",
@@ -153756,13 +153784,25 @@ mod u9spawn2_nr23_route_blockers {
         let sources = stage199d_wa2a_ownership_boundary::production_sources();
         for (step, owner, ranks) in PUBLICATION {
             let decl = alloc::format!("fn {owner}(");
-            let exists = sources.iter().any(|(_, src)| src.contains(&decl));
             assert!(
-                !exists,
-                "{step} ({ranks}) grew `{owner}` — recompute the routing ledger and move this \
-                 step into the completed table above"
+                sources.iter().any(|(_, src)| src.contains(&decl)),
+                "{step} ({ranks}) lost its rank-local owner `{owner}`"
             );
         }
+        // Both broad entries delegate rather than keeping a second copy of the policy.
+        const CNODE: &str = include_str!("cnode_state.rs");
+        let broad = CNODE
+            .split("pub(crate) fn set_process_cnode_for_pid(")
+            .nth(1)
+            .expect("the broad entry")
+            .split("\n    }\n")
+            .next()
+            .expect("body");
+        assert!(
+            broad.contains("set_process_cnode_for_pid_locked(capability, pid, cnode)")
+                && !broad.contains("ProcessCNodeRecord {"),
+            "the broad CNode binding must delegate, never re-implement"
+        );
         // And the commit half really is already rank-local, which is why this is an extraction
         // rather than a new subsystem.
         const RESERVATION: &str = include_str!("../spawn_reservation.rs");
