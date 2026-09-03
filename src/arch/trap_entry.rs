@@ -2675,6 +2675,13 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // set the ABI import already carries.
         || raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR
         || raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
+        // U9-FORK1 §4: Fork (NR 12). Listed for the same reason as the two spawn classes — the
+        // route is architecture-neutral but reachable here only for a listed NR, and an unlisted
+        // one keeps `nr = 0` so the dispatcher declines. Fork takes NO arguments, so the ABI
+        // import carries everything it needs by construction. It neither blocks nor switches: the
+        // child is enqueued, never dispatched, so the caller is still current when the trap
+        // returns, and the parent's return lane is written into its own frame.
+        || raw_nr == crate::kernel::syscall::SYSCALL_FORK_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

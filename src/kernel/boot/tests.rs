@@ -61875,7 +61875,10 @@ mod stage191a_lock_retire_inventory {
                 // U9-SPAWN-TXN3 §4 added the two image-loading spawn classes, the last live
                 // production classes with a terminal broad edge.
                 && SPLIT_SRC.contains("Syscall::SpawnProcess => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::SpawnFromMemoryObject => Some(syscall),"),
+                && SPLIT_SRC.contains("Syscall::SpawnFromMemoryObject => Some(syscall),")
+                // U9-FORK1 §4 added Fork, which shares the spawn transaction and reads nothing
+                // from user memory.
+                && SPLIT_SRC.contains("Syscall::Fork => Some(syscall),"),
             "the NR-only split gate must whitelist exactly the accepted classes"
         );
         // Dangerous classes must NOT appear as split-eligible (default-deny `_ => None`).
@@ -61883,7 +61886,6 @@ mod stage191a_lock_retire_inventory {
         for dangerous in [
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
-            "Syscall::Fork => Some",
             // U9-SPAWN1 SP-2 removed NR 11 from this list. It was here because the whole spawn
             // family was, not because NR 11 shares the family's obstacles: it creates no address
             // space, loads no ELF, mints nothing, maps nothing and never switches tasks. Its
@@ -61893,6 +61895,9 @@ mod stage191a_lock_retire_inventory {
             // cascade cannot run off-lock. §1 proved eleven of those substeps unreachable for the
             // capabilities a spawn creates — by object kind — and §2 replaced the rollback with
             // exactly the reachable closure, which is capability rank 4 plus one rank-2 read.
+            // U9-FORK1 §4 removed NR 12 for the reason the family was listed at all: it had no
+            // exact rollback. It has one now — the spawn reservation lifecycle plus the COW
+            // clone's own inverse — and the positive assertion above pins its admission.
             "Syscall::ReapFaultedTask => Some",
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
@@ -62298,7 +62303,6 @@ mod stage191c_split_user_copy_seam {
             "Syscall::IpcReply => Some",
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
-            "Syscall::Fork => Some",
             // U9-SPAWN-TXN3 §4: NR 23 left this list, for the same kind of reason NR 11 did —
             // the obstacle was never the seam, it was the rollback, and §2 replaced it with the
             // exact provisional-capability closure.
@@ -62328,15 +62332,33 @@ mod stage191c_split_user_copy_seam {
         // guard actually protects is not "only NR 28 mints" — it is that a minting class may only
         // be admitted once its mint has an EXACT off-lock rollback. Both spawn classes get theirs
         // from §2's provisional-capability contract, which is asserted here rather than assumed.
-        for spawn_class in [
+        // U9-FORK1 §4: Fork mints too — it inherits the parent's capabilities by delegating
+        // each one into the child's cspace — so it belongs to exactly this cohort, and it is
+        // admitted on exactly the same terms: `release_delegation` is the exact off-lock inverse
+        // of each mint, and it refuses to remove a slot that no longer holds the object its token
+        // names.
+        for minting_class in [
             "Syscall::SpawnProcess => Some(syscall),",
             "Syscall::SpawnFromMemoryObject => Some(syscall),",
+            "Syscall::Fork => Some(syscall),",
         ] {
             assert!(
-                SPLIT_SRC.contains(spawn_class),
-                "{spawn_class} is admitted by §4"
+                SPLIT_SRC.contains(minting_class),
+                "{minting_class} is admitted by §4"
             );
         }
+        const FORK_TXN: &str = include_str!("../syscall/fork_txn.rs");
+        assert!(
+            FORK_TXN.contains("owners.delegate_capability(parent_tid, cap, child_tid, rights)")
+                && FORK_TXN.contains("owners.release_delegation(grant)"),
+            "the fork's mint must have its exact off-lock inverse"
+        );
+        let unwinds = FORK_TXN.matches("owners.release_delegation(grant)").count();
+        assert_eq!(
+            unwinds, 2,
+            "both unwind paths — pre-publication and post-publication — must release the \
+             delegations this fork made"
+        );
         const PROVCAP: &str = include_str!("provisional_cap.rs");
         assert!(
             PROVCAP.contains("pub(crate) fn release_provisional_cap_locked(")
@@ -62628,6 +62650,8 @@ mod stage191e_dispatch_next_candidate_seam {
             // U9-SPAWN-TXN3 §4.
             "Syscall::SpawnProcess => Some(syscall),",
             "Syscall::SpawnFromMemoryObject => Some(syscall),",
+            // U9-FORK1 §4.
+            "Syscall::Fork => Some(syscall),",
         ] {
             assert!(
                 SPLIT_SRC.contains(accepted),
@@ -62644,7 +62668,6 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
             "Syscall::TransferRelease => Some",
-            "Syscall::Fork => Some",
             // U9-SPAWN1 SP-2 removed NR 11, and U9-SPAWN-TXN3 §4 removed NR 23 and NR 29: the
             // candidate seam never owned the whitelist's contents, and each admission came from
             // its own stage with its own guards.
@@ -114165,11 +114188,11 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            9,
-            "exactly nine literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            10,
+            "exactly ten literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
-             (U9-SPAWN1 SP-2) SpawnThread and (U9-SPAWN-TXN3 §4) SpawnProcess + \
-             SpawnFromMemoryObject"
+             (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
+             SpawnFromMemoryObject and (U9-FORK1 §4) Fork"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
