@@ -3540,494 +3540,6 @@ unsafe fn d6_read_pte(table_phys: u64, idx: u64, virt_offset: u64) -> Option<u64
     if entry & 1 == 0 { None } else { Some(entry) }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::vec;
-
-    #[test]
-    fn elf_pflags_map_to_expected_page_flags() {
-        let rx = KernelState::page_flags_from_elf_pflags(PF_R | PF_X).expect("rx");
-        assert!(rx.read);
-        assert!(!rx.write);
-        assert!(rx.execute);
-
-        let rw = KernelState::page_flags_from_elf_pflags(PF_R | PF_W).expect("rw");
-        assert!(rw.read);
-        assert!(rw.write);
-        assert!(!rw.execute);
-
-        let ro = KernelState::page_flags_from_elf_pflags(PF_R).expect("ro");
-        assert!(ro.read);
-        assert!(!ro.write);
-        assert!(!ro.execute);
-
-        let write_only = KernelState::page_flags_from_elf_pflags(PF_W).expect("w");
-        assert!(write_only.read);
-        assert!(write_only.write);
-        assert!(!write_only.execute);
-
-        let exec_only = KernelState::page_flags_from_elf_pflags(PF_X).expect("x");
-        assert!(exec_only.read);
-        assert!(!exec_only.write);
-        assert!(exec_only.execute);
-    }
-
-    #[test]
-    fn elf_pflags_reject_wx() {
-        assert_eq!(
-            KernelState::page_flags_from_elf_pflags(PF_W | PF_X),
-            Err(KernelError::WrongObject)
-        );
-    }
-
-    #[test]
-    fn load_elf_returns_heap_base_aligned_to_max_pt_load_end() {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let mut image = vec![0u8; 64 + 56];
-                image[0..4].copy_from_slice(b"\x7FELF");
-                image[4] = 2; // ELFCLASS64
-                image[5] = 1; // little-endian
-                image[6] = 1; // version
-                image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-                image[18..20].copy_from_slice(&183u16.to_le_bytes()); // AArch64
-                image[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
-                image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // e_entry
-                image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
-                image[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
-                image[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
-                image[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
-
-                let ph = 64usize;
-                image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-                image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
-                image[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
-                image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_vaddr
-                image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_paddr
-                image[ph + 32..ph + 40].copy_from_slice(&0u64.to_le_bytes()); // p_filesz
-                image[ph + 40..ph + 48].copy_from_slice(&0x1234u64.to_le_bytes()); // p_memsz
-                image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
-
-                let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
-                let (asid, _map) = state.create_user_address_space().expect("asid");
-                let (entry, _first_pt_load, heap_base) = state
-                    .load_elf_pt_load_segments(asid, &image)
-                    .expect("load elf");
-                assert_eq!(entry, 0x0040_0000usize);
-                assert_eq!(heap_base, 0x0040_2000usize);
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
-    }
-
-    #[test]
-    fn load_elf_copies_into_staging_then_finalizes_rx_permissions() {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let mut image = vec![0u8; 64 + 56 + 4];
-                image[0..4].copy_from_slice(b"\x7FELF");
-                image[4] = 2;
-                image[5] = 1;
-                image[6] = 1;
-                image[16..18].copy_from_slice(&2u16.to_le_bytes());
-                image[18..20].copy_from_slice(&183u16.to_le_bytes());
-                image[20..24].copy_from_slice(&1u32.to_le_bytes());
-                image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
-                image[32..40].copy_from_slice(&64u64.to_le_bytes());
-                image[52..54].copy_from_slice(&64u16.to_le_bytes());
-                image[54..56].copy_from_slice(&56u16.to_le_bytes());
-                image[56..58].copy_from_slice(&1u16.to_le_bytes());
-
-                let ph = 64usize;
-                image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
-                image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
-                image[ph + 8..ph + 16].copy_from_slice(&(64u64 + 56u64).to_le_bytes());
-                image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes());
-                image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
-                image[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes());
-                image[ph + 40..ph + 48].copy_from_slice(&4u64.to_le_bytes());
-                image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
-                image[64 + 56..64 + 60].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-
-                let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
-                let (asid, _map) = state.create_user_address_space().expect("asid");
-                state
-                    .load_elf_pt_load_segments(asid, &image)
-                    .expect("load elf");
-                let mapping = state
-                    .user_spaces
-                    .get(asid)
-                    .and_then(|aspace| aspace.resolve(VirtAddr(0x0040_0000)))
-                    .expect("resolved mapping");
-                assert!(mapping.flags.read);
-                assert!(!mapping.flags.write);
-                assert!(mapping.flags.execute);
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
-    }
-}
-
-// ── U9-QA — the authoritative off-lock queue-advancing dispatch ──────────────────────────────
-//
-// The broad queue-advancing switch is `KernelState::dispatch_next_task`, and every step it takes
-// is already reachable through a single-rank seam or a lock-free primitive:
-//
-// | step                       | owner     | rank / lock                                        |
-// |----------------------------|-----------|----------------------------------------------------|
-// | next-task selection        | scheduler | rank 1 — `dispatch_next_selection_on(cpu)`          |
-// | incoming ASID              | task      | rank 2 — `task_asid`                               |
-// | address-space activation   | HAL       | LOCK-FREE — `hal_adapters::switch_address_space`   |
-// |                            |           | + `note_address_space_activated` (per-CPU atomic)  |
-// | switch-plan build          | task      | rank 2 — `build_dispatch_switch_plan_locked`       |
-// | the switch itself          | arch      | NO LOCK — Stage 117 stash, drained by `trap_entry` |
-// | incoming context restore   | arch      | NO LOCK — U9/203C `post_switch_restore_*_split`    |
-// | terminal idle              | scheduler | rank 1 — the existing architecture idle path       |
-//
-// So the broad lock was never load-bearing for the advance; it was the ambient authority the steps
-// were written against. This transaction supplies that authority explicitly instead — the trap
-// `CpuId` and the exact outgoing identity — and takes each rank once, in monotonic order, with
-// nothing held across the HAL activation or the stash.
-//
-// It deliberately does NOT own selection policy: it calls the SAME
-// `Scheduler::dispatch_next_selection_on` the broad path calls, and the SAME
-// `build_dispatch_switch_plan_locked` extracted from `maybe_switch_kernel_context`. There is one
-// scheduler-selection implementation and one plan-build implementation in the tree.
-impl crate::runtime::SharedKernel {
-    /// U9-QA — capture the outgoing task's user context into its TCB, off the broad lock.
-    ///
-    /// The split twin of the `sync_current_thread_from_frame(trapframe)` that opens the broad
-    /// `handle_trap(Trap::Syscall, …)` arm. It MUST run before anything can select another task:
-    /// once the queue advance publishes the outgoing task as no longer current, the live trap frame
-    /// stops being that task's authoritative context.
-    ///
-    /// rank 2, one acquisition, keyed on the EXACT outgoing tid the caller authenticated — never an
-    /// ambient current-task lookup. Returns `false` if that tid has no TCB (fail closed).
-    pub(crate) fn capture_outgoing_user_context_split(
-        &self,
-        outgoing_tid: u64,
-        frame: &crate::kernel::trapframe::TrapFrame,
-    ) -> bool {
-        let captured = frame.capture_user_context();
-        self.with_task_tcbs_split_mut(|tcbs| {
-            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == outgoing_tid) {
-                Some(tcb) => {
-                    tcb.user_context = captured;
-                    true
-                }
-                None => false,
-            }
-        })
-    }
-
-    /// U9-QA — ADMISSION for one queue advance. Makes NO mutation, and is the ONLY place a
-    /// refusal can be raised.
-    ///
-    /// The caller must run this BEFORE it publishes its terminal transition (block, preempt or
-    /// fault). Once that publication happens the advance must complete, so every reason it could
-    /// decline is checked here, while falling through to the unchanged terminal broad dispatcher is
-    /// still safe.
-    ///
-    /// Checks, in order:
-    /// 1. lock-free — the four `can_stash_for_lock_drop` conditions (arch support, a trap drainer
-    ///    for this CPU, a single dispatching CPU, an empty stash);
-    /// 2. rank 1 — `peek_next_runnable_on(cpu)`, the NON-mutating candidate read (the run queue is
-    ///    unchanged; two calls return the same TID);
-    /// 3. rank 2 — the candidate must be RESUMABLE, i.e. its kernel context is initialized.
-    ///    A candidate that has never run takes the fresh/startup resume convention, which this
-    ///    transaction does not own, so it is refused here — before the caller has blocked anything
-    ///    and before the run queue has been touched.
-    ///
-    /// `apply` names the convention the CALLER will use to put the selected task on the CPU, so
-    /// that the two stash-specific refusals are asked only of a caller that will actually stash.
-    ///
-    /// `Ok(None)` means "no candidate": the advance will legitimately idle this CPU.
-    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-    pub(crate) fn queue_advance_admit_split(
-        &self,
-        cpu: CpuId,
-        apply: QueueAdvanceApply,
-    ) -> Result<Option<u64>, QueueAdvanceRefusal> {
-        let cpu_idx = cpu.0 as usize;
-        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-            return Err(QueueAdvanceRefusal::OutgoingIdentityStale);
-        }
-        // (1) Lock-free refusals.
-        //
-        // The two STASH-SPECIFIC ones are scoped to the stash convention (see
-        // [`QueueAdvanceApply`]). RISC-V is refused for `StashedKernelSwitch` by construction: the
-        // Stage 117 stash gate itself opens with `!cfg!(target_arch = "riscv64")`, and that
-        // architecture's `drain_switch_plan_stash` has no `post_switch_restore_*_split` arm, so a
-        // stashed plan would switch kernel contexts with nothing restoring the incoming one.
-        //
-        // That reason says nothing about `ExactTokenResume`, which stashes nothing and switches no
-        // kernel context — it activates the incoming address space and applies that task's saved
-        // USER context to the live trap frame. RISC-V has performed exactly that, live, since Stage
-        // 196E: `direct_dispatch_resume_incoming` is its gather+apply owner and its FutexWait drain
-        // already drives it. Refusing that convention on this architecture was refusing a capability
-        // it demonstrably has.
-        if matches!(apply, QueueAdvanceApply::StashedKernelSwitch) && cfg!(target_arch = "riscv64")
-        {
-            return Err(QueueAdvanceRefusal::ArchUnsupported);
-        }
-        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(QueueAdvanceRefusal::NoTrapDrainer);
-        }
-        // The SAME predicate `KernelState::dispatching_cpu_count` computes, read under rank 1 —
-        // together with the authoritative dispatch CPU, in ONE acquisition.
-        let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
-            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
-            let online = s.online_cpu_bitmap();
-            (
-                (online & !s.wake_only_bitmap()).count_ones() as usize,
-                sched.current_cpu,
-            )
-        });
-        if dispatching > 1 {
-            return Err(QueueAdvanceRefusal::MultiCpu);
-        }
-        // U9-QA §1: pre-check the authentication the commit's selection step will perform. The
-        // commit cannot refuse, so this must fail HERE — before the caller blocks anything.
-        if dispatch_cpu != cpu {
-            return Err(QueueAdvanceRefusal::CpuNotAuthoritative);
-        }
-        // Stash-specific: an `ExactTokenResume` publishes no plan, so an occupied stash is not its
-        // precondition. It is still checked for the stash convention, where a second plan is lost.
-        if matches!(apply, QueueAdvanceApply::StashedKernelSwitch)
-            && unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() }
-        {
-            return Err(QueueAdvanceRefusal::StashOccupied);
-        }
-        // (2) rank 1: the NON-mutating candidate peek. The run queue is not touched.
-        let Some(candidate) = self.with_scheduler_split_mut(|sched| {
-            crate::kernel::boot::kernel_ref(&sched.scheduler)
-                .peek_next_runnable_on(cpu)
-                .map(|t| t.0)
-        }) else {
-            return Ok(None);
-        };
-        // (3) rank 2: the candidate must be resumable BY THE CONVENTION THE CALLER WILL USE.
-        //
-        // This is the question admission exists to ask, and the two conventions answer it
-        // differently — the screen exists so that no refusal can happen after the dequeue, and the
-        // set of tasks each apply can actually serve is not the same.
-        //
-        // * `StashedKernelSwitch` needs `kernel_context.initialized`, which is exactly what
-        //   `build_dispatch_switch_plan_locked` requires before it will produce a plan.
-        //
-        // * `ExactTokenResume` needs whatever its architecture's resume owner accepts, and that
-        //   genuinely differs:
-        //
-        //   - x86_64: `x86_post_lock_resume_marked_incoming` refuses `X86ResumeRefusal::Context`
-        //     for an incarnation with no restorable saved context, and a task that has never run
-        //     takes the FIRST-RESUME TRAMPOLINE — which is the stash path, not this one. So
-        //     `kernel_context.initialized` is the right screen there, and screening here is what
-        //     keeps that post-dequeue (fatal) refusal unreachable.
-        //   - AArch64 and riscv64: their resume owners activate the incoming address space and
-        //     apply that task's saved user context, and their write-backs then serve the
-        //     fresh/startup convention from the argument mirror. A never-run task is genuinely
-        //     resumable on both, and screening it out refused a live-capable advance.
-        //
-        //     BOTH were measured, not assumed. RISC-V: the first FutexWait of a core-smoke boot
-        //     was refused `IncomingUnavailable` for incoming tid 2, and the in-lock path then
-        //     switched to that very task through the startup convention (`SATP_OK` → `FRAME_OK`
-        //     → `SRET_ARMED` → `RISCV_STARTUP_ARGS tid=2`). AArch64: its FutexWait oracle refused
-        //     three times for the same reason while its in-lock drain switched all three
-        //     successfully (`TTBR0_OK` → `FRAME_OK`). What both require is a resolvable ASID,
-        //     which is what `direct_dispatch_activate_asid_split` would otherwise refuse on.
-        //
-        // 203C-XFR replaces the x86_64 arm. It used to ask `kernel_context.initialized`, and the
-        // comment above recorded the belief that a never-run task "takes the FIRST-RESUME
-        // TRAMPOLINE — which is the stash path, not this one". Both halves were wrong, and the
-        // source says so:
-        //
-        //   * that trampoline (`yarm_kernel_thread_switch_trampoline`, `FIRST_RESUME_STASH`) is
-        //     the KERNEL-THREAD `switch_frames` first resume, and it switches BACK to the
-        //     outgoing task — it is not how any user task enters ring 3;
-        //   * production user tasks never get an initialized kernel context at all. Only
-        //     `BOOTSTRAP_FIRST_USER_TID` and `BOOTSTRAP_SUPERVISOR_TID` do, as a Stage-119 D6
-        //     proof arrangement, which is precisely why `build_dispatch_switch_plan_locked`
-        //     records "context switching for these tasks happens entirely via trap-frame
-        //     restore; switch_frames is not called".
-        //
-        // So the screen refused every service task in the system, and admitted only tid 1 and
-        // tid 2. That is not a conservative approximation of the apply's precondition — it is a
-        // different question. The apply's real precondition is that the incoming task owns a
-        // returnable continuation, which is what the classifier establishes, and which a
-        // never-run task with a seeded startup snapshot satisfies exactly as well as a resumed
-        // one. Refusal is still raised HERE, before any mutation.
-        let convention = self.with_task_tcbs_split_mut(|tcbs| {
-            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == candidate)?;
-            classify_incoming_resume_convention(tcb, apply)
-        });
-        let Some(convention) = convention else {
-            return Err(QueueAdvanceRefusal::IncomingUnavailable);
-        };
-        if matches!(convention, IncomingResumeConvention::X86FirstResume) {
-            crate::yarm_log!(
-                "QUEUE_ADVANCE_ADMIT_FIRST_RESUME cpu={} candidate={}",
-                cpu.0,
-                candidate
-            );
-        }
-        Ok(Some(candidate))
-    }
-
-    /// U9-QA — COMMIT the queue advance. Cannot refuse.
-    ///
-    /// `outgoing_tid` is the exact task the caller has already published as no longer runnable, and
-    /// `admitted` is the candidate [`Self::queue_advance_admit_split`] returned under the same
-    /// uninterrupted trap. Phases are monotonic and never nested:
-    ///
-    /// 1. **rank 1** — `SharedKernel::queue_advance_select_step_split`, the ONE authoritative
-    ///    selection step (U9-QA §1), which calls the SAME `dispatch_next_selection_on` the broad
-    ///    path calls. Because the caller has already cleared the current slot, this takes the
-    ///    `current is None` branch and DEQUEUES the admitted candidate.
-    /// 2. **rank 2** — the incoming ASID.
-    /// 3. **rank 2** — the switch plan, through the single shared builder. The LAST fallible step,
-    ///    taken before any lock-free side effect so a failure has nothing arch-visible to undo.
-    /// 4. **LOCK-FREE** — address-space activation for the incoming task.
-    /// 5. **LOCK-FREE** — stash the plan for the arch apply.
-    ///
-    /// `Idle` selection yields `TerminalIdle`; a `ContinuedCurrent` selection means the caller did
-    /// not actually clear the current slot and yields `ResumeSame` with nothing stashed. Neither is
-    /// a refusal — nothing was dequeued in either case.
-    ///
-    /// ## The SMP wake race (U9-QA §1)
-    ///
-    /// Admission and this commit take rank 1 separately, so a wake — on this CPU or on a wake-only
-    /// AP rerouting an enqueue onto this CPU's queue — can land between them. Every way that can
-    /// resolve ends in a valid outcome, and none of them is a refusal after publication:
-    ///
-    /// * **the wake enqueues an ordinary task** — the dequeue selects the FIFO/priority winner,
-    ///   which may or may not be the peeked candidate; either way exactly one task is dequeued and
-    ///   the rest stay queued. No duplicate enqueue: the wake enqueued once, the dequeue removed
-    ///   one.
-    /// * **the wake enqueues a HIGHER-priority task** — it displaces the peeked candidate at the
-    ///   head. The dequeue honours it; `admitted` was a proof, not a prediction, and the
-    ///   superseding is logged, not asserted on.
-    /// * **the wake enqueues into a queue admission found EMPTY** — the unconditional selection in
-    ///   step (1) sees it, so the CPU switches instead of idling. This is why there is no
-    ///   `admitted == None` short circuit: that would be a lost wake.
-    /// * **the wake targets the OUTGOING task itself** — the caller has already published it
-    ///   blocked, so the wake makes it runnable and enqueues it like any other task. It is then an
-    ///   ordinary dequeue candidate; it is never resumed through the stale frame this trap is
-    ///   returning through, because the plan build derives the outgoing side from its TCB.
-    /// * **the superseding task is not resumable** — step (3) refuses, and the dequeue is undone
-    ///   with its exact inverse. The queue and the current slot are left exactly as the wake left
-    ///   them, and this CPU idles; nothing stale is switched to.
-    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-    pub(crate) fn queue_advance_commit_split(
-        &self,
-        cpu: CpuId,
-        outgoing_tid: u64,
-        admitted: Option<u64>,
-    ) -> QueueAdvanceOutcome {
-        use crate::kernel::scheduler::DispatchSelection;
-        use crate::runtime::CpuDispatch;
-        let cpu_idx = cpu.0 as usize;
-        // (1) rank 1: the ONE authoritative selection step (U9-QA §1) — the same one the FutexWait
-        // retirement drain reaches the run queue through. It authenticates the CPU and calls the
-        // same `Scheduler::dispatch_next_selection_on` the broad path calls.
-        //
-        // U9-QA §1 (SMP WAKE RACE): the selection is run UNCONDITIONALLY, including when admission
-        // found no candidate. Admission's peek and this dequeue are two separate rank-1
-        // acquisitions, so a wake may enqueue between them; short-circuiting on `admitted == None`
-        // would idle a CPU that had just become runnable — a lost wake. Deciding from the
-        // authoritative dequeue instead means a task enqueued in that window is simply selected.
-        let dispatch = self.queue_advance_select_step_split(cpu, "queue_advance_commit_split");
-        let incoming = match dispatch {
-            // Admission already authenticated this CPU under the single-dispatcher gate, so a
-            // mismatch here is unreachable. It is still matched explicitly, and it dequeued
-            // NOTHING — so the truthful outcome is an idle CPU, never a fabricated switch.
-            CpuDispatch::RefusedCpuMismatch { .. } => return QueueAdvanceOutcome::TerminalIdle,
-            CpuDispatch::Selected { selection, .. } => match selection {
-                DispatchSelection::Dequeued { tid } => tid.0,
-                // The caller did not clear the current slot, so nothing was dequeued.
-                DispatchSelection::ContinuedCurrent { .. } => {
-                    return QueueAdvanceOutcome::ResumeSame;
-                }
-                DispatchSelection::Idle => return QueueAdvanceOutcome::TerminalIdle,
-            },
-        };
-        // U9-QA §1 (SMP WAKE RACE): `admitted` is the admission PROOF — that a resumable candidate
-        // existed and the four stash conditions held — never a prediction of the winner.
-        // `peek_highest` scans High → Normal → Low, so a wake that enqueues a higher-priority task
-        // in the window legitimately displaces the peeked candidate. The authoritative dequeue is
-        // the decision; the disagreement is recorded and the dequeued task is honoured. It is NOT
-        // an error, so it is not asserted on: the resumability of whatever was actually dequeued is
-        // re-established below, before anything irreversible happens.
-        if admitted != Some(incoming) {
-            crate::yarm_log!(
-                "D6_GLOBAL_LOCK_DROP_ADMITTED_SUPERSEDED cpu={} admitted={} dequeued={}",
-                cpu.0,
-                admitted.unwrap_or(u64::MAX),
-                incoming
-            );
-        }
-        // (2) rank 2: the incoming ASID.
-        let incoming_asid = self.task_asid_opt_split_read(incoming);
-        // (3) rank 2: the switch plan, through the SINGLE shared builder.
-        //
-        // This is the LAST step that can fail, and it is deliberately taken BEFORE the lock-free
-        // address-space activation so a failure leaves no arch-visible side effect to undo. It is
-        // also where the dequeued task's resumability is re-established: the builder refuses an
-        // uninitialized incoming kernel context, which is exactly the check admission ran against
-        // the peeked candidate. When the two agree the check is a formality; when a wake superseded
-        // the candidate it is the thing that keeps the advance sound.
-        let plan = self.with_task_tcbs_split_mut(|tcbs| {
-            build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming)
-        });
-        let Ok(Some(plan)) = plan else {
-            // Fail closed WITH AN EXACT UNDO. The dequeue made `incoming` current; leaving it there
-            // while this CPU idles would strand a runnable task behind a `current` slot nothing
-            // will resume. `preempt_reenqueue_only_on` is the existing exact inverse of the
-            // dequeue — it re-enqueues `current` and clears the slot — so the run queue and the
-            // current slot are restored to what they were before step (1). The outgoing task
-            // remains correctly blocked and will be woken by its own waker. Nothing is stashed, no
-            // address space was activated, and no plan was published.
-            let restored = self.with_scheduler_split_mut(|sched| {
-                crate::kernel::boot::kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu)
-                    == Some(crate::kernel::ipc::ThreadId(incoming))
-            });
-            crate::yarm_log!(
-                "D6_GLOBAL_LOCK_DROP_DEFERRED reason=plan_unavailable outgoing={} incoming={} dequeue_undone={}",
-                outgoing_tid,
-                incoming,
-                u8::from(restored)
-            );
-            return QueueAdvanceOutcome::TerminalIdle;
-        };
-        // (4) Lock-free: activate the incoming address space — the same two free functions
-        // `Hal::switch_address_space` calls, which `dispatch_next_task` uses at this exact point.
-        if let Some(asid) = incoming_asid {
-            crate::arch::hal_adapters::switch_address_space(asid);
-            crate::arch::hal::note_address_space_activated(cpu, asid);
-        }
-        // (5) Lock-free: publish the plan for the arch apply. This is the point of no return.
-        unsafe {
-            crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan);
-        }
-        crate::yarm_log!(
-            "D6_GLOBAL_LOCK_DROP_PLAN_READY outgoing={} incoming={}",
-            outgoing_tid,
-            incoming
-        );
-        QueueAdvanceOutcome::Switch {
-            outgoing_tid,
-            incoming_tid: incoming,
-            incoming_asid,
-        }
-    }
-}
-
 use crate::kernel::boot::MemorySubsystem;
 use crate::kernel::vm::AddressSpaceManager;
 
@@ -4724,4 +4236,492 @@ pub(crate) fn load_elf_with_mo_zero_copy_locked(
         zc_pages,
         copied_pages,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec;
+
+    #[test]
+    fn elf_pflags_map_to_expected_page_flags() {
+        let rx = KernelState::page_flags_from_elf_pflags(PF_R | PF_X).expect("rx");
+        assert!(rx.read);
+        assert!(!rx.write);
+        assert!(rx.execute);
+
+        let rw = KernelState::page_flags_from_elf_pflags(PF_R | PF_W).expect("rw");
+        assert!(rw.read);
+        assert!(rw.write);
+        assert!(!rw.execute);
+
+        let ro = KernelState::page_flags_from_elf_pflags(PF_R).expect("ro");
+        assert!(ro.read);
+        assert!(!ro.write);
+        assert!(!ro.execute);
+
+        let write_only = KernelState::page_flags_from_elf_pflags(PF_W).expect("w");
+        assert!(write_only.read);
+        assert!(write_only.write);
+        assert!(!write_only.execute);
+
+        let exec_only = KernelState::page_flags_from_elf_pflags(PF_X).expect("x");
+        assert!(exec_only.read);
+        assert!(!exec_only.write);
+        assert!(exec_only.execute);
+    }
+
+    #[test]
+    fn elf_pflags_reject_wx() {
+        assert_eq!(
+            KernelState::page_flags_from_elf_pflags(PF_W | PF_X),
+            Err(KernelError::WrongObject)
+        );
+    }
+
+    #[test]
+    fn load_elf_returns_heap_base_aligned_to_max_pt_load_end() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut image = vec![0u8; 64 + 56];
+                image[0..4].copy_from_slice(b"\x7FELF");
+                image[4] = 2; // ELFCLASS64
+                image[5] = 1; // little-endian
+                image[6] = 1; // version
+                image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+                image[18..20].copy_from_slice(&183u16.to_le_bytes()); // AArch64
+                image[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+                image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // e_entry
+                image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+                image[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+                image[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+                image[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+                let ph = 64usize;
+                image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+                image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+                image[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+                image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_vaddr
+                image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_paddr
+                image[ph + 32..ph + 40].copy_from_slice(&0u64.to_le_bytes()); // p_filesz
+                image[ph + 40..ph + 48].copy_from_slice(&0x1234u64.to_le_bytes()); // p_memsz
+                image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+                let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
+                let (asid, _map) = state.create_user_address_space().expect("asid");
+                let (entry, _first_pt_load, heap_base) = state
+                    .load_elf_pt_load_segments(asid, &image)
+                    .expect("load elf");
+                assert_eq!(entry, 0x0040_0000usize);
+                assert_eq!(heap_base, 0x0040_2000usize);
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn load_elf_copies_into_staging_then_finalizes_rx_permissions() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut image = vec![0u8; 64 + 56 + 4];
+                image[0..4].copy_from_slice(b"\x7FELF");
+                image[4] = 2;
+                image[5] = 1;
+                image[6] = 1;
+                image[16..18].copy_from_slice(&2u16.to_le_bytes());
+                image[18..20].copy_from_slice(&183u16.to_le_bytes());
+                image[20..24].copy_from_slice(&1u32.to_le_bytes());
+                image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+                image[32..40].copy_from_slice(&64u64.to_le_bytes());
+                image[52..54].copy_from_slice(&64u16.to_le_bytes());
+                image[54..56].copy_from_slice(&56u16.to_le_bytes());
+                image[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+                let ph = 64usize;
+                image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+                image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+                image[ph + 8..ph + 16].copy_from_slice(&(64u64 + 56u64).to_le_bytes());
+                image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+                image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+                image[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes());
+                image[ph + 40..ph + 48].copy_from_slice(&4u64.to_le_bytes());
+                image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+                image[64 + 56..64 + 60].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+                let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
+                let (asid, _map) = state.create_user_address_space().expect("asid");
+                state
+                    .load_elf_pt_load_segments(asid, &image)
+                    .expect("load elf");
+                let mapping = state
+                    .user_spaces
+                    .get(asid)
+                    .and_then(|aspace| aspace.resolve(VirtAddr(0x0040_0000)))
+                    .expect("resolved mapping");
+                assert!(mapping.flags.read);
+                assert!(!mapping.flags.write);
+                assert!(mapping.flags.execute);
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+}
+
+// ── U9-QA — the authoritative off-lock queue-advancing dispatch ──────────────────────────────
+//
+// The broad queue-advancing switch is `KernelState::dispatch_next_task`, and every step it takes
+// is already reachable through a single-rank seam or a lock-free primitive:
+//
+// | step                       | owner     | rank / lock                                        |
+// |----------------------------|-----------|----------------------------------------------------|
+// | next-task selection        | scheduler | rank 1 — `dispatch_next_selection_on(cpu)`          |
+// | incoming ASID              | task      | rank 2 — `task_asid`                               |
+// | address-space activation   | HAL       | LOCK-FREE — `hal_adapters::switch_address_space`   |
+// |                            |           | + `note_address_space_activated` (per-CPU atomic)  |
+// | switch-plan build          | task      | rank 2 — `build_dispatch_switch_plan_locked`       |
+// | the switch itself          | arch      | NO LOCK — Stage 117 stash, drained by `trap_entry` |
+// | incoming context restore   | arch      | NO LOCK — U9/203C `post_switch_restore_*_split`    |
+// | terminal idle              | scheduler | rank 1 — the existing architecture idle path       |
+//
+// So the broad lock was never load-bearing for the advance; it was the ambient authority the steps
+// were written against. This transaction supplies that authority explicitly instead — the trap
+// `CpuId` and the exact outgoing identity — and takes each rank once, in monotonic order, with
+// nothing held across the HAL activation or the stash.
+//
+// It deliberately does NOT own selection policy: it calls the SAME
+// `Scheduler::dispatch_next_selection_on` the broad path calls, and the SAME
+// `build_dispatch_switch_plan_locked` extracted from `maybe_switch_kernel_context`. There is one
+// scheduler-selection implementation and one plan-build implementation in the tree.
+impl crate::runtime::SharedKernel {
+    /// U9-QA — capture the outgoing task's user context into its TCB, off the broad lock.
+    ///
+    /// The split twin of the `sync_current_thread_from_frame(trapframe)` that opens the broad
+    /// `handle_trap(Trap::Syscall, …)` arm. It MUST run before anything can select another task:
+    /// once the queue advance publishes the outgoing task as no longer current, the live trap frame
+    /// stops being that task's authoritative context.
+    ///
+    /// rank 2, one acquisition, keyed on the EXACT outgoing tid the caller authenticated — never an
+    /// ambient current-task lookup. Returns `false` if that tid has no TCB (fail closed).
+    pub(crate) fn capture_outgoing_user_context_split(
+        &self,
+        outgoing_tid: u64,
+        frame: &crate::kernel::trapframe::TrapFrame,
+    ) -> bool {
+        let captured = frame.capture_user_context();
+        self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == outgoing_tid) {
+                Some(tcb) => {
+                    tcb.user_context = captured;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// U9-QA — ADMISSION for one queue advance. Makes NO mutation, and is the ONLY place a
+    /// refusal can be raised.
+    ///
+    /// The caller must run this BEFORE it publishes its terminal transition (block, preempt or
+    /// fault). Once that publication happens the advance must complete, so every reason it could
+    /// decline is checked here, while falling through to the unchanged terminal broad dispatcher is
+    /// still safe.
+    ///
+    /// Checks, in order:
+    /// 1. lock-free — the four `can_stash_for_lock_drop` conditions (arch support, a trap drainer
+    ///    for this CPU, a single dispatching CPU, an empty stash);
+    /// 2. rank 1 — `peek_next_runnable_on(cpu)`, the NON-mutating candidate read (the run queue is
+    ///    unchanged; two calls return the same TID);
+    /// 3. rank 2 — the candidate must be RESUMABLE, i.e. its kernel context is initialized.
+    ///    A candidate that has never run takes the fresh/startup resume convention, which this
+    ///    transaction does not own, so it is refused here — before the caller has blocked anything
+    ///    and before the run queue has been touched.
+    ///
+    /// `apply` names the convention the CALLER will use to put the selected task on the CPU, so
+    /// that the two stash-specific refusals are asked only of a caller that will actually stash.
+    ///
+    /// `Ok(None)` means "no candidate": the advance will legitimately idle this CPU.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn queue_advance_admit_split(
+        &self,
+        cpu: CpuId,
+        apply: QueueAdvanceApply,
+    ) -> Result<Option<u64>, QueueAdvanceRefusal> {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+            return Err(QueueAdvanceRefusal::OutgoingIdentityStale);
+        }
+        // (1) Lock-free refusals.
+        //
+        // The two STASH-SPECIFIC ones are scoped to the stash convention (see
+        // [`QueueAdvanceApply`]). RISC-V is refused for `StashedKernelSwitch` by construction: the
+        // Stage 117 stash gate itself opens with `!cfg!(target_arch = "riscv64")`, and that
+        // architecture's `drain_switch_plan_stash` has no `post_switch_restore_*_split` arm, so a
+        // stashed plan would switch kernel contexts with nothing restoring the incoming one.
+        //
+        // That reason says nothing about `ExactTokenResume`, which stashes nothing and switches no
+        // kernel context — it activates the incoming address space and applies that task's saved
+        // USER context to the live trap frame. RISC-V has performed exactly that, live, since Stage
+        // 196E: `direct_dispatch_resume_incoming` is its gather+apply owner and its FutexWait drain
+        // already drives it. Refusing that convention on this architecture was refusing a capability
+        // it demonstrably has.
+        if matches!(apply, QueueAdvanceApply::StashedKernelSwitch) && cfg!(target_arch = "riscv64")
+        {
+            return Err(QueueAdvanceRefusal::ArchUnsupported);
+        }
+        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(QueueAdvanceRefusal::NoTrapDrainer);
+        }
+        // The SAME predicate `KernelState::dispatching_cpu_count` computes, read under rank 1 —
+        // together with the authoritative dispatch CPU, in ONE acquisition.
+        let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
+            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+            let online = s.online_cpu_bitmap();
+            (
+                (online & !s.wake_only_bitmap()).count_ones() as usize,
+                sched.current_cpu,
+            )
+        });
+        if dispatching > 1 {
+            return Err(QueueAdvanceRefusal::MultiCpu);
+        }
+        // U9-QA §1: pre-check the authentication the commit's selection step will perform. The
+        // commit cannot refuse, so this must fail HERE — before the caller blocks anything.
+        if dispatch_cpu != cpu {
+            return Err(QueueAdvanceRefusal::CpuNotAuthoritative);
+        }
+        // Stash-specific: an `ExactTokenResume` publishes no plan, so an occupied stash is not its
+        // precondition. It is still checked for the stash convention, where a second plan is lost.
+        if matches!(apply, QueueAdvanceApply::StashedKernelSwitch)
+            && unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() }
+        {
+            return Err(QueueAdvanceRefusal::StashOccupied);
+        }
+        // (2) rank 1: the NON-mutating candidate peek. The run queue is not touched.
+        let Some(candidate) = self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler)
+                .peek_next_runnable_on(cpu)
+                .map(|t| t.0)
+        }) else {
+            return Ok(None);
+        };
+        // (3) rank 2: the candidate must be resumable BY THE CONVENTION THE CALLER WILL USE.
+        //
+        // This is the question admission exists to ask, and the two conventions answer it
+        // differently — the screen exists so that no refusal can happen after the dequeue, and the
+        // set of tasks each apply can actually serve is not the same.
+        //
+        // * `StashedKernelSwitch` needs `kernel_context.initialized`, which is exactly what
+        //   `build_dispatch_switch_plan_locked` requires before it will produce a plan.
+        //
+        // * `ExactTokenResume` needs whatever its architecture's resume owner accepts, and that
+        //   genuinely differs:
+        //
+        //   - x86_64: `x86_post_lock_resume_marked_incoming` refuses `X86ResumeRefusal::Context`
+        //     for an incarnation with no restorable saved context, and a task that has never run
+        //     takes the FIRST-RESUME TRAMPOLINE — which is the stash path, not this one. So
+        //     `kernel_context.initialized` is the right screen there, and screening here is what
+        //     keeps that post-dequeue (fatal) refusal unreachable.
+        //   - AArch64 and riscv64: their resume owners activate the incoming address space and
+        //     apply that task's saved user context, and their write-backs then serve the
+        //     fresh/startup convention from the argument mirror. A never-run task is genuinely
+        //     resumable on both, and screening it out refused a live-capable advance.
+        //
+        //     BOTH were measured, not assumed. RISC-V: the first FutexWait of a core-smoke boot
+        //     was refused `IncomingUnavailable` for incoming tid 2, and the in-lock path then
+        //     switched to that very task through the startup convention (`SATP_OK` → `FRAME_OK`
+        //     → `SRET_ARMED` → `RISCV_STARTUP_ARGS tid=2`). AArch64: its FutexWait oracle refused
+        //     three times for the same reason while its in-lock drain switched all three
+        //     successfully (`TTBR0_OK` → `FRAME_OK`). What both require is a resolvable ASID,
+        //     which is what `direct_dispatch_activate_asid_split` would otherwise refuse on.
+        //
+        // 203C-XFR replaces the x86_64 arm. It used to ask `kernel_context.initialized`, and the
+        // comment above recorded the belief that a never-run task "takes the FIRST-RESUME
+        // TRAMPOLINE — which is the stash path, not this one". Both halves were wrong, and the
+        // source says so:
+        //
+        //   * that trampoline (`yarm_kernel_thread_switch_trampoline`, `FIRST_RESUME_STASH`) is
+        //     the KERNEL-THREAD `switch_frames` first resume, and it switches BACK to the
+        //     outgoing task — it is not how any user task enters ring 3;
+        //   * production user tasks never get an initialized kernel context at all. Only
+        //     `BOOTSTRAP_FIRST_USER_TID` and `BOOTSTRAP_SUPERVISOR_TID` do, as a Stage-119 D6
+        //     proof arrangement, which is precisely why `build_dispatch_switch_plan_locked`
+        //     records "context switching for these tasks happens entirely via trap-frame
+        //     restore; switch_frames is not called".
+        //
+        // So the screen refused every service task in the system, and admitted only tid 1 and
+        // tid 2. That is not a conservative approximation of the apply's precondition — it is a
+        // different question. The apply's real precondition is that the incoming task owns a
+        // returnable continuation, which is what the classifier establishes, and which a
+        // never-run task with a seeded startup snapshot satisfies exactly as well as a resumed
+        // one. Refusal is still raised HERE, before any mutation.
+        let convention = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == candidate)?;
+            classify_incoming_resume_convention(tcb, apply)
+        });
+        let Some(convention) = convention else {
+            return Err(QueueAdvanceRefusal::IncomingUnavailable);
+        };
+        if matches!(convention, IncomingResumeConvention::X86FirstResume) {
+            crate::yarm_log!(
+                "QUEUE_ADVANCE_ADMIT_FIRST_RESUME cpu={} candidate={}",
+                cpu.0,
+                candidate
+            );
+        }
+        Ok(Some(candidate))
+    }
+
+    /// U9-QA — COMMIT the queue advance. Cannot refuse.
+    ///
+    /// `outgoing_tid` is the exact task the caller has already published as no longer runnable, and
+    /// `admitted` is the candidate [`Self::queue_advance_admit_split`] returned under the same
+    /// uninterrupted trap. Phases are monotonic and never nested:
+    ///
+    /// 1. **rank 1** — `SharedKernel::queue_advance_select_step_split`, the ONE authoritative
+    ///    selection step (U9-QA §1), which calls the SAME `dispatch_next_selection_on` the broad
+    ///    path calls. Because the caller has already cleared the current slot, this takes the
+    ///    `current is None` branch and DEQUEUES the admitted candidate.
+    /// 2. **rank 2** — the incoming ASID.
+    /// 3. **rank 2** — the switch plan, through the single shared builder. The LAST fallible step,
+    ///    taken before any lock-free side effect so a failure has nothing arch-visible to undo.
+    /// 4. **LOCK-FREE** — address-space activation for the incoming task.
+    /// 5. **LOCK-FREE** — stash the plan for the arch apply.
+    ///
+    /// `Idle` selection yields `TerminalIdle`; a `ContinuedCurrent` selection means the caller did
+    /// not actually clear the current slot and yields `ResumeSame` with nothing stashed. Neither is
+    /// a refusal — nothing was dequeued in either case.
+    ///
+    /// ## The SMP wake race (U9-QA §1)
+    ///
+    /// Admission and this commit take rank 1 separately, so a wake — on this CPU or on a wake-only
+    /// AP rerouting an enqueue onto this CPU's queue — can land between them. Every way that can
+    /// resolve ends in a valid outcome, and none of them is a refusal after publication:
+    ///
+    /// * **the wake enqueues an ordinary task** — the dequeue selects the FIFO/priority winner,
+    ///   which may or may not be the peeked candidate; either way exactly one task is dequeued and
+    ///   the rest stay queued. No duplicate enqueue: the wake enqueued once, the dequeue removed
+    ///   one.
+    /// * **the wake enqueues a HIGHER-priority task** — it displaces the peeked candidate at the
+    ///   head. The dequeue honours it; `admitted` was a proof, not a prediction, and the
+    ///   superseding is logged, not asserted on.
+    /// * **the wake enqueues into a queue admission found EMPTY** — the unconditional selection in
+    ///   step (1) sees it, so the CPU switches instead of idling. This is why there is no
+    ///   `admitted == None` short circuit: that would be a lost wake.
+    /// * **the wake targets the OUTGOING task itself** — the caller has already published it
+    ///   blocked, so the wake makes it runnable and enqueues it like any other task. It is then an
+    ///   ordinary dequeue candidate; it is never resumed through the stale frame this trap is
+    ///   returning through, because the plan build derives the outgoing side from its TCB.
+    /// * **the superseding task is not resumable** — step (3) refuses, and the dequeue is undone
+    ///   with its exact inverse. The queue and the current slot are left exactly as the wake left
+    ///   them, and this CPU idles; nothing stale is switched to.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn queue_advance_commit_split(
+        &self,
+        cpu: CpuId,
+        outgoing_tid: u64,
+        admitted: Option<u64>,
+    ) -> QueueAdvanceOutcome {
+        use crate::kernel::scheduler::DispatchSelection;
+        use crate::runtime::CpuDispatch;
+        let cpu_idx = cpu.0 as usize;
+        // (1) rank 1: the ONE authoritative selection step (U9-QA §1) — the same one the FutexWait
+        // retirement drain reaches the run queue through. It authenticates the CPU and calls the
+        // same `Scheduler::dispatch_next_selection_on` the broad path calls.
+        //
+        // U9-QA §1 (SMP WAKE RACE): the selection is run UNCONDITIONALLY, including when admission
+        // found no candidate. Admission's peek and this dequeue are two separate rank-1
+        // acquisitions, so a wake may enqueue between them; short-circuiting on `admitted == None`
+        // would idle a CPU that had just become runnable — a lost wake. Deciding from the
+        // authoritative dequeue instead means a task enqueued in that window is simply selected.
+        let dispatch = self.queue_advance_select_step_split(cpu, "queue_advance_commit_split");
+        let incoming = match dispatch {
+            // Admission already authenticated this CPU under the single-dispatcher gate, so a
+            // mismatch here is unreachable. It is still matched explicitly, and it dequeued
+            // NOTHING — so the truthful outcome is an idle CPU, never a fabricated switch.
+            CpuDispatch::RefusedCpuMismatch { .. } => return QueueAdvanceOutcome::TerminalIdle,
+            CpuDispatch::Selected { selection, .. } => match selection {
+                DispatchSelection::Dequeued { tid } => tid.0,
+                // The caller did not clear the current slot, so nothing was dequeued.
+                DispatchSelection::ContinuedCurrent { .. } => {
+                    return QueueAdvanceOutcome::ResumeSame;
+                }
+                DispatchSelection::Idle => return QueueAdvanceOutcome::TerminalIdle,
+            },
+        };
+        // U9-QA §1 (SMP WAKE RACE): `admitted` is the admission PROOF — that a resumable candidate
+        // existed and the four stash conditions held — never a prediction of the winner.
+        // `peek_highest` scans High → Normal → Low, so a wake that enqueues a higher-priority task
+        // in the window legitimately displaces the peeked candidate. The authoritative dequeue is
+        // the decision; the disagreement is recorded and the dequeued task is honoured. It is NOT
+        // an error, so it is not asserted on: the resumability of whatever was actually dequeued is
+        // re-established below, before anything irreversible happens.
+        if admitted != Some(incoming) {
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROP_ADMITTED_SUPERSEDED cpu={} admitted={} dequeued={}",
+                cpu.0,
+                admitted.unwrap_or(u64::MAX),
+                incoming
+            );
+        }
+        // (2) rank 2: the incoming ASID.
+        let incoming_asid = self.task_asid_opt_split_read(incoming);
+        // (3) rank 2: the switch plan, through the SINGLE shared builder.
+        //
+        // This is the LAST step that can fail, and it is deliberately taken BEFORE the lock-free
+        // address-space activation so a failure leaves no arch-visible side effect to undo. It is
+        // also where the dequeued task's resumability is re-established: the builder refuses an
+        // uninitialized incoming kernel context, which is exactly the check admission ran against
+        // the peeked candidate. When the two agree the check is a formality; when a wake superseded
+        // the candidate it is the thing that keeps the advance sound.
+        let plan = self.with_task_tcbs_split_mut(|tcbs| {
+            build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming)
+        });
+        let Ok(Some(plan)) = plan else {
+            // Fail closed WITH AN EXACT UNDO. The dequeue made `incoming` current; leaving it there
+            // while this CPU idles would strand a runnable task behind a `current` slot nothing
+            // will resume. `preempt_reenqueue_only_on` is the existing exact inverse of the
+            // dequeue — it re-enqueues `current` and clears the slot — so the run queue and the
+            // current slot are restored to what they were before step (1). The outgoing task
+            // remains correctly blocked and will be woken by its own waker. Nothing is stashed, no
+            // address space was activated, and no plan was published.
+            let restored = self.with_scheduler_split_mut(|sched| {
+                crate::kernel::boot::kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu)
+                    == Some(crate::kernel::ipc::ThreadId(incoming))
+            });
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROP_DEFERRED reason=plan_unavailable outgoing={} incoming={} dequeue_undone={}",
+                outgoing_tid,
+                incoming,
+                u8::from(restored)
+            );
+            return QueueAdvanceOutcome::TerminalIdle;
+        };
+        // (4) Lock-free: activate the incoming address space — the same two free functions
+        // `Hal::switch_address_space` calls, which `dispatch_next_task` uses at this exact point.
+        if let Some(asid) = incoming_asid {
+            crate::arch::hal_adapters::switch_address_space(asid);
+            crate::arch::hal::note_address_space_activated(cpu, asid);
+        }
+        // (5) Lock-free: publish the plan for the arch apply. This is the point of no return.
+        unsafe {
+            crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan);
+        }
+        crate::yarm_log!(
+            "D6_GLOBAL_LOCK_DROP_PLAN_READY outgoing={} incoming={}",
+            outgoing_tid,
+            incoming
+        );
+        QueueAdvanceOutcome::Switch {
+            outgoing_tid,
+            incoming_tid: incoming,
+            incoming_asid,
+        }
+    }
 }

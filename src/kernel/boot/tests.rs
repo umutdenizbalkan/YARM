@@ -39949,15 +39949,30 @@ mod stage144_arch_safe_trampoline_ip {
     // 2. Common initialization must use kernel_switch_frame_trampoline_ip(), not the raw symbol.
     #[test]
     fn stage144_provision_uses_trampoline_ip_helper() {
+        // U9-SPAWN-TXN §2 moved the initialization into the rank-local owner, so the guard
+        // follows it there. The broad entry now only acquires and delegates.
         let fn_start = THREAD_STATE_SRC
-            .find("fn provision_default_kernel_context")
-            .expect("provision_default_kernel_context must exist");
-        // The function spans ~50 lines; search from its start to the next `pub(crate) fn`.
+            .find("pub(crate) fn provision_default_kernel_context_locked")
+            .expect("provision_default_kernel_context_locked must exist");
         let fn_end = THREAD_STATE_SRC[fn_start..]
-            .find("\n    pub(crate) fn release_kernel_context")
+            .find("\n}\n")
             .map(|rel| fn_start + rel)
             .unwrap_or(THREAD_STATE_SRC.len());
         let fn_body = &THREAD_STATE_SRC[fn_start..fn_end];
+        // And the broad entry really does delegate rather than keeping a second copy.
+        let broad_start = THREAD_STATE_SRC
+            .find("pub(crate) fn provision_default_kernel_context(&mut self")
+            .expect("the broad entry must exist");
+        let broad_end = THREAD_STATE_SRC[broad_start..]
+            .find("\n    }\n")
+            .map(|rel| broad_start + rel)
+            .unwrap_or(THREAD_STATE_SRC.len());
+        let broad = &THREAD_STATE_SRC[broad_start..broad_end];
+        assert!(
+            broad.contains("provision_default_kernel_context_locked(tcbs, tid)")
+                && !broad.contains("kernel_switch_frame_trampoline_ip()"),
+            "the broad entry must delegate, never re-initialize"
+        );
         assert!(
             fn_body.contains("kernel_switch_frame_trampoline_ip()"),
             "provision_default_kernel_context must call kernel_switch_frame_trampoline_ip()"
@@ -53308,10 +53323,11 @@ mod stage165j_kernel_stack_128k {
     #[test]
     fn stage165j_derived_logic_uses_constant_and_supervisor_only() {
         // provision_default_kernel_context derives region/base/top from the const.
+        // U9-SPAWN-TXN §2: the math lives in the rank-local owner now.
         let prov_start = THREAD_STATE_SRC
-            .find("fn provision_default_kernel_context")
+            .find("pub(crate) fn provision_default_kernel_context_locked")
             .expect("provision fn");
-        let prov = &THREAD_STATE_SRC[prov_start..prov_start + 1200];
+        let prov = &THREAD_STATE_SRC[prov_start..prov_start + 2000];
         assert!(
             prov.contains("idx.saturating_mul(KERNEL_STACK_REGION_SIZE)")
                 && prov.contains("checked_add(KERNEL_STACK_REGION_SIZE)"),
@@ -153585,45 +153601,175 @@ mod u9spawn2_process_cnode_txn {
 mod u9spawn2_nr23_route_blockers {
     use super::*;
 
-    /// Every phase the NR 23 / NR 29 transaction still needs off the broad lock, and the fact
-    /// that none of them has a rank-local owner today.
+    /// The production corpus every ownership guard scans must actually CONTAIN the production
+    /// code, and this pins the one way it silently stops doing so.
     ///
-    /// A rank-local owner is one that takes its subsystem (`&mut XSubsystem`) rather than
-    /// `&mut self`, so an acquisition wrapper can drive it from either side — the shape §2's
-    /// `provision_process_cnode_locked` has. When one of these grows that shape, this test fails
-    /// and the phase table gets recomputed instead of the note going stale.
+    /// `production_sources()` truncates each file at its `#[cfg(test)] mod tests` marker, which is
+    /// correct — a guard must not match a test's own literals. The trap is that anything appended
+    /// AFTER that marker is production code the corpus never sees, so every forbidden-pattern and
+    /// ownership guard silently exempts it.
+    ///
+    /// That is not hypothetical: U9-SPAWN-VM2 appended the two rank-local ELF loaders to the end
+    /// of `exec_state.rs`, past its test module, and roughly 600 lines of production code were
+    /// invisible to every corpus scan until U9-SPAWN-TXN moved them above it. This test would have
+    /// caught that the moment it happened.
+    ///
+    /// `#[cfg(test)]` items are exempt by definition: they ship in no kernel, so a guard has no
+    /// reason to see them.
     #[test]
-    fn every_remaining_spawn_phase_still_lacks_a_rank_local_owner() {
-        const PHASES: &[(&str, &str)] = &[
-            ("create_user_address_space", "VM rank 5 + capability rank 4"),
-            ("load_elf_pt_load_segments", "VM rank 5 + memory rank 6"),
-            ("load_elf_with_mo_zero_copy", "VM rank 5 + memory rank 6"),
-            // U9-SPAWN-VM1 renamed the stack phase's body to `allocate_user_stack_in_asid` and
-            // left `allocate_user_stack_with_guard` as the TID-resolving wrapper. Both are named
-            // so the table tracks the call the provisioner actually makes AND the one the
-            // architecture bring-up sites still make.
-            ("allocate_user_stack_in_asid", "VM rank 5 + memory rank 6"),
-            (
-                "allocate_user_stack_with_guard",
-                "VM rank 5 + memory rank 6",
-            ),
-            ("create_endpoint", "IPC rank 3 + capability rank 4"),
-            (
-                "grant_capability_task_to_task_with_rights",
-                "capability rank 4",
-            ),
-            ("provision_default_kernel_context", "task rank 2"),
-        ];
-        let sources = stage199d_wa2a_ownership_boundary::production_sources();
-        for (phase, ranks) in PHASES {
-            let locked = alloc::format!("fn {phase}_locked(");
-            let has_rank_local = sources.iter().any(|(_, src)| src.contains(&locked));
+    fn no_production_item_hides_after_a_files_test_module() {
+        for (rel, _) in stage199d_wa2a_ownership_boundary::production_sources() {
+            let full = std::fs::read_to_string(&rel)
+                .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            let Some(at) = full.find("\n#[cfg(test)]\nmod tests") else {
+                continue;
+            };
+            let tail = &full[at + 1..];
+            let mut hidden: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+            let mut cfg_test = false;
+            for line in tail.lines() {
+                if line.starts_with("#[cfg(test)]") {
+                    cfg_test = true;
+                    continue;
+                }
+                let is_item = line.starts_with("pub fn ")
+                    || line.starts_with("pub(crate) fn ")
+                    || line.starts_with("pub struct ")
+                    || line.starts_with("pub(crate) struct ")
+                    || line.starts_with("pub enum ")
+                    || line.starts_with("pub(crate) enum ")
+                    || line.starts_with("pub const ")
+                    || line.starts_with("pub(crate) const ")
+                    || line.starts_with("pub static ")
+                    || line.starts_with("pub(crate) static ");
+                if is_item {
+                    if !cfg_test {
+                        hidden.push(line.into());
+                    }
+                    cfg_test = false;
+                } else if !line.trim_start().starts_with("//")
+                    && !line.trim_start().starts_with("#[")
+                    && !line.trim().is_empty()
+                {
+                    cfg_test = false;
+                }
+            }
             assert!(
-                !has_rank_local,
-                "{phase} ({ranks}) grew a rank-local owner — recompute the NR 23 phase table \
-                 before trusting the hard-stop note"
+                hidden.is_empty(),
+                "{rel} has production items after its `#[cfg(test)] mod tests` marker, so every \
+                 corpus-scanning guard silently exempts them — move them above it: {hidden:?}"
             );
         }
+    }
+
+    /// The recomputed NR 23 / NR 29 phase table.
+    ///
+    /// U9-SPAWN2 §3 wrote this as "none of these seven has a rank-local owner". Each later pass
+    /// closed some of them, and U9-SPAWN-TXN §2 closed the last, at which point the old assertion
+    /// fired — which was its job. The table is therefore INVERTED here rather than deleted: every
+    /// one of the seven must now HAVE a rank-local owner, so a regression that removed one is
+    /// caught just as loudly as the growth was.
+    ///
+    /// A rank-local owner takes its subsystem (`&mut XSubsystem`, or the TCB/class storage for
+    /// task rank 2) rather than `&mut self`, so an acquisition wrapper can drive it from either
+    /// side.
+    #[test]
+    fn every_spawn_phase_now_has_a_rank_local_owner() {
+        const PHASES: &[(&str, &str, &str)] = &[
+            (
+                "create_user_address_space",
+                "create_address_space_locked",
+                "VM rank 5 (the capability mint moved out — U9-SPAWN-VM2 §2)",
+            ),
+            (
+                "load_elf_pt_load_segments",
+                "load_elf_pt_load_segments_locked",
+                "VM rank 5 + memory rank 6",
+            ),
+            (
+                "load_elf_with_mo_zero_copy",
+                "load_elf_with_mo_zero_copy_locked",
+                "VM rank 5 + memory rank 6",
+            ),
+            (
+                "allocate_user_stack_in_asid",
+                "allocate_user_stack_locked",
+                "VM rank 5 + memory rank 6",
+            ),
+            (
+                "create_endpoint",
+                "provision_service_endpoint_locked",
+                "IPC rank 3 + capability rank 4",
+            ),
+            (
+                "grant_capability_task_to_task_with_rights",
+                "delegate_capability_locked",
+                "capability rank 4",
+            ),
+            (
+                "provision_default_kernel_context",
+                "provision_default_kernel_context_locked",
+                "task rank 2",
+            ),
+        ];
+        let sources = stage199d_wa2a_ownership_boundary::production_sources();
+        for (phase, owner, ranks) in PHASES {
+            let decl = alloc::format!("fn {owner}(");
+            assert!(
+                sources.iter().any(|(_, src)| src.contains(&decl)),
+                "{phase} ({ranks}) lost its rank-local owner `{owner}`"
+            );
+        }
+    }
+
+    /// The seven-phase table was never the COMPLETE routing ledger, and this records what it
+    /// omitted so the omission cannot be rediscovered as a surprise.
+    ///
+    /// U9-SPAWN-IC1 closed the last of the seven and reported that fact accurately. But routing
+    /// NR 23 / NR 29 off the broad lock needs the PUBLICATION phase too — everything
+    /// `spawn_image_after_claim` does after the reservation is claimed — and that phase has two
+    /// owners of its own which the seven-phase table never listed:
+    ///
+    /// | publication step | rank | rank-local owner |
+    /// |---|---|---|
+    /// | `set_process_cnode_for_pid` | capability 4 | none |
+    /// | the TCB write-set + `Spawning -> LiveSpawned` commit | task 2 | none |
+    ///
+    /// Neither is a new subsystem: the first is capability-state-only, and the commit already has
+    /// a rank-2-local free function in `spawn_reservation`. This test pins the gap until they are
+    /// built, and fails when either grows an owner — the same recompute-rather-than-go-stale
+    /// discipline the seven-phase table had.
+    #[test]
+    fn the_publication_phase_owners_are_the_remaining_gap() {
+        const PUBLICATION: &[(&str, &str, &str)] = &[
+            (
+                "set_process_cnode_for_pid",
+                "set_process_cnode_for_pid_locked",
+                "capability rank 4",
+            ),
+            (
+                "spawn_image_after_claim (TCB write-set + commit)",
+                "publish_spawned_image_locked",
+                "task rank 2",
+            ),
+        ];
+        let sources = stage199d_wa2a_ownership_boundary::production_sources();
+        for (step, owner, ranks) in PUBLICATION {
+            let decl = alloc::format!("fn {owner}(");
+            let exists = sources.iter().any(|(_, src)| src.contains(&decl));
+            assert!(
+                !exists,
+                "{step} ({ranks}) grew `{owner}` — recompute the routing ledger and move this \
+                 step into the completed table above"
+            );
+        }
+        // And the commit half really is already rank-local, which is why this is an extraction
+        // rather than a new subsystem.
+        const RESERVATION: &str = include_str!("../spawn_reservation.rs");
+        assert!(
+            RESERVATION.contains("pub(crate) fn commit_live_spawn(\n    tcbs: &mut [Option<ThreadControlBlock>]"),
+            "the Spawning -> LiveSpawned commit must stay a rank-2-local function over the TCBs"
+        );
     }
 
     /// §2's transaction, by contrast, HAS that shape — which is how the difference between a
