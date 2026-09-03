@@ -155321,6 +155321,392 @@ mod u9spawnvm2_provision_failure_injection {
 /// Structural guards first (what the code CANNOT do), then failure injection at every endpoint,
 /// capability, delegation and cleanup boundary (what it actually restores).
 #[cfg(test)]
+/// U9-SPAWN-TXN3 §5 — the provisional-capability rollback contract, and the proof that the split
+/// acquisition layer is live rather than dormant.
+mod u9spawntxn3_provisional_rollback {
+    use super::*;
+    use crate::kernel::boot::provisional_cap::{
+        MAX_PROVISIONAL_DESCENDANTS, ProvisionalCap, ProvisionalCapRelease,
+        collect_link_closure_locked, pid_for_cnode_locked, provisional_cap_token_locked,
+        release_provisional_cap_locked,
+    };
+    use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
+    use crate::kernel::syscall::spawn_txn::{SharedSpawnOwners, SpawnTxnOwners};
+    use crate::runtime::SharedKernel;
+
+    const PROVCAP: &str = include_str!("provisional_cap.rs");
+    const POLICY: &str = include_str!("../syscall/spawn_txn.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+
+    fn fixture() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    fn endpoint_cap(index: usize, generation: u64) -> Capability {
+        Capability::new(CapObject::Endpoint { index, generation }, CapRights::SEND)
+    }
+
+    /// Run the four-step rollback the way the policy composes it, through the BROAD adapter.
+    fn release(k: &SharedKernel, cnode: CNodeId, cap: CapId) -> ProvisionalCapRelease {
+        k.with(|s| {
+            let mut owners = crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s };
+            crate::kernel::syscall::spawn_txn::release_provisional_capability(
+                &mut owners,
+                cnode,
+                cap,
+            )
+        })
+    }
+
+    fn cap_present(k: &SharedKernel, cnode: CNodeId, cap: CapId) -> bool {
+        k.with(|s| s.capability_for_cnode_local(cnode, cap).is_some())
+    }
+
+    fn link_count(k: &SharedKernel) -> usize {
+        k.with(|s| {
+            s.with_capability_state(|capability| {
+                crate::kernel::boot::kernel_ref(&capability.delegated_capability_links)
+                    .iter()
+                    .flatten()
+                    .count()
+            })
+        })
+    }
+
+    // ── The reachable closure, exercised ─────────────────────────────────────────────────
+
+    /// The ordinary case: a minted provisional capability with no descendants is removed, and the
+    /// rollback reports exactly that.
+    #[test]
+    fn a_childless_provisional_cap_is_removed_and_reported() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(3, 7)))
+            .expect("mint");
+        assert!(cap_present(&k, cnode, cap));
+        assert_eq!(
+            release(&k, cnode, cap),
+            ProvisionalCapRelease::Released { descendants: 0 }
+        );
+        assert!(!cap_present(&k, cnode, cap), "the source slot is gone");
+    }
+
+    /// Repeat-inert: a second rollback of the same token finds nothing and touches nothing.
+    #[test]
+    fn the_rollback_is_repeat_inert() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(4, 9)))
+            .expect("mint");
+        assert!(release(&k, cnode, cap).released());
+        let links_before = link_count(&k);
+        assert_eq!(release(&k, cnode, cap), ProvisionalCapRelease::AlreadyGone);
+        assert_eq!(link_count(&k), links_before, "a repeat touched nothing");
+    }
+
+    /// A stale token whose slot now holds a DIFFERENT object must refuse WITHOUT mutation. This
+    /// is the hazard §1 refused to assume away: a fresh CapId is guessable and siblings share the
+    /// cspace, so the replacement must survive a stale rollback intact.
+    #[test]
+    fn a_recycled_slot_is_refused_and_left_intact() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(5, 11)))
+            .expect("mint");
+        // Build the token for the ORIGINAL incarnation, then replace the slot's contents.
+        let token = k
+            .with(|s| {
+                s.with_capability_state(|capability| {
+                    provisional_cap_token_locked(capability, cnode, cap)
+                })
+            })
+            .expect("token");
+        k.with(|s| {
+            s.with_capability_state_mut(|capability| {
+                if let Some(space) = capability
+                    .cnode_spaces
+                    .iter_mut()
+                    .flatten()
+                    .find(|space| space.id == cnode)
+                {
+                    let cspace = crate::kernel::boot::kernel_mut(&mut space.cspace);
+                    let _ = cspace.revoke(cap);
+                }
+            });
+        });
+        // A DIFFERENT object now occupies the same numeric slot.
+        let replacement = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(6, 12)))
+            .expect("replacement mint");
+        let outcome = k.with(|s| {
+            s.with_capability_state_mut(|capability| {
+                let empty = [None; MAX_PROVISIONAL_DESCENDANTS];
+                let none = [None; MAX_PROVISIONAL_DESCENDANTS];
+                release_provisional_cap_locked(capability, &token, &empty, &none)
+            })
+        });
+        assert!(
+            matches!(
+                outcome,
+                ProvisionalCapRelease::StaleObject { .. } | ProvisionalCapRelease::AlreadyGone
+            ),
+            "a stale token must refuse, not destroy: {outcome:?}"
+        );
+        assert!(
+            cap_present(&k, cnode, replacement),
+            "the replacement capability must survive a stale rollback"
+        );
+    }
+
+    /// The token really is generation-bearing: `CapId` packs the slot generation and `CapSpace`
+    /// refuses a mismatch, so a token naming a recycled slot resolves to nothing at all.
+    #[test]
+    fn the_token_carries_the_slot_generation() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(1, 1)))
+            .expect("mint");
+        let forged = CapId::new(cap.index(), cap.generation().wrapping_add(1));
+        assert_ne!(forged, cap, "the forged token names another generation");
+        assert!(
+            !cap_present(&k, cnode, forged),
+            "a wrong-generation CapId resolves to nothing"
+        );
+        assert_eq!(
+            release(&k, cnode, forged),
+            ProvisionalCapRelease::AlreadyGone
+        );
+        assert!(cap_present(&k, cnode, cap), "the real capability is intact");
+    }
+
+    /// The pid the token carries comes from the CAPABILITY domain's own process association, not
+    /// from an ambient current-task read.
+    #[test]
+    fn the_token_pid_comes_from_the_capability_domain() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let from_domain = k.with(|s| s.with_capability_state(|c| pid_for_cnode_locked(c, cnode)));
+        assert!(
+            from_domain.is_some(),
+            "the cspace has a process association"
+        );
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(2, 2)))
+            .expect("mint");
+        let token = k
+            .with(|s| s.with_capability_state(|c| provisional_cap_token_locked(c, cnode, cap)))
+            .expect("token");
+        assert_eq!(token.pid, from_domain.unwrap());
+        assert_eq!(token.cnode, cnode);
+        assert_eq!(token.cap, cap);
+    }
+
+    /// The link closure is bounded and reports overflow rather than truncating: a partial
+    /// descendant sweep would remove some authority and leave the rest with no provenance.
+    #[test]
+    fn an_overwide_link_closure_refuses_rather_than_truncating() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let cap = k
+            .with(|s| s.mint_capability_in_cnode(cnode, endpoint_cap(8, 3)))
+            .expect("mint");
+        // Record more links rooted at this cap than the bound admits.
+        k.with(|s| {
+            for i in 0..(MAX_PROVISIONAL_DESCENDANTS + 4) {
+                let _ = s.record_delegated_capability_link(
+                    1,
+                    cap,
+                    2000 + i as u64,
+                    CapId::new(900 + i, 1),
+                );
+            }
+        });
+        let closure = k.with(|s| {
+            s.with_capability_state(|capability| collect_link_closure_locked(capability, cap))
+        });
+        assert!(
+            closure.is_none(),
+            "a closure wider than the bound must report overflow"
+        );
+        assert_eq!(
+            release(&k, cnode, cap),
+            ProvisionalCapRelease::Residue,
+            "and the rollback must refuse rather than partially sweep"
+        );
+        assert!(
+            cap_present(&k, cnode, cap),
+            "a refused rollback leaves the source slot alone"
+        );
+    }
+
+    // ── The split acquisition layer is LIVE, not dormant ────────────────────────────────
+
+    /// `SharedSpawnOwners` is constructed and driven here, so the deliverable contains no dormant
+    /// split adapter. (In the freestanding builds the two syscall routes construct it; the hosted
+    /// build has no off-lock user-read seam, so this is where it is exercised.)
+    #[test]
+    fn the_split_acquisition_layer_is_constructed_and_answers() {
+        let k = fixture();
+        let cpu = k.current_cpu_split_read();
+        let tid = k.current_tid_split_read(cpu);
+        let owners = SharedSpawnOwners {
+            shared: &k,
+            spawner_tid: tid,
+            spawner_cnode: tid.and_then(|t| k.task_cnode_split(t)),
+            cpu,
+        };
+        // Snapshot reads answer from the identity it was handed, not from an ambient lookup.
+        assert_eq!(owners.current_tid(), tid);
+        assert_eq!(owners.current_cpu(), cpu);
+        // And a domain read really reaches the live kernel through its seam.
+        assert_eq!(
+            owners.live_task_count(),
+            k.with(|s| s.with_tcbs(|tcbs| tcbs.iter().flatten().count())),
+            "the split adapter reads the same task table the broad one does"
+        );
+    }
+
+    /// Both adapters reach the SAME rank-local rollback body — the property that makes broad and
+    /// split semantics impossible to diverge.
+    #[test]
+    fn both_adapters_reach_the_same_rollback_body() {
+        assert_eq!(
+            POLICY
+                .matches("provisional_cap::release_provisional_cap_locked(")
+                .count(),
+            2,
+            "exactly two acquisition adapters wrap the one rank-4 rollback body"
+        );
+        assert_eq!(
+            POLICY
+                .matches("pub(crate) fn release_provisional_capability<O: SpawnTxnOwners>(")
+                .count(),
+            1,
+            "and the four-step composition around it is stated once"
+        );
+    }
+
+    // ── The unreachable branches cannot silently become reachable ───────────────────────
+
+    /// §1 classified eleven substeps of the general revocation as unreachable BY OBJECT KIND. If
+    /// a future change made a spawn capability name a memory object or a notification, that
+    /// classification would be wrong — so the rollback owner is pinned to reach none of the
+    /// machinery those substeps need.
+    #[test]
+    fn the_rollback_owner_reaches_no_unreachable_substep() {
+        for forbidden in [
+            "active_transfer_mappings",
+            "adjust_memory_object_cap_refcount",
+            "reclaim_memory_object",
+            "destroy_notification",
+            "unmap_range_two_phase",
+            "report_transfer_revoke_to_supervisor",
+            "with_memory",
+            "with_ipc",
+            "with_scheduler",
+            "with_tcbs",
+        ] {
+            assert!(
+                !PROVCAP.contains(forbidden),
+                "the provisional-cap rollback must not reach {forbidden}: §1 proved it \
+                 unreachable for an AddressSpace/Endpoint capability, and reaching it would mean \
+                 the closure was mis-derived"
+            );
+        }
+    }
+
+    /// The rollback performs NO object destruction: the endpoint incarnation and the address
+    /// space are the ledger's, held as their own generation-bearing tokens.
+    #[test]
+    fn the_rollback_destroys_no_object() {
+        for forbidden in [
+            "remove_unpublished_endpoint",
+            "destroy_user_address_space",
+            "destroy_unresident_address_space",
+        ] {
+            assert!(
+                !PROVCAP.contains(forbidden),
+                "object teardown stays ledger-owned; {forbidden} must not appear in the \
+                 capability rollback"
+            );
+        }
+        // And the endpoint composition really does the capabilities first, then the object.
+        let compose = POLICY
+            .split("pub(crate) fn release_service_endpoint_grant<O: SpawnTxnOwners>(")
+            .nth(1)
+            .expect("the endpoint release composition");
+        let send = compose.find("grant.send_cap").expect("send cap release");
+        let recv = compose.find("grant.recv_cap").expect("recv cap release");
+        let object = compose
+            .find("remove_unpublished_endpoint(")
+            .expect("the endpoint incarnation removal");
+        assert!(
+            send < object && recv < object,
+            "both capabilities must go before the object they name"
+        );
+    }
+
+    /// Child before source, in the body itself: a child is authority derived from the source, so
+    /// removing the source first would leave live authority whose provenance is gone.
+    #[test]
+    fn the_body_removes_children_before_the_source() {
+        let body = PROVCAP
+            .split("pub(crate) fn release_provisional_cap_locked(")
+            .nth(1)
+            .expect("the rollback body");
+        let children = body
+            .find("remove_delegated_child_locked(")
+            .expect("the child removal");
+        let source = body
+            .find("── 3. The source slot, last.")
+            .expect("the source removal");
+        assert!(children < source, "children are removed before the source");
+    }
+
+    // ── The routes decline pre-mutation ─────────────────────────────────────────────────
+
+    /// Every refusal in either route happens before the transaction, which is the first mutation.
+    #[test]
+    fn every_route_refusal_precedes_the_first_mutation() {
+        for route in [
+            "fn try_split_spawn_process_into_frame(",
+            "fn try_split_spawn_from_mo_into_frame(",
+        ] {
+            // The hosted stub carries the same signature, so take the LAST definition — the
+            // freestanding route that actually runs the transaction.
+            assert_eq!(
+                SPLIT.matches(route).count(),
+                2,
+                "{route} is exactly one hosted stub plus one freestanding route"
+            );
+            let body = SPLIT
+                .rsplit(route)
+                .next()
+                .expect(route)
+                .split("\n}\n")
+                .next()
+                .expect("route body");
+            let txn = body
+                .find("spawn_image_txn::run_image_spawn_transaction(")
+                .expect("the transaction");
+            // Every `fail(` and every `?`-style decline is textually before the transaction.
+            let last_fail = body[..txn].rfind("return fail(");
+            assert!(
+                last_fail.is_some(),
+                "{route} must have pre-mutation refusals"
+            );
+            assert!(
+                body[txn..].matches("return fail(").count() == 0,
+                "{route} must not decline after the transaction has begun"
+            );
+        }
+    }
+}
+
 mod u9spawnic1_endpoint_cap_txn {
     use super::*;
     use crate::kernel::boot::spawn_ipc_cap_txn::{
