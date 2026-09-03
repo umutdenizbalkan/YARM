@@ -2562,7 +2562,6 @@ impl SharedKernel {
         true
     }
 
-    /// U9-SPAWN-TXN2 §3 — the split twin of `KernelState::set_process_cnode_for_pid`.
     // ── U9-FORK1 §4 — the seven fork owners, off the broad lock. ────────────────────────
     //
     // Each is the split spelling of the identically named `KernelState` owner in
@@ -2863,6 +2862,7 @@ impl SharedKernel {
         removed
     }
 
+    /// U9-SPAWN-TXN2 §3 — the split twin of `KernelState::set_process_cnode_for_pid`.
     pub(crate) fn set_process_cnode_for_pid_split(
         &self,
         pid: u64,

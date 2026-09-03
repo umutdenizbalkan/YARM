@@ -254,16 +254,15 @@ fn snapshot_parent_runs(
 /// 1. **Preflight**, before any mutation: the parent must exist and the child must fit. A refusal
 ///    here leaves the parent byte-identical because nothing has been written.
 /// 2. Create the child address space.
-/// 3. Per parent run, in snapshot order:
-///    a. map every page of the run into the child at the SAME virtual address against the SAME
-///       physical backing, with the write bit cleared — no frame is copied, and the mapper takes
-///       the covering MemoryObject's `map_refcount` up by exactly one per page;
-///    b. if the parent run is writable, write-protect its head IN PLACE (flags only — the entry
-///       count is unchanged, so the parent table cannot grow) and record the original flags;
-///    c. mark the run copy-on-write in both address spaces — or, for a run already read-only *and
-///       already COW* from an earlier fork, mark it COW in the child too. That second case is not
-///       an optimization: without the mark the child's first write finds the page present and
-///       read-only but not COW, the fault handler declines, and the fault loops.
+/// 3. Per parent run, in snapshot order: (a) map every page of the run into the child at the
+///    SAME virtual address against the SAME physical backing, with the write bit cleared — no
+///    frame is copied, and the mapper takes the covering MemoryObject's `map_refcount` up by
+///    exactly one per page; (b) if the parent run is writable, write-protect its head IN PLACE
+///    (flags only — the entry count is unchanged, so the parent table cannot grow) and record the
+///    original flags; (c) mark the run copy-on-write in both address spaces — or, for a run
+///    already read-only *and already COW* from an earlier fork, mark it COW in the child too.
+///    That last case is not an optimization: without the mark the child's first write finds the
+///    page present and read-only but not COW, the fault handler declines, and the fault loops.
 /// 4. Return the token, the parent's owed shootdown included.
 ///
 /// Any failure inside step 3 rolls the whole attempt back through [`rollback_cow_clone_locked`] —
