@@ -802,6 +802,11 @@ pub fn handle_riscv_trap_entry_shared(
             // never dispatched, so the caller is still current when this trap returns.
             || nr == crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR
             || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
+            // U9-FORK1 §4: Fork (NR 12). Same shape as the two spawn classes — it neither blocks
+            // nor switches, finalizes through the same same-task ecall writeback (sepc+4 once,
+            // sstatus preserved, a0 from `set_ok`), and enqueues the child rather than
+            // dispatching it, so the caller is still current when this trap returns.
+            || nr == crate::kernel::syscall::SYSCALL_FORK_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -813,6 +818,7 @@ pub fn handle_riscv_trap_entry_shared(
             !RISCV_FUTEXWAKE_SPLIT_MARKERS_LOGGED.swap(true, Ordering::Relaxed)
         } else if nr == crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR
             || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
+            || nr == crate::kernel::syscall::SYSCALL_FORK_NR
         {
             // U9-SPAWN-TXN3 §4/§6: NOT latched, deliberately.
             //

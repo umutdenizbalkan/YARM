@@ -320,6 +320,9 @@ pub(crate) mod ipc_abi;
 // Stage 155: `pub(crate)` so `kernel/recv_core.rs` (outside the syscall subtree)
 // can call the single `encode_recv_v2_meta` codec. Module holds pure code only.
 pub(crate) mod ipc_recv_core;
+// U9-FORK1 §3/§4: THE fork transaction, over the delivered `SpawnTxnOwners` plus the seven
+// operations a fork needs that a spawn does not.
+pub(crate) mod fork_txn;
 pub(crate) mod process;
 mod recv_shared_v3;
 mod sched;

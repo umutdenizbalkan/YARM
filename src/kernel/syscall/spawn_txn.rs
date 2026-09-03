@@ -48,6 +48,7 @@
 //! before the publication compensates exactly once, in reverse ownership order. After the
 //! publication there is no fallback and nothing left that can fail.
 
+use crate::kernel::boot::cow_clone::{CowCloneRollback, CowCloneToken};
 use crate::kernel::boot::defs::DelegatedCapabilityLink;
 use crate::kernel::boot::exec_state::SpawnedImagePublication;
 use crate::kernel::boot::process_cnode_txn::{ProcessCNodeGrant, ProcessCNodeRequest};
@@ -256,6 +257,73 @@ pub(crate) trait SpawnTxnOwners {
     ) -> Result<VirtAddr, KernelError>;
     /// Copy bytes into a user address space.
     fn copy_to_user(&mut self, asid: Asid, va: VirtAddr, bytes: &[u8]) -> Result<(), KernelError>;
+
+    // ── U9-FORK1 §1: the SEVEN operations a fork needs that a spawn does not. ─────────────
+    //
+    // Everything else a fork does — the TID, the reservation and its exact cancellation, the
+    // process CNode and its PID association, the class, the kernel context, capability
+    // delegation and its release, the CPU-pinned enqueue, the never-resident address-space
+    // teardown — is an owner this trait already had. These are the difference between building a
+    // child from an image and copying one from a parent.
+
+    /// Every fact about the parent a fork needs, under ONE task-domain acquisition.
+    ///
+    /// It replaces three separate reads (TCB, class, brk bounds), which off the broad lock could
+    /// each observe a different incarnation. After this the transaction reads no ambient current
+    /// task.
+    fn fork_parent_snapshot(&mut self, tid: u64) -> Option<super::fork_txn::ForkParentFacts>;
+
+    /// The capabilities a fork inherits, by the existing exhaustive allow/refuse policy.
+    fn snapshot_inheritable_caps(
+        &self,
+        tid: u64,
+    ) -> Result<super::fork_txn::InheritableCaps, KernelError>;
+
+    /// THE copy-on-write clone: VM rank 5 → memory rank 6, ONE acquisition, no frame copied.
+    ///
+    /// Returns the provisional token — the parent runs it downgraded with their original flags,
+    /// the runs it mapped into the child, and the TLB work the downgrade owes.
+    fn clone_address_space_cow(
+        &mut self,
+        parent_asid: Asid,
+        generation: u64,
+    ) -> Result<CowCloneToken, KernelError>;
+
+    /// Complete a write-protection's owed TLB work with NO domain lock held.
+    ///
+    /// `true` means every target acknowledged, or that there were none. `false` means a remote
+    /// CPU may still hold a writable translation for a page the child now shares, and the caller
+    /// must refuse rather than proceed.
+    fn complete_cow_shootdown(
+        &mut self,
+        plan: &crate::kernel::boot::cow_clone::CowShootdownPlan,
+    ) -> bool;
+
+    /// The clone's exact inverse: VM rank 5 → memory rank 6, ONE acquisition.
+    fn rollback_cow_clone(&mut self, token: &CowCloneToken) -> CowCloneRollback;
+
+    /// THE fork publication: the child's inherited context AND the `Reserved -> LiveSpawned`
+    /// commit, under ONE task-domain acquisition. Validates before it writes, so a refusal costs
+    /// no partial publication.
+    fn publish_forked_child(
+        &mut self,
+        reservation: &SpawnReservationToken,
+        publication: &super::fork_txn::ForkChildPublication,
+    ) -> Result<(), crate::kernel::spawn_reservation::ReservationRefusal>;
+
+    /// The sum of every live CNode space's reserved slot capacity — the global budget a
+    /// reservation refusal is measured against. Diagnostic only, and read under one acquisition.
+    fn reserved_cnode_slot_total(&self) -> usize;
+
+    /// Per-owner CNode capacity, as `(id, reserved slots, occupied slots)`. Diagnostic only,
+    /// bounded, and read under one acquisition.
+    fn cnode_capacity_breakdown(&self) -> alloc::vec::Vec<(u64, usize, usize)>;
+
+    /// Remove a child that WAS published, for the one failure arm after the commit.
+    ///
+    /// The reservation is spent by then, so its cancellation cannot be used; this is the ordinary
+    /// task-removal owner, reached with the exact TID the publication created.
+    fn remove_published_fork_child(&mut self, tid: u64) -> bool;
 }
 
 const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
@@ -1355,6 +1423,60 @@ impl SpawnTxnOwners for BroadSpawnOwners<'_> {
     fn copy_to_user(&mut self, asid: Asid, va: VirtAddr, bytes: &[u8]) -> Result<(), KernelError> {
         self.kernel.copy_to_user(asid, va, bytes)
     }
+
+    // ── U9-FORK1 §4: the fork operations, each one acquisition. ─────────────────────────
+
+    fn fork_parent_snapshot(&mut self, tid: u64) -> Option<super::fork_txn::ForkParentFacts> {
+        self.kernel.fork_parent_snapshot(tid)
+    }
+
+    fn snapshot_inheritable_caps(
+        &self,
+        tid: u64,
+    ) -> Result<super::fork_txn::InheritableCaps, KernelError> {
+        self.kernel.snapshot_inheritable_caps(tid)
+    }
+
+    fn clone_address_space_cow(
+        &mut self,
+        parent_asid: Asid,
+        generation: u64,
+    ) -> Result<CowCloneToken, KernelError> {
+        self.kernel
+            .clone_user_address_space_cow_token(parent_asid, generation)
+            .map_err(|failure| failure.err)
+    }
+
+    fn complete_cow_shootdown(
+        &mut self,
+        plan: &crate::kernel::boot::cow_clone::CowShootdownPlan,
+    ) -> bool {
+        self.kernel.complete_cow_write_protect_shootdown(plan)
+    }
+
+    fn rollback_cow_clone(&mut self, token: &CowCloneToken) -> CowCloneRollback {
+        self.kernel.rollback_cow_clone_token(token)
+    }
+
+    fn publish_forked_child(
+        &mut self,
+        reservation: &SpawnReservationToken,
+        publication: &super::fork_txn::ForkChildPublication,
+    ) -> Result<(), ReservationRefusal> {
+        self.kernel.publish_forked_child(reservation, publication)
+    }
+
+    fn reserved_cnode_slot_total(&self) -> usize {
+        self.kernel.reserved_cnode_slot_total()
+    }
+
+    fn cnode_capacity_breakdown(&self) -> alloc::vec::Vec<(u64, usize, usize)> {
+        self.kernel.cnode_capacity_breakdown()
+    }
+
+    fn remove_published_fork_child(&mut self, tid: u64) -> bool {
+        self.kernel.remove_published_fork_child(tid)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1852,5 +1974,61 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
     }
     fn copy_to_user(&mut self, asid: Asid, va: VirtAddr, bytes: &[u8]) -> Result<(), KernelError> {
         self.shared.copy_to_user_split(asid, va, bytes)
+    }
+
+    // ── U9-FORK1 §4: the fork operations, off the broad lock. ───────────────────────────
+
+    fn fork_parent_snapshot(&mut self, tid: u64) -> Option<super::fork_txn::ForkParentFacts> {
+        self.shared.fork_parent_snapshot_split(tid)
+    }
+
+    fn snapshot_inheritable_caps(
+        &self,
+        tid: u64,
+    ) -> Result<super::fork_txn::InheritableCaps, KernelError> {
+        self.shared.snapshot_inheritable_caps_split(tid)
+    }
+
+    fn clone_address_space_cow(
+        &mut self,
+        parent_asid: Asid,
+        generation: u64,
+    ) -> Result<CowCloneToken, KernelError> {
+        self.shared
+            .clone_address_space_cow_split(parent_asid, generation)
+    }
+
+    /// The split route holds NO domain lock here, so unlike the broad one it PERFORMS the
+    /// shootdown rather than deferring it, through the existing generation-matched coordinator.
+    fn complete_cow_shootdown(
+        &mut self,
+        plan: &crate::kernel::boot::cow_clone::CowShootdownPlan,
+    ) -> bool {
+        self.shared.complete_cow_write_protect_shootdown_split(plan)
+    }
+
+    fn rollback_cow_clone(&mut self, token: &CowCloneToken) -> CowCloneRollback {
+        self.shared.rollback_cow_clone_split(token)
+    }
+
+    fn publish_forked_child(
+        &mut self,
+        reservation: &SpawnReservationToken,
+        publication: &super::fork_txn::ForkChildPublication,
+    ) -> Result<(), ReservationRefusal> {
+        self.shared
+            .publish_forked_child_split(reservation, publication)
+    }
+
+    fn reserved_cnode_slot_total(&self) -> usize {
+        self.shared.reserved_cnode_slot_total_split()
+    }
+
+    fn cnode_capacity_breakdown(&self) -> alloc::vec::Vec<(u64, usize, usize)> {
+        self.shared.cnode_capacity_breakdown_split()
+    }
+
+    fn remove_published_fork_child(&mut self, tid: u64) -> bool {
+        self.shared.remove_published_fork_child_split(tid)
     }
 }
