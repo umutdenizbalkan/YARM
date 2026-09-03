@@ -207,6 +207,21 @@ impl KernelState {
         })
     }
 
+    /// rank 4 — bounded per-owner CNode capacity, for the capacity diagnostic.
+    pub(crate) fn cnode_capacity_breakdown(&self) -> alloc::vec::Vec<(u64, usize, usize)> {
+        let owners = self.with_capability_state(|capability| {
+            let mut out = alloc::vec::Vec::new();
+            for space in capability.cnode_spaces.iter().flatten().take(40) {
+                out.push((space.id, space.slot_capacity));
+            }
+            out
+        });
+        owners
+            .into_iter()
+            .map(|(id, reserved)| (id.0, reserved, self.cnode_occupied_slots(id).unwrap_or(0)))
+            .collect()
+    }
+
     pub(crate) fn remove_published_fork_child(&mut self, tid: u64) -> bool {
         let removed = self.with_task_enqueue_policy_mut(|tcbs, classes| {
             super::spawn_thread_core::unregister_thread_incarnation_locked(

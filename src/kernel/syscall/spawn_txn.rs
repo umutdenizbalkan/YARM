@@ -315,6 +315,10 @@ pub(crate) trait SpawnTxnOwners {
     /// reservation refusal is measured against. Diagnostic only, and read under one acquisition.
     fn reserved_cnode_slot_total(&self) -> usize;
 
+    /// Per-owner CNode capacity, as `(id, reserved slots, occupied slots)`. Diagnostic only,
+    /// bounded, and read under one acquisition.
+    fn cnode_capacity_breakdown(&self) -> alloc::vec::Vec<(u64, usize, usize)>;
+
     /// Remove a child that WAS published, for the one failure arm after the commit.
     ///
     /// The reservation is spent by then, so its cancellation cannot be used; this is the ordinary
@@ -1466,6 +1470,10 @@ impl SpawnTxnOwners for BroadSpawnOwners<'_> {
         self.kernel.reserved_cnode_slot_total()
     }
 
+    fn cnode_capacity_breakdown(&self) -> alloc::vec::Vec<(u64, usize, usize)> {
+        self.kernel.cnode_capacity_breakdown()
+    }
+
     fn remove_published_fork_child(&mut self, tid: u64) -> bool {
         self.kernel.remove_published_fork_child(tid)
     }
@@ -2014,6 +2022,10 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
 
     fn reserved_cnode_slot_total(&self) -> usize {
         self.shared.reserved_cnode_slot_total_split()
+    }
+
+    fn cnode_capacity_breakdown(&self) -> alloc::vec::Vec<(u64, usize, usize)> {
+        self.shared.cnode_capacity_breakdown_split()
     }
 
     fn remove_published_fork_child(&mut self, tid: u64) -> bool {

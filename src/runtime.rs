@@ -2643,23 +2643,60 @@ impl SharedKernel {
         parent_asid: crate::kernel::vm::Asid,
         generation: u64,
     ) -> Result<crate::kernel::boot::cow_clone::CowCloneToken, KernelError> {
-        self.with_vm_then_memory_split_mut(|vm, memory| {
-            crate::kernel::boot::cow_clone::clone_address_space_cow_locked(
-                vm,
-                memory,
-                parent_asid,
-                generation,
-            )
-        })
-        .map_err(|failure| {
-            crate::yarm_log!(
-                "FORK_SPLIT_COW_FAIL site={} va=0x{:x} reason={:?}",
-                failure.site,
-                failure.va,
+        // The `VM_COW_*` vocabulary is emitted HERE as well as from the broad acquisition, and
+        // for the same reason U9-SPAWN-TXN3 §6 had to make the RISC-V split marker
+        // per-invocation: once every fork routes through this path, a marker that only the broad
+        // path emits leaves the oracle blind — a working route looks identical to no route at
+        // all. Same lines, same fields, driven off the returned token with no lock held.
+        let vm_cow = crate::kernel::boot::vm_cow_enabled();
+        if vm_cow {
+            crate::yarm_log!("VM_COW_FORK_BEGIN parent_asid={}", parent_asid.0);
+        }
+        let token = self
+            .with_vm_then_memory_split_mut(|vm, memory| {
+                crate::kernel::boot::cow_clone::clone_address_space_cow_locked(
+                    vm,
+                    memory,
+                    parent_asid,
+                    generation,
+                )
+            })
+            .map_err(|failure| {
+                crate::yarm_log!(
+                    "FORK_SPLIT_COW_FAIL site={} va=0x{:x} reason={:?}",
+                    failure.site,
+                    failure.va,
+                    failure.err
+                );
                 failure.err
+            })?;
+        if vm_cow {
+            for run in &token.child_runs {
+                crate::yarm_log!(
+                    "VM_COW_FORK_CHILD_MAP va=0x{:x} pages={}",
+                    run.virt.0,
+                    run.pages
+                );
+            }
+            for run in &token.wp {
+                crate::yarm_log!(
+                    "VM_COW_FORK_PARENT_WRITE_PROTECT va=0x{:x} pages={}",
+                    run.virt.0,
+                    run.pages
+                );
+                crate::yarm_log!(
+                    "VM_COW_FORK_REFCOUNT_OK va=0x{:x} pages={}",
+                    run.virt.0,
+                    run.pages
+                );
+            }
+            crate::yarm_log!(
+                "VM_COW_FORK_DONE parent_asid={} child_asid={}",
+                token.parent_asid.0,
+                token.child_asid.0
             );
-            failure.err
-        })
+        }
+        Ok(token)
     }
 
     /// NO lock — PERFORM the write-protection's owed TLB work.
@@ -2711,9 +2748,26 @@ impl SharedKernel {
         &self,
         token: &crate::kernel::boot::cow_clone::CowCloneToken,
     ) -> crate::kernel::boot::cow_clone::CowCloneRollback {
+        let vm_cow = crate::kernel::boot::vm_cow_enabled();
+        if vm_cow {
+            crate::yarm_log!(
+                "VM_COW_FORK_ROLLBACK_BEGIN parent_asid={} child_asid={} wp_runs={}",
+                token.parent_asid.0,
+                token.child_asid.0,
+                token.wp.len()
+            );
+        }
         let outcome = self.with_vm_then_memory_split_mut(|vm, memory| {
             crate::kernel::boot::cow_clone::rollback_cow_clone_locked(vm, memory, token)
         });
+        if vm_cow {
+            crate::yarm_log!(
+                "VM_COW_FORK_ROLLBACK_OK parent_asid={} child_asid={} outcome={:?}",
+                token.parent_asid.0,
+                token.child_asid.0,
+                outcome
+            );
+        }
         crate::yarm_log!(
             "FORK_SPLIT_COW_ROLLBACK parent_asid={} child_asid={} outcome={:?}",
             token.parent_asid.0,
@@ -2771,6 +2825,22 @@ impl SharedKernel {
                 .flatten()
                 .map(|space| space.slot_capacity)
                 .sum::<usize>()
+        })
+    }
+
+    /// rank 4 — bounded per-owner CNode capacity, for the capacity diagnostic. One acquisition:
+    /// the reservation and the occupancy are read together, so the pair cannot describe two
+    /// different moments.
+    pub(crate) fn cnode_capacity_breakdown_split(&self) -> alloc::vec::Vec<(u64, usize, usize)> {
+        self.with_capability_state_split_mut(|capability| {
+            let mut out = alloc::vec::Vec::new();
+            for space in capability.cnode_spaces.iter().flatten().take(40) {
+                let occupied = crate::kernel::boot::kernel_ref(&space.cspace)
+                    .live_cap_ids()
+                    .count();
+                out.push((space.id.0, space.slot_capacity, occupied));
+            }
+            out
         })
     }
 

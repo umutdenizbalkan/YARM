@@ -184,6 +184,7 @@ pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(
                     owners.reserved_cnode_slot_total(),
                     limits.max_total_cnode_slots
                 );
+                report_capacity_breakdown(owners, parent.class, proof);
                 crate::yarm_log!("FORK_PROOF_ALLOC_CHILD_FAIL reason={:?} step=reserve", err);
             }
             return Err(err);
@@ -221,6 +222,10 @@ pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(
         Err(err) => {
             if proof {
                 crate::yarm_log!("FORK_PROOF_COW_FAIL reason={:?}", err);
+                // A clone failure is a capacity failure far more often than not — the child's
+                // page tables come from the same PT-frame pool the slab heap draws from — so the
+                // same breakdown that explains a refused reservation explains a refused clone.
+                report_capacity_breakdown(owners, parent.class, proof);
             }
             unwind(
                 owners,
@@ -394,6 +399,49 @@ pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(
         clone.wp.len()
     );
     Ok(child_tid)
+}
+
+/// The PT-pool and per-owner CNode breakdown behind a capacity-shaped fork failure.
+///
+/// It lives here rather than in `handle_fork` because `handle_fork` is the BROAD entry, and once
+/// NR 12 routes through the split dispatcher no production fork reaches it — a diagnostic left
+/// there would be source-present and permanently unreachable. `reserved_cnode_slots` well under
+/// `max_total_cnode_slots` means the failure is the slab heap behind the PT pool, not the slot
+/// budget; `pt_pool_free_frames` near zero confirms it.
+fn report_capacity_breakdown<O: SpawnTxnOwners>(owners: &mut O, class: TaskClass, proof: bool) {
+    // Gated HERE as well as at every call site. The gate is what makes "no FORK_PROOF_ line ever
+    // reaches a normal boot" checkable lexically, and a helper that relied on its callers being
+    // gated would be the one hole in that.
+    if proof {
+        let limits = owners.capacity_limits();
+        let child_requested = match class {
+            TaskClass::Driver => limits.driver_cnode_slot_capacity,
+            _ => limits.default_cnode_slot_capacity,
+        };
+        let breakdown = owners.cnode_capacity_breakdown();
+        crate::yarm_log!(
+            "FORK_PROOF_ALLOC_CHILD_POOL child_class={:?} child_requested_slots={} pt_pool_free_frames={} live_cnodes={}",
+            class,
+            child_requested,
+            crate::kernel::frame_allocator::pt_pool_free_frames(),
+            breakdown.len()
+        );
+        crate::yarm_log!(
+            "FORK_PROOF_ALLOC_CHILD_CAPACITY step=capacity live_tasks={} max_tasks={} reserved_cnode_slots={} max_total_cnode_slots={}",
+            owners.live_task_count(),
+            limits.max_tasks,
+            owners.reserved_cnode_slot_total(),
+            limits.max_total_cnode_slots
+        );
+        for (id, reserved, occupied) in breakdown {
+            crate::yarm_log!(
+                "FORK_PROOF_ALLOC_CHILD_CNODE_OWNER id={} reserved={} occupied={}",
+                id,
+                reserved,
+                occupied
+            );
+        }
+    }
 }
 
 /// The reverse compensation for a failure BEFORE the publication.

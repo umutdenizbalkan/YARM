@@ -59319,20 +59319,30 @@ mod stage181c_fork_internal {
     // headroom, the requested child capacity, and a per-owner cnode breakdown.
     #[test]
     fn stage181c_fork_failure_reports_pool_and_owner_breakdown() {
-        // U9-FORK1 §4: the breakdown moved to `handle_fork`'s error arm — the one place on the
-        // fork's error path that still holds `&mut KernelState`, since the transaction runs over
-        // an owner interface that cannot reach the frame allocator. Same fields, same sub-knob.
-        const FORK_HANDLER_SRC: &str = include_str!("../syscall/process.rs");
+        // U9-FORK1 §4: the breakdown lives in the TRANSACTION, not in `handle_fork`. Once NR 12
+        // routes through the split dispatcher no production fork reaches the broad handler, so a
+        // diagnostic left there would be source-present and permanently unreachable — the
+        // vacuous-oracle shape this programme keeps finding. Asserting it here is what keeps it
+        // on the path that actually runs.
+        const FORK_TXN_181C: &str = include_str!("../syscall/fork_txn.rs");
         assert!(
-            FORK_HANDLER_SRC.contains("FORK_PROOF_ALLOC_CHILD_POOL")
-                && FORK_HANDLER_SRC.contains("pt_pool_free_frames")
-                && FORK_HANDLER_SRC.contains("child_requested_slots="),
+            FORK_TXN_181C.contains("FORK_PROOF_ALLOC_CHILD_POOL")
+                && FORK_TXN_181C.contains("pt_pool_free_frames")
+                && FORK_TXN_181C.contains("child_requested_slots="),
             "fork failure must report PT-pool headroom + child requested slots"
         );
         assert!(
-            FORK_HANDLER_SRC.contains("FORK_PROOF_ALLOC_CHILD_CNODE_OWNER")
-                && FORK_HANDLER_SRC.contains("cnode_occupied_slots"),
+            FORK_TXN_181C.contains("FORK_PROOF_ALLOC_CHILD_CNODE_OWNER")
+                && FORK_TXN_181C.contains("cnode_capacity_breakdown()"),
             "fork failure must emit a per-owner cnode breakdown (id/reserved/occupied)"
+        );
+        // And it must be reachable from BOTH capacity-shaped failure arms, not just one.
+        assert_eq!(
+            FORK_TXN_181C
+                .matches("report_capacity_breakdown(owners, parent.class, proof);")
+                .count(),
+            2,
+            "the breakdown must be reported for a refused reservation AND a refused clone"
         );
     }
 
