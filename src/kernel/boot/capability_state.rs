@@ -46,6 +46,23 @@ impl KernelState {
         Ok(delegated_cap)
     }
 
+    /// Delegate a capability from one task to another, attenuated to `rights`.
+    ///
+    /// U9-SPAWN-IC1 split this into the three pieces its ranks always wanted:
+    ///
+    /// 1. **a rank-2 identity snapshot** — both TIDs' CNodes, resolved here, before capability
+    ///    rank 4 is acquired. The old body read `task_cnode(dest_tid)` in the middle of its
+    ///    capability work;
+    /// 2. **a rank-3 liveness check** — `resolve_capability_for_task` reaches
+    ///    `capability_object_live`, which reads IPC generations. It stays here, ahead of rank 4, so
+    ///    the order is 2 → 3 → 4 and never 4 → 3;
+    /// 3. **one capability-only rank-4 body**, [`spawn_ipc_cap_txn::delegate_capability_locked`],
+    ///    which re-validates both cspaces and the source object under the lock and mints exactly
+    ///    the rights intersection.
+    ///
+    /// The MemoryObject capability refcount the old body incremented inside
+    /// `mint_capability_in_cnode` is now applied HERE, after rank 4 releases, because it is memory
+    /// rank 6. The token says whether it is owed, so the two cannot drift.
     pub fn grant_capability_task_to_task_with_rights(
         &mut self,
         source_tid: u64,
@@ -53,49 +70,85 @@ impl KernelState {
         dest_tid: u64,
         rights: CapRights,
     ) -> Result<CapId, KernelError> {
+        let grant = self.delegate_capability(source_tid, source_cap, dest_tid, rights)?;
+        Ok(grant.dest_cap)
+    }
+
+    /// The broad acquisition wrapper for the delegation body, returning the exact rollback token.
+    ///
+    /// Callers that only need the resulting `CapId` use
+    /// [`Self::grant_capability_task_to_task_with_rights`]; callers that may have to undo the
+    /// delegation take the token.
+    pub(crate) fn delegate_capability(
+        &mut self,
+        source_tid: u64,
+        source_cap: CapId,
+        dest_tid: u64,
+        rights: CapRights,
+    ) -> Result<super::spawn_ipc_cap_txn::DelegationGrant, KernelError> {
+        // ── 2 → 3: identities, then the liveness of the object being delegated. ─────────
         let capability = self.resolve_capability_for_task(source_tid, source_cap)?;
-        let attenuated = capability
-            .derive(rights)
-            .map_err(|_| KernelError::MissingRight)?;
+        let source_cnode = self
+            .task_cnode(source_tid)
+            .ok_or(KernelError::TaskMissing)?;
         let dest_cnode = self.task_cnode(dest_tid).ok_or(KernelError::TaskMissing)?;
-        let delegated_cap = self.mint_capability_in_cnode(dest_cnode, attenuated)?;
-        if source_tid != dest_tid {
-            if let Err(link_err) = self.record_delegated_capability_link(
-                source_tid,
+        let identity = super::spawn_ipc_cap_txn::DelegationIdentity {
+            source_tid,
+            source_cnode,
+            dest_tid,
+            dest_cnode,
+        };
+        // ── 4: the capability-only body. Its growth limits come from the capacity config,
+        //        read and normalized here so the body reads no config domain of its own.
+        let limits = self.runtime_capacity_config();
+        let cnode_limits = super::spawn_ipc_cap_txn::CnodeGrowthLimits {
+            slot_capacity: Self::normalize_requested_cnode_slots(
+                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                limits,
+            )?,
+            max_total_cnode_slots: limits.max_total_cnode_slots,
+        };
+        let grant = self.with_capability_state_mut(|capability_state| {
+            super::spawn_ipc_cap_txn::delegate_capability_locked(
+                capability_state,
+                &identity,
                 source_cap,
-                dest_tid,
-                delegated_cap,
-            ) {
-                // Delegation link table is full: roll back the already-minted cap to
-                // prevent a permanent slot leak in the destination cnode.
-                //
-                // fast_revoke_reply_cap_in_cnode clears the cnode slot but does NOT
-                // adjust cap_refcount (it is intentionally named for Reply caps which
-                // carry no MemoryObject refcount).  For MemoryObject / DmaRegion caps,
-                // mint_capability_in_cnode already incremented cap_refcount, so we must
-                // decrement it here to keep the refcount symmetric.
-                let revoked = self.fast_revoke_reply_cap_in_cnode(
-                    dest_cnode,
-                    delegated_cap,
-                    attenuated.object,
-                );
-                if revoked {
-                    self.adjust_memory_object_cap_refcount(attenuated.object, -1);
-                    self.reclaim_memory_object_if_unreferenced(attenuated.object);
-                }
-                crate::yarm_log!(
-                    "GRANT_CAP_LINK_FAIL_ROLLBACK src_tid={} src_cap={} dest_tid={} dest_cap={} err={:?} revoked={}",
-                    source_tid,
-                    source_cap.0,
-                    dest_tid,
-                    delegated_cap.0,
-                    link_err,
-                    revoked
-                );
-                return Err(link_err);
-            }
+                rights,
+                capability.object,
+                cnode_limits,
+            )
+        })?;
+        // ── 6: the memory-object refcount, once rank 4 is released. ────────────────────
+        if grant.owes_memory_refcount {
+            self.adjust_memory_object_cap_refcount(grant.object, 1);
         }
-        Ok(delegated_cap)
+        Ok(grant)
+    }
+
+    /// Undo one delegation, in the exact reverse of [`Self::delegate_capability`].
+    ///
+    /// Rank 4 removes the delegation link and the capability — refusing if the destination slot no
+    /// longer holds the exact object the token names, so a stale token can never revoke a recycled
+    /// capability belonging to someone else. Only if that removal actually happened does the
+    /// memory refcount come back down, which is what keeps the two symmetric.
+    pub(crate) fn release_delegation(
+        &mut self,
+        grant: &super::spawn_ipc_cap_txn::DelegationGrant,
+    ) -> bool {
+        let released = self.with_capability_state_mut(|capability_state| {
+            super::spawn_ipc_cap_txn::release_delegation_grant_locked(capability_state, grant)
+        });
+        if released && grant.owes_memory_refcount {
+            self.adjust_memory_object_cap_refcount(grant.object, -1);
+            self.reclaim_memory_object_if_unreferenced(grant.object);
+        }
+        crate::yarm_log!(
+            "SPAWN_DELEGATE_RELEASED dest_cnode={} dest_cap={} released={}",
+            grant.identity.dest_cnode.0,
+            grant.dest_cap.0,
+            u8::from(released)
+        );
+        released
     }
 
     pub fn capability_for_cnode(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {

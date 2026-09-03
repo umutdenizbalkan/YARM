@@ -146652,7 +146652,26 @@ mod stage199gc2_synchronous_is_production_unreachable {
                 include_str!("restart_state.rs")
             ),
             ("runtime.rs", include_str!("../../runtime.rs")),
+            // U9-SPAWN-IC1 moved the sole constructor call here, so the corpus follows it.
+            (
+                "kernel/boot/spawn_ipc_cap_txn.rs",
+                include_str!("spawn_ipc_cap_txn.rs")
+            ),
         ]
+    }
+
+    /// Source with comment lines removed, so a guard reads CODE and never matches the prose that
+    /// explains the rule it is checking.
+    fn code(src: &str) -> alloc::string::String {
+        let mut out = alloc::string::String::with_capacity(src.len());
+        for line in src.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
     }
 
     /// (1) The mode field is private and has no setter: an endpoint's mode is fixed at
@@ -146693,15 +146712,36 @@ mod stage199gc2_synchronous_is_production_unreachable {
     fn the_only_mode_choosing_constructor_has_one_caller() {
         let callers: usize = production_sources()
             .iter()
-            .map(|(_, src)| src.matches("Endpoint::new_with_mode(").count())
+            .map(|(_, src)| code(src).matches("Endpoint::new_with_mode(").count())
             .sum();
         assert_eq!(
             callers, 1,
             "exactly one production caller of the mode-choosing constructor"
         );
+        // U9-SPAWN-IC1 moved the construction into the rank-local endpoint transaction, so the
+        // chain from caller to constructor is now two links. Both are asserted, so the mode is
+        // still traceably the caller's and never a literal chosen en route.
+        const IC1_TXN: &str = include_str!("spawn_ipc_cap_txn.rs");
         assert!(
-            IPC_STATE.contains("Endpoint::new_with_mode(max_depth, mode)"),
-            "and it is `create_endpoint_with_mode`, which forwards its caller's mode"
+            IC1_TXN.contains("Endpoint::new_with_mode(request.max_depth, request.mode)"),
+            "the sole constructor call forwards the request's mode"
+        );
+        // ...and `create_endpoint_with_mode` puts its own caller's `mode` PARAMETER into that
+        // request. Asserted by absence rather than by a literal layout, so reformatting cannot
+        // silently defeat it: the body names no `EndpointMode::` variant at all, so the only mode
+        // it can be forwarding is the one it was given.
+        let ctor = code(IPC_STATE)
+            .split("pub fn create_endpoint_with_mode(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next().map(alloc::string::String::from))
+            .expect("the endpoint constructor");
+        assert!(
+            ctor.contains("mode,"),
+            "`create_endpoint_with_mode` must forward its `mode` parameter into the request"
+        );
+        assert!(
+            !ctor.contains("EndpointMode::"),
+            "`create_endpoint_with_mode` must not name a mode variant: it forwards, never chooses"
         );
     }
 
@@ -146711,6 +146751,7 @@ mod stage199gc2_synchronous_is_production_unreachable {
     #[test]
     fn no_production_source_constructs_a_synchronous_endpoint() {
         for (name, src) in production_sources() {
+            let src = code(src);
             assert!(
                 !src.contains("create_endpoint_with_mode(") || name == "kernel/boot/ipc_state.rs",
                 "{name}: only the endpoint owner may call the mode-choosing constructor"
@@ -146718,6 +146759,7 @@ mod stage199gc2_synchronous_is_production_unreachable {
             for forbidden in [
                 "create_endpoint_with_mode(max_depth, EndpointMode::Synchronous)",
                 "new_with_mode(max_depth, EndpointMode::Synchronous)",
+                "mode: EndpointMode::Synchronous",
             ] {
                 assert!(
                     !src.contains(forbidden),
@@ -152104,6 +152146,26 @@ mod u9spawn1_sp3_spawn_ledger {
         })
     }
 
+    /// The service-endpoint request the spawn transaction builds, so a test drives the exact
+    /// production shape rather than an approximation of it.
+    pub(super) fn endpoint_request(
+        state: &crate::kernel::boot::KernelState,
+        owner_cnode: crate::kernel::capabilities::CNodeId,
+    ) -> crate::kernel::boot::spawn_ipc_cap_txn::ServiceEndpointRequest {
+        let limits = state.runtime_capacity_config();
+        crate::kernel::boot::spawn_ipc_cap_txn::ServiceEndpointRequest {
+            owner_cnode,
+            max_depth: 8,
+            mode: crate::kernel::ipc::EndpointMode::Buffered,
+            max_endpoints: limits.max_endpoints,
+            cnode_limits: crate::kernel::boot::spawn_ipc_cap_txn::CnodeGrowthLimits {
+                slot_capacity: crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE
+                    .min(limits.max_capability_slots),
+                max_total_cnode_slots: limits.max_total_cnode_slots,
+            },
+        }
+    }
+
     /// A kernel with a live spawner, so the endpoint and capability phases mint into a real
     /// cspace instead of being skipped.
     fn fixture() -> SharedKernel {
@@ -152245,12 +152307,14 @@ mod u9spawn1_sp3_spawn_ledger {
                 cnode,
                 cap: aspace_cap,
             });
-            let (idx, send, recv) = s.create_endpoint(8).expect("an endpoint");
-            ledger.record(ProvisionalSpawnResource::Endpoint(idx));
-            ledger.record(ProvisionalSpawnResource::Capability { cnode, cap: send });
-            ledger.record(ProvisionalSpawnResource::Capability { cnode, cap: recv });
+            // U9-SPAWN-IC1: the endpoint and its two capabilities are ONE grant now, so they are
+            // one ledger entry rather than three.
+            let grant = s
+                .provision_service_endpoint(&endpoint_request(s, cnode))
+                .expect("an endpoint grant");
+            ledger.record(ProvisionalSpawnResource::Endpoint(grant));
         });
-        assert_eq!(ledger.len(), 6, "one entry per acquisition");
+        assert_eq!(ledger.len(), 4, "one entry per acquisition");
         assert_ne!(baseline(&k), before, "the acquisitions must be observable");
         k.with(|s| s.unwind_spawn_ledger(ledger));
         assert_eq!(
@@ -152267,28 +152331,28 @@ mod u9spawn1_sp3_spawn_ledger {
     fn unwinding_already_released_resources_is_inert() {
         let k = fixture();
         let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
-        let (token, asid, idx, send) = k.with(|s| {
+        let (token, asid, grant) = k.with(|s| {
             let token = s
                 .reserve_task_for_spawn_with_class(90_002, TaskClass::App)
                 .expect("a reservation");
             let (asid, _cap) = s.create_user_address_space().expect("an address space");
-            let (idx, send, _recv) = s.create_endpoint(8).expect("an endpoint");
-            (token, asid, idx, send)
+            let grant = s
+                .provision_service_endpoint(&endpoint_request(s, cnode))
+                .expect("an endpoint grant");
+            (token, asid, grant)
         });
         // Release every one of them through its owner FIRST.
         k.with(|s| {
             s.cancel_spawn_reservation(token).expect("cancel");
             s.destroy_user_address_space_by_asid(asid).expect("destroy");
-            s.destroy_endpoint(idx).expect("destroy");
-            let _ = s.revoke_capability_in_cnode(cnode, send);
+            s.release_service_endpoint_grant(&grant);
         });
         let before = baseline(&k);
         // Now unwind a ledger that still names them.
         let mut ledger = SpawnLedger::new();
         ledger.record(ProvisionalSpawnResource::Reservation(token));
         ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
-        ledger.record(ProvisionalSpawnResource::Endpoint(idx));
-        ledger.record(ProvisionalSpawnResource::Capability { cnode, cap: send });
+        ledger.record(ProvisionalSpawnResource::Endpoint(grant));
         k.with(|s| s.unwind_spawn_ledger(ledger));
         assert_eq!(
             baseline(&k),
@@ -152301,9 +152365,10 @@ mod u9spawn1_sp3_spawn_ledger {
     /// where it can be checked rather than left as a magic number.
     #[test]
     fn the_ledger_capacity_covers_every_production_spawn_shape() {
-        // 1 reservation + 1 address space + 1 address-space capability + 2 endpoints
-        // + 2 × (send, recv) endpoint capabilities.
-        assert_eq!(MAX_PROVISIONAL_SPAWN_RESOURCES, 1 + 1 + 1 + 2 + 2 * 2);
+        // U9-SPAWN-IC1: 1 reservation + 1 address space + 1 address-space capability
+        // + 2 endpoint GRANTS (each carrying its endpoint and both its capabilities)
+        // + 1 parent delegation.
+        assert_eq!(MAX_PROVISIONAL_SPAWN_RESOURCES, 1 + 1 + 1 + 2 + 1);
         let mut ledger = SpawnLedger::new();
         for n in 0..MAX_PROVISIONAL_SPAWN_RESOURCES {
             ledger.record(ProvisionalSpawnResource::Capability {
