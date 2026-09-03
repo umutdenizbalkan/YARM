@@ -792,6 +792,16 @@ pub fn handle_riscv_trap_entry_shared(
             // nor switches, so it finalizes through the same same-task ecall writeback DebugLog
             // uses (sepc+4 once, sstatus preserved, a0 from `set_ok`).
             || nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
+            // U9-SPAWN-TXN3 §4: SpawnProcess (NR 23) and SpawnFromMemoryObject (NR 29), the last
+            // two live production classes with a terminal broad edge. Same reason as the classes
+            // above — the routes are architecture-neutral but reachable here only for a listed
+            // NR. Neither blocks nor switches: each runs the one generic spawn transaction and
+            // returns the child TID plus the packed capability word in the caller's own frame,
+            // so both finalize through the same same-task ecall writeback DebugLog uses
+            // (sepc+4 once, sstatus preserved, a0/a1 from `set_ok`). The child is enqueued,
+            // never dispatched, so the caller is still current when this trap returns.
+            || nr == crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR
+            || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -801,6 +811,21 @@ pub fn handle_riscv_trap_entry_shared(
             !RISCV_DEBUGLOG_SPLIT_MARKERS_LOGGED.swap(true, Ordering::Relaxed)
         } else if nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR {
             !RISCV_FUTEXWAKE_SPLIT_MARKERS_LOGGED.swap(true, Ordering::Relaxed)
+        } else if nr == crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR
+            || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
+        {
+            // U9-SPAWN-TXN3 §4/§6: NOT latched, deliberately.
+            //
+            // Both spawn classes finalize through `Complete`, and on this architecture that
+            // disposition's marker was emitted only under the two one-shot latches above — so a
+            // spawn route that ran perfectly left NO evidence, and the terminal-edge count could
+            // not be measured here at all. (That is what made an earlier reading of this pass
+            // look like a routing failure on RISC-V when the routes were in fact working: the
+            // oracle was blind, not the path.)
+            //
+            // Per-invocation is what §6 needs — it asserts `split=3` for NR 23 and `split=5` for
+            // NR 29 — and the volume is exactly those eight lines per boot.
+            true
         } else {
             false
         };

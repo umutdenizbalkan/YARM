@@ -2661,6 +2661,20 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // entry) are the first three the ABI import already carries, and its route neither
         // blocks nor switches — it returns the child TID in the same frame.
         || raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
+        // U9-SPAWN-TXN3 §4 — SpawnProcess (NR 23) and SpawnFromMemoryObject (NR 29), the last
+        // two live production classes with a terminal broad edge. Without the import `nr` stays
+        // 0, the split dispatcher declines, and both keep that edge on this architecture no
+        // matter what their routes admit.
+        //
+        // What the classes need from AArch64 they already have. Neither route blocks, switches
+        // nor defers: each runs the one generic spawn transaction and returns the child TID and
+        // the packed capability word in the same frame, exactly as NR 11 does — the child is
+        // enqueued, never dispatched, so the caller is still current when the trap returns. NR
+        // 23's four arguments (image id, parent pid, startup-args pointer and count) and NR 29's
+        // five (image id, MemoryObject cap, parent pid, pointer, count) are within the argument
+        // set the ABI import already carries.
+        || raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR
+        || raw_nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

@@ -768,8 +768,39 @@ if (( riscv_split_nr5_uncaptured != 0 )); then
   echo "[fail] RISC-V IpcRecvTimeout committed without capturing the outgoing context (n=${riscv_split_nr5_uncaptured})"
   failures=$((failures + 1))
 fi
-if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 + riscv_split_nr1 )); then
-  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog/FutexWake/FutexWait/IpcRecvTimeout/IpcSend syscall (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5} nr1=${riscv_split_nr1})"
+# U9-SPAWN-TXN3 §4/§6 — SpawnProcess (NR 23) and SpawnFromMemoryObject (NR 29) are retired off
+# the terminal broad dispatcher by this pass, so they join the allow-list. Both are pinned to the
+# NON-SWITCHING `result=ok` disposition below: each runs the one generic spawn transaction and
+# returns the child TID in the caller's own frame, so a committed queue advance or a post-work
+# deferral from either would mean the class had silently become something else.
+riscv_split_nr23=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=23 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr29=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr23=${riscv_split_nr23:-0}
+riscv_split_nr29=${riscv_split_nr29:-0}
+riscv_split_nr23_ok=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=23 .*result=ok" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr29_ok=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 .*result=ok" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr23_ok=${riscv_split_nr23_ok:-0}
+riscv_split_nr29_ok=${riscv_split_nr29_ok:-0}
+if (( riscv_split_nr23 != riscv_split_nr23_ok )); then
+  echo "[fail] RISC-V SpawnProcess split serviced a switching disposition (nr23=${riscv_split_nr23} ok=${riscv_split_nr23_ok})"
+  failures=$((failures + 1))
+fi
+if (( riscv_split_nr29 != riscv_split_nr29_ok )); then
+  echo "[fail] RISC-V SpawnFromMemoryObject split serviced a switching disposition (nr29=${riscv_split_nr29} ok=${riscv_split_nr29_ok})"
+  failures=$((failures + 1))
+fi
+# And the counts are the boot's own spawn census: three NR 23 and five NR 29, matching
+# KSPAWN_ENTER and SPAWN_FROM_MO_OK. A route that silently stopped firing would show here.
+if (( riscv_split_nr23 != 3 )); then
+  echo "[fail] RISC-V SpawnProcess split count is ${riscv_split_nr23}, expected 3"
+  failures=$((failures + 1))
+fi
+if (( riscv_split_nr29 != 5 )); then
+  echo "[fail] RISC-V SpawnFromMemoryObject split count is ${riscv_split_nr29}, expected 5"
+  failures=$((failures + 1))
+fi
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 )); then
+  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29})"
   failures=$((failures + 1))
 fi
 
