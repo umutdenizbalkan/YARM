@@ -74633,10 +74633,32 @@ mod stage196a_riscv_shared_trap_foundation {
         // class — with the same committed-only companion check, plus one more that pins the
         // defect that stage fixed: a committed NR 5 line whose outgoing user context was never
         // captured left the parked receiver with a stale saved pc and faulted on resume.
+        //
+        // U9-SPAWN-IC1 §5 widened it once more, to IpcSend (NR 1). That is an ORACLE correction,
+        // not a retirement: Stage 199G-C4 §2 already gave RISC-V the POST-WORK committed
+        // disposition for the U6 blocking-send lifecycle, and one `IpcSend` per boot has been
+        // settling through it ever since — the allow-list simply was never updated, so the smoke's
+        // total has been exactly one over the sum of the other four. The companion check below
+        // pins NR 1 to that exact disposition, so admitting it did not admit an early-returning
+        // send.
         assert!(
             RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15")
-                && RISCV_SMOKE.contains("non-DebugLog/FutexWake/FutexWait/IpcRecvTimeout syscall"),
-            "smoke must assert DebugLog+FutexWake+FutexWait+IpcRecvTimeout-only split dispatch"
+                && RISCV_SMOKE
+                    .contains("non-DebugLog/FutexWake/FutexWait/IpcRecvTimeout/IpcSend syscall"),
+            "smoke must assert DebugLog+FutexWake+FutexWait+IpcRecvTimeout+IpcSend-only split \
+             dispatch"
+        );
+        assert!(
+            RISCV_SMOKE.contains("RISC-V IpcSend split serviced a non-post-work disposition"),
+            "smoke must pin every NR 1 split line to the post-work committed disposition"
+        );
+        // And the kernel really does produce that disposition for NR 1, from the trap wrapper —
+        // so the widened expectation describes existing behavior rather than licensing new
+        // behavior.
+        assert!(
+            RISCV_TRAP_SRC.contains("SplitDispatchDisposition::PostWorkCommitted")
+                && RISCV_TRAP_SRC.contains("result=post_work_committed"),
+            "the RISC-V wrapper must own the post-work committed disposition the oracle admits"
         );
         assert!(
             RISCV_SMOKE.contains("RISC-V FutexWait split did not commit a queue advance"),
@@ -146733,7 +146755,11 @@ mod stage199gc2_synchronous_is_production_unreachable {
         let ctor = code(IPC_STATE)
             .split("pub fn create_endpoint_with_mode(")
             .nth(1)
-            .and_then(|rest| rest.split("\n    }\n").next().map(alloc::string::String::from))
+            .and_then(|rest| {
+                rest.split("\n    }\n")
+                    .next()
+                    .map(alloc::string::String::from)
+            })
             .expect("the endpoint constructor");
         assert!(
             ctor.contains("mode,"),
@@ -154720,5 +154746,767 @@ mod u9spawnvm2_provision_failure_injection {
             });
             assert_eq!(baseline(&k), before, "cycle {cycle} drifted");
         }
+    }
+}
+
+/// U9-SPAWN-IC1 — the rank-local endpoint/capability bodies, and the exactness of their rollback.
+///
+/// Structural guards first (what the code CANNOT do), then failure injection at every endpoint,
+/// capability, delegation and cleanup boundary (what it actually restores).
+#[cfg(test)]
+mod u9spawnic1_endpoint_cap_txn {
+    use super::*;
+    use crate::kernel::boot::spawn_ipc_cap_txn::{
+        CnodeGrowthLimits, DelegationIdentity, EndpointRemoval, ServiceEndpointRequest,
+    };
+    use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
+    use crate::kernel::ipc::EndpointMode;
+    use crate::kernel::task::TaskClass;
+    use crate::runtime::SharedKernel;
+
+    const TXN: &str = include_str!("spawn_ipc_cap_txn.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const CAP_STATE: &str = include_str!("capability_state.rs");
+    const ORCHESTRATOR: &str = include_str!("orchestrator_state.rs");
+    const SPAWN_TXN: &str = include_str!("../syscall/spawn_image_txn.rs");
+
+    /// Comment-stripped source, so a guard reads CODE and never the prose explaining its rule.
+    fn code(src: &str) -> alloc::string::String {
+        let mut out = alloc::string::String::with_capacity(src.len());
+        for line in src.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    fn body(src: &str, sig: &str) -> alloc::string::String {
+        let after = src.split(sig).nth(1).expect("function present");
+        code(after.split("\n}\n").next().expect("function closes"))
+    }
+
+    // ── §2 / §3 structural guards ───────────────────────────────────────────────────────
+
+    /// The rank-local layer holds no lock and can reach no other domain. It was handed two
+    /// subsystems and nothing else, so this is checkable from its signatures.
+    #[test]
+    fn the_rank_local_layer_reaches_no_other_domain() {
+        let src = code(TXN);
+        for lock in [
+            "with_ipc_state",
+            "with_capability_state",
+            "with_tcbs",
+            "with_scheduler",
+            "with_user_spaces",
+            "with_memory_state",
+            "with_ipc_then_capability_mut",
+            "_state_lock",
+        ] {
+            assert!(
+                !src.contains(lock),
+                "the rank-local layer must not acquire {lock} — it is handed its subsystems"
+            );
+        }
+        for reach in [
+            "current_cpu",
+            "current_tid",
+            "current_task_cnode",
+            "task_cnode",
+            "task_asid",
+            "runtime_capacity_config",
+            "adjust_memory_object_cap_refcount",
+            "destroy_endpoint",
+            "wake_",
+            "enqueue",
+            "submit_cross_cpu_work",
+        ] {
+            assert!(
+                !src.contains(reach),
+                "the rank-local layer must not reach {reach}"
+            );
+        }
+        // The only `KernelState::` use is the pre-existing rank-4 CNode-growth body.
+        for call in src.match_indices("KernelState::") {
+            let tail = &src[call.0 + "KernelState::".len()..];
+            let name: alloc::string::String = tail
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert_eq!(
+                name, "ensure_cnode_space_locked",
+                "KernelState::{name} is not a rank-local associated function"
+            );
+        }
+    }
+
+    /// §3: the capability-only body touches no IPC state either — which is why the object's
+    /// liveness is an INPUT, established by the caller at rank 3 before rank 4 was acquired.
+    #[test]
+    fn the_delegation_body_is_capability_only_and_takes_liveness_as_input() {
+        let delegate = body(TXN, "pub(crate) fn delegate_capability_locked(");
+        for forbidden in ["endpoint", "ipc", "IpcSubsystem", "generation"] {
+            assert!(
+                !delegate.contains(forbidden),
+                "the delegation body must not reach IPC state: found `{forbidden}`"
+            );
+        }
+        assert!(
+            delegate.contains("expected_object"),
+            "the object it validates against must be an input, not something it re-derives"
+        );
+        // And the broad wrapper really does establish liveness (rank 3) before rank 4.
+        let wrapper = body(CAP_STATE, "pub(crate) fn delegate_capability(");
+        let live = wrapper
+            .find("resolve_capability_for_task(")
+            .expect("the liveness check");
+        let rank4 = wrapper
+            .find("with_capability_state_mut(")
+            .expect("the rank-4 acquisition");
+        assert!(
+            live < rank4,
+            "object liveness (IPC rank 3) must be established BEFORE capability rank 4 is taken"
+        );
+        // The memory refcount is applied after rank 4 releases, never inside it.
+        let mem = wrapper
+            .find("adjust_memory_object_cap_refcount(")
+            .expect("the memory refcount");
+        assert!(
+            rank4 < mem,
+            "the MemoryObject refcount is rank 6 and must follow the rank-4 body"
+        );
+    }
+
+    /// IPC before capability, in exactly one seam, and nowhere else in the kernel.
+    #[test]
+    fn the_composition_seam_fixes_ipc_before_capability() {
+        let seam = body(
+            ORCHESTRATOR,
+            "pub(crate) fn with_ipc_then_capability_mut<R>(",
+        );
+        let ipc = seam.find("self.ipc_state_lock.lock()").expect("ipc lock");
+        let cap = seam
+            .find("self.capability_state_lock.lock()")
+            .expect("capability lock");
+        assert!(
+            ipc < cap,
+            "IPC rank 3 must be taken before capability rank 4"
+        );
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            if rel == "src/kernel/boot/orchestrator_state.rs" {
+                continue;
+            }
+            assert!(
+                !(src.contains("ipc_state_lock.lock()")
+                    && src.contains("capability_state_lock.lock()")),
+                "{rel} takes both domain locks itself; the order belongs to one seam"
+            );
+        }
+    }
+
+    /// §2: the unpublished-endpoint removal checks all three publication surfaces and the
+    /// incarnation, and the LIVE teardown keeps the wake/settle work it owes.
+    #[test]
+    fn the_unpublished_removal_refuses_rather_than_guesses() {
+        let removal = body(TXN, "pub(crate) fn remove_unpublished_endpoint_locked(");
+        for surface in [
+            "endpoint_generations",
+            "endpoint_waiters",
+            "endpoint_sender_waiters",
+            "irq_routes",
+        ] {
+            assert!(
+                removal.contains(surface),
+                "the removal must consult {surface} before clearing a slot"
+            );
+        }
+        assert!(
+            removal.contains("EndpointRemoval::Stale")
+                && removal.contains("EndpointRemoval::Published"),
+            "both refusal outcomes must be reachable and distinct"
+        );
+        // The live teardown still does the work only it can do.
+        let destroy = IPC_STATE
+            .split("pub fn destroy_endpoint(")
+            .nth(1)
+            .expect("the live teardown");
+        assert!(
+            destroy.contains("settle_blocked_sender_envelope")
+                && destroy.contains("take_endpoint_waiter_record"),
+            "the live teardown must still settle senders and take the waiter record"
+        );
+    }
+
+    /// §5: the ledger names incarnations, not indices, and both provisional classes carry the
+    /// identity their release needs.
+    #[test]
+    fn the_ledger_records_identities_not_indices() {
+        let src = code(SPAWN_TXN);
+        assert!(
+            src.contains("Endpoint(crate::kernel::boot::spawn_ipc_cap_txn::ServiceEndpointGrant)"),
+            "the endpoint entry must carry the grant, not a bare index"
+        );
+        assert!(
+            src.contains("Delegation(crate::kernel::boot::spawn_ipc_cap_txn::DelegationGrant)"),
+            "the parent delegation must have a ledger entry of its own"
+        );
+        assert!(
+            !src.contains("Endpoint(usize)"),
+            "an index is not an identity: endpoint slots are recycled"
+        );
+    }
+
+    /// §4: the two ASID cases are decided by a check, use DIFFERENT owners, and are not
+    /// conflated. This is the guard the directive asks for.
+    #[test]
+    fn the_two_asid_release_cases_are_never_conflated() {
+        let release = SPAWN_TXN
+            .split("fn release_provisional_spawn_resource(")
+            .nth(1)
+            .expect("the release")
+            .split("\n    /// Undo an in-flight spawn")
+            .next()
+            .expect("body");
+        let arm = code(release)
+            .split("ProvisionalSpawnResource::AddressSpace(asid) => {")
+            .nth(1)
+            .map(alloc::string::String::from)
+            .expect("the address-space arm");
+        // The decision is made from live state, not assumed.
+        assert!(
+            arm.contains("tcb.asid == Some(asid)"),
+            "the release must CHECK whether any task carries the ASID"
+        );
+        // Two owners, one per case, and both present.
+        assert!(
+            arm.contains("destroy_unresident_address_space_locked"),
+            "a never-resident ASID must use the never-resident owner"
+        );
+        assert!(
+            arm.contains("destroy_user_address_space_by_asid"),
+            "a carried ASID must fall back to the live teardown"
+        );
+        // And the fallback is loud, because it means the ledger's own contract was violated.
+        assert!(
+            arm.contains("SPAWN_LEDGER_ASID_STILL_BOUND"),
+            "the conflation case must report itself rather than pass silently"
+        );
+        // The variant has exactly one construction site, and it precedes the commit.
+        let txn = SPAWN_TXN
+            .split("pub(crate) fn run_image_spawn_transaction(")
+            .nth(1)
+            .expect("the transaction");
+        assert_eq!(
+            txn.matches("ProvisionalSpawnResource::AddressSpace(")
+                .count(),
+            1,
+            "exactly one site constructs the address-space entry"
+        );
+        let record = txn
+            .find("ProvisionalSpawnResource::AddressSpace(")
+            .expect("the record");
+        let commit = txn.find("spawn_user_task_from_image(").expect("the commit");
+        assert!(
+            record < commit,
+            "the entry is recorded before the only step that could publish the ASID"
+        );
+    }
+
+    // ── Failure injection ───────────────────────────────────────────────────────────────
+
+    /// Every column a leak could move, by identity rather than as a total.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Baseline {
+        tasks: usize,
+        live_endpoints: alloc::vec::Vec<usize>,
+        endpoint_generations: alloc::vec::Vec<u64>,
+        endpoint_waiters: usize,
+        caller_cnode_slots: usize,
+        total_cnode_slots: usize,
+        delegation_links: usize,
+        memory_objects: usize,
+        memory_object_cap_refs: u64,
+        address_spaces: usize,
+        free_frames: usize,
+    }
+
+    fn baseline(k: &SharedKernel) -> Baseline {
+        k.with(|s| {
+            let cnode = s.current_task_cnode();
+            let limits = s.runtime_capacity_config();
+            Baseline {
+                tasks: s.with_tcbs(|tcbs| tcbs.iter().flatten().count()),
+                live_endpoints: s.with_ipc_state(|ipc| {
+                    (0..limits.max_endpoints)
+                        .filter(|i| ipc.endpoints[*i].is_some())
+                        .collect()
+                }),
+                endpoint_generations: s.with_ipc_state(|ipc| {
+                    ipc.endpoint_generations[..limits.max_endpoints].to_vec()
+                }),
+                endpoint_waiters: s
+                    .with_ipc_state(|ipc| ipc.endpoint_waiters.iter().flatten().count()),
+                caller_cnode_slots: match cnode {
+                    Some(cnode) => s.with_capability_state(|cap| {
+                        cap.cnode_spaces
+                            .iter()
+                            .flatten()
+                            .filter(|space| space.id == cnode)
+                            .map(|space| {
+                                crate::kernel::boot::kernel_ref(&space.cspace).occupied_slots()
+                            })
+                            .sum::<usize>()
+                    }),
+                    None => 0,
+                },
+                total_cnode_slots: s.with_capability_state(|cap| {
+                    cap.cnode_spaces
+                        .iter()
+                        .flatten()
+                        .map(|space| {
+                            crate::kernel::boot::kernel_ref(&space.cspace).occupied_slots()
+                        })
+                        .sum::<usize>()
+                }),
+                delegation_links: s.with_capability_state(|cap| {
+                    crate::kernel::boot::kernel_ref(&cap.delegated_capability_links)
+                        .iter()
+                        .flatten()
+                        .count()
+                }),
+                memory_objects: s.with_memory_state(|m| m.memory_objects.iter().flatten().count()),
+                memory_object_cap_refs: s.with_memory_state(|m| {
+                    m.memory_objects
+                        .iter()
+                        .flatten()
+                        .map(|o| o.cap_refcount as u64)
+                        .sum()
+                }),
+                address_spaces: s.with_user_spaces(|spaces| {
+                    (0..crate::kernel::vm::MAX_ADDRESS_SPACES)
+                        .filter(|n| spaces.get(crate::kernel::vm::Asid(*n as u16)).is_some())
+                        .count()
+                }),
+                free_frames: s.with_memory_state(|m| m.frame_allocator.free_frames()),
+            }
+        })
+    }
+
+    impl Baseline {
+        /// The same baseline with endpoint generations blanked.
+        ///
+        /// Generations are a monotonic anti-reuse counter, not a resource: a REAL create followed
+        /// by a REAL destroy must advance them, or a stale capability could resolve against the
+        /// next incarnation. So they are compared exactly across a FAILED transaction — which must
+        /// consume none — and deliberately excluded when comparing across a completed acquire and
+        /// release, which must consume exactly one and does.
+        fn resources_only(mut self) -> Self {
+            self.endpoint_generations.clear();
+            self
+        }
+
+        /// The same view, without consuming the baseline the caller still needs.
+        fn clone_resources_only(&self) -> Self {
+            self.clone().resources_only()
+        }
+    }
+
+    fn fixture() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    fn request(k: &SharedKernel, owner_cnode: CNodeId) -> ServiceEndpointRequest {
+        k.with(|s| {
+            let limits = s.runtime_capacity_config();
+            ServiceEndpointRequest {
+                owner_cnode,
+                max_depth: 8,
+                mode: EndpointMode::Buffered,
+                max_endpoints: limits.max_endpoints,
+                cnode_limits: CnodeGrowthLimits {
+                    slot_capacity: crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE
+                        .min(limits.max_capability_slots),
+                    max_total_cnode_slots: limits.max_total_cnode_slots,
+                },
+            }
+        })
+    }
+
+    /// Fill the owner's cspace so the NEXT mint fails, and report how many were taken.
+    fn exhaust_cnode(k: &SharedKernel, cnode: CNodeId) -> usize {
+        let mut minted = 0usize;
+        k.with(|s| {
+            while s
+                .mint_capability_in_cnode(
+                    cnode,
+                    Capability::new(
+                        CapObject::Endpoint {
+                            index: 0,
+                            generation: 1,
+                        },
+                        CapRights::SEND,
+                    ),
+                )
+                .is_ok()
+            {
+                minted += 1;
+                assert!(minted < 100_000, "the cspace must be exhaustible");
+            }
+        });
+        minted
+    }
+
+    /// A capability mint failure inside the transaction must leave NO endpoint behind — the exact
+    /// defect the split repairs. Before U9-SPAWN-IC1 the endpoint was installed under rank 3,
+    /// rank 3 was released, and a failing mint returned with the endpoint stranded.
+    #[test]
+    fn a_mint_failure_leaves_no_stranded_endpoint() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        exhaust_cnode(&k, cnode);
+        let before = baseline(&k);
+        let req = request(&k, cnode);
+        for attempt in 0..4 {
+            let err = k
+                .with(|s| s.provision_service_endpoint(&req))
+                .expect_err("an exhausted cspace cannot fund the capabilities");
+            assert_eq!(
+                baseline(&k),
+                before,
+                "attempt {attempt} left state behind: {err:?}"
+            );
+        }
+        // The generation is put BACK, not left bumped — otherwise each failure would silently
+        // consume an incarnation and the census would drift.
+        assert_eq!(
+            baseline(&k).endpoint_generations,
+            before.endpoint_generations,
+            "a failed transaction must not consume an endpoint generation"
+        );
+    }
+
+    /// The second mint is its own boundary: the first capability exists when it fails, and must
+    /// come back out along with the endpoint.
+    #[test]
+    fn a_second_mint_failure_takes_the_first_capability_back() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        exhaust_cnode(&k, cnode);
+        // Hand exactly ONE slot back, so the send mint succeeds and the recv mint fails.
+        k.with(|s| {
+            let victim = s.with_capability_state(|cap| {
+                cap.cnode_spaces
+                    .iter()
+                    .flatten()
+                    .find(|space| space.id == cnode)
+                    .and_then(|space| {
+                        let cspace = crate::kernel::boot::kernel_ref(&space.cspace);
+                        (0..cspace.capacity())
+                            .map(|i| CapId(i as u64))
+                            .find(|id| cspace.get(*id).is_some())
+                    })
+            });
+            if let Some(victim) = victim {
+                s.with_capability_state_mut(|cap| {
+                    if let Some(space) = cap
+                        .cnode_spaces
+                        .iter_mut()
+                        .flatten()
+                        .find(|space| space.id == cnode)
+                    {
+                        let _ = crate::kernel::boot::kernel_mut(&mut space.cspace).revoke(victim);
+                    }
+                });
+            }
+        });
+        let before = baseline(&k);
+        let req = request(&k, cnode);
+        let err = k
+            .with(|s| s.provision_service_endpoint(&req))
+            .expect_err("one free slot cannot fund two capabilities");
+        assert_eq!(
+            baseline(&k),
+            before,
+            "the first capability and the endpoint must both come back: {err:?}"
+        );
+    }
+
+    /// The success path, then the exact release: every column returns, and repeating the release
+    /// is inert rather than destructive.
+    #[test]
+    fn a_grant_and_its_release_return_every_column() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let before = baseline(&k);
+        let req = request(&k, cnode);
+        let grant = k
+            .with(|s| s.provision_service_endpoint(&req))
+            .expect("a grant");
+        assert_ne!(baseline(&k), before, "the acquisition must be observable");
+        let removal = k.with(|s| s.release_service_endpoint_grant(&grant));
+        assert_eq!(removal, EndpointRemoval::Removed);
+        let after = baseline(&k);
+        assert_eq!(
+            after.resources_only(),
+            before.clone_resources_only(),
+            "the release must return every resource column"
+        );
+        // The incarnation counter is the one thing that must NOT return: it advanced twice, once
+        // for the create and once for the destroy, which is what stops a stale capability from
+        // ever resolving against the next endpoint in that slot.
+        let advanced = baseline(&k).endpoint_generations[grant.endpoint_index];
+        assert!(
+            advanced > grant.endpoint_generation,
+            "the destroy must advance the incarnation past the one it removed"
+        );
+        for repeat in 0..3 {
+            let again = k.with(|s| s.release_service_endpoint_grant(&grant));
+            assert_eq!(
+                again,
+                EndpointRemoval::Stale,
+                "repeat {repeat}: a spent grant owns nothing"
+            );
+            assert_eq!(
+                baseline(&k).endpoint_generations[grant.endpoint_index],
+                advanced,
+                "repeat {repeat}: an inert release must not advance the incarnation either"
+            );
+        }
+    }
+
+    /// THE identity proof: a stale grant naming a RECYCLED endpoint slot must not destroy the
+    /// endpoint that now lives there. This is what an index-only ledger entry could not express.
+    #[test]
+    fn a_stale_grant_never_destroys_the_replacement_in_its_slot() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let req = request(&k, cnode);
+        let first = k
+            .with(|s| s.provision_service_endpoint(&req))
+            .expect("first grant");
+        k.with(|s| s.release_service_endpoint_grant(&first));
+        let second = k
+            .with(|s| s.provision_service_endpoint(&req))
+            .expect("second grant");
+        assert_eq!(
+            second.endpoint_index, first.endpoint_index,
+            "the slot must be recycled, or this proves nothing"
+        );
+        assert_ne!(
+            second.endpoint_generation, first.endpoint_generation,
+            "the incarnation must differ"
+        );
+        let with_second = baseline(&k);
+        // Now replay the STALE grant. It names the same index and a dead generation.
+        let removal = k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                crate::kernel::boot::spawn_ipc_cap_txn::remove_unpublished_endpoint_locked(
+                    ipc,
+                    first.endpoint_index,
+                    first.endpoint_generation,
+                )
+            })
+        });
+        assert_eq!(removal, EndpointRemoval::Stale);
+        assert_eq!(
+            baseline(&k),
+            with_second,
+            "a stale grant must not touch the replacement occupying its slot"
+        );
+        k.with(|s| s.release_service_endpoint_grant(&second));
+    }
+
+    /// A PUBLISHED endpoint is refused by the unpublished removal, so the rollback can never
+    /// strand a waiter that the live teardown would have woken.
+    #[test]
+    fn a_published_endpoint_is_refused_by_the_unpublished_removal() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let req = request(&k, cnode);
+        let grant = k
+            .with(|s| s.provision_service_endpoint(&req))
+            .expect("a grant");
+        // Publish it the way an IRQ binding would: route a line at this endpoint.
+        k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                ipc.irq_routes[0] = Some(grant.endpoint_index);
+            })
+        });
+        let removal = k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                crate::kernel::boot::spawn_ipc_cap_txn::remove_unpublished_endpoint_locked(
+                    ipc,
+                    grant.endpoint_index,
+                    grant.endpoint_generation,
+                )
+            })
+        });
+        assert_eq!(
+            removal,
+            EndpointRemoval::Published,
+            "an externally referenced endpoint must be refused, not removed"
+        );
+        assert!(
+            k.with(|s| s.with_ipc_state(|ipc| ipc.endpoints[grant.endpoint_index].is_some())),
+            "and it must still be installed"
+        );
+        k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                ipc.irq_routes[0] = None;
+            })
+        });
+    }
+
+    /// §3 delegation: the exact rollback token, and its refusal on a recycled slot.
+    #[test]
+    fn a_delegation_and_its_release_are_exact_and_stale_safe() {
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let spawner = k.with(|s| s.current_tid().expect("a current task"));
+        let req = request(&k, cnode);
+        let grant = k
+            .with(|s| s.provision_service_endpoint(&req))
+            .expect("a grant");
+        let before = baseline(&k);
+        // Delegate to ourselves: same task, so no link is recorded, and the identity is real.
+        let delegation = k
+            .with(|s| s.delegate_capability(spawner, grant.send_cap, spawner, CapRights::SEND))
+            .expect("a delegation");
+        assert_ne!(baseline(&k), before, "the delegation must be observable");
+        assert!(
+            k.with(|s| s.release_delegation(&delegation)),
+            "the exact token releases it"
+        );
+        assert_eq!(baseline(&k), before, "and every column returns");
+        // Replaying it is inert: the slot is empty, or has been recycled to something else.
+        for repeat in 0..3 {
+            assert!(
+                !k.with(|s| s.release_delegation(&delegation)),
+                "repeat {repeat}: a spent delegation releases nothing"
+            );
+            assert_eq!(baseline(&k), before, "repeat {repeat} drifted");
+        }
+        // And a token whose slot has been REUSED by an unrelated capability is refused.
+        let squatter = k
+            .with(|s| {
+                s.mint_capability_in_cnode(
+                    cnode,
+                    Capability::new(
+                        CapObject::Endpoint {
+                            index: 999,
+                            generation: 7,
+                        },
+                        CapRights::SEND,
+                    ),
+                )
+            })
+            .expect("a squatter");
+        let with_squatter = baseline(&k);
+        let stale = crate::kernel::boot::spawn_ipc_cap_txn::DelegationGrant {
+            identity: DelegationIdentity {
+                source_tid: spawner,
+                source_cnode: cnode,
+                dest_tid: spawner,
+                dest_cnode: cnode,
+            },
+            source_cap: grant.send_cap,
+            dest_cap: squatter,
+            object: grant_object(&grant),
+            linked: false,
+            owes_memory_refcount: false,
+        };
+        assert!(
+            !k.with(|s| s.release_delegation(&stale)),
+            "a stale token must refuse a slot holding a different object"
+        );
+        assert_eq!(
+            baseline(&k),
+            with_squatter,
+            "and must not revoke the unrelated capability occupying it"
+        );
+        k.with(|s| {
+            let _ = s.revoke_capability_in_cnode(cnode, squatter);
+            s.release_service_endpoint_grant(&grant);
+        });
+    }
+
+    fn grant_object(
+        grant: &crate::kernel::boot::spawn_ipc_cap_txn::ServiceEndpointGrant,
+    ) -> CapObject {
+        CapObject::Endpoint {
+            index: grant.endpoint_index,
+            generation: grant.endpoint_generation,
+        }
+    }
+
+    /// §4: a failure sweep far beyond `MAX_ADDRESS_SPACES` consumes ZERO retired-ASID slots, so
+    /// the rollback stays exact instead of exhausting the array and starting to leak.
+    #[test]
+    fn failure_sweeps_beyond_max_address_spaces_consume_no_retired_slots() {
+        use crate::kernel::syscall::spawn_image_txn::{ProvisionalSpawnResource, SpawnLedger};
+        let k = fixture();
+        let before = baseline(&k);
+        for cycle in 0..(crate::kernel::vm::MAX_ADDRESS_SPACES * 3) {
+            k.with(|s| {
+                let (asid, cap) = s
+                    .create_user_address_space()
+                    .unwrap_or_else(|e| panic!("cycle {cycle}: no address space: {e:?}"));
+                let cnode = s.current_task_cnode().expect("spawner cspace");
+                let mut ledger = SpawnLedger::new();
+                ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
+                ledger.record(ProvisionalSpawnResource::Capability { cnode, cap });
+                s.unwind_spawn_ledger(ledger);
+            });
+            assert_eq!(baseline(&k), before, "cycle {cycle} drifted");
+        }
+        // If a retired slot had been consumed per cycle, `create_user_address_space` would have
+        // started failing long before here — MAX_ADDRESS_SPACES is the depth of that array.
+        assert_eq!(
+            baseline(&k),
+            before,
+            "the sweep must end exactly where it started"
+        );
+    }
+
+    /// The whole spawn ledger, every class at once, released in reverse acquisition order.
+    #[test]
+    fn every_ledger_class_including_the_new_ones_returns_its_columns() {
+        use crate::kernel::syscall::spawn_image_txn::{ProvisionalSpawnResource, SpawnLedger};
+        let k = fixture();
+        let cnode = k.with(|s| s.current_task_cnode().expect("spawner cspace"));
+        let spawner = k.with(|s| s.current_tid().expect("a current task"));
+        let before = baseline(&k);
+        let req = request(&k, cnode);
+        let mut ledger = SpawnLedger::new();
+        k.with(|s| {
+            let token = s
+                .reserve_task_for_spawn_with_class(90_301, TaskClass::App)
+                .expect("a reservation");
+            ledger.record(ProvisionalSpawnResource::Reservation(token));
+            let (asid, aspace_cap) = s.create_user_address_space().expect("an address space");
+            ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
+            ledger.record(ProvisionalSpawnResource::Capability {
+                cnode,
+                cap: aspace_cap,
+            });
+            let grant = s
+                .provision_service_endpoint(&req)
+                .expect("an endpoint grant");
+            ledger.record(ProvisionalSpawnResource::Endpoint(grant));
+            let delegation = s
+                .delegate_capability(spawner, grant.send_cap, spawner, CapRights::SEND)
+                .expect("a delegation");
+            ledger.record(ProvisionalSpawnResource::Delegation(delegation));
+        });
+        assert_eq!(ledger.len(), 5, "one entry per acquisition");
+        assert_ne!(baseline(&k), before, "the acquisitions must be observable");
+        k.with(|s| s.unwind_spawn_ledger(ledger));
+        assert_eq!(
+            baseline(&k).resources_only(),
+            before.clone_resources_only(),
+            "every class — including the endpoint grant and the delegation — went back"
+        );
     }
 }

@@ -452,7 +452,7 @@ pub(crate) fn delegate_capability_locked(
 }
 
 /// `record_delegated_capability_link`'s body, under capability rank 4 and nothing else.
-fn record_delegation_link_locked(
+pub(crate) fn record_delegation_link_locked(
     capability: &mut CapabilitySubsystem,
     source_tid: u64,
     source_cap: CapId,

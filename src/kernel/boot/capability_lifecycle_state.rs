@@ -711,6 +711,19 @@ impl KernelState {
         }
     }
 
+    /// Record a delegation link, through the rank-4 body that owns the table.
+    ///
+    /// U9-SPAWN-IC1 moved the policy into
+    /// [`spawn_ipc_cap_txn::record_delegation_link_locked`], which
+    /// [`spawn_ipc_cap_txn::delegate_capability_locked`] calls while it already holds capability
+    /// rank 4 — so the link is recorded inside the same transaction that minted the capability it
+    /// describes, and a full link table rolls the mint back rather than leaving an unlinked
+    /// delegation behind.
+    ///
+    /// This broad wrapper therefore has no production caller left. It is kept, and gated to test
+    /// builds, because the link-table exhaustion and rollback tests drive it directly; deleting it
+    /// would cost that coverage, and leaving it un-gated would be dormant production API.
+    #[cfg(test)]
     pub(crate) fn record_delegated_capability_link(
         &mut self,
         source_tid: u64,
@@ -719,26 +732,9 @@ impl KernelState {
         dest_cap: CapId,
     ) -> Result<(), KernelError> {
         self.with_capability_state_mut(|capability| {
-            let links = kernel_mut(&mut capability.delegated_capability_links);
-            if links.iter().flatten().any(|link| {
-                link.source_tid == source_tid
-                    && link.source_cap == source_cap
-                    && link.dest_tid == dest_tid
-                    && link.dest_cap == dest_cap
-            }) {
-                return Ok(());
-            }
-            if let Some(slot) = links.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(DelegatedCapabilityLink {
-                    source_tid,
-                    source_cap,
-                    dest_tid,
-                    dest_cap,
-                });
-                Ok(())
-            } else {
-                Err(KernelError::CapabilityFull)
-            }
+            super::spawn_ipc_cap_txn::record_delegation_link_locked(
+                capability, source_tid, source_cap, dest_tid, dest_cap,
+            )
         })
     }
 

@@ -7014,6 +7014,181 @@ process CNode, and no rank-4 owner can do that off the broad lock.**
 presence in `src/runtime.rs`. NR 11 is routed precisely because a thread joins its parent's
 EXISTING CNode and declines before mutating when it is absent; NR 23 always creates one.
 
+## U9-SPAWN-IC1 — rank-local endpoint and capability provisioning
+
+Base `origin/main = a9e7c58`. Census `2 / 0 / 2` before and after. U9 remains OPEN.
+
+### §1 — the identity ledger
+
+Traced from the shared NR 23 / NR 29 transaction's endpoint and capability phases (a 105-method
+transitive closure). Every resource the transaction creates or delegates, by exact identity:
+
+| resource | identity | owner rank | externally visible when |
+|---|---|---|---|
+| endpoint incarnation | `(index, generation)` in `endpoints[index]` / `endpoint_generations[index]`, mode `Buffered`, depth 8 | IPC 3 | a capability naming that incarnation reaches an invokable cspace |
+| send capability | `CapId` in the SPAWNER's CNode, object `Endpoint{index, generation}`, rights `SEND` | capability 4 | the mint |
+| receive capability | same CNode and object, rights `RECEIVE` | capability 4 | the mint |
+| parent delegation | `SEND` capability in the PARENT's CNode + a `DelegatedCapabilityLink` | capability 4 | the mint into the parent's cspace |
+| child delegations | `RECEIVE` caps into the CHILD's CNode | capability 4 | after the commit — not this pass's |
+
+Exact inverse of each: revoke the capability through the capability owner (which cascades to
+delegated descendants), then remove the endpoint incarnation — only if it is still that incarnation
+and still unpublished.
+
+The identities the transaction needs from task rank 2 — the spawner's CNode, and both cnodes in a
+delegation — are snapshotted before any rank-3 or rank-4 owner is acquired. The old code reached
+the spawner's CNode through `current_task_cnode()` from *inside* the mint: an ambient task-rank read
+taken while deciding a capability-rank action.
+
+### §2 — one endpoint+capability transaction
+
+`create_endpoint_with_mode` installed the endpoint under rank 3, released rank 3, then minted under
+rank 4. Its own comment stated the reason:
+
+> Capability minting happens outside the lock (capability rank 4 > ipc rank 3).
+
+That reasoning is correct about ORDER and was resolved by giving up ATOMICITY. A `CapabilityFull`
+on either mint returned an error with the endpoint already installed — named by nothing, removed by
+nobody — and the spawn ledger could not compensate, because it only learns the endpoint index on
+success.
+
+Rank 3 then rank 4 is not an inversion; it is the legal order.
+[`KernelState::with_ipc_then_capability_mut`] takes them that way, and
+`provision_service_endpoint_locked` performs all four steps inside:
+
+1. validate the exact target CNode identity and capacity (reached by the first mint through
+   `ensure_cnode_space_locked`, so a CNode that cannot be created or grown fails before any
+   capability exists);
+2. allocate the endpoint incarnation — free slot, generation bump, object install;
+3. mint `SEND` then `RECEIVE`, both naming `(index, generation)`;
+4. return the identity-bearing token.
+
+Any failure restores state before the owners are released, in reverse: minted capabilities removed,
+endpoint slot cleared, **and the generation put back to its entry value**. That last part is the
+one easy to get wrong — leaving it bumped would be "safe" but would consume an incarnation on every
+failure, drifting the very census this transaction is measured against.
+
+**Identities, not indices.** The ledger's `Endpoint(usize)` was not an identity. Endpoint slots are
+recycled, so a stale unwind naming a reused index would have destroyed a REPLACEMENT endpoint
+belonging to someone else. It now carries the whole grant, and
+`remove_unpublished_endpoint_locked` checks four things before clearing a slot: the incarnation
+still matches, no receiver waits on it, no sender is parked on it, and no IRQ routes to it. A
+provisional endpoint from a failed spawn satisfies all four by construction. If any fails it
+returns `Stale` or `Published` without mutating — both correct, inert answers.
+
+Destroying a LIVE endpoint is deliberately NOT rank-local and cannot be: `destroy_endpoint` wakes a
+stranded receiver (scheduler 1 + task 2) and settles orphaned senders' transfer envelopes (memory
+6). That work is real, stays where it is, and is owed only by a published endpoint.
+
+### §3 — the capability-only delegation owner
+
+`grant_capability_task_to_task_with_rights` is now three pieces in rank order:
+
+* **rank 2** — both tasks' cnodes, snapshotted;
+* **rank 3** — the object-liveness check it always performed through `capability_object_live`
+  (which reads endpoint/notification/reply generations), kept AHEAD of rank 4 so the order is
+  2 → 3 → 4 and never 4 → 3;
+* **rank 4** — `delegate_capability_locked`, which re-validates both cspaces and the source OBJECT
+  under the lock (refusing a slot recycled between snapshot and lock), derives through
+  `Capability::derive` so the minted rights are exactly the intersection and never more, mints, and
+  records the delegation link — rolling the mint back if the link table is full.
+
+The MemoryObject capability refcount that `mint_capability_in_cnode` applied inline is memory rank
+6, so the rank-4 body does not touch it: the token records whether it is owed and the broad wrapper
+applies it once rank 4 releases. `release_delegation_grant_locked` is its exact inverse and refuses
+unless the destination slot still holds the object the token recorded — which is what stops a stale
+rollback from revoking an unrelated recycled capability.
+
+### §4 — the provisional-ASID correction
+
+`ProvisionalSpawnResource::AddressSpace` names an address space that was never published to a TCB.
+The variant is constructed at exactly one site, right after `provision_spawn_image`, and that
+remains true at every point the ledger can unwind — including after a FAILED commit, because
+`spawn_user_task_from_image` restores the same incarnation through `restore_after_failed_spawn`,
+whose `SpawnBaseline` captures and replays `tcb.asid`.
+
+The release does not take that on trust. It re-checks the TCB table and only then uses
+`destroy_unresident_address_space_locked`; a carrier found there is a contract violation, and the
+release emits `SPAWN_LEDGER_ASID_STILL_BOUND` and falls back to the live teardown rather than
+skipping a shootdown that might be owed. A guard asserts the two cases use different owners, that
+the decision is made from live state, and that the loud fallback exists — so they cannot be
+conflated.
+
+Consequence: a failure sweep past `MAX_ADDRESS_SPACES` consumes zero retired-ASID slots, which the
+hosted proof exercises for 3 × `MAX_ADDRESS_SPACES` cycles.
+
+### §5 — production integration, injection, and the oracle correction
+
+The broad transaction's phase 4 uses `provision_service_endpoint` and records the grant; phase 5
+uses `delegate_capability` and records ITS grant too, rather than relying on the send capability's
+revoke cascade to remove the parent copy as a side effect. `MAX_PROVISIONAL_SPAWN_RESOURCES` drops
+9 → 6: each endpoint's three entries become one grant, and the delegation gains one.
+
+Fourteen proofs. Seven structural, seven by injection across eleven columns compared by identity —
+task table, live endpoint set, the full generation vector, waiter count, the caller's cnode
+occupancy, total cnode occupancy, delegation links, MemoryObject count and total cap refcount,
+address spaces, free frames:
+
+* a mint failure leaves NO stranded endpoint, and consumes NO generation — the exact defect;
+* the SECOND mint failing takes the first capability back with it;
+* a completed grant and its release return every resource column, while the incarnation counter
+  correctly advances (a real create and a real destroy must advance it, or a stale capability could
+  resolve against the next occupant);
+* **a stale grant does not destroy the replacement in its recycled slot** — the proof an index-only
+  entry could not express;
+* a PUBLISHED endpoint is refused by the unpublished removal;
+* a delegation's release is exact, inert on repeat, and refuses a slot re-minted to a different
+  object;
+* the whole ledger, every class at once, released in reverse order.
+
+Live, three fresh runs per architecture on freshly built artifacts:
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| oracle | 49 ok / 0 fail ×3 | 20 ok / 0 fail ×3 | **passes** ×3 |
+| NR 23 / NR 29 provisionings | 3 / 5 | 3 / 5 | 3 / 5 |
+| `SPAWN_IMAGE_PROVISIONED` / `PM_ELF_ZC_DONE` | 8 / 5 | 8 / 5 | 8 / 5 |
+| `SPAWN_EP_TXN_OK` / `_FAIL` | 22 / 0 | 22 / 0 | 22 / 0 |
+| ledger unwinds, delegation releases, stale sources | 0 / 0 / 0 | 0 | 0 |
+| panics, faults | 0 | 0 | 0 |
+
+**The RISC-V oracle correction.** U9-SPAWN-VM2 identified the smoke's unaccounted split-dispatch
+syscall as NR 1 (`IpcSend`) taking the `PostWorkCommitted` disposition — the U6 blocking-send
+lifecycle doing exactly what Stage 199G-C4 §2 built it to do, on an allow-list that was never
+widened when that class landed. This pass changes the EXPECTATION only: NR 1 joins the list, and a
+companion check pins every NR 1 line to `result=post_work_committed`, so admitting the class did not
+admit an early-returning send. No kernel source was touched for it, and the hosted mirror of the
+guard additionally asserts that the RISC-V wrapper really owns that disposition — so the widened
+expectation describes existing behavior rather than licensing new behavior. The RISC-V core smoke
+passes for the first time since that class landed.
+
+### What is rank-local now, and what is next
+
+All seven of U9-SPAWN2 §3's phases now have rank-local bodies:
+
+| phase | body | ranks |
+|---|---|---|
+| `create_user_address_space` | `create_address_space_locked` | VM 5 |
+| `load_elf_pt_load_segments` | `load_elf_pt_load_segments_locked` | VM 5 + memory 6 |
+| `load_elf_with_mo_zero_copy` | `load_elf_with_mo_zero_copy_locked` | VM 5 + memory 6 |
+| `allocate_user_stack_in_asid` | `allocate_user_stack_locked` | VM 5 + memory 6 |
+| `create_endpoint` | `provision_service_endpoint_locked` | IPC 3 + capability 4 |
+| `grant_capability_task_to_task_with_rights` | `delegate_capability_locked` | capability 4 |
+| `provision_default_kernel_context` | — | task 2 |
+
+**The next missing owner is the last one: `provision_default_kernel_context`, at task rank 2** — the
+kernel stack and context a reserved incarnation gets. It is reached from
+`reserve_task_for_spawn_with_class`, which U9-SPAWN2 §2 already gave a rank-4 CNode transaction; what
+remains is a rank-2 body taking `&mut [Option<ThreadControlBlock>]` and the class table, over which
+the reservation becomes an acquisition wrapper.
+
+Note that having rank-local bodies for all seven phases is NOT the same as being able to route
+NR 23 or NR 29 off the broad lock. The phases span ranks 2, 3, 4, 5 and 6, and a spawn must hold
+them in a single consistent order across the whole transaction — the reservation before the address
+space, the address space before the endpoints, the endpoints before the commit — while today each
+phase acquires and releases its own owners. Composing them is the next design question, and this
+pass deliberately routed neither syscall.
+
 ## U9-SPAWN-VM2 — the rank-local VM/image body
 
 Base `origin/main = c091878`. Census `2 / 0 / 2` before and after. U9 remains OPEN.
