@@ -2654,15 +2654,38 @@ impl KernelState {
         Ok(())
     }
 
+    /// Allocate and map a task's user stack, resolving the address space from the task itself.
+    ///
+    /// This is the TID-keyed entry: it requires `tid` to ALREADY carry an ASID, which is why the
+    /// stack could historically only be allocated after the spawn commit had bound one. The
+    /// layout, guard page and probe all live in [`Self::allocate_user_stack_in_asid`]; this adds
+    /// only the lookup, so there is exactly one stack-layout policy.
     pub(crate) fn allocate_user_stack_with_guard(
         &mut self,
+        tid: u64,
+        stack_pages: usize,
+    ) -> Result<crate::kernel::vm::VirtAddr, KernelError> {
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        self.allocate_user_stack_in_asid(asid, tid, stack_pages)
+    }
+
+    /// THE user-stack allocator: the stack slot is derived from `tid`, but it is installed in the
+    /// address space the CALLER names.
+    ///
+    /// U9-SPAWN-VM1 split this out of [`Self::allocate_user_stack_with_guard`] unchanged. The
+    /// spawn-image provisioner needs a stack in an address space that no task carries yet — the
+    /// child is `ReservedUnstarted` and its ASID is deliberately not yet bound — so it cannot go
+    /// through the TID lookup. Nothing else differs: same slot arithmetic, same guard page, same
+    /// overlap refusal, same resolve probe.
+    pub(crate) fn allocate_user_stack_in_asid(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
         tid: u64,
         stack_pages: usize,
     ) -> Result<crate::kernel::vm::VirtAddr, KernelError> {
         if stack_pages == 0 {
             return Err(KernelError::WrongObject);
         }
-        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
         let stack_bytes = (stack_pages as u64)
             .checked_mul(crate::kernel::vm::PAGE_SIZE as u64)
             .ok_or(KernelError::WrongObject)?;

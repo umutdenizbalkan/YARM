@@ -58,6 +58,8 @@ mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
 pub(crate) mod shared_region_txn;
+/// U9-SPAWN-VM1: THE spawn-image provisioner — address space, image, stack, and one rollback.
+pub(crate) mod spawn_image_provision;
 /// U9-SPAWN1 SP-2: THE thread-incarnation lifecycle — allocate, register, undo.
 pub(crate) mod spawn_thread_core;
 mod task_core_state;

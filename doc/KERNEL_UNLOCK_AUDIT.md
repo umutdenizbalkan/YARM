@@ -7014,6 +7014,166 @@ process CNode, and no rank-4 owner can do that off the broad lock.**
 presence in `src/runtime.rs`. NR 11 is routed precisely because a thread joins its parent's
 EXISTING CNode and declines before mutating when it is absent; NR 23 always creates one.
 
+## U9-SPAWN-VM1 — the off-lock process image provisioner
+
+Base `origin/main = f40ec35`. Census `2 / 0 / 2` before and after. U9 remains OPEN.
+
+### §1 — the provision ledger, and the non-residency proof
+
+Provisioning a process image was four separately-failing steps spread over two files:
+
+| step | owner before | failure arm before |
+|---|---|---|
+| create the address space, mint its capability | `create_user_address_space` | ledger unwind (SP-3) |
+| load the ELF | `load_elf_pt_load_segments` / `load_elf_with_mo_zero_copy` | ledger unwind (SP-3) |
+| map NR 23's initrd window | `map_boot_initrd_window` in the transaction | tolerated, by policy |
+| allocate the user stack | `allocate_user_stack_with_guard`, INSIDE `spawn_image_after_claim` | **none** |
+
+The last row is the defect. The stack was allocated past the reservation claim, inside the commit,
+so a stack-allocation failure could not be rolled back — it returned an error from a step the
+ledger no longer covered.
+
+Everything a provisioning owns, by exact identity: the ASID and its `AddressSpace` registry slot;
+the MAP/READ/WRITE capability naming it, minted into the CALLER's cspace; every PT_LOAD page and
+its backing frame; every zero-copy initramfs grant and its `MemoryObject`; the page-table pages
+installed for them; the read-only initrd window's pages; the stack's pages and its guard page. The
+result facts are the entry, the stack top, and the zero-copy/copied page counts. TLS is not a
+provisioning fact — `set_thread_tls_base` is a separate NR 11 concern and no image spawn sets one.
+
+**The hard-stop condition is CLEARED.** Rollback owes no TLB shootdown, and this is established
+from source:
+
+1. `live_cpu_bitmap_for_asid` defines residency as
+   `current_tid_on_cpu(cpu).and_then(task_asid) == Some(asid)` for some online, non-wake-only CPU.
+2. A task carries an ASID only through `tcb.asid = Some(..)`. Every site: two inside
+   `spawn_image_after_claim` (the COMMIT, after the provisioner has returned), one AP bring-up, one
+   shared-region client ASID, one fork COW child, and `bind_task_asid` whose only callers are tests.
+3. `AddressSpaceManager::allocate_asid` returns a candidate only when `!asid_in_use(candidate)`,
+   which excludes live AND retired-but-unacknowledged ASIDs.
+
+So between `create_user_address_space` and the commit no TCB carries this ASID, therefore no CPU is
+running with it, therefore the shootdown target set is empty. The child is `ReservedUnstarted`
+throughout — it cannot be dispatched, so it cannot make its own ASID resident either.
+
+### §2 — one transaction, one rollback
+
+`src/kernel/boot/spawn_image_provision.rs`. Phases in order: **plan** (pure — validate the ELF and
+compute its extents while nothing is owned) → **address space** → **load**, through the image-source
+adapter → **initrd window** (NR 23 only, tolerated) → **stack** → **token**.
+
+`ImageSource` is the only axis NR 23 and NR 29 differ on: where immutable image bytes come from and
+which loader reads them. Everything after that is shared and stated once.
+
+The plan's admission is deliberately IDENTICAL to `load_elf_pt_load_segments`' own gate — ELF64
+magic and class, a non-empty program-header table of legal entry size lying inside the image, and
+per-PT_LOAD `p_filesz <= p_memsz` with a file range inside the image and no overflowing address
+arithmetic. A second EVALUATION of the same rules, not a second policy: an image the plan refuses is
+one the loader would have refused a few hundred instructions later, holding an address space. The
+one check only the plan can make is the extent bound, because the loader discovers extents as it
+maps them — a PT_LOAD span reaching into kernel space is refused before one page of it is installed.
+`p_flags` stay the loader's to interpret and `e_entry` is recorded as a fact rather than judged.
+
+Rollback order is the exact reverse of acquisition:
+
+1. **the address-space capability**, through `revoke_capability_in_cnode`. It lives in the CALLER's
+   cspace, so `destroy_user_address_space_by_asid` does not and cannot reach it — the leak SP-3
+   found on every arm.
+2. **the address space**, through the repaired U9-ASPACE1 teardown owner. One call drains every
+   mapping installed in the ASID, reclaims MemoryObject-backed frames through the U9-MO2
+   backing-aware lifecycle, returns plain user backing to the allocator via
+   `release_unreferenced_user_frame`, frees the page-table pages and retires the ASID.
+
+No unmapping, frame-freeing or stack-layout policy is duplicated. Inertness is structural: a revoke
+of an absent capability returns `InvalidCapability` and a destroy of an absent ASID returns an
+error; both are logged and neither mutates.
+
+`allocate_user_stack_with_guard(tid, pages)` became a thin lookup over
+`allocate_user_stack_in_asid(asid, tid, pages)`, which carries the unchanged layout, guard page,
+overlap refusal and resolve probe. The provisioner needs a stack in an address space no task carries
+yet, and duplicating the layout to get one was not an option.
+
+**Production delegation, not a banked helper.** `run_image_spawn_transaction` — the one transaction
+both NR 23 and NR 29 already route through — replaces its address-space and load phases with a
+single `provision_spawn_image` call, and `spawn_image_after_claim` consumes
+`UserImageSpec::provisioned_stack_top` instead of allocating its own. The nine architecture
+bring-up sites take the `None` default and allocate exactly as before.
+
+### §3 — failure injection and the marker comparison
+
+`u9spawnvm1_provision_rollback`, 5 proofs. Every column is checked by identity, not as a total:
+tasks, address spaces, free frames, MemoryObjects, endpoints, spawner cspace slots, installed
+mappings.
+
+* **Malformed images** — truncated, bad magic, ELFCLASS32, no program headers, out-of-bounds and
+  undersized header table, `p_filesz > p_memsz`, extent overflow, and a segment reaching into kernel
+  space. Each is refused with kernel state **never moved**, not merely restored, because the plan is
+  pure. That is a stronger statement than a rollback, and it is why the plan runs first.
+* **Frame exhaustion at every allocation position** — the allocator is held down to exactly `n`
+  allocatable frames for every `n` from zero up to one short of a successful spawn, so the
+  exhaustion lands on a different allocation each time (an ELF page, a page-table page, a stack
+  page, the guard page). Each restores the baseline exactly, and each is repeated twice more to
+  prove the rollback is repeatable and a stale one inert.
+* **Publication failure** — the commit refuses, and the ledger gives back the image AND the stack.
+* **Stack consumption** — the commit consumes the provisioned stack; re-running the TID-keyed
+  allocator over the same slot is refused, which is exactly why it must not allocate again.
+* **ASID non-residency** — no task carries the child's ASID across a rolled-back spawn, and the
+  provisioner's code contains no `tcb.asid` binding.
+
+Each sweep position gets a fresh kernel on purpose: the retired-ASID array is `MAX_ADDRESS_SPACES`
+deep and drains only on CPU acknowledgement, which nothing in a hosted fixture does, so past that
+many teardowns `destroy_and_collect_mappings` correctly refuses with `VmError::Full`. That is a
+documented limit of the deferred shootdown-ACK mechanism, not a leak — and a shared kernel would
+have measured it instead of the rollback.
+
+Live, all three architectures, freshly built artifacts:
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `SPAWN_IMAGE_PROVISIONED` (3 NR 23 + 5 NR 29) | 8 | 8 | 8 |
+| `PM_ELF_ZC_DONE` | 5 | 5 | 5 |
+| service entries | all present, once each | all present, once each | all present, once each |
+| panics | 0 | 0 | 0 |
+| result stream vs `f40ec35` | identical (49 ok, 0 fail) | identical (20 ok, 0 fail) | identical, incl. the same pre-existing `[fail]` |
+| marker NAME SET vs `f40ec35` | +`SPAWN_IMAGE_PROVISIONED` only | +`SPAWN_IMAGE_PROVISIONED` only | +`SPAWN_IMAGE_PROVISIONED` only |
+
+Three deliberate differences, and nothing else:
+
+1. **`SPAWN_IMAGE_PROVISIONED`** is new — one line per provisioning, naming the ASID, entry, stack
+   top, extents and zero-copy counts.
+2. **The spawn block moved as a unit.** `KSPAWN_ASID_OK` / `KSPAWN_LOAD_OK` now follow the stack
+   markers instead of straddling them, because the stack is allocated before the provisioner
+   returns. The multiset of marker names is unchanged; only their order is.
+3. **The default-off Stage 175 `SPAWN_LIFECYCLE_*` markers** are all emitted after the provisioning
+   rather than bracketing its steps, keeping their exact spellings and relative order, since the
+   phases they name now happen inside one call.
+
+Two apparent differences that are NOT attributable, and were checked rather than assumed: the
+`*_FUTEX_WAIT_DISPATCH_*` vs `*_FUTEX_WAIT_POST_LOCK_IDLE_*` marker set on AArch64 and RISC-V is
+run-to-run nondeterminism on whether a replacement task is runnable at the moment of the single
+`FutexWait` — three RISC-V runs of the SAME head binary produced the dispatch path twice and the
+idle path once, and the baseline produced both across its runs. And a truncated `RISCV_T` token is
+the log line QEMU was killed mid-write on at the timeout.
+
+### What this retires, and what it does not
+
+Of U9-SPAWN2 §3's seven phases, three — `create_user_address_space`, `load_elf_*` and
+`allocate_user_stack_*` — now have **one owner with one rollback** instead of three independent
+ones. That is the consolidation half of the "off-lock VM address-space provisioner" that §3 named
+as the next exact residual owner.
+
+It is **not** the rank-local half. `provision_spawn_image` takes `&mut KernelState`, not `&mut`
+its subsystem, because the owners it consolidates have no rank-local form — and a seam built over
+the broad state would be dormant API with no caller, which the directive forbids and which
+U9-SPAWN2 §3 already refused once. So the phase table's verdict stands: none of the seven has a
+rank-local owner, and its guard still asserts so.
+
+**The next missing spawn subsystem** is therefore the same one, narrowed: a rank-local VM
+address-space/ELF-load/user-stack owner taking `&mut VmSubsystem` and `&mut MemorySubsystem`
+in that rank order, over which `provision_spawn_image` becomes an acquisition wrapper. Its shape is
+now fully determined — the phases, their order, their rollback and their non-residency proof are all
+settled and production-exercised; what remains is splitting `map_user_page_in_asid_raw`,
+`alloc_user_data_frame` and the address-space create/destroy pair into rank-local bodies.
+
 ## U9-SPAWN2 — the byte-copy spawn fallback, the process-CNode transaction, and the NR 23 stop
 
 Base `origin/main = 63b1706`. Census `2 / 0 / 2` before and after. U9 remains OPEN.

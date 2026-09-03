@@ -84,6 +84,60 @@ no boot ever dispatched it, and the earlier claim in this file and in
 that function calls `nr=24`. The number stays unassigned and is **not**
 reusable; invoking it returns `InvalidNumber` pre-lock.
 
+### The image provisioner (U9-SPAWN-VM1)
+
+Both surviving image-loading spawns — `SpawnProcess` (`nr=23`) and
+`SpawnFromMemoryObject` (`nr=29`) — run the same transaction
+(`src/kernel/syscall/spawn_image_txn.rs`), and its address-space, image and
+user-stack phases are one owner:
+`KernelState::provision_spawn_image` in
+`src/kernel/boot/spawn_image_provision.rs`.
+
+Its phases, in order:
+
+1. **plan** — validate the ELF and compute its PT_LOAD extents. Pure: no kernel
+   state is touched, so a malformed image is refused before anything exists to
+   unwind. Admission is exactly the loader's own gate, plus a refusal of any
+   segment extent reaching into kernel space.
+2. **address space** — create the ASID and mint the MAP/READ/WRITE capability
+   naming it, into the CALLER's cspace.
+3. **load** — the image-source adapter. This is the ONLY axis `nr=23` and
+   `nr=29` differ on: `nr=23` stages PT_LOAD segments from a kernel-side slice
+   with the entry from its own parsed header; `nr=29` uses the initramfs
+   zero-copy grant loader, which reports the entry itself.
+4. **initrd window** — `nr=23` only, for `initramfs_srv`. Failure is tolerated:
+   the server falls back to its syscall bridge.
+5. **stack** — the child's user stack and guard page, in that same address
+   space. This is why it happens here rather than in the commit: a stack
+   allocated inside the commit could not be rolled back.
+6. **token** — the ASID, its capability, the entry, the stack top, and the
+   zero-copy/copied page counts.
+
+On any failure from phase 3 on, the provisioner revokes the address-space
+capability and destroys the address space, in that order. One destroy drains
+every mapping installed in the ASID — segments, grants, the initrd window, the
+stack and its guard page — so no unmapping or frame-freeing policy is stated
+twice. No TLB shootdown is owed: the child is `ReservedUnstarted` and its ASID
+is bound to a TCB only by the commit, so it is never CPU-resident while the
+provisioning is in flight.
+
+The commit (`spawn_image_after_claim`) consumes the provisioned stack through
+`UserImageSpec::provisioned_stack_top`. A caller that did not provision one —
+the architecture bring-up sites — leaves it `None` and the commit allocates the
+stack itself, as before.
+
+One line per provisioning appears in the boot log:
+
+```
+SPAWN_IMAGE_PROVISIONED tid=… path=… asid=… entry=0x… stack_top=0x… \
+    first_vaddr=0x… end=0x… zc_pages=… copied_pages=…
+```
+
+A default boot emits eight: three for `nr=23` (`initramfs_srv`, `devfs_srv`,
+`vfs_server`) and five for `nr=29`.
+
+---
+
 Image IDs 7–12 are **frozen** (see `doc/KERNEL_UNLOCKING.md` §3).
 
 ---
