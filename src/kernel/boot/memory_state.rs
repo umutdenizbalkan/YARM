@@ -478,8 +478,9 @@ impl KernelState {
         if vm_cow {
             for run in &token.child_runs {
                 crate::yarm_log!(
-                    "VM_COW_FORK_CHILD_MAP va=0x{:x} pages={}",
+                    "VM_COW_FORK_CHILD_MAP va=0x{:x} phys=0x{:x} pages={}",
                     run.virt.0,
+                    run.phys.0,
                     run.pages
                 );
             }

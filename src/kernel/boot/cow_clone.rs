@@ -122,6 +122,20 @@ pub(crate) struct CowRun {
     pub(crate) pages: usize,
 }
 
+/// One run installed in the child, with the PHYSICAL backing it was installed against.
+///
+/// The phys is recorded because "the child maps the parent's original backing, and no frame is
+/// copied during the fork" is a claim about physical identity, and a caller that only logged the
+/// virtual address would leave it to be inferred. With it, the map line and the later
+/// `path=private_copy` fault's `new_pa` can be compared directly: same phys before the write,
+/// different phys after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CowChildRun {
+    pub(crate) virt: VirtAddr,
+    pub(crate) phys: PhysAddr,
+    pub(crate) pages: usize,
+}
+
 /// The TLB work a clone owes once its locks are released.
 ///
 /// Empty `runs` means no permission was downgraded, which is the whole obligation discharged.
@@ -168,7 +182,7 @@ pub(crate) struct CowCloneToken {
     /// Parent runs write-protected by THIS attempt.
     pub(crate) wp: Vec<CowWpRun>,
     /// Runs mapped into the child by THIS attempt.
-    pub(crate) child_runs: Vec<CowRun>,
+    pub(crate) child_runs: Vec<CowChildRun>,
     /// Pages that were already read-only AND already copy-on-write in the parent — inherited from
     /// an EARLIER fork — and whose mark this attempt propagated to the child. Recorded so the
     /// caller can report them: without the propagated mark the child's first write finds the page
@@ -320,7 +334,11 @@ pub(crate) fn clone_address_space_cow_locked(
                 // Record the partial run BEFORE unwinding: the pages that did go in took
                 // refcounts, and the unwind reads this list to give them back.
                 if p > 0 {
-                    token.child_runs.push(CowRun { virt, pages: p });
+                    token.child_runs.push(CowChildRun {
+                        virt,
+                        phys,
+                        pages: p,
+                    });
                 }
                 rollback_cow_clone_locked(vm, memory, &token);
                 return Err(CowCloneError::new(site::MAP_CHILD, pv.0, err));
@@ -342,7 +360,7 @@ pub(crate) fn clone_address_space_cow_locked(
                 }
             }
         }
-        token.child_runs.push(CowRun { virt, pages });
+        token.child_runs.push(CowChildRun { virt, phys, pages });
 
         if flags.write {
             // ── 3b. Downgrade the parent run head in place. No split, entry count fixed.
