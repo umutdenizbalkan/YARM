@@ -154105,10 +154105,7 @@ mod u9spawnvm2_rank_local_body {
                 "with_user_spaces",
                 "with_memory_state",
             ] {
-                assert!(
-                    !body.contains(reach),
-                    "{name} must not reach {reach}"
-                );
+                assert!(!body.contains(reach), "{name} must not reach {reach}");
             }
         }
         // And their signatures name exactly the two subsystems.
@@ -154153,7 +154150,9 @@ mod u9spawnvm2_rank_local_body {
             .next()
             .expect("body");
         assert!(
-            drain.contains("if pending_cpu_bitmap == 0 {\n            return Ok(drained);\n        }"),
+            drain.contains(
+                "if pending_cpu_bitmap == 0 {\n            return Ok(drained);\n        }"
+            ),
             "an empty pending-CPU set must return before the retired-ASID insert"
         );
         // The LIVE teardown keeps its shootdown; only the never-resident one skips it.
@@ -154596,7 +154595,11 @@ mod u9spawnvm2_provision_failure_injection {
         // A zero entry is refused at the same place, before an address space exists.
         let good = tiny_elf();
         let err = provision(&k, &good, 0).expect_err("a zero entry is refused");
-        assert_eq!(baseline(&k), before, "zero-entry refusal moved state: {err:?}");
+        assert_eq!(
+            baseline(&k),
+            before,
+            "zero-entry refusal moved state: {err:?}"
+        );
     }
 
     /// A stale rollback is inert, and the rank-local destroy never consumes a retired-ASID slot —

@@ -7014,6 +7014,189 @@ process CNode, and no rank-4 owner can do that off the broad lock.**
 presence in `src/runtime.rs`. NR 11 is routed precisely because a thread joins its parent's
 EXISTING CNode and declines before mutating when it is absent; NR 23 always creates one.
 
+## U9-SPAWN-VM2 — the rank-local VM/image body
+
+Base `origin/main = c091878`. Census `2 / 0 / 2` before and after. U9 remains OPEN.
+
+### §1 — the audit, and the two boundaries it found
+
+U9-SPAWN-VM1 made image provisioning one owner with one rollback, but that owner took
+`&mut KernelState`. "Which ranks does it touch" was therefore a question answered by tracing
+callees, and the answer could change without anyone noticing.
+
+The transitive callee closure of the whole image path is 42 `KernelState` methods. Mechanically
+scanning it for domain accessors below VM rank 5 returns exactly two:
+
+| reach | from | rank |
+|---|---|---|
+| `mint_capability_for_current_context` → `current_task_cnode`, `mint_capability_in_cnode` | `create_user_address_space` | task 2 + capability 4 |
+| `online_cpu_bitmap`, `wake_only_cpu_bitmap`, `submit_cross_cpu_work` | `destroy_user_address_space_by_asid` | scheduler 1 + SMP mailbox |
+
+Everything else — `alloc_user_data_frame`, `release_unreferenced_user_frame`,
+`map_user_page_in_asid_raw`, both ELF loaders, `copy_to_user` and its
+`validate_user_access_for_asid` / `write_user_byte` halves, `allocate_user_stack_in_asid`, the COW
+page set, the MemoryObject map and pin refcounts — was already VM(5) + memory(6) only. The arch
+page-table backend reached from these takes the page-table frame pool's own leaf lock, which sits
+outside the rank ladder and is already taken from rank-5 paths today.
+
+So the refactor is expressible, and `src/kernel/boot/vm_image_locked.rs` expresses it. Thirteen
+bodies, each taking `&mut AddressSpaceManager` and/or `&mut MemorySubsystem` and nothing else:
+
+| body | was |
+|---|---|
+| `create_address_space_locked` | the VM half of `create_user_address_space` |
+| `drain_address_space_locked` / `reclaim_drained_mappings_locked` | the two halves of the teardown |
+| `destroy_unresident_address_space_locked` | new: the never-resident inverse |
+| `alloc_user_data_frame_locked` | `alloc_user_data_frame` |
+| `release_unreferenced_user_frame_locked` | `release_unreferenced_user_frame` (U9-ASPACE1's four conditions, verbatim) |
+| `map_user_page_in_asid_raw_locked` | `map_user_page_in_asid_raw` |
+| `validate_user_access_for_asid_locked`, `write_user_byte_locked`, `copy_to_user_locked` | `copy_to_user` and its halves, both cfg variants |
+| `allocate_user_stack_locked` | `allocate_user_stack_in_asid` |
+| `load_elf_pt_load_segments_locked`, `load_elf_with_mo_zero_copy_locked` | in `exec_state.rs`, beside the private ELF readers they use |
+
+Every broad `KernelState` method that held one of these is now a one-line delegation. That
+direction is the point: the broad path executes the same instructions, so there is no second copy
+to drift. `KernelState::with_vm_then_memory_mut` is the composition seam and fixes the order at
+VM(5) → memory(6) in exactly one place; a guard asserts no other file in the kernel takes both
+domain locks itself.
+
+Two broad methods became dead and were removed rather than banked:
+`KernelState::release_unreferenced_user_frame` and `clear_cow_pages_for_asid`.
+
+**No `SharedKernel` split wrapper was added.** §1 permits one only if a real pre-lock production
+caller uses it in this pass; there is none, so there is none — `runtime.rs` is untouched.
+
+### §2 — the capability leaves the critical section
+
+`provision_image_locked` returns a `ProvisionToken` carrying the ASID, entry, stack top, page
+counts and the initrd window — and no capability, which is what makes "no rank-4 operation while
+rank 5/6 is held" structural rather than a convention.
+
+The broad wrapper then:
+
+1. provisions under VM+memory;
+2. releases both (the closure returns);
+3. mints the address-space capability through the capability owner, with nothing held;
+4. on a mint failure, reacquires VM+memory and rolls the exact token back;
+5. returns the existing `ImageProvision`.
+
+Step 4 propagates the MINT's own error, unchanged. That matters for the syscall result: the caller
+sees the capability error it would have seen anyway, not a VM error invented by the rollback.
+
+`create_user_address_space` keeps its combined contract for its other callers, and gained the same
+discipline — on a mint failure it destroys the address space it just created instead of leaking it.
+
+### §3 — the invariants, proved structurally
+
+Seven guards (`u9spawnvm2_rank_local_body`). Structural because the claim is "this code CANNOT do
+X", and a passing run only shows it did not do X that time:
+
+* **No lower rank.** The layer acquires no lock and names no lower-rank accessor. The only
+  `KernelState::` items it uses are `*_locked` bodies plus two associated functions the guard
+  proves receiver-free — `pte_allows_user_access` (per-ISA page-table bit decode) and
+  `phys_to_direct_map_ptr` (link-time constants). A new name appearing there fails the guard.
+* **No `self` at all** in the provisioner body or either ELF loader.
+* **No shootdown**, and none possible: the never-resident destroy passes an empty pending-CPU set,
+  and `vm.rs` really does return before the retired-ASID insert on an empty set — asserted against
+  `vm.rs`, not assumed. The LIVE teardown keeps its shootdown, because its ASID can be resident.
+* **VM before memory**, in one seam, and nowhere else in the kernel.
+* **No capability operation inside any `with_vm_then_memory_mut` closure**, matched kernel-wide by
+  brace depth rather than a guessed window; plus the token is capability-free.
+* **The ASID is never exposed.** The layer never writes `tcb.asid`, never enqueues, and every
+  fallible phase after the address space exists routes to the one rollback.
+* **Borrowed backing is never freed.** The release goes through the general allocator only, which
+  declines frames it never issued — which is what covers initramfs pages.
+
+The first draft of these guards tripped on three of its own doc comments; they now read
+comment-stripped source.
+
+Rollback order is unchanged and is what draining an address space naturally produces: stack and
+guard page, initrd window and ELF segments unmapped together (releasing the arch page-table pages
+behind them) → the frames and MemoryObject references those mappings held → the address-space
+registry entry → the ASID. Capability cleanup is separate, in the broad wrapper, where the
+capability lives.
+
+### §4 — failure injection at every boundary
+
+Five proofs (`u9spawnvm2_provision_failure_injection`), each checking nine columns by identity
+rather than as a total, because a total can be restored by two errors cancelling: task table, VM
+registry size AND the exact live-ASID set, installed mappings, general allocator, page-table frame
+pool, MemoryObject count AND total map refcount, and the caller's CNode.
+
+* **Frame exhaustion at every allocation position, on ONE kernel.** VM1's sweep needed a fresh
+  kernel per position because its rollback went through the LIVE teardown and consumed a
+  retired-ASID slot each time. The never-resident destroy takes none, so every iteration now starts
+  from the baseline the previous rollback restored and drift accumulates instead of being reset
+  away.
+* **The capability mint** — the boundary VM1 could not have, because it minted before the image
+  existed. The caller's CNode is exhausted through the production owner; the whole provisioned
+  image comes back and the mint's own typed error propagates. Repeated three more times.
+* **A refused image moves no column at all** — stronger than restoration, and the reason the pure
+  plan runs first.
+* **Stale rollback is refused, not repeated**, and 3 × `MAX_ADDRESS_SPACES` provision/rollback
+  cycles run without exhausting anything.
+* **The page-table pool is consumed and returned exactly.** This column turned out to have reach
+  even under `hosted-dev` — the shadow page tables still allocate hierarchy pages from the pool —
+  which was worth measuring rather than assuming.
+
+Live, three fresh runs per architecture on freshly built artifacts:
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| runs | 3 | 3 | 3 |
+| NR 23 provisionings | 3 | 3 | 3 |
+| NR 29 provisionings / `PM_ELF_ZC_DONE` | 5 / 5 | 5 / 5 | 5 / 5 |
+| `SPAWN_IMAGE_PROVISIONED` | 8 | 8 | 8 |
+| service chain | complete, once each | complete | complete |
+| `SPAWN_IMAGE_UNWOUND` / `ASPACE_CREATE_CAP_MINT_FAIL` | 0 / 0 | 0 / 0 | 0 / 0 |
+| panics, faults | 0 | 0 | 0 |
+| oracle result | 49 ok / 0 fail ×3 | 20 ok / 0 fail ×3 | the pre-existing `[fail]` only |
+
+x86_64's marker NAME SET is identical to `c091878`. The histogram differs only in idle-loop
+counters (`D6_LOCAL_DISPATCH_SEAM_*`, `SCHED_ENTER_IDLE_HLT`, `TIMER_SPLIT_TICK_OK`,
+`YARM_LOCK_SPLIT_STAGE2B`) — and two runs of the SAME head binary differ by the same magnitude in
+exactly those counters, so it is how many idle iterations fit before the QEMU timeout, not an
+effect of the change. Clippy's diagnostic histogram is byte-identical to the base.
+
+### The pre-existing RISC-V split-dispatch finding
+
+Investigated, identified, and deliberately not fixed. The RISC-V core smoke asserts that its split
+dispatcher services only NR 15, 10, 9 and 5, and the totals have been one over the sum of those
+four for some time. The unaccounted line is the same on every run:
+
+```
+YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=1 cpu=0 result=post_work_committed finalized=1
+```
+
+**NR 1 is `IpcSend`**, exactly once per boot, taking the `PostWorkCommitted` disposition — the U6
+blocking-send lifecycle (Stage 199G-C4 §2, `src/arch/riscv64/trap.rs`) doing precisely what it was
+built to do. The smoke's allow-list predates that class landing on RISC-V and was never widened.
+The oracle is stale, not the kernel. Widening an oracle is a deliberate act with its own
+justification and evidence, and it is not this pass's scope.
+
+### What is rank-local now, and what is next
+
+Of U9-SPAWN2 §3's seven phases, four now have rank-local bodies taking their subsystems
+explicitly: `create_user_address_space` (as `create_address_space_locked`),
+`load_elf_pt_load_segments`, `load_elf_with_mo_zero_copy` and `allocate_user_stack_in_asid` — plus
+the teardown that inverts them. Three remain broad-only: `create_endpoint` (IPC 3 + capability 4),
+`grant_capability_task_to_task_with_rights` (capability 4) and `provision_default_kernel_context`
+(task 2).
+
+**The next missing spawn subsystem** is therefore the endpoint/capability half: a rank-local
+endpoint creator taking `&mut IpcSubsystem` and `&mut CapabilitySubsystem` in rank order (3 then
+4), over which the transaction's phase 4 becomes an acquisition wrapper the same way phase 2/3 did
+here. `grant_capability_task_to_task_with_rights` is capability-only and looks like the smaller
+sibling of the same extraction; `provision_default_kernel_context` is task-rank and independent.
+
+A separate finding, recorded rather than acted on: the spawn ledger's
+`ProvisionalSpawnResource::AddressSpace` release still goes through the LIVE teardown, so a spawn
+that fails AFTER provisioning (an endpoint or commit failure) still consumes a retired-ASID slot
+even though its ASID is equally never-resident. That is pre-existing and bounded in practice — a
+failed spawn is already boot-fatal — but it is the same defect class this pass removed from the
+provisioner's own rollback, and it is the natural first thing to fix when that ledger is next
+touched.
+
 ## U9-SPAWN-VM1 — the off-lock process image provisioner
 
 Base `origin/main = f40ec35`. Census `2 / 0 / 2` before and after. U9 remains OPEN.

@@ -113,8 +113,21 @@ Its phases, in order:
 6. **token** — the ASID, its capability, the entry, the stack top, and the
    zero-copy/copied page counts.
 
-On any failure from phase 3 on, the provisioner revokes the address-space
-capability and destroys the address space, in that order. One destroy drains
+U9-SPAWN-VM2 split that into a rank-local body and a broad wrapper. The body
+(`provision_image_locked` in the same file) takes only `&mut AddressSpaceManager`
+(VM, rank 5) and `&mut MemorySubsystem` (rank 6), so it cannot reach a task, the
+scheduler, IPC, capabilities or the current CPU — it was handed none of them. The
+bodies it calls live in `src/kernel/boot/vm_image_locked.rs`, and the broad
+`KernelState` methods that used to hold them now delegate there, so the broad path
+and the rank-local path run the same instructions.
+
+The capability is published OUTSIDE that: the body returns a capability-free
+token, the wrapper releases both locks, mints the address-space capability, and on
+a mint failure reacquires and rolls the exact token back while propagating the
+mint's own error. No capability operation happens while VM or memory is held.
+
+On any failure from phase 3 on, the rollback destroys the address space, which
+returns everything mapped into it. One destroy drains
 every mapping installed in the ASID — segments, grants, the initrd window, the
 stack and its guard page — so no unmapping or frame-freeing policy is stated
 twice. No TLB shootdown is owed: the child is `ReservedUnstarted` and its ASID
