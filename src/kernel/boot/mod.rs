@@ -10,6 +10,8 @@ mod capability_service_state;
 mod capability_state;
 mod capacity_state;
 pub(crate) mod cnode_state;
+/// U9-FORK1 §2 — THE copy-on-write address-space clone, as one rank-local transaction.
+pub(crate) mod cow_clone;
 pub(crate) mod defs;
 mod delegation_state;
 mod driver_state;
