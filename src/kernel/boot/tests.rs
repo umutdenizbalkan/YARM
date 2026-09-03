@@ -153939,3 +153939,718 @@ mod u9spawnvm1_provision_rollback {
         );
     }
 }
+
+/// U9-SPAWN-VM2 §3 — the locking and rollback invariants of the rank-local image body.
+///
+/// These are structural: they read the body's source and its signatures rather than observing a
+/// run, because the property being asserted is "this code CANNOT do X", and a passing run only
+/// shows it did not do X this time. The runtime restoration proofs live in
+/// `u9spawnvm2_provision_failure_injection`.
+#[cfg(test)]
+mod u9spawnvm2_rank_local_body {
+    use super::*;
+
+    const VM_LOCKED: &str = include_str!("vm_image_locked.rs");
+    const PROVISION: &str = include_str!("spawn_image_provision.rs");
+    const EXEC: &str = include_str!("exec_state.rs");
+    const ORCHESTRATOR: &str = include_str!("orchestrator_state.rs");
+
+    /// Source with every comment line removed, so a guard reads CODE and never matches the prose
+    /// that explains the very rule it is checking. (This module's own history: the first draft
+    /// tripped on three doc comments that named the things they forbid.)
+    fn code(src: &str) -> alloc::string::String {
+        let mut out = alloc::string::String::with_capacity(src.len());
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The text of the closure passed to the `n`-th `with_vm_then_memory_mut(` call in `src`,
+    /// delimited by brace depth rather than by a guessed window.
+    fn vm_memory_closures(src: &str) -> alloc::vec::Vec<alloc::string::String> {
+        let mut found = alloc::vec::Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find("with_vm_then_memory_mut(") {
+            let open = from + rel + "with_vm_then_memory_mut".len();
+            let bytes = src.as_bytes();
+            let mut depth = 0i32;
+            let mut end = open;
+            for (i, b) in bytes[open..].iter().enumerate() {
+                match b {
+                    b'(' | b'{' | b'[' => depth += 1,
+                    b')' | b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found.push(src[open..=end].into());
+            from = end.max(open + 1);
+        }
+        found
+    }
+
+    /// The comment-stripped body of one function, by name, from its signature to its closing
+    /// brace at column 0.
+    fn free_fn_body(src: &str, sig: &str) -> alloc::string::String {
+        let after = src.split(sig).nth(1).expect("function present");
+        code(after.split("\n}\n").next().expect("function closes"))
+    }
+
+    /// The rank-local layer cannot acquire a lower rank, because it has nothing to acquire one
+    /// WITH. Every entry point takes its subsystems by `&mut`, and `KernelState` — the only thing
+    /// in the kernel that owns a lock — never appears as a parameter.
+    #[test]
+    fn no_rank_local_body_can_reach_below_vm() {
+        let body = code(VM_LOCKED);
+        let body = body.as_str();
+        // No lock is taken anywhere in the layer.
+        for lock in [
+            "with_user_spaces",
+            "with_memory_state",
+            "with_tcbs",
+            "with_scheduler",
+            "with_ipc_state",
+            "with_capability_state",
+            "with_vm_then_memory_mut",
+            "_state_lock",
+            "scheduler_state.lock()",
+        ] {
+            assert!(
+                !body.contains(lock),
+                "the rank-local layer must not acquire {lock} — it is handed its subsystems"
+            );
+        }
+        // And it cannot reach the domains those locks protect.
+        for reach in [
+            "current_cpu",
+            "current_tid",
+            "current_task_cnode",
+            "task_asid",
+            "task_cnode",
+            "online_cpu_bitmap",
+            "wake_only_cpu_bitmap",
+            "submit_cross_cpu_work",
+            "live_cpu_bitmap_for_asid",
+            "mint_capability",
+            "revoke_capability",
+            "yield_current",
+        ] {
+            assert!(
+                !body.contains(reach),
+                "the rank-local layer must not reach {reach}: it is below VM rank 5"
+            );
+        }
+        // The only `KernelState::` uses are associated functions that hold no state: the
+        // `*_locked` bodies, which take a subsystem, and two pure helpers that read nothing but
+        // link-time constants — `pte_allows_user_access` (per-ISA page-table bit decode) and
+        // `phys_to_direct_map_ptr` (physical address to direct-map pointer). None takes `&self`,
+        // so none can reach a lock. A new name appearing here is a real finding, not noise.
+        const STATELESS_HELPERS: [&str; 2] = ["pte_allows_user_access", "phys_to_direct_map_ptr"];
+        for call in body.match_indices("KernelState::") {
+            let tail = &body[call.0 + "KernelState::".len()..];
+            let name: alloc::string::String = tail
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                name.ends_with("_locked") || STATELESS_HELPERS.contains(&name.as_str()),
+                "KernelState::{name} is not a rank-local or stateless associated function"
+            );
+        }
+        // Both helpers really are stateless: neither takes a receiver.
+        const USER_MEM: &str = include_str!("user_memory_state.rs");
+        for helper in STATELESS_HELPERS {
+            let sig = alloc::format!("fn {helper}(");
+            let after = USER_MEM.split(&sig).nth(1).expect(helper);
+            let params = after.split(')').next().expect("params");
+            assert!(
+                !params.contains("self"),
+                "{helper} grew a receiver; it can now reach a lock"
+            );
+        }
+    }
+
+    /// The same for the rank-local provisioner body and the two ELF loaders.
+    #[test]
+    fn the_provisioner_body_and_loaders_are_rank_local_too() {
+        let prov = free_fn_body(PROVISION, "pub(crate) fn provision_image_locked(");
+        let seg = free_fn_body(EXEC, "pub(crate) fn load_elf_pt_load_segments_locked(");
+        let zc = free_fn_body(EXEC, "pub(crate) fn load_elf_with_mo_zero_copy_locked(");
+        for (name, body) in [
+            ("provision_image_locked", prov.as_str()),
+            ("load_elf_pt_load_segments_locked", seg.as_str()),
+            ("load_elf_with_mo_zero_copy_locked", zc.as_str()),
+        ] {
+            assert!(
+                !body.contains("self."),
+                "{name} must take no `self` — its whole input surface is its parameters"
+            );
+            for reach in [
+                "current_cpu",
+                "current_tid",
+                "with_tcbs",
+                "mint_capability",
+                "submit_cross_cpu_work",
+                "with_user_spaces",
+                "with_memory_state",
+            ] {
+                assert!(
+                    !body.contains(reach),
+                    "{name} must not reach {reach}"
+                );
+            }
+        }
+        // And their signatures name exactly the two subsystems.
+        for sig in [
+            "pub(crate) fn provision_image_locked(\n    vm: &mut AddressSpaceManager,\n    memory: &mut MemorySubsystem,",
+            "pub(crate) fn rollback_provision_locked(\n    vm: &mut AddressSpaceManager,\n    memory: &mut MemorySubsystem,",
+        ] {
+            assert!(
+                PROVISION.contains(sig),
+                "the rank-local entry points must take VM and memory explicitly"
+            );
+        }
+    }
+
+    /// The body performs no TLB shootdown, and cannot: the only destroy it reaches passes an
+    /// empty pending-CPU set, which is what tells `destroy_and_collect_mappings` there is nothing
+    /// to acknowledge and no retired slot to take.
+    #[test]
+    fn the_body_performs_no_shootdown_and_takes_no_retired_slot() {
+        let body = code(VM_LOCKED);
+        let body = body.as_str();
+        assert!(
+            !body.contains("TlbShootdown") && !body.contains("shootdown_wait"),
+            "the rank-local layer must never post shootdown work"
+        );
+        let destroy = free_fn_body(
+            VM_LOCKED,
+            "pub(crate) fn destroy_unresident_address_space_locked(",
+        );
+        assert!(
+            destroy.contains("drain_address_space_locked(vm, memory, asid, 0)"),
+            "the never-resident destroy must pass an EMPTY pending-CPU set"
+        );
+        // And the drain really does skip the retired slot on an empty set — the property the
+        // never-resident destroy depends on, asserted against `vm.rs` rather than assumed.
+        const VM_SRC: &str = include_str!("../vm.rs");
+        let drain = VM_SRC
+            .split("pub fn destroy_and_collect_mappings(")
+            .nth(1)
+            .expect("the drain")
+            .split("\n    }\n")
+            .next()
+            .expect("body");
+        assert!(
+            drain.contains("if pending_cpu_bitmap == 0 {\n            return Ok(drained);\n        }"),
+            "an empty pending-CPU set must return before the retired-ASID insert"
+        );
+        // The LIVE teardown keeps its shootdown; only the never-resident one skips it.
+        const MEMORY: &str = include_str!("memory_state.rs");
+        let live = MEMORY
+            .split("pub(crate) fn destroy_user_address_space_by_asid(")
+            .nth(1)
+            .expect("the live teardown")
+            .split("\n    }\n")
+            .next()
+            .expect("body");
+        assert!(
+            live.contains("WorkItem::TlbShootdown") && live.contains("online_cpu_bitmap()"),
+            "the live teardown must still shoot down: its ASID can be resident"
+        );
+    }
+
+    /// Rank 5 before rank 6, in exactly one place, so no caller can get it wrong.
+    #[test]
+    fn the_composition_seam_fixes_vm_before_memory() {
+        let seam = ORCHESTRATOR
+            .split("pub(crate) fn with_vm_then_memory_mut<R>(")
+            .nth(1)
+            .expect("the seam")
+            .split("\n    }\n")
+            .next()
+            .expect("body");
+        let vm = seam.find("self.vm_state_lock.lock()").expect("vm lock");
+        let mem = seam
+            .find("self.memory_state_lock.lock()")
+            .expect("memory lock");
+        assert!(vm < mem, "VM rank 5 must be taken before memory rank 6");
+        // Nothing else in the kernel nests these two by hand.
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            if rel == "src/kernel/boot/orchestrator_state.rs" {
+                continue;
+            }
+            assert!(
+                !(src.contains("vm_state_lock.lock()") && src.contains("memory_state_lock.lock()")),
+                "{rel} takes both domain locks itself; the order belongs to one seam"
+            );
+        }
+    }
+
+    /// No rank-4 operation happens while rank 5/6 is held: the mint sits outside every
+    /// `with_vm_then_memory_mut` closure in the provisioner.
+    #[test]
+    fn no_capability_operation_runs_under_vm_or_memory() {
+        // Whole-kernel: no `with_vm_then_memory_mut` closure anywhere may mint or revoke.
+        for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
+            for closure in vm_memory_closures(&code(&src)) {
+                for forbidden in ["mint_capability", "revoke_capability", "current_task_cnode"] {
+                    assert!(
+                        !closure.contains(forbidden),
+                        "{rel} performs {forbidden} (capability rank 4) while VM/memory is held"
+                    );
+                }
+            }
+        }
+        assert!(
+            !vm_memory_closures(&code(PROVISION)).is_empty(),
+            "the provisioner must actually use the seam, or this guard checks nothing"
+        );
+        // And the token the body returns carries no capability at all, which is what makes that
+        // structurally true rather than a convention.
+        let token = PROVISION
+            .split("pub(crate) struct ProvisionToken {")
+            .nth(1)
+            .expect("the token")
+            .split("\n}\n")
+            .next()
+            .expect("fields");
+        assert!(
+            !token.contains("CapId"),
+            "the rank-local token must be capability-free"
+        );
+    }
+
+    /// The ASID is never exposed to a runnable or current task by the body, and a partial address
+    /// space is never published: the registry entry exists only while the body owns it, and any
+    /// failure destroys it before returning.
+    #[test]
+    fn the_body_never_publishes_a_partial_address_space() {
+        let body = code(VM_LOCKED);
+        let prov = free_fn_body(PROVISION, "pub(crate) fn provision_image_locked(");
+        for src in [body.as_str(), prov.as_str()] {
+            assert!(
+                !src.contains("tcb.asid") && !src.contains("bind_task_asid"),
+                "the rank-local layer must never bind an ASID to a task — that is the commit's"
+            );
+            assert!(
+                !src.contains("enqueue") && !src.contains("set_task_status"),
+                "the rank-local layer must never make anything runnable"
+            );
+        }
+        // Every fallible phase after the address space exists routes to the rollback.
+        let owning: alloc::vec::Vec<&str> = prov
+            .lines()
+            .filter(|l| l.contains("Err(err) => return Err(rollback_provision_locked("))
+            .collect();
+        assert_eq!(
+            owning.len(),
+            2,
+            "the two owning phases (load, stack) each unwind through the one rollback"
+        );
+    }
+
+    /// Borrowed backing is never freed. The initrd window maps frames the kernel does not own, and
+    /// the release's own conditions are what decline them — asserted here as a reachable path
+    /// rather than as a comment.
+    #[test]
+    fn borrowed_initrd_backing_is_never_freed() {
+        let release = free_fn_body(
+            VM_LOCKED,
+            "pub(crate) fn release_unreferenced_user_frame_locked(",
+        );
+        // The allocator itself is the authority: a frame it never issued has no tracking slot, so
+        // `free_frame` declines it. That is condition 3, and it is what covers initrd pages.
+        assert!(
+            release.contains("free_frame(phys.0)\n        .is_ok()")
+                || release.contains(".free_frame(phys.0)"),
+            "the release must go through the allocator, which declines frames it never issued"
+        );
+        assert!(
+            !release.contains("free_contiguous") && !release.contains("free_pt_frame"),
+            "the release must not reach past the general allocator"
+        );
+    }
+}
+
+/// U9-SPAWN-VM2 §4 — failure injection at every allocation, map and publication boundary of the
+/// rank-local provisioner, including the one boundary U9-SPAWN-VM1 could not have: the
+/// capability mint, which now happens AFTER a whole image has been provisioned.
+///
+/// Restoration is asserted column by column — VM registry and ASID set, installed mappings,
+/// general and page-table frame allocators, MemoryObject references, the caller's CNode, and the
+/// task table — never as a total, because a total can be restored by two errors cancelling.
+#[cfg(test)]
+mod u9spawnvm2_provision_failure_injection {
+    use super::*;
+    use crate::kernel::boot::spawn_image_provision::ImageSource;
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    use crate::kernel::vm::{Asid, MAX_ADDRESS_SPACES};
+    use crate::runtime::SharedKernel;
+
+    use super::u9spawn1_sp3_spawn_ledger::tiny_elf;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Baseline {
+        /// Task table — the spawn reservation lives here.
+        tasks: usize,
+        /// VM registry: how many address spaces exist.
+        address_spaces: usize,
+        /// The exact ASID set, not just its size: a rollback that freed one ASID and leaked
+        /// another would keep the count.
+        live_asids: alloc::vec::Vec<u16>,
+        /// Every mapping installed in every live address space — page tables included, since a
+        /// leaked page-table entry keeps a mapping alive.
+        mappings: usize,
+        /// The general frame allocator.
+        free_frames: usize,
+        /// The page-table frame pool, which the arch backend draws from independently.
+        pt_pool_free_frames: usize,
+        /// MemoryObjects, and the total of their map refcounts — a leaked reference keeps the
+        /// count while moving the total.
+        memory_objects: usize,
+        memory_object_map_refs: u64,
+        /// The caller's CNode: minted capabilities land here.
+        caller_cnode_slots: usize,
+    }
+
+    fn baseline(k: &SharedKernel) -> Baseline {
+        k.with(|s| {
+            let cnode = s.current_task_cnode();
+            Baseline {
+                tasks: s.with_tcbs(|tcbs| tcbs.iter().flatten().count()),
+                address_spaces: s.with_user_spaces(|spaces| {
+                    (0..MAX_ADDRESS_SPACES)
+                        .filter(|n| spaces.get(Asid(*n as u16)).is_some())
+                        .count()
+                }),
+                live_asids: s.with_user_spaces(|spaces| {
+                    (0..MAX_ADDRESS_SPACES)
+                        .filter(|n| spaces.get(Asid(*n as u16)).is_some())
+                        .map(|n| n as u16)
+                        .collect()
+                }),
+                mappings: s.with_user_spaces(|spaces| {
+                    (0..MAX_ADDRESS_SPACES)
+                        .filter_map(|n| spaces.get(Asid(n as u16)))
+                        .map(|aspace| aspace.mappings())
+                        .sum::<usize>()
+                }),
+                free_frames: s.with_memory_state(|m| m.frame_allocator.free_frames()),
+                pt_pool_free_frames: crate::kernel::frame_allocator::pt_pool_free_frames(),
+                memory_objects: s.with_memory_state(|m| m.memory_objects.iter().flatten().count()),
+                memory_object_map_refs: s.with_memory_state(|m| {
+                    m.memory_objects
+                        .iter()
+                        .flatten()
+                        .map(|o| o.map_refcount as u64)
+                        .sum()
+                }),
+                caller_cnode_slots: match cnode {
+                    Some(cnode) => s.with_capability_state(|cap| {
+                        cap.cnode_spaces
+                            .iter()
+                            .flatten()
+                            .filter(|space| space.id == cnode)
+                            .map(|space| {
+                                crate::kernel::boot::kernel_ref(&space.cspace).occupied_slots()
+                            })
+                            .sum::<usize>()
+                    }),
+                    None => 0,
+                },
+            }
+        })
+    }
+
+    fn fixture() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    /// Drive the provisioner directly, through the broad wrapper production uses.
+    fn provision(
+        k: &SharedKernel,
+        elf: &[u8],
+        entry: usize,
+    ) -> Result<crate::kernel::boot::spawn_image_provision::ImageProvision, KernelError> {
+        let mut startup = [0u64; 18];
+        k.with(|s| {
+            s.provision_spawn_image(
+                90_100,
+                "test/image",
+                ImageSource::PtLoadSegments { elf, entry },
+                false,
+                &mut startup,
+                64,
+            )
+        })
+    }
+
+    fn hold_every_allocatable_frame(k: &SharedKernel) -> alloc::vec::Vec<u64> {
+        let mut held = alloc::vec::Vec::new();
+        k.with(|s| {
+            while let Ok(pa) = s.alloc_user_data_frame() {
+                held.push(pa);
+            }
+        });
+        held
+    }
+
+    fn release_held(k: &SharedKernel, held: &mut alloc::vec::Vec<u64>, count: usize) {
+        k.with(|s| {
+            for _ in 0..count {
+                let Some(pa) = held.pop() else { break };
+                s.with_memory_state_mut(|m| {
+                    let _ = crate::kernel::boot::kernel_mut(&mut m.frame_allocator).free_frame(pa);
+                });
+            }
+        });
+    }
+
+    /// Every allocation position, on ONE kernel.
+    ///
+    /// U9-SPAWN-VM1's sweep needed a fresh kernel per position, because its rollback went through
+    /// the LIVE teardown and so consumed a retired-ASID slot each time; past `MAX_ADDRESS_SPACES`
+    /// of them the teardown correctly refused and the sweep measured that instead of the rollback.
+    /// The never-resident destroy takes no slot, so the whole sweep now runs on one kernel — which
+    /// is the stronger statement: every iteration starts from the baseline the previous
+    /// iteration's rollback restored, so drift accumulates instead of being reset away.
+    #[test]
+    fn frame_exhaustion_at_every_position_restores_every_column_on_one_kernel() {
+        let cost = {
+            let k = fixture();
+            let elf = tiny_elf();
+            let before = baseline(&k).free_frames;
+            provision(&k, &elf, 0x40_0000).expect("the reference provisioning succeeds");
+            before - baseline(&k).free_frames
+        };
+        assert!(cost > 0, "a provisioning must consume frames");
+
+        let k = fixture();
+        let mut held = hold_every_allocatable_frame(&k);
+        assert!(
+            held.len() > cost,
+            "the sweep needs more held frames ({}) than one provisioning costs ({cost})",
+            held.len()
+        );
+        let elf = tiny_elf();
+        let anchor = baseline(&k);
+        for n in 0..cost {
+            if n > 0 {
+                release_held(&k, &mut held, 1);
+            }
+            let before = baseline(&k);
+            let err = provision(&k, &elf, 0x40_0000)
+                .expect_err(&alloc::format!("{n} frames cannot fund a cost of {cost}"));
+            assert_eq!(
+                baseline(&k),
+                before,
+                "position {n} left state behind: {err:?}"
+            );
+            for repeat in 0..2 {
+                let _ = provision(&k, &elf, 0x40_0000).expect_err("again");
+                assert_eq!(
+                    baseline(&k),
+                    before,
+                    "repeat {repeat} at position {n} drifted"
+                );
+            }
+        }
+        // Across the whole sweep only the deliberately released frames moved: every other column
+        // is exactly where it started, which a per-kernel sweep could not have shown.
+        let end = baseline(&k);
+        assert_eq!(end.live_asids, anchor.live_asids, "no ASID leaked or moved");
+        assert_eq!(end.mappings, anchor.mappings, "no mapping leaked");
+        assert_eq!(
+            end.pt_pool_free_frames, anchor.pt_pool_free_frames,
+            "no page-table frame leaked"
+        );
+        assert_eq!(
+            end.memory_objects, anchor.memory_objects,
+            "no MemoryObject leaked"
+        );
+        assert_eq!(
+            end.memory_object_map_refs, anchor.memory_object_map_refs,
+            "no MemoryObject map reference leaked"
+        );
+        assert_eq!(
+            end.caller_cnode_slots, anchor.caller_cnode_slots,
+            "no capability leaked into the caller's cspace"
+        );
+        assert_eq!(end.tasks, anchor.tasks, "no task record leaked");
+    }
+
+    /// THE new boundary: the capability mint, which runs after a whole image is provisioned.
+    ///
+    /// U9-SPAWN-VM1 could not fail here — it minted inside `create_user_address_space`, before the
+    /// image existed. Now the mint owns a complete address space when it fails, and must give all
+    /// of it back while propagating its OWN error.
+    #[test]
+    fn a_capability_mint_failure_rolls_the_whole_provisioning_back() {
+        let k = fixture();
+        // Fill the caller's CNode through the production owner, so the mint fails the way it
+        // would in production rather than through a test-only switch.
+        let mut minted = 0usize;
+        let mint_err = loop {
+            let outcome = k.with(|s| {
+                s.mint_capability_for_current_context(Capability::new(
+                    CapObject::AddressSpace { asid: 0 },
+                    CapRights::READ,
+                ))
+            });
+            match outcome {
+                Ok(_) => {
+                    minted += 1;
+                    assert!(minted < 100_000, "the caller's CNode must be exhaustible");
+                }
+                Err(err) => break err,
+            }
+        };
+        assert!(
+            minted > 0,
+            "the mint must have worked before it stopped working"
+        );
+
+        let before = baseline(&k);
+        let elf = tiny_elf();
+        let err = provision(&k, &elf, 0x40_0000)
+            .expect_err("a provisioning whose capability cannot be published must fail");
+        assert_eq!(
+            err, mint_err,
+            "the MINT's own error must propagate — not a VM error invented by the rollback"
+        );
+        assert_eq!(
+            baseline(&k),
+            before,
+            "a failed mint must give back the whole provisioning it was publishing"
+        );
+        // And repeatedly: the arm is not one-shot.
+        for _ in 0..3 {
+            let again = provision(&k, &elf, 0x40_0000).expect_err("again");
+            assert_eq!(again, mint_err, "the same typed error every time");
+            assert_eq!(baseline(&k), before, "and the same restored baseline");
+        }
+    }
+
+    /// A malformed image never moves any column: the plan is pure, so nothing is owned when it
+    /// refuses. Stronger than restoration, and the reason the plan runs first.
+    /// The page-table pool is a SEPARATE allocator from the general one, with its own global
+    /// lock, and the arch backend draws from it to build the hierarchy behind each mapping. It is
+    /// therefore its own leak channel, and its own restoration claim.
+    ///
+    /// This measures whether the column has reach here rather than assuming it: it records what a
+    /// provisioning actually consumes, then requires the rollback to return exactly that. (It has
+    /// reach even under `hosted-dev`, which was worth checking — the shadow page tables still
+    /// allocate hierarchy pages from the pool.)
+    #[test]
+    fn the_page_table_pool_is_consumed_and_returned_exactly() {
+        let k = fixture();
+        let before = crate::kernel::frame_allocator::pt_pool_free_frames();
+        let provisioned = provision(&k, &tiny_elf(), 0x40_0000).expect("provisioned");
+        let during = crate::kernel::frame_allocator::pt_pool_free_frames();
+        assert!(
+            during <= before,
+            "a provisioning may only consume page-table frames, never invent them"
+        );
+        k.with(|s| {
+            s.with_vm_then_memory_mut(|vm, memory| {
+                crate::kernel::boot::vm_image_locked::destroy_unresident_address_space_locked(
+                    vm,
+                    memory,
+                    provisioned.asid,
+                )
+            })
+            .expect("rollback");
+            if let Some(cnode) = s.current_task_cnode() {
+                let _ = s.revoke_capability_in_cnode(cnode, provisioned.aspace_cap);
+            }
+        });
+        assert_eq!(
+            crate::kernel::frame_allocator::pt_pool_free_frames(),
+            before,
+            "the rollback must return every page-table frame the provisioning took \
+             (consumed {} during provisioning)",
+            before - during
+        );
+    }
+
+    #[test]
+    fn a_refused_image_moves_no_column_at_all() {
+        let k = fixture();
+        let before = baseline(&k);
+        let mut junk = tiny_elf();
+        junk[1] = b'X';
+        let err = provision(&k, &junk, 0x40_0000).expect_err("bad magic is refused");
+        assert_eq!(baseline(&k), before, "refusal moved state: {err:?}");
+        // A zero entry is refused at the same place, before an address space exists.
+        let good = tiny_elf();
+        let err = provision(&k, &good, 0).expect_err("a zero entry is refused");
+        assert_eq!(baseline(&k), before, "zero-entry refusal moved state: {err:?}");
+    }
+
+    /// A stale rollback is inert, and the rank-local destroy never consumes a retired-ASID slot —
+    /// which is what lets the sweep above run unbounded on one kernel.
+    #[test]
+    fn repeated_and_stale_rollback_is_inert_and_takes_no_retired_slot() {
+        let k = fixture();
+        let before = baseline(&k);
+        // A successful provisioning, then its exact rollback, twice more.
+        let provisioned = provision(&k, &tiny_elf(), 0x40_0000).expect("provisioned");
+        let asid = provisioned.asid;
+        k.with(|s| {
+            let first = s.with_vm_then_memory_mut(|vm, memory| {
+                crate::kernel::boot::vm_image_locked::destroy_unresident_address_space_locked(
+                    vm, memory, asid,
+                )
+            });
+            assert!(first.is_ok(), "the first rollback succeeds");
+            for _ in 0..3 {
+                let stale = s.with_vm_then_memory_mut(|vm, memory| {
+                    crate::kernel::boot::vm_image_locked::destroy_unresident_address_space_locked(
+                        vm, memory, asid,
+                    )
+                });
+                assert!(stale.is_err(), "a stale rollback is refused, not repeated");
+            }
+            // The capability the wrapper published is the caller's to revoke; do so, so the
+            // comparison below is against a fully released baseline.
+            if let Some(cnode) = s.current_task_cnode() {
+                let _ = s.revoke_capability_in_cnode(cnode, provisioned.aspace_cap);
+            }
+        });
+        assert_eq!(
+            baseline(&k),
+            before,
+            "one provisioning plus its rollback returns every column"
+        );
+
+        // Many cycles: with no retired-ASID slot consumed, this cannot run out.
+        for cycle in 0..(MAX_ADDRESS_SPACES * 3) {
+            let p = provision(&k, &tiny_elf(), 0x40_0000)
+                .unwrap_or_else(|e| panic!("cycle {cycle} could not provision: {e:?}"));
+            k.with(|s| {
+                s.with_vm_then_memory_mut(|vm, memory| {
+                    crate::kernel::boot::vm_image_locked::destroy_unresident_address_space_locked(
+                        vm, memory, p.asid,
+                    )
+                })
+                .unwrap_or_else(|e| panic!("cycle {cycle} could not roll back: {e:?}"));
+                if let Some(cnode) = s.current_task_cnode() {
+                    let _ = s.revoke_capability_in_cnode(cnode, p.aspace_cap);
+                }
+            });
+            assert_eq!(baseline(&k), before, "cycle {cycle} drifted");
+        }
+    }
+}
