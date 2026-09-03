@@ -258,8 +258,8 @@ impl KernelState {
             }
         }
 
-        let (removed_cnode_space, removed_process_record) = self
-            .with_capability_state_mut(|capability| {
+        let (removed_cnode_space, removed_process_record) =
+            self.with_capability_state_mut(|capability| {
                 reap_process_cspace_locked(capability, pid, cnode)
             });
 

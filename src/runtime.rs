@@ -2478,8 +2478,7 @@ impl SharedKernel {
         // ── task 2: nothing of this process may still be alive. ────────────────────────
         let (has_live_threads, carries_asid) = self.with_task_tcbs_split_mut(|tcbs| {
             let live = tcbs.iter().flatten().any(|tcb| {
-                tcb.thread_group_id.0 == pid
-                    && tcb.status != crate::kernel::task::TaskStatus::Dead
+                tcb.thread_group_id.0 == pid && tcb.status != crate::kernel::task::TaskStatus::Dead
             });
             let asid = tcbs
                 .iter()
@@ -2542,18 +2541,15 @@ impl SharedKernel {
                 .unwrap_or(record.dest_tid);
             if crate::kernel::boot::cnode_state::link_names_process(source_pid, dest_pid, pid) {
                 self.with_capability_state_split_mut(|capability| {
-                    crate::kernel::boot::kernel_mut(
-                        &mut capability.delegated_capability_links,
-                    )[idx] = None;
+                    crate::kernel::boot::kernel_mut(&mut capability.delegated_capability_links)
+                        [idx] = None;
                 });
                 removed_delegation_links = removed_delegation_links.saturating_add(1);
             }
         }
         let (removed_cnode_space, removed_process_record) =
             self.with_capability_state_split_mut(|capability| {
-                crate::kernel::boot::cnode_state::reap_process_cspace_locked(
-                    capability, pid, cnode,
-                )
+                crate::kernel::boot::cnode_state::reap_process_cspace_locked(capability, pid, cnode)
             });
         crate::yarm_log!(
             "YARM_PROC_CNODE_CLEANUP_NOALLOC pid={} cnode={} slots=0 removed_links={} removed_cspace={} removed_record={}",

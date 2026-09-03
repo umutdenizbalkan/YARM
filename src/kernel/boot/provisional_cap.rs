@@ -163,7 +163,10 @@ pub(crate) struct DelegatedSlot {
 pub(crate) fn collect_link_closure_locked(
     capability: &CapabilitySubsystem,
     root_cap: CapId,
-) -> Option<([Option<DelegatedCapabilityLink>; MAX_PROVISIONAL_DESCENDANTS], usize)> {
+) -> Option<(
+    [Option<DelegatedCapabilityLink>; MAX_PROVISIONAL_DESCENDANTS],
+    usize,
+)> {
     let links = kernel_ref(&capability.delegated_capability_links);
     let mut out: [Option<DelegatedCapabilityLink>; MAX_PROVISIONAL_DESCENDANTS] =
         [None; MAX_PROVISIONAL_DESCENDANTS];

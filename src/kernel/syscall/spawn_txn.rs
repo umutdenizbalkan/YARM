@@ -48,6 +48,7 @@
 //! before the publication compensates exactly once, in reverse ownership order. After the
 //! publication there is no fallback and nothing left that can fail.
 
+use crate::kernel::boot::defs::DelegatedCapabilityLink;
 use crate::kernel::boot::exec_state::SpawnedImagePublication;
 use crate::kernel::boot::process_cnode_txn::{ProcessCNodeGrant, ProcessCNodeRequest};
 use crate::kernel::boot::provisional_cap::{
@@ -60,7 +61,6 @@ use crate::kernel::boot::spawn_ipc_cap_txn::{
     DelegationGrant, EndpointRemoval, ServiceEndpointGrant, ServiceEndpointRequest,
 };
 use crate::kernel::boot::{KernelError, RuntimeCapacityConfig, SpawnedUserTask, UserImageSpec};
-use crate::kernel::boot::defs::DelegatedCapabilityLink;
 use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::spawn_reservation::{ReservationRefusal, SpawnBaseline, SpawnReservationToken};
@@ -542,7 +542,8 @@ pub(crate) fn release_service_endpoint_grant<O: SpawnTxnOwners>(
 ) -> EndpointRemoval {
     let send = release_provisional_capability(owners, grant.owner_cnode, grant.send_cap);
     let recv = release_provisional_capability(owners, grant.owner_cnode, grant.recv_cap);
-    let removal = owners.remove_unpublished_endpoint(grant.endpoint_index, grant.endpoint_generation);
+    let removal =
+        owners.remove_unpublished_endpoint(grant.endpoint_index, grant.endpoint_generation);
     crate::yarm_log!(
         "SPAWN_EP_TXN_RELEASED slot={} generation={} send_revoked={} recv_revoked={} endpoint={:?}",
         grant.endpoint_index,
@@ -1426,16 +1427,13 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
     fn allocate_thread_id(&mut self) -> Result<u64, KernelError> {
         let max_tasks = self.capacity_limits().max_tasks;
         let policy = self.shared.tid_allocation_policy_split_read();
-        let (tid, delta) = self.shared.with_spawn_thread_split_mut(
-            |tcbs, _classes, cursor, _tls| {
-                crate::kernel::boot::spawn_thread_core::allocate_dynamic_tid_locked(
-                    tcbs,
-                    cursor,
-                    policy,
-                    max_tasks,
-                )
-            },
-        )?;
+        let (tid, delta) =
+            self.shared
+                .with_spawn_thread_split_mut(|tcbs, _classes, cursor, _tls| {
+                    crate::kernel::boot::spawn_thread_core::allocate_dynamic_tid_locked(
+                        tcbs, cursor, policy, max_tasks,
+                    )
+                })?;
         // Telemetry is rank 10 and is applied with the task lock released, exactly as the broad
         // twin does — which is what keeps 2 → 10 from ever being held nested.
         self.shared.apply_tid_allocation_delta_split(delta);
@@ -1495,10 +1493,9 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
         &mut self,
         token: &SpawnReservationToken,
     ) -> Result<SpawnBaseline, ReservationRefusal> {
-        self.shared
-            .with_task_tcbs_split_mut(|tcbs| {
-                crate::kernel::spawn_reservation::claim_for_spawn(tcbs, token)
-            })
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::spawn_reservation::claim_for_spawn(tcbs, token)
+        })
     }
     fn restore_after_failed_spawn(
         &mut self,
