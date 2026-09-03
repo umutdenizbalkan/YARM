@@ -44940,6 +44940,8 @@ mod stage163_sender_wake_proven {
     //     normal boot).
     #[test]
     fn stage163c_kernel_fork_diagnostics_gated() {
+        const FORK_TXN_SRC: &str = include_str!("../syscall/fork_txn.rs");
+        const MEMORY_STATE_SRC_163C: &str = include_str!("memory_state.rs");
         // Entry/return diagnostics in the syscall handler.
         assert!(
             PROCESS_SYSCALL_SRC.contains("FORK_PROOF_ENTER")
@@ -44958,16 +44960,69 @@ mod stage163_sender_wake_proven {
             "FORK_PROOF_CHILD_RET_SET",
             "FORK_PROOF_CHILD_ENQUEUE_OK",
         ] {
+            // U9-FORK1 §4: `FORK_PROOF_COW_*` stayed with the clone acquisition in
+            // `memory_state.rs`; every other step marker moved with the transaction.
             assert!(
-                THREAD_STATE_SRC.contains(marker),
+                FORK_TXN_SRC.contains(marker) || MEMORY_STATE_SRC_163C.contains(marker),
                 "fork clone path must emit `{marker}`"
             );
         }
-        // Gated on the sub-knob: every FORK_PROOF_ marker is behind a proof check.
+        // Gated on the sub-knob: every FORK_PROOF_ marker is behind a proof check. U9-FORK1 §4
+        // moved the markers into the transaction and the clone acquisition, so the gate is
+        // checked there — and now EXHAUSTIVELY: every `FORK_PROOF_` emission in the transaction
+        // is counted against the `if proof {` blocks that can contain one, which the old
+        // "the file mentions a proof check somewhere" form did not do.
+        for (name, src) in [
+            ("fork_txn.rs", FORK_TXN_SRC),
+            ("memory_state.rs", MEMORY_STATE_SRC_163C),
+        ] {
+            assert!(
+                src.contains("ipc_recv_proof_sender_wake_active()") && src.contains("if proof {"),
+                "{name}: kernel fork diagnostics must be proof-gated"
+            );
+        }
+        // Not one `FORK_PROOF_` emission may sit outside a proof gate. Every gated emission is
+        // nested inside `if proof {` and therefore indented deeper than a bare statement of the
+        // transaction body, which is what makes this checkable line by line rather than by a
+        // whole-file "mentions the gate somewhere".
+        let first_gate = FORK_TXN_SRC.find("if proof {").expect("a proof gate");
+        let first_marker = FORK_TXN_SRC.find("\"FORK_PROOF_").expect("a proof marker");
         assert!(
-            THREAD_STATE_SRC.contains("ipc_recv_proof_sender_wake_active()")
-                && THREAD_STATE_SRC.contains("if proof {"),
-            "kernel fork diagnostics must be proof-gated"
+            first_gate < first_marker,
+            "the proof gate must be established before the first FORK_PROOF_ emission"
+        );
+        // Walk the transaction body tracking brace depth, and require every `FORK_PROOF_`
+        // emission to be lexically inside an `if proof {` block. This is the exhaustive form: a
+        // new ungated marker cannot be added without failing here, which the old
+        // "the file mentions a proof check somewhere" assertion could not detect.
+        let body = super::stage163j_fork_return_lane::fork_complete_body();
+        let mut depth = 0i32;
+        let mut gate_depth: Option<i32> = None;
+        let mut ungated = alloc::vec::Vec::new();
+        for line in body.lines() {
+            let opens_gate = line.trim() == "if proof {";
+            if line.contains("\"FORK_PROOF_") && gate_depth.is_none() {
+                ungated.push(line.trim());
+            }
+            for ch in line.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if gate_depth == Some(depth) {
+                            gate_depth = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if opens_gate && gate_depth.is_none() {
+                gate_depth = Some(depth - 1);
+            }
+        }
+        assert!(
+            ungated.is_empty(),
+            "every FORK_PROOF_ emission must sit inside an `if proof {{` block; ungated: {ungated:?}"
         );
     }
 
@@ -45844,12 +45899,17 @@ mod stage163j_fork_return_lane {
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
 
-    fn fork_complete_body() -> &'static str {
-        THREAD_SRC
-            .split("fn fork_complete_post_clone")
+    /// U9-FORK1 §4: the fork body moved out of `thread_state.rs` into the generic transaction,
+    /// which BOTH the broad and the split adapter execute. Reading it here is therefore strictly
+    /// stronger than reading the old broad-only body: one assertion now binds both routes.
+    pub(super) const FORK_TXN_SRC: &str = include_str!("../syscall/fork_txn.rs");
+
+    pub(super) fn fork_complete_body() -> &'static str {
+        FORK_TXN_SRC
+            .split("pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(")
             .nth(1)
-            .map(|s| &s[..s.len().min(8500)])
-            .expect("fork_complete_post_clone body")
+            .and_then(|s| s.split("\n/// The reverse compensation").next())
+            .expect("fork transaction body")
     }
 
     // 1. The child's AUTHORITATIVE return lane is the saved GPR snapshot
@@ -45857,25 +45917,37 @@ mod stage163j_fork_return_lane {
     //    not merely `arg0` (which only feeds the new-task rdi path).
     #[test]
     fn stage163j_child_return_lane_gpr0_zeroed() {
-        let body = fork_complete_body();
+        // U9-FORK1 §4: snapshot-then-override is now ONE named function, so the property is
+        // checked where it is decided rather than in the middle of a long body.
+        let ctx = FORK_TXN_SRC
+            .split("pub(crate) fn fork_child_context(parent: &UserRegisterContext)")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("fork_child_context body");
         assert!(
-            body.contains("child.user_context.user_gprs[0] = 0;"),
+            ctx.contains("context.user_gprs[0] = 0;"),
             "child fork return lane (user_gprs[0]/rax) must be explicitly zeroed"
         );
         assert!(
-            body.contains("child.user_context = parent.user_context;"),
+            ctx.contains("context.arg0 = 0;"),
+            "the new-task lane must be zeroed too"
+        );
+        assert!(
+            ctx.contains("let mut context = *parent;"),
             "child context is cloned from the parent first"
         );
-        // The clone must precede the return-lane override (snapshot-then-override).
-        let clone_at = body
-            .find("child.user_context = parent.user_context;")
-            .expect("clone");
-        let zero_at = body
-            .find("child.user_context.user_gprs[0] = 0;")
-            .expect("zero");
+        let clone_at = ctx.find("let mut context = *parent;").expect("clone");
+        let zero_at = ctx.find("context.user_gprs[0] = 0;").expect("zero");
         assert!(
             clone_at < zero_at,
             "the return lane must be overridden AFTER copying the parent context"
+        );
+        // And the publication installs exactly that function's result — nothing else may write
+        // the child's context.
+        assert!(
+            fork_complete_body()
+                .contains("user_context: fork_child_context(&parent.user_context),"),
+            "the publication must install the one derived context"
         );
     }
 
@@ -45940,12 +46012,13 @@ mod stage163j_fork_return_lane {
             "FORK_PROOF_CHILD_FRAME_BEFORE_ENQUEUE",
         ] {
             assert!(
-                THREAD_SRC.contains(marker),
+                FORK_TXN_SRC.contains(marker),
                 "fork path must emit `{marker}`"
             );
         }
         assert!(
-            THREAD_SRC.contains("ipc_recv_proof_sender_wake_active()"),
+            FORK_TXN_SRC.contains("ipc_recv_proof_sender_wake_active()")
+                && FORK_TXN_SRC.contains("if proof {"),
             "fork diagnostics must be proof-gated"
         );
         assert!(
@@ -46105,11 +46178,7 @@ mod stage163k_no_smoke_interference {
     //    budget rather than the task table.
     #[test]
     fn stage163k_register_fail_reports_capacity_source() {
-        let body = THREAD_SRC
-            .split("fn fork_complete_post_clone")
-            .nth(1)
-            .map(|s| &s[..s.len().min(6500)])
-            .expect("fork_complete_post_clone body");
+        let body = super::stage163j_fork_return_lane::fork_complete_body();
         assert!(
             body.contains("FORK_PROOF_ALLOC_CHILD_CAPACITY")
                 && body.contains("max_total_cnode_slots")
@@ -46122,13 +46191,8 @@ mod stage163k_no_smoke_interference {
     // 4. Stage 163J child return-lane fix remains intact (ret0/rax/user_gpr0 = 0).
     #[test]
     fn stage163k_preserves_163j_return_lane() {
-        let body = THREAD_SRC
-            .split("fn fork_complete_post_clone")
-            .nth(1)
-            .map(|s| &s[..s.len().min(8500)])
-            .expect("fork_complete_post_clone body");
         assert!(
-            body.contains("child.user_context.user_gprs[0] = 0;"),
+            super::stage163j_fork_return_lane::FORK_TXN_SRC.contains("context.user_gprs[0] = 0;"),
             "Stage 163J: child return lane (user_gprs[0]/rax) must stay zeroed"
         );
     }
@@ -46688,32 +46752,29 @@ mod stage163n_sender_wake_fix {
     // preventing AArch64 SMP CPU-scatter that starves the child.
     #[test]
     fn stage163n_fork_child_enqueued_with_woken_task() {
-        let fork_body = THREAD_STATE_SRC
-            .split("fn fork_complete_post_clone")
-            .nth(1)
-            .and_then(|s| s.split("\n    pub").next())
-            .expect("fork_complete_post_clone body");
+        let fork_body = super::stage163j_fork_return_lane::fork_complete_body();
+        // U9-FORK1 §4: the child still lands on the parent's CPU, now stated EXPLICITLY —
+        // `enqueue_on_cpu(current_cpu())` names the CPU instead of deriving it inside
+        // `enqueue_woken_task`, and the balanced placement that would scatter it is provably
+        // absent from the fork transaction.
         assert!(
-            fork_body.contains("enqueue_woken_task(child_tid)"),
-            "fork_complete_post_clone must use enqueue_woken_task so child lands on parent's CPU"
+            fork_body.contains("let cpu = owners.current_cpu();")
+                && fork_body.contains("owners.enqueue_on_cpu(cpu, child_tid)"),
+            "the fork must enqueue the child on the PARENT's CPU"
         );
         assert!(
-            !fork_body.contains("enqueue_task(child_tid)"),
-            "fork_complete_post_clone must not use enqueue_task (would scatter to any online CPU)"
+            !fork_body.contains("enqueue_balanced"),
+            "the fork must not use enqueue_balanced (would scatter to any online CPU)"
         );
     }
 
     // Task B: fork child enqueue log includes cpu and reason fields (from enqueue_woken_task).
     #[test]
     fn stage163n_fork_child_enqueue_log_includes_cpu_reason() {
-        let fork_body = THREAD_STATE_SRC
-            .split("fn fork_complete_post_clone")
-            .nth(1)
-            .and_then(|s| s.split("\n    pub").next())
-            .expect("fork_complete_post_clone body");
+        let fork_body = super::stage163j_fork_return_lane::fork_complete_body();
         assert!(
             fork_body.contains("FORK_PROOF_CHILD_ENQUEUE_OK child_tid={} cpu={} reason={}"),
-            "fork enqueue log must include cpu and reason fields from enqueue_woken_task"
+            "fork enqueue log must include cpu and reason fields"
         );
     }
 
@@ -59258,15 +59319,19 @@ mod stage181c_fork_internal {
     // headroom, the requested child capacity, and a per-owner cnode breakdown.
     #[test]
     fn stage181c_fork_failure_reports_pool_and_owner_breakdown() {
+        // U9-FORK1 §4: the breakdown moved to `handle_fork`'s error arm — the one place on the
+        // fork's error path that still holds `&mut KernelState`, since the transaction runs over
+        // an owner interface that cannot reach the frame allocator. Same fields, same sub-knob.
+        const FORK_HANDLER_SRC: &str = include_str!("../syscall/process.rs");
         assert!(
-            THREAD_SRC.contains("FORK_PROOF_ALLOC_CHILD_POOL")
-                && THREAD_SRC.contains("pt_pool_free_frames")
-                && THREAD_SRC.contains("child_requested_slots="),
+            FORK_HANDLER_SRC.contains("FORK_PROOF_ALLOC_CHILD_POOL")
+                && FORK_HANDLER_SRC.contains("pt_pool_free_frames")
+                && FORK_HANDLER_SRC.contains("child_requested_slots="),
             "fork failure must report PT-pool headroom + child requested slots"
         );
         assert!(
-            THREAD_SRC.contains("FORK_PROOF_ALLOC_CHILD_CNODE_OWNER")
-                && THREAD_SRC.contains("cnode_occupied_slots"),
+            FORK_HANDLER_SRC.contains("FORK_PROOF_ALLOC_CHILD_CNODE_OWNER")
+                && FORK_HANDLER_SRC.contains("cnode_occupied_slots"),
             "fork failure must emit a per-owner cnode breakdown (id/reserved/occupied)"
         );
     }
@@ -118701,7 +118766,13 @@ mod stage199d_wa2a_ownership_boundary {
             // U9-SPAWN1 SP-2: `spawn_user_thread`'s Runnable write moved to the shared
             // thread-incarnation owner, so thread_state.rs falls 4 -> 3 and the owner gains 1.
             ("src/kernel/boot/spawn_thread_core.rs", 1),
-            ("src/kernel/boot/thread_state.rs", 3),
+            // U9-FORK1 §4: 3 -> 2. `fork_complete_post_clone` wrote `child.status = Runnable`
+            // directly, making a fork child live in the middle of a sequence that could still
+            // fail seven different ways. The fork now runs on the spawn reservation lifecycle, so
+            // the child becomes Runnable through `commit_live_spawn` — an already-enumerated
+            // writer in `spawn_reservation.rs` — and this file loses a status writer rather than
+            // gaining one. The census total falls by one; no new candidate wake owner exists.
+            ("src/kernel/boot/thread_state.rs", 2),
             ("src/kernel/spawn_reservation.rs", 2),
             ("src/kernel/task.rs", 2),
             ("src/kernel/task_transition.rs", 1),
@@ -118761,12 +118832,14 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            39,
-            "36 raw writes (U6 added `commit_blocking_send_split`; U7 added \
+            38,
+            "35 raw writes (U6 added `commit_blocking_send_split`; U7 added \
              `drain_send_timeout_post_work`; U9-F added \
              `wake_destroyed_notification_waiter_split`; U9-RX3 added the exact BLOCK/UNWIND \
-             pair `recv_block_phase_b_split` and `recv_block_unwind_race_split`), the WA3A \
-             barrier's single write, and the WA3B barrier's two"
+             pair `recv_block_phase_b_split` and `recv_block_unwind_race_split`; U9-FORK1 \
+             RETIRED `fork_complete_post_clone`'s direct Runnable write, 36 -> 35, because the \
+             fork child now becomes live through the reservation commit), the WA3A barrier's \
+             single write, and the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -119270,12 +119343,10 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Cannot,
         ),
-        (
-            "src/kernel/boot/thread_state.rs",
-            "fork_complete_post_clone",
-            1,
-            Verdict::Cannot,
-        ),
+        // U9-FORK1 §4 RETIRED this row. `fork_complete_post_clone` wrote `child.status =
+        // Runnable` directly; the fork now runs on the spawn reservation lifecycle and the child
+        // becomes live through `commit_live_spawn` (already enumerated in spawn_reservation.rs).
+        // One fewer status writer, and no new candidate wake owner.
         // ── task.rs (2) ─────────────────────────────────────────────────────────────────────
         ("src/kernel/task.rs", "new", 1, Verdict::FreshConstructor),
         // Stage 199D-WA3B: the non-live reservation constructor. A fresh constructor like
@@ -119748,14 +119819,7 @@ mod stage199d_wa2b_wake_owner_census {
             "}",
             "if wake_count < wake_tids.len() {",
         ),
-        (
-            "src/kernel/boot/thread_state.rs",
-            "fork_complete_post_clone",
-            "child.status",
-            "TaskStatus::Runnable",
-            "child.user_context.arg0 = 0;",
-            "Ok::<_, KernelError>(())",
-        ),
+        // U9-FORK1 §4 RETIRED this fingerprint along with the write it pinned.
         (
             "src/kernel/task.rs",
             "new",
@@ -119947,8 +120011,9 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            35,
-            "33 raw writes: U6 (199C) added `commit_blocking_send_split`, the split form of the \
+            34,
+            "32 raw writes (U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
+             write, 33 -> 32, when the fork moved onto the spawn reservation lifecycle): U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
              split form of \
              `wake_tid_to_runnable`'s transition, when the blocked-waiter Phase-C completions \
@@ -120023,8 +120088,9 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            44,
-            "37 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
+            43,
+            "U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43. \
+             36 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
              `commit_blocking_send_split`, U3 (203C)'s `wake_tid_to_runnable_split`, and U7 \
              (199E)'s `drain_send_timeout_post_work`"
         );
@@ -120038,9 +120104,10 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            44,
-            "35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair) + 8 transition-barriered \
-             sites + 1 reservation-barriered site"
+            43,
+            "34 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
+             `fork_complete_post_clone`'s, 35 -> 34) + 8 transition-barriered sites + 1 \
+             reservation-barriered site"
         );
     }
 
@@ -120373,7 +120440,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            44,
+            43,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -120399,7 +120466,10 @@ mod stage199d_wa2b_wake_owner_census {
         // fresh wait generation, so it is never a transition out.
         assert_eq!(
             (can, cannot, into_blocked, fresh, non_production),
-            (15, 17, 9, 2, 1)
+            // U9-FORK1 §4: CANNOT 17 -> 16. `fork_complete_post_clone`'s Runnable write was a
+            // CANNOT row (it wrote a slot the fork had just registered, so it could wake nothing);
+            // retiring the write retires the row.
+            (15, 16, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -120474,12 +120544,7 @@ mod stage199d_wa2b_wake_owner_census {
                 // never name a live task, let alone a Blocked one.
                 ".position(Option::is_none)",
             ),
-            (
-                "thread_state.rs",
-                "fork_complete_post_clone",
-                "let child_tid = match self.allocate_thread_id() {",
-                "fn fork_complete_post_clone(",
-            ),
+            // U9-FORK1 §4 RETIRED this row: the write it guarded no longer exists.
             (
                 "runtime.rs",
                 "futex_wake_split_mut",

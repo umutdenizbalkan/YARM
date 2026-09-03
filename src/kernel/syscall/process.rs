@@ -108,6 +108,36 @@ pub(super) fn handle_fork(
             let se = SyscallError::from(e);
             if proof {
                 crate::yarm_log!("FORK_PROOF_RETURN_ERR code={} reason={:?}", se as usize, e);
+                // U9-FORK1 §4: the PT-pool / per-owner CNode breakdown. It used to sit inside
+                // `fork_complete_post_clone`'s register arm; the transaction that replaced that
+                // arm runs over an owner interface and cannot reach the frame allocator or
+                // enumerate CNode spaces, so the breakdown moved HERE — the one place on the
+                // fork's error path that still holds `&mut KernelState`. Same fields, same
+                // sub-knob, same purpose: `reserved_cnode_slots` well under `max_total` means the
+                // failure is the slab heap behind the PT pool, not the slot budget.
+                let limits = kernel.runtime_capacity_config();
+                let child_requested = limits.default_cnode_slot_capacity;
+                crate::yarm_log!(
+                    "FORK_PROOF_ALLOC_CHILD_POOL child_requested_slots={} pt_pool_free_frames={} live_cnodes={}",
+                    child_requested,
+                    crate::kernel::frame_allocator::pt_pool_free_frames(),
+                    kernel.with_capability_state(|cap| cap.cnode_spaces.iter().flatten().count())
+                );
+                let owners = kernel.with_capability_state(|cap| {
+                    let mut out = alloc::vec::Vec::new();
+                    for space in cap.cnode_spaces.iter().flatten().take(40) {
+                        out.push((space.id, space.slot_capacity));
+                    }
+                    out
+                });
+                for (id, cap_slots) in owners {
+                    crate::yarm_log!(
+                        "FORK_PROOF_ALLOC_CHILD_CNODE_OWNER id={} reserved={} occupied={}",
+                        id.0,
+                        cap_slots,
+                        kernel.cnode_occupied_slots(id).unwrap_or(0)
+                    );
+                }
                 // Stage 181C: the actual cause behind an opaque `Internal` (err=255).
                 crate::yarm_log!(
                     "FORK_COW_FAIL reason={} kernel_error={:?} syscall_code={}",

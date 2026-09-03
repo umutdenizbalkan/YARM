@@ -2563,6 +2563,235 @@ impl SharedKernel {
     }
 
     /// U9-SPAWN-TXN2 §3 — the split twin of `KernelState::set_process_cnode_for_pid`.
+    // ── U9-FORK1 §4 — the seven fork owners, off the broad lock. ────────────────────────
+    //
+    // Each is the split spelling of the identically named `KernelState` owner in
+    // `kernel/boot/fork_owners.rs`, reaching the SAME rank-local body through a `SharedKernel`
+    // seam. Only one differs in behaviour, and deliberately:
+    // `complete_cow_write_protect_shootdown_split` PERFORMS the shootdown, because unlike the
+    // broad route it holds no lock while waiting for the ACK.
+
+    /// rank 2, ONE acquisition — the parent's whole fork-relevant state.
+    pub(crate) fn fork_parent_snapshot_split(
+        &self,
+        tid: u64,
+    ) -> Option<crate::kernel::syscall::fork_txn::ForkParentFacts> {
+        let facts = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+            let idx = tcbs
+                .iter()
+                .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid))?;
+            let tcb = tcbs[idx].as_ref()?;
+            let class = (*classes.get(idx)?)?;
+            let asid = tcb.asid?;
+            Some(crate::kernel::syscall::fork_txn::ForkParentFacts {
+                tid,
+                class,
+                asid,
+                tls_ptr: tcb.tls_ptr,
+                user_entry: tcb.user_entry,
+                user_stack_top: tcb.user_stack_top,
+                user_context: tcb.user_context,
+                brk_bounds: None,
+            })
+        })?;
+        // rank 6, after rank 2 released.
+        let brk_bounds =
+            self.with_memory_split_mut(|memory| KernelState::task_brk_bounds_locked(memory, tid));
+        Some(crate::kernel::syscall::fork_txn::ForkParentFacts {
+            brk_bounds,
+            ..facts
+        })
+    }
+
+    /// rank 4 — the capabilities a fork inherits, by the one exhaustive policy.
+    pub(crate) fn snapshot_inheritable_caps_split(
+        &self,
+        tid: u64,
+    ) -> Result<crate::kernel::syscall::fork_txn::InheritableCaps, KernelError> {
+        let cnode = self.task_cnode_split(tid).ok_or(KernelError::TaskMissing)?;
+        // ONE capability-domain acquisition: enumerate the live slots and classify them in the
+        // same acquisition, so a slot revoked between the enumeration and the classification
+        // cannot be inherited. (The broad owner enumerates and then re-resolves per slot; under
+        // the broad lock that is equivalent, off it is not.)
+        let out = self.with_capability_state_split_mut(|capability| {
+            let mut out: crate::kernel::syscall::fork_txn::InheritableCaps = alloc::vec::Vec::new();
+            if let Some(space) = capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == cnode)
+            {
+                let cspace = crate::kernel::boot::kernel_ref(&space.cspace);
+                for cap in cspace.live_cap_ids() {
+                    if let Some(capability) = cspace.get(cap)
+                        && crate::kernel::syscall::fork_txn::fork_should_inherit_capability(
+                            capability.object,
+                        )
+                    {
+                        out.push((cap, capability.rights()));
+                    }
+                }
+            }
+            out
+        });
+        Ok(out)
+    }
+
+    /// rank 5 → 6, ONE acquisition — THE copy-on-write clone.
+    pub(crate) fn clone_address_space_cow_split(
+        &self,
+        parent_asid: crate::kernel::vm::Asid,
+        generation: u64,
+    ) -> Result<crate::kernel::boot::cow_clone::CowCloneToken, KernelError> {
+        self.with_vm_then_memory_split_mut(|vm, memory| {
+            crate::kernel::boot::cow_clone::clone_address_space_cow_locked(
+                vm,
+                memory,
+                parent_asid,
+                generation,
+            )
+        })
+        .map_err(|failure| {
+            crate::yarm_log!(
+                "FORK_SPLIT_COW_FAIL site={} va=0x{:x} reason={:?}",
+                failure.site,
+                failure.va,
+                failure.err
+            );
+            failure.err
+        })
+    }
+
+    /// NO lock — PERFORM the write-protection's owed TLB work.
+    ///
+    /// This is the half the broad route cannot do. Each downgraded page goes through
+    /// [`Self::complete_unmap_shootdown_split`], which invalidates locally and then waits for
+    /// every remote holder of this ASID to publish `ack_gen == req_gen` — with no domain lock
+    /// held, which is the whole §14.4 D3 requirement. `false` means at least one target did not
+    /// acknowledge, and the caller must refuse the fork: a remote CPU that still holds a writable
+    /// translation for a page the child now shares would silently break the copy-on-write.
+    pub(crate) fn complete_cow_write_protect_shootdown_split(
+        &self,
+        plan: &crate::kernel::boot::cow_clone::CowShootdownPlan,
+    ) -> bool {
+        if plan.is_empty() {
+            return true;
+        }
+        if !crate::kernel::boot::cow_clone::remote_write_protect_work_is_owed() {
+            crate::yarm_log!(
+                "FORK_COW_SHOOTDOWN_SPLIT asid={} runs={} pages={} result=broadcast_by_hardware",
+                plan.asid.0,
+                plan.runs.len(),
+                plan.pages()
+            );
+            return true;
+        }
+        let page_sz = crate::kernel::vm::PAGE_SIZE as u64;
+        let mut all_acked = true;
+        for run in &plan.runs {
+            for p in 0..run.pages {
+                let va = crate::kernel::vm::VirtAddr(run.virt.0 + p as u64 * page_sz);
+                if !self.complete_unmap_shootdown_split(plan.asid, va) {
+                    all_acked = false;
+                }
+            }
+        }
+        crate::yarm_log!(
+            "FORK_COW_SHOOTDOWN_SPLIT asid={} runs={} pages={} result={}",
+            plan.asid.0,
+            plan.runs.len(),
+            plan.pages(),
+            if all_acked { "ok" } else { "incomplete" }
+        );
+        all_acked
+    }
+
+    /// rank 5 → 6, ONE acquisition — the clone's exact inverse.
+    pub(crate) fn rollback_cow_clone_split(
+        &self,
+        token: &crate::kernel::boot::cow_clone::CowCloneToken,
+    ) -> crate::kernel::boot::cow_clone::CowCloneRollback {
+        let outcome = self.with_vm_then_memory_split_mut(|vm, memory| {
+            crate::kernel::boot::cow_clone::rollback_cow_clone_locked(vm, memory, token)
+        });
+        crate::yarm_log!(
+            "FORK_SPLIT_COW_ROLLBACK parent_asid={} child_asid={} outcome={:?}",
+            token.parent_asid.0,
+            token.child_asid.0,
+            outcome
+        );
+        outcome
+    }
+
+    /// rank 2, ONE acquisition — THE fork publication and its reservation commit.
+    pub(crate) fn publish_forked_child_split(
+        &self,
+        reservation: &crate::kernel::spawn_reservation::SpawnReservationToken,
+        publication: &crate::kernel::syscall::fork_txn::ForkChildPublication,
+    ) -> Result<(), crate::kernel::spawn_reservation::ReservationRefusal> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::spawn_reservation::validate_commit_ready(tcbs, reservation)?;
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == publication.tid)
+                .ok_or(crate::kernel::spawn_reservation::ReservationRefusal::TaskMissing)?;
+            tcb.thread_group_id = crate::kernel::task::ThreadGroupId(publication.tid);
+            tcb.asid = Some(publication.asid);
+            tcb.tls_ptr = publication.tls_ptr;
+            tcb.user_entry = publication.user_entry;
+            tcb.user_stack_top = publication.user_stack_top;
+            tcb.user_context = publication.user_context;
+            crate::kernel::spawn_reservation::commit_live_spawn(tcbs, reservation)
+        })?;
+        // rank 6, after rank 2 released: the child's brk bounds.
+        if let Some((base, end)) = publication.brk_bounds {
+            let _ = self.with_memory_split_mut(|memory| {
+                KernelState::set_task_brk_bounds_locked(memory, publication.tid, base, end)
+            });
+        }
+        crate::yarm_log!(
+            "FORK_CHILD_PUBLISHED_SPLIT tid={} asid={} pc=0x{:x} sp=0x{:x} ret0={} arg0={}",
+            publication.tid,
+            publication.asid.0,
+            publication.user_context.instruction_ptr.0,
+            publication.user_context.stack_ptr.0,
+            publication.user_context.user_gprs[0],
+            publication.user_context.arg0
+        );
+        Ok(())
+    }
+
+    /// rank 4 — the global reserved CNode-slot budget, for the capacity diagnostic.
+    pub(crate) fn reserved_cnode_slot_total_split(&self) -> usize {
+        self.with_capability_state_split_mut(|capability| {
+            capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .map(|space| space.slot_capacity)
+                .sum::<usize>()
+        })
+    }
+
+    /// rank 2 — remove a PUBLISHED fork child, through the one incarnation-undo owner.
+    pub(crate) fn remove_published_fork_child_split(&self, tid: u64) -> bool {
+        let removed = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+            crate::kernel::boot::spawn_thread_core::unregister_thread_incarnation_locked(
+                tcbs,
+                classes,
+                tid,
+                crate::kernel::task::ThreadGroupId(tid),
+            )
+        });
+        crate::yarm_log!(
+            "FORK_CHILD_UNPUBLISHED_SPLIT tid={} removed={}",
+            tid,
+            u8::from(removed)
+        );
+        removed
+    }
+
     pub(crate) fn set_process_cnode_for_pid_split(
         &self,
         pid: u64,
