@@ -91,7 +91,9 @@ pub(super) fn handle_fork(
             crate::kernel::frame_allocator::pt_pool_free_frames()
         );
     }
-    match kernel.fork_user_process_cow(parent_tid) {
+    // The LIVE frame, not the TCB: see `fork_txn`'s note on where the child's context
+    // comes from. This route holds the parent's frame, so it passes it.
+    match kernel.fork_user_process_cow(parent_tid, Some(frame.capture_user_context())) {
         Ok(child_tid) => {
             if proof {
                 crate::yarm_log!("FORK_PROOF_PARENT_RET child_tid={}", child_tid);

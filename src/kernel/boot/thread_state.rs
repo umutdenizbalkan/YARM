@@ -2736,9 +2736,13 @@ impl KernelState {
     /// steps that returned `Err` without undoing it — is replaced by the delivered spawn
     /// reservation lifecycle, so every failure arm now has an exact inverse. See `fork_txn.rs`
     /// for the order and the ledger.
-    pub fn fork_user_process_cow(&mut self, parent_tid: u64) -> Result<u64, KernelError> {
+    pub fn fork_user_process_cow(
+        &mut self,
+        parent_tid: u64,
+        parent_context: Option<crate::kernel::task::UserRegisterContext>,
+    ) -> Result<u64, KernelError> {
         let mut owners = crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: self };
-        crate::kernel::syscall::fork_txn::fork_process_cow(&mut owners, parent_tid)
+        crate::kernel::syscall::fork_txn::fork_process_cow(&mut owners, parent_tid, parent_context)
     }
 }
 

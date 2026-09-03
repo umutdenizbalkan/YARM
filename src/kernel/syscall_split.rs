@@ -3811,7 +3811,12 @@ fn try_split_fork_into_frame(
         return None;
     };
     let mut owners = spawn_owners_for(shared, cpu)?;
-    match crate::kernel::syscall::fork_txn::fork_process_cow(&mut owners, parent_tid) {
+    let parent_context = frame.capture_user_context();
+    match crate::kernel::syscall::fork_txn::fork_process_cow(
+        &mut owners,
+        parent_tid,
+        Some(parent_context),
+    ) {
         Ok(child_tid) => {
             let Ok(ret0) = usize::try_from(child_tid) else {
                 // Unreachable for any TID this kernel allocates, and NOT a place to fall back to

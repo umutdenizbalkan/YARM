@@ -6947,7 +6947,7 @@ fn fork_child_preserves_parent_registers_except_arg0() {
         .set_thread_user_context(33, parent_ctx)
         .expect("set parent ctx");
 
-    let child_tid = state.fork_user_process_cow(33).expect("fork");
+    let child_tid = state.fork_user_process_cow(33, None).expect("fork");
     let child_ctx = state
         .thread_user_context(child_tid)
         .expect("child user context");
@@ -6994,7 +6994,7 @@ fn fork_child_sets_tls_restore_pending_when_tls_present() {
         .set_thread_tls_base(34, 0xABCD_0000)
         .expect("set parent tls");
 
-    let child_tid = state.fork_user_process_cow(34).expect("fork");
+    let child_tid = state.fork_user_process_cow(34, None).expect("fork");
     assert_eq!(state.thread_tls_base(child_tid), Some(0xABCD_0000));
     assert_eq!(state.tls_restore_pending(child_tid), Some(true));
 }
@@ -7017,7 +7017,7 @@ fn fork_child_starts_with_empty_robust_futex_state() {
         .set_robust_futex_head(35, 0x5000, 8)
         .expect("parent robust futex");
 
-    let child_tid = state.fork_user_process_cow(35).expect("fork");
+    let child_tid = state.fork_user_process_cow(35, None).expect("fork");
     assert!(state.robust_futex_state(35).is_some());
     assert_eq!(state.robust_futex_state(child_tid), None);
 }
@@ -7039,7 +7039,7 @@ fn fork_child_inherits_brk_bounds() {
     state
         .set_task_brk_bounds(37, 0x5000, 0x9000)
         .expect("set parent brk");
-    let child_tid = state.fork_user_process_cow(37).expect("fork");
+    let child_tid = state.fork_user_process_cow(37, None).expect("fork");
     assert_eq!(state.task_brk_bounds(child_tid), Some((0x5000, 0x9000)));
 }
 
@@ -7065,7 +7065,7 @@ fn fork_child_inherits_parent_endpoint_caps_with_same_rights() {
         .grant_capability_task_to_task_with_rights(0, recv_root, 39, CapRights::RECEIVE)
         .expect("grant recv");
 
-    let child_tid = state.fork_user_process_cow(39).expect("fork");
+    let child_tid = state.fork_user_process_cow(39, None).expect("fork");
     let child_caps = state
         .snapshot_live_capabilities_for_task(child_tid)
         .expect("child caps");
@@ -7135,7 +7135,7 @@ fn fork_child_does_not_inherit_kernel_caps() {
         )
         .expect("mint kernel cap");
 
-    let child_tid = state.fork_user_process_cow(40).expect("fork");
+    let child_tid = state.fork_user_process_cow(40, None).expect("fork");
     let child_caps = state
         .snapshot_live_capabilities_for_task(child_tid)
         .expect("child caps");
@@ -7290,7 +7290,7 @@ fn fork_cow_cap_refcount_incremented_after_inherit() {
         1
     );
 
-    let child_tid = state.fork_user_process_cow(42).expect("fork");
+    let child_tid = state.fork_user_process_cow(42, None).expect("fork");
     let _ = child_tid;
 
     let slot = state
@@ -7325,7 +7325,7 @@ fn fork_child_exit_does_not_reclaim_shared_frame_while_parent_alive() {
         .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x2000), PageFlags::USER_RW)
         .expect("map parent");
 
-    let child_tid = state.fork_user_process_cow(43).expect("fork");
+    let child_tid = state.fork_user_process_cow(43, None).expect("fork");
     let child_asid = state.task_asid(child_tid).expect("child asid");
 
     // Destroy child address space (simulates child exit cleanup).
@@ -7375,7 +7375,7 @@ fn fork_parent_exit_does_not_reclaim_while_child_maps_frame() {
         .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x3000), PageFlags::USER_RW)
         .expect("map parent");
 
-    let child_tid = state.fork_user_process_cow(44).expect("fork");
+    let child_tid = state.fork_user_process_cow(44, None).expect("fork");
     let child_asid = state.task_asid(child_tid).expect("child asid");
 
     // Exit parent: destroy address space then revoke all parent caps.
@@ -7426,7 +7426,7 @@ fn fork_both_exit_reclaims_shared_frame() {
         .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x4000), PageFlags::USER_RW)
         .expect("map parent");
 
-    let child_tid = state.fork_user_process_cow(45).expect("fork");
+    let child_tid = state.fork_user_process_cow(45, None).expect("fork");
     let child_asid = state.task_asid(child_tid).expect("child asid");
 
     // Exit child: destroy child asid, revoke child caps.
@@ -7965,7 +7965,7 @@ fn fork_cow_split_old_frame_eventually_freed_after_both_exit() {
         .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x8000), PageFlags::USER_RW)
         .expect("map parent");
 
-    let child_tid = state.fork_user_process_cow(51).expect("fork");
+    let child_tid = state.fork_user_process_cow(51, None).expect("fork");
     let child_asid = state.task_asid(child_tid).expect("child asid");
 
     // Child triggers a COW split — it gets a new private frame.
@@ -20523,7 +20523,7 @@ fn fork_cap_inheritance_increments_refcount() {
         "cap_refcount must be 1 before fork"
     );
 
-    let _child_tid = state.fork_user_process_cow(51).expect("fork");
+    let _child_tid = state.fork_user_process_cow(51, None).expect("fork");
 
     let slot = state
         .memory_object_slot_by_id(mo_id)
@@ -45946,22 +45946,42 @@ mod stage163j_fork_return_lane {
         // the child's context.
         assert!(
             fork_complete_body()
-                .contains("user_context: fork_child_context(&parent.user_context),"),
-            "the publication must install the one derived context"
+                .contains("fork_child_context(&parent_context.unwrap_or(parent.user_context))"),
+            "the publication must install the one derived context, from the LIVE frame when the \
+             caller has one"
         );
     }
 
     // 2. The parent's fork return is the child TID (ret0 = child_tid, err = 0).
     #[test]
     fn stage163j_parent_returns_child_tid() {
+        // U9-FORK1 §4: BOTH routes write the parent's return lane, so both are checked. The
+        // broad handler is now the fallback; the split route is what a production fork takes.
         let handler = PROCESS_SRC
             .split("fn handle_fork")
             .nth(1)
-            .map(|s| &s[..s.len().min(1800)])
+            .map(|s| &s[..s.len().min(3200)])
             .expect("handle_fork body");
         assert!(
             handler.contains("frame.set_ok(") && handler.contains("usize::try_from(child_tid)"),
-            "parent fork return must be child_tid via set_ok"
+            "parent fork return must be child_tid via set_ok (broad route)"
+        );
+        const SPLIT_FORK: &str = include_str!("../syscall_split.rs");
+        let route = SPLIT_FORK
+            .split("fn try_split_fork_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n/// Read and normalise").next())
+            .expect("the split fork route");
+        assert!(
+            route.contains("usize::try_from(child_tid)")
+                && route.contains("frame.set_ok(ret0, 0, 0)"),
+            "parent fork return must be child_tid via set_ok (split route)"
+        );
+        // And BOTH must take the child's context from the live frame, not the TCB.
+        assert!(
+            handler.contains("Some(frame.capture_user_context())")
+                && route.contains("frame.capture_user_context()"),
+            "both routes must pass the parent's LIVE frame context"
         );
     }
 

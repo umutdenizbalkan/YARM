@@ -41,6 +41,20 @@
 //! observable while any of that can still happen; nothing is enqueued before step 8, so it is not
 //! dispatchable until everything else is done.
 //!
+//! # Where the child's register context comes from
+//!
+//! From the parent's LIVE trap frame, passed in as `parent_context` — never from the parent's
+//! TCB. The TCB copy is refreshed by `sync_current_thread_from_frame`, which a split route runs
+//! AFTER the dispatcher, so a child built from the TCB inherits the parent's context from its
+//! PREVIOUS trap. On RISC-V that is the `ecall` address rather than `ecall + 4`, and the child
+//! resumes onto its own fork instruction and forks again — a re-fork loop bounded only by
+//! capacity, which is exactly what a first live matrix showed (12, 9 and 2 forks across three
+//! otherwise identical boots). The frame is authoritative for the in-flight syscall on every
+//! architecture and on both routes, so both pass it and the two cannot diverge.
+//!
+//! `None` is the no-frame caller — hosted bring-up and the focused tests — which falls back to
+//! the TCB snapshot explicitly rather than ambiently.
+//!
 //! # Where the parent's identity comes from
 //!
 //! Step 1 and nowhere else. After it, the transaction reads no ambient current task: every later
@@ -70,6 +84,9 @@ pub(crate) struct ForkParentFacts {
     pub(crate) tls_ptr: Option<VirtAddr>,
     pub(crate) user_entry: Option<VirtAddr>,
     pub(crate) user_stack_top: Option<VirtAddr>,
+    /// The parent's LAST SAVED context. It is authoritative only for a caller that has no live
+    /// trap frame; a syscall route must pass its frame's own capture instead. See
+    /// [`fork_process_cow`]'s `parent_context`.
     pub(crate) user_context: UserRegisterContext,
     pub(crate) brk_bounds: Option<(usize, usize)>,
 }
@@ -117,6 +134,7 @@ pub(crate) fn fork_child_context(parent: &UserRegisterContext) -> UserRegisterCo
 pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(
     owners: &mut O,
     parent_tid: u64,
+    parent_context: Option<UserRegisterContext>,
 ) -> Result<u64, KernelError> {
     // Proof-gated step diagnostics, active only under the sender-wake sub-knob. They name the
     // SAME phases the pre-U9-FORK1 fork named, so the existing oracles read unchanged; what
@@ -319,7 +337,7 @@ pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(
         tls_ptr: parent.tls_ptr,
         user_entry: parent.user_entry,
         user_stack_top: parent.user_stack_top,
-        user_context: fork_child_context(&parent.user_context),
+        user_context: fork_child_context(&parent_context.unwrap_or(parent.user_context)),
         brk_bounds: parent.brk_bounds,
     };
     if let Err(refusal) = owners.publish_forked_child(&reservation, &publication) {
