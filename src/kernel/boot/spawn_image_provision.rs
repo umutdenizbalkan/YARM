@@ -46,8 +46,13 @@
 //! from and which loader reads them. Everything after that — the address space, its capability,
 //! the stack, the extents, the rollback — is shared and stated once.
 
+use super::defs::MemorySubsystem;
+use super::vm_image_locked::{
+    allocate_user_stack_locked, create_address_space_locked,
+    destroy_unresident_address_space_locked, map_user_page_in_asid_raw_locked,
+};
 use super::*;
-use crate::kernel::vm::{CachePolicy, PAGE_SIZE};
+use crate::kernel::vm::{AddressSpaceManager, CachePolicy, PAGE_SIZE};
 
 /// How a spawn obtains its immutable image bytes. The ONLY axis NR 23 and NR 29 differ on.
 pub(crate) enum ImageSource<'a> {
@@ -209,26 +214,305 @@ fn elf_load_extents(image: &[u8]) -> Result<(u64, u64, u64), KernelError> {
     Ok((rd_u64(24)?, first, end))
 }
 
+/// Everything one provisioning needs, all of it immutable.
+///
+/// A request is the whole input surface of [`provision_image_locked`]. There is no ambient state
+/// behind it — no current task, no current CPU, no `KernelState` — which is what makes the body's
+/// rank-locality checkable by reading its signature rather than by tracing its callees.
+pub(crate) struct ImageProvisionRequest<'a> {
+    /// Whose stack slot to use. A plain number here: the body never looks the task up, and the
+    /// task need not exist yet.
+    pub(crate) tid: u64,
+    pub(crate) source: ImageSource<'a>,
+    /// NR 23 only: also map the boot initrd read-only for `initramfs_srv`.
+    pub(crate) map_initrd_window: bool,
+    pub(crate) stack_pages: usize,
+}
+
+/// What a rank-local provisioning produced. Identity-bearing, and deliberately capability-free.
+///
+/// U9-SPAWN-VM2 §2: the address-space capability is NOT in here. Minting one reads the current
+/// task's CNode (rank 2) and writes a capability space (rank 4), and doing that while VM (rank 5)
+/// is held is a rank inversion. The token names the address space; publishing a capability over it
+/// is the broad wrapper's separate step, after both locks are released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProvisionToken {
+    /// The child's address space. Not CPU-resident until the commit binds it to a task, which is
+    /// exactly what makes [`rollback_provision_locked`] exact and shootdown-free.
+    pub(crate) asid: Asid,
+    pub(crate) entry: usize,
+    /// Top of the child's user stack, already mapped in `asid`.
+    pub(crate) stack_top: VirtAddr,
+    /// Zero-copy and copied page counts, for the `PM_ELF_ZC_DONE` accounting NR 29 reports.
+    pub(crate) zc_pages: usize,
+    pub(crate) copied_pages: usize,
+    /// `(user pointer, length)` of the initrd window, when one was mapped. The body returns it
+    /// rather than writing the caller's startup slots, so it owns no caller state either.
+    pub(crate) initrd_user_window: Option<(u64, u64)>,
+    /// The extents the plan computed, carried so the caller can report what it provisioned
+    /// without walking the program headers a third time.
+    pub(crate) first_vaddr: u64,
+    pub(crate) last_vaddr_end: u64,
+}
+
+/// THE rank-local image provisioner.
+///
+/// Takes the VM manager (rank 5), the memory subsystem (rank 6) and immutable facts. That is the
+/// entire input surface: it cannot read a task, touch the scheduler, mint a capability, consult
+/// the current CPU or call back into `KernelState`, because it was handed none of them.
+///
+/// Phases, in order, each owning what the previous one produced:
+///
+/// 1. **Plan** — validate the image and compute its extents. Pure; nothing is owned yet, so a
+///    malformed image costs nothing to refuse.
+/// 2. **Address space** — create the ASID. From here a failure owes a rollback.
+/// 3. **Load** — the image-source adapter maps the segments and their backing.
+/// 4. **Initrd window** — NR 23 only; tolerated on failure, because `initramfs_srv` falls back to
+///    its syscall bridge when the window is absent.
+/// 5. **Stack** — allocate and map the child's user stack in the same address space.
+/// 6. **Token** — the ASID, the entry, the stack top, and the result facts.
+///
+/// On any failure from phase 3 onward, [`rollback_provision_locked`] returns the address space and
+/// everything mapped into it, exactly once.
+pub(crate) fn provision_image_locked(
+    vm: &mut AddressSpaceManager,
+    memory: &mut MemorySubsystem,
+    request: &ImageProvisionRequest<'_>,
+) -> Result<ProvisionToken, KernelError> {
+    // ── 1. Plan. Nothing is owned yet, so a refusal here is free. ───────────────────────
+    let (elf, declared_entry) = match &request.source {
+        ImageSource::PtLoadSegments { elf, entry } => (*elf, Some(*entry)),
+        ImageSource::ZeroCopyInitramfsSlice { elf, .. } => (*elf, None),
+    };
+    let plan = plan_image_load(elf)?;
+    // NR 23 supplies the entry from its own parse of this same header. Zero is refused by the
+    // commit regardless; refusing it now means refusing it before an address space exists.
+    // NR 29 has no declared entry — its loader reports one — so there is nothing to check.
+    if declared_entry == Some(0) {
+        return Err(KernelError::WrongObject);
+    }
+
+    // ── 2. Address space. From here a failure owes a rollback. ──────────────────────────
+    let asid = create_address_space_locked(vm)?;
+
+    // ── 3. Load, through the source's adapter. ──────────────────────────────────────────
+    let loaded = match request.source {
+        ImageSource::PtLoadSegments { elf, entry } => {
+            super::exec_state::load_elf_pt_load_segments_locked(vm, memory, asid, elf)
+                .map(|_| (entry, 0usize, 0usize))
+        }
+        ImageSource::ZeroCopyInitramfsSlice {
+            image_id,
+            elf,
+            initrd_phys_base,
+            file_initrd_offset,
+        } => super::exec_state::load_elf_with_mo_zero_copy_locked(
+            vm,
+            memory,
+            image_id,
+            asid,
+            elf,
+            initrd_phys_base,
+            file_initrd_offset,
+        )
+        .map(|(entry, _first, _heap, zc, copied)| (entry, zc, copied)),
+    };
+    let (entry, zc_pages, copied_pages) = match loaded {
+        Ok(facts) => facts,
+        Err(err) => return Err(rollback_provision_locked(vm, memory, asid, "load", err)),
+    };
+
+    // ── 4. NR 23's initrd window. Tolerated on failure, unchanged. ──────────────────────
+    let initrd_user_window = if request.map_initrd_window {
+        map_boot_initrd_window_locked(vm, memory, asid)
+    } else {
+        None
+    };
+
+    // ── 5. The child's user stack, in the address space it belongs to. ──────────────────
+    let stack_top =
+        match allocate_user_stack_locked(vm, memory, asid, request.tid, request.stack_pages) {
+            Ok(top) => top,
+            Err(err) => return Err(rollback_provision_locked(vm, memory, asid, "stack", err)),
+        };
+
+    Ok(ProvisionToken {
+        asid,
+        entry,
+        stack_top,
+        zc_pages,
+        copied_pages,
+        initrd_user_window,
+        first_vaddr: plan.first_vaddr,
+        last_vaddr_end: plan.last_vaddr_end,
+    })
+}
+
+/// THE rollback for a provisioning token, in exact reverse acquisition order.
+///
+/// One call to [`destroy_unresident_address_space_locked`] does the whole VM/memory half, in this
+/// order, because that is the order draining an address space naturally produces:
+///
+/// 1. the stack and its guard page, the initrd window, and every ELF segment — unmapped together,
+///    which also releases the arch page-table pages behind them;
+/// 2. the frames and MemoryObject references those mappings held, each through its own owner;
+/// 3. the address-space registry entry;
+/// 4. the ASID itself.
+///
+/// No TLB shootdown and no retired-ASID slot: the ASID was never bound to a task, so no CPU can
+/// hold a translation for it. That is not an optimisation — a rollback that consumed a retired
+/// slot would exhaust `MAX_ADDRESS_SPACES` of them and start failing.
+///
+/// The address-space CAPABILITY is not touched here, because at this level there is none: the
+/// token carries no capability, and cleaning one up is the broad wrapper's separate step.
+///
+/// Inert on repetition and on a stale ASID: the second call finds no registry entry, returns
+/// `InvalidAsid` and mutates nothing. Returns the error it was called with, so a caller can
+/// `return Err(rollback_provision_locked(..))` in one line and cannot forget to propagate it.
+pub(crate) fn rollback_provision_locked(
+    vm: &mut AddressSpaceManager,
+    memory: &mut MemorySubsystem,
+    asid: Asid,
+    phase: &'static str,
+    err: KernelError,
+) -> KernelError {
+    let destroyed = destroy_unresident_address_space_locked(vm, memory, asid).is_ok();
+    crate::yarm_log!(
+        "SPAWN_IMAGE_UNWOUND asid={} phase={} destroyed={} err={:?}",
+        asid.0,
+        phase,
+        u8::from(destroyed),
+        err
+    );
+    err
+}
+
+/// Map the boot initrd read-only into `asid`, returning the user pointer and length.
+///
+/// NR 23's `initramfs_srv` only. Failure is TOLERATED: the server falls back to its syscall bridge
+/// when the window is absent, so a mapping failure must not fail the spawn. Pages installed before
+/// a failure belong to `asid`, which the rollback destroys wholesale — a partial window is not a
+/// leak.
+///
+/// The initrd's location is an immutable boot fact (two atomics published once during bring-up)
+/// and the direct-map bases are link-time constants, so reading them costs no lock and belongs to
+/// no rank.
+fn map_boot_initrd_window_locked(
+    vm: &mut AddressSpaceManager,
+    memory: &mut MemorySubsystem,
+    asid: Asid,
+) -> Option<(u64, u64)> {
+    const INITRD_USER_VA_BASE: u64 = 0x0C00_0000;
+    let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() else {
+        crate::yarm_log!("INITRAMFS_INITRD_MAP_SKIP reason=no_boot_initrd");
+        return None;
+    };
+    let initrd_virt_raw = initrd.as_ptr() as u64;
+    let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
+    let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
+    let initrd_phys_raw = if virt_base > phys_base && initrd_virt_raw >= virt_base {
+        match initrd_virt_raw
+            .checked_sub(virt_base)
+            .and_then(|off| phys_base.checked_add(off))
+        {
+            Some(phys) => phys,
+            None => {
+                crate::yarm_log!(
+                    "INITRAMFS_INITRD_ADDR_INVALID raw_ptr=0x{:x} virt_base=0x{:x} phys_base=0x{:x}",
+                    initrd_virt_raw,
+                    virt_base,
+                    phys_base
+                );
+                return None;
+            }
+        }
+    } else if initrd_virt_raw < virt_base || virt_base == phys_base {
+        initrd_virt_raw
+    } else {
+        crate::yarm_log!(
+            "INITRAMFS_INITRD_ADDR_INVALID raw_ptr=0x{:x} virt_base=0x{:x} phys_base=0x{:x}",
+            initrd_virt_raw,
+            virt_base,
+            phys_base
+        );
+        return None;
+    };
+    let initrd_len = initrd.len() as u64;
+    let mut first6 = [0u8; 6];
+    let first6_len = core::cmp::min(initrd.len(), first6.len());
+    first6[..first6_len].copy_from_slice(&initrd[..first6_len]);
+    crate::yarm_log!(
+        "INITRAMFS_INITRD_SOURCE_RANGE raw_ptr=0x{:x} phys_start=0x{:x} len={}",
+        initrd_virt_raw,
+        initrd_phys_raw,
+        initrd_len
+    );
+    crate::yarm_log!("INITRAMFS_INITRD_FIRST6 bytes={:?}", first6);
+    let page: u64 = PAGE_SIZE as u64;
+    let phys_start = initrd_phys_raw & !(page - 1);
+    let phys_end = (initrd_phys_raw + initrd_len + page - 1) & !(page - 1);
+    let pages_to_map = ((phys_end - phys_start) / page) as usize;
+    let initrd_offset_in_first_page = initrd_phys_raw - phys_start;
+    crate::yarm_log!(
+        "INITRAMFS_INITRD_MAP_BEGIN phys_start=0x{:x} phys_end=0x{:x} len={} pages={}",
+        phys_start,
+        phys_end,
+        initrd_len,
+        pages_to_map
+    );
+    let initrd_flags = PageFlags {
+        read: true,
+        write: false,
+        execute: false,
+        user: true,
+        cache_policy: CachePolicy::WriteBack,
+    };
+    for i in 0..pages_to_map {
+        let virt = VirtAddr(INITRD_USER_VA_BASE + (i as u64) * page);
+        let phys = PhysAddr(phys_start + (i as u64) * page);
+        if let Err(e) = map_user_page_in_asid_raw_locked(
+            vm,
+            memory,
+            asid,
+            virt,
+            Mapping {
+                phys,
+                flags: initrd_flags,
+            },
+        ) {
+            crate::yarm_log!(
+                "INITRAMFS_INITRD_MAP_FAIL page={} virt=0x{:x} err={:?}",
+                i,
+                virt.0,
+                e
+            );
+            return None;
+        }
+    }
+    let user_initrd_ptr = INITRD_USER_VA_BASE + initrd_offset_in_first_page;
+    crate::yarm_log!(
+        "INITRAMFS_INITRD_MAP_DONE user_ptr=0x{:x} len={} rights=ro",
+        user_initrd_ptr,
+        initrd_len
+    );
+    Some((user_initrd_ptr, initrd_len))
+}
+
 impl KernelState {
-    /// THE spawn-image provisioner.
+    /// THE spawn-image provisioner — broad acquisition and composition wrapper.
     ///
-    /// Phases, in order, each releasing what it holds before the next begins:
+    /// Three steps, and the order is the whole point of U9-SPAWN-VM2 §2:
     ///
-    /// 1. **Plan** — validate the image and compute its extents. Pure; nothing is owned yet, so a
-    ///    malformed image costs nothing to refuse.
-    /// 2. **Address space** — create the ASID and mint its capability.
-    /// 3. **Load** — the image-source adapter maps the segments and their backing.
-    /// 4. **Initrd window** — NR 23's `initramfs_srv` only; tolerated on failure, exactly as
-    ///    before, because the server falls back to its syscall bridge.
-    /// 5. **Stack** — allocate and map the child's user stack in the same address space.
-    /// 6. **Token** — return the ASID, its capability, the entry and the stack top.
-    ///
-    /// On any failure from phase 3 onward the whole address space is destroyed through the
-    /// repaired teardown owner, which unmaps every page, returns MemoryObject-backed frames
-    /// through the backing-aware lifecycle and plain user backing to the allocator — one call,
-    /// once, and no shootdown is owed because the ASID was never CPU-resident. The address-space
-    /// capability is handed back to the caller's ledger rather than revoked here: it lives in the
-    /// CALLER's cspace, and the ledger is the owner that holds cspace entries.
+    /// 1. **Provision** under VM(5)+memory(6), through [`provision_image_locked`]. Both locks are
+    ///    released when it returns.
+    /// 2. **Publish** the address-space capability, through the capability owner (rank 4, reading
+    ///    the current task's CNode at rank 2). No VM or memory lock is held, so no rank inversion
+    ///    exists to reason about — which is why the mint moved out of `create_user_address_space`
+    ///    for this path.
+    /// 3. **On a mint failure**, reacquire VM+memory and roll the exact token back. The
+    ///    provisioning succeeded, so there is a whole address space to return; the mint's own
+    ///    error is what propagates, unchanged, so the syscall result is the capability error the
+    ///    caller would have seen anyway rather than a VM error invented here.
     pub(crate) fn provision_spawn_image(
         &mut self,
         tid: u64,
@@ -238,226 +522,55 @@ impl KernelState {
         startup_args: &mut [u64; 18],
         stack_pages: usize,
     ) -> Result<ImageProvision, KernelError> {
-        // ── 1. Plan. Nothing is owned yet, so a refusal here is free. ───────────────────
-        let (elf, declared_entry) = match &source {
-            ImageSource::PtLoadSegments { elf, entry } => (*elf, Some(*entry)),
-            ImageSource::ZeroCopyInitramfsSlice { elf, .. } => (*elf, None),
+        let request = ImageProvisionRequest {
+            tid,
+            source,
+            map_initrd_window,
+            stack_pages,
         };
-        let plan = plan_image_load(elf)?;
-        // NR 23 supplies the entry from its own parse of this same header. Zero is refused by the
-        // commit regardless; refusing it now means refusing it before an address space exists.
-        // NR 29 has no declared entry — its loader reports one — so there is nothing to check.
-        if declared_entry == Some(0) {
-            return Err(KernelError::WrongObject);
+        // ── 1. VM(5) → memory(6), held for the whole provisioning and released here. ────
+        let token = self
+            .with_vm_then_memory_mut(|vm, memory| provision_image_locked(vm, memory, &request))?;
+
+        // ── 2. The capability naming the address space, minted with no VM/memory held. ──
+        let aspace_cap = match self.mint_capability_for_current_context(Capability::new(
+            CapObject::AddressSpace { asid: token.asid.0 },
+            CapRights::MAP | CapRights::READ | CapRights::WRITE,
+        )) {
+            Ok(cap) => cap,
+            // ── 3. Reacquire and roll the exact token back; propagate the MINT's error. ─
+            Err(err) => {
+                self.with_vm_then_memory_mut(|vm, memory| {
+                    rollback_provision_locked(vm, memory, token.asid, "aspace_cap_mint", err)
+                });
+                return Err(err);
+            }
+        };
+
+        if let Some((user_ptr, len)) = token.initrd_user_window {
+            startup_args[15] = user_ptr;
+            startup_args[16] = len;
         }
-
-        // ── 2. Address space. From here a failure owes a teardown. ──────────────────────
-        let (asid, aspace_cap) = self.create_user_address_space()?;
-
-        // ── 3. Load, through the source's adapter. ──────────────────────────────────────
-        let loaded = match source {
-            ImageSource::PtLoadSegments { elf, entry } => self
-                .load_elf_pt_load_segments(asid, elf)
-                .map(|_| (entry, 0usize, 0usize)),
-            ImageSource::ZeroCopyInitramfsSlice {
-                image_id,
-                elf,
-                initrd_phys_base,
-                file_initrd_offset,
-            } => self
-                .load_elf_with_mo_zero_copy(
-                    image_id,
-                    asid,
-                    elf,
-                    initrd_phys_base,
-                    file_initrd_offset,
-                )
-                .map(|(entry, _first, _heap, zc, copied)| (entry, zc, copied)),
-        };
-        let (entry, zc_pages, copied_pages) = match loaded {
-            Ok(facts) => facts,
-            Err(err) => return Err(self.unwind_spawn_image(asid, aspace_cap, "load", err)),
-        };
-
-        // ── 4. NR 23's initrd window. Tolerated on failure, unchanged. ──────────────────
-        if map_initrd_window {
-            self.map_boot_initrd_window_into(asid, startup_args);
-        }
-
-        // ── 5. The child's user stack, in the address space it belongs to. ──────────────
-        let stack_top = match self.allocate_user_stack_in_asid(asid, tid, stack_pages) {
-            Ok(top) => top,
-            Err(err) => return Err(self.unwind_spawn_image(asid, aspace_cap, "stack", err)),
-        };
-
         crate::yarm_log!(
             "SPAWN_IMAGE_PROVISIONED tid={} path={} asid={} entry=0x{:x} stack_top=0x{:x} \
              first_vaddr=0x{:x} end=0x{:x} zc_pages={} copied_pages={}",
             tid,
             image_path,
-            asid.0,
-            entry,
-            stack_top.0,
-            plan.first_vaddr,
-            plan.last_vaddr_end,
-            zc_pages,
-            copied_pages
+            token.asid.0,
+            token.entry,
+            token.stack_top.0,
+            token.first_vaddr,
+            token.last_vaddr_end,
+            token.zc_pages,
+            token.copied_pages
         );
         Ok(ImageProvision {
-            asid,
+            asid: token.asid,
             aspace_cap,
-            entry,
-            stack_top,
-            zc_pages,
-            copied_pages,
+            entry: token.entry,
+            stack_top: token.stack_top,
+            zc_pages: token.zc_pages,
+            copied_pages: token.copied_pages,
         })
-    }
-
-    /// The ONE rollback, in exact reverse acquisition order.
-    ///
-    /// Phase 2 acquired two things in the order (address space, capability naming it), so the
-    /// unwind releases (capability, address space):
-    ///
-    /// 1. **the address-space capability** — through `revoke_capability_in_cnode`, the owner of
-    ///    cspace entries. It lives in the CALLER's cspace, not in the child's, so the teardown
-    ///    below does not and cannot reach it. U9-SPAWN1 SP-3 found this leak on every arm.
-    /// 2. **the address space** — through `destroy_user_address_space_by_asid`, the repaired
-    ///    teardown owner (U9-ASPACE1 §1). One call drains every mapping installed in the ASID —
-    ///    ELF segments, zero-copy grants, the initrd window, the stack and its guard page —
-    ///    reclaims MemoryObject-backed frames through the backing-aware lifecycle, returns plain
-    ///    user backing to the allocator, frees the page-table pages and retires the ASID.
-    ///
-    /// No TLB shootdown is owed: see this module's header. The ASID was never bound to a TCB, so
-    /// `live_cpu_bitmap_for_asid` is empty by construction.
-    ///
-    /// Inert on repetition and on stale input: revoking an absent capability returns
-    /// `InvalidCapability` and destroying an already-destroyed ASID returns an error; both are
-    /// logged and neither mutates. Returns the error it was called with so a caller can
-    /// `return Err(self.unwind_spawn_image(..))` in one line and cannot forget to propagate it.
-    fn unwind_spawn_image(
-        &mut self,
-        asid: Asid,
-        aspace_cap: CapId,
-        phase: &'static str,
-        err: KernelError,
-    ) -> KernelError {
-        let revoked = match self.current_task_cnode() {
-            Some(cnode) => self.revoke_capability_in_cnode(cnode, aspace_cap).is_ok(),
-            None => false,
-        };
-        let destroyed = self.destroy_user_address_space_by_asid(asid).is_ok();
-        crate::yarm_log!(
-            "SPAWN_IMAGE_UNWOUND asid={} phase={} cap={} revoked={} destroyed={} err={:?}",
-            asid.0,
-            phase,
-            aspace_cap.0,
-            u8::from(revoked),
-            u8::from(destroyed),
-            err
-        );
-        err
-    }
-
-    /// Map the boot initrd read-only into `asid` and publish it in startup slots 15/16.
-    ///
-    /// NR 23's `initramfs_srv` only. Failure is TOLERATED, exactly as it was before this moved
-    /// here from the spawn transaction: the server falls back to its syscall bridge when the
-    /// window is absent, so a mapping failure must not fail the spawn. Pages installed before a
-    /// failure belong to `asid`, which the rollback above destroys wholesale — a partial window
-    /// is not a leak.
-    fn map_boot_initrd_window_into(&mut self, asid: Asid, startup_args: &mut [u64; 18]) {
-        const INITRD_USER_VA_BASE: u64 = 0x0C00_0000;
-        let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() else {
-            crate::yarm_log!("INITRAMFS_INITRD_MAP_SKIP reason=no_boot_initrd");
-            return;
-        };
-        let initrd_virt_raw = initrd.as_ptr() as u64;
-        let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
-        let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
-        let initrd_phys_raw = if virt_base > phys_base && initrd_virt_raw >= virt_base {
-            match initrd_virt_raw
-                .checked_sub(virt_base)
-                .and_then(|off| phys_base.checked_add(off))
-            {
-                Some(phys) => phys,
-                None => {
-                    crate::yarm_log!(
-                        "INITRAMFS_INITRD_ADDR_INVALID raw_ptr=0x{:x} virt_base=0x{:x} phys_base=0x{:x}",
-                        initrd_virt_raw,
-                        virt_base,
-                        phys_base
-                    );
-                    return;
-                }
-            }
-        } else if initrd_virt_raw < virt_base || virt_base == phys_base {
-            initrd_virt_raw
-        } else {
-            crate::yarm_log!(
-                "INITRAMFS_INITRD_ADDR_INVALID raw_ptr=0x{:x} virt_base=0x{:x} phys_base=0x{:x}",
-                initrd_virt_raw,
-                virt_base,
-                phys_base
-            );
-            return;
-        };
-        let initrd_len = initrd.len() as u64;
-        let mut first6 = [0u8; 6];
-        let first6_len = core::cmp::min(initrd.len(), first6.len());
-        first6[..first6_len].copy_from_slice(&initrd[..first6_len]);
-        crate::yarm_log!(
-            "INITRAMFS_INITRD_SOURCE_RANGE raw_ptr=0x{:x} phys_start=0x{:x} len={}",
-            initrd_virt_raw,
-            initrd_phys_raw,
-            initrd_len
-        );
-        crate::yarm_log!("INITRAMFS_INITRD_FIRST6 bytes={:?}", first6);
-        let page: u64 = PAGE_SIZE as u64;
-        let phys_start = initrd_phys_raw & !(page - 1);
-        let phys_end = (initrd_phys_raw + initrd_len + page - 1) & !(page - 1);
-        let pages_to_map = ((phys_end - phys_start) / page) as usize;
-        let initrd_offset_in_first_page = initrd_phys_raw - phys_start;
-        crate::yarm_log!(
-            "INITRAMFS_INITRD_MAP_BEGIN phys_start=0x{:x} phys_end=0x{:x} len={} pages={}",
-            phys_start,
-            phys_end,
-            initrd_len,
-            pages_to_map
-        );
-        let initrd_flags = PageFlags {
-            read: true,
-            write: false,
-            execute: false,
-            user: true,
-            cache_policy: CachePolicy::WriteBack,
-        };
-        for i in 0..pages_to_map {
-            let virt = VirtAddr(INITRD_USER_VA_BASE + (i as u64) * page);
-            let phys = PhysAddr(phys_start + (i as u64) * page);
-            if let Err(e) = self.map_user_page_in_asid_raw(
-                asid,
-                virt,
-                Mapping {
-                    phys,
-                    flags: initrd_flags,
-                },
-            ) {
-                crate::yarm_log!(
-                    "INITRAMFS_INITRD_MAP_FAIL page={} virt=0x{:x} err={:?}",
-                    i,
-                    virt.0,
-                    e
-                );
-                return;
-            }
-        }
-        let user_initrd_ptr = INITRD_USER_VA_BASE + initrd_offset_in_first_page;
-        startup_args[15] = user_initrd_ptr;
-        startup_args[16] = initrd_len;
-        crate::yarm_log!(
-            "INITRAMFS_INITRD_MAP_DONE user_ptr=0x{:x} len={} rights=ro",
-            user_initrd_ptr,
-            initrd_len
-        );
     }
 }

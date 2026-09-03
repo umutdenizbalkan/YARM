@@ -19,6 +19,59 @@ commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
 Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 `doc/KERNEL_UNLOCKING.md` §0.
 
+**U9-SPAWN-VM2 — the image provisioner depends only on explicit VM and memory owners, and
+publishes its capability outside them. Census remains `2 / 0 / 2`. U9 remains OPEN.**
+
+*§1 — split policy from acquisition.* VM1's provisioner was one owner with one rollback, but it
+took `&mut KernelState`, so "which ranks does it touch" was a question you answered by tracing
+callees. An audit of the transitive callee closure of the whole image path (42 methods) found
+exactly TWO places reaching below VM rank 5, and both are gone:
+`create_user_address_space` minted a capability (reading the current task's CNode at rank 2 and
+writing a capability space at rank 4, while VM was held), and
+`destroy_user_address_space_by_asid` read the scheduler's CPU bitmaps and posted SMP mailbox
+work. Everything else — frame allocation and release, raw page mapping, both ELF loaders,
+`copy_to_user`, the user stack and guard page, the COW set, the MemoryObject refcounts — was
+already VM+memory only.
+
+`src/kernel/boot/vm_image_locked.rs` is the rank-local layer: thirteen bodies taking
+`&mut AddressSpaceManager` and/or `&mut MemorySubsystem` and nothing else, so their rank-locality
+is readable from a signature rather than traced. The broad `KernelState` methods that held those
+bodies are now one-line delegations — the broad path runs the same instructions, so there is no
+second policy to drift. `with_vm_then_memory_mut` fixes VM(5) → memory(6) in one place.
+
+*The never-resident destroy.* The broad teardown passes `online & !wake_only` rather than the
+resident set, so it registers a retired ASID on every destroy; that array is `MAX_ADDRESS_SPACES`
+deep and drains only on acknowledgement. A rollback path using it would consume a slot per failed
+spawn and eventually make the teardown refuse — turning an exact rollback into a leak. A
+never-resident address space owes no shootdown, takes no slot, and rolls back without bound; the
+LIVE teardown keeps its shootdown, because its ASID can be resident.
+
+*§2 — capability publication is separate.* The rank-local body returns a capability-free token.
+The broad wrapper provisions under VM+memory, releases both, mints the address-space capability
+with nothing held, and on a mint failure reacquires and rolls the exact token back while
+propagating the MINT's own error — so the syscall result is the capability error the caller would
+have seen, not a VM error invented by the rollback.
+
+*§3/§4 — twelve new proofs.* Seven structural (no lock acquired, no lower-rank name reachable, no
+shootdown, no capability operation inside any `with_vm_then_memory_mut` closure kernel-wide, VM
+before memory in exactly one seam, no ASID ever bound to a task, borrowed initrd backing never
+freed) and five by injection, each checking nine columns by identity: task table, VM registry AND
+the exact live-ASID set, mappings, general allocator, page-table frame pool, MemoryObject count
+AND total map refcount, and the caller's CNode. The frame-exhaustion sweep now runs on ONE kernel,
+which VM1's could not, so drift accumulates instead of being reset away; and 3 × MAX_ADDRESS_SPACES
+provision/rollback cycles run without exhausting anything.
+
+*Live.* Three fresh runs per architecture: NR 23 = 3, NR 29 = 5/5, `SPAWN_IMAGE_PROVISIONED` = 8,
+`PM_ELF_ZC_DONE` = 5, full service chain, zero panics and zero unwind residue on every run.
+x86_64 49/49 checks with a marker NAME SET identical to `c091878`. Clippy diagnostics byte-identical.
+
+*The pre-existing RISC-V finding, investigated but not fixed.* The core smoke's unaccounted
+split-dispatch syscall is **NR 1, `IpcSend`** — exactly one per boot, on every run:
+`YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=1 cpu=0 result=post_work_committed finalized=1`. That is
+the U6 blocking-send lifecycle (Stage 199G-C4 §2) doing what it was built to do; the smoke's
+allow-list (NR 15/10/9/5) predates that class landing on RISC-V and was never widened. The oracle
+is stale, not the kernel — and widening an oracle is not this pass's scope.
+
 **U9-SPAWN-VM1 — the address space, the image and the user stack are one provisioner with one
 exact rollback, production-exercised by broad NR 23/NR 29 on all three architectures. Census
 remains `2 / 0 / 2`. U9 remains OPEN.**
