@@ -61656,7 +61656,11 @@ mod stage191a_lock_retire_inventory {
                 && SPLIT_SRC.contains("Syscall::VmBrk => Some(syscall),")
                 && SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
                 // Stage 191B added FutexWake as the fifth split class.
-                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
+                // U9-SPAWN-TXN3 §4 added the two image-loading spawn classes, the last live
+                // production classes with a terminal broad edge.
+                && SPLIT_SRC.contains("Syscall::SpawnProcess => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::SpawnFromMemoryObject => Some(syscall),"),
             "the NR-only split gate must whitelist exactly the accepted classes"
         );
         // Dangerous classes must NOT appear as split-eligible (default-deny `_ => None`).
@@ -61669,8 +61673,11 @@ mod stage191a_lock_retire_inventory {
             // family was, not because NR 11 shares the family's obstacles: it creates no address
             // space, loads no ELF, mints nothing, maps nothing and never switches tasks. Its
             // siblings below still do, and stay.
-            "Syscall::SpawnProcess => Some",
-            "Syscall::SpawnFromMemoryObject => Some",
+            // U9-SPAWN-TXN3 §4 removed NR 23 and NR 29 from this list. They were here because
+            // their rollback went through the kernel's GENERAL revocation, whose sixteen-substep
+            // cascade cannot run off-lock. §1 proved eleven of those substeps unreachable for the
+            // capabilities a spawn creates — by object kind — and §2 replaced the rollback with
+            // exactly the reachable closure, which is capability rank 4 plus one rank-2 read.
             "Syscall::ReapFaultedTask => Some",
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
@@ -62077,7 +62084,9 @@ mod stage191c_split_user_copy_seam {
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
             "Syscall::Fork => Some",
-            "Syscall::SpawnProcess => Some",
+            // U9-SPAWN-TXN3 §4: NR 23 left this list, for the same kind of reason NR 11 did —
+            // the obstacle was never the seam, it was the rollback, and §2 replaced it with the
+            // exact provisional-capability closure.
             "Syscall::ReapFaultedTask => Some",
             "Syscall::FutexWait => Some",
             "Syscall::Yield => Some",
@@ -62095,13 +62104,32 @@ mod stage191c_split_user_copy_seam {
     /// so a failed mint compensates without touching the frame allocator. No other minting
     /// class has been shown to have that property, so none may ride in on NR 28's admission.
     #[test]
-    fn nr28_is_the_only_minting_class_admitted() {
+    fn every_minting_class_admitted_has_an_exact_off_lock_rollback() {
         assert!(
             SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some(syscall),"),
             "NR 28 is admitted, with its own §4 guards"
         );
+        // U9-SPAWN-TXN3 §4: NR 23 and NR 29 mint too, and are now admitted. The property this
+        // guard actually protects is not "only NR 28 mints" — it is that a minting class may only
+        // be admitted once its mint has an EXACT off-lock rollback. Both spawn classes get theirs
+        // from §2's provisional-capability contract, which is asserted here rather than assumed.
+        for spawn_class in [
+            "Syscall::SpawnProcess => Some(syscall),",
+            "Syscall::SpawnFromMemoryObject => Some(syscall),",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(spawn_class),
+                "{spawn_class} is admitted by §4"
+            );
+        }
+        const PROVCAP: &str = include_str!("provisional_cap.rs");
+        assert!(
+            PROVCAP.contains("pub(crate) fn release_provisional_cap_locked(")
+                && PROVCAP.contains("ProvisionalCapRelease::StaleObject")
+                && PROVCAP.contains("ProvisionalCapRelease::Residue"),
+            "the admitted spawn classes must have an exact, refusing, bounded rollback owner"
+        );
         for still_locked in [
-            "Syscall::SpawnFromMemoryObject => Some",
             "Syscall::VmAnonMap => Some",
             "Syscall::TransferRelease => Some",
             "Syscall::CreateEndpoint => Some",
@@ -62382,6 +62410,9 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::VmBrk => Some(syscall),",
             "Syscall::DebugLog => Some(syscall),",
             "Syscall::FutexWake => Some(syscall),",
+            // U9-SPAWN-TXN3 §4.
+            "Syscall::SpawnProcess => Some(syscall),",
+            "Syscall::SpawnFromMemoryObject => Some(syscall),",
         ] {
             assert!(
                 SPLIT_SRC.contains(accepted),
@@ -62399,10 +62430,9 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::VmAnonMap => Some",
             "Syscall::TransferRelease => Some",
             "Syscall::Fork => Some",
-            // U9-SPAWN1 SP-2 removed NR 11: the candidate seam never owned the whitelist's
-            // contents, and NR 11's admission came from SP-2 with its own guards.
-            "Syscall::SpawnProcess => Some",
-            "Syscall::SpawnFromMemoryObject => Some",
+            // U9-SPAWN1 SP-2 removed NR 11, and U9-SPAWN-TXN3 §4 removed NR 23 and NR 29: the
+            // candidate seam never owned the whitelist's contents, and each admission came from
+            // its own stage with its own guards.
             // U9-MO2 §4 removed NR 28 from this list. Stage 191E's claim is that the CANDIDATE
             // SEAM adds no live class — it does not, and did not, own the whitelist's contents;
             // NR 28's admission came from §4 and is pinned by its own guards.
@@ -74736,13 +74766,27 @@ mod stage196a_riscv_shared_trap_foundation {
         // total has been exactly one over the sum of the other four. The companion check below
         // pins NR 1 to that exact disposition, so admitting it did not admit an early-returning
         // send.
+        //
+        // U9-SPAWN-TXN3 §4 widened it a final time, to SpawnProcess (NR 23) and
+        // SpawnFromMemoryObject (NR 29) — a real retirement this time, not an oracle correction.
+        // Both are pinned below to the NON-SWITCHING `result=ok` disposition and to their exact
+        // boot counts, so widening the membership did not widen the contract.
         assert!(
             RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15")
-                && RISCV_SMOKE
-                    .contains("non-DebugLog/FutexWake/FutexWait/IpcRecvTimeout/IpcSend syscall"),
-            "smoke must assert DebugLog+FutexWake+FutexWait+IpcRecvTimeout+IpcSend-only split \
-             dispatch"
+                && RISCV_SMOKE.contains("serviced a syscall outside the retired set"),
+            "smoke must assert the split dispatcher services only the retired set"
         );
+        for pin in [
+            "RISC-V SpawnProcess split serviced a switching disposition",
+            "RISC-V SpawnFromMemoryObject split serviced a switching disposition",
+            "RISC-V SpawnProcess split count is",
+            "RISC-V SpawnFromMemoryObject split count is",
+        ] {
+            assert!(
+                RISCV_SMOKE.contains(pin),
+                "smoke must pin the newly retired spawn classes: {pin}"
+            );
+        }
         assert!(
             RISCV_SMOKE.contains("RISC-V IpcSend split serviced a non-post-work disposition"),
             "smoke must pin every NR 1 split line to the post-work committed disposition"
@@ -113889,6 +113933,12 @@ mod stage199d_riscv_canonical_admission {
             // U9-SPAWN1 SP-2: the second NON-switching member — NR 11 finalizes through the
             // same same-task ecall writeback DebugLog and NR 28 use.
             "SYSCALL_SPAWN_THREAD_NR",
+            // U9-SPAWN-TXN3 §4: the third and fourth NON-switching members — NR 23 and NR 29,
+            // the last two live production classes with a terminal broad edge. Each runs the one
+            // generic spawn transaction and returns the child TID in the caller's own frame, so
+            // both finalize through that same writeback.
+            "SYSCALL_SPAWN_PROCESS_NR",
+            "SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -113900,10 +113950,11 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            7,
-            "exactly seven literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
-             FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo and \
-             (U9-SPAWN1 SP-2) SpawnThread"
+            9,
+            "exactly nine literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+             FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
+             (U9-SPAWN1 SP-2) SpawnThread and (U9-SPAWN-TXN3 §4) SpawnProcess + \
+             SpawnFromMemoryObject"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -155783,10 +155834,12 @@ mod u9spawnic1_endpoint_cap_txn {
             .with(|s| s.provision_service_endpoint(&req))
             .expect("a grant");
         assert_ne!(baseline(&k), before, "the acquisition must be observable");
-        let removal = k.with(|s| crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+        let removal = k.with(|s| {
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
                 &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
                 &grant,
-            ));
+            )
+        });
         assert_eq!(removal, EndpointRemoval::Removed);
         let after = baseline(&k);
         assert_eq!(
@@ -155803,10 +155856,12 @@ mod u9spawnic1_endpoint_cap_txn {
             "the destroy must advance the incarnation past the one it removed"
         );
         for repeat in 0..3 {
-            let again = k.with(|s| crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
-                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
-                &grant,
-            ));
+            let again = k.with(|s| {
+                crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                    &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                    &grant,
+                )
+            });
             assert_eq!(
                 again,
                 EndpointRemoval::Stale,
@@ -155830,10 +155885,12 @@ mod u9spawnic1_endpoint_cap_txn {
         let first = k
             .with(|s| s.provision_service_endpoint(&req))
             .expect("first grant");
-        k.with(|s| crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
-            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
-            &first,
-        ));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &first,
+            )
+        });
         let second = k
             .with(|s| s.provision_service_endpoint(&req))
             .expect("second grant");
@@ -155862,10 +155919,12 @@ mod u9spawnic1_endpoint_cap_txn {
             with_second,
             "a stale grant must not touch the replacement occupying its slot"
         );
-        k.with(|s| crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
-            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
-            &second,
-        ));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_txn::release_service_endpoint_grant(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                &second,
+            )
+        });
     }
 
     /// A PUBLISHED endpoint is refused by the unpublished removal, so the rollback can never

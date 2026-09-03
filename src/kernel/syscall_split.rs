@@ -3841,8 +3841,9 @@ fn try_split_spawn_process_into_frame(
     use crate::kernel::task::TaskClass;
     use yarm_srv_common::cpio::CpioArchive;
 
-    let fail =
-        |e: SyscallError| -> Option<Result<(), TrapHandleError>> { Some(Err(TrapHandleError::Syscall(e))) };
+    let fail = |e: SyscallError| -> Option<Result<(), TrapHandleError>> {
+        Some(Err(TrapHandleError::Syscall(e)))
+    };
 
     // ── Pre-mutation. Nothing below has touched anything until the transaction. ───────
     let mut owners = spawn_owners_for(shared, cpu)?;
@@ -3954,8 +3955,9 @@ fn try_split_spawn_from_mo_into_frame(
     use crate::kernel::syscall::{SyscallError, process::spawn_image_path_for_image_id};
     use crate::kernel::task::TaskClass;
 
-    let fail =
-        |e: SyscallError| -> Option<Result<(), TrapHandleError>> { Some(Err(TrapHandleError::Syscall(e))) };
+    let fail = |e: SyscallError| -> Option<Result<(), TrapHandleError>> {
+        Some(Err(TrapHandleError::Syscall(e)))
+    };
 
     let mut owners = spawn_owners_for(shared, cpu)?;
     let caller_tid = owners.spawner_tid?;
@@ -4627,14 +4629,35 @@ mod tests {
     }
 
     #[test]
-    fn stage29_spawnv5_not_eligible() {
+    /// U9-SPAWN-TXN3 §4 INVERTED this guard. NR 23 was excluded from the NR-only gate because
+    /// its rollback went through the kernel's general revocation, whose sixteen-substep cascade
+    /// spans five domains and cannot run off-lock. §1 proved eleven of those substeps unreachable
+    /// for the capabilities a spawn creates — by object kind, not by timing — and §2 replaced the
+    /// rollback with exactly the reachable closure. So NR 23 is admitted now.
+    ///
+    /// What remains true, and is what this guard checks instead, is the property the exclusion
+    /// existed to protect: the route may still DECLINE, and every decline is pre-mutation and
+    /// falls back unchanged. The hosted build has no off-lock user-read seam (it needs the direct
+    /// map), so the route declines here and the fallback is exactly what it always was.
+    fn stage29_spawnv5_is_eligible_but_still_declines_pre_mutation() {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
         let mut frame = TrapFrame::new(SYSCALL_SPAWN_PROCESS_NR, [1, 2, 3, 4, 5, 6]);
         assert_eq!(
             try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy(),
-            None
+            None,
+            "a declined spawn must fall back unchanged"
         );
-        assert!(classify_split_eligible_nr_only(decode(SYSCALL_SPAWN_PROCESS_NR)).is_none());
+        assert!(
+            classify_split_eligible_nr_only(decode(SYSCALL_SPAWN_PROCESS_NR)).is_some(),
+            "NR 23 passes the NR-only gate since U9-SPAWN-TXN3 §4"
+        );
+        assert!(
+            classify_split_eligible_nr_only(decode(
+                crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
+            ))
+            .is_some(),
+            "and so does NR 29, its sibling"
+        );
     }
 
     #[test]
@@ -4721,7 +4744,8 @@ mod tests {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
         // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A),
         // NR 10 (FutexWake, Stage 191B), NR 28 (CreateInitramfsFileSliceMo, U9-MO2 §4)
-        // and NR 11 (SpawnThread, U9-SPAWN1 SP-2) may pass the NR-only split-eligibility gate.
+        // NR 11 (SpawnThread, U9-SPAWN1 SP-2), and NR 23 + NR 29 (SpawnProcess and
+        // SpawnFromMemoryObject, U9-SPAWN-TXN3 §4) may pass the NR-only split-eligibility gate.
         // (Stage 197A removed NR 27 InitramfsReadChunk from the whitelist and the ABI.)
         // Every other syscall stays global-lock-only. This is an EXHAUSTIVE sweep of the
         // whole NR space, so it is the guard that would catch a sixth admission arriving
@@ -4738,6 +4762,8 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
                 || nr == crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR
+                || nr == SYSCALL_SPAWN_PROCESS_NR
+                || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {
