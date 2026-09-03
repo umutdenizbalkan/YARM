@@ -122036,7 +122036,9 @@ mod stage199d_wa3b_spawn_reservation {
             .next()
             .expect("owner body");
         let validate = owner.find("validate_commit_ready").expect("validation");
-        let install = owner.find("tcb.user_context =").expect("the context install");
+        let install = owner
+            .find("tcb.user_context =")
+            .expect("the context install");
         let commit = owner.find("commit_live_spawn").expect("live commit");
         assert!(
             validate < install && install < commit,
@@ -153711,8 +153713,7 @@ mod u9spawn2_nr23_route_blockers {
     #[test]
     fn no_production_item_hides_after_a_files_test_module() {
         for (rel, _) in stage199d_wa2a_ownership_boundary::production_sources() {
-            let full = std::fs::read_to_string(&rel)
-                .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            let full = std::fs::read_to_string(&rel).unwrap_or_else(|e| panic!("read {rel}: {e}"));
             let Some(at) = full.find("\n#[cfg(test)]\nmod tests") else {
                 continue;
             };
@@ -153871,7 +153872,9 @@ mod u9spawn2_nr23_route_blockers {
         // rather than a new subsystem.
         const RESERVATION: &str = include_str!("../spawn_reservation.rs");
         assert!(
-            RESERVATION.contains("pub(crate) fn commit_live_spawn(\n    tcbs: &mut [Option<ThreadControlBlock>]"),
+            RESERVATION.contains(
+                "pub(crate) fn commit_live_spawn(\n    tcbs: &mut [Option<ThreadControlBlock>]"
+            ),
             "the Spawning -> LiveSpawned commit must stay a rank-2-local function over the TCBs"
         );
     }
