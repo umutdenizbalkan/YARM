@@ -73,10 +73,11 @@
 //! is a pre-existing policy decision about what a spawn means, not a leak, and SP-3 is a
 //! compensation repair.
 
-use super::{SyscallError, current_tid};
+use super::SyscallError;
+use super::spawn_txn::SpawnTxnOwners;
 use crate::kernel::boot::spawn_image_provision::{ImageProvision, ImageSource};
 use crate::kernel::boot::spawn_ipc_cap_txn::{CnodeGrowthLimits, ServiceEndpointRequest};
-use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
+use crate::kernel::boot::{KernelError, UserImageSpec};
 use crate::kernel::capabilities::{CNodeId, CapId, CapRights};
 use crate::kernel::ipc::EndpointMode;
 use crate::kernel::spawn_reservation::SpawnReservationToken;
@@ -207,115 +208,105 @@ impl SpawnLedger {
     }
 }
 
-impl KernelState {
-    /// Release ONE provisional resource through its actual owner.
-    fn release_provisional_spawn_resource(&mut self, resource: ProvisionalSpawnResource) {
-        match resource {
-            ProvisionalSpawnResource::Reservation(token) => {
-                let tid = token.tid();
-                let ok = self.cancel_spawn_reservation(token).is_ok();
-                crate::yarm_log!(
-                    "SPAWN_LEDGER_RELEASE class=reservation tid={} ok={}",
-                    tid,
-                    u8::from(ok)
-                );
-            }
-            ProvisionalSpawnResource::AddressSpace(asid) => {
-                // U9-SPAWN-IC1 §4 — the two cases are decided here and never conflated.
-                //
-                // A never-resident ASID owes no TLB shootdown and must NOT take a retired-ASID
-                // slot: that array is `MAX_ADDRESS_SPACES` deep and drains only on CPU
-                // acknowledgement, so a rollback path consuming one per failed spawn would
-                // eventually make the teardown refuse — an exact rollback turning into a leak.
-                // A published one owes the full live teardown, and gets it.
-                let carrier = self.with_tcbs(|tcbs| {
-                    tcbs.iter()
-                        .flatten()
-                        .find(|tcb| tcb.asid == Some(asid))
-                        .map(|tcb| tcb.tid.0)
-                });
-                match carrier {
-                    None => {
-                        let ok = self
-                            .with_vm_then_memory_mut(|vm, memory| {
-                                crate::kernel::boot::vm_image_locked::destroy_unresident_address_space_locked(
-                                    vm, memory, asid,
-                                )
-                            })
-                            .is_ok();
-                        crate::yarm_log!(
-                            "SPAWN_LEDGER_RELEASE class=address_space asid={} owner=unresident ok={}",
-                            asid.0,
-                            u8::from(ok)
-                        );
-                    }
-                    Some(tid) => {
-                        // The ledger's own contract says this cannot happen. Report it and take
-                        // the safe path rather than skip a shootdown that might be owed.
-                        crate::yarm_log!(
-                            "SPAWN_LEDGER_ASID_STILL_BOUND asid={} tid={} result=live_teardown",
-                            asid.0,
-                            tid
-                        );
-                        let ok = self.destroy_user_address_space_by_asid(asid).is_ok();
-                        crate::yarm_log!(
-                            "SPAWN_LEDGER_RELEASE class=address_space asid={} owner=live ok={}",
-                            asid.0,
-                            u8::from(ok)
-                        );
-                    }
+/// Release ONE provisional resource through its actual owner.
+fn release_provisional_spawn_resource<O: SpawnTxnOwners>(
+    owners: &mut O,
+    resource: ProvisionalSpawnResource,
+) {
+    match resource {
+        ProvisionalSpawnResource::Reservation(token) => {
+            let tid = token.tid();
+            let ok = super::spawn_txn::cancel_spawn_reservation(owners, token).is_ok();
+            crate::yarm_log!(
+                "SPAWN_LEDGER_RELEASE class=reservation tid={} ok={}",
+                tid,
+                u8::from(ok)
+            );
+        }
+        ProvisionalSpawnResource::AddressSpace(asid) => {
+            // U9-SPAWN-IC1 §4 — the two cases are decided here and never conflated.
+            //
+            // A never-resident ASID owes no TLB shootdown and must NOT take a retired-ASID
+            // slot: that array is `MAX_ADDRESS_SPACES` deep and drains only on CPU
+            // acknowledgement, so a rollback path consuming one per failed spawn would
+            // eventually make the teardown refuse — an exact rollback turning into a leak.
+            // A published one owes the full live teardown, and gets it.
+            let carrier = owners.asid_carrier_tid(asid);
+            match carrier {
+                None => {
+                    let ok = owners.destroy_unresident_address_space(asid);
+                    crate::yarm_log!(
+                        "SPAWN_LEDGER_RELEASE class=address_space asid={} owner=unresident ok={}",
+                        asid.0,
+                        u8::from(ok)
+                    );
+                }
+                Some(tid) => {
+                    // The ledger's own contract says this cannot happen. Report it and take
+                    // the safe path rather than skip a shootdown that might be owed.
+                    crate::yarm_log!(
+                        "SPAWN_LEDGER_ASID_STILL_BOUND asid={} tid={} result=live_teardown",
+                        asid.0,
+                        tid
+                    );
+                    let ok = owners.destroy_live_address_space(asid);
+                    crate::yarm_log!(
+                        "SPAWN_LEDGER_RELEASE class=address_space asid={} owner=live ok={}",
+                        asid.0,
+                        u8::from(ok)
+                    );
                 }
             }
-            ProvisionalSpawnResource::Endpoint(grant) => {
-                // Capabilities first, then the endpoint — and only if it is still the same
-                // unpublished incarnation. See `KernelState::release_service_endpoint_grant`.
-                let removal = self.release_service_endpoint_grant(&grant);
-                crate::yarm_log!(
-                    "SPAWN_LEDGER_RELEASE class=endpoint index={} generation={} outcome={:?}",
-                    grant.endpoint_index,
-                    grant.endpoint_generation,
-                    removal
-                );
-            }
-            ProvisionalSpawnResource::Delegation(grant) => {
-                let released = self.release_delegation(&grant);
-                crate::yarm_log!(
-                    "SPAWN_LEDGER_RELEASE class=delegation dest_cnode={} dest_cap={} released={}",
-                    grant.identity.dest_cnode.0,
-                    grant.dest_cap.0,
-                    u8::from(released)
-                );
-            }
-            ProvisionalSpawnResource::Capability { cnode, cap } => {
-                let ok = self.revoke_capability_in_cnode(cnode, cap).is_ok();
-                crate::yarm_log!(
-                    "SPAWN_LEDGER_RELEASE class=capability cnode={} cap={} ok={}",
-                    cnode.0,
-                    cap.0,
-                    u8::from(ok)
-                );
-            }
         }
-    }
-
-    /// Undo an in-flight spawn: release every provisional resource in REVERSE acquisition order,
-    /// each through its actual owner, restoring the baseline the transaction started from.
-    ///
-    /// Consumes the ledger, so one transaction cannot be unwound twice.
-    pub(crate) fn unwind_spawn_ledger(&mut self, mut ledger: SpawnLedger) {
-        let held = ledger.len;
-        for slot_index in (0..held).rev() {
-            if let Some(resource) = ledger.entries[slot_index].take() {
-                self.release_provisional_spawn_resource(resource);
-            }
+        ProvisionalSpawnResource::Endpoint(grant) => {
+            // Capabilities first, then the endpoint — and only if it is still the same
+            // unpublished incarnation. See `KernelState::release_service_endpoint_grant`.
+            let removal = owners.release_service_endpoint_grant(&grant);
+            crate::yarm_log!(
+                "SPAWN_LEDGER_RELEASE class=endpoint index={} generation={} outcome={:?}",
+                grant.endpoint_index,
+                grant.endpoint_generation,
+                removal
+            );
         }
-        crate::yarm_log!("SPAWN_LEDGER_UNWOUND released={} result=baseline", held);
+        ProvisionalSpawnResource::Delegation(grant) => {
+            let released = owners.release_delegation(&grant);
+            crate::yarm_log!(
+                "SPAWN_LEDGER_RELEASE class=delegation dest_cnode={} dest_cap={} released={}",
+                grant.identity.dest_cnode.0,
+                grant.dest_cap.0,
+                u8::from(released)
+            );
+        }
+        ProvisionalSpawnResource::Capability { cnode, cap } => {
+            let ok = owners.revoke_capability_in_cnode(cnode, cap).is_ok();
+            crate::yarm_log!(
+                "SPAWN_LEDGER_RELEASE class=capability cnode={} cap={} ok={}",
+                cnode.0,
+                cap.0,
+                u8::from(ok)
+            );
+        }
     }
 }
 
+/// Undo an in-flight spawn: release every provisional resource in REVERSE acquisition order,
+/// each through its actual owner, restoring the baseline the transaction started from.
+///
+/// Consumes the ledger, so one transaction cannot be unwound twice.
+pub(crate) fn unwind_spawn_ledger<O: SpawnTxnOwners>(owners: &mut O, mut ledger: SpawnLedger) {
+    let held = ledger.len;
+    for slot_index in (0..held).rev() {
+        if let Some(resource) = ledger.entries[slot_index].take() {
+            release_provisional_spawn_resource(owners, resource);
+        }
+    }
+    crate::yarm_log!("SPAWN_LEDGER_UNWOUND released={} result=baseline", held);
+}
+
 /// Carry a phase's outcome forward, or unwind the whole transaction and fail.
-fn advance<T>(
-    kernel: &mut KernelState,
+fn advance<T, O: SpawnTxnOwners>(
+    owners: &mut O,
     ledger: SpawnLedger,
     outcome: Result<T, KernelError>,
     name: &'static str,
@@ -324,7 +315,7 @@ fn advance<T>(
         Ok(value) => Ok((value, ledger)),
         Err(err) => {
             crate::yarm_log!("KSPAWN_FAIL phase={} err={:?} result=unwinding", name, err);
-            kernel.unwind_spawn_ledger(ledger);
+            unwind_spawn_ledger(owners, ledger);
             Err(SyscallError::from(err))
         }
     }
@@ -384,8 +375,8 @@ pub(crate) struct SpawnImageCommitted {
 ///
 /// Every failure in 1..5 unwinds the ledger to the transaction's baseline before returning, and
 /// nothing reachable exists until 6 completes.
-pub(crate) fn run_image_spawn_transaction(
-    kernel: &mut KernelState,
+pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(
+    owners: &mut O,
     request: SpawnImageRequest<'_>,
 ) -> Result<SpawnImageCommitted, SyscallError> {
     let SpawnImageRequest {
@@ -404,7 +395,7 @@ pub(crate) fn run_image_spawn_transaction(
     //
     // The TID itself is not a ledger entry. `allocate_thread_id` advances a monotonic cursor
     // that is deliberately never rewound: a TID is not reused, so there is nothing to restore.
-    let tid = kernel.allocate_thread_id().map_err(|err| {
+    let tid = owners.allocate_thread_id().map_err(|err| {
         crate::yarm_log!("KSPAWN_FAIL phase=allocate_tid err={:?}", err);
         SyscallError::from(err)
     })?;
@@ -413,8 +404,8 @@ pub(crate) fn run_image_spawn_transaction(
     let reply_tid = usize::try_from(tid).map_err(|_| SyscallError::Internal)?;
 
     let ledger = SpawnLedger::new();
-    let outcome = kernel.reserve_task_for_spawn_with_class(tid, class);
-    let (reservation, mut ledger) = advance(kernel, ledger, outcome, "reserve_task")?;
+    let outcome = super::spawn_txn::reserve_task_for_spawn(owners, tid, class, tid);
+    let (reservation, mut ledger) = advance(owners, ledger, outcome, "reserve_task")?;
     ledger.record(ProvisionalSpawnResource::Reservation(reservation));
 
     // ── Phase 2+3: the child's whole image, through THE provisioner. ─────────────────────
@@ -438,7 +429,8 @@ pub(crate) fn run_image_spawn_transaction(
     // handler discarded that capability as `_aspace_cap`, and `destroy_user_address_space_by_asid`
     // does not own it, so a failed spawn leaked one on every arm.
     let zero_copy = matches!(source, SpawnImageSource::ZeroCopyInitramfsSlice { .. });
-    let outcome = kernel.provision_spawn_image(
+    let outcome = super::spawn_txn::provision_spawn_image(
+        owners,
         tid,
         image_path,
         match source {
@@ -460,7 +452,7 @@ pub(crate) fn run_image_spawn_transaction(
         &mut startup_args,
         SPAWN_USER_STACK_PAGES,
     );
-    let (provision, mut ledger) = advance(kernel, ledger, outcome, "provision_image")?;
+    let (provision, mut ledger) = advance(owners, ledger, outcome, "provision_image")?;
     let ImageProvision {
         asid,
         aspace_cap,
@@ -470,7 +462,7 @@ pub(crate) fn run_image_spawn_transaction(
         copied_pages,
     } = provision;
     ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
-    if let Some(cnode) = kernel.current_task_cnode() {
+    if let Some(cnode) = owners.current_task_cnode() {
         ledger.record(ProvisionalSpawnResource::Capability {
             cnode,
             cap: aspace_cap,
@@ -514,10 +506,10 @@ pub(crate) fn run_image_spawn_transaction(
     //
     // The spawner's identity is resolved HERE, under task rank 2, before either owner is
     // acquired. The transaction body has no ambient current-task read of its own.
-    let spawner_tid = current_tid(kernel).unwrap_or(0);
-    let spawner_cnode = kernel.current_task_cnode();
+    let spawner_tid = owners.current_tid().unwrap_or(0);
+    let spawner_cnode = owners.current_task_cnode();
     let endpoint_request = spawner_cnode.map(|owner_cnode| {
-        let limits = kernel.runtime_capacity_config();
+        let limits = owners.capacity_limits();
         ServiceEndpointRequest {
             owner_cnode,
             max_depth: SERVICE_ENDPOINT_DEPTH,
@@ -534,9 +526,9 @@ pub(crate) fn run_image_spawn_transaction(
     // Endpoint creation and parent delegation stay TOLERANT of failure, exactly as before: the
     // spawn proceeds with capability id 0 and the child comes up without its service endpoint.
     // That is a pre-existing policy decision about what a spawn means, not a leak.
-    let provision_endpoint = |kernel: &mut KernelState, ledger: &mut SpawnLedger| {
+    let provision_endpoint = |owners: &mut O, ledger: &mut SpawnLedger| {
         let request = endpoint_request.as_ref()?;
-        match kernel.provision_service_endpoint(request) {
+        match owners.provision_service_endpoint(request) {
             Ok(grant) => {
                 ledger.record(ProvisionalSpawnResource::Endpoint(grant));
                 Some(grant)
@@ -548,7 +540,7 @@ pub(crate) fn run_image_spawn_transaction(
         }
     };
 
-    let (service_send_cap, service_recv_cap) = match provision_endpoint(kernel, &mut ledger) {
+    let (service_send_cap, service_recv_cap) = match provision_endpoint(owners, &mut ledger) {
         Some(grant) => {
             crate::yarm_log!(
                 "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
@@ -560,7 +552,7 @@ pub(crate) fn run_image_spawn_transaction(
         }
         None => (0u64, 0u64),
     };
-    let service_reply_recv_cap = match provision_endpoint(kernel, &mut ledger) {
+    let service_reply_recv_cap = match provision_endpoint(owners, &mut ledger) {
         Some(grant) => {
             crate::yarm_log!(
                 "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
@@ -580,7 +572,7 @@ pub(crate) fn run_image_spawn_transaction(
     // The delegated copy is a descendant of `service_send_cap`, whose grant the ledger already
     // owns, so releasing that grant removes this copy too through the revoke cascade.
     let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
-        match kernel.delegate_capability(
+        match owners.delegate_capability(
             spawner_tid,
             CapId(service_send_cap),
             parent_pid,
@@ -618,7 +610,8 @@ pub(crate) fn run_image_spawn_transaction(
         parent_pid,
         image_id
     );
-    let outcome = kernel.spawn_user_task_from_image(
+    let outcome = super::spawn_txn::spawn_user_task_from_image(
+        owners,
         reservation,
         UserImageSpec {
             tid,
@@ -646,7 +639,7 @@ pub(crate) fn run_image_spawn_transaction(
     }
     // A failed spawn restores the exact incarnation the ledger's token names, so that token is
     // still the right one to cancel with.
-    let (spawned, ledger) = advance(kernel, ledger, outcome, "spawn_user_task")?;
+    let (spawned, ledger) = advance(owners, ledger, outcome, "spawn_user_task")?;
     ledger.commit();
     crate::yarm_log!("KSPAWN_TASK_READY tid={}", spawned.tid);
     if lifecycle_markers {

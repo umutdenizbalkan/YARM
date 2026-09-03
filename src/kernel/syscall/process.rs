@@ -190,7 +190,7 @@ pub(super) fn handle_spawn_process(
         );
     }
     let committed = spawn_image_txn::run_image_spawn_transaction(
-        kernel,
+        &mut super::spawn_txn::BroadSpawnOwners { kernel },
         spawn_image_txn::SpawnImageRequest {
             image_id,
             image_path,
@@ -567,7 +567,7 @@ pub(super) fn handle_spawn_from_memory_object(
     };
 
     let committed = spawn_image_txn::run_image_spawn_transaction(
-        kernel,
+        &mut super::spawn_txn::BroadSpawnOwners { kernel },
         spawn_image_txn::SpawnImageRequest {
             image_id,
             image_path,

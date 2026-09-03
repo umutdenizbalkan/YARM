@@ -327,6 +327,7 @@ mod sched;
 // and 29. `pub(crate)` so the split route and the hosted failure-injection proofs reach the same
 // owner the broad handlers use.
 pub(crate) mod spawn_image_txn;
+pub(crate) mod spawn_txn;
 mod vm;
 
 // Stage 149: [S] shared helper re-exports so sibling modules and external

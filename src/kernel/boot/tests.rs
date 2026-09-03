@@ -152258,7 +152258,7 @@ mod u9spawn1_sp3_spawn_ledger {
     ) -> Result<u64, crate::kernel::syscall::SyscallError> {
         k.with(|s| {
             run_image_spawn_transaction(
-                s,
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
                 SpawnImageRequest {
                     image_id: 0,
                     image_path: "init",
@@ -152388,7 +152388,10 @@ mod u9spawn1_sp3_spawn_ledger {
         });
         assert_eq!(ledger.len(), 4, "one entry per acquisition");
         assert_ne!(baseline(&k), before, "the acquisitions must be observable");
-        k.with(|s| s.unwind_spawn_ledger(ledger));
+        k.with(|s| crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+            ledger,
+        ));
         assert_eq!(
             baseline(&k),
             before,
@@ -152425,7 +152428,10 @@ mod u9spawn1_sp3_spawn_ledger {
         ledger.record(ProvisionalSpawnResource::Reservation(token));
         ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
         ledger.record(ProvisionalSpawnResource::Endpoint(grant));
-        k.with(|s| s.unwind_spawn_ledger(ledger));
+        k.with(|s| crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+            ledger,
+        ));
         assert_eq!(
             baseline(&k),
             before,
@@ -154025,7 +154031,7 @@ mod u9spawnvm1_provision_rollback {
     ) -> Result<u64, crate::kernel::syscall::SyscallError> {
         k.with(|s| {
             run_image_spawn_transaction(
-                s,
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
                 SpawnImageRequest {
                     image_id: 0,
                     image_path: "init",
@@ -154754,7 +154760,8 @@ mod u9spawnvm2_provision_failure_injection {
     ) -> Result<crate::kernel::boot::spawn_image_provision::ImageProvision, KernelError> {
         let mut startup = [0u64; 18];
         k.with(|s| {
-            s.provision_spawn_image(
+            crate::kernel::syscall::spawn_txn::provision_spawn_image(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
                 90_100,
                 "test/image",
                 ImageSource::PtLoadSegments { elf, entry },
@@ -155735,7 +155742,10 @@ mod u9spawnic1_endpoint_cap_txn {
                 let mut ledger = SpawnLedger::new();
                 ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
                 ledger.record(ProvisionalSpawnResource::Capability { cnode, cap });
-                s.unwind_spawn_ledger(ledger);
+                crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+            ledger,
+        );
             });
             assert_eq!(baseline(&k), before, "cycle {cycle} drifted");
         }
@@ -155780,7 +155790,10 @@ mod u9spawnic1_endpoint_cap_txn {
         });
         assert_eq!(ledger.len(), 5, "one entry per acquisition");
         assert_ne!(baseline(&k), before, "the acquisitions must be observable");
-        k.with(|s| s.unwind_spawn_ledger(ledger));
+        k.with(|s| crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+            ledger,
+        ));
         assert_eq!(
             baseline(&k).resources_only(),
             before.clone_resources_only(),
