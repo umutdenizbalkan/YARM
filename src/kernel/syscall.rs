@@ -134,7 +134,7 @@ macro_rules! syscall_trace { ($($arg:tt)*) => { if AARCH64_SYSCALL_TRACE { crate
 
 /// PM is always TID 3 (RING3_PM_SERVER_TID in both aarch64 and x86_64 boot).
 /// Temporary Phase 2B bridge constant — replace with page-cap grant in Phase 3.
-const PM_BOOTSTRAP_TID: u64 = 3;
+pub(crate) const PM_BOOTSTRAP_TID: u64 = 3;
 
 // ── Stage 102/145–150: mechanical syscall decomposition (zero behavior change) ─
 // Extracted submodules (D4 steps). Each module contains only the handler
@@ -320,7 +320,7 @@ pub(crate) mod ipc_abi;
 // Stage 155: `pub(crate)` so `kernel/recv_core.rs` (outside the syscall subtree)
 // can call the single `encode_recv_v2_meta` codec. Module holds pure code only.
 pub(crate) mod ipc_recv_core;
-mod process;
+pub(crate) mod process;
 mod recv_shared_v3;
 mod sched;
 // U9-SPAWN1 SP-3: the ONE compensated image-loading spawn transaction, shared by NR 23, 24, 26

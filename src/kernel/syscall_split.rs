@@ -2303,6 +2303,19 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_create_initramfs_mo_into_frame(shared, cpu, frame);
     }
 
+    // U9-SPAWN-TXN3 §4: the two image-loading spawn classes. Both run the ONE generic spawn
+    // transaction through `SharedSpawnOwners`, so nothing about the phase order, the validation
+    // or the compensation differs from the broad path — only the acquisitions do. Every case they
+    // decline is BEFORE the first mutation and returns `None`, propagating UNCHANGED to the
+    // global-lock fallback below; after the first mutation neither ever declines.
+    if matches!(syscall, Syscall::SpawnProcess) {
+        return try_split_spawn_process_into_frame(shared, cpu, frame);
+    }
+
+    if matches!(syscall, Syscall::SpawnFromMemoryObject) {
+        return try_split_spawn_from_mo_into_frame(shared, cpu, frame);
+    }
+
     // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) — a pure read
     // serviced off the global lock. The helper returns `None` for any case it cannot
     // service (hosted-dev, unavailable requester), which propagates UNCHANGED back to
@@ -3724,6 +3737,28 @@ fn try_split_create_initramfs_mo_into_frame(
     None
 }
 
+/// Hosted: both spawn routes read the caller's startup-args array through the off-lock user-read
+/// seam, which uses the direct map and therefore only exists on the real targets. The transaction
+/// they run is exercised directly by the `u9spawntxn3_*` hosted tests through both adapters.
+#[cfg(feature = "hosted-dev")]
+fn try_split_spawn_process_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
+/// Hosted counterpart of [`try_split_spawn_from_mo_into_frame`]; see the note above.
+#[cfg(feature = "hosted-dev")]
+fn try_split_spawn_from_mo_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
 /// Number-only split eligibility classifier (no arg validation, no lock).
 ///
 /// Used by [`try_split_dispatch_into_frame`] as the fast default-deny gate before
@@ -3731,6 +3766,326 @@ fn try_split_create_initramfs_mo_into_frame(
 /// performed by `classify_split_eligible`, so a syscall that passes this gate but
 /// fails its preconditions (e.g. `target_pid == 0`) still falls back to the
 /// global-lock path for the canonical error encoding.
+/// Snapshot the spawning task's identity ONCE, before any phase runs.
+///
+/// U9-SPAWN-IC1's rule: the caller identity is established up front and passed explicitly, never
+/// re-read from an ambient current-task lookup partway through a transaction whose locks are
+/// released between phases.
+fn spawn_owners_for(
+    shared: &SharedKernel,
+    cpu: CpuId,
+) -> Option<crate::kernel::syscall::spawn_txn::SharedSpawnOwners<'_>> {
+    let tid = shared.current_tid_authoritative(cpu)?;
+    Some(crate::kernel::syscall::spawn_txn::SharedSpawnOwners {
+        shared,
+        spawner_tid: Some(tid),
+        spawner_cnode: shared.task_cnode_split(tid),
+        cpu,
+    })
+}
+
+/// Read and normalise the caller's startup-args array, off-lock.
+///
+/// Freestanding only: the off-lock user-read seam reads through the direct map, which exists
+/// only on the real targets. The hosted suite drives the transaction directly instead.
+#[cfg(not(feature = "hosted-dev"))]
+///
+/// Applies the SAME admission (`plan_spawn_startup_args`), the SAME little-endian decode and the
+/// SAME kernel-owned-slot normalisation the broad handler applies — all three are shared pure
+/// functions, so a route cannot admit an array the broad handler would refuse, nor let a
+/// caller-supplied value survive into a slot the spawn is about to write.
+fn split_normalized_startup_args(
+    shared: &SharedKernel,
+    tid: u64,
+    ptr: usize,
+    count: usize,
+) -> Result<([u64; 18], [u64; 4]), crate::kernel::syscall::SyscallError> {
+    use crate::kernel::syscall::process::{
+        decode_spawn_startup_args_into, normalize_startup_args, plan_spawn_startup_args,
+    };
+    let mut out = [0u64; 18];
+    let Some(byte_len) = plan_spawn_startup_args(ptr, count)? else {
+        return Ok(normalize_startup_args(out));
+    };
+    let asid = shared.task_asid_for_tid_split_read(tid);
+    let mut slot_idx = 0usize;
+    let mut remaining = byte_len;
+    let mut at = ptr;
+    while remaining > 0 {
+        let chunk = remaining.min(crate::kernel::ipc::Message::MAX_PAYLOAD);
+        let Some(payload) = shared.copy_from_user_asid_split_read(asid, at, chunk) else {
+            return Err(crate::kernel::syscall::SyscallError::InvalidArgs);
+        };
+        decode_spawn_startup_args_into(&mut out, &mut slot_idx, &payload[..chunk]);
+        at = at
+            .checked_add(chunk)
+            .ok_or(crate::kernel::syscall::SyscallError::InvalidArgs)?;
+        remaining -= chunk;
+    }
+    Ok(normalize_startup_args(out))
+}
+
+/// U9-SPAWN-TXN3 §4 — NR 23 `SpawnProcess`, before the terminal acquisition.
+///
+/// Every gate down to the ELF parse is a pure read of boot-time data or of the caller's own
+/// memory, and each declines with `None` so the broad handler produces the exact error it always
+/// did. The transaction is the first mutation, and from there every outcome is `Some`.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_spawn_process_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::spawn_image_txn;
+    use crate::kernel::syscall::{SyscallError, process::spawn_image_path_for_image_id};
+    use crate::kernel::task::TaskClass;
+    use yarm_srv_common::cpio::CpioArchive;
+
+    let fail =
+        |e: SyscallError| -> Option<Result<(), TrapHandleError>> { Some(Err(TrapHandleError::Syscall(e))) };
+
+    // ── Pre-mutation. Nothing below has touched anything until the transaction. ───────
+    let mut owners = spawn_owners_for(shared, cpu)?;
+    let tid = owners.spawner_tid?;
+
+    let image_id = frame.arg(0) as u64;
+    let parent_pid = frame.arg(1) as u64;
+    let startup_args_ptr = frame.arg(2);
+    let startup_args_count = frame.arg(3);
+    crate::yarm_log!(
+        "KSPAWN_ENTER image_id={} parent_pid={} args_count={}",
+        image_id,
+        parent_pid,
+        startup_args_count
+    );
+    let spawn_lc = crate::kernel::boot::spawn_lifecycle_enabled();
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_REQUEST_BEGIN image_id={} parent_pid={}",
+            image_id,
+            parent_pid
+        );
+    }
+    let (startup_args, extra_send_caps) =
+        match split_normalized_startup_args(shared, tid, startup_args_ptr, startup_args_count) {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        };
+    const INITRAMFS_IMAGE_ID: u64 = 4;
+    let Some(image_path) = spawn_image_path_for_image_id(image_id) else {
+        if spawn_lc {
+            crate::yarm_log!("SPAWN_LIFECYCLE_BAD_IMAGE_ID image_id={}", image_id);
+        }
+        return fail(SyscallError::InvalidArgs);
+    };
+    crate::yarm_log!("KSPAWN_PATH path={}", image_path);
+    let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    let entry = match CpioArchive::new(initrd).find(image_path) {
+        Ok(Some(entry)) => entry,
+        Ok(None) | Err(_) => {
+            if spawn_lc {
+                crate::yarm_log!("SPAWN_LIFECYCLE_IMAGE_RESOLVE_FAIL image_id={}", image_id);
+            }
+            return fail(SyscallError::InvalidArgs);
+        }
+    };
+    let elf_bytes = entry.file_data();
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_IMAGE_RESOLVE_OK image_id={} bytes={}",
+            image_id,
+            elf_bytes.len()
+        );
+        crate::yarm_log!("SPAWN_LIFECYCLE_ELF_PARSE_BEGIN image_id={}", image_id);
+    }
+    crate::yarm_log!("KSPAWN_ELF_FOUND size={}", elf_bytes.len());
+    let Ok(elf) = yarm_srv_common::elf::ElfImageInfo::parse(image_id, elf_bytes) else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_ELF_PARSE_OK image_id={} entry=0x{:x}",
+            image_id,
+            elf.entry
+        );
+    }
+
+    // ── The transaction. From here every outcome is `Some`. ──────────────────────────
+    match spawn_image_txn::run_image_spawn_transaction(
+        &mut owners,
+        spawn_image_txn::SpawnImageRequest {
+            image_id,
+            image_path,
+            source: spawn_image_txn::SpawnImageSource::PtLoadSegments {
+                elf: elf_bytes,
+                entry: elf.entry as usize,
+            },
+            class: TaskClass::SystemServer,
+            parent_pid,
+            startup_args,
+            extra_send_caps,
+            map_initrd_window: image_id == INITRAMFS_IMAGE_ID,
+            lifecycle_markers: spawn_lc,
+        },
+    ) {
+        Ok(committed) => {
+            frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
+            Some(Ok(()))
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// U9-SPAWN-TXN3 §4 — NR 29 `SpawnFromMemoryObject`, before the terminal acquisition.
+///
+/// Identical in every respect to NR 23 except the `ImageSource` it builds: the image comes from a
+/// MemoryObject the caller already holds, loaded zero-copy from the initrd blob.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_spawn_from_mo_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::capabilities::{CapId, CapObject};
+    use crate::kernel::syscall::spawn_image_txn;
+    use crate::kernel::syscall::{SyscallError, process::spawn_image_path_for_image_id};
+    use crate::kernel::task::TaskClass;
+
+    let fail =
+        |e: SyscallError| -> Option<Result<(), TrapHandleError>> { Some(Err(TrapHandleError::Syscall(e))) };
+
+    let mut owners = spawn_owners_for(shared, cpu)?;
+    let caller_tid = owners.spawner_tid?;
+    // Access gate: PM only, exactly as the broad handler gates it.
+    if caller_tid != crate::kernel::syscall::PM_BOOTSTRAP_TID {
+        crate::yarm_log!("SPAWN_FROM_MO_DENIED tid={} reason=not_pm", caller_tid);
+        return fail(SyscallError::MissingRight);
+    }
+
+    let image_id = frame.arg(0) as u64;
+    let mo_cap_raw = frame.arg(1) as u64;
+    let parent_pid = frame.arg(2) as u64;
+    let startup_args_ptr = frame.arg(3);
+    let startup_args_count = frame.arg(4);
+    crate::yarm_log!(
+        "SPAWN_FROM_MO_ENTER image_id={} mo_cap={} parent_pid={}",
+        image_id,
+        mo_cap_raw,
+        parent_pid
+    );
+
+    let Ok(capability) = shared.resolve_capability_for_task_split(caller_tid, CapId(mo_cap_raw))
+    else {
+        return fail(SyscallError::InvalidCapability);
+    };
+    let CapObject::MemoryObject { id: mo_id } = capability.object else {
+        crate::yarm_log!(
+            "SPAWN_FROM_MO_WRONG_CAP image_id={} mo_cap={}",
+            image_id,
+            mo_cap_raw
+        );
+        return fail(SyscallError::WrongObject);
+    };
+    let Some((file_data_offset, file_len)) = shared.with_memory_split_mut(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|mo| mo.id == mo_id)
+            .and_then(|mo| match mo.kind {
+                crate::kernel::boot::MemoryObjectKind::InitramfsFileSlice {
+                    initrd_offset,
+                    file_len,
+                } => Some((initrd_offset as usize, file_len as usize)),
+                _ => None,
+            })
+    }) else {
+        return fail(SyscallError::WrongObject);
+    };
+    let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    let Some(end) = file_data_offset.checked_add(file_len) else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    if end > initrd.len() {
+        crate::yarm_log!(
+            "SPAWN_FROM_MO_BOUNDS_ERR image_id={} off={} len={} initrd_len={}",
+            image_id,
+            file_data_offset,
+            file_len,
+            initrd.len()
+        );
+        return fail(SyscallError::InvalidArgs);
+    }
+    let elf_bytes = &initrd[file_data_offset..end];
+    crate::yarm_log!(
+        "SPAWN_FROM_MO_ELF image_id={} elf_len={}",
+        image_id,
+        elf_bytes.len()
+    );
+    let Ok(elf) = yarm_srv_common::elf::ElfImageInfo::parse(image_id, elf_bytes) else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    crate::yarm_log!("SPAWN_FROM_MO_ENTRY entry=0x{:x}", elf.entry);
+    let Some(image_path) = spawn_image_path_for_image_id(image_id) else {
+        return fail(SyscallError::InvalidArgs);
+    };
+    let (startup_args, extra_send_caps) = match split_normalized_startup_args(
+        shared,
+        caller_tid,
+        startup_args_ptr,
+        startup_args_count,
+    ) {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
+    let initrd_virt_raw = initrd.as_ptr() as u64;
+    let initrd_phys_base = {
+        let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
+        let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
+        if virt_base > phys_base && initrd_virt_raw >= virt_base {
+            initrd_virt_raw - virt_base + phys_base
+        } else {
+            initrd_virt_raw
+        }
+    };
+
+    // ── The transaction. From here every outcome is `Some`. ──────────────────────────
+    match spawn_image_txn::run_image_spawn_transaction(
+        &mut owners,
+        spawn_image_txn::SpawnImageRequest {
+            image_id,
+            image_path,
+            source: spawn_image_txn::SpawnImageSource::ZeroCopyInitramfsSlice {
+                elf: elf_bytes,
+                initrd_phys_base,
+                file_initrd_offset: file_data_offset as u64,
+            },
+            class: TaskClass::SystemServer,
+            parent_pid,
+            startup_args,
+            extra_send_caps,
+            map_initrd_window: false,
+            lifecycle_markers: false,
+        },
+    ) {
+        Ok(committed) => {
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_OK image_id={} spawned_tid={}",
+                image_id,
+                committed.tid
+            );
+            frame.set_ok(0, committed.reply_tid, committed.packed_ret2 as usize);
+            Some(Ok(()))
+        }
+        Err(e) => fail(e),
+    }
+}
+
 fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
     match syscall {
         Syscall::ControlPlaneSetCnodeSlots => Some(syscall),
@@ -3767,6 +4122,15 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // work and no task switch. `try_split_spawn_thread_into_frame` decides the rest.
         Syscall::SpawnThread => Some(syscall),
         Syscall::CreateInitramfsFileSliceMo => Some(syscall),
+        // U9-SPAWN-TXN3 §4: SpawnProcess (NR 23) and SpawnFromMemoryObject (NR 29) — the last two
+        // live production classes reaching a terminal broad acquisition. Both execute the SAME
+        // generic spawn transaction the broad path executes; they differ only in how the image
+        // reaches the new address space, which is the `ImageSource` each one builds. Their
+        // rollback is the exact provisional-capability closure U9-SPAWN-TXN3 §1 derived, so every
+        // owner they need exists off-lock. `try_split_spawn_process_into_frame` and
+        // `try_split_spawn_from_mo_into_frame` decide the rest.
+        Syscall::SpawnProcess => Some(syscall),
+        Syscall::SpawnFromMemoryObject => Some(syscall),
         // Stage 197A removed the former NR 27 InitramfsReadChunk split class along with the
         // syscall. Its sibling note — that NR 28 MINTS a capability and therefore "stays
         // global-lock-only" — was retired by U9-MO2 §4: the mint was never the obstacle, the
