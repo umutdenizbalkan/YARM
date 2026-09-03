@@ -75,45 +75,17 @@ impl KernelState {
         }
     }
 
+    /// Copy a byte range into a user address space.
+    /// Body: [`super::vm_image_locked::copy_to_user_locked`].
     pub fn copy_to_user(
         &mut self,
         asid: Asid,
         va: VirtAddr,
         bytes: &[u8],
     ) -> Result<(), KernelError> {
-        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
-            crate::yarm_log!(
-                "COPY_TO_USER asid={} va=0x{:x} len={}",
-                asid.0,
-                va.0,
-                bytes.len()
-            );
-        }
-        let mut last_page_base: Option<usize> = None;
-        for (i, &byte) in bytes.iter().enumerate() {
-            let addr = va.0 as usize + i;
-            let page_base = addr & !(crate::kernel::vm::PAGE_SIZE - 1usize);
-            if last_page_base != Some(page_base) {
-                let pte_present = crate::arch::selected_isa::page_table::resolve_page(
-                    asid,
-                    VirtAddr(page_base as u64),
-                )
-                .is_some();
-                if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
-                    crate::yarm_log!(
-                        "COPY_TO_USER_PAGE asid={} page_va=0x{:x} pte_present={} offset={}",
-                        asid.0,
-                        page_base,
-                        pte_present,
-                        i
-                    );
-                }
-                last_page_base = Some(page_base);
-            }
-            let phys = self.validate_user_access_for_asid(asid, addr, true)?;
-            self.write_user_byte(asid, VirtAddr(phys), byte)?;
-        }
-        Ok(())
+        self.with_vm_then_memory_mut(|vm, memory| {
+            super::vm_image_locked::copy_to_user_locked(vm, memory, asid, va, bytes)
+        })
     }
 
     pub fn copy_from_user(
@@ -287,7 +259,7 @@ impl KernelState {
     }
 
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    fn pte_allows_user_access(
+    pub(crate) fn pte_allows_user_access(
         pte: crate::arch::selected_isa::page_table::PageTableEntry,
         need_write: bool,
     ) -> bool {
@@ -298,7 +270,7 @@ impl KernelState {
     }
 
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    fn pte_allows_user_access(
+    pub(crate) fn pte_allows_user_access(
         pte: crate::arch::selected_isa::page_table::PageTableEntry,
         need_write: bool,
     ) -> bool {
@@ -309,7 +281,7 @@ impl KernelState {
     }
 
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-    fn pte_allows_user_access(
+    pub(crate) fn pte_allows_user_access(
         pte: crate::arch::selected_isa::page_table::PageTableEntry,
         need_write: bool,
     ) -> bool {

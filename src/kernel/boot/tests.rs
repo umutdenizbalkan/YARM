@@ -152351,22 +152351,38 @@ mod u9spawn1_sp3_spawn_ledger {
         // anything is created, the address space precedes the load, and the stack is last — which
         // is what puts it on the rollback's side of the commit.
         let prov = PROVISION_SRC
-            .split("pub(crate) fn provision_spawn_image(")
+            .split("pub(crate) fn provision_image_locked(")
             .nth(1)
-            .expect("the provisioner body");
+            .expect("the rank-local provisioner body");
         let plan = prov.find("plan_image_load(elf)").expect("the plan phase");
         let create = prov
-            .find("create_user_address_space()")
+            .find("create_address_space_locked(vm)")
             .expect("the address-space phase");
         let load = prov
-            .find("load_elf_pt_load_segments(")
+            .find("load_elf_pt_load_segments_locked(")
             .expect("the load phase");
         let stack = prov
-            .find("allocate_user_stack_in_asid(")
+            .find("allocate_user_stack_locked(")
             .expect("the stack phase");
         assert!(
             plan < create && create < load && load < stack,
             "provisioning order must stay plan → address space → image → stack"
+        );
+        // U9-SPAWN-VM2 §2: the capability is published by the BROAD wrapper, strictly after the
+        // rank-local body returned and both locks were released — never while rank 5/6 is held.
+        let broad = PROVISION_SRC
+            .split("pub(crate) fn provision_spawn_image(")
+            .nth(1)
+            .expect("the broad wrapper");
+        let provisioned = broad
+            .find("provision_image_locked(vm, memory, &request)")
+            .expect("the provisioning step");
+        let mint = broad
+            .find("mint_capability_for_current_context(")
+            .expect("the capability publication step");
+        assert!(
+            provisioned < mint,
+            "the address-space capability must be minted after provisioning, not during it"
         );
     }
 
@@ -152401,20 +152417,20 @@ mod u9spawn1_sp3_spawn_ledger {
             "each fallible acquisition is carried by the same ledger-aware step"
         );
 
-        // The same rule inside the provisioner, where the acquisitions now live. `?` is legal on
-        // the plan and on `create_user_address_space` — nothing is owned yet at either point —
-        // and forbidden on every step after, which must route through `unwind_spawn_image`.
+        // The same rule inside the rank-local body, where the acquisitions live. `?` is legal on
+        // the plan and on `create_address_space_locked` — nothing is owned yet at either point —
+        // and forbidden on every step after, which must route through `rollback_provision_locked`.
         let prov = PROVISION_SRC
-            .split("pub(crate) fn provision_spawn_image(")
+            .split("pub(crate) fn provision_image_locked(")
             .nth(1)
-            .expect("the provisioner body");
+            .expect("the rank-local provisioner body");
         let owns_from = prov
-            .find("create_user_address_space()")
+            .find("create_address_space_locked(vm)")
             .expect("the address-space phase");
         for acquisition in [
-            "load_elf_pt_load_segments(",
-            "load_elf_with_mo_zero_copy(",
-            "allocate_user_stack_in_asid(",
+            "load_elf_pt_load_segments_locked(",
+            "load_elf_with_mo_zero_copy_locked(",
+            "allocate_user_stack_locked(",
         ] {
             let at = prov.find(acquisition).expect(acquisition);
             assert!(at > owns_from, "{acquisition} runs while the ASID is owned");
@@ -152423,14 +152439,27 @@ mod u9spawn1_sp3_spawn_ledger {
             assert!(
                 !stmt.contains(")?") && !stmt.contains("?;"),
                 "{acquisition} holds an address space — its failure must go through \
-                 `unwind_spawn_image`, not a bare `?` that abandons it"
+                 `rollback_provision_locked`, not a bare `?` that abandons it"
             );
         }
         assert_eq!(
-            prov.matches("self.unwind_spawn_image(asid, aspace_cap,")
+            prov.matches("rollback_provision_locked(vm, memory, asid,")
                 .count(),
             2,
             "exactly the two owning phases (load, stack) unwind, and both through the one rollback"
+        );
+        // The broad wrapper adds exactly one more: the capability-mint failure, which owns a whole
+        // provisioned image and must give it back.
+        let broad = PROVISION_SRC
+            .split("pub(crate) fn provision_spawn_image(")
+            .nth(1)
+            .expect("the broad wrapper");
+        assert_eq!(
+            broad
+                .matches("rollback_provision_locked(vm, memory, token.asid,")
+                .count(),
+            1,
+            "the mint failure rolls the exact token back, exactly once"
         );
     }
 
@@ -152513,6 +152542,10 @@ mod u9aspace1_teardown_frame_reclaim {
     use crate::runtime::SharedKernel;
 
     const MEMORY_SRC: &str = include_str!("memory_state.rs");
+    /// U9-SPAWN-VM2 moved the release owner and the drain/reclaim halves of the teardown into the
+    /// rank-local VM/memory layer. The guards below follow them there rather than being relaxed:
+    /// the same conditions are asserted, against the file that now holds the only copy.
+    const VM_LOCKED_SRC: &str = include_str!("vm_image_locked.rs");
 
     fn kernel() -> SharedKernel {
         SharedKernel::new(Bootstrap::init().expect("init"))
@@ -152798,10 +152831,10 @@ mod u9aspace1_teardown_frame_reclaim {
     /// existing authorities rather than keeping a count of its own.
     #[test]
     fn the_release_is_gated_on_existing_authorities() {
-        let body = MEMORY_SRC
-            .split("fn release_unreferenced_user_frame(")
+        let body = VM_LOCKED_SRC
+            .split("pub(crate) fn release_unreferenced_user_frame_locked(")
             .nth(1)
-            .and_then(|s| s.split("\n    }\n").next())
+            .and_then(|s| s.split("\n}\n").next())
             .expect("the release owner");
         for authority in ["memory_objects", "any_mapping_for_phys", "free_frame"] {
             assert!(
@@ -152834,13 +152867,18 @@ mod u9aspace1_teardown_frame_reclaim {
                  assumes nothing does"
             );
         }
-        // It is reached from the teardown owner's drain loop, and from nowhere else.
+        // It is reached from the teardown owner's reclaim loop, and from nowhere else.
         assert_eq!(
-            MEMORY_SRC
-                .matches("self.release_unreferenced_user_frame(phys)")
+            VM_LOCKED_SRC
+                .matches("release_unreferenced_user_frame_locked(vm, memory, phys)")
                 .count(),
             1,
-            "exactly one call site, inside the teardown owner"
+            "exactly one call site, inside the drained-mapping reclaim loop"
+        );
+        // And there is no second copy left behind on `KernelState`.
+        assert!(
+            !MEMORY_SRC.contains("fn release_unreferenced_user_frame("),
+            "the broad method must be gone, not shadowing the rank-local owner"
         );
         // And it never invents a physical address or edits a count.
         assert!(
@@ -152869,7 +152907,10 @@ mod u9aspace1_teardown_frame_reclaim {
         );
         // No architecture may drain an address space by hand.
         for (rel, src) in stage199d_wa2a_ownership_boundary::production_sources() {
-            if rel == "src/kernel/vm.rs" || rel == "src/kernel/boot/memory_state.rs" {
+            // `vm.rs` defines the drain; `vm_image_locked.rs` is the single rank-local caller both
+            // teardowns (live and never-resident) now go through. Everything else must not drain
+            // an address space by hand, or it would miss the frame release.
+            if rel == "src/kernel/vm.rs" || rel == "src/kernel/boot/vm_image_locked.rs" {
                 continue;
             }
             assert!(
@@ -152878,6 +152919,20 @@ mod u9aspace1_teardown_frame_reclaim {
                  would miss the frame release"
             );
         }
+        // The two teardowns are siblings over one drain, not two drains: the live one adds the
+        // shootdown its resident ASID owes, the never-resident one adds nothing.
+        assert_eq!(
+            VM_LOCKED_SRC
+                .matches("destroy_and_collect_mappings(")
+                .count(),
+            1,
+            "exactly one drain call exists"
+        );
+        assert!(
+            MEMORY_SRC.contains("vm_image_locked::drain_address_space_locked(")
+                && MEMORY_SRC.contains("vm_image_locked::reclaim_drained_mappings_locked("),
+            "the live teardown must delegate both halves rather than keep its own copy"
+        );
     }
 }
 

@@ -70,6 +70,8 @@ mod transfer_state;
 pub(crate) use transfer_state::transfer_shared_region_bounds_ok;
 mod types;
 mod user_memory_state;
+/// U9-SPAWN-VM2: the rank-local VM(5)/memory(6) bodies the image path is built out of.
+pub(crate) mod vm_image_locked;
 /// Stage 199D-WA2A-R1 — the endpoint-waiter ownership primitive.
 ///
 /// Stage 199D-WA3C2 raises this from `mod` to `pub(crate)`, because the off-lock direct NR6/NR7

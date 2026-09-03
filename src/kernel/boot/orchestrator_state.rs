@@ -1886,6 +1886,38 @@ impl KernelState {
         })
     }
 
+    /// U9-SPAWN-VM2 — the address-space manager (VM, rank 5) and the memory subsystem
+    /// (rank 6) under ONE acquisition each, taken in that order.
+    ///
+    /// This is the composition seam the rank-local image provisioner needs. Every phase of a
+    /// spawn image — create the ASID, allocate backing, map a page, load a segment, allocate the
+    /// stack, and unwind all of it — touches both domains, and doing so through the single-domain
+    /// accessors means dropping and retaking a lock between every step. Holding both for the whole
+    /// body is what makes the provisioning one transaction rather than a sequence of them.
+    ///
+    /// Rank 5 before rank 6 is the ONLY legal order (`doc/KERNEL_LOCKING.md`), and it is fixed
+    /// here rather than left to each caller — which is the point of having one helper instead of
+    /// nested `with_user_spaces_mut` / `with_memory_state_mut` calls that could be written either
+    /// way round. Nothing inside the closure may call back into `KernelState`: both locks are
+    /// held, so a re-entrant acquisition would deadlock.
+    pub(crate) fn with_vm_then_memory_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut AddressSpaceManager, &mut MemorySubsystem) -> R,
+    ) -> R {
+        // Multi-lock helper order (must match doc/KERNEL_LOCKING.md): vm -> memory
+        Self::debug_lock_order_note("vm");
+        let _vm_guard = self.vm_state_lock.lock();
+        Self::debug_lock_order_note("memory");
+        let _mem_guard = self.memory_state_lock.lock();
+        let memory = core::ptr::addr_of_mut!(self.memory);
+        // SAFETY: `user_spaces` and `memory` are disjoint fields of the same `KernelState`,
+        // serialized by the two distinct guards held for the whole closure.
+        f(
+            kernel_mut(&mut self.user_spaces),
+            kernel_mut(unsafe { &mut *memory }),
+        )
+    }
+
     pub(crate) fn with_user_spaces<R>(&self, f: impl FnOnce(&AddressSpaceManager) -> R) -> R {
         // Lock-order domain: vm
         Self::debug_lock_order_note("vm");

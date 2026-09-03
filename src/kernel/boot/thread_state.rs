@@ -92,12 +92,12 @@ pub(crate) const KERNEL_STACK_GUARD_SIZE: usize = 0x1000;
 /// canonical boundary is physically impossible, so the depth must be reduced, not
 /// the range extended.)
 const D6_PROOF_MAX_TASKS: usize = 128;
-const USER_STACK_STRIDE_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const USER_STACK_STRIDE_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_arch = "x86_64")]
 const USER_VIRT_TOP_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
 #[cfg(not(target_arch = "x86_64"))]
 const USER_VIRT_TOP_EXCLUSIVE: u64 = crate::kernel::vm::KERNEL_SPACE_BASE;
-const USER_STACK_TOP_BASE: u64 = USER_VIRT_TOP_EXCLUSIVE - USER_STACK_STRIDE_BYTES;
+pub(crate) const USER_STACK_TOP_BASE: u64 = USER_VIRT_TOP_EXCLUSIVE - USER_STACK_STRIDE_BYTES;
 
 #[cfg(all(target_arch = "x86_64", not(test)))]
 core::arch::global_asm!(
@@ -2677,102 +2677,17 @@ impl KernelState {
     /// child is `ReservedUnstarted` and its ASID is deliberately not yet bound — so it cannot go
     /// through the TID lookup. Nothing else differs: same slot arithmetic, same guard page, same
     /// overlap refusal, same resolve probe.
+    /// THE user-stack allocator — broad entry.
+    /// Body: [`super::vm_image_locked::allocate_user_stack_locked`].
     pub(crate) fn allocate_user_stack_in_asid(
         &mut self,
         asid: crate::kernel::vm::Asid,
         tid: u64,
         stack_pages: usize,
     ) -> Result<crate::kernel::vm::VirtAddr, KernelError> {
-        if stack_pages == 0 {
-            return Err(KernelError::WrongObject);
-        }
-        let stack_bytes = (stack_pages as u64)
-            .checked_mul(crate::kernel::vm::PAGE_SIZE as u64)
-            .ok_or(KernelError::WrongObject)?;
-        let stride = USER_STACK_STRIDE_BYTES.max(stack_bytes + crate::kernel::vm::PAGE_SIZE as u64);
-        // USER_STACK_TOP_BASE may be small on architectures with a narrow user
-        // VA range (e.g. AArch64 prototype: 1 GB).  Dynamic TIDs (>= 10000) can
-        // exceed the available slots if we multiply directly, causing checked_sub
-        // to return None.  Wrap tid into the available slot count instead; the
-        // per-address-space overlap check below catches any actual VA conflicts
-        // within the same process.
-        let max_slots = (USER_STACK_TOP_BASE / stride).max(1);
-        let slot = tid % max_slots;
-        let top = USER_STACK_TOP_BASE
-            .checked_sub(slot.saturating_mul(stride))
-            .ok_or(KernelError::WrongObject)?;
-        let base = top
-            .checked_sub(stack_bytes)
-            .ok_or(KernelError::WrongObject)?;
-        let guard = base
-            .checked_sub(crate::kernel::vm::PAGE_SIZE as u64)
-            .ok_or(KernelError::WrongObject)?;
-        if top >= crate::kernel::vm::KERNEL_SPACE_BASE || guard == 0 {
-            return Err(KernelError::WrongObject);
-        }
-        for page in (guard..top).step_by(crate::kernel::vm::PAGE_SIZE) {
-            if self.with_user_spaces(|spaces| {
-                spaces
-                    .get(asid)
-                    .and_then(|aspace| aspace.resolve(crate::kernel::vm::VirtAddr(page)))
-                    .is_some()
-            }) {
-                return Err(KernelError::WrongObject);
-            }
-        }
-        for page in (base..top).step_by(crate::kernel::vm::PAGE_SIZE) {
-            let phys = crate::kernel::vm::PhysAddr(self.alloc_user_data_frame()?);
-            self.map_user_page_in_asid_raw(
-                asid,
-                crate::kernel::vm::VirtAddr(page),
-                crate::kernel::vm::Mapping {
-                    phys,
-                    flags: crate::kernel::vm::PageFlags::USER_RW,
-                },
-            )?;
-            #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
-            crate::yarm_log!(
-                "KSPAWN_NEW_TASK_STACK tid={} asid={} stack_va=0x{:x} pa=0x{:x} stack_base=0x{:x} stack_top=0x{:x}",
-                tid,
-                asid.0,
-                page,
-                phys.0,
-                base,
-                top
-            );
-        }
-        let guard_phys = crate::kernel::vm::PhysAddr(self.alloc_user_data_frame()?);
-        self.map_user_page_in_asid_raw(
-            asid,
-            crate::kernel::vm::VirtAddr(guard),
-            crate::kernel::vm::Mapping {
-                phys: guard_phys,
-                flags: crate::kernel::vm::PageFlags::GUARD,
-            },
-        )?;
-        if cfg!(not(feature = "hosted-dev")) {
-            crate::yarm_log!(
-                "USER_STACK asid={} base=0x{:x} top=0x{:x}",
-                asid.0,
-                base,
-                top
-            );
-        }
-        let stack_probe = crate::kernel::vm::VirtAddr(top - 8);
-        let stack_resolve =
-            crate::arch::selected_isa::page_table::resolve_page(asid, stack_probe).is_some();
-        if cfg!(not(feature = "hosted-dev")) {
-            crate::yarm_log!(
-                "USER_STACK_RESOLVE asid={} probe=0x{:x} ok={}",
-                asid.0,
-                stack_probe.0,
-                stack_resolve
-            );
-        }
-        if !stack_resolve {
-            return Err(KernelError::UserMemoryFault);
-        }
-        Ok(crate::kernel::vm::VirtAddr(top))
+        self.with_vm_then_memory_mut(|vm, memory| {
+            super::vm_image_locked::allocate_user_stack_locked(vm, memory, asid, tid, stack_pages)
+        })
     }
 
     pub fn spawn_user_thread(
