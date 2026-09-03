@@ -19,6 +19,42 @@ commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
 Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 `doc/KERNEL_UNLOCKING.md` §0.
 
+**U9-SPAWN-VM1 — the address space, the image and the user stack are one provisioner with one
+exact rollback, production-exercised by broad NR 23/NR 29 on all three architectures. Census
+remains `2 / 0 / 2`. U9 remains OPEN.**
+
+*§1/§2 — one provisioner.* Provisioning a process image was four separately-failing steps spread
+over two files: create the address space and mint its capability, load the ELF, map NR 23's initrd
+window, and — much later, past the reservation claim, INSIDE the commit — allocate the user stack.
+The last one had no failure arm at all, because a stack allocated inside the commit could not be
+rolled back. `src/kernel/boot/spawn_image_provision.rs` now owns all four, with the image source as
+the only axis NR 23 and NR 29 differ on: plan (pure, nothing owned) → address space → load →
+initrd window → stack → token. Rollback is the exact reverse, once: revoke the address-space
+capability, which lives in the CALLER's cspace where the teardown cannot reach it, then destroy the
+address space through the repaired U9-ASPACE1 teardown owner.
+
+*Why rollback owes no shootdown.* Established from source, not assumed: `live_cpu_bitmap_for_asid`
+defines residency as some online CPU's current task carrying the ASID; a task carries one only
+through `tcb.asid = Some(..)`, and every such site is enumerated — two inside the commit, one AP
+bring-up, one shared-region client, one fork child, one test-only binder; and `allocate_asid`
+returns only candidates that are neither live nor retired-unacknowledged. Between creation and
+commit no TCB carries the child's ASID, and the child is `ReservedUnstarted` throughout, so it
+cannot make its own ASID resident either.
+
+*§3 — failure injection.* Nine malformed-image shapes are refused with kernel state never moved,
+not merely restored, because the plan is pure. Frame exhaustion is swept across every allocation
+position from zero up to one short of a successful spawn, each restoring tasks, address spaces,
+free frames, MemoryObjects, endpoints, spawner cspace slots and installed mappings exactly, and
+each repeated twice more. Live: `PM_ELF_ZC_DONE = 5` and eight `SPAWN_IMAGE_PROVISIONED` (3 NR 23 +
+5 NR 29) on x86_64, AArch64 and RISC-V, zero panics, result streams identical to `f40ec35`, and the
+marker NAME SET differs by exactly the one new marker.
+
+*What it does NOT do.* The provisioner still takes `&mut KernelState`; it has no rank-local seam,
+because the owners it consolidates have none and building a seam over the broad state would be
+dormant API. So U9-SPAWN2 §3's phase table stands unchanged in its verdict — what changed is that
+three of its seven phases now have ONE owner with ONE rollback instead of three independent ones,
+which is the prerequisite that residual-owner note named.
+
 **U9-SPAWN2 — the byte-copy spawn fallback and NR 24 are gone; the process-CNode transaction is
 one owner; the live NR 23/NR 29 split route HARD-STOPS on four remaining subsystems. Census
 remains `2 / 0 / 2`. U9 remains OPEN.**
