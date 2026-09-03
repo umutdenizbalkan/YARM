@@ -74,11 +74,18 @@
 //! compensation repair.
 
 use super::{SyscallError, current_tid};
+use crate::kernel::boot::spawn_image_provision::{ImageProvision, ImageSource};
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use crate::kernel::capabilities::{CNodeId, CapId, CapRights};
 use crate::kernel::spawn_reservation::SpawnReservationToken;
 use crate::kernel::task::TaskClass;
-use crate::kernel::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+use crate::kernel::vm::Asid;
+
+/// The user stack every image-loading spawn gets, in pages.
+///
+/// The value is the one `spawn_image_after_claim` has always passed; U9-SPAWN-VM1 only moved the
+/// decision to the caller that now owns the stack's rollback, so it is stated once.
+const SPAWN_USER_STACK_PAGES: usize = 64;
 
 /// One provisional resource, with the identity its owner needs to release it.
 ///
@@ -273,107 +280,6 @@ pub(crate) struct SpawnImageCommitted {
     pub(crate) packed_ret2: u64,
 }
 
-/// Map the boot initrd read-only into `asid` and publish it in startup slots 15/16.
-///
-/// Failure is TOLERATED, exactly as before: `initramfs_srv` falls back to its syscall bridge when
-/// the window is absent, so a mapping failure must not fail the spawn. Pages installed before a
-/// failure belong to `asid`, which the ledger already owns.
-fn map_boot_initrd_window(kernel: &mut KernelState, asid: Asid, startup_args: &mut [u64; 18]) {
-    const INITRD_USER_VA_BASE: u64 = 0x0C00_0000;
-    let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() else {
-        crate::yarm_log!("INITRAMFS_INITRD_MAP_SKIP reason=no_boot_initrd");
-        return;
-    };
-    let initrd_virt_raw = initrd.as_ptr() as u64;
-    let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
-    let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
-    let initrd_phys_raw = if virt_base > phys_base && initrd_virt_raw >= virt_base {
-        match initrd_virt_raw
-            .checked_sub(virt_base)
-            .and_then(|off| phys_base.checked_add(off))
-        {
-            Some(phys) => phys,
-            None => {
-                crate::yarm_log!(
-                    "INITRAMFS_INITRD_ADDR_INVALID raw_ptr=0x{:x} virt_base=0x{:x} phys_base=0x{:x}",
-                    initrd_virt_raw,
-                    virt_base,
-                    phys_base
-                );
-                return;
-            }
-        }
-    } else if initrd_virt_raw < virt_base || virt_base == phys_base {
-        initrd_virt_raw
-    } else {
-        crate::yarm_log!(
-            "INITRAMFS_INITRD_ADDR_INVALID raw_ptr=0x{:x} virt_base=0x{:x} phys_base=0x{:x}",
-            initrd_virt_raw,
-            virt_base,
-            phys_base
-        );
-        return;
-    };
-    let initrd_len = initrd.len() as u64;
-    let mut first6 = [0u8; 6];
-    let first6_len = core::cmp::min(initrd.len(), first6.len());
-    first6[..first6_len].copy_from_slice(&initrd[..first6_len]);
-    crate::yarm_log!(
-        "INITRAMFS_INITRD_SOURCE_RANGE raw_ptr=0x{:x} phys_start=0x{:x} len={}",
-        initrd_virt_raw,
-        initrd_phys_raw,
-        initrd_len
-    );
-    crate::yarm_log!("INITRAMFS_INITRD_FIRST6 bytes={:?}", first6);
-    let page: u64 = PAGE_SIZE as u64;
-    let phys_start = initrd_phys_raw & !(page - 1);
-    let phys_end = (initrd_phys_raw + initrd_len + page - 1) & !(page - 1);
-    let pages_to_map = ((phys_end - phys_start) / page) as usize;
-    let initrd_offset_in_first_page = initrd_phys_raw - phys_start;
-    crate::yarm_log!(
-        "INITRAMFS_INITRD_MAP_BEGIN phys_start=0x{:x} phys_end=0x{:x} len={} pages={}",
-        phys_start,
-        phys_end,
-        initrd_len,
-        pages_to_map
-    );
-    let initrd_flags = PageFlags {
-        read: true,
-        write: false,
-        execute: false,
-        user: true,
-        cache_policy: CachePolicy::WriteBack,
-    };
-    for i in 0..pages_to_map {
-        let virt = VirtAddr(INITRD_USER_VA_BASE + (i as u64) * page);
-        let phys = PhysAddr(phys_start + (i as u64) * page);
-        if let Err(e) = kernel.map_user_page_in_asid_raw(
-            asid,
-            virt,
-            Mapping {
-                phys,
-                flags: initrd_flags,
-            },
-        ) {
-            crate::yarm_log!(
-                "INITRAMFS_INITRD_MAP_FAIL page={} virt=0x{:x} err={:?}",
-                i,
-                virt.0,
-                e
-            );
-            return;
-        }
-    }
-    let user_initrd_ptr = INITRD_USER_VA_BASE + initrd_offset_in_first_page;
-    startup_args[15] = user_initrd_ptr;
-    startup_args[16] = initrd_len;
-    crate::yarm_log!(
-        "INITRAMFS_INITRD_MAP_DONE user_ptr=0x{:x} len={} rights=ro",
-        user_initrd_ptr,
-        initrd_len
-    );
-}
-
 /// THE image-loading spawn transaction, shared by NR 23, NR 24, NR 26 and NR 29.
 ///
 /// Phases, in ledger order:
@@ -420,16 +326,58 @@ pub(crate) fn run_image_spawn_transaction(
     let (reservation, mut ledger) = advance(kernel, ledger, outcome, "reserve_task")?;
     ledger.record(ProvisionalSpawnResource::Reservation(reservation));
 
-    // ── Phase 2: the address space, and the capability that names it. ────────────────────
+    // ── Phase 2+3: the child's whole image, through THE provisioner. ─────────────────────
     //
-    // `create_user_address_space` returns TWO resources, not one: the ASID, and a MAP/READ/WRITE
-    // capability over it minted into the caller's cspace. Every handler discarded that
-    // capability as `_aspace_cap`, and `destroy_user_address_space_by_asid` does not own it — it
-    // frees the address space, not the caller's cspace slot naming it. So a failed spawn left a
-    // capability behind on EVERY failure arm, including the earliest one. The SP-3 hosted
-    // failure-injection proof is what surfaced it.
-    let outcome = kernel.create_user_address_space();
-    let ((asid, aspace_cap), mut ledger) = advance(kernel, ledger, outcome, "create_asid")?;
+    // U9-SPAWN-VM1 replaced four separately-failing steps — create the address space, load the
+    // ELF, map NR 23's initrd window, and (much later, past the commit) allocate the user stack —
+    // with one `provision_spawn_image` call that owns them together and rolls all four back with
+    // one exact unwind. Two consequences for this transaction:
+    //
+    //   * The failure arm is now the provisioner's. It destroys the address space AND revokes the
+    //     capability naming it before returning, so nothing is recorded in the ledger on a failed
+    //     provisioning — recording after the fact would double-release. The ledger records both
+    //     resources only once the provisioning SUCCEEDED and ownership transferred here, and from
+    //     then on it is what covers a later endpoint or commit failure.
+    //   * The user stack now exists BEFORE the commit rather than inside it, which is what lets a
+    //     stack-allocation failure roll back at all. `spawn_image_after_claim` consumes it through
+    //     `UserImageSpec::provisioned_stack_top` instead of allocating its own.
+    //
+    // `create_user_address_space` returning TWO resources — the ASID and a MAP/READ/WRITE
+    // capability over it minted into the CALLER's cspace — is the subtlety SP-3 surfaced: every
+    // handler discarded that capability as `_aspace_cap`, and `destroy_user_address_space_by_asid`
+    // does not own it, so a failed spawn leaked one on every arm.
+    let zero_copy = matches!(source, SpawnImageSource::ZeroCopyInitramfsSlice { .. });
+    let outcome = kernel.provision_spawn_image(
+        tid,
+        image_path,
+        match source {
+            SpawnImageSource::PtLoadSegments { elf, entry } => {
+                ImageSource::PtLoadSegments { elf, entry }
+            }
+            SpawnImageSource::ZeroCopyInitramfsSlice {
+                elf,
+                initrd_phys_base,
+                file_initrd_offset,
+            } => ImageSource::ZeroCopyInitramfsSlice {
+                image_id,
+                elf,
+                initrd_phys_base,
+                file_initrd_offset,
+            },
+        },
+        map_initrd_window,
+        &mut startup_args,
+        SPAWN_USER_STACK_PAGES,
+    );
+    let (provision, mut ledger) = advance(kernel, ledger, outcome, "provision_image")?;
+    let ImageProvision {
+        asid,
+        aspace_cap,
+        entry,
+        stack_top,
+        zc_pages,
+        copied_pages,
+    } = provision;
     ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
     if let Some(cnode) = kernel.current_task_cnode() {
         ledger.record(ProvisionalSpawnResource::Capability {
@@ -438,6 +386,9 @@ pub(crate) fn run_image_spawn_transaction(
         });
     }
     crate::yarm_log!("KSPAWN_ASID_OK tid={} asid={}", tid, asid.0);
+    // The Stage 175 phase markers keep their exact relative order and spelling. They are all
+    // emitted after the provisioning now rather than bracketing its steps, because the phases
+    // they name happen inside one call — that is the only change, and the set is default-off.
     if lifecycle_markers {
         crate::yarm_log!(
             "SPAWN_LIFECYCLE_ASPACE_CREATE_OK tid={} asid={}",
@@ -446,45 +397,19 @@ pub(crate) fn run_image_spawn_transaction(
         );
         crate::yarm_log!("SPAWN_LIFECYCLE_ELF_LOAD_BEGIN tid={} asid={}", tid, asid.0);
     }
-
-    // ── Phase 3: the image. ──────────────────────────────────────────────────────────────
-    let (entry, mut ledger) = match source {
-        SpawnImageSource::PtLoadSegments { elf, entry } => {
-            let outcome = kernel.load_elf_pt_load_segments(asid, elf);
-            let (_loaded, ledger) = advance(kernel, ledger, outcome, "load_elf")?;
-            (entry, ledger)
-        }
-        SpawnImageSource::ZeroCopyInitramfsSlice {
-            elf,
-            initrd_phys_base,
-            file_initrd_offset,
-        } => {
-            let outcome = kernel.load_elf_with_mo_zero_copy(
-                image_id,
-                asid,
-                elf,
-                initrd_phys_base,
-                file_initrd_offset,
-            );
-            let ((entry, _first_vaddr, _heap_base, zc_pages, copied_pages), ledger) =
-                advance(kernel, ledger, outcome, "load_elf_zero_copy")?;
-            crate::yarm_log!(
-                "PM_ELF_ZC_DONE image_id={} path={} zc_pages={} copied_pages={}",
-                image_id,
-                image_path,
-                zc_pages,
-                copied_pages
-            );
-            (entry, ledger)
-        }
-    };
+    if zero_copy {
+        crate::yarm_log!(
+            "PM_ELF_ZC_DONE image_id={} path={} zc_pages={} copied_pages={}",
+            image_id,
+            image_path,
+            zc_pages,
+            copied_pages
+        );
+    }
     crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
     if lifecycle_markers {
         crate::yarm_log!("SPAWN_LIFECYCLE_ELF_LOAD_OK tid={} asid={}", tid, asid.0);
         crate::yarm_log!("SPAWN_LIFECYCLE_ZC_LOAD_OK tid={} asid={}", tid, asid.0);
-    }
-    if map_initrd_window {
-        map_boot_initrd_window(kernel, asid, &mut startup_args);
     }
 
     // ── Phase 4: the two service endpoints and their capabilities. ───────────────────────
@@ -584,6 +509,9 @@ pub(crate) fn run_image_spawn_transaction(
             service_recv_cap,
             service_reply_recv_cap,
             extra_send_caps,
+            // Already allocated and mapped in `asid` by the provisioner, and already covered by
+            // its rollback. The commit consumes it instead of allocating a second one.
+            provisioned_stack_top: Some(stack_top),
         },
     );
     if let Err(err) = &outcome {

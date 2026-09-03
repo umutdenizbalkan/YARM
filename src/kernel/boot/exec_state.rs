@@ -2862,20 +2862,30 @@ impl KernelState {
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
         }
-        let stack_top = match self.allocate_user_stack_with_guard(spec.tid, 64) {
-            Ok(top) => top,
-            Err(err) => {
-                crate::yarm_log!(
-                    "SPAWN_TASK_STACK_FAIL tid={} asid={} err={:?}",
-                    spec.tid,
-                    asid.0,
-                    err
-                );
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
+        // U9-SPAWN-VM1: a caller that provisioned the image as one transaction already allocated
+        // and mapped this stack in `asid`, BEFORE the commit, which is what makes a
+        // stack-allocation failure rollable-back. Allocating again here would install a second
+        // stack at the same slot — the overlap check inside the allocator would refuse it — so the
+        // provisioned one is consumed, not re-derived. `None` is every caller that did not
+        // provision one (the nine architecture bring-up sites), and they allocate exactly as
+        // before.
+        let stack_top = match spec.provisioned_stack_top {
+            Some(top) => top,
+            None => match self.allocate_user_stack_with_guard(spec.tid, 64) {
+                Ok(top) => top,
+                Err(err) => {
+                    crate::yarm_log!(
+                        "SPAWN_TASK_STACK_FAIL tid={} asid={} err={:?}",
+                        spec.tid,
+                        asid.0,
+                        err
+                    );
+                    if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                        crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
+                    }
+                    return Err(err);
                 }
-                return Err(err);
-            }
+            },
         };
         crate::yarm_log!(
             "SPAWN_TASK_STACK_OK tid={} stack_top=0x{:x}",

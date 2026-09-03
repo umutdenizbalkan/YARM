@@ -120902,6 +120902,7 @@ mod stage199d_wa3a_transition_barriers {
             service_recv_cap: 0,
             service_reply_recv_cap: 0,
             extra_send_caps: [0; 4],
+            provisioned_stack_top: None,
         };
         assert!(
             state
@@ -152020,6 +152021,9 @@ mod u9spawn1_sp3_spawn_ledger {
 
     const TXN_SRC: &str = include_str!("../syscall/spawn_image_txn.rs");
     const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    /// U9-SPAWN-VM1 moved the address space, the image load and the user stack behind THE
+    /// provisioner, so the ordering and no-bare-`?` guards below follow them there.
+    const PROVISION_SRC: &str = include_str!("spawn_image_provision.rs");
 
     /// A real ELF64 image with one PT_LOAD segment, so the load phase runs the production loader
     /// rather than a stub. `entry` is a parameter because an entry of zero is exactly how the
@@ -152326,9 +152330,12 @@ mod u9spawn1_sp3_spawn_ledger {
         let reserve = txn
             .find("reserve_task_for_spawn_with_class(tid, class)")
             .expect("the reservation phase");
+        // U9-SPAWN-VM1: the address space is no longer created inline. `provision_spawn_image` is
+        // the step that creates it — together with the image and the stack — so it is the step
+        // the reservation must precede.
         let aspace = txn
-            .find("create_user_address_space()")
-            .expect("the address-space phase");
+            .find("provision_spawn_image(")
+            .expect("the provisioning phase");
         let commit = txn
             .find("spawn_user_task_from_image(")
             .expect("the commit phase");
@@ -152339,6 +152346,27 @@ mod u9spawn1_sp3_spawn_ledger {
         assert!(
             aspace < commit,
             "and the commit stays last — it is the only step that publishes a reachable task"
+        );
+        // Inside the provisioner the same ordering holds one level down: the PURE plan runs before
+        // anything is created, the address space precedes the load, and the stack is last — which
+        // is what puts it on the rollback's side of the commit.
+        let prov = PROVISION_SRC
+            .split("pub(crate) fn provision_spawn_image(")
+            .nth(1)
+            .expect("the provisioner body");
+        let plan = prov.find("plan_image_load(elf)").expect("the plan phase");
+        let create = prov
+            .find("create_user_address_space()")
+            .expect("the address-space phase");
+        let load = prov
+            .find("load_elf_pt_load_segments(")
+            .expect("the load phase");
+        let stack = prov
+            .find("allocate_user_stack_in_asid(")
+            .expect("the stack phase");
+        assert!(
+            plan < create && create < load && load < stack,
+            "provisioning order must stay plan → address space → image → stack"
         );
     }
 
@@ -152352,9 +152380,7 @@ mod u9spawn1_sp3_spawn_ledger {
             .expect("the transaction body");
         for acquisition in [
             "reserve_task_for_spawn_with_class",
-            "create_user_address_space",
-            "load_elf_pt_load_segments",
-            "load_elf_with_mo_zero_copy",
+            "provision_spawn_image",
             "spawn_user_task_from_image",
         ] {
             let at = txn.find(acquisition).expect(acquisition);
@@ -152371,8 +152397,40 @@ mod u9spawn1_sp3_spawn_ledger {
         }
         // And every one of them goes through the one carrier.
         assert!(
-            txn.matches("advance(kernel, ledger, outcome,").count() >= 5,
+            txn.matches("advance(kernel, ledger, outcome,").count() >= 3,
             "each fallible acquisition is carried by the same ledger-aware step"
+        );
+
+        // The same rule inside the provisioner, where the acquisitions now live. `?` is legal on
+        // the plan and on `create_user_address_space` — nothing is owned yet at either point —
+        // and forbidden on every step after, which must route through `unwind_spawn_image`.
+        let prov = PROVISION_SRC
+            .split("pub(crate) fn provision_spawn_image(")
+            .nth(1)
+            .expect("the provisioner body");
+        let owns_from = prov
+            .find("create_user_address_space()")
+            .expect("the address-space phase");
+        for acquisition in [
+            "load_elf_pt_load_segments(",
+            "load_elf_with_mo_zero_copy(",
+            "allocate_user_stack_in_asid(",
+        ] {
+            let at = prov.find(acquisition).expect(acquisition);
+            assert!(at > owns_from, "{acquisition} runs while the ASID is owned");
+            let stmt: &str =
+                &prov[at..prov[at..].find(";\n").map(|e| at + e).unwrap_or(prov.len())];
+            assert!(
+                !stmt.contains(")?") && !stmt.contains("?;"),
+                "{acquisition} holds an address space — its failure must go through \
+                 `unwind_spawn_image`, not a bare `?` that abandons it"
+            );
+        }
+        assert_eq!(
+            prov.matches("self.unwind_spawn_image(asid, aspace_cap,")
+                .count(),
+            2,
+            "exactly the two owning phases (load, stack) unwind, and both through the one rollback"
         );
     }
 
@@ -153394,7 +153452,15 @@ mod u9spawn2_nr23_route_blockers {
             ("create_user_address_space", "VM rank 5 + capability rank 4"),
             ("load_elf_pt_load_segments", "VM rank 5 + memory rank 6"),
             ("load_elf_with_mo_zero_copy", "VM rank 5 + memory rank 6"),
-            ("allocate_user_stack_with_guard", "VM rank 5"),
+            // U9-SPAWN-VM1 renamed the stack phase's body to `allocate_user_stack_in_asid` and
+            // left `allocate_user_stack_with_guard` as the TID-resolving wrapper. Both are named
+            // so the table tracks the call the provisioner actually makes AND the one the
+            // architecture bring-up sites still make.
+            ("allocate_user_stack_in_asid", "VM rank 5 + memory rank 6"),
+            (
+                "allocate_user_stack_with_guard",
+                "VM rank 5 + memory rank 6",
+            ),
             ("create_endpoint", "IPC rank 3 + capability rank 4"),
             (
                 "grant_capability_task_to_task_with_rights",
@@ -153446,5 +153512,375 @@ mod u9spawn2_nr23_route_blockers {
                  banked dormant API"
             );
         }
+    }
+}
+
+/// U9-SPAWN-VM1 §3 — failure injection across THE spawn-image provisioner.
+///
+/// Every position the provisioner can fail at is driven, and each one must return the kernel to
+/// the EXACT baseline it started from — the allocator's free count, the VM registry, the ASID set,
+/// the installed mappings, the MemoryObject table, the endpoint table, the spawner's cspace and
+/// the task table, column by column rather than as a total.
+///
+/// The frame sweep is what makes "at every allocation position" a claim rather than a hope: the
+/// allocator is drained to each free-frame count from zero up to one short of what a successful
+/// spawn consumes, so the exhaustion lands on a different allocation each time — an ELF page, a
+/// page-table page, a stack page, the guard page — and every one of them must roll back whole.
+#[cfg(test)]
+mod u9spawnvm1_provision_rollback {
+    use super::*;
+    use crate::kernel::boot::spawn_image_provision::plan_image_load;
+    use crate::kernel::syscall::spawn_image_txn::{
+        SpawnImageRequest, SpawnImageSource, run_image_spawn_transaction,
+    };
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::vm::{Asid, MAX_ADDRESS_SPACES};
+    use crate::runtime::SharedKernel;
+
+    use super::u9spawn1_sp3_spawn_ledger::tiny_elf;
+
+    /// The same column set SP-3 established, plus the two the provisioner newly owns: the count of
+    /// installed user mappings, and the free-frame count that the stack and its guard page move.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Baseline {
+        tasks: usize,
+        address_spaces: usize,
+        free_frames: usize,
+        memory_objects: usize,
+        endpoints: usize,
+        spawner_caps: usize,
+        mappings: usize,
+    }
+
+    fn baseline(k: &SharedKernel) -> Baseline {
+        k.with(|s| {
+            let cnode = s.current_task_cnode();
+            Baseline {
+                tasks: s.with_tcbs(|tcbs| tcbs.iter().flatten().count()),
+                address_spaces: s.with_user_spaces(|spaces| {
+                    (0..MAX_ADDRESS_SPACES)
+                        .filter(|n| spaces.get(Asid(*n as u16)).is_some())
+                        .count()
+                }),
+                free_frames: s.with_memory_state(|m| m.frame_allocator.free_frames()),
+                memory_objects: s.with_memory_state(|m| m.memory_objects.iter().flatten().count()),
+                endpoints: s.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count()),
+                spawner_caps: match cnode {
+                    Some(cnode) => s.with_capability_state(|cap| {
+                        cap.cnode_spaces
+                            .iter()
+                            .flatten()
+                            .filter(|space| space.id == cnode)
+                            .map(|space| {
+                                crate::kernel::boot::kernel_ref(&space.cspace).occupied_slots()
+                            })
+                            .sum::<usize>()
+                    }),
+                    None => 0,
+                },
+                // Every mapping installed in every live address space. A leaked page-table
+                // entry moves this even when the frame behind it was returned.
+                mappings: s.with_user_spaces(|spaces| {
+                    (0..MAX_ADDRESS_SPACES)
+                        .filter_map(|n| spaces.get(Asid(n as u16)))
+                        .map(|aspace| aspace.mappings())
+                        .sum::<usize>()
+                }),
+            }
+        })
+    }
+
+    fn fixture() -> SharedKernel {
+        SharedKernel::new(Bootstrap::init().expect("init"))
+    }
+
+    fn run(
+        k: &SharedKernel,
+        elf: &[u8],
+        entry: usize,
+    ) -> Result<u64, crate::kernel::syscall::SyscallError> {
+        k.with(|s| {
+            run_image_spawn_transaction(
+                s,
+                SpawnImageRequest {
+                    image_id: 0,
+                    image_path: "init",
+                    source: SpawnImageSource::PtLoadSegments { elf, entry },
+                    class: TaskClass::SystemServer,
+                    parent_pid: 0,
+                    startup_args: [0u64; 18],
+                    extra_send_caps: [0u64; 4],
+                    map_initrd_window: false,
+                    lifecycle_markers: false,
+                },
+            )
+            .map(|c| c.tid)
+        })
+    }
+
+    /// Take every frame the hosted allocator will track, and hand back exactly `allow` of them.
+    ///
+    /// This is the precise lever the sweep needs. The hosted `MAX_TRACKED_FRAME_REFS` is 256, so
+    /// the allocator refuses further single-frame allocations long before its free-page COUNT runs
+    /// out — draining toward `free_frames() == 0` would never terminate. Holding the tracked
+    /// capacity instead and returning `allow` frames makes exactly `allow` allocations succeed and
+    /// the next one fail, wherever in the provisioning that lands.
+    fn hold_every_allocatable_frame(k: &SharedKernel) -> alloc::vec::Vec<u64> {
+        let mut held = alloc::vec::Vec::new();
+        k.with(|s| {
+            while let Ok(pa) = s.alloc_user_data_frame() {
+                held.push(pa);
+            }
+        });
+        held
+    }
+
+    /// Hand `count` held frames back, so exactly that many further allocations can succeed.
+    fn release_held(k: &SharedKernel, held: &mut alloc::vec::Vec<u64>, count: usize) {
+        k.with(|s| {
+            for _ in 0..count {
+                let Some(pa) = held.pop() else { break };
+                s.with_memory_state_mut(|m| {
+                    let _ = crate::kernel::boot::kernel_mut(&mut m.frame_allocator).free_frame(pa);
+                });
+            }
+        });
+    }
+
+    fn free_frames(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()))
+    }
+
+    /// An ELF64 header wrapper for the malformed cases, so each one differs from a WORKING image
+    /// in exactly the field under test.
+    fn elf_with_segment(p_vaddr: u64, p_memsz: u64, p_filesz: u64) -> alloc::vec::Vec<u8> {
+        let mut img = tiny_elf();
+        let ph = 64;
+        img[ph + 16..ph + 24].copy_from_slice(&p_vaddr.to_le_bytes());
+        img[ph + 24..ph + 32].copy_from_slice(&p_vaddr.to_le_bytes());
+        img[ph + 32..ph + 40].copy_from_slice(&p_filesz.to_le_bytes());
+        img[ph + 40..ph + 48].copy_from_slice(&p_memsz.to_le_bytes());
+        img
+    }
+
+    /// The plan is PURE, so every malformed shape is refused with the kernel untouched — not
+    /// unwound back to baseline, but never moved off it. That is a stronger statement, and it is
+    /// the reason the plan runs first.
+    #[test]
+    fn every_malformed_image_is_refused_before_anything_is_created() {
+        let k = fixture();
+        let before = baseline(&k);
+
+        let mut truncated = tiny_elf();
+        truncated.truncate(32);
+        let mut bad_magic = tiny_elf();
+        bad_magic[1] = b'X';
+        let mut elf32 = tiny_elf();
+        elf32[4] = 1; // ELFCLASS32
+        let mut no_segments = tiny_elf();
+        no_segments[56..58].copy_from_slice(&0u16.to_le_bytes()); // e_phnum = 0
+        let mut ph_out_of_bounds = tiny_elf();
+        ph_out_of_bounds[32..40].copy_from_slice(&0xFFFF_0000u64.to_le_bytes()); // e_phoff
+        let mut short_phentsize = tiny_elf();
+        short_phentsize[54..56].copy_from_slice(&8u16.to_le_bytes());
+
+        let cases: &[(&str, alloc::vec::Vec<u8>)] = &[
+            ("truncated below the ELF header", truncated),
+            ("wrong magic", bad_magic),
+            ("ELFCLASS32", elf32),
+            ("no program headers", no_segments),
+            ("program header table outside the image", ph_out_of_bounds),
+            ("undersized program header entries", short_phentsize),
+            // p_filesz > p_memsz: the file range cannot exceed the memory the segment occupies.
+            (
+                "segment file size overflows its memory size",
+                elf_with_segment(0x40_0000, 0x1000, 0x2000),
+            ),
+            // p_vaddr + p_memsz overflows u64 — the classic extent-arithmetic trap.
+            (
+                "segment extent overflows the address space",
+                elf_with_segment(u64::MAX - 0x100, 0x1000, 0x40),
+            ),
+            // A segment that reaches into kernel space. The loader would discover this page by
+            // page; the plan refuses the whole image before the first one.
+            (
+                "segment reaches into kernel space",
+                elf_with_segment(crate::kernel::vm::KERNEL_SPACE_BASE, 0x1000, 0x40),
+            ),
+        ];
+
+        for (name, img) in cases {
+            assert!(
+                plan_image_load(img).is_err(),
+                "the pure plan must refuse: {name}"
+            );
+            let err = run(&k, img, 0x40_0000)
+                .expect_err(&alloc::format!("the spawn must refuse: {name}"));
+            assert_eq!(
+                baseline(&k),
+                before,
+                "{name} moved kernel state before refusing: {err:?}"
+            );
+        }
+
+        // A zero entry is refused for the same reason and at the same place: before the address
+        // space exists, rather than at the commit holding eight provisional resources.
+        let good = tiny_elf();
+        let err = run(&k, &good, 0).expect_err("a zero entry cannot spawn");
+        assert_eq!(
+            baseline(&k),
+            before,
+            "zero-entry refusal moved state: {err:?}"
+        );
+    }
+
+    /// The sweep. With exactly `n` allocatable frames the exhaustion lands on the `n`-th
+    /// allocation the provisioning makes — an ELF page, a page-table page for it, a stack page,
+    /// the guard page — so running every `n` short of success walks the failure across every
+    /// allocation position in turn, and each one must roll back whole.
+    ///
+    /// Each position gets a FRESH kernel, for a reason worth recording: the retired-ASID array is
+    /// `MAX_ADDRESS_SPACES` slots deep and drains only when every CPU acknowledges the shootdown,
+    /// which nothing in a hosted fixture does. Past that many teardowns
+    /// `destroy_and_collect_mappings` correctly refuses with `VmError::Full` — a documented limit
+    /// of the deferred shootdown-ACK mechanism, not a leak — and a sweep that shared one kernel
+    /// would be measuring that instead of the rollback. Two repeats per position stay well inside
+    /// the budget and are what prove a rollback is repeatable rather than one-shot.
+    #[test]
+    fn frame_exhaustion_at_every_allocation_position_restores_the_baseline() {
+        // First learn what a SUCCESSFUL provisioning costs, so the sweep's upper bound is derived
+        // rather than guessed.
+        let cost = {
+            let k = fixture();
+            let elf = tiny_elf();
+            let before = free_frames(&k);
+            run(&k, &elf, 0x40_0000).expect("the reference spawn commits");
+            before - free_frames(&k)
+        };
+        assert!(
+            cost > 0,
+            "a spawn must consume frames, or this sweep proves nothing"
+        );
+
+        let elf = tiny_elf();
+        for n in 0..cost {
+            let k = fixture();
+            let mut held = hold_every_allocatable_frame(&k);
+            assert!(
+                held.len() >= n,
+                "position {n} needs {n} held frames, only {} were takeable",
+                held.len()
+            );
+            release_held(&k, &mut held, n);
+            let before = baseline(&k);
+            let err = run(&k, &elf, 0x40_0000).expect_err(&alloc::format!(
+                "{n} allocatable frames cannot fund a spawn costing {cost}"
+            ));
+            assert_eq!(
+                baseline(&k),
+                before,
+                "frame exhaustion at allocation position {n} left state behind: {err:?}"
+            );
+            // And the failure is repeatable from the restored baseline — a rollback that only
+            // works once is not a rollback, and a stale one must be inert.
+            for repeat in 0..2 {
+                let _ = run(&k, &elf, 0x40_0000).expect_err("the same exhaustion again");
+                assert_eq!(
+                    baseline(&k),
+                    before,
+                    "repeat {repeat} of the rollback at position {n} drifted"
+                );
+            }
+        }
+    }
+
+    /// The commit is the one publication step, and its failure arm has to give back everything the
+    /// provisioning acquired — including the user stack, which before U9-SPAWN-VM1 was allocated
+    /// INSIDE the commit and therefore could not be rolled back at all.
+    #[test]
+    fn a_failed_publication_returns_the_stack_and_the_image() {
+        let k = fixture();
+        let before = baseline(&k);
+        let elf = tiny_elf();
+        // Entry zero is refused by `spawn_image_after_claim` — after the provisioning succeeded,
+        // so the ledger is holding the address space, its capability, both endpoints and their
+        // capabilities when the commit refuses.
+        let err = run(&k, &elf, 0).expect_err("a zero entry cannot be published");
+        assert_eq!(
+            baseline(&k),
+            before,
+            "failed publication left provisioning behind: {err:?}"
+        );
+    }
+
+    /// A successful provisioning maps the stack in the CHILD's address space, and the commit
+    /// consumes that stack rather than allocating a second one at the same slot.
+    #[test]
+    fn the_commit_consumes_the_provisioned_stack_instead_of_reallocating() {
+        let k = fixture();
+        let elf = tiny_elf();
+        let tid = run(&k, &elf, 0x40_0000).expect("a well-formed spawn commits");
+        let (asid, stack_top) = k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                let tcb = tcbs
+                    .iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .expect("the committed task");
+                (tcb.asid, tcb.user_stack_top)
+            })
+        });
+        let asid = asid.expect("the child carries its ASID only after the commit");
+        let stack_top = stack_top.expect("the child has a stack");
+        // The stack is real: its last page resolves in the child's address space.
+        let probe = crate::kernel::vm::VirtAddr(stack_top.0 - 8);
+        assert!(
+            k.with(|s| s.with_user_spaces(|spaces| spaces
+                .get(asid)
+                .and_then(|a| a.resolve(probe))
+                .is_some())),
+            "the provisioned stack must be mapped in the child's address space"
+        );
+        // And re-running the TID-keyed allocator over the same slot is refused, which is exactly
+        // why the commit must not allocate again: it would collide with the provisioned stack.
+        assert!(
+            k.with(|s| s.allocate_user_stack_with_guard(tid, 64))
+                .is_err(),
+            "a second stack at the same slot must be refused — the commit must consume, not \
+             re-derive, the provisioned one"
+        );
+    }
+
+    /// Rollback owes no TLB shootdown because the child's ASID is never CPU-resident before the
+    /// commit. This asserts the two halves of that from live state rather than from the comment.
+    #[test]
+    fn the_child_asid_is_not_cpu_resident_before_the_commit() {
+        let k = fixture();
+        let elf = tiny_elf();
+        // Before: a failing spawn never binds an ASID to any task, so no TCB can carry one that
+        // the rollback would have to shoot down.
+        let asids_before: alloc::vec::Vec<_> =
+            k.with(|s| s.with_tcbs(|tcbs| tcbs.iter().flatten().filter_map(|t| t.asid).collect()));
+        let _ = run(&k, &elf, 0).expect_err("a zero entry cannot be published");
+        let asids_after: alloc::vec::Vec<_> =
+            k.with(|s| s.with_tcbs(|tcbs| tcbs.iter().flatten().filter_map(|t| t.asid).collect()));
+        assert_eq!(
+            asids_before, asids_after,
+            "a rolled-back spawn must leave no task carrying its ASID"
+        );
+        // And the ASID binding is the COMMIT's, not the provisioner's: the only sites that write
+        // `tcb.asid` in the spawn path live in `spawn_image_after_claim`.
+        const PROVISION_SRC: &str = include_str!("spawn_image_provision.rs");
+        // Scan the CODE, not the module header — the header explains the rule and would otherwise
+        // match its own statement of it.
+        let code = PROVISION_SRC
+            .split("\nuse super::*;\n")
+            .nth(1)
+            .expect("the provisioner's code region");
+        assert!(
+            !code.contains("tcb.asid = Some("),
+            "the provisioner must never bind its ASID to a task — that is what makes rollback \
+             shootdown-free"
+        );
     }
 }
