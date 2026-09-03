@@ -34792,6 +34792,11 @@ mod stage117_global_lock_drop_before_switch {
 #[cfg(test)]
 mod stage118_production_switch_frame_init {
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
@@ -34864,36 +34869,36 @@ mod stage118_production_switch_frame_init {
     #[test]
     fn stage118_exec_state_emits_switch_frame_init_begin() {
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
-            "exec_state.rs must emit D6_KERNEL_SWITCH_FRAME_INIT_BEGIN in spawn_user_task_from_image"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
+            "the spawn publication policy must emit D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"
         );
     }
 
     #[test]
     fn stage118_exec_state_emits_switch_frame_init_done() {
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
-            "exec_state.rs must emit D6_KERNEL_SWITCH_FRAME_INIT_DONE on success"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            "the spawn publication policy must emit D6_KERNEL_SWITCH_FRAME_INIT_DONE on success"
         );
     }
 
     #[test]
     fn stage118_exec_state_emits_switch_frame_init_deferred() {
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
-            "exec_state.rs must emit D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED on failure"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
+            "the spawn publication policy must emit D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED on failure"
         );
     }
 
     #[test]
     fn stage118_exec_state_switch_frame_init_gated_on_x86_64_and_tid1() {
         assert!(
-            EXEC_STATE_SRC.contains("target_arch = \"x86_64\""),
-            "exec_state.rs switch-frame init must be gated on #[cfg(target_arch = \"x86_64\")]"
+            SPAWN_PUBLISH_SRC.contains("target_arch = \"x86_64\""),
+            "switch-frame init must be gated on #[cfg(target_arch = \"x86_64\")]"
         );
         assert!(
-            EXEC_STATE_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
-            "exec_state.rs switch-frame init must be gated on spec.tid == BOOTSTRAP_FIRST_USER_TID"
+            SPAWN_PUBLISH_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
+            "switch-frame init must be gated on spec.tid == BOOTSTRAP_FIRST_USER_TID"
         );
     }
 
@@ -35045,6 +35050,11 @@ mod stage118_production_switch_frame_init {
 #[cfg(test)]
 mod stage119_minimal_task_pair {
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
@@ -35076,43 +35086,43 @@ mod stage119_minimal_task_pair {
     #[test]
     fn stage119_exec_state_init_gate_covers_supervisor_tid() {
         assert!(
-            EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
-            "exec_state.rs switch-frame init must be gated on BOOTSTRAP_SUPERVISOR_TID (tid=2)"
+            SPAWN_PUBLISH_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
+            "switch-frame init must be gated on BOOTSTRAP_SUPERVISOR_TID (tid=2)"
         );
     }
 
     #[test]
     fn stage119_exec_state_init_gate_uses_or_for_both_tids() {
         assert!(
-            EXEC_STATE_SRC
+            SPAWN_PUBLISH_SRC
                 .contains("BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID")
-                || EXEC_STATE_SRC
+                || SPAWN_PUBLISH_SRC
                     .contains("BOOTSTRAP_SUPERVISOR_TID || spec.tid == BOOTSTRAP_FIRST_USER_TID"),
-            "exec_state.rs switch-frame init must use || to OR tid=1 and tid=2 conditions"
+            "switch-frame init must use || to OR tid=1 and tid=2 conditions"
         );
     }
 
     #[test]
     fn stage119_exec_state_init_gate_still_covers_first_user_tid() {
         assert!(
-            EXEC_STATE_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
-            "exec_state.rs switch-frame init must still cover BOOTSTRAP_FIRST_USER_TID (tid=1)"
+            SPAWN_PUBLISH_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
+            "switch-frame init must still cover BOOTSTRAP_FIRST_USER_TID (tid=1)"
         );
     }
 
     #[test]
     fn stage119_exec_state_switch_frame_init_markers_still_present() {
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
-            "exec_state.rs D6_KERNEL_SWITCH_FRAME_INIT_BEGIN marker must be preserved in Stage 119"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
+            "D6_KERNEL_SWITCH_FRAME_INIT_BEGIN marker must be preserved in Stage 119"
         );
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
-            "exec_state.rs D6_KERNEL_SWITCH_FRAME_INIT_DONE marker must be preserved in Stage 119"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            "D6_KERNEL_SWITCH_FRAME_INIT_DONE marker must be preserved in Stage 119"
         );
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
-            "exec_state.rs D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED marker must be preserved in Stage 119"
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
+            "D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED marker must be preserved in Stage 119"
         );
     }
 
@@ -35265,6 +35275,11 @@ mod stage119_minimal_task_pair {
 #[cfg(test)]
 mod stage120_controlled_switch_proof {
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -35372,14 +35387,15 @@ mod stage120_controlled_switch_proof {
         ] {
             assert!(
                 EXEC_STATE_SRC.contains(marker)
+                    || SPAWN_PUBLISH_SRC.contains(marker)
                     || TRAP_ENTRY_SRC.contains(marker)
                     || MOD_SRC.contains(marker),
                 "Stage 120 marker missing: {marker}"
             );
         }
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE")
-                && EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE")
+                && SPAWN_PUBLISH_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
             "Stage 119 tid=1/tid=2 initialization must remain intact"
         );
         assert!(
@@ -35409,6 +35425,11 @@ mod stage121_first_resume_abi_diagnostics {
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
     const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
@@ -35470,8 +35491,8 @@ mod stage121_first_resume_abi_diagnostics {
     fn stage121_initialized_frame_uses_trampoline_ip_and_sysv_stack_shape() {
         assert!(
             THREAD_STATE_SRC.contains("set_instruction_ptr(switch_entry)")
-                && EXEC_STATE_SRC.contains("kernel_switch_frame_trampoline_ip")
-                || EXEC_STATE_SRC
+                && SPAWN_PUBLISH_SRC.contains("kernel_switch_frame_trampoline_ip")
+                || SPAWN_PUBLISH_SRC
                     .contains("yarm_kernel_thread_switch_trampoline as *const () as usize"),
             "initialized production frames must still use the first-resume entry symbol"
         );
@@ -35546,6 +35567,11 @@ mod stage121_first_resume_abi_diagnostics {
 mod stage122_first_instruction_proof {
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
@@ -35565,8 +35591,8 @@ mod stage122_first_instruction_proof {
             "kernel_switch_frame_trampoline_ip must return the assembly shim symbol, not the Rust handler"
         );
         assert!(
-            EXEC_STATE_SRC.contains("kernel_switch_frame_trampoline_ip()")
-                && EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            SPAWN_PUBLISH_SRC.contains("kernel_switch_frame_trampoline_ip()")
+                && SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
             "initialized switch frames must log/use the shim entry address"
         );
         assert!(
@@ -35995,6 +36021,11 @@ mod stage125_first_resume_rust_entry_bridge {
 mod stage126_kernel_switch_stack_mapping_backing {
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
     const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
     const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
@@ -36094,8 +36125,8 @@ mod stage126_kernel_switch_stack_mapping_backing {
             "initialized x86_64 switch stacks must be backed/mapped or fail initialization"
         );
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED")
-                && EXEC_STATE_SRC.contains("initialize_thread_kernel_switch_frame"),
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED")
+                && SPAWN_PUBLISH_SRC.contains("initialize_thread_kernel_switch_frame"),
             "production frame initialization must still surface explicit deferral on failure"
         );
     }
@@ -36153,6 +36184,11 @@ mod stage126_kernel_switch_stack_mapping_backing {
 mod stage127_target_asid_switch_stack_mapping {
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
     const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
     const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
@@ -36199,20 +36235,40 @@ mod stage127_target_asid_switch_stack_mapping {
 
     #[test]
     fn stage127_retry_runs_after_target_asid_is_bound() {
-        let bind = EXEC_STATE_SRC
-            .find("tcb.asid = Some(asid);")
+        // U9-SPAWN-TXN2 §2: the bind is no longer an inline `tcb.asid = Some(asid)` closure —
+        // it is `bind_spawned_task_asid_locked`, a named rank-2 owner, reached from the one
+        // publication policy. The ORDER invariant is unchanged and is asserted over that policy,
+        // where both the bind call and the retry now live. This is strictly more precise than the
+        // old spelling: it anchors on the call that performs the bind rather than on one possible
+        // way of writing the field.
+        let bind = SPAWN_PUBLISH_SRC
+            .find(".bind_spawned_task_asid(spec.tid, asid)")
             .expect("target ASID bind");
-        let retry = EXEC_STATE_SRC
+        let retry = SPAWN_PUBLISH_SRC
             .find("D6_KERNEL_SWITCH_FRAME_INIT_RETRY tid={}")
             .expect("retry marker");
         assert!(
             bind < retry,
             "Stage 127 retry must happen after the target task ASID/root is bound"
         );
+        // And the owner it calls really is the one that writes the field — once, in a body that
+        // reaches nothing but the TCB storage.
+        let body = EXEC_STATE_SRC
+            .split("pub(crate) fn bind_spawned_task_asid_locked(")
+            .nth(1)
+            .expect("the rank-2 owner")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert_eq!(
+            body.matches("tcb.asid = Some(asid);").count(),
+            1,
+            "the spawn ASID bind writes the field exactly once, inside its rank-2 owner"
+        );
         assert!(
-            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid={}")
-                && EXEC_STATE_SRC.contains("reason=retry_failed")
-                && EXEC_STATE_SRC
+            SPAWN_PUBLISH_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid={}")
+                && SPAWN_PUBLISH_SRC.contains("reason=retry_failed")
+                && SPAWN_PUBLISH_SRC
                     .contains("initialize_thread_kernel_switch_frame(spec.tid, entry)"),
             "Stage 127 must expose retry success/failure markers"
         );
@@ -56916,6 +56972,11 @@ mod stage175_spawn_lifecycle {
     const MOD_SRC: &str = include_str!("mod.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const EXEC_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
     /// U9-SPAWN1 SP-3: the phase markers moved with the phases, into the one compensated
     /// transaction the four spawn syscalls now share.
@@ -57020,7 +57081,10 @@ mod stage175_spawn_lifecycle {
             "SPAWN_LIFECYCLE_ZOMBIE_LEAK",
             "SPAWN_LIFECYCLE_DUPLICATE_TID",
         ] {
-            assert!(EXEC_SRC.contains(m), "exec_state.rs must emit marker {m}");
+            assert!(
+                EXEC_SRC.contains(m) || SPAWN_PUBLISH_SRC.contains(m) || SPAWN_TXN_SRC.contains(m),
+                "the spawn path must emit marker {m}"
+            );
         }
         // Enabled marker is emitted by the cmdline apply.
         assert!(
@@ -57150,6 +57214,11 @@ fn stage175b_single_registration_is_not_a_duplicate_tid() {
 // gone and DUPLICATE_TID is emitted only from the true `tcb_count > 1` invariant.
 mod stage175b_duplicate_tid_gate {
     const EXEC_SRC: &str = include_str!("exec_state.rs");
+    /// U9-SPAWN-TXN2 §2: the spawn publication policy moved out of `exec_state.rs` into the ONE
+    /// generic transaction over `SpawnTxnOwners`, so both the broad and the split acquisition
+    /// reach the same body. Assertions whose subject is that policy follow it here; assertions
+    /// about what stayed in `exec_state.rs` keep pointing there.
+    const SPAWN_PUBLISH_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
 
@@ -57157,16 +57226,26 @@ mod stage175b_duplicate_tid_gate {
     // `tcb_count > 1` invariant — and NOT from a pre-register presence scan.
     #[test]
     fn stage175b_duplicate_tid_only_from_count_invariant() {
+        // U9-SPAWN-TXN2 §2: the post-spawn invariant moved with the publication policy. It is
+        // still ONE site — and now it is one site in the ONE policy both acquisitions execute,
+        // which is stronger than one site in one of two possible implementations.
         assert_eq!(
-            EXEC_SRC.matches("SPAWN_LIFECYCLE_DUPLICATE_TID").count(),
+            SPAWN_PUBLISH_SRC
+                .matches("SPAWN_LIFECYCLE_DUPLICATE_TID")
+                .count(),
             1,
             "DUPLICATE_TID must be emitted from exactly one site"
         );
+        assert_eq!(
+            EXEC_SRC.matches("SPAWN_LIFECYCLE_DUPLICATE_TID").count(),
+            0,
+            "and exec_state.rs must not have kept a second copy of the detector"
+        );
         // That single site is the post-register invariant guarded by tcb_count > 1.
-        let idx = EXEC_SRC
+        let idx = SPAWN_PUBLISH_SRC
             .find("SPAWN_LIFECYCLE_DUPLICATE_TID")
             .expect("duplicate-tid emission");
-        let before = &EXEC_SRC[idx.saturating_sub(120)..idx];
+        let before = &SPAWN_PUBLISH_SRC[idx.saturating_sub(120)..idx];
         assert!(
             before.contains("tcb_count > 1"),
             "the DUPLICATE_TID emission must be guarded by the tcb_count > 1 invariant"
@@ -57174,8 +57253,8 @@ mod stage175b_duplicate_tid_gate {
         // The removed pre-register presence scan (`any(... tid.0 == spec.tid ...)`
         // immediately emitting DUPLICATE_TID) must NOT be present anymore.
         assert!(
-            EXEC_SRC.contains("Stage 175B"),
-            "exec_state must carry the Stage 175B rationale for the narrowed detector"
+            SPAWN_PUBLISH_SRC.contains("Stage 175B"),
+            "the policy must carry the Stage 175B rationale for the narrowed detector"
         );
     }
 
