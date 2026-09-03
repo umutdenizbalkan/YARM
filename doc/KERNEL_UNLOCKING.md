@@ -12978,3 +12978,135 @@ acquisition.
 The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still exist
 for their other residual classes, so ***U9 remains OPEN***: this increment empties the NR23/NR29
 population that reached them, it does not delete them.
+
+### U9-FORK1 — the one COW clone owner, the fork ledger, and NR 12 off both terminal dispatchers. CENSUS-DELTA 0.
+
+**U9-FORK1 — Fork was never missing a mechanism; it was missing an inverse.** NR 12 could not be
+routed off the terminal dispatchers because a failed fork had no exact compensation, and it had no
+compensation because it never ran on a transaction. It does now, and the transaction is the one
+`SpawnTxnOwners` composition U9-SPAWN-TXN3 delivered plus the seven operations a fork needs that a
+spawn does not.
+
+#### What the ledger was, before
+
+`fork_complete_post_clone` called `register_task_with_class`, which creates an **already-live**
+task, and then returned `Err` from seven later steps without undoing it. A fork that failed at
+`set_process_cnode_for_pid`, at capability inheritance, at the TCB write, at the brk copy or at the
+enqueue left a registered, `Runnable`, CNode-owning task that no run queue held and whose TID could
+never be reallocated. The enqueue arm was worse: it destroyed that task's address space on the way
+out, leaving a runnable TCB naming a freed ASID. Separately, the clone's own rollback tore the
+child down through the **live** teardown, which registers a retired ASID for every destroy — so a
+rollback path that ran often enough would consume the whole retired array and
+`destroy_and_collect_mappings` would correctly refuse, turning an exact rollback into a leak.
+
+#### The seven missing owners
+
+| owner | rank | what it does |
+|---|---|---|
+| `fork_parent_snapshot` | 2 (+6) | class, ASID, TLS, entry, stack and context in ONE acquisition; brk after it |
+| `snapshot_inheritable_caps` | 4 | the existing exhaustive allow/refuse policy, applied under one acquisition |
+| `clone_address_space_cow` | 5 → 6 | THE clone, one acquisition, no frame copied |
+| `complete_cow_shootdown` | none | the write-protection's owed TLB work, with no lock held |
+| `rollback_cow_clone` | 5 → 6 | the clone's exact inverse |
+| `publish_forked_child` | 2 | the inherited context AND the `Reserved -> LiveSpawned` commit, together |
+| `remove_published_fork_child` | 2 | the one incarnation-undo owner, for the single post-commit arm |
+
+Everything else — the TID, the reservation and its exact cancellation, the process CNode and its
+PID association, the class, the kernel context, capability delegation and its release, the
+CPU-pinned enqueue, the never-resident teardown — is an owner the interface already had.
+
+#### The clone, as one transaction
+
+The previous body ran `map_user_page_in_asid_raw` (vm→memory), `with_user_spaces_mut` (vm), then
+`mark_cow_page` (memory) twice — **per page**. That is O(pages) acquisitions, invisible under the
+broad lock and wrong off it: another CPU sees a parent that is half copy-on-write.
+`cow_clone.rs` holds VM (rank 5) and memory (rank 6) for the whole body, and that is the only
+reason the file exists.
+
+`CowCloneToken` carries the parent and child ASIDs, a monotonic generation stamped by the caller
+(never derived from either ASID, so a token cannot name a recycled pair), the parent runs this
+attempt downgraded with their original flags, the runs it installed in the child **with their
+physical backing**, the parent's mapping count before the clone, and the TLB work the downgrade
+owes. `rollback_cow_clone_locked` is the only inverse — the forward body calls it too — and it
+refuses without mutation on a stale parent, is inert when the child is already gone, and tears the
+child down through the never-resident teardown so no retired-ASID slot is consumed.
+
+#### The parent's TLB obligation
+
+Write-protecting a parent run is a permission **downgrade** and owes exactly the invalidation an
+unmap owes: a CPU still holding a writable translation writes straight through to the frame the
+child now shares. The local half is discharged inside the VM lock — every architecture's
+`map_page` ends in its own `invalidate_page` — but the remote half cannot be, because a CPU may not
+be IPI'd under a domain lock. The plan is therefore returned, not performed:
+
+| arch | write-protect invalidation | remote work owed | who discharges it |
+|---|---|---|---|
+| x86_64 | `invlpg`, this core only | yes | the split route, through the 0xF1 coordinator |
+| AArch64 | `tlbi vaae1is`, inner-shareable **broadcast** | none | hardware, inside the VM lock |
+| RISC-V | `sfence.vma va, x0`, this hart only | yes | the split route, through the coordinator |
+
+The broad route holds the broad lock for the whole syscall and so cannot wait for an ACK; it
+**defers**, through the same `VM_TLB_SHOOTDOWN_DEFERRED` accounting the broad COW handler already
+uses. That is exactly the behaviour this route had before U9-FORK1 and no weaker; the split route
+is what makes it real, and the two are now distinguishable in a log instead of silently identical.
+
+#### Two oracles that would have gone blind
+
+Both are recorded because both are the shape this programme keeps finding — a working route
+indistinguishable from no route.
+
+1. The `VM_COW_*` fork vocabulary was emitted only by the broad clone acquisition. The moment NR 12
+   routed, the x86_64 `VM_COW=1` gate saw `VM_COW_FORK_BEGIN=0`. The split acquisition now emits
+   the same lines from the same token.
+2. The PT-pool and per-owner CNode breakdown sat in `handle_fork`, which no production fork reaches
+   any more. It now lives in the transaction, reported from both capacity-shaped failure arms.
+
+#### The nondeterminism the first live matrix found
+
+The first RISC-V matrix was **12, 9 and 2 forks across three otherwise identical boots**. The cause
+is exact: the child was built from `parent.user_context`, the TCB copy, which
+`sync_current_thread_from_frame` refreshes AFTER the split dispatcher runs — so a child assembled
+from it inherits the parent's context from its PREVIOUS trap. On RISC-V that is the `ecall` address
+rather than `ecall + 4`, and the child resumed onto its own fork instruction and forked again, a
+re-fork loop bounded only by capacity. The trap frame is authoritative for the in-flight syscall on
+every architecture and both routes, so both now pass `frame.capture_user_context()` and the two
+cannot diverge.
+
+### Residual terminal-dispatch matrix (source-recomputed)
+
+| edge | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| NR12 `Fork` production terminal edges | **0** | **0** | **0** |
+| NR12 split route (`result=ok`) per boot | 2 | 1 | 1 |
+| fork transactions committed / unwound | 1 / 1 | 1 / 0 | 1 / 0 |
+| userspace COW isolation witness (parent, child) | ok, ok | *see below* | ok, ok |
+| broad-lock census (`with_cpu / with_broad / TOTAL`) | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+Three consecutive boots per architecture are identical in every counter. `FORK_PROOF_ENTER`, the
+first line of the broad `handle_fork`, is **zero on all nine runs** — the terminal edge is not
+inferred from a route count, it is measured at the terminal entry itself. No duplicate child, no
+rollback residue, no panic.
+
+x86_64 runs two forks: the witness, which commits, and a later one that hits a **pre-existing**
+page-table-pool wall (`PT_MAP_FAIL … err=OutOfMemory`) and unwinds exactly. That second fork is a
+naturally occurring live rollback witness every boot. The wall itself is unchanged and was not in
+scope; what changed is that the fork which hits it now compensates completely, and reports the
+accurate error rather than a misleading `CapabilityFull`. The x86_64 `VM_COW=1` profile was **RED
+at base** for that reason and is green here.
+
+### Known red and known-unchanged, neither weakened
+
+* **AArch64 COW fault recovery remains broad, and remains broken.** The Fork transaction itself is
+  live-proven there — split-routed, committed, distinct `{tid, asid}`, both roles reaching
+  userspace — but neither role completes its isolation write: the COW fault is handled
+  (`PF_PROOF_COW_HANDLE_OK … pte_writable=1 path=private_copy`) and the task then takes an
+  unhandled read at `addr=0x0 rip=0x402090`. That is byte-identical to the same measurement at
+  base, on both roles, and is a fault-recovery defect outside NR 12. It does not invalidate the
+  NR 12 retirement; it is the reason AArch64's isolation column is not `ok, ok`.
+* **An intermittent RISC-V supervisor fault is pre-existing.** `tid=2` faults at a small address in
+  one of three runs here; at base it reproduces in **three of five** runs (`addr=0x19`, `0x18`,
+  `0x9`, at varying PCs). Neither fork participant ever faults on RISC-V, at base or now.
+
+The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
+their other residual classes, so ***U9 remains OPEN***: this increment empties the NR 12 population
+that reached them, it does not delete them.
