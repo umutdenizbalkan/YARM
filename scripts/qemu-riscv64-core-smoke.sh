@@ -701,23 +701,48 @@ if (( QEMU_SMP >= 2 )); then
   fi
 fi
 
-# Stage 196C + U9-QA §2 + 199G-B §2: the RISC-V split dispatcher may service DebugLog (NR 15),
-# FutexWake (NR 10), FutexWait (NR 9) and IpcRecvTimeout (NR 5) ONLY. NR 15 and NR 10 are
-# NON-SWITCHING and return early; NR 9 and NR 5 are the SWITCHING classes — each publishes its
-# block pre-lock and settles through an existing drain (Stage 196E for NR 9, the homologous
-# D2-recv drain for NR 5), which is why their lines read `result=queue_advance_committed` rather
-# than `result=ok`. Any `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is none of the four
-# means another class was wrongly retired off the global lock.
+# Stage 196C + U9-QA §2 + 199G-B §2 + U9-SPAWN-IC1 §5: the RISC-V split dispatcher may service
+# DebugLog (NR 15), FutexWake (NR 10), FutexWait (NR 9), IpcRecvTimeout (NR 5) and IpcSend (NR 1)
+# ONLY. NR 15 and NR 10 are NON-SWITCHING and return early; NR 9 and NR 5 are the SWITCHING
+# classes — each publishes its block pre-lock and settles through an existing drain (Stage 196E
+# for NR 9, the homologous D2-recv drain for NR 5), which is why their lines read
+# `result=queue_advance_committed` rather than `result=ok`.
+#
+# U9-SPAWN-IC1 §5 — NR 1 is the ORACLE CORRECTION, not a kernel change. Stage 199G-C4 §2 gave
+# RISC-V the POST-WORK committed disposition for the U6 blocking-send lifecycle, and one
+# `IpcSend` per boot legitimately settles through it:
+#
+#   YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=1 cpu=0 result=post_work_committed finalized=1
+#
+# This allow-list was never widened when that class landed, so the total has been exactly one over
+# the sum of the other four ever since — a stale expectation, not a leaked class. Only the
+# expectation changes here; no kernel behavior is touched. NR 1 is pinned to its exact disposition
+# below, so it can only ever be the post-work class and never an ordinary early return.
+#
+# Any `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is none of the five means another
+# class was wrongly retired off the global lock.
 riscv_split_total=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=" "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr15=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr10=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=10 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr9=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr5=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=5 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr1=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=1 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_total=${riscv_split_total:-0}
 riscv_split_nr15=${riscv_split_nr15:-0}
 riscv_split_nr10=${riscv_split_nr10:-0}
 riscv_split_nr9=${riscv_split_nr9:-0}
 riscv_split_nr5=${riscv_split_nr5:-0}
+riscv_split_nr1=${riscv_split_nr1:-0}
+# U9-SPAWN-IC1 §5: every NR 1 line must be the POST-WORK committed disposition. A NR 1 that
+# early-returned would be a genuinely new class off the global lock, which is what the totals
+# check below is for — this pins WHICH NR 1 is admissible, so widening the list did not widen the
+# contract.
+riscv_split_nr1_post_work=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=1 .*result=post_work_committed" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr1_post_work=${riscv_split_nr1_post_work:-0}
+if (( riscv_split_nr1 != riscv_split_nr1_post_work )); then
+  echo "[fail] RISC-V IpcSend split serviced a non-post-work disposition (nr1=${riscv_split_nr1} post_work=${riscv_split_nr1_post_work})"
+  failures=$((failures + 1))
+fi
 # Every NR 9 line must be a committed queue advance — never an early return, which for a
 # switching class would mean returning through the parked caller's own frame.
 riscv_split_nr9_committed=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=9 .*result=queue_advance_committed" "$LOGFILE" 2>/dev/null || echo 0)
@@ -743,8 +768,39 @@ if (( riscv_split_nr5_uncaptured != 0 )); then
   echo "[fail] RISC-V IpcRecvTimeout committed without capturing the outgoing context (n=${riscv_split_nr5_uncaptured})"
   failures=$((failures + 1))
 fi
-if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 )); then
-  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog/FutexWake/FutexWait/IpcRecvTimeout syscall (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5})"
+# U9-SPAWN-TXN3 §4/§6 — SpawnProcess (NR 23) and SpawnFromMemoryObject (NR 29) are retired off
+# the terminal broad dispatcher by this pass, so they join the allow-list. Both are pinned to the
+# NON-SWITCHING `result=ok` disposition below: each runs the one generic spawn transaction and
+# returns the child TID in the caller's own frame, so a committed queue advance or a post-work
+# deferral from either would mean the class had silently become something else.
+riscv_split_nr23=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=23 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr29=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr23=${riscv_split_nr23:-0}
+riscv_split_nr29=${riscv_split_nr29:-0}
+riscv_split_nr23_ok=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=23 .*result=ok" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr29_ok=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=29 .*result=ok" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr23_ok=${riscv_split_nr23_ok:-0}
+riscv_split_nr29_ok=${riscv_split_nr29_ok:-0}
+if (( riscv_split_nr23 != riscv_split_nr23_ok )); then
+  echo "[fail] RISC-V SpawnProcess split serviced a switching disposition (nr23=${riscv_split_nr23} ok=${riscv_split_nr23_ok})"
+  failures=$((failures + 1))
+fi
+if (( riscv_split_nr29 != riscv_split_nr29_ok )); then
+  echo "[fail] RISC-V SpawnFromMemoryObject split serviced a switching disposition (nr29=${riscv_split_nr29} ok=${riscv_split_nr29_ok})"
+  failures=$((failures + 1))
+fi
+# And the counts are the boot's own spawn census: three NR 23 and five NR 29, matching
+# KSPAWN_ENTER and SPAWN_FROM_MO_OK. A route that silently stopped firing would show here.
+if (( riscv_split_nr23 != 3 )); then
+  echo "[fail] RISC-V SpawnProcess split count is ${riscv_split_nr23}, expected 3"
+  failures=$((failures + 1))
+fi
+if (( riscv_split_nr29 != 5 )); then
+  echo "[fail] RISC-V SpawnFromMemoryObject split count is ${riscv_split_nr29}, expected 5"
+  failures=$((failures + 1))
+fi
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 )); then
+  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29})"
   failures=$((failures + 1))
 fi
 

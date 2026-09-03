@@ -304,6 +304,26 @@ pub(crate) fn clear_reservation_slot(tcbs: &mut [Option<ThreadControlBlock>], in
 /// authority and the token that produced it can never be consumed again. This is the single
 /// point at which a reserved TCB becomes `Runnable`, and therefore the single point at which it
 /// becomes eligible to be enqueued — the caller must not enqueue before calling this.
+/// U9-SPAWN-TXN §3 — is this token's incarnation ready to be committed, right now?
+///
+/// Exactly the checks [`commit_live_spawn`] makes, through the SAME `resolve` authority, but
+/// read-only. A publisher calls this BEFORE it writes anything, so a refusal costs no partial
+/// publication: everything the commit could reject is rejected while the TCB is still untouched,
+/// and the commit that follows — under the same lock, on a reservation no other CPU can reach —
+/// cannot then fail.
+pub(crate) fn validate_commit_ready(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    token: &SpawnReservationToken,
+) -> Result<(), ReservationRefusal> {
+    let (_, reservation) = resolve(tcbs, token)?;
+    if reservation.phase != SpawnPhase::Spawning {
+        return Err(ReservationRefusal::WrongPhase {
+            observed: reservation.phase,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn commit_live_spawn(
     tcbs: &mut [Option<ThreadControlBlock>],
     token: &SpawnReservationToken,

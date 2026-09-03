@@ -92,12 +92,12 @@ pub(crate) const KERNEL_STACK_GUARD_SIZE: usize = 0x1000;
 /// canonical boundary is physically impossible, so the depth must be reduced, not
 /// the range extended.)
 const D6_PROOF_MAX_TASKS: usize = 128;
-const USER_STACK_STRIDE_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const USER_STACK_STRIDE_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_arch = "x86_64")]
 const USER_VIRT_TOP_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
 #[cfg(not(target_arch = "x86_64"))]
 const USER_VIRT_TOP_EXCLUSIVE: u64 = crate::kernel::vm::KERNEL_SPACE_BASE;
-const USER_STACK_TOP_BASE: u64 = USER_VIRT_TOP_EXCLUSIVE - USER_STACK_STRIDE_BYTES;
+pub(crate) const USER_STACK_TOP_BASE: u64 = USER_VIRT_TOP_EXCLUSIVE - USER_STACK_STRIDE_BYTES;
 
 #[cfg(all(target_arch = "x86_64", not(test)))]
 core::arch::global_asm!(
@@ -2226,65 +2226,32 @@ impl KernelState {
         })
     }
 
+    /// Provision the default kernel context (stack region + switch frame) for a reserved
+    /// incarnation — broad entry.
+    ///
+    /// U9-SPAWN-TXN §2 moved the body to [`provision_default_kernel_context_locked`], which takes
+    /// the TCB storage directly. This is the last of U9-SPAWN2 §3's seven phases to get a
+    /// rank-local owner.
+    ///
+    /// The old shape was three separate task-lock acquisitions — a slot-index read, a
+    /// `set_thread_kernel_stack` write, and a switch-frame write — so a TCB could be observed
+    /// with a stack assigned and no switch frame, or vice versa. One acquisition removes that
+    /// window, and the body's all-or-nothing refusal removes the partially initialized TCB it
+    /// could otherwise leave behind.
     pub(crate) fn provision_default_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
-        let idx = self
-            .with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid))
-            })
-            .ok_or(KernelError::TaskMissing)?;
-
-        // Stage 134: compute region_base separately so the guard page offset
-        // (KERNEL_STACK_GUARD_SIZE) can be applied.  The region layout is:
-        //   [region_base,  region_base + GUARD)  → unmapped guard page
-        //   [region_base + GUARD, region_base + REGION_SIZE)  → mapped stack
-        let region_base = KERNEL_STACK_REGION_BASE
-            .checked_add(idx.saturating_mul(KERNEL_STACK_REGION_SIZE))
-            .ok_or(KernelError::VmFull)?;
-        let stack_base = region_base
-            .checked_add(KERNEL_STACK_GUARD_SIZE)
-            .ok_or(KernelError::VmFull)?;
-        let stack_top = region_base
-            .checked_add(KERNEL_STACK_REGION_SIZE)
-            .ok_or(KernelError::VmFull)?;
-        self.set_thread_kernel_stack(tid, stack_base, stack_top)?;
+        let outcome =
+            self.with_tcbs_mut(|tcbs| provision_default_kernel_context_locked(tcbs, tid))?;
         crate::yarm_log!(
             "KERNEL_STACK_RANGE tid={} base=0x{:x} top=0x{:x}",
             tid,
-            stack_base,
-            stack_top
+            outcome.stack_base,
+            outcome.stack_top
         );
-
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
-            tcb.kernel_context
-                .frame
-                .set_instruction_ptr(kernel_switch_frame_trampoline_ip());
-            tcb.kernel_context.initialized = false;
-            tcb.kernel_context.owns_stack = true;
-            Ok(())
-        })
+        Ok(())
     }
 
     pub(crate) fn release_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.kernel_context.stack_base = None;
-            tcb.kernel_context.stack_top = None;
-            tcb.kernel_context.frame = Default::default();
-            tcb.kernel_context.initialized = false;
-            tcb.kernel_context.owns_stack = false;
-            Ok(())
-        })
+        self.with_tcbs_mut(|tcbs| release_kernel_context_locked(tcbs, tid))
     }
 
     pub fn set_thread_user_context(
@@ -2654,102 +2621,40 @@ impl KernelState {
         Ok(())
     }
 
+    /// Allocate and map a task's user stack, resolving the address space from the task itself.
+    ///
+    /// This is the TID-keyed entry: it requires `tid` to ALREADY carry an ASID, which is why the
+    /// stack could historically only be allocated after the spawn commit had bound one. The
+    /// layout, guard page and probe all live in [`Self::allocate_user_stack_in_asid`]; this adds
+    /// only the lookup, so there is exactly one stack-layout policy.
     pub(crate) fn allocate_user_stack_with_guard(
         &mut self,
         tid: u64,
         stack_pages: usize,
     ) -> Result<crate::kernel::vm::VirtAddr, KernelError> {
-        if stack_pages == 0 {
-            return Err(KernelError::WrongObject);
-        }
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-        let stack_bytes = (stack_pages as u64)
-            .checked_mul(crate::kernel::vm::PAGE_SIZE as u64)
-            .ok_or(KernelError::WrongObject)?;
-        let stride = USER_STACK_STRIDE_BYTES.max(stack_bytes + crate::kernel::vm::PAGE_SIZE as u64);
-        // USER_STACK_TOP_BASE may be small on architectures with a narrow user
-        // VA range (e.g. AArch64 prototype: 1 GB).  Dynamic TIDs (>= 10000) can
-        // exceed the available slots if we multiply directly, causing checked_sub
-        // to return None.  Wrap tid into the available slot count instead; the
-        // per-address-space overlap check below catches any actual VA conflicts
-        // within the same process.
-        let max_slots = (USER_STACK_TOP_BASE / stride).max(1);
-        let slot = tid % max_slots;
-        let top = USER_STACK_TOP_BASE
-            .checked_sub(slot.saturating_mul(stride))
-            .ok_or(KernelError::WrongObject)?;
-        let base = top
-            .checked_sub(stack_bytes)
-            .ok_or(KernelError::WrongObject)?;
-        let guard = base
-            .checked_sub(crate::kernel::vm::PAGE_SIZE as u64)
-            .ok_or(KernelError::WrongObject)?;
-        if top >= crate::kernel::vm::KERNEL_SPACE_BASE || guard == 0 {
-            return Err(KernelError::WrongObject);
-        }
-        for page in (guard..top).step_by(crate::kernel::vm::PAGE_SIZE) {
-            if self.with_user_spaces(|spaces| {
-                spaces
-                    .get(asid)
-                    .and_then(|aspace| aspace.resolve(crate::kernel::vm::VirtAddr(page)))
-                    .is_some()
-            }) {
-                return Err(KernelError::WrongObject);
-            }
-        }
-        for page in (base..top).step_by(crate::kernel::vm::PAGE_SIZE) {
-            let phys = crate::kernel::vm::PhysAddr(self.alloc_user_data_frame()?);
-            self.map_user_page_in_asid_raw(
-                asid,
-                crate::kernel::vm::VirtAddr(page),
-                crate::kernel::vm::Mapping {
-                    phys,
-                    flags: crate::kernel::vm::PageFlags::USER_RW,
-                },
-            )?;
-            #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
-            crate::yarm_log!(
-                "KSPAWN_NEW_TASK_STACK tid={} asid={} stack_va=0x{:x} pa=0x{:x} stack_base=0x{:x} stack_top=0x{:x}",
-                tid,
-                asid.0,
-                page,
-                phys.0,
-                base,
-                top
-            );
-        }
-        let guard_phys = crate::kernel::vm::PhysAddr(self.alloc_user_data_frame()?);
-        self.map_user_page_in_asid_raw(
-            asid,
-            crate::kernel::vm::VirtAddr(guard),
-            crate::kernel::vm::Mapping {
-                phys: guard_phys,
-                flags: crate::kernel::vm::PageFlags::GUARD,
-            },
-        )?;
-        if cfg!(not(feature = "hosted-dev")) {
-            crate::yarm_log!(
-                "USER_STACK asid={} base=0x{:x} top=0x{:x}",
-                asid.0,
-                base,
-                top
-            );
-        }
-        let stack_probe = crate::kernel::vm::VirtAddr(top - 8);
-        let stack_resolve =
-            crate::arch::selected_isa::page_table::resolve_page(asid, stack_probe).is_some();
-        if cfg!(not(feature = "hosted-dev")) {
-            crate::yarm_log!(
-                "USER_STACK_RESOLVE asid={} probe=0x{:x} ok={}",
-                asid.0,
-                stack_probe.0,
-                stack_resolve
-            );
-        }
-        if !stack_resolve {
-            return Err(KernelError::UserMemoryFault);
-        }
-        Ok(crate::kernel::vm::VirtAddr(top))
+        self.allocate_user_stack_in_asid(asid, tid, stack_pages)
+    }
+
+    /// THE user-stack allocator: the stack slot is derived from `tid`, but it is installed in the
+    /// address space the CALLER names.
+    ///
+    /// U9-SPAWN-VM1 split this out of [`Self::allocate_user_stack_with_guard`] unchanged. The
+    /// spawn-image provisioner needs a stack in an address space that no task carries yet — the
+    /// child is `ReservedUnstarted` and its ASID is deliberately not yet bound — so it cannot go
+    /// through the TID lookup. Nothing else differs: same slot arithmetic, same guard page, same
+    /// overlap refusal, same resolve probe.
+    /// THE user-stack allocator — broad entry.
+    /// Body: [`super::vm_image_locked::allocate_user_stack_locked`].
+    pub(crate) fn allocate_user_stack_in_asid(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        tid: u64,
+        stack_pages: usize,
+    ) -> Result<crate::kernel::vm::VirtAddr, KernelError> {
+        self.with_vm_then_memory_mut(|vm, memory| {
+            super::vm_image_locked::allocate_user_stack_locked(vm, memory, asid, tid, stack_pages)
+        })
     }
 
     pub fn spawn_user_thread(
@@ -3093,4 +2998,103 @@ impl KernelState {
         }
         Ok(child_tid)
     }
+}
+
+/// U9-SPAWN-TXN §2 — the kernel-stack region one reserved incarnation gets, and the facts a
+/// caller needs to report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DefaultKernelContext {
+    pub(crate) stack_base: usize,
+    pub(crate) stack_top: usize,
+}
+
+/// THE default-kernel-context owner: task rank 2, one acquisition, all or nothing.
+///
+/// This is the last of U9-SPAWN2 §3's seven spawn phases to become rank-local. It takes the TCB
+/// storage explicitly and reaches nothing else — no scheduler, no VM, no capability state, no
+/// `KernelState` — so its rank-locality is readable from its signature.
+///
+/// # Exact identity, and no partial TCB on refusal
+///
+/// The stack region is derived from the TCB's SLOT INDEX, not from the TID: kernel stacks are a
+/// fixed array of regions indexed by slot, so two tasks in the same slot at different times share
+/// a region and two tasks in different slots never collide. The index is located by exact TID
+/// match, and a TID with no live TCB is refused before anything is written.
+///
+/// Every arithmetic step is checked, and — this is the part the old three-acquisition shape got
+/// wrong — all of it happens BEFORE the first field is written. The old body computed the region,
+/// called `set_thread_kernel_stack` (which took the task lock, validated, and wrote two fields and
+/// `initialized = false`), released, then took the lock again to write the frame's stack pointer,
+/// instruction pointer and `owns_stack`. A failure between those two acquisitions left a TCB with
+/// a kernel stack assigned and no switch frame — a partially initialized incarnation that nothing
+/// removed. Here the only fallible steps are the index lookup and the address arithmetic, both of
+/// which complete before any write, so a refusal leaves the TCB exactly as it was found.
+pub(crate) fn provision_default_kernel_context_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+) -> Result<DefaultKernelContext, KernelError> {
+    let idx = tcbs
+        .iter()
+        .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid))
+        .ok_or(KernelError::TaskMissing)?;
+
+    // Stage 134: compute region_base separately so the guard page offset
+    // (KERNEL_STACK_GUARD_SIZE) can be applied. The region layout is:
+    //   [region_base,  region_base + GUARD)              → unmapped guard page
+    //   [region_base + GUARD, region_base + REGION_SIZE) → mapped stack
+    let region_base = KERNEL_STACK_REGION_BASE
+        .checked_add(idx.saturating_mul(KERNEL_STACK_REGION_SIZE))
+        .ok_or(KernelError::VmFull)?;
+    let stack_base = region_base
+        .checked_add(KERNEL_STACK_GUARD_SIZE)
+        .ok_or(KernelError::VmFull)?;
+    let stack_top = region_base
+        .checked_add(KERNEL_STACK_REGION_SIZE)
+        .ok_or(KernelError::VmFull)?;
+    // `set_thread_kernel_stack`'s validation, applied here so this body enforces the same
+    // contract rather than trusting a caller to have called it first.
+    if stack_base == 0 || stack_top == 0 || stack_base >= stack_top {
+        return Err(KernelError::WrongObject);
+    }
+
+    // FIRST WRITE. Everything fallible is behind us, so the whole set lands or none of it does.
+    let tcb = tcbs
+        .get_mut(idx)
+        .and_then(Option::as_mut)
+        .ok_or(KernelError::TaskMissing)?;
+    tcb.kernel_context.stack_base = Some(crate::kernel::vm::VirtAddr(stack_base as u64));
+    tcb.kernel_context.stack_top = Some(crate::kernel::vm::VirtAddr(stack_top as u64));
+    tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
+    tcb.kernel_context
+        .frame
+        .set_instruction_ptr(kernel_switch_frame_trampoline_ip());
+    tcb.kernel_context.initialized = false;
+    tcb.kernel_context.owns_stack = true;
+    Ok(DefaultKernelContext {
+        stack_base,
+        stack_top,
+    })
+}
+
+/// U9-SPAWN-TXN3 §3 — THE kernel-context release, under task rank 2 and nothing else.
+///
+/// The exact inverse of [`provision_default_kernel_context_locked`]: it gives back everything
+/// that owner installed, and nothing else. It was an inline closure inside
+/// `KernelState::release_kernel_context`; as a named owner both the broad and the split
+/// reservation-cancel reach the same body, so the two cannot give back different fields.
+pub(crate) fn release_kernel_context_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+) -> Result<(), KernelError> {
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|tcb| tcb.tid.0 == tid)
+        .ok_or(KernelError::TaskMissing)?;
+    tcb.kernel_context.stack_base = None;
+    tcb.kernel_context.stack_top = None;
+    tcb.kernel_context.frame = Default::default();
+    tcb.kernel_context.initialized = false;
+    tcb.kernel_context.owns_stack = false;
+    Ok(())
 }

@@ -2233,6 +2233,32 @@ impl SharedKernel {
         )
     }
 
+    /// U9-SPAWN-TXN2 §3 — task (rank 2) split-mut seam for the SPAWN-RESERVATION GENERATION.
+    ///
+    /// The split twin of `KernelState::with_task_spawn_generation_mut`, over the identical
+    /// projection. The generation counter's only rule is that no two reservations ever receive
+    /// the same value; that is what makes a token naming an earlier occupant of a numeric TID
+    /// unable to match a later one. Both paths must therefore stamp it under the SAME lock —
+    /// a split path with a lock of its own would serialize against nothing.
+    ///
+    /// Callers must not already hold a lock of rank ≥ 2.
+    pub(crate) fn with_task_spawn_generation_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut [Option<crate::kernel::task::ThreadControlBlock>], &mut u64) -> R,
+    ) -> R {
+        // SAFETY: same pattern as `with_task_enqueue_policy_split_mut` — `tcbs` and
+        // `spawn_reservation_generation` are disjoint fields of the same `KernelState`, both
+        // serialized by `task_state_lock`, which is held for the whole closure.
+        let (task_lock, tcbs, generation) = unsafe {
+            KernelState::task_spawn_generation_split_mut_ptrs_from_raw(self.state.data_ptr())
+        };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let tcbs = unsafe { &mut *tcbs };
+        let generation = unsafe { &mut *generation };
+        f(kernel_mut(tcbs).as_mut_slice(), generation)
+    }
+
     /// U9-SPAWN1 SP-2 — THE off-lock `SpawnThread` (NR 11) transaction.
     ///
     /// Composes the shared thread-incarnation owner and the SP-1 enqueue owner, in the order the
@@ -2355,6 +2381,196 @@ impl SharedKernel {
             crate::kernel::task_enqueue::commit_enqueue_locked(
                 kernel_mut(&mut sched.scheduler),
                 &plan,
+            )
+        })
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the PINNED off-lock task enqueue: the split twin of
+    /// `KernelState::enqueue_on_cpu`.
+    ///
+    /// Identical in shape to [`Self::enqueue_task_split`] and differing from it in exactly the
+    /// way the two broad twins differ: it plans through `plan_pinned_enqueue_locked`, which
+    /// enqueues where it is told and deliberately neither pins driver affinity nor reads
+    /// `cpu_affinity`. Both halves of the policy are the shared `task_enqueue` owners, so the
+    /// pinned pair cannot drift from the balanced pair or from their broad twins.
+    ///
+    /// The spawn transaction needs this one because NR 23 spawns `SystemServer` tasks, which the
+    /// authoritative policy pins to the bootstrap CPU so the supervisor and PM reach their
+    /// receives before init runs.
+    pub(crate) fn enqueue_on_cpu_split(&self, cpu: CpuId, tid: u64) -> Result<CpuId, KernelError> {
+        let plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+            crate::kernel::task_enqueue::plan_pinned_enqueue_locked(tcbs, classes, tid, cpu)
+        })?;
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::task_enqueue::commit_enqueue_locked(
+                kernel_mut(&mut sched.scheduler),
+                &plan,
+            )
+        })
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the split twin of `KernelState::provision_default_kernel_context`.
+    ///
+    /// Both wrap the SAME rank-2 owner, which validates the whole kernel-stack derivation before
+    /// its first write, so a refusal leaves no partially initialized TCB on either path.
+    pub(crate) fn provision_default_kernel_context_split(
+        &self,
+        tid: u64,
+    ) -> Result<crate::kernel::boot::thread_state::DefaultKernelContext, KernelError> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::thread_state::provision_default_kernel_context_locked(tcbs, tid)
+        })
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the split twin of the spawn ASID binding.
+    pub(crate) fn bind_spawned_task_asid_split(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Result<(), KernelError> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::exec_state::bind_spawned_task_asid_locked(tcbs, tid, asid)
+        })
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the split twin of the spawn publication.
+    ///
+    /// One rank-2 acquisition spanning validate → install → commit, exactly as the broad path
+    /// takes it, so neither path can be observed with a published user context on a task whose
+    /// reservation never committed.
+    pub(crate) fn publish_spawned_image_split(
+        &self,
+        reservation: &crate::kernel::spawn_reservation::SpawnReservationToken,
+        publication: &crate::kernel::boot::exec_state::SpawnedImagePublication,
+    ) -> Result<(), crate::kernel::spawn_reservation::ReservationRefusal> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::exec_state::publish_spawned_image_locked(
+                tcbs,
+                reservation,
+                publication,
+            )
+        })
+    }
+
+    /// U9-SPAWN-TXN3 §3 — the split twin of the no-alloc process-CNode reap.
+    ///
+    /// The broad reap is a five-domain sweep: it checks for live threads (task 2), destroys any
+    /// address space the process still carried (vm 5), purges its transfer envelopes and active
+    /// transfer mappings (ipc 3, and vm 5 again for the unmap), then removes its delegation links,
+    /// its cspace and its process record (capability 4).
+    ///
+    /// For a spawn rollback three of those phases are provably empty, and this twin **refuses
+    /// rather than implementing them**, because reaching one would mean the ledger's own contract
+    /// was already violated:
+    ///
+    /// * the reserved TCB is cleared by `clear_reservation_at` BEFORE the reap, so no TCB carries
+    ///   the pid at all — hence no live thread and no address space to reclaim;
+    /// * the child never ran, so it owns no transfer envelope and no active transfer mapping.
+    ///
+    /// Refusing keeps the D3 fence intact: the address-space arm would need the shootdown
+    /// coordinator, and `AI_AGENT_RULES` §14.4's own fail-safe direction is to leave frames
+    /// unavailable rather than recycle memory a remote CPU may still translate.
+    ///
+    /// The phases that DO run reach the same two shared owners the broad reap reaches —
+    /// `link_names_process` for the predicate and `reap_process_cspace_locked` for the removal —
+    /// so neither path can decide differently about which links a dying process takes with it.
+    pub(crate) fn reap_process_cnode_split(&self, pid: u64) -> bool {
+        // ── task 2: nothing of this process may still be alive. ────────────────────────
+        let (has_live_threads, carries_asid) = self.with_task_tcbs_split_mut(|tcbs| {
+            let live = tcbs.iter().flatten().any(|tcb| {
+                tcb.thread_group_id.0 == pid && tcb.status != crate::kernel::task::TaskStatus::Dead
+            });
+            let asid = tcbs
+                .iter()
+                .flatten()
+                .any(|tcb| tcb.thread_group_id.0 == pid && tcb.asid.is_some());
+            (live, asid)
+        });
+        if has_live_threads {
+            return false;
+        }
+        if carries_asid {
+            crate::yarm_log!(
+                "SPAWN_SPLIT_OWNER_REFUSED op=reap_process_cnode pid={}                  reason=process_still_carries_an_asid",
+                pid
+            );
+            return false;
+        }
+        // ── ipc 3: and it may own no transfer state, which would need a vm-5 unmap. ─────
+        let owns_transfer_state = self.with_ipc_split_mut(|ipc| {
+            let envelope = ipc
+                .transfer_envelopes
+                .iter()
+                .flatten()
+                .any(|envelope| envelope.source_tid.0 == pid);
+            let mapping = ipc
+                .active_transfer_mappings
+                .iter()
+                .flatten()
+                .any(|mapping| mapping.owner_tid.0 == pid);
+            envelope || mapping
+        });
+        if owns_transfer_state {
+            crate::yarm_log!(
+                "SPAWN_SPLIT_OWNER_REFUSED op=reap_process_cnode pid={}                  reason=process_still_owns_transfer_state",
+                pid
+            );
+            return false;
+        }
+        let Some(cnode) = self.task_cnode_split(pid).or_else(|| {
+            self.with_capability_state_split_mut(|capability| {
+                crate::kernel::boot::provisional_cap::process_cnode_for_pid_locked(capability, pid)
+            })
+        }) else {
+            return true;
+        };
+        // ── capability 4, per link slot, with the tid → pid resolution at rank 2 between
+        //    acquisitions, exactly as the broad reap splits it. ──────────────────────────
+        let mut removed_delegation_links = 0usize;
+        for idx in 0..crate::kernel::boot::max_delegated_capability_links() {
+            let Some(record) = self.with_capability_state_split_mut(|capability| {
+                crate::kernel::boot::kernel_ref(&capability.delegated_capability_links)[idx]
+            }) else {
+                continue;
+            };
+            let source_pid = self
+                .process_id_split_read(record.source_tid)
+                .unwrap_or(record.source_tid);
+            let dest_pid = self
+                .process_id_split_read(record.dest_tid)
+                .unwrap_or(record.dest_tid);
+            if crate::kernel::boot::cnode_state::link_names_process(source_pid, dest_pid, pid) {
+                self.with_capability_state_split_mut(|capability| {
+                    crate::kernel::boot::kernel_mut(&mut capability.delegated_capability_links)
+                        [idx] = None;
+                });
+                removed_delegation_links = removed_delegation_links.saturating_add(1);
+            }
+        }
+        let (removed_cnode_space, removed_process_record) =
+            self.with_capability_state_split_mut(|capability| {
+                crate::kernel::boot::cnode_state::reap_process_cspace_locked(capability, pid, cnode)
+            });
+        crate::yarm_log!(
+            "YARM_PROC_CNODE_CLEANUP_NOALLOC pid={} cnode={} slots=0 removed_links={} removed_cspace={} removed_record={}",
+            pid,
+            cnode.0,
+            removed_delegation_links,
+            removed_cnode_space as u8,
+            removed_process_record as u8
+        );
+        true
+    }
+
+    /// U9-SPAWN-TXN2 §3 — the split twin of `KernelState::set_process_cnode_for_pid`.
+    pub(crate) fn set_process_cnode_for_pid_split(
+        &self,
+        pid: u64,
+        cnode: crate::kernel::capabilities::CNodeId,
+    ) -> Result<(), KernelError> {
+        self.with_capability_state_split_mut(|capability| {
+            crate::kernel::boot::cnode_state::set_process_cnode_for_pid_locked(
+                capability, pid, cnode,
             )
         })
     }
@@ -5357,6 +5573,67 @@ impl SharedKernel {
                 .map(|entry| entry.phys)
                 .ok_or(KernelError::MemoryObjectMissing)
         })
+    }
+
+    /// U9-SPAWN-TXN §3 — the split twin of `KernelState::with_vm_then_memory_mut`: the address
+    /// space manager (VM, rank 5) and the memory subsystem (rank 6) under ONE acquisition each,
+    /// taken in that order.
+    ///
+    /// This is what lets the rank-local image provisioner run from a pre-lock route: it needs both
+    /// domains for the whole provisioning, and driving it through the two single-domain seams
+    /// would mean dropping and retaking a lock between every phase. Rank 5 before rank 6 is fixed
+    /// here, exactly as the broad twin fixes it, so no caller can write the pair the other way
+    /// round. Nothing inside the closure may call back into `SharedKernel`: both locks are held.
+    pub(crate) fn with_vm_then_memory_split_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut crate::kernel::vm::AddressSpaceManager,
+            &mut crate::kernel::boot::MemorySubsystem,
+        ) -> R,
+    ) -> R {
+        // SAFETY: the two projectors derive raw field pointers without forming a reference to the
+        // whole `KernelState`; `vm_state_lock` serializes `user_spaces` and `memory_state_lock`
+        // serializes `memory`, and both guards are held for the whole closure. The two fields are
+        // disjoint, so the two `&mut` never alias.
+        let (vm_lock, user_spaces) =
+            unsafe { KernelState::vm_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let (memory_lock, memory) =
+            unsafe { KernelState::memory_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let vm_lock = unsafe { &*vm_lock };
+        let _vm_guard = vm_lock.lock();
+        let memory_lock = unsafe { &*memory_lock };
+        let _memory_guard = memory_lock.lock();
+        let user_spaces = unsafe { &mut *user_spaces };
+        let memory = unsafe { &mut *memory };
+        f(kernel_mut(user_spaces), kernel_mut(memory))
+    }
+
+    /// U9-SPAWN-TXN §3 — the split twin of `KernelState::with_ipc_then_capability_mut`: the IPC
+    /// subsystem (rank 3) and the capability subsystem (rank 4) under ONE acquisition each, in
+    /// that order.
+    ///
+    /// The rank-local endpoint transaction needs both to keep an endpoint and the capabilities
+    /// naming it atomic. IPC before capability is the only legal order and is fixed here.
+    pub(crate) fn with_ipc_then_capability_split_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut crate::kernel::boot::IpcSubsystem,
+            &mut crate::kernel::boot::CapabilitySubsystem,
+        ) -> R,
+    ) -> R {
+        // SAFETY: same pattern. `ipc_state_lock` serializes `ipc`, `capability_state_lock`
+        // serializes `capability`; the fields are disjoint and both guards are held throughout.
+        let (ipc_lock, ipc) =
+            unsafe { KernelState::ipc_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let (capability_lock, capability) =
+            unsafe { KernelState::capability_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let ipc_lock = unsafe { &*ipc_lock };
+        let _ipc_guard = ipc_lock.lock();
+        let capability_lock = unsafe { &*capability_lock };
+        let _capability_guard = capability_lock.lock();
+        let ipc = unsafe { &mut *ipc };
+        let capability = unsafe { &mut *capability };
+        f(kernel_mut(ipc), capability)
     }
 
     pub(crate) fn with_vm_user_spaces_split_mut<R>(

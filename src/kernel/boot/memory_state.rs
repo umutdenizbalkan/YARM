@@ -8,7 +8,7 @@ use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::topology::CpuBitmap;
-use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr, VmError};
+use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError};
 
 impl KernelState {
     fn begin_live_tlb_shootdown_wait(&mut self, requester: CpuId, targets: CpuBitmap) -> u64 {
@@ -87,12 +87,6 @@ impl KernelState {
         }
     }
 
-    fn clear_cow_pages_for_asid(&mut self, asid: Asid) {
-        self.with_memory_state_mut(|memory| {
-            memory.cow_pages.remove(&asid.0);
-        });
-    }
-
     pub(crate) fn is_cow_page(&self, asid: Asid, virt: VirtAddr) -> bool {
         self.with_memory_state(|memory| {
             memory
@@ -135,15 +129,45 @@ impl KernelState {
         self.destroy_user_address_space_by_asid(asid)
     }
 
+    /// Create a user address space AND publish a capability naming it into the caller's cspace.
+    ///
+    /// The two halves are now separable, and U9-SPAWN-VM2 separated them because they live two
+    /// ranks apart: creation is VM (rank 5), while the mint reads the current task's CNode
+    /// (task rank 2) and writes a capability space (rank 4). Holding VM across that inversion is
+    /// what kept the image path from being expressible in VM+memory terms.
+    ///
+    /// This broad entry keeps the combined contract for its existing callers — VM first, released,
+    /// then the mint — and on a mint failure destroys the address space it just created rather
+    /// than leaking it. The image provisioner does NOT use this: it takes
+    /// [`vm_image_locked::create_address_space_locked`] and publishes the capability itself, so
+    /// the mint can be sequenced after a whole image is provisioned rather than in the middle.
     pub fn create_user_address_space(&mut self) -> Result<(Asid, CapId), KernelError> {
-        let asid = self
-            .with_user_spaces_mut(|spaces| spaces.create_user_space())
-            .map_err(KernelError::Vm)?;
-        let map_cap = self.mint_capability_for_current_context(Capability::new(
+        let asid =
+            self.with_user_spaces_mut(super::vm_image_locked::create_address_space_locked)?;
+        match self.mint_capability_for_current_context(Capability::new(
             CapObject::AddressSpace { asid: asid.0 },
             CapRights::MAP | CapRights::READ | CapRights::WRITE,
-        ))?;
-        Ok((asid, map_cap))
+        )) {
+            Ok(map_cap) => Ok((asid, map_cap)),
+            Err(err) => {
+                // The address space is brand new, so no task carries its ASID and no CPU can hold
+                // a translation for it: the never-resident destroy is the exact inverse.
+                let destroyed = self
+                    .with_vm_then_memory_mut(|vm, memory| {
+                        super::vm_image_locked::destroy_unresident_address_space_locked(
+                            vm, memory, asid,
+                        )
+                    })
+                    .is_ok();
+                crate::yarm_log!(
+                    "ASPACE_CREATE_CAP_MINT_FAIL asid={} destroyed={} err={:?}",
+                    asid.0,
+                    u8::from(destroyed),
+                    err
+                );
+                Err(err)
+            }
+        }
     }
 
     fn live_cpu_bitmap_for_asid(&self, asid: Asid) -> CpuBitmap {
@@ -286,11 +310,21 @@ impl KernelState {
         Ok(())
     }
 
+    /// Destroy a LIVE user address space: drain it, tell every CPU that could be holding a
+    /// translation, then reclaim.
+    ///
+    /// U9-SPAWN-VM2 split the body into two rank-local halves so the shootdown submission — the
+    /// one part that reaches below VM, reading the scheduler's CPU bitmaps and posting SMP mailbox
+    /// work — sits BETWEEN them rather than inside them. The documented two-phase-unmap ordering
+    /// is therefore preserved exactly: mappings are gone, then the shootdown is queued, then the
+    /// frames are returned.
+    ///
+    /// A never-resident address space owes none of that;
+    /// [`vm_image_locked::destroy_unresident_address_space_locked`] is its exact inverse.
     pub(crate) fn destroy_user_address_space_by_asid(
         &mut self,
         asid: Asid,
     ) -> Result<(), KernelError> {
-        self.clear_cow_pages_for_asid(asid);
         // Stage 183.5: exclude wake-only online APs from the retire-pending set.
         // They cannot hold translations for this ASID (no dispatcher, no user CR3,
         // no user-VA accesses), and nothing drains their cross-CPU work queues yet
@@ -299,11 +333,9 @@ impl KernelState {
         // its dispatcher lands and the real remote shootdown IPI + AP-side drain
         // are wired.
         let pending_cpu_bitmap = self.online_cpu_bitmap() & !self.wake_only_cpu_bitmap();
-        let drained = self
-            .with_user_spaces_mut(|spaces| {
-                spaces.destroy_and_collect_mappings(asid, pending_cpu_bitmap)
-            })
-            .map_err(KernelError::Vm)?;
+        let drained = self.with_vm_then_memory_mut(|vm, memory| {
+            super::vm_image_locked::drain_address_space_locked(vm, memory, asid, pending_cpu_bitmap)
+        })?;
 
         // Stage 18 ordering fix: submit TLB shootdown work items BEFORE
         // reclaiming frames.  Under the global lock both orderings are safe,
@@ -334,92 +366,10 @@ impl KernelState {
 
         // Reclaim physical frames after shootdown work items have been queued.
         // Each DrainedMapping entry may cover multiple contiguous pages; reclaim all.
-        for dm in drained.into_iter().flatten() {
-            for page in 0..dm.pages {
-                let phys = PhysAddr(dm.mapping.phys.0 + (page as u64 * PAGE_SIZE as u64));
-                self.note_mapping_removed(phys);
-                self.reclaim_memory_object_for_phys(phys);
-                // U9-ASPACE1: and the frames no MemoryObject ever described.
-                self.release_unreferenced_user_frame(phys);
-            }
-        }
-
+        self.with_vm_then_memory_mut(|vm, memory| {
+            super::vm_image_locked::reclaim_drained_mappings_locked(vm, memory, drained);
+        });
         Ok(())
-    }
-
-    /// U9-ASPACE1 — return a drained user frame to the allocator once nothing can reach it.
-    ///
-    /// # The leak this closes
-    ///
-    /// Address-space teardown reclaimed a drained page through [`Self::note_mapping_removed`] and
-    /// [`Self::reclaim_memory_object_for_phys`], and both are MemoryObject-scoped: they find the
-    /// object whose `phys` matches and act on its refcount. A page that no MemoryObject ever
-    /// described was therefore never reclaimed by anything.
-    ///
-    /// That is not an exotic case — it is the ordinary one. `alloc_user_data_frame` takes a bare
-    /// frame from the allocator and registers no object, so every ELF `PT_LOAD` page an image
-    /// loads is exactly this shape. Each address space destroyed lost one frame per such page,
-    /// for the life of the boot, whether the space died from a task exiting or from a spawn
-    /// failing.
-    ///
-    /// # Why it is safe to free here
-    ///
-    /// Four independent conditions have to hold, and each is checked against an owner that
-    /// already exists rather than against a count this function maintains:
-    ///
-    /// 1. **No MemoryObject describes the frame.** If one does, the frame belongs to the
-    ///    MemoryObject lifecycle, which has just had its say one line above. A still-referenced
-    ///    object keeps its page; that decision is its refcount's to make, not this teardown's.
-    /// 2. **No live address space still maps it.** A COW child, a shared region and an aliased
-    ///    zero-copy grant all map a frame from more than one space. The dying space has already
-    ///    been taken out of the registry by `destroy_and_collect_mappings`, so
-    ///    [`AddressSpaceManager::any_mapping_for_phys`] answers about everyone *else*: whoever
-    ///    drops the last mapping is the one that frees it.
-    /// 3. **The allocator handed it out in the first place.** This is the condition that makes
-    ///    the other kinds of physical memory safe, and it is exact rather than approximate.
-    ///    `Bootstrap::init_state_into` sanitizes every reserved range out of the boot regions
-    ///    BEFORE the allocator is seeded, and seeds the page-table pool from a strictly disjoint
-    ///    slice, so the main allocator's inventory is by construction nothing but user-data
-    ///    frames it issued: a borrowed initramfs page, a reserved range and a PT-pool page are
-    ///    not in it and never were. `reserve_frame`, which would be the one way to track a frame
-    ///    the allocator did not issue, has no production caller. `free_frame` refuses any frame
-    ///    it has no tracking slot for, so those pages are declined rather than freed, and
-    ///    `AlreadyFree` here means "not mine" — a correct outcome, not an error.
-    ///
-    /// Deliberately NOT consulted: `is_pa_reserved` and `is_pa_in_pt_pool`. They look like the
-    /// obvious guard and they are the wrong authority — they read process-global registries that
-    /// are never reset, so in a test binary that builds many kernels one kernel's ranges answer
-    /// another kernel's question. Condition 3 asks the allocator that actually owns the frame.
-    ///
-    /// Condition 3 also makes repetition inert: a second teardown naming the same page finds it
-    /// untracked and declines. And because `free_frame` decrements a shared frame's refcount
-    /// rather than releasing it outright, a frame that some future path retains stays safe even
-    /// before condition 2 could see it.
-    fn release_unreferenced_user_frame(&mut self, phys: PhysAddr) {
-        let described_by_memory_object = self.with_memory_state(|memory| {
-            memory
-                .memory_objects
-                .iter()
-                .flatten()
-                .any(|object| object.phys == phys)
-        });
-        if described_by_memory_object {
-            return;
-        }
-        if self.with_user_spaces(|spaces| spaces.any_mapping_for_phys(phys)) {
-            return;
-        }
-        let released = self.with_memory_state_mut(|memory| {
-            kernel_mut(&mut memory.frame_allocator)
-                .free_frame(phys.0)
-                .is_ok()
-        });
-        if released {
-            crate::yarm_log!(
-                "ASPACE_FRAME_RELEASED phys=0x{:x} owner=user_backing",
-                phys.0
-            );
-        }
     }
 
     pub(crate) fn clone_user_address_space_cow(
@@ -1259,25 +1209,9 @@ impl KernelState {
         self.alloc_anonymous_memory_object_with_len(crate::kernel::vm::PAGE_SIZE)
     }
 
+    /// Take one frame for user data. Body: [`vm_image_locked::alloc_user_data_frame_locked`].
     pub(crate) fn alloc_user_data_frame(&mut self) -> Result<u64, KernelError> {
-        let pa = self.with_memory_state_mut(|memory| {
-            kernel_mut(&mut memory.frame_allocator)
-                .alloc_frame()
-                .map_err(|_| KernelError::MemoryObjectFull)
-        })?;
-        #[cfg(not(feature = "hosted-dev"))]
-        if let Some((rs, re)) = crate::kernel::frame_allocator::is_pa_in_pt_pool(pa) {
-            crate::yarm_log!(
-                "PMEM_ALLOC_PT_POOL_BUG pa=0x{:x} pt_range=0x{:x}..0x{:x}",
-                pa,
-                rs,
-                re
-            );
-            panic!("PMEM_ALLOC_PT_POOL_BUG: main frame allocator returned a PT-pool PA");
-        }
-        #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
-        crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user", pa);
-        Ok(pa)
+        self.with_memory_state_mut(super::vm_image_locked::alloc_user_data_frame_locked)
     }
 
     pub fn alloc_anonymous_memory_object_with_len(
@@ -1434,57 +1368,19 @@ impl KernelState {
         })
     }
 
+    /// Install one page in one address space with exactly the permissions given.
+    /// Body: [`vm_image_locked::map_user_page_in_asid_raw_locked`].
     pub(crate) fn map_user_page_in_asid_raw(
         &mut self,
         asid: Asid,
         virt: VirtAddr,
         mapping: Mapping,
     ) -> Result<Option<Mapping>, KernelError> {
-        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
-            crate::yarm_log!(
-                "MAP_USER_RAW_BEGIN asid={} virt=0x{:x} phys=0x{:x} user={} rwx={}{}{}",
-                asid.0,
-                virt.0,
-                mapping.phys.0,
-                mapping.flags.user,
-                if mapping.flags.read { "r" } else { "-" },
-                if mapping.flags.write { "w" } else { "-" },
-                if mapping.flags.execute { "x" } else { "-" }
-            );
-        }
-        let old = self.with_user_spaces_mut(|spaces| {
-            let aspace = spaces
-                .get_mut(asid)
-                .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-            if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
-                crate::yarm_log!(
-                    "MAP_USER_RAW_ASPACE asid={} aspace_asid={}",
-                    asid.0,
-                    aspace.asid().map(|asid| asid.0).unwrap_or(0)
-                );
-            }
-            aspace.map_page(virt, mapping).map_err(KernelError::Vm)
-        })?;
-        let resolved = crate::arch::selected_isa::page_table::resolve_page(asid, virt).is_some();
-        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
-            crate::yarm_log!(
-                "MAP_USER_RAW_DONE asid={} virt=0x{:x} had_old={} resolve_ok={}",
-                asid.0,
-                virt.0,
-                old.is_some(),
-                resolved
-            );
-        }
-        if let Some(old_mapping) = old {
-            self.clear_cow_page(asid, virt);
-            self.note_mapping_removed(old_mapping.phys);
-            self.reclaim_memory_object_for_phys(old_mapping.phys);
-        }
-        if mapping.flags.write {
-            self.clear_cow_page(asid, virt);
-        }
-        self.note_mapping_inserted(mapping.phys);
-        Ok(old)
+        self.with_vm_then_memory_mut(|vm, memory| {
+            super::vm_image_locked::map_user_page_in_asid_raw_locked(
+                vm, memory, asid, virt, mapping,
+            )
+        })
     }
 
     pub fn map_user_page_with_caps(

@@ -50,6 +50,15 @@ pub struct UserImageSpec {
     pub service_reply_recv_cap: u64,
     /// Up to 4 send cap IDs in the spawner's cnode to delegate into slots 13-16.
     pub extra_send_caps: [u64; 4],
+    /// U9-SPAWN-VM1: the user stack this image's provisioner already allocated and mapped in
+    /// `asid`.
+    ///
+    /// `None` means "this caller did not provision one" — the commit then allocates it itself,
+    /// exactly as every caller did before. `Some(top)` means the stack is already mapped and the
+    /// commit must NOT allocate a second one; the provisioner owns it and unwinds it with the
+    /// address space. Only the image-spawn transaction sets it; the nine architecture bring-up
+    /// sites take the `None` default.
+    pub provisioned_stack_top: Option<VirtAddr>,
 }
 
 impl UserImageSpec {
@@ -68,6 +77,7 @@ impl Default for UserImageSpec {
             service_recv_cap: 0,
             service_reply_recv_cap: 0,
             extra_send_caps: [0; 4],
+            provisioned_stack_top: None,
         }
     }
 }

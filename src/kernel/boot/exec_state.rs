@@ -3,7 +3,7 @@
 
 use super::{DispatchSwitchPlan, KernelError, KernelState, SpawnedUserTask, UserImageSpec};
 use crate::arch::hal::Hal;
-use crate::kernel::capabilities::{CapId, CapRights};
+use crate::kernel::capabilities::CapRights;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext, WaitReason};
@@ -39,13 +39,6 @@ fn read_u64_le(image: &[u8], offset: usize) -> Result<u64, KernelError> {
     let mut raw = [0u8; 8];
     raw.copy_from_slice(bytes);
     Ok(u64::from_le_bytes(raw))
-}
-
-fn task_missing_with_site(site: &'static str, cpu: u8) -> KernelError {
-    if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-        crate::yarm_log!("TASK_MISSING site={} cpu={}", site, cpu);
-    }
-    KernelError::TaskMissing
 }
 
 const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
@@ -478,283 +471,19 @@ impl KernelState {
     /// Minimal ELF64 loader for PT_LOAD segments:
     /// validates headers, maps pages for each load segment, copies file bytes,
     /// and zero-fills the BSS tail.
+    /// THE PT_LOAD segment loader — broad entry.
+    ///
+    /// U9-SPAWN-VM2 moved the body to [`load_elf_pt_load_segments_locked`], which takes the VM and
+    /// memory subsystems explicitly. This acquires them in rank order (5 then 6) and calls it, so
+    /// there is one loader and the broad path runs the same instructions the provisioner does.
     pub fn load_elf_pt_load_segments(
         &mut self,
         asid: Asid,
         image: &[u8],
     ) -> Result<(usize, usize, usize), KernelError> {
-        if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
-            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                crate::yarm_log!(
-                    "ELF_REJECT_HEADER len={} magic_ok={} class={}",
-                    image.len(),
-                    image.get(..4) == Some(b"\x7FELF"),
-                    image.get(4).copied().unwrap_or(0)
-                );
-            }
-            return Err(KernelError::WrongObject);
-        }
-        let entry = read_u64_le(image, 24)?;
-        let phoff = read_u64_le(image, 32)? as usize;
-        let phentsize = read_u16_le(image, 54)? as usize;
-        let phnum = read_u16_le(image, 56)? as usize;
-        if phnum == 0 || phentsize < ELF64_PHDR_SIZE {
-            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                crate::yarm_log!(
-                    "ELF_REJECT_PH_TABLE phnum={} phentsize={}",
-                    phnum,
-                    phentsize
-                );
-            }
-            return Err(KernelError::WrongObject);
-        }
-        let table_size = phnum
-            .checked_mul(phentsize)
-            .ok_or(KernelError::WrongObject)?;
-        let phend = phoff
-            .checked_add(table_size)
-            .ok_or(KernelError::WrongObject)?;
-        if phend > image.len() {
-            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                crate::yarm_log!(
-                    "ELF_REJECT_PH_BOUNDS phoff={} phend={} len={}",
-                    phoff,
-                    phend,
-                    image.len()
-                );
-            }
-            return Err(KernelError::WrongObject);
-        }
-
-        let mut max_loaded_end = 0u64;
-        let mut first_pt_load_vaddr = 0u64;
-        let mut saw_pt_load = false;
-        for idx in 0..phnum {
-            let base = phoff
-                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
-                .ok_or(KernelError::WrongObject)?;
-            let p_type = read_u32_le(image, base)?;
-            if p_type != PT_LOAD {
-                continue;
-            }
-            let _p_flags = read_u32_le(image, base + 4)?;
-            let p_offset = read_u64_le(image, base + 8)? as usize;
-            let p_vaddr = read_u64_le(image, base + 16)?;
-            let p_filesz = read_u64_le(image, base + 32)? as usize;
-            let p_memsz = read_u64_le(image, base + 40)? as usize;
-            if !saw_pt_load {
-                first_pt_load_vaddr = p_vaddr;
-            }
-            saw_pt_load = true;
-            let seg_end = p_vaddr
-                .checked_add(p_memsz as u64)
-                .ok_or(KernelError::WrongObject)?;
-            if seg_end > max_loaded_end {
-                max_loaded_end = seg_end;
-            }
-            if p_filesz > p_memsz {
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!(
-                        "ELF_REJECT_SEG_SIZE idx={} filesz={} memsz={}",
-                        idx,
-                        p_filesz,
-                        p_memsz
-                    );
-                }
-                return Err(KernelError::WrongObject);
-            }
-            let file_end = p_offset
-                .checked_add(p_filesz)
-                .ok_or(KernelError::WrongObject)?;
-            if file_end > image.len() {
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!(
-                        "ELF_REJECT_FILE_BOUNDS idx={} offset={} filesz={} end={} len={}",
-                        idx,
-                        p_offset,
-                        p_filesz,
-                        file_end,
-                        image.len()
-                    );
-                }
-                return Err(KernelError::WrongObject);
-            }
-
-            let page_size = PAGE_SIZE as u64;
-            let seg_start = p_vaddr;
-            let seg_end = p_vaddr
-                .checked_add(p_memsz as u64)
-                .ok_or(KernelError::WrongObject)?;
-            let page_start = seg_start & !(page_size - 1);
-            let page_end = (seg_end + page_size - 1) & !(page_size - 1);
-            let mut va = page_start;
-            while va < page_end {
-                let combined_pflags =
-                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
-                let flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
-                let existing =
-                    crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
-                let phys = if let Some(entry) = existing {
-                    entry.addr()
-                } else {
-                    self.alloc_user_data_frame()?
-                };
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!(
-                        "ELF_MAP_PAGE_BEGIN asid={} seg_vbase=0x{:x} page_va=0x{:x} phys=0x{:x} memsz={} filesz={} overlap={} pflags=0x{:x}",
-                        asid.0,
-                        p_vaddr,
-                        va,
-                        phys,
-                        p_memsz,
-                        p_filesz,
-                        existing.is_some(),
-                        combined_pflags
-                    );
-                }
-                let stage_flags = Self::staging_page_flags_from_final(flags);
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!(
-                        "ELF_MAP_PAGE_STAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
-                        asid.0,
-                        va,
-                        stage_flags.read,
-                        stage_flags.write,
-                        stage_flags.execute,
-                        stage_flags.user
-                    );
-                }
-                self.map_user_page_in_asid_raw(
-                    asid,
-                    VirtAddr(va),
-                    Mapping {
-                        phys: PhysAddr(phys),
-                        flags: stage_flags,
-                    },
-                )?;
-                #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
-                crate::yarm_log!(
-                    "KSPAWN_NEW_TASK_MAP_RANGE asid={} va=0x{:x} pa=0x{:x}",
-                    asid.0,
-                    va,
-                    phys
-                );
-                let post_map_present =
-                    crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
-                        .is_some();
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!(
-                        "ELF_MAP_PAGE_DONE asid={} page_va=0x{:x} post_resolve={} final_r={} final_w={} final_x={} final_u={}",
-                        asid.0,
-                        va,
-                        post_map_present,
-                        flags.read,
-                        flags.write,
-                        flags.execute,
-                        flags.user
-                    );
-                    if va == 0x0040_0000 {
-                        crate::yarm_log!(
-                            "ELF_MAP_PAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
-                            asid.0,
-                            va,
-                            flags.read,
-                            flags.write,
-                            flags.execute,
-                            flags.user
-                        );
-                    }
-                }
-                if !post_map_present {
-                    if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                        crate::yarm_log!(
-                            "ELF_MAP_PAGE_INVARIANT_FAIL asid={} page_va=0x{:x} phys=0x{:x}",
-                            asid.0,
-                            va,
-                            phys
-                        );
-                    }
-                    return Err(KernelError::UserMemoryFault);
-                }
-                va += page_size;
-            }
-
-            let file_bytes = &image[p_offset..file_end];
-            self.copy_to_user(asid, VirtAddr(p_vaddr), file_bytes)?;
-            if p_memsz > p_filesz {
-                let mut remaining = p_memsz - p_filesz;
-                let mut cursor = p_vaddr + p_filesz as u64;
-                let zeros = [0u8; 256];
-                while remaining > 0 {
-                    let chunk = remaining.min(zeros.len());
-                    self.copy_to_user(asid, VirtAddr(cursor), &zeros[..chunk])?;
-                    remaining -= chunk;
-                    cursor += chunk as u64;
-                }
-            }
-        }
-        if !saw_pt_load {
-            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                crate::yarm_log!("ELF_REJECT_NO_PT_LOAD");
-            }
-            return Err(KernelError::WrongObject);
-        }
-        for idx in 0..phnum {
-            let base = phoff
-                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
-                .ok_or(KernelError::WrongObject)?;
-            let p_type = read_u32_le(image, base)?;
-            if p_type != PT_LOAD {
-                continue;
-            }
-            let p_vaddr = read_u64_le(image, base + 16)?;
-            let p_memsz = read_u64_le(image, base + 40)? as usize;
-            let page_size = PAGE_SIZE as u64;
-            let seg_end = p_vaddr
-                .checked_add(p_memsz as u64)
-                .ok_or(KernelError::WrongObject)?;
-            let page_start = p_vaddr & !(page_size - 1);
-            let page_end = (seg_end + page_size - 1) & !(page_size - 1);
-            let mut va = page_start;
-            while va < page_end {
-                let combined_pflags =
-                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
-                let final_flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
-                let phys = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
-                    .ok_or(KernelError::UserMemoryFault)?
-                    .addr();
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!(
-                        "ELF_FINALIZE_PAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
-                        asid.0,
-                        va,
-                        final_flags.read,
-                        final_flags.write,
-                        final_flags.execute,
-                        final_flags.user
-                    );
-                }
-                self.map_user_page_in_asid_raw(
-                    asid,
-                    VirtAddr(va),
-                    Mapping {
-                        phys: PhysAddr(phys),
-                        flags: final_flags,
-                    },
-                )?;
-                va += page_size;
-            }
-        }
-        let page_size = PAGE_SIZE as u64;
-        let heap_base = max_loaded_end
-            .checked_add(page_size - 1)
-            .ok_or(KernelError::WrongObject)?
-            & !(page_size - 1);
-        Ok((
-            entry as usize,
-            first_pt_load_vaddr as usize,
-            heap_base as usize,
-        ))
+        self.with_vm_then_memory_mut(|vm, memory| {
+            load_elf_pt_load_segments_locked(vm, memory, asid, image)
+        })
     }
 
     /// Count total ELF PT_LOAD pages for telemetry (not unique; overlapping segments counted multiple times).
@@ -786,18 +515,8 @@ impl KernelState {
         Ok(total)
     }
 
-    /// ELF loader for `SpawnFromMemoryObject` (Phase 3A syscall nr=29).
-    ///
-    /// Attempts zero-copy mapping of read-only, page-aligned file pages directly
-    /// from the initrd physical backing.  Falls back to alloc+copy for:
-    ///  - Writable segments
-    ///  - Pages that cross file/BSS boundary
-    ///  - Any segment whose file data is NOT page-aligned within the initrd
-    ///    (typical for CPIO archives without explicit alignment)
-    ///
-    /// `image_id` is used only for diagnostic logging.
-    ///
-    /// Returns `(entry, first_pt_load_vaddr, heap_base, zc_pages, copied_pages)`.
+    /// THE zero-copy initramfs loader — broad entry. Body:
+    /// [`load_elf_with_mo_zero_copy_locked`].
     pub fn load_elf_with_mo_zero_copy(
         &mut self,
         image_id: u64,
@@ -806,333 +525,17 @@ impl KernelState {
         initrd_phys_base: u64,
         file_initrd_offset: u64,
     ) -> Result<(usize, usize, usize, usize, usize), KernelError> {
-        // Determine zero-copy feasibility: file data must start on a page boundary
-        // within the initrd physical region for any page to be directly mappable.
-        let page_size = PAGE_SIZE as u64;
-        let file_phys_start = initrd_phys_base.saturating_add(file_initrd_offset);
-        let offset_in_page = file_phys_start & (page_size - 1);
-        let zc_feasible = offset_in_page == 0;
-
-        crate::yarm_log!(
-            "ZC_FEASIBILITY image_id={} initrd_phys=0x{:x} file_off=0x{:x} \
-             file_phys=0x{:x} offset_in_page={} feasible={}",
-            image_id,
-            initrd_phys_base,
-            file_initrd_offset,
-            file_phys_start,
-            offset_in_page,
-            zc_feasible
-        );
-
-        if !zc_feasible {
-            // CPIO file data is not page-aligned — use existing copy-based loader.
-            // zc_pages = 0; copied_pages = total page slots in PT_LOAD segments.
-            let copied_pages = Self::count_elf_load_pages(image).unwrap_or(0);
-            crate::yarm_log!(
-                "ZC_FALLBACK image_id={} reason=cpio_file_data_unaligned copied_pages={}",
+        self.with_vm_then_memory_mut(|vm, memory| {
+            load_elf_with_mo_zero_copy_locked(
+                vm,
+                memory,
                 image_id,
-                copied_pages
-            );
-            let (entry, first, heap) = self.load_elf_pt_load_segments(asid, image)?;
-            return Ok((entry, first, heap, 0, copied_pages));
-        }
-
-        // File data IS page-aligned in the initrd.  Perform per-page ZC decision.
-        // For each PT_LOAD page:
-        //   - Non-writable && fully within file && page-aligned phys → map RO from initrd
-        //   - Everything else → alloc anon frame + copy (writable, BSS, partial pages)
-        if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
-            return Err(KernelError::WrongObject);
-        }
-        let entry = read_u64_le(image, 24)?;
-        let phoff = read_u64_le(image, 32)? as usize;
-        let phentsize = read_u16_le(image, 54)? as usize;
-        let phnum = read_u16_le(image, 56)? as usize;
-        if phnum == 0 || phentsize < ELF64_PHDR_SIZE {
-            return Err(KernelError::WrongObject);
-        }
-        let table_size = phnum
-            .checked_mul(phentsize)
-            .ok_or(KernelError::WrongObject)?;
-        let phend = phoff
-            .checked_add(table_size)
-            .ok_or(KernelError::WrongObject)?;
-        if phend > image.len() {
-            return Err(KernelError::WrongObject);
-        }
-
-        let mut max_loaded_end = 0u64;
-        let mut first_pt_load_vaddr = 0u64;
-        let mut saw_pt_load = false;
-        let mut zc_pages = 0usize;
-        let mut copied_pages = 0usize;
-        let mut seg_load_idx = 0usize;
-
-        // First pass: allocate physical pages and map (staging flags for copy pages).
-        for idx in 0..phnum {
-            let base = phoff
-                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
-                .ok_or(KernelError::WrongObject)?;
-            let p_type = read_u32_le(image, base)?;
-            if p_type != PT_LOAD {
-                continue;
-            }
-            let p_flags_raw = read_u32_le(image, base + 4)?;
-            let p_offset = read_u64_le(image, base + 8)? as usize;
-            let p_vaddr = read_u64_le(image, base + 16)?;
-            let p_filesz = read_u64_le(image, base + 32)? as usize;
-            let p_memsz = read_u64_le(image, base + 40)? as usize;
-            let seg_idx = seg_load_idx;
-            seg_load_idx += 1;
-            if !saw_pt_load {
-                first_pt_load_vaddr = p_vaddr;
-            }
-            saw_pt_load = true;
-            let seg_end = p_vaddr
-                .checked_add(p_memsz as u64)
-                .ok_or(KernelError::WrongObject)?;
-            if seg_end > max_loaded_end {
-                max_loaded_end = seg_end;
-            }
-            if p_filesz > p_memsz {
-                return Err(KernelError::WrongObject);
-            }
-            let file_end = p_offset
-                .checked_add(p_filesz)
-                .ok_or(KernelError::WrongObject)?;
-            if file_end > image.len() {
-                return Err(KernelError::WrongObject);
-            }
-            let seg_start = p_vaddr;
-            let page_start = seg_start & !(page_size - 1);
-            let page_end_va = (seg_end + page_size - 1) & !(page_size - 1);
-            let p_offset_page = p_offset as u64 & !(page_size - 1);
-            let p_vaddr_page = p_vaddr & !(page_size - 1);
-
-            crate::yarm_log!(
-                "ZC_SEG_BEGIN image_id={} seg={} p_offset=0x{:x} p_vaddr=0x{:x} \
-                 p_filesz={} p_memsz={} p_flags=0x{:x} file_data_phys=0x{:x} \
-                 offset_in_page={}",
-                image_id,
-                seg_idx,
-                p_offset,
-                p_vaddr,
-                p_filesz,
-                p_memsz,
-                p_flags_raw,
-                file_phys_start,
-                file_phys_start & (page_size - 1)
-            );
-
-            let mut seg_zc = 0usize;
-            let mut seg_copied = 0usize;
-
-            let mut va = page_start;
-            while va < page_end_va {
-                let combined_pflags =
-                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
-                // Detect WX before calling page_flags_from_elf_pflags so we can log the reason.
-                if (combined_pflags & PF_W) != 0 && (combined_pflags & PF_X) != 0 {
-                    crate::yarm_log!(
-                        "ZC_PAGE image_id={} seg={} va=0x{:x} src_phys=0x0 \
-                         reason=wx_rejected pflags=0x{:x}",
-                        image_id,
-                        seg_idx,
-                        va,
-                        combined_pflags
-                    );
-                    return Err(KernelError::WrongObject);
-                }
-                let flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
-                // ELF file page index within this segment.
-                let page_idx = (va - p_vaddr_page) / page_size;
-                let elf_file_page_start = p_offset_page + page_idx * page_size;
-                // Page is fully in file data if all bytes in [va, va+PAGE_SIZE)
-                // fall within [p_vaddr, p_vaddr+p_filesz).
-                let page_fully_in_file = va >= p_vaddr
-                    && p_filesz > 0
-                    && va.saturating_add(page_size) <= p_vaddr.saturating_add(p_filesz as u64);
-                // Zero-copy eligibility: RO, fully-in-file, page-aligned phys.
-                let initrd_phys_of_page = file_phys_start.saturating_add(elf_file_page_start);
-                let can_zc = !flags.write
-                    && page_fully_in_file
-                    && (initrd_phys_of_page & (page_size - 1)) == 0;
-
-                // Determine diagnostic reason for the page decision.
-                let reason = if can_zc {
-                    "full_page_zc_ok"
-                } else if flags.write {
-                    "writable_segment_copy"
-                } else if va < p_vaddr {
-                    "partial_head_copy"
-                } else if p_filesz == 0 || va >= p_vaddr.saturating_add(p_filesz as u64) {
-                    "bss_copy"
-                } else if va.saturating_add(page_size) > p_vaddr.saturating_add(p_filesz as u64) {
-                    "partial_tail_copy"
-                } else {
-                    // page_fully_in_file is true but initrd_phys_of_page is misaligned;
-                    // can only occur if file_phys_start alignment changed mid-computation.
-                    "elf_offset_unaligned"
-                };
-
-                crate::yarm_log!(
-                    "ZC_PAGE image_id={} seg={} va=0x{:x} src_phys=0x{:x} reason={}",
-                    image_id,
-                    seg_idx,
-                    va,
-                    initrd_phys_of_page,
-                    reason
-                );
-
-                let existing =
-                    crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
-                if existing.is_some() {
-                    // Page already mapped by an earlier overlapping segment — skip.
-                } else if can_zc {
-                    // Zero-copy: map the initrd physical page directly (RO final flags).
-                    self.map_user_page_in_asid_raw(
-                        asid,
-                        VirtAddr(va),
-                        Mapping {
-                            phys: PhysAddr(initrd_phys_of_page),
-                            flags,
-                        },
-                    )?;
-                    zc_pages += 1;
-                    seg_zc += 1;
-                } else {
-                    // Copy: alloc anonymous frame, map with staging RW flags.
-                    let phys = self.alloc_user_data_frame()?;
-                    let stage_flags = Self::staging_page_flags_from_final(flags);
-                    self.map_user_page_in_asid_raw(
-                        asid,
-                        VirtAddr(va),
-                        Mapping {
-                            phys: PhysAddr(phys),
-                            flags: stage_flags,
-                        },
-                    )?;
-                    copied_pages += 1;
-                    seg_copied += 1;
-                }
-                va += page_size;
-            }
-
-            crate::yarm_log!(
-                "ZC_SEG_DONE image_id={} seg={} p_vaddr=0x{:x} p_flags=0x{:x} \
-                 zc_pages={} copied_pages={}",
-                image_id,
-                seg_idx,
-                p_vaddr,
-                p_flags_raw,
-                seg_zc,
-                seg_copied
-            );
-
-            // Copy ELF file bytes into non-ZC pages only.
-            // Iterate page by page to skip ZC pages (which are already correct and RO).
-            let mut va = page_start;
-            while va < page_end_va {
-                // Determine ZC status for this page.
-                let page_idx = (va - p_vaddr_page) / page_size;
-                let elf_file_page_start = p_offset_page + page_idx * page_size;
-                let combined_pflags =
-                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
-                let flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
-                let page_fully_in_file = va >= p_vaddr
-                    && p_filesz > 0
-                    && va.saturating_add(page_size) <= p_vaddr.saturating_add(p_filesz as u64);
-                let initrd_phys_of_page = file_phys_start.saturating_add(elf_file_page_start);
-                let can_zc = !flags.write
-                    && page_fully_in_file
-                    && (initrd_phys_of_page & (page_size - 1)) == 0;
-
-                if !can_zc {
-                    // Copy file bytes into this page.
-                    // Clamp the file range to what falls within this page's VA.
-                    let copy_va_start = core::cmp::max(va, p_vaddr);
-                    let copy_va_end = core::cmp::min(va + page_size, p_vaddr + p_filesz as u64);
-                    if copy_va_start < copy_va_end {
-                        let copy_len = (copy_va_end - copy_va_start) as usize;
-                        let file_off = (copy_va_start - p_vaddr) as usize + p_offset;
-                        self.copy_to_user(
-                            asid,
-                            VirtAddr(copy_va_start),
-                            &image[file_off..file_off + copy_len],
-                        )?;
-                    }
-                    // Zero BSS portion of this page.
-                    let bss_va_start = core::cmp::max(va, p_vaddr + p_filesz as u64);
-                    let bss_va_end = core::cmp::min(va + page_size, p_vaddr + p_memsz as u64);
-                    if bss_va_start < bss_va_end {
-                        let bss_len = (bss_va_end - bss_va_start) as usize;
-                        let zeros = [0u8; 256];
-                        let mut remaining = bss_len;
-                        let mut cursor = bss_va_start;
-                        while remaining > 0 {
-                            let chunk = remaining.min(zeros.len());
-                            self.copy_to_user(asid, VirtAddr(cursor), &zeros[..chunk])?;
-                            remaining -= chunk;
-                            cursor += chunk as u64;
-                        }
-                    }
-                }
-                va += page_size;
-            }
-        }
-
-        if !saw_pt_load {
-            return Err(KernelError::WrongObject);
-        }
-
-        // Second pass: enforce final permissions on copy pages.
-        // ZC pages already have final flags from the first pass.
-        for idx in 0..phnum {
-            let base = phoff
-                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
-                .ok_or(KernelError::WrongObject)?;
-            if read_u32_le(image, base)? != PT_LOAD {
-                continue;
-            }
-            let p_vaddr = read_u64_le(image, base + 16)?;
-            let p_memsz = read_u64_le(image, base + 40)?;
-            let seg_end = p_vaddr
-                .checked_add(p_memsz)
-                .ok_or(KernelError::WrongObject)?;
-            let page_start = p_vaddr & !(page_size - 1);
-            let page_end_va = (seg_end + page_size - 1) & !(page_size - 1);
-            let mut va = page_start;
-            while va < page_end_va {
-                let combined_pflags =
-                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
-                let final_flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
-                let phys = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
-                    .ok_or(KernelError::UserMemoryFault)?
-                    .addr();
-                self.map_user_page_in_asid_raw(
-                    asid,
-                    VirtAddr(va),
-                    Mapping {
-                        phys: PhysAddr(phys),
-                        flags: final_flags,
-                    },
-                )?;
-                va += page_size;
-            }
-        }
-
-        let heap_base = max_loaded_end
-            .checked_add(page_size - 1)
-            .ok_or(KernelError::WrongObject)?
-            & !(page_size - 1);
-
-        Ok((
-            entry as usize,
-            first_pt_load_vaddr as usize,
-            heap_base as usize,
-            zc_pages,
-            copied_pages,
-        ))
+                asid,
+                image,
+                initrd_phys_base,
+                file_initrd_offset,
+            )
+        })
     }
 
     fn maybe_switch_kernel_context(
@@ -2526,6 +1929,13 @@ impl KernelState {
 
     /// Stage 199D-WA3B: spawn a user task by consuming an EXACT one-shot reservation.
     ///
+    /// U9-SPAWN-TXN2 §2 moved the body to
+    /// [`crate::kernel::syscall::spawn_txn::spawn_user_task_from_image`], which states the
+    /// publication policy ONCE over the `SpawnTxnOwners` interface. This is now the BROAD
+    /// acquisition adapter's entry into it; the split route enters the same policy through its
+    /// own adapter. The nine architecture bring-up sites keep calling this and get byte-identical
+    /// behaviour, because there is only one body left to call.
+    ///
     /// `reservation` is the authority, not `spec.tid`. Before any spawn-specific mutation the
     /// reservation is validated and claimed atomically under one rank-2 acquisition — exact TID,
     /// exact generation, expected class, expected process, and phase `ReservedUnstarted` — so a
@@ -2540,54 +1950,13 @@ impl KernelState {
     pub fn spawn_user_task_from_image(
         &mut self,
         reservation: crate::kernel::spawn_reservation::SpawnReservationToken,
-        mut spec: UserImageSpec,
+        spec: UserImageSpec,
     ) -> Result<SpawnedUserTask, KernelError> {
-        let cpu = self.current_cpu();
-        if spec.tid != reservation.tid() {
-            crate::yarm_log!(
-                "SPAWN_RESERVATION_REFUSED site=spawn_user_task_from_image tid={} reason=spec_tid_mismatch reservation_tid={}",
-                spec.tid,
-                reservation.tid()
-            );
-            return Err(KernelError::WrongObject);
-        }
-        // Claim the reservation FIRST: everything below this line is spawn-specific mutation.
-        let baseline = self.with_tcbs_mut(|tcbs| {
-            crate::kernel::spawn_reservation::claim_for_spawn(tcbs, &reservation).map_err(
-                |refusal| {
-                    crate::kernel::spawn_reservation::log_reservation_refusal(
-                        "spawn_user_task_from_image",
-                        spec.tid,
-                        refusal,
-                    );
-                    KernelError::WrongObject
-                },
-            )
-        })?;
-        let tid = spec.tid;
-        match self.spawn_image_after_claim(&reservation, spec) {
-            Ok(spawned) => Ok(spawned),
-            Err(err) => {
-                // The reservation lifecycle is transactional: restore the SAME incarnation, so
-                // it never stays `Spawning` after an ordinary returned error and the caller's
-                // token stays exactly as valid as it was.
-                let restored = self.with_tcbs_mut(|tcbs| {
-                    crate::kernel::spawn_reservation::restore_after_failed_spawn(
-                        tcbs,
-                        &reservation,
-                        baseline,
-                    )
-                    .is_ok()
-                });
-                crate::yarm_log!(
-                    "SPAWN_FAILED_RESERVATION_RESTORED tid={} restored={} err={:?}",
-                    tid,
-                    u8::from(restored),
-                    err
-                );
-                Err(err)
-            }
-        }
+        crate::kernel::syscall::spawn_txn::spawn_user_task_from_image(
+            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: self },
+            reservation,
+            spec,
+        )
     }
 
     /// Test/hosted-only: reserve and immediately consume, for tests whose subject is something
@@ -2604,503 +1973,6 @@ impl KernelState {
     ) -> Result<SpawnedUserTask, KernelError> {
         let reservation = self.reserve_task_for_spawn_with_class(spec.tid, spec.class)?;
         self.spawn_user_task_from_image(reservation, spec)
-    }
-
-    /// The spawn body proper, entered only with the reservation already claimed
-    /// (`Spawning`). Every `?` here returns to the caller above, which restores the reservation.
-    fn spawn_image_after_claim(
-        &mut self,
-        reservation: &crate::kernel::spawn_reservation::SpawnReservationToken,
-        mut spec: UserImageSpec,
-    ) -> Result<SpawnedUserTask, KernelError> {
-        let cpu = self.current_cpu();
-        // Stage 199D-WA3B: the WA3A hard-stop is closed. The destination is no longer "any TID
-        // the caller names" — it is the exact reservation claimed above, which by construction
-        // was never a live task. Registration idempotence is no longer spawn authorization.
-        if spec.entry == 0 {
-            return Err(KernelError::WrongObject);
-        }
-        let asid = spec.asid.ok_or(KernelError::UserMemoryFault)?;
-        if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
-            return Err(KernelError::UserMemoryFault);
-        }
-
-        crate::yarm_log!(
-            "SPAWN_TASK_ENTER tid={} asid={} entry=0x{:x}",
-            spec.tid,
-            asid.0,
-            spec.entry
-        );
-        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!(
-                "FIRST_USER_CREATE_BEGIN cpu={} tid={} asid={} entry=0x{:x}",
-                cpu.0,
-                spec.tid,
-                asid.0,
-                spec.entry
-            );
-        }
-        // Stage 175 (SPAWN-LIFECYCLE): default-off lifecycle phase markers. Every
-        // register/cnode/cap/thread step below is UNCHANGED — these only expose the
-        // phase boundaries of the spawn/image-loading metadata path.
-        //
-        // Stage 175B: a duplicate-TID is NOT detectable by a pre-register presence
-        // scan — the bootstrap tasks (tid 1/2/3) legitimately pre-reserve their TCB
-        // slot before this spawn runs, so a pre-check flags every bootstrap spawn as
-        // a false duplicate. The only true duplicate is a *second live TCB* for the
-        // same tid, which the post-register invariant below (`tcb_count > 1`) detects
-        // after `register_task_with_class` has (idempotently) claimed the slot.
-        let spawn_lc = crate::kernel::boot::spawn_lifecycle_enabled();
-        // Stage 199D-WA3B: no registration here. The TCB, CNode, class and kernel context were
-        // provisioned by `reserve_task_for_spawn_with_class`, and the reservation is already
-        // claimed — so this spawn cannot create, and cannot overwrite, anything.
-        crate::yarm_log!("SPAWN_TASK_REGISTER_OK tid={}", spec.tid);
-        if spawn_lc {
-            crate::yarm_log!("SPAWN_LIFECYCLE_TCB_ALLOC_OK tid={}", spec.tid);
-            // The address space was created upstream and is bound to this task; a
-            // missing address space here would be an aspace-setup violation.
-            crate::yarm_log!(
-                "SPAWN_LIFECYCLE_ASPACE_CREATE_OK tid={} asid={}",
-                spec.tid,
-                asid.0
-            );
-        }
-
-        // Stage 119 Part A: minimal task-pair init — x86_64 only, tid=1 (init
-        // server) and tid=2 (supervisor). Sets kernel_context.initialized = true
-        // for both tasks so that the first timer preemption of tid=1 dispatching
-        // tid=2 as incoming produces a real switch_frames call and the first-resume
-        // handler can prove lock reacquisition via post_switch_restore.
-        #[cfg(target_arch = "x86_64")]
-        if spec.tid == BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID {
-            let entry = super::thread_state::kernel_switch_frame_trampoline_ip();
-            crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN tid={}", spec.tid);
-            match self.initialize_thread_kernel_switch_frame(spec.tid, entry) {
-                Ok(()) => {
-                    let stack = self.with_tcbs(|tcbs| {
-                        tcbs.iter()
-                            .flatten()
-                            .find(|tcb| tcb.tid.0 == spec.tid)
-                            .and_then(|tcb| tcb.kernel_context.stack_top)
-                            .map(|t| t.0)
-                            .unwrap_or(0)
-                    });
-                    crate::yarm_log!(
-                        "D6_KERNEL_SWITCH_FRAME_INIT_DONE tid={} entry=0x{:x} stack=0x{:x}",
-                        spec.tid,
-                        entry,
-                        stack,
-                    );
-                }
-                Err(e) => {
-                    crate::yarm_log!(
-                        "D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED reason=init_failed tid={} err={:?}",
-                        spec.tid,
-                        e,
-                    );
-                }
-            }
-        }
-
-        if spec.spawner_tid != 0 && spec.service_recv_cap != 0 {
-            match self.grant_capability_task_to_task_with_rights(
-                spec.spawner_tid,
-                CapId(spec.service_recv_cap),
-                spec.tid,
-                CapRights::RECEIVE,
-            ) {
-                Ok(local_cap) => {
-                    spec.startup_args[12] = local_cap.0;
-                    crate::yarm_log!(
-                        "KSPAWN_RECV_CAP_DELEGATED tid={} local_cap={}",
-                        spec.tid,
-                        local_cap.0
-                    );
-                }
-                Err(e) => {
-                    crate::yarm_log!("KSPAWN_RECV_CAP_DELEGATE_FAIL tid={} err={:?}", spec.tid, e);
-                }
-            }
-        }
-        if spec.spawner_tid != 0 && spec.service_reply_recv_cap != 0 {
-            match self.grant_capability_task_to_task_with_rights(
-                spec.spawner_tid,
-                CapId(spec.service_reply_recv_cap),
-                spec.tid,
-                CapRights::RECEIVE,
-            ) {
-                Ok(local_cap) => {
-                    spec.startup_args[2] = local_cap.0;
-                    crate::yarm_log!(
-                        "SPAWN_SERVICE_REPLY_RECV_CAP_CHILD child_tid={} cap={} rights=RECEIVE",
-                        spec.tid,
-                        local_cap.0
-                    );
-                    crate::yarm_log!(
-                        "SPAWN_STARTUP_SLOT_2_REPLY_RECV child_tid={} value={}",
-                        spec.tid,
-                        spec.startup_args[2]
-                    );
-                }
-                Err(e) => {
-                    crate::yarm_log!(
-                        "KSPAWN_REPLY_RECV_CAP_DELEGATE_FAIL tid={} err={:?}",
-                        spec.tid,
-                        e
-                    );
-                }
-            }
-        }
-        for (i, &raw_cap) in spec.extra_send_caps.iter().enumerate() {
-            if raw_cap != 0 && spec.spawner_tid != 0 {
-                match self.grant_capability_task_to_task_with_rights(
-                    spec.spawner_tid,
-                    CapId(raw_cap),
-                    spec.tid,
-                    CapRights::SEND,
-                ) {
-                    Ok(local_cap) => {
-                        spec.startup_args[13 + i] = local_cap.0;
-                        crate::yarm_log!(
-                            "KSPAWN_EXTRA_CAP_DELEGATED tid={} slot={} local_cap={}",
-                            spec.tid,
-                            13 + i,
-                            local_cap.0
-                        );
-                    }
-                    Err(e) => {
-                        crate::yarm_log!(
-                            "KSPAWN_EXTRA_CAP_DELEGATE_FAIL tid={} slot={} err={:?}",
-                            spec.tid,
-                            13 + i,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        let cnode = self.task_cnode(spec.tid).ok_or(task_missing_with_site(
-            "spawn_user_task_from_image/task_cnode",
-            cpu.0,
-        ))?;
-        crate::yarm_log!(
-            "SPAWN_TASK_CAP_CHECK name=task_cnode cap={} object=cnode result=ok",
-            cnode.0
-        );
-        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!(
-                "FIRST_USER_LOOKUP cpu={} tid={} cnode={} status=found",
-                cpu.0,
-                spec.tid,
-                cnode.0
-            );
-        }
-        self.set_process_cnode_for_pid(spec.tid, cnode)?;
-        if spawn_lc {
-            crate::yarm_log!(
-                "SPAWN_LIFECYCLE_CNODE_SETUP_OK tid={} cnode={}",
-                spec.tid,
-                cnode.0
-            );
-            // The bootstrap/service caps were delegated into this cnode above.
-            crate::yarm_log!("SPAWN_LIFECYCLE_BOOTSTRAP_CAPS_OK tid={}", spec.tid);
-        }
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == spec.tid)
-                .ok_or(task_missing_with_site(
-                    "spawn_user_task_from_image/set_asid_tcb_lookup",
-                    cpu.0,
-                ))?;
-            tcb.asid = Some(asid);
-            Ok::<_, KernelError>(())
-        })?;
-
-        // Stage 127: Stage 126 correctly refused to publish x86_64 initialized
-        // switch frames without a mapped kernel switch-stack page, but the first
-        // attempt above can run before the target task ASID is bound. Retry at
-        // the first point where the target ASID/root is known so the mapping gate
-        // uses the target task root rather than temporal active-ASID presence.
-        #[cfg(target_arch = "x86_64")]
-        if (spec.tid == BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID)
-            && !self
-                .thread_kernel_context(spec.tid)
-                .is_some_and(|ctx| ctx.initialized)
-        {
-            let entry = super::thread_state::kernel_switch_frame_trampoline_ip();
-            crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_RETRY tid={}", spec.tid);
-            match self.initialize_thread_kernel_switch_frame(spec.tid, entry) {
-                Ok(()) => {
-                    let stack = self.with_tcbs(|tcbs| {
-                        tcbs.iter()
-                            .flatten()
-                            .find(|tcb| tcb.tid.0 == spec.tid)
-                            .and_then(|tcb| tcb.kernel_context.stack_top)
-                            .map(|t| t.0)
-                            .unwrap_or(0)
-                    });
-                    crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid={}", spec.tid);
-                    crate::yarm_log!(
-                        "D6_KERNEL_SWITCH_FRAME_INIT_DONE tid={} entry=0x{:x} stack=0x{:x}",
-                        spec.tid,
-                        entry,
-                        stack,
-                    );
-                }
-                Err(e) => {
-                    crate::yarm_log!(
-                        "D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED reason=retry_failed tid={} err={:?}",
-                        spec.tid,
-                        e,
-                    );
-                }
-            }
-        }
-        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
-        }
-        let stack_top = match self.allocate_user_stack_with_guard(spec.tid, 64) {
-            Ok(top) => top,
-            Err(err) => {
-                crate::yarm_log!(
-                    "SPAWN_TASK_STACK_FAIL tid={} asid={} err={:?}",
-                    spec.tid,
-                    asid.0,
-                    err
-                );
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
-                }
-                return Err(err);
-            }
-        };
-        crate::yarm_log!(
-            "SPAWN_TASK_STACK_OK tid={} stack_top=0x{:x}",
-            spec.tid,
-            stack_top.0
-        );
-        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation");
-            crate::yarm_log!("BOOTSTRAP_STAGE: before entry setup");
-            crate::yarm_log!("USER_ENTRY rip=0x{:x}", spec.entry);
-        }
-        let startup_slots_len = spec.startup_args.len();
-        let startup_slots_bytes_len = startup_slots_len * core::mem::size_of::<u64>();
-        let startup_slots_start =
-            (stack_top.0 as usize).saturating_sub(startup_slots_bytes_len) & !0x7usize;
-        let startup_stack_ptr = startup_slots_start & !0xFusize;
-        // x86-64 SysV ABI: at the very first instruction of a function the
-        // stack pointer must satisfy RSP ≡ 8 (mod 16) because a CALL would
-        // normally push an 8-byte return address before the callee is entered.
-        // We enter user tasks via IRETQ / SYSRETQ (no return-address push), so
-        // we must pre-subtract 8 from the initial stack pointer to satisfy the
-        // invariant.  The trap return path (flush_trap_context_to_iret_frame)
-        // and the initial-IRETQ path (enter_dispatched_user_task_if_available)
-        // both read the stack pointer directly from user_context, so the
-        // adjustment only needs to appear here.
-        // AArch64 requires 16-byte SP alignment at function entry — no
-        // pre-subtraction is needed there.
-        #[cfg(target_arch = "x86_64")]
-        let startup_stack_ptr = startup_stack_ptr.wrapping_sub(8);
-        #[allow(unused_variables)]
-        #[cfg(not(target_arch = "x86_64"))]
-        let startup_stack_ptr = startup_stack_ptr;
-        // Ensure slot[0] (task_id) is always the actual allocated TID.
-        // PM does not know the new task's TID at SpawnV5 call time and sends
-        // startup_args[0]=0.  Fill it now so that:
-        //   (a) the user-visible slot[0] holds the correct task_id, and
-        //   (b) user_context.arg0 = spec.tid ≠ 0, which satisfies the
-        //       x86_64 new-task detection check (is_new_task requires arg(0)!=0)
-        //       so the startup ABI registers (RDI/RSI/RDX/RCX/R8/R9) are
-        //       properly injected on the task's very first dispatch.
-        if spec.startup_args[0] == 0 {
-            spec.startup_args[0] = spec.tid;
-        }
-        let startup_slots_ptr = VirtAddr(startup_slots_start as u64);
-        let mut startup_slots_bytes = [0u8; core::mem::size_of::<u64>() * 18];
-        for (index, slot) in spec.startup_args.iter().copied().enumerate() {
-            let begin = index * core::mem::size_of::<u64>();
-            startup_slots_bytes[begin..begin + core::mem::size_of::<u64>()]
-                .copy_from_slice(&slot.to_le_bytes());
-        }
-        self.copy_to_user(
-            asid,
-            startup_slots_ptr,
-            &startup_slots_bytes[..startup_slots_bytes_len],
-        )?;
-        crate::yarm_log!(
-            "YARM_FIRST_USER_STARTUP_BLOCK va=0x{:x} count={} mapped=true",
-            startup_slots_start,
-            startup_slots_len
-        );
-
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == spec.tid)
-                .ok_or(task_missing_with_site(
-                    "spawn_user_task_from_image/set_context_tcb_lookup",
-                    cpu.0,
-                ))?;
-            tcb.thread_group_id = ThreadGroupId(spec.tid);
-            tcb.asid = Some(asid);
-            tcb.user_entry = Some(VirtAddr(spec.entry as u64));
-            tcb.user_stack_top = Some(stack_top);
-            tcb.user_context = UserRegisterContext {
-                instruction_ptr: VirtAddr(spec.entry as u64),
-                stack_ptr: VirtAddr(startup_stack_ptr as u64),
-                user_gprs: [0; 32],
-                // Startup entry ABI args:
-                //   arg0 => task_id / tid
-                //   arg1 => process-manager request-send cap
-                //   arg2 => process-manager reply-recv cap
-                arg0: spec.startup_args[0] as usize,
-                arg1: spec.startup_args[1] as usize,
-                arg2: spec.startup_args[2] as usize,
-                // Extended startup delivery ABI:
-                //   arg3 => pointer to [u64; 18] startup slot block in userspace memory
-                //   arg4 => startup slot count
-                //   arg5 => reserved (0)
-                arg3: startup_slots_start,
-                arg4: startup_slots_len,
-                arg5: 0,
-            };
-            crate::yarm_log!(
-                "USER_INITIAL_CONTEXT tid={} pc=0x{:016x} sp=0x{:016x} arg0=0x{:016x} arg1=0x{:016x} gpr29=0x{:016x} gpr30=0x{:016x} ctx_ptr=0x{:x}",
-                spec.tid,
-                tcb.user_context.instruction_ptr.0,
-                tcb.user_context.stack_ptr.0,
-                tcb.user_context.arg0 as u64,
-                tcb.user_context.arg1 as u64,
-                tcb.user_context.user_gprs[29] as u64,
-                tcb.user_context.user_gprs[30] as u64,
-                &tcb.user_context as *const _ as usize
-            );
-            if matches!(spec.class, crate::kernel::task::TaskClass::SystemServer)
-                || spec.tid == BOOTSTRAP_FIRST_USER_TID
-            {
-                tcb.cpu_affinity = Some(CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID));
-            }
-            Ok::<_, KernelError>(())
-        })?;
-        // Stage 199D-WA3B: the EXACT one-shot commit `Spawning -> LiveSpawned`. This is the only
-        // place a reserved TCB becomes `Runnable`, it clears the reservation record so the token
-        // can never be consumed again, and it runs strictly BEFORE the enqueue below — so the
-        // task becomes scheduler-visible only after a fully successful image construction.
-        self.with_tcbs_mut(|tcbs| {
-            crate::kernel::spawn_reservation::commit_live_spawn(tcbs, reservation).map_err(
-                |refusal| {
-                    crate::kernel::spawn_reservation::log_reservation_refusal(
-                        "spawn_user_task_from_image/commit",
-                        spec.tid,
-                        refusal,
-                    );
-                    KernelError::WrongObject
-                },
-            )
-        })?;
-        crate::yarm_log!("SPAWN_TASK_LIVE_COMMIT_OK tid={}", spec.tid);
-        crate::yarm_log!("SPAWN_TASK_CONTEXT_OK tid={}", spec.tid);
-        if spawn_lc {
-            crate::yarm_log!("SPAWN_LIFECYCLE_THREAD_READY tid={}", spec.tid);
-        }
-        let bootstrap_cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
-        // Pin all SystemServer tasks (supervisor, PM, init) to CPU 0 so the
-        // scheduler queue on the bootstrap CPU has them in spawn order:
-        //   [idle/TID0, supervisor/TID2, PM/TID3, init/TID1]
-        // This guarantees supervisor and PM reach their recv() before init runs.
-        let should_pin = matches!(spec.class, crate::kernel::task::TaskClass::SystemServer)
-            || spec.tid == BOOTSTRAP_FIRST_USER_TID;
-        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!(
-                "FIRST_USER_ENQUEUE_DECISION cpu={} tid={} chosen_cpu={} reason={}",
-                cpu.0,
-                spec.tid,
-                bootstrap_cpu.0,
-                if should_pin {
-                    "bootstrap_pin"
-                } else {
-                    "scheduler_default"
-                }
-            );
-        }
-
-        let enqueued_cpu = if should_pin {
-            let chosen_cpu = bootstrap_cpu;
-            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                crate::yarm_log!(
-                    "FINAL_FIRST_USER_ENQUEUE_SITE cpu={} tid={} chosen_cpu={} bootstrap_pin={}",
-                    cpu.0,
-                    spec.tid,
-                    chosen_cpu.0,
-                    should_pin as u8
-                );
-            }
-            if chosen_cpu != bootstrap_cpu {
-                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-                    crate::yarm_log!(
-                        "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
-                        cpu.0,
-                        spec.tid,
-                        chosen_cpu.0
-                    );
-                }
-            }
-            assert_eq!(chosen_cpu.0, bootstrap_cpu.0);
-            self.enqueue_on_cpu(chosen_cpu, spec.tid)?;
-            chosen_cpu
-        } else {
-            self.enqueue_task(spec.tid)?
-        };
-        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!(
-                "FIRST_USER_ENQUEUE cpu={} tid={} target_cpu={} status=ok",
-                cpu.0,
-                spec.tid,
-                enqueued_cpu.0
-            );
-            crate::yarm_log!("BOOTSTRAP_FIRST_USER tid={} enqueued=true", spec.tid);
-        }
-        if spawn_lc {
-            crate::yarm_log!("SPAWN_LIFECYCLE_PROCESS_READY tid={}", spec.tid);
-            // Post-spawn invariant: exactly one live TCB for this tid, bound to the
-            // spawn ASID and not already exited (a zombie). Any deviation is a leak.
-            let tcb_count = self.with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .flatten()
-                    .filter(|tcb| tcb.tid.0 == spec.tid)
-                    .count()
-            });
-            let zombie = self.with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == spec.tid)
-                    .map(|tcb| matches!(tcb.status, TaskStatus::Exited(_) | TaskStatus::Dead))
-                    .unwrap_or(false)
-            });
-            if tcb_count == 0 {
-                crate::yarm_log!("SPAWN_LIFECYCLE_TCB_LEAK tid={} count=0", spec.tid);
-            } else if tcb_count > 1 {
-                crate::yarm_log!(
-                    "SPAWN_LIFECYCLE_DUPLICATE_TID tid={} count={}",
-                    spec.tid,
-                    tcb_count
-                );
-            } else if zombie {
-                crate::yarm_log!("SPAWN_LIFECYCLE_ZOMBIE_LEAK tid={}", spec.tid);
-            } else {
-                crate::yarm_log!("SPAWN_LIFECYCLE_INVARIANT_OK tid={}", spec.tid);
-            }
-        }
-        Ok(SpawnedUserTask {
-            tid: spec.tid,
-            entry: spec.entry,
-            asid: Some(asid),
-        })
     }
 
     /// Stage 175 (SPAWN-LIFECYCLE): one-shot, self-contained spawn-rollback proof.
@@ -4118,6 +2990,831 @@ unsafe fn d6_read_pte(table_phys: u64, idx: u64, virt_offset: u64) -> Option<u64
         .wrapping_add(idx.wrapping_mul(8));
     let entry = core::ptr::read_volatile(virt as *const u64);
     if entry & 1 == 0 { None } else { Some(entry) }
+}
+
+use crate::kernel::boot::MemorySubsystem;
+use crate::kernel::task::ThreadControlBlock;
+use crate::kernel::vm::AddressSpaceManager;
+
+// ── U9-SPAWN-VM2: the rank-local ELF loaders ────────────────────────────────────────────────
+//
+// Both bodies below were `KernelState` methods. They never touched anything but the VM and memory
+// subsystems — the transitive-callee audit found their only stateful calls were
+// `alloc_user_data_frame`, `map_user_page_in_asid_raw` and `copy_to_user`, all of which are now
+// rank-local — so making that explicit cost nothing but the plumbing. The ELF parsing itself is
+// unchanged, and the private `read_*_le` readers and `KernelState::*_elf_pflags` helpers they use
+// stay exactly where they were: this is an ownership change, not a second parser.
+
+pub(crate) fn load_elf_pt_load_segments_locked(
+    vm: &mut AddressSpaceManager,
+    memory: &mut MemorySubsystem,
+    asid: Asid,
+    image: &[u8],
+) -> Result<(usize, usize, usize), KernelError> {
+    if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!(
+                "ELF_REJECT_HEADER len={} magic_ok={} class={}",
+                image.len(),
+                image.get(..4) == Some(b"\x7FELF"),
+                image.get(4).copied().unwrap_or(0)
+            );
+        }
+        return Err(KernelError::WrongObject);
+    }
+    let entry = read_u64_le(image, 24)?;
+    let phoff = read_u64_le(image, 32)? as usize;
+    let phentsize = read_u16_le(image, 54)? as usize;
+    let phnum = read_u16_le(image, 56)? as usize;
+    if phnum == 0 || phentsize < ELF64_PHDR_SIZE {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!(
+                "ELF_REJECT_PH_TABLE phnum={} phentsize={}",
+                phnum,
+                phentsize
+            );
+        }
+        return Err(KernelError::WrongObject);
+    }
+    let table_size = phnum
+        .checked_mul(phentsize)
+        .ok_or(KernelError::WrongObject)?;
+    let phend = phoff
+        .checked_add(table_size)
+        .ok_or(KernelError::WrongObject)?;
+    if phend > image.len() {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!(
+                "ELF_REJECT_PH_BOUNDS phoff={} phend={} len={}",
+                phoff,
+                phend,
+                image.len()
+            );
+        }
+        return Err(KernelError::WrongObject);
+    }
+
+    let mut max_loaded_end = 0u64;
+    let mut first_pt_load_vaddr = 0u64;
+    let mut saw_pt_load = false;
+    for idx in 0..phnum {
+        let base = phoff
+            .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+            .ok_or(KernelError::WrongObject)?;
+        let p_type = read_u32_le(image, base)?;
+        if p_type != PT_LOAD {
+            continue;
+        }
+        let _p_flags = read_u32_le(image, base + 4)?;
+        let p_offset = read_u64_le(image, base + 8)? as usize;
+        let p_vaddr = read_u64_le(image, base + 16)?;
+        let p_filesz = read_u64_le(image, base + 32)? as usize;
+        let p_memsz = read_u64_le(image, base + 40)? as usize;
+        if !saw_pt_load {
+            first_pt_load_vaddr = p_vaddr;
+        }
+        saw_pt_load = true;
+        let seg_end = p_vaddr
+            .checked_add(p_memsz as u64)
+            .ok_or(KernelError::WrongObject)?;
+        if seg_end > max_loaded_end {
+            max_loaded_end = seg_end;
+        }
+        if p_filesz > p_memsz {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                crate::yarm_log!(
+                    "ELF_REJECT_SEG_SIZE idx={} filesz={} memsz={}",
+                    idx,
+                    p_filesz,
+                    p_memsz
+                );
+            }
+            return Err(KernelError::WrongObject);
+        }
+        let file_end = p_offset
+            .checked_add(p_filesz)
+            .ok_or(KernelError::WrongObject)?;
+        if file_end > image.len() {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                crate::yarm_log!(
+                    "ELF_REJECT_FILE_BOUNDS idx={} offset={} filesz={} end={} len={}",
+                    idx,
+                    p_offset,
+                    p_filesz,
+                    file_end,
+                    image.len()
+                );
+            }
+            return Err(KernelError::WrongObject);
+        }
+
+        let page_size = PAGE_SIZE as u64;
+        let seg_start = p_vaddr;
+        let seg_end = p_vaddr
+            .checked_add(p_memsz as u64)
+            .ok_or(KernelError::WrongObject)?;
+        let page_start = seg_start & !(page_size - 1);
+        let page_end = (seg_end + page_size - 1) & !(page_size - 1);
+        let mut va = page_start;
+        while va < page_end {
+            let combined_pflags = KernelState::load_page_elf_pflags(
+                image,
+                phoff,
+                phentsize,
+                phnum,
+                va,
+                va + page_size,
+            )?;
+            let flags = KernelState::page_flags_from_elf_pflags(combined_pflags)?;
+            let existing = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
+            let phys = if let Some(entry) = existing {
+                entry.addr()
+            } else {
+                crate::kernel::boot::vm_image_locked::alloc_user_data_frame_locked(memory)?
+            };
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                crate::yarm_log!(
+                    "ELF_MAP_PAGE_BEGIN asid={} seg_vbase=0x{:x} page_va=0x{:x} phys=0x{:x} memsz={} filesz={} overlap={} pflags=0x{:x}",
+                    asid.0,
+                    p_vaddr,
+                    va,
+                    phys,
+                    p_memsz,
+                    p_filesz,
+                    existing.is_some(),
+                    combined_pflags
+                );
+            }
+            let stage_flags = KernelState::staging_page_flags_from_final(flags);
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                crate::yarm_log!(
+                    "ELF_MAP_PAGE_STAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
+                    asid.0,
+                    va,
+                    stage_flags.read,
+                    stage_flags.write,
+                    stage_flags.execute,
+                    stage_flags.user
+                );
+            }
+            crate::kernel::boot::vm_image_locked::map_user_page_in_asid_raw_locked(
+                vm,
+                memory,
+                asid,
+                VirtAddr(va),
+                Mapping {
+                    phys: PhysAddr(phys),
+                    flags: stage_flags,
+                },
+            )?;
+            #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
+            crate::yarm_log!(
+                "KSPAWN_NEW_TASK_MAP_RANGE asid={} va=0x{:x} pa=0x{:x}",
+                asid.0,
+                va,
+                phys
+            );
+            let post_map_present =
+                crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va)).is_some();
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                crate::yarm_log!(
+                    "ELF_MAP_PAGE_DONE asid={} page_va=0x{:x} post_resolve={} final_r={} final_w={} final_x={} final_u={}",
+                    asid.0,
+                    va,
+                    post_map_present,
+                    flags.read,
+                    flags.write,
+                    flags.execute,
+                    flags.user
+                );
+                if va == 0x0040_0000 {
+                    crate::yarm_log!(
+                        "ELF_MAP_PAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
+                        asid.0,
+                        va,
+                        flags.read,
+                        flags.write,
+                        flags.execute,
+                        flags.user
+                    );
+                }
+            }
+            if !post_map_present {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                    crate::yarm_log!(
+                        "ELF_MAP_PAGE_INVARIANT_FAIL asid={} page_va=0x{:x} phys=0x{:x}",
+                        asid.0,
+                        va,
+                        phys
+                    );
+                }
+                return Err(KernelError::UserMemoryFault);
+            }
+            va += page_size;
+        }
+
+        let file_bytes = &image[p_offset..file_end];
+        crate::kernel::boot::vm_image_locked::copy_to_user_locked(
+            vm,
+            memory,
+            asid,
+            VirtAddr(p_vaddr),
+            file_bytes,
+        )?;
+        if p_memsz > p_filesz {
+            let mut remaining = p_memsz - p_filesz;
+            let mut cursor = p_vaddr + p_filesz as u64;
+            let zeros = [0u8; 256];
+            while remaining > 0 {
+                let chunk = remaining.min(zeros.len());
+                crate::kernel::boot::vm_image_locked::copy_to_user_locked(
+                    vm,
+                    memory,
+                    asid,
+                    VirtAddr(cursor),
+                    &zeros[..chunk],
+                )?;
+                remaining -= chunk;
+                cursor += chunk as u64;
+            }
+        }
+    }
+    if !saw_pt_load {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!("ELF_REJECT_NO_PT_LOAD");
+        }
+        return Err(KernelError::WrongObject);
+    }
+    for idx in 0..phnum {
+        let base = phoff
+            .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+            .ok_or(KernelError::WrongObject)?;
+        let p_type = read_u32_le(image, base)?;
+        if p_type != PT_LOAD {
+            continue;
+        }
+        let p_vaddr = read_u64_le(image, base + 16)?;
+        let p_memsz = read_u64_le(image, base + 40)? as usize;
+        let page_size = PAGE_SIZE as u64;
+        let seg_end = p_vaddr
+            .checked_add(p_memsz as u64)
+            .ok_or(KernelError::WrongObject)?;
+        let page_start = p_vaddr & !(page_size - 1);
+        let page_end = (seg_end + page_size - 1) & !(page_size - 1);
+        let mut va = page_start;
+        while va < page_end {
+            let combined_pflags = KernelState::load_page_elf_pflags(
+                image,
+                phoff,
+                phentsize,
+                phnum,
+                va,
+                va + page_size,
+            )?;
+            let final_flags = KernelState::page_flags_from_elf_pflags(combined_pflags)?;
+            let phys = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
+                .ok_or(KernelError::UserMemoryFault)?
+                .addr();
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                crate::yarm_log!(
+                    "ELF_FINALIZE_PAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
+                    asid.0,
+                    va,
+                    final_flags.read,
+                    final_flags.write,
+                    final_flags.execute,
+                    final_flags.user
+                );
+            }
+            crate::kernel::boot::vm_image_locked::map_user_page_in_asid_raw_locked(
+                vm,
+                memory,
+                asid,
+                VirtAddr(va),
+                Mapping {
+                    phys: PhysAddr(phys),
+                    flags: final_flags,
+                },
+            )?;
+            va += page_size;
+        }
+    }
+    let page_size = PAGE_SIZE as u64;
+    let heap_base = max_loaded_end
+        .checked_add(page_size - 1)
+        .ok_or(KernelError::WrongObject)?
+        & !(page_size - 1);
+    Ok((
+        entry as usize,
+        first_pt_load_vaddr as usize,
+        heap_base as usize,
+    ))
+}
+
+/// ELF loader for `SpawnFromMemoryObject` (Phase 3A syscall nr=29).
+///
+/// Attempts zero-copy mapping of read-only, page-aligned file pages directly
+/// from the initrd physical backing.  Falls back to alloc+copy for:
+///  - Writable segments
+///  - Pages that cross file/BSS boundary
+///  - Any segment whose file data is NOT page-aligned within the initrd
+///    (typical for CPIO archives without explicit alignment)
+///
+/// `image_id` is used only for diagnostic logging.
+///
+/// Returns `(entry, first_pt_load_vaddr, heap_base, zc_pages, copied_pages)`.
+pub(crate) fn load_elf_with_mo_zero_copy_locked(
+    vm: &mut AddressSpaceManager,
+    memory: &mut MemorySubsystem,
+    image_id: u64,
+    asid: Asid,
+    image: &[u8],
+    initrd_phys_base: u64,
+    file_initrd_offset: u64,
+) -> Result<(usize, usize, usize, usize, usize), KernelError> {
+    // Determine zero-copy feasibility: file data must start on a page boundary
+    // within the initrd physical region for any page to be directly mappable.
+    let page_size = PAGE_SIZE as u64;
+    let file_phys_start = initrd_phys_base.saturating_add(file_initrd_offset);
+    let offset_in_page = file_phys_start & (page_size - 1);
+    let zc_feasible = offset_in_page == 0;
+
+    crate::yarm_log!(
+        "ZC_FEASIBILITY image_id={} initrd_phys=0x{:x} file_off=0x{:x} \
+         file_phys=0x{:x} offset_in_page={} feasible={}",
+        image_id,
+        initrd_phys_base,
+        file_initrd_offset,
+        file_phys_start,
+        offset_in_page,
+        zc_feasible
+    );
+
+    if !zc_feasible {
+        // CPIO file data is not page-aligned — use existing copy-based loader.
+        // zc_pages = 0; copied_pages = total page slots in PT_LOAD segments.
+        let copied_pages = KernelState::count_elf_load_pages(image).unwrap_or(0);
+        crate::yarm_log!(
+            "ZC_FALLBACK image_id={} reason=cpio_file_data_unaligned copied_pages={}",
+            image_id,
+            copied_pages
+        );
+        let (entry, first, heap) = load_elf_pt_load_segments_locked(vm, memory, asid, image)?;
+        return Ok((entry, first, heap, 0, copied_pages));
+    }
+
+    // File data IS page-aligned in the initrd.  Perform per-page ZC decision.
+    // For each PT_LOAD page:
+    //   - Non-writable && fully within file && page-aligned phys → map RO from initrd
+    //   - Everything else → alloc anon frame + copy (writable, BSS, partial pages)
+    if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
+        return Err(KernelError::WrongObject);
+    }
+    let entry = read_u64_le(image, 24)?;
+    let phoff = read_u64_le(image, 32)? as usize;
+    let phentsize = read_u16_le(image, 54)? as usize;
+    let phnum = read_u16_le(image, 56)? as usize;
+    if phnum == 0 || phentsize < ELF64_PHDR_SIZE {
+        return Err(KernelError::WrongObject);
+    }
+    let table_size = phnum
+        .checked_mul(phentsize)
+        .ok_or(KernelError::WrongObject)?;
+    let phend = phoff
+        .checked_add(table_size)
+        .ok_or(KernelError::WrongObject)?;
+    if phend > image.len() {
+        return Err(KernelError::WrongObject);
+    }
+
+    let mut max_loaded_end = 0u64;
+    let mut first_pt_load_vaddr = 0u64;
+    let mut saw_pt_load = false;
+    let mut zc_pages = 0usize;
+    let mut copied_pages = 0usize;
+    let mut seg_load_idx = 0usize;
+
+    // First pass: allocate physical pages and map (staging flags for copy pages).
+    for idx in 0..phnum {
+        let base = phoff
+            .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+            .ok_or(KernelError::WrongObject)?;
+        let p_type = read_u32_le(image, base)?;
+        if p_type != PT_LOAD {
+            continue;
+        }
+        let p_flags_raw = read_u32_le(image, base + 4)?;
+        let p_offset = read_u64_le(image, base + 8)? as usize;
+        let p_vaddr = read_u64_le(image, base + 16)?;
+        let p_filesz = read_u64_le(image, base + 32)? as usize;
+        let p_memsz = read_u64_le(image, base + 40)? as usize;
+        let seg_idx = seg_load_idx;
+        seg_load_idx += 1;
+        if !saw_pt_load {
+            first_pt_load_vaddr = p_vaddr;
+        }
+        saw_pt_load = true;
+        let seg_end = p_vaddr
+            .checked_add(p_memsz as u64)
+            .ok_or(KernelError::WrongObject)?;
+        if seg_end > max_loaded_end {
+            max_loaded_end = seg_end;
+        }
+        if p_filesz > p_memsz {
+            return Err(KernelError::WrongObject);
+        }
+        let file_end = p_offset
+            .checked_add(p_filesz)
+            .ok_or(KernelError::WrongObject)?;
+        if file_end > image.len() {
+            return Err(KernelError::WrongObject);
+        }
+        let seg_start = p_vaddr;
+        let page_start = seg_start & !(page_size - 1);
+        let page_end_va = (seg_end + page_size - 1) & !(page_size - 1);
+        let p_offset_page = p_offset as u64 & !(page_size - 1);
+        let p_vaddr_page = p_vaddr & !(page_size - 1);
+
+        crate::yarm_log!(
+            "ZC_SEG_BEGIN image_id={} seg={} p_offset=0x{:x} p_vaddr=0x{:x} \
+             p_filesz={} p_memsz={} p_flags=0x{:x} file_data_phys=0x{:x} \
+             offset_in_page={}",
+            image_id,
+            seg_idx,
+            p_offset,
+            p_vaddr,
+            p_filesz,
+            p_memsz,
+            p_flags_raw,
+            file_phys_start,
+            file_phys_start & (page_size - 1)
+        );
+
+        let mut seg_zc = 0usize;
+        let mut seg_copied = 0usize;
+
+        let mut va = page_start;
+        while va < page_end_va {
+            let combined_pflags = KernelState::load_page_elf_pflags(
+                image,
+                phoff,
+                phentsize,
+                phnum,
+                va,
+                va + page_size,
+            )?;
+            // Detect WX before calling page_flags_from_elf_pflags so we can log the reason.
+            if (combined_pflags & PF_W) != 0 && (combined_pflags & PF_X) != 0 {
+                crate::yarm_log!(
+                    "ZC_PAGE image_id={} seg={} va=0x{:x} src_phys=0x0 \
+                     reason=wx_rejected pflags=0x{:x}",
+                    image_id,
+                    seg_idx,
+                    va,
+                    combined_pflags
+                );
+                return Err(KernelError::WrongObject);
+            }
+            let flags = KernelState::page_flags_from_elf_pflags(combined_pflags)?;
+            // ELF file page index within this segment.
+            let page_idx = (va - p_vaddr_page) / page_size;
+            let elf_file_page_start = p_offset_page + page_idx * page_size;
+            // Page is fully in file data if all bytes in [va, va+PAGE_SIZE)
+            // fall within [p_vaddr, p_vaddr+p_filesz).
+            let page_fully_in_file = va >= p_vaddr
+                && p_filesz > 0
+                && va.saturating_add(page_size) <= p_vaddr.saturating_add(p_filesz as u64);
+            // Zero-copy eligibility: RO, fully-in-file, page-aligned phys.
+            let initrd_phys_of_page = file_phys_start.saturating_add(elf_file_page_start);
+            let can_zc =
+                !flags.write && page_fully_in_file && (initrd_phys_of_page & (page_size - 1)) == 0;
+
+            // Determine diagnostic reason for the page decision.
+            let reason = if can_zc {
+                "full_page_zc_ok"
+            } else if flags.write {
+                "writable_segment_copy"
+            } else if va < p_vaddr {
+                "partial_head_copy"
+            } else if p_filesz == 0 || va >= p_vaddr.saturating_add(p_filesz as u64) {
+                "bss_copy"
+            } else if va.saturating_add(page_size) > p_vaddr.saturating_add(p_filesz as u64) {
+                "partial_tail_copy"
+            } else {
+                // page_fully_in_file is true but initrd_phys_of_page is misaligned;
+                // can only occur if file_phys_start alignment changed mid-computation.
+                "elf_offset_unaligned"
+            };
+
+            crate::yarm_log!(
+                "ZC_PAGE image_id={} seg={} va=0x{:x} src_phys=0x{:x} reason={}",
+                image_id,
+                seg_idx,
+                va,
+                initrd_phys_of_page,
+                reason
+            );
+
+            let existing = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
+            if existing.is_some() {
+                // Page already mapped by an earlier overlapping segment — skip.
+            } else if can_zc {
+                // Zero-copy: map the initrd physical page directly (RO final flags).
+                crate::kernel::boot::vm_image_locked::map_user_page_in_asid_raw_locked(
+                    vm,
+                    memory,
+                    asid,
+                    VirtAddr(va),
+                    Mapping {
+                        phys: PhysAddr(initrd_phys_of_page),
+                        flags,
+                    },
+                )?;
+                zc_pages += 1;
+                seg_zc += 1;
+            } else {
+                // Copy: alloc anonymous frame, map with staging RW flags.
+                let phys =
+                    crate::kernel::boot::vm_image_locked::alloc_user_data_frame_locked(memory)?;
+                let stage_flags = KernelState::staging_page_flags_from_final(flags);
+                crate::kernel::boot::vm_image_locked::map_user_page_in_asid_raw_locked(
+                    vm,
+                    memory,
+                    asid,
+                    VirtAddr(va),
+                    Mapping {
+                        phys: PhysAddr(phys),
+                        flags: stage_flags,
+                    },
+                )?;
+                copied_pages += 1;
+                seg_copied += 1;
+            }
+            va += page_size;
+        }
+
+        crate::yarm_log!(
+            "ZC_SEG_DONE image_id={} seg={} p_vaddr=0x{:x} p_flags=0x{:x} \
+             zc_pages={} copied_pages={}",
+            image_id,
+            seg_idx,
+            p_vaddr,
+            p_flags_raw,
+            seg_zc,
+            seg_copied
+        );
+
+        // Copy ELF file bytes into non-ZC pages only.
+        // Iterate page by page to skip ZC pages (which are already correct and RO).
+        let mut va = page_start;
+        while va < page_end_va {
+            // Determine ZC status for this page.
+            let page_idx = (va - p_vaddr_page) / page_size;
+            let elf_file_page_start = p_offset_page + page_idx * page_size;
+            let combined_pflags = KernelState::load_page_elf_pflags(
+                image,
+                phoff,
+                phentsize,
+                phnum,
+                va,
+                va + page_size,
+            )?;
+            let flags = KernelState::page_flags_from_elf_pflags(combined_pflags)?;
+            let page_fully_in_file = va >= p_vaddr
+                && p_filesz > 0
+                && va.saturating_add(page_size) <= p_vaddr.saturating_add(p_filesz as u64);
+            let initrd_phys_of_page = file_phys_start.saturating_add(elf_file_page_start);
+            let can_zc =
+                !flags.write && page_fully_in_file && (initrd_phys_of_page & (page_size - 1)) == 0;
+
+            if !can_zc {
+                // Copy file bytes into this page.
+                // Clamp the file range to what falls within this page's VA.
+                let copy_va_start = core::cmp::max(va, p_vaddr);
+                let copy_va_end = core::cmp::min(va + page_size, p_vaddr + p_filesz as u64);
+                if copy_va_start < copy_va_end {
+                    let copy_len = (copy_va_end - copy_va_start) as usize;
+                    let file_off = (copy_va_start - p_vaddr) as usize + p_offset;
+                    crate::kernel::boot::vm_image_locked::copy_to_user_locked(
+                        vm,
+                        memory,
+                        asid,
+                        VirtAddr(copy_va_start),
+                        &image[file_off..file_off + copy_len],
+                    )?;
+                }
+                // Zero BSS portion of this page.
+                let bss_va_start = core::cmp::max(va, p_vaddr + p_filesz as u64);
+                let bss_va_end = core::cmp::min(va + page_size, p_vaddr + p_memsz as u64);
+                if bss_va_start < bss_va_end {
+                    let bss_len = (bss_va_end - bss_va_start) as usize;
+                    let zeros = [0u8; 256];
+                    let mut remaining = bss_len;
+                    let mut cursor = bss_va_start;
+                    while remaining > 0 {
+                        let chunk = remaining.min(zeros.len());
+                        crate::kernel::boot::vm_image_locked::copy_to_user_locked(
+                            vm,
+                            memory,
+                            asid,
+                            VirtAddr(cursor),
+                            &zeros[..chunk],
+                        )?;
+                        remaining -= chunk;
+                        cursor += chunk as u64;
+                    }
+                }
+            }
+            va += page_size;
+        }
+    }
+
+    if !saw_pt_load {
+        return Err(KernelError::WrongObject);
+    }
+
+    // Second pass: enforce final permissions on copy pages.
+    // ZC pages already have final flags from the first pass.
+    for idx in 0..phnum {
+        let base = phoff
+            .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+            .ok_or(KernelError::WrongObject)?;
+        if read_u32_le(image, base)? != PT_LOAD {
+            continue;
+        }
+        let p_vaddr = read_u64_le(image, base + 16)?;
+        let p_memsz = read_u64_le(image, base + 40)?;
+        let seg_end = p_vaddr
+            .checked_add(p_memsz)
+            .ok_or(KernelError::WrongObject)?;
+        let page_start = p_vaddr & !(page_size - 1);
+        let page_end_va = (seg_end + page_size - 1) & !(page_size - 1);
+        let mut va = page_start;
+        while va < page_end_va {
+            let combined_pflags = KernelState::load_page_elf_pflags(
+                image,
+                phoff,
+                phentsize,
+                phnum,
+                va,
+                va + page_size,
+            )?;
+            let final_flags = KernelState::page_flags_from_elf_pflags(combined_pflags)?;
+            let phys = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
+                .ok_or(KernelError::UserMemoryFault)?
+                .addr();
+            crate::kernel::boot::vm_image_locked::map_user_page_in_asid_raw_locked(
+                vm,
+                memory,
+                asid,
+                VirtAddr(va),
+                Mapping {
+                    phys: PhysAddr(phys),
+                    flags: final_flags,
+                },
+            )?;
+            va += page_size;
+        }
+    }
+
+    let heap_base = max_loaded_end
+        .checked_add(page_size - 1)
+        .ok_or(KernelError::WrongObject)?
+        & !(page_size - 1);
+
+    Ok((
+        entry as usize,
+        first_pt_load_vaddr as usize,
+        heap_base as usize,
+        zc_pages,
+        copied_pages,
+    ))
+}
+
+/// U9-SPAWN-TXN §3 — everything the publication writes into the child's TCB, as one value.
+///
+/// Passed by reference rather than reached through `&mut KernelState`, which is what lets the
+/// publication be rank-local: the owner needs the TCB storage and these facts, and nothing else.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpawnedImagePublication {
+    pub(crate) tid: u64,
+    pub(crate) class: crate::kernel::task::TaskClass,
+    pub(crate) asid: Asid,
+    pub(crate) entry: usize,
+    pub(crate) stack_top: VirtAddr,
+    pub(crate) startup_stack_ptr: usize,
+    pub(crate) startup_slots_start: usize,
+    pub(crate) startup_slots_len: usize,
+    pub(crate) startup_args: [u64; 18],
+}
+
+/// U9-SPAWN-TXN2 §3 — THE spawn ASID binding, under task rank 2 and nothing else.
+///
+/// Binding `tcb.asid` is the step that makes an address space *attributable* to a task, which is
+/// what `live_cpu_bitmap_for_asid` consults to decide whether a teardown owes a TLB shootdown and
+/// what the spawn ledger's address-space arm consults to decide between the never-resident and
+/// the live teardown. It was an inline `with_tcbs_mut` closure inside `spawn_image_after_claim`;
+/// as a named owner it can be reached identically by the broad and split adapters, and the
+/// ledger's "is this ASID still carried by a TCB?" question has exactly one answer to invert.
+///
+/// Fallible only in the "no such TID" direction, and that check happens before the write, so a
+/// refusal leaves the TCB byte-for-byte unchanged.
+pub(crate) fn bind_spawned_task_asid_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+    asid: Asid,
+) -> Result<(), KernelError> {
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|tcb| tcb.tid.0 == tid)
+        .ok_or(KernelError::TaskMissing)?;
+    tcb.asid = Some(asid);
+    Ok(())
+}
+
+/// THE spawn publication owner: task rank 2, one acquisition, all or nothing.
+///
+/// The second of the two publication-phase owners the U9-SPAWN2 seven-phase table never listed.
+/// It takes the TCB storage and a `SpawnedImagePublication` and reaches nothing else.
+///
+/// # Order, and why the commit cannot fail here
+///
+/// 1. **Validate.** `validate_commit_ready` runs the EXACT checks `commit_live_spawn` makes —
+///    through the same `resolve` authority, not a copy — while the TCB is still untouched. Exact
+///    TID, `Reserved` status, a present reservation record, matching generation, class and
+///    process, and phase `Spawning`. A refusal here writes nothing.
+/// 2. **Install** the thread group, ASID, entry, stack top, the full initial user register
+///    context and the bootstrap CPU pin.
+/// 3. **Commit** `Spawning -> LiveSpawned`, the single step that makes the task `Runnable` and
+///    clears the reservation record so its token can never be consumed again.
+///
+/// Step 3 re-validates and therefore *could* refuse in principle — but it cannot here: step 1
+/// checked every one of those conditions, and the task lock is held across all three, so no other
+/// CPU can move the reservation in between. That is why this needs no undo for step 2, and why it
+/// had to become one acquisition to be safe: as two, a commit refusal left a fully published user
+/// context on a task that never became runnable.
+///
+/// The child is still not scheduler-visible when this returns. The enqueue is rank 1, separate,
+/// and last.
+pub(crate) fn publish_spawned_image_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    reservation: &crate::kernel::spawn_reservation::SpawnReservationToken,
+    publication: &SpawnedImagePublication,
+) -> Result<(), crate::kernel::spawn_reservation::ReservationRefusal> {
+    // ── 1. Validate, before a single field is written. ──────────────────────────────────
+    crate::kernel::spawn_reservation::validate_commit_ready(tcbs, reservation)?;
+
+    // ── 2. Install. `resolve` already proved this TCB exists and is the right incarnation. ──
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|tcb| tcb.tid.0 == publication.tid)
+        .ok_or(crate::kernel::spawn_reservation::ReservationRefusal::TaskMissing)?;
+    tcb.thread_group_id = ThreadGroupId(publication.tid);
+    tcb.asid = Some(publication.asid);
+    tcb.user_entry = Some(VirtAddr(publication.entry as u64));
+    tcb.user_stack_top = Some(publication.stack_top);
+    tcb.user_context = UserRegisterContext {
+        instruction_ptr: VirtAddr(publication.entry as u64),
+        stack_ptr: VirtAddr(publication.startup_stack_ptr as u64),
+        user_gprs: [0; 32],
+        // Startup entry ABI args:
+        //   arg0 => task_id / tid
+        //   arg1 => process-manager request-send cap
+        //   arg2 => process-manager reply-recv cap
+        arg0: publication.startup_args[0] as usize,
+        arg1: publication.startup_args[1] as usize,
+        arg2: publication.startup_args[2] as usize,
+        // Extended startup delivery ABI:
+        //   arg3 => pointer to [u64; 18] startup slot block in userspace memory
+        //   arg4 => startup slot count
+        //   arg5 => reserved (0)
+        arg3: publication.startup_slots_start,
+        arg4: publication.startup_slots_len,
+        arg5: 0,
+    };
+    crate::yarm_log!(
+        "USER_INITIAL_CONTEXT tid={} pc=0x{:016x} sp=0x{:016x} arg0=0x{:016x} arg1=0x{:016x} gpr29=0x{:016x} gpr30=0x{:016x} ctx_ptr=0x{:x}",
+        publication.tid,
+        tcb.user_context.instruction_ptr.0,
+        tcb.user_context.stack_ptr.0,
+        tcb.user_context.arg0 as u64,
+        tcb.user_context.arg1 as u64,
+        tcb.user_context.user_gprs[29] as u64,
+        tcb.user_context.user_gprs[30] as u64,
+        &tcb.user_context as *const _ as usize
+    );
+    if matches!(
+        publication.class,
+        crate::kernel::task::TaskClass::SystemServer
+    ) || publication.tid == BOOTSTRAP_FIRST_USER_TID
+    {
+        tcb.cpu_affinity = Some(CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID));
+    }
+
+    // ── 3. Commit. Step 1 proved every condition this re-checks. ────────────────────────
+    crate::kernel::spawn_reservation::commit_live_spawn(tcbs, reservation)
 }
 
 #[cfg(test)]

@@ -190,7 +190,7 @@ pub(super) fn handle_spawn_process(
         );
     }
     let committed = spawn_image_txn::run_image_spawn_transaction(
-        kernel,
+        &mut super::spawn_txn::BroadSpawnOwners { kernel },
         spawn_image_txn::SpawnImageRequest {
             image_id,
             image_path,
@@ -279,7 +279,7 @@ impl<'a, const N: usize> Drop for StagingBufferClaim<'a, N> {
     }
 }
 
-fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
+pub(crate) fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
     match image_id {
         0 => Some("init"),
         1 => Some("sbin/supervisor"),
@@ -325,7 +325,20 @@ fn normalized_startup_args(
     startup_args_ptr: usize,
     startup_args_count: usize,
 ) -> Result<([u64; UserImageSpec::DEFAULT_STARTUP_ARGS.len()], [u64; 4]), SyscallError> {
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    let startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    Ok(normalize_startup_args(startup_args))
+}
+
+/// U9-SPAWN-TXN3 §4 — THE startup-args normalisation, stated once.
+///
+/// Slots 2, 12 and 13..=16 are KERNEL-owned: the spawn fills them with the capabilities it
+/// delegates into the child, so whatever userspace put there is first harvested (13..=16 become
+/// the requested extra send caps) and then zeroed. Both the broad handler and the pre-lock route
+/// call this, so a route cannot accidentally let a caller-supplied value survive into a slot the
+/// kernel is about to write.
+pub(crate) fn normalize_startup_args(
+    mut startup_args: [u64; UserImageSpec::DEFAULT_STARTUP_ARGS.len()],
+) -> ([u64; UserImageSpec::DEFAULT_STARTUP_ARGS.len()], [u64; 4]) {
     startup_args[2] = 0;
     let extra_send_caps = [
         startup_args[13],
@@ -338,7 +351,46 @@ fn normalized_startup_args(
     startup_args[14] = 0;
     startup_args[15] = 0;
     startup_args[16] = 0;
-    Ok((startup_args, extra_send_caps))
+    (startup_args, extra_send_caps)
+}
+
+/// U9-SPAWN-TXN3 §4 — THE startup-args admission, before any user memory is read.
+///
+/// `Ok(None)` means "no array supplied, use the defaults". `Ok(Some(byte_len))` is how many bytes
+/// the caller must read. Pure, so the pre-lock route applies the identical bounds without a
+/// second copy of them.
+pub(crate) fn plan_spawn_startup_args(
+    startup_args_ptr: usize,
+    startup_args_count: usize,
+) -> Result<Option<usize>, SyscallError> {
+    if startup_args_count == 0 {
+        return Ok(None);
+    }
+    if startup_args_count > UserImageSpec::DEFAULT_STARTUP_ARGS.len() || startup_args_ptr == 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let byte_len = startup_args_count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(SyscallError::InvalidArgs)?;
+    validate_user_region(startup_args_ptr as u64, byte_len as u64)?;
+    Ok(Some(byte_len))
+}
+
+/// U9-SPAWN-TXN3 §4 — THE startup-args decode: little-endian words into the 18-slot array.
+pub(crate) fn decode_spawn_startup_args_into(
+    out: &mut [u64; UserImageSpec::DEFAULT_STARTUP_ARGS.len()],
+    slot_idx: &mut usize,
+    bytes: &[u8],
+) {
+    for chunk in bytes.chunks_exact(core::mem::size_of::<u64>()) {
+        if *slot_idx >= out.len() {
+            break;
+        }
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        out[*slot_idx] = u64::from_le_bytes(word);
+        *slot_idx += 1;
+    }
 }
 
 fn copy_spawn_startup_args(
@@ -347,16 +399,9 @@ fn copy_spawn_startup_args(
     startup_args_count: usize,
 ) -> Result<[u64; UserImageSpec::DEFAULT_STARTUP_ARGS.len()], SyscallError> {
     let mut out = UserImageSpec::DEFAULT_STARTUP_ARGS;
-    if startup_args_count == 0 {
+    let Some(byte_len) = plan_spawn_startup_args(startup_args_ptr, startup_args_count)? else {
         return Ok(out);
-    }
-    if startup_args_count > out.len() || startup_args_ptr == 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    let byte_len = startup_args_count
-        .checked_mul(core::mem::size_of::<u64>())
-        .ok_or(SyscallError::InvalidArgs)?;
-    validate_user_region(startup_args_ptr as u64, byte_len as u64)?;
+    };
     // copy_from_current_user is limited to Message::MAX_PAYLOAD (128 bytes) per call.
     // Read in chunks so that larger startup_args arrays (e.g. 18 * 8 = 144 bytes) work.
     let mut slot_idx = 0usize;
@@ -367,15 +412,7 @@ fn copy_spawn_startup_args(
         let payload = kernel
             .copy_from_current_user(ptr, chunk_bytes)
             .map_err(SyscallError::from)?;
-        for chunk in payload[..chunk_bytes].chunks_exact(core::mem::size_of::<u64>()) {
-            if slot_idx >= out.len() {
-                break;
-            }
-            let mut word = [0u8; 8];
-            word.copy_from_slice(chunk);
-            out[slot_idx] = u64::from_le_bytes(word);
-            slot_idx += 1;
-        }
+        decode_spawn_startup_args_into(&mut out, &mut slot_idx, &payload[..chunk_bytes]);
         ptr = ptr
             .checked_add(chunk_bytes)
             .ok_or(SyscallError::InvalidArgs)?;
@@ -567,7 +604,7 @@ pub(super) fn handle_spawn_from_memory_object(
     };
 
     let committed = spawn_image_txn::run_image_spawn_transaction(
-        kernel,
+        &mut super::spawn_txn::BroadSpawnOwners { kernel },
         spawn_image_txn::SpawnImageRequest {
             image_id,
             image_path,

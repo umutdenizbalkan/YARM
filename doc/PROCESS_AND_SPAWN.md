@@ -84,6 +84,109 @@ no boot ever dispatched it, and the earlier claim in this file and in
 that function calls `nr=24`. The number stays unassigned and is **not**
 reusable; invoking it returns `InvalidNumber` pre-lock.
 
+### The service endpoints and the parent delegation (U9-SPAWN-IC1)
+
+After the image, the shared transaction creates two service endpoints and
+delegates one capability to the parent. Both are rank-local transactions now.
+
+**Each endpoint and its two capabilities are one transaction.**
+`provision_service_endpoint_locked` (`src/kernel/boot/spawn_ipc_cap_txn.rs`)
+holds IPC rank 3 and capability rank 4 together — the legal order — and
+validates the target CNode, installs the incarnation `(index, generation)`,
+mints its `SEND` and `RECEIVE` capabilities, and returns a token naming all of
+it. A failure restores the endpoint slot and puts the generation back before
+releasing either owner. Before this, the endpoint was installed under rank 3,
+rank 3 was released, and a failing mint returned with the endpoint stranded.
+
+The token carries the GENERATION, not just the index: endpoint slots are
+recycled, and a rollback naming only an index could destroy a replacement
+endpoint. `remove_unpublished_endpoint_locked` refuses unless the incarnation
+still matches and the endpoint is still unpublished — no waiting receiver, no
+parked sender, no IRQ route. A published endpoint belongs to `destroy_endpoint`,
+which wakes and settles what it strands and needs ranks the rank-local body does
+not hold.
+
+**The parent delegation** goes through `delegate_capability`, which snapshots
+both cnodes at task rank 2, checks the object's liveness at IPC rank 3, and then
+runs a capability-only rank-4 body that re-validates both cspaces and the source
+object under the lock and mints exactly the rights intersection. It returns a
+rollback token naming the destination cspace, the capability and the object it
+carries; releasing it refuses unless that slot still holds that exact object, so
+a stale rollback cannot revoke an unrelated recycled capability.
+
+Both grants are recorded in the spawn ledger and released in reverse acquisition
+order: the delegation first, then each endpoint grant (capabilities before the
+incarnation).
+
+---
+
+### The image provisioner (U9-SPAWN-VM1)
+
+Both surviving image-loading spawns — `SpawnProcess` (`nr=23`) and
+`SpawnFromMemoryObject` (`nr=29`) — run the same transaction
+(`src/kernel/syscall/spawn_image_txn.rs`), and its address-space, image and
+user-stack phases are one owner:
+`KernelState::provision_spawn_image` in
+`src/kernel/boot/spawn_image_provision.rs`.
+
+Its phases, in order:
+
+1. **plan** — validate the ELF and compute its PT_LOAD extents. Pure: no kernel
+   state is touched, so a malformed image is refused before anything exists to
+   unwind. Admission is exactly the loader's own gate, plus a refusal of any
+   segment extent reaching into kernel space.
+2. **address space** — create the ASID and mint the MAP/READ/WRITE capability
+   naming it, into the CALLER's cspace.
+3. **load** — the image-source adapter. This is the ONLY axis `nr=23` and
+   `nr=29` differ on: `nr=23` stages PT_LOAD segments from a kernel-side slice
+   with the entry from its own parsed header; `nr=29` uses the initramfs
+   zero-copy grant loader, which reports the entry itself.
+4. **initrd window** — `nr=23` only, for `initramfs_srv`. Failure is tolerated:
+   the server falls back to its syscall bridge.
+5. **stack** — the child's user stack and guard page, in that same address
+   space. This is why it happens here rather than in the commit: a stack
+   allocated inside the commit could not be rolled back.
+6. **token** — the ASID, its capability, the entry, the stack top, and the
+   zero-copy/copied page counts.
+
+U9-SPAWN-VM2 split that into a rank-local body and a broad wrapper. The body
+(`provision_image_locked` in the same file) takes only `&mut AddressSpaceManager`
+(VM, rank 5) and `&mut MemorySubsystem` (rank 6), so it cannot reach a task, the
+scheduler, IPC, capabilities or the current CPU — it was handed none of them. The
+bodies it calls live in `src/kernel/boot/vm_image_locked.rs`, and the broad
+`KernelState` methods that used to hold them now delegate there, so the broad path
+and the rank-local path run the same instructions.
+
+The capability is published OUTSIDE that: the body returns a capability-free
+token, the wrapper releases both locks, mints the address-space capability, and on
+a mint failure reacquires and rolls the exact token back while propagating the
+mint's own error. No capability operation happens while VM or memory is held.
+
+On any failure from phase 3 on, the rollback destroys the address space, which
+returns everything mapped into it. One destroy drains
+every mapping installed in the ASID — segments, grants, the initrd window, the
+stack and its guard page — so no unmapping or frame-freeing policy is stated
+twice. No TLB shootdown is owed: the child is `ReservedUnstarted` and its ASID
+is bound to a TCB only by the commit, so it is never CPU-resident while the
+provisioning is in flight.
+
+The commit (`spawn_image_after_claim`) consumes the provisioned stack through
+`UserImageSpec::provisioned_stack_top`. A caller that did not provision one —
+the architecture bring-up sites — leaves it `None` and the commit allocates the
+stack itself, as before.
+
+One line per provisioning appears in the boot log:
+
+```
+SPAWN_IMAGE_PROVISIONED tid=… path=… asid=… entry=0x… stack_top=0x… \
+    first_vaddr=0x… end=0x… zc_pages=… copied_pages=…
+```
+
+A default boot emits eight: three for `nr=23` (`initramfs_srv`, `devfs_srv`,
+`vfs_server`) and five for `nr=29`.
+
+---
+
 Image IDs 7–12 are **frozen** (see `doc/KERNEL_UNLOCKING.md` §3).
 
 ---
