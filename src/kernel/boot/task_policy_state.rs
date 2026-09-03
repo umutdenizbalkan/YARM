@@ -119,21 +119,37 @@ impl KernelState {
         let cnode = cnode_grant.cnode;
         // Monotonic, never derived from the TID: a token for an earlier occupant of this numeric
         // TID cannot match this reservation.
-        let generation = self.spawn_reservation_generation;
-        self.spawn_reservation_generation = self.spawn_reservation_generation.saturating_add(1);
+        //
+        // U9-SPAWN-TXN §3: taken under the task lock. It was a bare read-modify-write on a
+        // `KernelState` field with no domain, serialized only by the broad lock — so two
+        // reservations racing off-lock could have been stamped with the same generation, and the
+        // whole point of the counter is that they cannot be.
+        let generation = self.with_task_spawn_generation_mut(|_tcbs, generation| {
+            let issued = *generation;
+            *generation = generation.saturating_add(1);
+            issued
+        });
         let reservation = crate::kernel::task::SpawnReservation {
             generation,
             class,
             process_pid,
             phase: crate::kernel::task::SpawnPhase::ReservedUnstarted,
         };
-        let inserted_idx = self.with_tcbs_mut(|tcbs| {
-            if let Some(idx) = tcbs.iter().position(|slot| slot.is_none()) {
-                tcbs[idx] = Some(ThreadControlBlock::reserved(ThreadId(tid), reservation));
-                Some(idx)
-            } else {
-                None
-            }
+        // U9-SPAWN-TXN §3: the TCB slot and its class entry go in under ONE task-domain
+        // acquisition, through the seam U9-SPAWN1 SP-1 established for exactly this pair.
+        //
+        // They used to be a `with_tcbs_mut` followed by a bare
+        // `kernel_mut(&mut self.task_classes)[idx] = ..` — a write to task-domain state performed
+        // with NO lock held. Under the broad lock that was serialized by the broad lock; it is
+        // not serialized by anything else, so any off-lock path touching the class table would
+        // have raced it. This is a lock-domain assignment, not a policy change: `task_classes`
+        // already belongs to the task domain (`KernelState::task_class` reads it from inside
+        // `with_tcbs`), and the seam that owns both fields already exists.
+        let inserted_idx = self.with_task_enqueue_policy_mut(|tcbs, classes| {
+            let idx = tcbs.iter().position(|slot| slot.is_none())?;
+            tcbs[idx] = Some(ThreadControlBlock::reserved(ThreadId(tid), reservation));
+            classes[idx] = Some(class);
+            Some(idx)
         });
         let Some(inserted_idx) = inserted_idx else {
             // U9-SPAWN2 §2: the CNode transaction happened; this reservation did not. Release
@@ -141,12 +157,11 @@ impl KernelState {
             self.release_process_cnode_grant(&cnode_request, &cnode_grant);
             return Err(KernelError::TaskTableFull);
         };
-        super::kernel_mut(&mut self.task_classes)[inserted_idx] = Some(class);
         if let Err(err) = self.provision_default_kernel_context(tid) {
-            self.with_tcbs_mut(|tcbs| {
-                crate::kernel::spawn_reservation::clear_reservation_slot(tcbs, inserted_idx)
+            self.with_task_enqueue_policy_mut(|tcbs, classes| {
+                crate::kernel::spawn_reservation::clear_reservation_slot(tcbs, inserted_idx);
+                classes[inserted_idx] = None;
             });
-            super::kernel_mut(&mut self.task_classes)[inserted_idx] = None;
             self.release_process_cnode_grant(&cnode_request, &cnode_grant);
             return Err(err);
         }
@@ -207,10 +222,12 @@ impl KernelState {
         // Release the kernel context BEFORE the slot goes away: the existing primitive resolves
         // the task by TID and would find nothing afterwards.
         let _ = self.release_kernel_context(tid);
-        self.with_tcbs_mut(|tcbs| {
-            crate::kernel::spawn_reservation::clear_reservation_slot(tcbs, index)
+        // U9-SPAWN-TXN §3: slot and class cleared together, under the seam that owns both —
+        // the exact inverse of the paired insert above, and no longer a lockless class write.
+        self.with_task_enqueue_policy_mut(|tcbs, classes| {
+            crate::kernel::spawn_reservation::clear_reservation_slot(tcbs, index);
+            classes[index] = None;
         });
-        super::kernel_mut(&mut self.task_classes)[index] = None;
         let cnode_reaped = self.maybe_cleanup_process_cnode_for_pid_noalloc_reap(process_pid);
         crate::yarm_log!(
             "SPAWN_RESERVATION_CANCELLED tid={} generation={} pid={} cnode_reaped={}",

@@ -2038,6 +2038,33 @@ impl KernelState {
     /// would have raced the very table it consults. Placing the two behind the same lock is a
     /// lock-DOMAIN assignment, not a policy change: `allocate_thread_id` is the only production
     /// reader or writer of the cursor, and it always read `tcbs` in the same breath.
+    /// U9-SPAWN-TXN §3 — the TCB array and the spawn-reservation generation counter under ONE
+    /// acquisition of the task lock.
+    ///
+    /// `spawn_reservation_generation` was a bare `KernelState` field with no lock domain at all:
+    /// `reserve_task_for_spawn_with_class_in_process` read-modify-wrote it with nothing held,
+    /// serialized only by the broad lock that happened to surround the whole reservation. Its one
+    /// correctness rule is that no two reservations ever receive the same value — which is what
+    /// makes a token for an earlier occupant of a numeric TID unable to match a later one — and
+    /// that rule is unenforceable off-lock without a domain.
+    ///
+    /// Placing it in the task domain is an assignment, not a policy change, and it is the same
+    /// repair U9-SPAWN1 SP-2 made for the dynamic-TID cursor: the counter is only ever consumed in
+    /// the same breath as the TCB insert it stamps, so the two belong behind the same lock.
+    pub(crate) fn with_task_spawn_generation_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut [Option<ThreadControlBlock>; MAX_TASKS], &mut u64) -> R,
+    ) -> R {
+        // Lock-order domain: task
+        Self::debug_lock_order_note("task");
+        let _task_guard = self.task_state_lock.lock();
+        let generation = core::ptr::addr_of_mut!(self.spawn_reservation_generation);
+        // SAFETY: `spawn_reservation_generation` and `tcbs` are disjoint fields of the same
+        // `KernelState`, both now serialized by `task_state_lock`, which is held for the whole
+        // closure.
+        f(kernel_mut(&mut self.tcbs), unsafe { &mut *generation })
+    }
+
     pub(crate) fn with_task_tid_alloc_mut<R>(
         &mut self,
         f: impl FnOnce(

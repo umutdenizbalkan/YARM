@@ -153629,6 +153629,70 @@ mod u9spawn2_process_cnode_txn {
 mod u9spawn2_nr23_route_blockers {
     use super::*;
 
+    /// U9-SPAWN-TXN §3 — two task-domain fields that had no lock domain, and must not lose one
+    /// again.
+    ///
+    /// `task_classes` and `spawn_reservation_generation` were both written from
+    /// `task_policy_state.rs` with NO lock held: the first through a bare
+    /// `kernel_mut(&mut self.task_classes)[idx] = ..`, the second as a plain read-modify-write of
+    /// a `KernelState` field. Under the broad lock both were serialized by the broad lock and
+    /// nothing else — so a spawn phase driven off-lock would have raced them, and the generation
+    /// counter's entire correctness rule (no two reservations ever share a value, which is what
+    /// stops a token for an earlier occupant of a numeric TID matching a later one) was
+    /// unenforceable.
+    ///
+    /// Both are task-domain state and are now written through the seams that own them. This
+    /// asserts they stay there.
+    #[test]
+    fn the_reservation_task_domain_fields_are_never_written_lockless() {
+        // Comment-stripped, so the guard reads CODE and not the prose that explains the rule.
+        let code = |src: &str| -> alloc::string::String {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .fold(alloc::string::String::new(), |mut acc, l| {
+                    acc.push_str(l);
+                    acc.push('\n');
+                    acc
+                })
+        };
+        for (rel, raw) in stage199d_wa2a_ownership_boundary::production_sources() {
+            if rel == "src/kernel/boot/orchestrator_state.rs" {
+                // The seams themselves legitimately name the fields, under their guards.
+                continue;
+            }
+            let src = code(&raw);
+            assert!(
+                !src.contains("kernel_mut(&mut self.task_classes)"),
+                "{rel} writes the class table with no lock held; it is task-domain state and \
+                 belongs inside `with_task_enqueue_policy_mut`"
+            );
+            assert!(
+                !src.contains("self.spawn_reservation_generation ="),
+                "{rel} writes the spawn-reservation generation with no lock held; it belongs \
+                 inside `with_task_spawn_generation_mut`"
+            );
+        }
+        // And the reservation really pairs each write with the TCB mutation it stamps, so the
+        // slot and its class can never be observed out of step.
+        const POLICY: &str = include_str!("task_policy_state.rs");
+        let reserve = POLICY
+            .split("pub fn reserve_task_for_spawn_with_class_in_process(")
+            .nth(1)
+            .expect("the reservation")
+            .split("\n    /// ")
+            .next()
+            .expect("body");
+        assert!(
+            reserve.contains("with_task_enqueue_policy_mut(|tcbs, classes|")
+                && reserve.contains("classes[idx] = Some(class);"),
+            "the TCB insert and its class entry must land under one acquisition"
+        );
+        assert!(
+            reserve.contains("with_task_spawn_generation_mut("),
+            "the generation must be issued under the task lock"
+        );
+    }
+
     /// The production corpus every ownership guard scans must actually CONTAIN the production
     /// code, and this pins the one way it silently stops doing so.
     ///

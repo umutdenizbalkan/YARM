@@ -5359,6 +5359,67 @@ impl SharedKernel {
         })
     }
 
+    /// U9-SPAWN-TXN §3 — the split twin of `KernelState::with_vm_then_memory_mut`: the address
+    /// space manager (VM, rank 5) and the memory subsystem (rank 6) under ONE acquisition each,
+    /// taken in that order.
+    ///
+    /// This is what lets the rank-local image provisioner run from a pre-lock route: it needs both
+    /// domains for the whole provisioning, and driving it through the two single-domain seams
+    /// would mean dropping and retaking a lock between every phase. Rank 5 before rank 6 is fixed
+    /// here, exactly as the broad twin fixes it, so no caller can write the pair the other way
+    /// round. Nothing inside the closure may call back into `SharedKernel`: both locks are held.
+    pub(crate) fn with_vm_then_memory_split_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut crate::kernel::vm::AddressSpaceManager,
+            &mut crate::kernel::boot::MemorySubsystem,
+        ) -> R,
+    ) -> R {
+        // SAFETY: the two projectors derive raw field pointers without forming a reference to the
+        // whole `KernelState`; `vm_state_lock` serializes `user_spaces` and `memory_state_lock`
+        // serializes `memory`, and both guards are held for the whole closure. The two fields are
+        // disjoint, so the two `&mut` never alias.
+        let (vm_lock, user_spaces) =
+            unsafe { KernelState::vm_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let (memory_lock, memory) =
+            unsafe { KernelState::memory_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let vm_lock = unsafe { &*vm_lock };
+        let _vm_guard = vm_lock.lock();
+        let memory_lock = unsafe { &*memory_lock };
+        let _memory_guard = memory_lock.lock();
+        let user_spaces = unsafe { &mut *user_spaces };
+        let memory = unsafe { &mut *memory };
+        f(kernel_mut(user_spaces), kernel_mut(memory))
+    }
+
+    /// U9-SPAWN-TXN §3 — the split twin of `KernelState::with_ipc_then_capability_mut`: the IPC
+    /// subsystem (rank 3) and the capability subsystem (rank 4) under ONE acquisition each, in
+    /// that order.
+    ///
+    /// The rank-local endpoint transaction needs both to keep an endpoint and the capabilities
+    /// naming it atomic. IPC before capability is the only legal order and is fixed here.
+    pub(crate) fn with_ipc_then_capability_split_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut crate::kernel::boot::IpcSubsystem,
+            &mut crate::kernel::boot::CapabilitySubsystem,
+        ) -> R,
+    ) -> R {
+        // SAFETY: same pattern. `ipc_state_lock` serializes `ipc`, `capability_state_lock`
+        // serializes `capability`; the fields are disjoint and both guards are held throughout.
+        let (ipc_lock, ipc) =
+            unsafe { KernelState::ipc_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let (capability_lock, capability) =
+            unsafe { KernelState::capability_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let ipc_lock = unsafe { &*ipc_lock };
+        let _ipc_guard = ipc_lock.lock();
+        let capability_lock = unsafe { &*capability_lock };
+        let _capability_guard = capability_lock.lock();
+        let ipc = unsafe { &mut *ipc };
+        let capability = unsafe { &mut *capability };
+        f(kernel_mut(ipc), capability)
+    }
+
     pub(crate) fn with_vm_user_spaces_split_mut<R>(
         &self,
         f: impl FnOnce(&mut crate::kernel::vm::AddressSpaceManager) -> R,
