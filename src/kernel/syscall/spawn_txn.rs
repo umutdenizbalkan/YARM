@@ -56,9 +56,7 @@ use crate::kernel::boot::spawn_image_provision::{
 use crate::kernel::boot::spawn_ipc_cap_txn::{
     DelegationGrant, EndpointRemoval, ServiceEndpointGrant, ServiceEndpointRequest,
 };
-use crate::kernel::boot::{
-    KernelError, RuntimeCapacityConfig, SpawnedUserTask, UserImageSpec,
-};
+use crate::kernel::boot::{KernelError, RuntimeCapacityConfig, SpawnedUserTask, UserImageSpec};
 use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::spawn_reservation::{ReservationRefusal, SpawnBaseline, SpawnReservationToken};
@@ -422,9 +420,7 @@ pub(crate) fn provision_spawn_image<O: SpawnTxnOwners>(
             owners.mint_capability_in_cnode(
                 cnode,
                 Capability::new(
-                    CapObject::AddressSpace {
-                        asid: token.asid.0,
-                    },
+                    CapObject::AddressSpace { asid: token.asid.0 },
                     CapRights::MAP | CapRights::READ | CapRights::WRITE,
                 ),
             )
@@ -716,9 +712,9 @@ fn commit_spawned_image<O: SpawnTxnOwners>(
         // The bootstrap/service caps were delegated into this cnode above.
         crate::yarm_log!("SPAWN_LIFECYCLE_BOOTSTRAP_CAPS_OK tid={}", spec.tid);
     }
-    owners
-        .bind_spawned_task_asid(spec.tid, asid)
-        .map_err(|_| task_missing_with_site("spawn_user_task_from_image/set_asid_tcb_lookup", cpu.0))?;
+    owners.bind_spawned_task_asid(spec.tid, asid).map_err(|_| {
+        task_missing_with_site("spawn_user_task_from_image/set_asid_tcb_lookup", cpu.0)
+    })?;
 
     // Stage 127: Stage 126 correctly refused to publish x86_64 initialized switch frames without
     // a mapped kernel switch-stack page, but the first attempt above can run before the target

@@ -118631,7 +118631,12 @@ mod stage199d_wa2a_ownership_boundary {
             callers,
             alloc::vec![
                 alloc::string::String::from("src/kernel/boot/spawn_thread_core.rs"),
-                alloc::string::String::from("src/kernel/boot/task_policy_state.rs"),
+                // U9-SPAWN-TXN2 §2: was `task_policy_state.rs`. The reservation policy moved into
+                // the ONE generic transaction, so its compensation arms moved with it. The
+                // argument is unchanged and still holds: the only slot this clears is the
+                // reservation the same policy inserted moments earlier, which is `Reserved` and
+                // has therefore never been runnable, never been enqueued, and never been Blocked.
+                alloc::string::String::from("src/kernel/syscall/spawn_txn.rs"),
             ],
             "the slot-clearing owner's callers must stay enumerated"
         );
@@ -119888,15 +119893,20 @@ mod stage199d_wa2b_wake_owner_census {
         // The ninth Group-3 site HARD-STOPPED: the absence precondition is not satisfiable by
         // the current boot sequence, so the gate was reverted rather than weakened. Pin the
         // reason so the finding cannot be lost, and pin that no weaker predicate crept in.
+        // U9-SPAWN-TXN2 §2: the reservation-consuming body moved into the one generic policy.
+        // The predicate is asserted there, where the only implementation now lives — and the
+        // broad entry in `exec_state.rs` is checked to be a delegation, so it cannot have kept a
+        // weaker copy.
         let exec = production_source("src/kernel/boot/exec_state.rs");
-        let spawn = exec
-            .split("pub fn spawn_user_task_from_image(")
+        let policy = production_source("src/kernel/syscall/spawn_txn.rs");
+        let spawn = policy
+            .split("pub(crate) fn spawn_user_task_from_image<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("spawn");
-        let spawn = &spawn[..spawn.find("\n    fn ").unwrap_or(spawn.len())];
+        let spawn = &spawn[..spawn.find("\nfn ").unwrap_or(spawn.len())];
         for needle in [
-            "reservation: crate::kernel::spawn_reservation::SpawnReservationToken",
-            "claim_for_spawn",
+            "reservation: SpawnReservationToken",
+            "claim_reservation",
             "restore_after_failed_spawn",
         ] {
             assert!(
@@ -119904,19 +119914,37 @@ mod stage199d_wa2b_wake_owner_census {
                 "spawn must consume an exact reservation (`{needle}`)"
             );
         }
+        // The rank-2 bodies those two owner methods wrap are the reservation module's own.
+        for needle in ["claim_for_spawn", "restore_after_failed_spawn"] {
+            assert!(
+                policy.contains(needle),
+                "the broad adapter must reach the reservation module's `{needle}`"
+            );
+        }
+        assert!(
+            exec.contains("crate::kernel::syscall::spawn_txn::spawn_user_task_from_image("),
+            "the broad entry must delegate rather than keep a second reservation consumer"
+        );
         assert!(
             !exec.contains("Stage 199D-WA3A HARD-STOP"),
             "the WA3A hard-stop note must be gone now that the site is closed"
         );
-        // Registration idempotence is no longer spawn authorization anywhere in the body.
-        let body = exec
-            .split("fn spawn_image_after_claim(")
+        // Registration idempotence is no longer spawn authorization anywhere in the body. The
+        // body is `commit_spawned_image` in the one policy now, and it reaches domains only
+        // through the owner interface — which has no registration method at all, so the check is
+        // stated over the interface as well as the body.
+        let body = policy
+            .split("fn commit_spawned_image<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("spawn body");
         assert!(
             !body[..body.find("SPAWN_TASK_CONTEXT_OK").unwrap_or(body.len())]
-                .contains("self.register_task_with_class("),
+                .contains("register_task_with_class"),
             "the spawn body must not register — the reservation already provisioned the TCB"
+        );
+        assert!(
+            !policy.contains("fn register_task_with_class"),
+            "and the owner interface must expose no registration operation to reach"
         );
         // The boot sequence is pinned in its NEW shape: reserve, grant, consume. If any boot
         // path regresses to register-then-overwrite, this fails.
@@ -122090,18 +122118,21 @@ mod stage199d_wa3b_spawn_reservation {
         // `publish_spawned_image_locked`, so the ordering is asserted against the CALL to that
         // owner — and, one level down, against the owner's own validate → install → commit order.
         let exec = production_source("src/kernel/boot/exec_state.rs");
-        // Bound the body to the method itself: the file also holds the rank-local owner, which
-        // legitimately contains `commit_live_spawn`, and an unbounded split would sweep it in.
-        let body = exec
-            .split("fn spawn_image_after_claim(")
+        let policy = production_source("src/kernel/syscall/spawn_txn.rs");
+        // U9-SPAWN-TXN2 §2: the body is `commit_spawned_image` in the ONE generic policy now.
+        // Bound the split to that function: the same file also holds the broad adapter, whose
+        // `publish_spawned_image` method legitimately names the owner, and an unbounded split
+        // would sweep it in.
+        let body = policy
+            .split("fn commit_spawned_image<O: SpawnTxnOwners>(")
             .nth(1)
-            .and_then(|rest| rest.split("\n    pub fn dispatch_ready_task(").next())
+            .and_then(|rest| rest.split("\npub(crate) struct BroadSpawnOwners").next())
             .expect("spawn body");
         let publish = body
-            .find("publish_spawned_image_locked(")
+            .find(".publish_spawned_image(")
             .expect("the publication owner call");
         let enqueue = body
-            .find("self.enqueue_on_cpu(chosen_cpu")
+            .find("owners.enqueue_on_cpu(chosen_cpu")
             .expect("enqueue");
         assert!(
             publish < enqueue,
@@ -122129,6 +122160,13 @@ mod stage199d_wa3b_spawn_reservation {
             body.matches("commit_live_spawn").count(),
             0,
             "the commit belongs to the publication owner, not to a second acquisition"
+        );
+        // The policy reaches the publication ONLY through the owner interface, so neither
+        // acquisition can smuggle in a second publication of its own.
+        assert_eq!(
+            body.matches("publish_spawned_image_locked(").count(),
+            0,
+            "the policy must not call the rank-local owner directly; that is the adapter's job"
         );
     }
 
@@ -152217,6 +152255,11 @@ mod u9spawn1_sp3_spawn_ledger {
     /// U9-SPAWN-VM1 moved the address space, the image load and the user stack behind THE
     /// provisioner, so the ordering and no-bare-`?` guards below follow them there.
     const PROVISION_SRC: &str = include_str!("spawn_image_provision.rs");
+    /// U9-SPAWN-TXN2 §2: the ONE generic spawn transaction policy, over `SpawnTxnOwners`.
+    /// Both the broad and the split acquisition execute this body, so an assertion here binds
+    /// both paths at once — which is strictly stronger than asserting over one of two possible
+    /// implementations.
+    const SPAWN_POLICY_SRC: &str = include_str!("../syscall/spawn_txn.rs");
 
     /// A real ELF64 image with one PT_LOAD segment, so the load phase runs the production loader
     /// rather than a stub. `entry` is a parameter because an entry of zero is exactly how the
@@ -152467,10 +152510,12 @@ mod u9spawn1_sp3_spawn_ledger {
         });
         assert_eq!(ledger.len(), 4, "one entry per acquisition");
         assert_ne!(baseline(&k), before, "the acquisitions must be observable");
-        k.with(|s| crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
-            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
-            ledger,
-        ));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                ledger,
+            )
+        });
         assert_eq!(
             baseline(&k),
             before,
@@ -152507,10 +152552,12 @@ mod u9spawn1_sp3_spawn_ledger {
         ledger.record(ProvisionalSpawnResource::Reservation(token));
         ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
         ledger.record(ProvisionalSpawnResource::Endpoint(grant));
-        k.with(|s| crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
-            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
-            ledger,
-        ));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                ledger,
+            )
+        });
         assert_eq!(
             baseline(&k),
             before,
@@ -152546,11 +152593,11 @@ mod u9spawn1_sp3_spawn_ledger {
     #[test]
     fn the_reservation_precedes_the_first_address_space() {
         let txn = TXN_SRC
-            .split("pub(crate) fn run_image_spawn_transaction(")
+            .split("pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("the transaction body");
         let reserve = txn
-            .find("reserve_task_for_spawn_with_class(tid, class)")
+            .find("reserve_task_for_spawn(owners, tid, class, tid)")
             .expect("the reservation phase");
         // U9-SPAWN-VM1: the address space is no longer created inline. `provision_spawn_image` is
         // the step that creates it — together with the image and the stack — so it is the step
@@ -152590,21 +152637,34 @@ mod u9spawn1_sp3_spawn_ledger {
             plan < create && create < load && load < stack,
             "provisioning order must stay plan → address space → image → stack"
         );
-        // U9-SPAWN-VM2 §2: the capability is published by the BROAD wrapper, strictly after the
-        // rank-local body returned and both locks were released — never while rank 5/6 is held.
-        let broad = PROVISION_SRC
-            .split("pub(crate) fn provision_spawn_image(")
+        // U9-SPAWN-VM2 §2 / U9-SPAWN-TXN2 §2: the capability is published by the COMPOSITION,
+        // strictly after the rank-local body returned and both locks were released — never while
+        // rank 5/6 is held. The composition is now in the one policy, and it reaches both steps
+        // through the owner interface, so this ordering binds the broad and split paths alike.
+        let compose = SPAWN_POLICY_SRC
+            .split("pub(crate) fn provision_spawn_image<O: SpawnTxnOwners>(")
             .nth(1)
-            .expect("the broad wrapper");
-        let provisioned = broad
-            .find("provision_image_locked(vm, memory, &request)")
+            .and_then(|rest| rest.split("\n// ─").next())
+            .expect("the provisioning composition");
+        let provisioned = compose
+            .find("provision_image(&request)")
             .expect("the provisioning step");
-        let mint = broad
-            .find("mint_capability_for_current_context(")
+        let mint = compose
+            .find("mint_capability_in_cnode(")
             .expect("the capability publication step");
         assert!(
             provisioned < mint,
             "the address-space capability must be minted after provisioning, not during it"
+        );
+        // And the cspace it mints into is resolved EXPLICITLY, not through an ambient
+        // current-task lookup buried inside the mint — which is what lets the split path state
+        // the same identity the broad one does.
+        let cnode = compose
+            .find("current_task_cnode()")
+            .expect("the explicit caller cspace");
+        assert!(
+            cnode < mint,
+            "the caller's cspace must be resolved before the mint, as an explicit argument"
         );
     }
 
@@ -152613,11 +152673,11 @@ mod u9spawn1_sp3_spawn_ledger {
     #[test]
     fn no_acquisition_step_returns_through_a_bare_question_mark() {
         let txn = TXN_SRC
-            .split("pub(crate) fn run_image_spawn_transaction(")
+            .split("pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("the transaction body");
         for acquisition in [
-            "reserve_task_for_spawn_with_class",
+            "reserve_task_for_spawn",
             "provision_spawn_image",
             "spawn_user_task_from_image",
         ] {
@@ -152635,7 +152695,7 @@ mod u9spawn1_sp3_spawn_ledger {
         }
         // And every one of them goes through the one carrier.
         assert!(
-            txn.matches("advance(kernel, ledger, outcome,").count() >= 3,
+            txn.matches("advance(owners, ledger, outcome,").count() >= 3,
             "each fallible acquisition is carried by the same ledger-aware step"
         );
 
@@ -152670,18 +152730,30 @@ mod u9spawn1_sp3_spawn_ledger {
             2,
             "exactly the two owning phases (load, stack) unwind, and both through the one rollback"
         );
-        // The broad wrapper adds exactly one more: the capability-mint failure, which owns a whole
-        // provisioned image and must give it back.
-        let broad = PROVISION_SRC
-            .split("pub(crate) fn provision_spawn_image(")
+        // U9-SPAWN-TXN2 §2: the composition around the rank-local body moved into the one
+        // policy, so the third rollback arm — the capability-mint failure, which owns a whole
+        // provisioned image and must give it back — is asserted there. It now reaches the
+        // rollback through the owner interface, which is why the spelling changed and not the
+        // rule.
+        let compose = SPAWN_POLICY_SRC
+            .split("pub(crate) fn provision_spawn_image<O: SpawnTxnOwners>(")
             .nth(1)
-            .expect("the broad wrapper");
+            .and_then(|rest| rest.split("\n// ─").next())
+            .expect("the provisioning composition");
         assert_eq!(
-            broad
-                .matches("rollback_provision_locked(vm, memory, token.asid,")
+            compose
+                .matches("rollback_provision(token.asid, \"aspace_cap_mint\", err)")
                 .count(),
             1,
             "the mint failure rolls the exact token back, exactly once"
+        );
+        let mint = compose.find("mint_capability_in_cnode(").expect("the mint");
+        let rollback = compose
+            .find("rollback_provision(token.asid")
+            .expect("the rollback");
+        assert!(
+            mint < rollback,
+            "the rollback is the mint's failure arm, not a step that runs before it"
         );
     }
 
@@ -153496,6 +153568,11 @@ mod u9spawn2_process_cnode_txn {
 
     const TXN_SRC: &str = include_str!("process_cnode_txn.rs");
     const RESERVE_SRC: &str = include_str!("task_policy_state.rs");
+    /// U9-SPAWN-TXN2 §2: the ONE generic spawn transaction policy, over `SpawnTxnOwners`.
+    /// Both the broad and the split acquisition execute this body, so an assertion here binds
+    /// both paths at once — which is strictly stronger than asserting over one of two possible
+    /// implementations.
+    const SPAWN_POLICY_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
 
     fn kernel() -> SharedKernel {
@@ -153675,13 +153752,21 @@ mod u9spawn2_process_cnode_txn {
     /// which is what makes this a production owner rather than a helper-only API.
     #[test]
     fn the_broad_reservation_delegates_and_compensates() {
-        let body = RESERVE_SRC
-            .split("pub fn reserve_task_for_spawn_with_class_in_process(")
+        // U9-SPAWN-TXN2 §2: the reservation body moved into the ONE generic policy, so this now
+        // binds both acquisitions rather than the broad one alone. The broad entry in
+        // `task_policy_state.rs` is separately checked to be a pure delegation, so it cannot have
+        // kept a second, uncompensated copy.
+        assert!(
+            RESERVE_SRC.contains("crate::kernel::syscall::spawn_txn::reserve_task_for_spawn("),
+            "the broad entry must delegate to the one reservation policy"
+        );
+        let body = SPAWN_POLICY_SRC
+            .split("pub(crate) fn reserve_task_for_spawn<O: SpawnTxnOwners>(")
             .nth(1)
-            .and_then(|s| s.split("\n    }\n").next())
+            .and_then(|s| s.split("\n/// ").next())
             .expect("the reservation body");
         assert!(
-            body.contains("self.provision_process_cnode(&cnode_request)"),
+            body.contains("owners.provision_process_cnode(&cnode_request)"),
             "the reservation must go through the transaction"
         );
         for bypassed in [
@@ -153700,6 +153785,31 @@ mod u9spawn2_process_cnode_txn {
                 .count()
                 >= 2,
             "each failure after the CNode transaction must release it"
+        );
+        // Exhaustive, not merely present. The reservation has exactly four failure returns: two
+        // occupancy/capacity refusals BEFORE the CNode transaction (which own nothing yet), and
+        // two arms AFTER it — a full task table and a kernel-context failure. Both of the latter
+        // release the grant, which is what the `>= 2` count above pins; this pins that there is
+        // no third post-transaction arm that could have been missed.
+        assert_eq!(
+            body.matches("return Err(").count(),
+            4,
+            "the reservation has exactly four failure returns"
+        );
+        let cnode_txn = body
+            .find("owners.provision_process_cnode(&cnode_request)")
+            .expect("the CNode transaction");
+        assert_eq!(
+            body[cnode_txn..].matches("return Err(").count(),
+            2,
+            "exactly two failure arms exist after the CNode transaction"
+        );
+        assert_eq!(
+            body[cnode_txn..]
+                .matches("release_process_cnode_grant(&cnode_request, &cnode_grant)")
+                .count(),
+            2,
+            "and each of them releases the grant — one release per post-transaction arm"
         );
         // And the PID is the caller's, never the current task's.
         assert!(
@@ -153786,23 +153896,54 @@ mod u9spawn2_nr23_route_blockers {
         }
         // And the reservation really pairs each write with the TCB mutation it stamps, so the
         // slot and its class can never be observed out of step.
-        const POLICY: &str = include_str!("task_policy_state.rs");
-        let reserve = POLICY
-            .split("pub fn reserve_task_for_spawn_with_class_in_process(")
-            .nth(1)
-            .expect("the reservation")
-            .split("\n    /// ")
+        //
+        // U9-SPAWN-TXN2 §2: the reservation POLICY moved into the one generic transaction, which
+        // reaches the task domain only through `insert_reservation` / `stamp_spawn_generation`.
+        // The pairing is therefore a property of the ADAPTERS, and it is asserted on each of
+        // them — the broad one here, and the split one by the same names in `runtime.rs`.
+        const POLICY: &str = include_str!("../syscall/spawn_txn.rs");
+        let broad_insert = POLICY
+            .split("fn insert_reservation(")
+            .nth(2)
+            .expect("the broad adapter's insert")
+            .split("\n    fn ")
             .next()
             .expect("body");
         assert!(
-            reserve.contains("with_task_enqueue_policy_mut(|tcbs, classes|")
-                && reserve.contains("classes[idx] = Some(class);"),
+            broad_insert.contains("with_task_enqueue_policy_mut(|tcbs, classes|")
+                && broad_insert.contains("classes[idx] = Some(class);"),
             "the TCB insert and its class entry must land under one acquisition"
         );
+        let broad_stamp = POLICY
+            .split("fn stamp_spawn_generation(&mut self) -> u64 {")
+            .nth(1)
+            .expect("the broad adapter's generation stamp")
+            .split("\n    fn ")
+            .next()
+            .expect("body");
         assert!(
-            reserve.contains("with_task_spawn_generation_mut("),
+            broad_stamp.contains("with_task_spawn_generation_mut("),
             "the generation must be issued under the task lock"
         );
+        // The policy itself must not reach either storage directly — it has no way to, and this
+        // pins that the interface is what it depends on.
+        let reserve = POLICY
+            .split("pub(crate) fn reserve_task_for_spawn<O: SpawnTxnOwners>(")
+            .nth(1)
+            .expect("the reservation policy")
+            .split("\n/// ")
+            .next()
+            .expect("body");
+        for direct in [
+            "with_task_enqueue_policy_mut",
+            "with_task_spawn_generation_mut",
+        ] {
+            assert!(
+                !reserve.contains(direct),
+                "the generic reservation policy must reach the task domain only through the \
+                 owner interface, never through `{direct}` directly"
+            );
+        }
     }
 
     /// The production corpus every ownership guard scans must actually CONTAIN the production
@@ -154406,6 +154547,11 @@ mod u9spawnvm2_rank_local_body {
 
     const VM_LOCKED: &str = include_str!("vm_image_locked.rs");
     const PROVISION: &str = include_str!("spawn_image_provision.rs");
+    /// U9-SPAWN-TXN2 §2: the ONE generic spawn transaction policy, over `SpawnTxnOwners`.
+    /// Both the broad and the split acquisition execute this body, so an assertion here binds
+    /// both paths at once — which is strictly stronger than asserting over one of two possible
+    /// implementations.
+    const SPAWN_POLICY_SRC: &str = include_str!("../syscall/spawn_txn.rs");
     const EXEC: &str = include_str!("exec_state.rs");
     const ORCHESTRATOR: &str = include_str!("orchestrator_state.rs");
 
@@ -154666,9 +154812,12 @@ mod u9spawnvm2_rank_local_body {
                 }
             }
         }
+        // U9-SPAWN-TXN2 §2: the `with_vm_then_memory_mut` acquisitions moved out of the
+        // provisioner's broad wrapper (which is gone) and into the broad ADAPTER, which is where
+        // acquisition now lives. The anchor follows them, so the guard still checks something.
         assert!(
-            !vm_memory_closures(&code(PROVISION)).is_empty(),
-            "the provisioner must actually use the seam, or this guard checks nothing"
+            !vm_memory_closures(&code(SPAWN_POLICY_SRC)).is_empty(),
+            "the broad adapter must actually use the seam, or this guard checks nothing"
         );
         // And the token the body returns carries no capability at all, which is what makes that
         // structurally true rather than a convention.
@@ -155133,6 +155282,11 @@ mod u9spawnic1_endpoint_cap_txn {
     const CAP_STATE: &str = include_str!("capability_state.rs");
     const ORCHESTRATOR: &str = include_str!("orchestrator_state.rs");
     const SPAWN_TXN: &str = include_str!("../syscall/spawn_image_txn.rs");
+    /// U9-SPAWN-TXN2 §2: the ONE generic spawn transaction policy, over `SpawnTxnOwners`.
+    /// Both the broad and the split acquisition execute this body, so an assertion here binds
+    /// both paths at once — which is strictly stronger than asserting over one of two possible
+    /// implementations.
+    const SPAWN_POLICY_SRC: &str = include_str!("../syscall/spawn_txn.rs");
 
     /// Comment-stripped source, so a guard reads CODE and never the prose explaining its rule.
     fn code(src: &str) -> alloc::string::String {
@@ -155327,10 +155481,10 @@ mod u9spawnic1_endpoint_cap_txn {
     #[test]
     fn the_two_asid_release_cases_are_never_conflated() {
         let release = SPAWN_TXN
-            .split("fn release_provisional_spawn_resource(")
+            .split("fn release_provisional_spawn_resource<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("the release")
-            .split("\n    /// Undo an in-flight spawn")
+            .split("\n/// Undo an in-flight spawn")
             .next()
             .expect("body");
         let arm = code(release)
@@ -155338,19 +155492,36 @@ mod u9spawnic1_endpoint_cap_txn {
             .nth(1)
             .map(alloc::string::String::from)
             .expect("the address-space arm");
-        // The decision is made from live state, not assumed.
+        // The decision is made from live state, not assumed. U9-SPAWN-TXN2 §2 moved the ledger
+        // into the one generic policy, so the arm asks the owner interface who carries the ASID
+        // and the ADAPTER answers from the live TCB table — checked one level down.
         assert!(
-            arm.contains("tcb.asid == Some(asid)"),
+            arm.contains("owners.asid_carrier_tid(asid)"),
             "the release must CHECK whether any task carries the ASID"
+        );
+        assert!(
+            SPAWN_POLICY_SRC
+                .split("fn asid_carrier_tid(&self, asid: Asid) -> Option<u64> {")
+                .nth(1)
+                .expect("the broad adapter's carrier lookup")
+                .contains("tcb.asid == Some(asid)"),
+            "and the adapter must answer it from the live TCB table"
         );
         // Two owners, one per case, and both present.
         assert!(
-            arm.contains("destroy_unresident_address_space_locked"),
+            arm.contains("owners.destroy_unresident_address_space(asid)"),
             "a never-resident ASID must use the never-resident owner"
         );
         assert!(
-            arm.contains("destroy_user_address_space_by_asid"),
+            arm.contains("owners.destroy_live_address_space(asid)"),
             "a carried ASID must fall back to the live teardown"
+        );
+        // The two adapter methods really are the two different teardowns, not one aliased twice.
+        assert!(
+            SPAWN_POLICY_SRC.contains("destroy_unresident_address_space_locked(")
+                && SPAWN_POLICY_SRC.contains("destroy_user_address_space_by_asid("),
+            "the broad adapter must reach the never-resident owner and the live teardown \
+             respectively, so the two cases stay distinct at the acquisition layer too"
         );
         // And the fallback is loud, because it means the ledger's own contract was violated.
         assert!(
@@ -155359,7 +155530,7 @@ mod u9spawnic1_endpoint_cap_txn {
         );
         // The variant has exactly one construction site, and it precedes the commit.
         let txn = SPAWN_TXN
-            .split("pub(crate) fn run_image_spawn_transaction(")
+            .split("pub(crate) fn run_image_spawn_transaction<O: SpawnTxnOwners>(")
             .nth(1)
             .expect("the transaction");
         assert_eq!(
@@ -155822,9 +155993,9 @@ mod u9spawnic1_endpoint_cap_txn {
                 ledger.record(ProvisionalSpawnResource::AddressSpace(asid));
                 ledger.record(ProvisionalSpawnResource::Capability { cnode, cap });
                 crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
-            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
-            ledger,
-        );
+                    &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                    ledger,
+                );
             });
             assert_eq!(baseline(&k), before, "cycle {cycle} drifted");
         }
@@ -155869,10 +156040,12 @@ mod u9spawnic1_endpoint_cap_txn {
         });
         assert_eq!(ledger.len(), 5, "one entry per acquisition");
         assert_ne!(baseline(&k), before, "the acquisitions must be observable");
-        k.with(|s| crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
-            &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
-            ledger,
-        ));
+        k.with(|s| {
+            crate::kernel::syscall::spawn_image_txn::unwind_spawn_ledger(
+                &mut crate::kernel::syscall::spawn_txn::BroadSpawnOwners { kernel: s },
+                ledger,
+            )
+        });
         assert_eq!(
             baseline(&k).resources_only(),
             before.clone_resources_only(),
