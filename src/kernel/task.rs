@@ -225,6 +225,29 @@ impl UserRegisterContext {
         self.user_gprs.iter().all(|&g| g == 0) && self.arg0 != 0
     }
 
+    /// U9-A64-COW2 §2 — whether this context's ARGUMENT lanes may be copied over the user
+    /// registers on resume.
+    ///
+    /// A resume path that mirrors `arg0..arg5` into `x0..x5` (AArch64) is writing over live user
+    /// state, so it may only do so when the argument lanes are the authoritative copy. Exactly two
+    /// shapes qualify:
+    ///
+    /// 1. a FIRST RESUME, where `user_gprs` are all zero and the startup ABI is in the argument
+    ///    lanes — [`Self::is_first_resume_shape`];
+    /// 2. a JUST-ENCODED BLOCKED COMPLETION, whose result the encoder writes into the argument
+    ///    lanes precisely so the mirror delivers it.
+    ///
+    /// Everything else is an ordinary resume — most importantly a page-fault return, whose
+    /// faulting instruction is about to be retried with its live registers. A fault frame's
+    /// argument lanes are never imported from the GPRs (only `import_syscall_abi_from_user_gprs`
+    /// does that, and only for a syscall), so mirroring there writes zeros over six live
+    /// registers. That was the U9-A64-COW2 defect: x0 entered a handled COW fault holding a
+    /// format-string pointer and left holding zero.
+    #[must_use]
+    pub fn argument_lanes_are_authoritative(&self, completion_encoded: bool) -> bool {
+        completion_encoded || self.is_first_resume_shape()
+    }
+
     /// True when this continuation can actually be returned through.
     ///
     /// `flush_trap_context_to_iret_frame` leaves the hardware frame's `rip`/`rsp` UNTOUCHED

@@ -417,9 +417,15 @@ fn try_split_cow_page_fault_into_frame(
     use crate::kernel::trap::FaultAccess;
     use SplitDispatchDisposition as D;
 
-    if !cfg!(target_arch = "x86_64") {
+    // U9-A64-COW2 §4: x86_64 and AArch64. RISC-V is deliberately absent — it has no independent
+    // COW witness of its own, and §3 admits a class only on one.
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
         return D::NotHandled;
-    }
+    };
     let Some(fault) = fault else {
         return D::NotHandled;
     };
@@ -432,10 +438,7 @@ fn try_split_cow_page_fault_into_frame(
     let Ok((class, Some(facts))) = shared.classify_page_fault_shared(cpu, fault) else {
         return D::NotHandled;
     };
-    if !matches!(
-        page_fault_route_for("x86_64", class),
-        PageFaultRoute::SplitCow
-    ) {
+    if !matches!(page_fault_route_for(arch, class), PageFaultRoute::SplitCow) {
         return D::NotHandled;
     }
     // (2) This route owns the PRIVATE-COPY arm only. An already-writable COW page is the broad
