@@ -149,19 +149,65 @@ QEMU_CMD=(
 )
 
 echo "[info] qemu command: ${QEMU_CMD[*]}"
-rm -f "$LOGFILE" "$SNAPSHOT" "$LOGFILE.normalized"
-set +e
-if command -v timeout >/dev/null 2>&1; then
-  timeout --foreground "${TIMEOUT_SECS}s" stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
-  QEMU_STATUS=${PIPESTATUS[0]}
-else
-  stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
-  QEMU_STATUS=${PIPESTATUS[0]}
-fi
-set -e
 
-tr '\r' '\n' <"$LOGFILE" >"$LOGFILE.normalized"
-LOG_NORM="$LOGFILE.normalized"
+# U9-REAP1 §6 — the PRE-EXISTING riscv64 fault-report rendezvous stall, and why this boot may be
+# retried.
+#
+# On riscv64 the crash_test_srv fault report is enqueued on the supervisor's endpoint with
+# `TASK_FAULT_REPORT_ENQUEUE_OK ... waiters=0 queued=1 woke=0` — the supervisor is not parked on
+# the endpoint at the instant the report lands, nothing wakes it, and it never returns to receive.
+# The chain then stops at exactly one fault with ZERO SUPERVISOR_FAULT_LOOKUP_OK, and no PM
+# teardown and no NR 31 ever happen on either route.
+#
+# This is measured at base, not inferred: a freshly built 70327f7 reproduces the identical
+# signature in TWO OF FOUR boots (`faults=1 lookup=0 teardown=0 reap_ok=0`), and no supervisor
+# fault is involved, so it is a DIFFERENT phenomenon from the known intermittent RISC-V supervisor
+# fault. Nothing in this increment touches the rendezvous.
+#
+# A boot whose chain never started proves nothing either way about the reap, so it is retried
+# rather than reported as a reap failure — bounded, counted, and named in the output. Every
+# assertion below still runs at full strength on the boot that does start the chain; the stall
+# detector is deliberately narrow (a fault was delivered AND the supervisor looked up nothing), so
+# a chain that starts and then breaks is a real failure and is reported as one.
+BOOT_ATTEMPTS=${BOOT_ATTEMPTS:-1}
+if [[ "$ARCH_ORACLE" == "reap_chain" ]]; then
+  BOOT_ATTEMPTS=${BOOT_ATTEMPTS:-4}
+fi
+boot_attempt=0
+stalled_boots=0
+while :; do
+  boot_attempt=$((boot_attempt + 1))
+  rm -f "$LOGFILE" "$SNAPSHOT" "$LOGFILE.normalized"
+  set +e
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --foreground "${TIMEOUT_SECS}s" stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
+    QEMU_STATUS=${PIPESTATUS[0]}
+  else
+    stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
+    QEMU_STATUS=${PIPESTATUS[0]}
+  fi
+  set -e
+  tr '\r' '\n' <"$LOGFILE" >"$LOGFILE.normalized"
+  LOG_NORM="$LOGFILE.normalized"
+
+  if [[ "$ARCH_ORACLE" != "reap_chain" ]]; then
+    break
+  fi
+  attempt_faults=$(rg -a -c "\\bCRASH_TEST_SRV_FAULT_NOW\\b" "$LOG_NORM" 2>/dev/null || echo 0)
+  attempt_lookups=$(rg -a -c "\\bSUPERVISOR_FAULT_LOOKUP_OK\\b" "$LOG_NORM" 2>/dev/null || echo 0)
+  if [[ "$attempt_faults" -ge 1 && "$attempt_lookups" -eq 0 ]]; then
+    stalled_boots=$((stalled_boots + 1))
+    echo "[warn] riscv64 fault-report rendezvous stalled before the chain started (attempt ${boot_attempt}/${BOOT_ATTEMPTS}): faults=${attempt_faults} supervisor_lookups=0 — PRE-EXISTING, reproduces at base in 2 of 4 boots, and no NR 31 runs on either route in such a boot"
+    if [[ "$boot_attempt" -lt "$BOOT_ATTEMPTS" ]]; then
+      echo "[info] retrying the boot; the reap chain is not judged by a boot that never started it"
+      continue
+    fi
+    echo "[error] riscv64 chain never started in ${BOOT_ATTEMPTS} boots; this run is INCONCLUSIVE about NR 31, not a reap failure"
+    echo "SUPERVISOR_CRASH_RESTART_BASELINE arch=riscv64 oracle=reap_chain attempts=${boot_attempt} stalled=${stalled_boots} result=inconclusive reason=fault_report_rendezvous_stall"
+    exit 1
+  fi
+  break
+done
 
 count_marker() {
   local marker=$1
@@ -310,7 +356,7 @@ if [[ "$ARCH_ORACLE" == "reap_chain" ]]; then
     echo "[info] marker snapshot: $SNAPSHOT"
     exit 1
   fi
-  echo "SUPERVISOR_CRASH_RESTART_BASELINE arch=riscv64 oracle=reap_chain faults=${rc_faults} teardowns=${rc_teardown_ok} reaps=${rc_reap_ok} distinct_targets=${rc_distinct} result=ok"
+  echo "SUPERVISOR_CRASH_RESTART_BASELINE arch=riscv64 oracle=reap_chain attempts=${boot_attempt} stalled=${stalled_boots} faults=${rc_faults} teardowns=${rc_teardown_ok} reaps=${rc_reap_ok} distinct_targets=${rc_distinct} result=ok"
   echo "[ok] SUP-L6 riscv64 reap-chain smoke passed"
   echo "[ok] marker snapshot: $SNAPSHOT"
   exit 0
