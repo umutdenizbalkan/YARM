@@ -13110,3 +13110,126 @@ at base** for that reason and is green here.
 The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
 their other residual classes, so ***U9 remains OPEN***: this increment empties the NR 12 population
 that reached them, it does not delete them.
+
+### U9-A64-COW2 — the AArch64 post-Fork COW failure, and the write-COW class it earned. CENSUS-DELTA 0.
+
+**U9-A64-COW2 — the defect was never in copy-on-write recovery.** U9-FORK1 recorded AArch64 as
+"COW fault recovery remains broad and remains broken": the fault was handled, and the task then took
+an unhandled read at `addr=0x0 rip=0x402090`. That reading named the symptom. The first incorrect
+boundary is one register, in a different owner, and COW recovery is correct throughout.
+
+#### What was measured
+
+Instrumenting the AArch64 vector boundary at `b545e65`, on the COW write that follows a Fork:
+
+```
+IN   elr=0x409160 far=0x45e000 x0=0x40ef3a x1..x3=0 x19=0x4007f0 x20=0x400784 x22..x25 live
+OUT  elr=0x409160              x0=0x0      x1..x3=0 x19=0x4007f0 x20=0x400784 x22..x25 live
+```
+
+**x0 alone is destroyed.** ELR is preserved, so the faulting instruction is retried; SP and every
+other register survive. `0x40ef3a` is the format-string pointer the userspace code computes at
+`0x40915c`, one instruction *before* the faulting store and consumed *after* it — so it must
+survive the exception, and does not. Userspace then reaches
+`0x402090: ldrb w8, [x2]` inside `core::fmt::write` with a null derived from it. Both roles, every
+boot.
+
+The COW transaction in between is textbook: `VM_COW_PHASE_METADATA → FRAME_ALLOC → PT_UPDATE →
+TLB_LOCAL_FLUSH → DONE` with a fresh private frame and `pte_writable=1`, on every attempt.
+
+#### The owner
+
+`apply_restored_thread_state`'s **argument mirror**. It copies the frame's argument lanes over
+`x0..x5` whenever `!syscall_return`, which is true for every non-syscall trap. Its justification was
+stated in the source as:
+
+> For a resumed task `capture_user_context` already wrote `user_gprs[i]` into `arg_i`, so the
+> assignment is idempotent.
+
+That is **false**. `capture_user_context` copies `args` verbatim and never mirrors GPRs into them.
+The mirror is idempotent only for a **syscall** frame, whose argument lanes
+`import_syscall_abi_from_user_gprs` populated from `x0..x5` on the way in. A fault frame's argument
+lanes are never imported and stay zero, so the mirror wrote zeros over six live user registers on
+every handled AArch64 fault. Only x0 was visibly nonzero here; the exposure was always six wide.
+
+#### The repair
+
+`UserRegisterContext::argument_lanes_are_authoritative` names the two shapes whose argument lanes
+may be copied over user registers, and the mirror is gated on it:
+
+1. a **first resume** — `user_gprs == [0; 32]` with the startup ABI in the argument lanes, which is
+   the case the mirror exists for;
+2. a **just-encoded blocked completion** — `encode_blocked_completion_result` writes its result
+   into those lanes precisely so the mirror delivers it, and both completion classes are covered so
+   neither can be silently dropped.
+
+Everything else is an ordinary resume. The ELR retry, the x18 TLS lane, the completion encodes and
+the private-copy order are untouched; the change is one gate and one predicate.
+
+#### Broad-route qualification, before any routing change
+
+Three fresh AArch64 profiles, identical: `isolation_ok=2`, `isolation_fail=0`, `unhandled=0`,
+`panic=0`, `cow_faults = cow_done = handled = 6`. Parent writes `0xA1` and reads `0xA1`; child
+writes `0xC2` and reads `0xC2`, at the same original VA. **This is the first time AArch64 completed
+the end-to-end COW isolation witness.** Two forks now commit rather than one, because the child
+survives to run the later one.
+
+#### The class that witness earned
+
+`page_fault_route_for` admits a class on a live witness and nothing else, which is why AArch64's COW
+row read `Broad` — the workload died before producing one. With the repair the class is ordinary,
+and §3 found it needs no second policy:
+
+* the ingress is architecture-neutral and already live on AArch64 (its terminal-fault route reaches
+  the split dispatcher through the same shared site every boot);
+* the transaction, its refusal set and its rollback read no architecture;
+* the arch-specific TLB obligations are already discharged. `arch_map_page` ends in AArch64's own
+  `dsb ishst; tlbi vaae1is; dsb ish; isb` — an inner-shareable **broadcast**, its completion
+  barrier, and context synchronization — so when the transaction returns the new translation is
+  visible domain-wide and this PE is synchronized, and the `eret` to EL0 is itself
+  context-synchronizing. Nothing further is required before returning to EL0, and
+  `complete_unmap_shootdown_split` gates only the OLD-frame reclaim, which is the fail-safe
+  direction.
+
+§4 is therefore one matrix row and one derived architecture string. RISC-V is deliberately absent:
+it has no independent COW witness.
+
+### Residual page-fault routing matrix (source-recomputed)
+
+| class | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| write-COW private copy | SplitCow | **SplitCow** | Broad |
+| terminally unhandled | Broad | SplitTerminal | Broad |
+| demand candidate | Broad | Broad | Broad |
+| kernel / absent task | Broad | Broad | Broad |
+| broad-lock census | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+Three consecutive boots per architecture, identical in every counter:
+
+| | AArch64 | x86_64 | RISC-V |
+|---|---|---|---|
+| NR12 split / broad | 2 / **0** | 2 / **0** | 1 / **0** |
+| fork committed / unwound | 2 / 0 | 1 / 1 | 1 / 0 |
+| split COW commits | **6** | 4 | 0 |
+| **broad COW handler entries** | **0** | **0** | 4 |
+| BEGIN / DONE / handled | 6 / 6 / 6 | 4 / 4 / 4 | 4 / 4 / 4 |
+| userspace isolation (parent, child) | ok, ok | ok, ok | ok, ok |
+| unhandled faults, panics | 0, 0 | 0, 0 | see below |
+
+For the witness page, both roles fault on the **same** original frame and receive **distinct** new
+ones — `tid=1 old_pa=0x45ee1000 new_pa=0x45fca000`, `tid=10000 old_pa=0x45ee1000 new_pa=0x45fcc000`
+— every commit acknowledged, six distinct frames for six commits, and zero duplicate recoveries.
+
+x86_64's pre-existing page-table-pool failure is preserved exactly: one fork commits, the second
+hits the wall and unwinds completely.
+
+### Known red, unchanged and not weakened
+
+The intermittent RISC-V supervisor fault is pre-existing. It appears in one of three runs here
+(`tid=2 addr=0x9`), and a **freshly built** base at `b545e65` reproduces the same class in **three
+of five** runs (`addr=0x83`, `0x19`, `0xa`, at varying PCs). Neither fork participant faults on
+RISC-V, at base or now, and its isolation witness is intact in every run.
+
+The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
+their other residual classes, so ***U9 remains OPEN***: this increment empties the AArch64 write-COW
+population that reached them, it does not delete them.
