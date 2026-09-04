@@ -114268,6 +114268,11 @@ mod stage199d_riscv_canonical_admission {
             // yield or change address space by reaping a task the scheduler released at fault
             // time, so it finalizes through that same writeback.
             "SYSCALL_REAP_FAULTED_TASK_NR",
+            // U9-EXIT1 §5: NR 16, and the FIRST SWITCHING member of this list. Every other entry
+            // finalizes through the same-task ecall writeback; NR 16 finalizes nothing at all —
+            // it advances no sepc and writes no a0, because the task it belonged to is gone — and
+            // its queue advance is the existing deferral plus the existing drain.
+            "SYSCALL_EXIT_CURRENT_TASK_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -114279,11 +114284,12 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            11,
-            "exactly eleven literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            12,
+            "exactly twelve literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
-             SpawnFromMemoryObject, (U9-FORK1 §4) Fork and (U9-REAP1 §4) ReapFaultedTask"
+             SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask and \
+             (U9-EXIT1 §5) ExitCurrentTask"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -118874,6 +118880,21 @@ mod stage199d_wa2a_ownership_boundary {
             // slot, so the wake can fire at most once per destruction.
             ("src/kernel/boot/capability_lifecycle_state.rs", 1),
             ("src/kernel/boot/exec_state.rs", 4),
+            // U9-EXIT1 §2: a NEW file with 3 writes — the self-exit claim, its exact inverse, and
+            // the joiner wake the exit owes.
+            //
+            // - `claim_self_exit_locked` writes `Running -> Exited(code)`. This is the write the
+            //   broad `exit_task` performs in its own scoped acquisition; it did not multiply, it
+            //   is now ALSO reachable from the split route, and both routes reach this one body.
+            //   It is not a wake owner: `Exited` is terminal, and the only transition out of it in
+            //   this census is a reap's `-> Dead`.
+            // - `rollback_exit_claim_locked` writes the claim's exact `status_before` back — which
+            //   `status_is_self_exitable` restricts to `Running`, so no reachable rollback can
+            //   produce a `Blocked` task.
+            // - `wake_joiners_for_locked` writes `Blocked(Join) -> Runnable`. It IS a wake owner,
+            //   of exactly the same class as `wake_joiners_for` in thread_state.rs, whose rank-2
+            //   half this is: one body, two owners, with the rank-1 enqueues left to the caller.
+            ("src/kernel/boot/exit_claim.rs", 3),
             ("src/kernel/boot/ipc_state.rs", 9),
             // U9-REAP1 §2: a NEW file with 2 writes, and both are the same site's two halves.
             //
@@ -118965,15 +118986,16 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            39,
-            "35 raw writes (U6 added `commit_blocking_send_split`; U7 added \
+            42,
+            "38 raw writes (U6 added `commit_blocking_send_split`; U7 added \
              `drain_send_timeout_post_work`; U9-F added \
              `wake_destroyed_notification_waiter_split`; U9-RX3 added the exact BLOCK/UNWIND \
              pair `recv_block_phase_b_split` and `recv_block_unwind_race_split`; U9-FORK1 \
              RETIRED `fork_complete_post_clone`'s direct Runnable write, 36 -> 35, because the \
              fork child now becomes live through the reservation commit; U9-REAP1 MOVED the \
              faulted reap's `-> Dead` write into the claim and added its exact inverse, \
-             35 -> 36), the WA3A barrier's single write, and the WA3B barrier's two"
+             35 -> 36; U9-EXIT1 added the self-exit claim, its inverse and the rank-2 half of the \
+             joiner wake, 36 -> 39), the WA3A barrier's single write, and the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -119273,6 +119295,7 @@ mod stage199d_wa2b_wake_owner_census {
     const POLICY: &str = include_str!("task_policy_state.rs");
     const SPAWN_CORE: &str = include_str!("spawn_thread_core.rs");
     const REAP_CLAIM: &str = include_str!("reap_claim.rs");
+    const EXIT_CLAIM: &str = include_str!("exit_claim.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
@@ -119412,6 +119435,34 @@ mod stage199d_wa2b_wake_owner_census {
             "ipc_recv_with_optional_deadline",
             1,
             Verdict::IntoBlocked,
+        ),
+        // ── exit_claim.rs (3) — U9-EXIT1 §2 ─────────────────────────────────────────────────
+        //
+        // The claim and its inverse are CANNOT for the same reason the reap's pair is: the status
+        // that gates the write and the status the write replaces are ONE read, taken inside the
+        // acquisition that performs the write, behind a predicate (`status_is_self_exitable`) that
+        // admits `Running` and nothing else. A blocked task is refused by a precondition no caller
+        // can bypass.
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "claim_self_exit_locked",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "rollback_exit_claim_locked",
+            1,
+            Verdict::Cannot,
+        ),
+        // The joiner wake is a genuine CAN, classified as one rather than excused: it moves a task
+        // out of `Blocked(Join)`. It is the rank-2 half of `wake_joiners_for`, already CAN in
+        // thread_state.rs — the same class and the same body, now reachable from both owners.
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "wake_joiners_for_locked",
+            1,
+            Verdict::Can,
         ),
         // ── reap_claim.rs (2) — U9-REAP1 §2 ─────────────────────────────────────────────────
         //
@@ -119827,6 +119878,30 @@ mod stage199d_wa2b_wake_owner_census {
         // write is the CALL to that owner. The status write itself is unchanged, and the
         // ordering it encodes (publish, then Runnable) is exactly what moved with it.
         (
+            "src/kernel/boot/exit_claim.rs",
+            "claim_self_exit_locked",
+            "tcb.status",
+            "TaskStatus::Exited(code)",
+            "}",
+            "tcb.restart.token = Some(token);",
+        ),
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "rollback_exit_claim_locked",
+            "tcb.status",
+            "claim.status_before",
+            "};",
+            "tcb.restart.token = None;",
+        ),
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "wake_joiners_for_locked",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "if n < out.len() {",
+        ),
+        (
             "src/kernel/boot/ipc_state.rs",
             "rt_commit_receiver_runnable",
             "tcb.status",
@@ -120171,8 +120246,8 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            35,
-            "32 raw writes (U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
+            38,
+            "35 raw writes (U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
              write, 33 -> 32, when the fork moved onto the spawn reservation lifecycle): U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
              split form of \
@@ -120248,10 +120323,11 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            44,
+            47,
             "U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43; U9-REAP1 §2 moved \
              the faulted reap's `-> Dead` write into its claim and added the claim's exact \
-             inverse, 43 -> 44. \
+             inverse, 43 -> 44; U9-EXIT1 §2 added the self-exit claim, its exact inverse and the \
+             rank-2 half of the joiner wake, 44 -> 47. \
              36 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
              `commit_blocking_send_split`, U3 (203C)'s `wake_tid_to_runnable_split`, and U7 \
              (199E)'s `drain_send_timeout_post_work`"
@@ -120266,7 +120342,7 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            44,
+            47,
             "35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
              `fork_complete_post_clone`'s, 35 -> 34; U9-REAP1 §2 moved the faulted reap's \
              `-> Dead` write into its claim and added the claim's exact inverse, 34 -> 35) + 8 \
@@ -120603,7 +120679,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            44,
+            47,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -120641,7 +120717,12 @@ mod stage199d_wa2b_wake_owner_census {
             // become `Blocked(EndpointReceive)` in between; the claim reads and writes the status
             // in ONE acquisition behind `status_is_claimable`, and its inverse can only restore a
             // status that predicate already admitted.
-            (14, 18, 9, 2, 1)
+            // U9-EXIT1 §2: CAN 14 -> 15 and CANNOT 18 -> 20. The self-exit claim and its exact
+            // inverse are CANNOT for the same reason the reap pair is — one acquisition behind a
+            // predicate that admits only `Running`. `wake_joiners_for_locked` is a genuine CAN and
+            // is classified as one: it moves a task out of `Blocked(Join)`, and it is the rank-2
+            // half of `wake_joiners_for`, which is already CAN.
+            (15, 20, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -120740,6 +120821,25 @@ mod stage199d_wa2b_wake_owner_census {
             // There is no window between them for a task to become `Blocked`, which is exactly
             // what the base path — reading the status in the handler and writing it in the
             // cleanup — could not say.
+            // U9-EXIT1 §2: the self-exit claim, and the same closure argument as the reap's. The
+            // target is the CPU's own `current`, so it is not caller-selected at all; and the
+            // status the guard tests is the same read the write replaces, taken inside one
+            // acquisition, so there is no window in which the task could become `Blocked`.
+            (
+                "exit_claim.rs",
+                "claim_self_exit_locked",
+                "if !status_is_self_exitable(status_before) {",
+                "let status_before = tcb.status;",
+            ),
+            // Its inverse: the guard is the exact-incarnation match, and the value it writes is
+            // the claim's captured `status_before`, which `status_is_self_exitable` restricts to
+            // `Running`.
+            (
+                "exit_claim.rs",
+                "rollback_exit_claim_locked",
+                ".find(|tcb| tcb.tid.0 == claim.tid && tcb.asid == claim.asid)",
+                "matches!(status, TaskStatus::Running)",
+            ),
             (
                 "reap_claim.rs",
                 "claim_faulted_task_for_reap_locked",
@@ -120787,6 +120887,7 @@ mod stage199d_wa2b_wake_owner_census {
                 "thread_state.rs" => THREAD,
                 "spawn_thread_core.rs" => SPAWN_CORE,
                 "reap_claim.rs" => REAP_CLAIM,
+                "exit_claim.rs" => EXIT_CLAIM,
                 "runtime.rs" => RUNTIME,
                 other => panic!("unknown census source {other}"),
             };
@@ -157960,9 +158061,8 @@ mod u9reap1_reap_transaction {
     use super::*;
     use crate::kernel::boot::reap_claim::{
         ClosingReplyLink, ReapClaim, ReapRefusal, claim_faulted_task_for_reap_locked,
-        collect_process_asids_locked, owner_pid_of_locked,
-        process_has_live_threads_locked, rollback_reap_claim_locked, status_is_claimable,
-        task_asid_locked,
+        collect_process_asids_locked, owner_pid_of_locked, process_has_live_threads_locked,
+        rollback_reap_claim_locked, status_is_claimable, task_asid_locked,
     };
     use crate::kernel::boot::{ActiveTransferMapping, SenderWaiter, TransferEnvelope};
     use crate::kernel::capabilities::{CNodeId, CapObject};

@@ -1219,13 +1219,11 @@ impl SharedKernel {
 
     /// U9-EXIT1 §3 — report a task exit to PM: endpoint enqueue (rank 3), then wake.
     pub(crate) fn report_task_exit_to_pm_split(&self, cpu: CpuId, tid: u64, code: u64) -> bool {
-        let Some(endpoint_idx) =
-            self.with_fault_split_mut(|faults| faults.pm_task_exit_endpoint)
+        let Some(endpoint_idx) = self.with_fault_split_mut(|faults| faults.pm_task_exit_endpoint)
         else {
             return false;
         };
-        let payload =
-            yarm_ipc_abi::process_abi::KernelPmTaskExitedPayload::new(tid, code).encode();
+        let payload = yarm_ipc_abi::process_abi::KernelPmTaskExitedPayload::new(tid, code).encode();
         let Ok(msg) = crate::kernel::ipc::Message::with_header(
             0,
             yarm_ipc_abi::process_abi::KERNEL_OP_PM_TASK_EXITED,
@@ -2099,6 +2097,51 @@ impl SharedKernel {
                 .map(|tcb| matches!(tcb.status, crate::kernel::task::TaskStatus::Faulted))
                 .unwrap_or(false)
         })
+    }
+
+    /// U9-EXIT1 §3 — reverify one EXIT deferral, by exact incarnation.
+    ///
+    /// Deliberately not shaped like its two neighbours. `futex_wait_reverify_blocked` and
+    /// `terminal_fault_reverify_faulted` both end in `.unwrap_or(false)`, so a MISSING TCB
+    /// reverifies as *not ok* — correct for them, because a blocked or faulted task must still
+    /// exist. An exiting task need not: it can legitimately have been joined or reaped between the
+    /// claim and this drain, and absence then means the exit SUCCEEDED. Reading absence as failure
+    /// would strand the CPU with `current` already cleared and nothing selected.
+    ///
+    /// So absence is represented explicitly rather than inferred — `Removed` is a distinct verdict
+    /// from `Terminal`, and only `Contradicted` (present and NOT terminal, i.e. something
+    /// resurrected a claimed task) refuses. Neither neighbouring predicate is loosened.
+    pub(crate) fn exit_reverify_terminal(
+        &self,
+        tid: u64,
+        asid: Option<crate::kernel::vm::Asid>,
+    ) -> crate::kernel::boot::exit_claim::ExitDrainVerdict {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::exit_claim::exit_drain_verdict_locked(tcbs, tid, asid)
+        })
+    }
+
+    /// The drain's boolean form: is this outgoing task's exit deferral still owed and sound?
+    ///
+    /// `Terminal` and `Removed` both mean "the advance is owed"; `Contradicted` is the only
+    /// refusal, and it is the one that must never happen after a claim.
+    pub(crate) fn exit_reverify_ok(&self, tid: u64) -> bool {
+        use crate::kernel::boot::exit_claim::ExitDrainVerdict as V;
+        let asid = self.task_asid_opt_split_read(tid);
+        match self.exit_reverify_terminal(tid, asid) {
+            V::Terminal => true,
+            V::Removed => {
+                crate::yarm_log!("EXIT_TASK_DRAIN_REVERIFY_REMOVED tid={}", tid);
+                true
+            }
+            V::Contradicted => {
+                crate::yarm_log!(
+                    "EXIT_TASK_DRAIN_REVERIFY_CONTRADICTED tid={} result=fail",
+                    tid
+                );
+                false
+            }
+        }
     }
 
     pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {

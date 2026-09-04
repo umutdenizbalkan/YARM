@@ -54,12 +54,12 @@ pub(crate) use ipc_state::{
     enqueue_reply_into_endpoint_locked, publish_recv_waiter_locked, reclaim_reply_authority_with,
     release_reply_terminal_locked, reserve_direct_reply_record_locked,
 };
+pub(crate) mod exit_claim;
 mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;
 pub(crate) mod process_cnode_txn;
 pub(crate) mod provisional_cap;
-pub(crate) mod exit_claim;
 pub(crate) mod reap_claim;
 mod reply_cap_rank_split;
 mod restart_state;
@@ -1143,10 +1143,73 @@ pub(crate) fn futex_wait_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
 }
 
 /// Stage 192A: clear the FutexWait dispatch deferral for `cpu`.
+// ── U9-EXIT1 §3: the EXIT half of the queue-advance deferral ────────────────────────
+//
+// The exit route reserves the EXISTING queue-advance deferral — there is no second selector, no
+// second scheduler policy and no second drain. What it additionally publishes is one per-CPU cell
+// naming the exact `{tid, asid}` incarnation that is exiting, and it exists for two reasons that a
+// bare TID could not serve:
+//
+//   * **the drain must reverify differently.** A FutexWait outgoing must still be
+//     `Blocked(Futex)` and a faulted one must still be `Faulted`, so both of those predicates read
+//     a missing TCB as failure. An exiting task may legitimately have been joined or reaped in the
+//     meantime, and absence then means the exit SUCCEEDED. The cell is what lets the drain pick the
+//     right question instead of loosening the other two.
+//
+//   * **the exiting frame must not be saved.** The post-`QueueAdvanceCommitted` bridges capture the
+//     outgoing task's user context into its TCB so a later resume restarts at the right pc. An
+//     exiting task is never resumed, so capturing is at best pointless and at worst records a
+//     corpse's registers. The cell is what tells the capture site to skip.
+//
+// Per-CPU, single-shot, and generation-bearing by construction (`{tid, asid}`, never a bare TID).
+static EXIT_QUEUE_ADVANCE_OUTGOING: [crate::kernel::lock::SpinLockIrq<
+    Option<(u64, Option<Asid>)>,
+>; crate::kernel::scheduler::MAX_CPUS] =
+    [const { crate::kernel::lock::SpinLockIrq::new(None) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Publish the exiting incarnation for this CPU's queue-advance deferral. Returns `false` WITHOUT
+/// overwriting when one is already pending — a duplicate is a bug, not last-writer-wins.
+#[must_use]
+pub(crate) fn exit_queue_advance_publish(cpu_idx: usize, tid: u64, asid: Option<Asid>) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    let mut slot = EXIT_QUEUE_ADVANCE_OUTGOING[cpu_idx].lock();
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some((tid, asid));
+    true
+}
+
+/// Peek the exiting incarnation without consuming it. The drain reads this to choose its reverify
+/// and to decide whether to skip the outgoing-context capture.
+#[must_use]
+pub(crate) fn exit_queue_advance_pending(cpu_idx: usize) -> Option<(u64, Option<Asid>)> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    *EXIT_QUEUE_ADVANCE_OUTGOING[cpu_idx].lock()
+}
+
+/// Clear the cell. Called on the pre-mutation release path and by the drain once it has consumed
+/// the deferral, so a later trap can never act on a stale exit.
+pub(crate) fn exit_queue_advance_clear(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        *EXIT_QUEUE_ADVANCE_OUTGOING[cpu_idx].lock() = None;
+    }
+}
+
 pub(crate) fn futex_wait_dispatch_clear(cpu_idx: usize) {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return;
     }
+    // U9-EXIT1 §3: the exit cell is cleared with the deferral it annotates, in one place rather
+    // than at each of the ten drain tails that release the deferral. The two are paired by
+    // construction — the exit route publishes the cell only while holding this deferral, and the
+    // cell means nothing without it — so clearing them together is what stops a stale exit
+    // identity outliving the advance it described and mis-steering the NEXT trap's reverify.
+    exit_queue_advance_clear(cpu_idx);
     FUTEX_WAIT_DISPATCH_OUTGOING[cpu_idx].store(u64::MAX, core::sync::atomic::Ordering::Release);
     FUTEX_WAIT_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }

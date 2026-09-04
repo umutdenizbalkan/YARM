@@ -142,6 +142,10 @@ pub(crate) trait ExitOwners {
     fn reserve_queue_advance(&mut self, cpu: CpuId, outgoing: u64) -> bool;
     /// Release it. Only ever called on a pre-mutation refusal path.
     fn release_queue_advance(&mut self, cpu: CpuId);
+    /// Name the exact exiting incarnation for this CPU's deferral, so the drain reverifies with
+    /// the exit predicate and the bridges skip capturing a corpse's frame. `false` means one is
+    /// already pending, which is a duplicate and must refuse.
+    fn publish_exit_deferral(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool;
 
     // ── rank 3 — IPC (SHARED with U9-REAP1) ─────────────────────────────────────────────────
     fn revoke_reply_caps_for_caller(
@@ -198,7 +202,9 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
     }
 
     // (2) rank 1 — the self is defined by the scheduler, never by an argument.
-    let tid = owners.current_tid_on_cpu(cpu).ok_or(ExitRefusal::NoCurrent)?;
+    let tid = owners
+        .current_tid_on_cpu(cpu)
+        .ok_or(ExitRefusal::NoCurrent)?;
 
     // (3) rank 2 — the exiting thread's own facts. Every refusal below is free.
     let preflight = owners.exit_preflight(tid)?;
@@ -269,6 +275,17 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
             return Err(refusal);
         }
     };
+
+    // The deferral is now attributable to an exact incarnation. Published AFTER the claim so the
+    // cell can never name a task that did not actually exit, and BEFORE any cleanup so the drain
+    // cannot observe a reserved-but-unattributed advance.
+    if !owners.publish_exit_deferral(cpu, tid, preflight.asid) {
+        crate::yarm_log!(
+            "EXIT_TASK_DUPLICATE_DEFERRAL tid={} cpu={} result=fail",
+            tid,
+            cpu.0
+        );
+    }
 
     let mut outcome = ExitOutcome {
         claim,
@@ -426,8 +443,9 @@ impl ExitOwners for SharedExitOwners<'_> {
             .with_task_tcbs_split_mut(|tcbs| body::rollback_exit_claim_locked(tcbs, claim))
     }
     fn server_reply_link_present(&self, tid: u64, asid: Asid) -> bool {
-        self.shared
-            .with_task_tcbs_split_mut(|tcbs| body::server_reply_link_present_locked(tcbs, tid, asid))
+        self.shared.with_task_tcbs_split_mut(|tcbs| {
+            body::server_reply_link_present_locked(tcbs, tid, asid)
+        })
     }
     fn take_server_reply_link(&mut self, tid: u64, asid: Asid) -> Option<ServerReplyLink> {
         self.shared
@@ -471,7 +489,11 @@ impl ExitOwners for SharedExitOwners<'_> {
         crate::kernel::boot::futex_wait_dispatch_try_defer(cpu.0 as usize, outgoing)
     }
     fn release_queue_advance(&mut self, cpu: CpuId) {
+        // `futex_wait_dispatch_clear` clears the exit cell too — the two are released as one.
         crate::kernel::boot::futex_wait_dispatch_clear(cpu.0 as usize);
+    }
+    fn publish_exit_deferral(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
+        crate::kernel::boot::exit_queue_advance_publish(cpu.0 as usize, tid, asid)
     }
 
     fn revoke_reply_caps_for_caller(

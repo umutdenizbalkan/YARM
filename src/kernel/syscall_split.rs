@@ -718,6 +718,16 @@ pub(crate) fn try_split_dispatch_into_frame(
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
+    // U9-EXIT1 §5 — the FOURTH switching class, and the only one that never returns at all. It is
+    // tried here for the same reason the three above it are: the NR-only whitelist's contract is
+    // that every class on it may be early-returned through the caller's own frame, and an exiting
+    // task has no frame to return through. It answers `QueueAdvanceCommitted` so the EXISTING
+    // post-lock drain — the one FutexWait and the terminal fault already share — selects and
+    // applies the next context.
+    match try_split_exit_current_task(shared, cpu) {
+        SplitDispatchDisposition::NotHandled => {}
+        handled => return handled,
+    }
     match try_split_dispatch_nonswitching_into_frame(shared, cpu, frame) {
         None => SplitDispatchDisposition::NotHandled,
         Some(result) => SplitDispatchDisposition::Complete(result),
@@ -3814,6 +3824,74 @@ fn spawn_owners_for(
 ///
 /// The child's return lane is not set here. It was installed by the publication, from
 /// `fork_child_context`, which is the single owner of that decision on every path.
+/// U9-EXIT1 §5 — NR 16 `ExitCurrentTask`, before the terminal acquisition.
+///
+/// The only admitted class that cannot return through its own frame. It reserves the existing
+/// queue-advance deferral before anything irreversible, claims and removes itself, performs the
+/// cleanup, and answers `QueueAdvanceCommitted` so the EXISTING post-lock drain selects and applies
+/// the next context. No second selector, no second scheduler policy, no second drain.
+///
+/// Every refusal is pre-mutation and returns `NotHandled`, so the broad handler produces the exact
+/// answer it always did — including its `WouldBlock` decline when a reply is owed and no deferred
+/// slot is free, which this route reproduces rather than reinterprets. After the claim there is no
+/// fallback: re-entering the broad handler would mint a second restart token, publish a second
+/// disposition and re-sweep records this transaction already retired.
+fn try_split_exit_current_task(shared: &SharedKernel, cpu: CpuId) -> SplitDispatchDisposition {
+    use crate::kernel::boot::exit_claim::ExitRefusal;
+    use crate::kernel::syscall::exit_txn::{SharedExitOwners, run_exit_transaction};
+    type D = SplitDispatchDisposition;
+
+    let mut owners = SharedExitOwners { shared };
+    match run_exit_transaction(
+        &mut owners,
+        cpu,
+        crate::kernel::syscall::EXIT_STATUS_SELF_REQUESTED,
+    ) {
+        Ok(outcome) => {
+            let claim = &outcome.claim;
+            // The same three markers the broad handler emits, in the broad handler's causal order,
+            // so an observer sees one vocabulary for one syscall regardless of route.
+            crate::yarm_log!(
+                "EXIT_TASK_SYSCALL_DISPATCHED nr={} tid={} asid={} target=self result=ok",
+                crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR,
+                claim.tid(),
+                claim.sweep_asid().0
+            );
+            crate::yarm_log!(
+                "EXIT_TASK_LIFECYCLE_TRANSITION tid={} asid={} syscall_returns=0 result=ok",
+                claim.tid(),
+                claim.sweep_asid().0
+            );
+            crate::yarm_log!(
+                "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=exit_current_task_switch_required tid={} cpu={}",
+                claim.tid(),
+                cpu.0
+            );
+            D::QueueAdvanceCommitted
+        }
+        Err(refusal) if refusal.may_fall_back() => {
+            crate::yarm_log!(
+                "EXIT_TASK_SPLIT_DECLINED cpu={} reason={} task_mutation=none",
+                cpu.0,
+                refusal.marker()
+            );
+            D::NotHandled
+        }
+        Err(refusal) => {
+            // `current` was already cleared when this was discovered, so the trap cannot re-enter
+            // the broad dispatcher. Fail closed: the deferral is released, nothing is resumed, and
+            // the existing terminal-idle settlement runs.
+            debug_assert!(matches!(refusal, ExitRefusal::VictimChanged));
+            crate::yarm_log!(
+                "EXIT_TASK_SPLIT_FAILED_CLOSED cpu={} reason={}",
+                cpu.0,
+                refusal.marker()
+            );
+            D::Complete(Ok(()))
+        }
+    }
+}
+
 /// U9-REAP1 §4 — NR 31 `ReapFaultedTask`, before the terminal acquisition.
 ///
 /// Gate for gate the broad handler: PM-only, never self-targeting, and only a terminal task. The

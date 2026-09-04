@@ -778,13 +778,25 @@ pub fn handle_trap_entry_shared(
             // deferral carries rather than on any ambient "current" lookup, because the drain
             // is about to overwrite the live frame with the INCOMING task's context.
             if matches!(disposition, SplitDispatchDisposition::QueueAdvanceCommitted) {
-                finalize_split_handled_syscall(
-                    shared,
-                    cpu,
-                    entering,
-                    frame,
-                    SplitFinalizeReason::PublishedTransition,
-                );
+                // U9-EXIT1 §3/§5: an EXITING outgoing gets neither of the two steps below.
+                //
+                // `finalize_split_handled_syscall` commits a syscall RESULT and an advanced PC
+                // into the outgoing incarnation, and the capture saves its register file — both
+                // exist so a task that will be RESUMED observes the right thing. An exited task is
+                // never resumed, and writing a return value or a saved frame into a corpse is
+                // exactly what §5 forbids. NR 16 is already absent from the finalize gate's NR
+                // list, so this is belt and braces on the write and the operative skip on the
+                // capture.
+                let exiting = crate::kernel::boot::exit_queue_advance_pending(cpu_idx).is_some();
+                if !exiting {
+                    finalize_split_handled_syscall(
+                        shared,
+                        cpu,
+                        entering,
+                        frame,
+                        SplitFinalizeReason::PublishedTransition,
+                    );
+                }
                 // 199D-DW2: read the identity from whichever deferral the route ACTUALLY
                 // published, not from FutexWait's alone. A blocking receive (NR 2/NR 5) and a
                 // blocking send publish the D2-RECV / D2-SEND deferrals, so asking only
@@ -797,6 +809,7 @@ pub fn handle_trap_entry_shared(
                     .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx))
                     .or_else(|| crate::kernel::boot::d2_send_dispatch_outgoing(cpu_idx));
                 let captured = outgoing
+                    .filter(|_| !exiting)
                     .map(|t| shared.capture_outgoing_user_context_split(t, frame))
                     .unwrap_or(false);
                 crate::yarm_log!(
@@ -1635,7 +1648,16 @@ pub fn handle_trap_entry_shared(
         crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_BEGIN cpu={}", cpu.0);
         let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
         let reverify_ok = outgoing
-            .map(|t| shared.futex_wait_reverify_blocked(t))
+            // U9-EXIT1 §3: a THIRD outgoing state joins the two this drain already admits, and
+            // each is still verified exactly. A FutexWait caller is `Blocked(Futex)`; a terminally
+            // faulted task is `Faulted`; an EXITED task is `Exited|Dead` — or legitimately gone,
+            // which `exit_reverify_ok` represents explicitly rather than reading absence as
+            // failure. Neither existing predicate is loosened.
+            .map(|t| {
+                shared.futex_wait_reverify_blocked(t)
+                    || crate::kernel::boot::exit_queue_advance_pending(cpu_idx)
+                        .is_some_and(|(et, _)| et == t && shared.exit_reverify_ok(t))
+            })
             .unwrap_or(false);
         if reverify_ok {
             // Queue-advancing dequeue (emits QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK).
@@ -1776,6 +1798,11 @@ pub fn handle_trap_entry_shared(
                 .map(|t| {
                     shared.futex_wait_reverify_blocked(t)
                         || shared.terminal_fault_reverify_faulted(t)
+                        // U9-EXIT1 §3: the third admitted outgoing state. Verified exactly, and
+                        // by its OWN predicate — an exiting task may legitimately be gone by now,
+                        // which the two above must continue to treat as failure.
+                        || crate::kernel::boot::exit_queue_advance_pending(cpu_idx)
+                            .is_some_and(|(et, _)| et == t && shared.exit_reverify_ok(t))
                 })
                 .unwrap_or(false);
             if reverify_ok {
@@ -2690,6 +2717,17 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // the caller's address space, so the caller is still current when the trap returns and its
         // return lane is written into its own frame.
         || raw_nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
+        // U9-EXIT1 §5: ExitCurrentTask (NR 16). Listed for the same reason as the classes above —
+        // the route is architecture-neutral but reachable here only for a listed NR, and an
+        // unlisted one keeps `nr = 0` so the dispatcher declines. NR 16 takes NO arguments, so the
+        // import carries everything it needs by construction.
+        //
+        // It is deliberately NOT added to the `split_finalize_handled_syscall` gate below. That
+        // gate commits a syscall RESULT into the entering incarnation, and an exited task must
+        // never be written a return value or an advanced PC — §5's "no syscall completion written
+        // to the dead task". FutexWait needs it because its blocked caller will be resumed; an
+        // exiting task never is.
+        || raw_nr == crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

@@ -400,7 +400,7 @@ pub(crate) fn server_reply_link_present_locked(
     server_tid: u64,
     server_asid: Asid,
 ) -> bool {
-    tcbs.iter()
-        .flatten()
-        .any(|t| t.tid.0 == server_tid && t.asid == Some(server_asid) && t.server_reply_link.is_some())
+    tcbs.iter().flatten().any(|t| {
+        t.tid.0 == server_tid && t.asid == Some(server_asid) && t.server_reply_link.is_some()
+    })
 }

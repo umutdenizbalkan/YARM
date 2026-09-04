@@ -4045,6 +4045,7 @@ waiter was published**. It is the exact inverse of `recv_block_phase_b_split` an
 rank order (task 2, then scheduler 1). It cannot act on a receiver that any sender can observe,
 because no waiter exists for it to be found through.
 | `capability_lifecycle_state.rs` | `wake_destroyed_notification_waiter_split` | 1 |
+| `exit_claim.rs` | `wake_joiners_for_locked` | 1 |
 
 **Layer 2 — logical origins**, i.e. every direct production caller of each helper writer:
 
