@@ -46,7 +46,6 @@
 //!    U9-QA deferral is published and the EXISTING drain selects and applies somebody else;
 //! 3. [`ClearedCurrentToken::fatal`] — neither could be proven. Diverges.
 
-use super::*;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::scheduler::TaskPriority;
 use crate::kernel::vm::Asid;
@@ -136,18 +135,6 @@ impl Drop for ClearedCurrentToken {
 }
 
 impl ClearedCurrentToken {
-    /// The CPU whose current slot is empty.
-    pub(crate) const fn cpu(&self) -> CpuId {
-        self.cpu
-    }
-    /// The incarnation that was removed from it.
-    pub(crate) const fn tid(&self) -> u64 {
-        self.tid
-    }
-    pub(crate) const fn asid(&self) -> Option<Asid> {
-        self.asid
-    }
-
     /// Consume without running `Drop`. Private: every public exit from the token goes through one
     /// of the three settlements below.
     fn consume(self) -> (CpuId, u64, Option<Asid>, TaskPriority) {
@@ -210,7 +197,14 @@ impl ClearedCurrentToken {
         owners: &mut O,
         authority: AdvanceAuthority<'_>,
     ) -> ClearedCurrentSettlement {
-        let (cpu, tid, asid, _) = (self.cpu, self.tid, self.asid, self.priority);
+        let (cpu, tid, asid) = (self.cpu, self.tid, self.asid);
+        // The authority is not decoration: a claim may only license an advance past the exact
+        // incarnation it claimed. Reading it here is what makes `Claimed` unable to stand in for
+        // some other victim's settlement.
+        if let AdvanceAuthority::Claimed(claim) = authority {
+            debug_assert_eq!(claim.tid(), tid, "a claim licenses only its own victim");
+            debug_assert_eq!(claim.asid(), asid, "and only its own incarnation");
+        }
         let published = owners.publish_advance_for(cpu, tid, asid);
         crate::yarm_log!(
             "CLEARED_CURRENT_ADVANCE cpu={} tid={} asid={} authority={} published={} result=ok",
