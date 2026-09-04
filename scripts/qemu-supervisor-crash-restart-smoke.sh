@@ -169,9 +169,10 @@ echo "[info] qemu command: ${QEMU_CMD[*]}"
 # assertion below still runs at full strength on the boot that does start the chain; the stall
 # detector is deliberately narrow (a fault was delivered AND the supervisor looked up nothing), so
 # a chain that starts and then breaks is a real failure and is reported as one.
-BOOT_ATTEMPTS=${BOOT_ATTEMPTS:-1}
 if [[ "$ARCH_ORACLE" == "reap_chain" ]]; then
   BOOT_ATTEMPTS=${BOOT_ATTEMPTS:-4}
+else
+  BOOT_ATTEMPTS=${BOOT_ATTEMPTS:-1}
 fi
 boot_attempt=0
 stalled_boots=0
