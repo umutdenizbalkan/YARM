@@ -355,6 +355,21 @@ pub(crate) fn page_fault_route_for(arch: &str, class: PageFaultClass) -> PageFau
     match (arch, class) {
         // Live-witnessed at base: 2 x private_copy COW faults under VM_COW=1.
         ("x86_64", PageFaultClass::CowCandidate) => PageFaultRoute::SplitCow,
+        // U9-A64-COW2 §3/§4 — live-witnessed here for the first time: 6 x private_copy COW
+        // faults per boot with parent and child both completing the userspace isolation check.
+        //
+        // The witness could not exist before. AArch64's post-Fork COW workload died at the FIRST
+        // recovered fault, because `apply_restored_thread_state`'s argument mirror zeroed x0..x5
+        // on every non-syscall resume (U9-A64-COW2 §1/§2). With that repaired the class is
+        // ordinary, and it needs no second policy: the transaction, its refusal set and its
+        // rollback are architecture-neutral, and the two arch-specific obligations are already
+        // discharged. `arch_map_page` ends in AArch64's own
+        // `dsb ishst; tlbi vaae1is; dsb ish; isb` — an inner-shareable BROADCAST plus completion
+        // plus context synchronization — so by the time the transaction returns the new
+        // translation is visible domain-wide and this PE is synchronized, and the `eret` to EL0
+        // is itself context-synchronizing. `complete_unmap_shootdown_split` therefore gates only
+        // the OLD-frame reclaim on AArch64, which is exactly the fail-safe direction.
+        ("aarch64", PageFaultClass::CowCandidate) => PageFaultRoute::SplitCow,
         // Live-witnessed at base: 1 x terminal user read at 0x0 in the core profile.
         ("aarch64", PageFaultClass::TerminallyUnhandled) => PageFaultRoute::SplitTerminal,
         // EVERY demand candidate stays broad, on every architecture: zero live witnesses.
