@@ -49,12 +49,50 @@ use crate::kernel::scheduler::CpuId;
 use crate::kernel::task::{RestartToken, TaskStatus, ThreadControlBlock, ThreadDetachState};
 use crate::kernel::vm::Asid;
 
-/// Why a self-exit could not be claimed. Every variant is produced strictly BEFORE any mutation,
-/// so a refusal leaves the whole kernel byte-for-byte unchanged and the broad handler may run.
+/// U9-EXIT2 §1/§4 — what the ROUTE must do with a failure.
+///
+/// Derived from source classification, and exhaustive by construction: there is deliberately no
+/// "hand it back to the broad dispatcher" variant, because after NR 16 is recognized no production
+/// arm may fall through to the terminal acquisition this stage exists to retire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitDisposition {
+    /// **Class B** — mechanically impossible at a userspace NR 16 boundary, proven from source by
+    /// the U9-EXIT2 §5 guards. Nothing was mutated. Settled as a typed invariant error, the same
+    /// way `try_split_ipc_send_into_frame` settles a `Kernel` capability and a `Synchronous`
+    /// endpoint: an impossible class is refused with a typed error rather than a fallback, because
+    /// a fallback would be the one edge the stage exists to remove and an edge no trap can take.
+    ImpossibleState,
+    /// **Class C** — a real, userspace-visible condition the broad handler answers with a typed
+    /// error. NR 16 has exactly one member: a task that still owes a reply and finds no free
+    /// deferred server-death slot is `WouldBlock`, unchanged, and still Running.
+    InvalidPreLock,
+    /// **Class D** — discovered after `current` was cleared. The task is off this CPU and must
+    /// never be resumed; the route fails closed and the existing terminal-idle settlement runs.
+    FailClosed,
+}
+
+/// A refusal, together with the settlement the route owes it. Produced only by
+/// [`crate::kernel::syscall::exit_txn::run_exit_transaction`], which is the only code that knows
+/// whether the point of no return had been passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExitFailure {
+    pub(crate) refusal: ExitRefusal,
+    pub(crate) disposition: ExitDisposition,
+}
+
+/// Why a self-exit could not be claimed.
+///
+/// U9-EXIT2 §1 split the three conditions U9-EXIT1 collapsed into `NoCurrent`. They have different
+/// source classifications and different impossibility arguments, and a disposition table cannot be
+/// read — let alone checked — while three arms share one name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExitRefusal {
+    /// This CPU is not running the post-lock drainer, or is not the authoritative dispatch CPU.
+    RouteNotAdmitted,
     /// This CPU has no resolvable current task, so there is no self to exit.
     NoCurrent,
+    /// Another route already holds this CPU's ONE queue-advance deferral.
+    QueueAdvanceHeld,
     /// No TCB carries this TID.
     TaskGone,
     /// The TCB's ASID is not the one the claim was resolved against: a different incarnation now
@@ -83,7 +121,9 @@ impl ExitRefusal {
     /// A short stable name for the wire.
     pub(crate) const fn marker(self) -> &'static str {
         match self {
+            Self::RouteNotAdmitted => "route_not_admitted",
             Self::NoCurrent => "no_current",
+            Self::QueueAdvanceHeld => "queue_advance_held",
             Self::TaskGone => "task_gone",
             Self::IdentityChanged => "identity_changed",
             Self::NotRunning => "not_running",
@@ -94,24 +134,36 @@ impl ExitRefusal {
         }
     }
 
-    /// Does this refusal mean "the broad handler must produce the answer", rather than "the exit
-    /// happened elsewhere"?
+    /// U9-EXIT2 §1 — the settlement this refusal owes, given where the transaction was when it
+    /// was produced.
     ///
-    /// Every variant here is pre-mutation, so every one of them may fall back. The distinction is
-    /// kept explicit anyway: a future variant that is NOT safe to fall back from must be forced to
-    /// say so here rather than inherit permission by default.
-    pub(crate) const fn may_fall_back(self) -> bool {
+    /// `past_point_of_no_return` is true once `current` has been cleared. From that instant the
+    /// trap can neither re-enter the broad dispatcher nor return through the caller's frame, so
+    /// EVERY refusal is class D regardless of what it says — which is precisely the defect
+    /// U9-EXIT1 shipped: a claim that lost the race between the preflight and the linearization
+    /// point produced `NotRunning`, whose `may_fall_back()` was `true`, and the route handed a
+    /// CPU with `current` already cleared back to `handle_exit_current_task`.
+    ///
+    /// Before that point the split is by source classification, not by convenience:
+    /// `DeferredCapacity` is the one real condition (class C); everything else names a state that
+    /// cannot exist at a userspace NR 16 boundary (class B).
+    pub(crate) const fn disposition(self, past_point_of_no_return: bool) -> ExitDisposition {
+        if past_point_of_no_return {
+            return ExitDisposition::FailClosed;
+        }
         match self {
-            Self::NoCurrent
+            Self::DeferredCapacity => ExitDisposition::InvalidPreLock,
+            Self::RouteNotAdmitted
+            | Self::NoCurrent
+            | Self::QueueAdvanceHeld
             | Self::TaskGone
             | Self::IdentityChanged
             | Self::NotRunning
             | Self::DetachedThread
             | Self::RobustFutexList
-            | Self::DeferredCapacity => true,
-            // The scheduler already cleared `current` before this was discovered, so the trap
-            // cannot re-enter the broad dispatcher — it must fail closed instead.
-            Self::VictimChanged => false,
+            // Reached only after `current` was cleared, so the guard above already answered; the
+            // arm exists so the match stays exhaustive without a wildcard.
+            | Self::VictimChanged => ExitDisposition::ImpossibleState,
         }
     }
 }

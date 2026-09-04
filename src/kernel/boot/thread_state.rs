@@ -2297,6 +2297,17 @@ impl KernelState {
         Ok(self.thread_tls_base(tid))
     }
 
+    /// U9-EXIT2 §2 — the ONLY writer of `ThreadDetachState::Detached`, and it has no production
+    /// caller: no syscall reaches it, no boot path calls it, and every TCB constructor produces
+    /// `Joinable`. So a `Detached` task cannot exist in a production kernel, which is what makes
+    /// the self-exit route's `DetachedThread` refusal a class-B impossibility rather than a
+    /// population it declines to serve.
+    ///
+    /// The `cfg` is the proof, not a comment about it: the freestanding builds do not compile this
+    /// function at all, so a future production path that tries to detach a thread breaks the build
+    /// and is forced to answer §2's real question — what the smallest no-allocation terminal
+    /// cleanup for a detached self-exit would be — instead of silently reintroducing a broad edge.
+    #[cfg(any(test, feature = "hosted-dev"))]
     pub fn mark_thread_detached(&mut self, tid: u64) -> Result<(), KernelError> {
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
@@ -2363,6 +2374,17 @@ impl KernelState {
         Ok(Some(exit_code))
     }
 
+    /// U9-EXIT2 §3 — the ONLY writer of the robust-futex registry, and it has no production
+    /// caller: there is no `SetRobustFutexHead` syscall, no boot path registers a list, and the
+    /// fork publication explicitly CLEARS the child's slot. So the registry is empty in a
+    /// production kernel, `has_robust_futex_list` is always false, and the broad `exit_task`'s
+    /// robust-wake loop is unreachable.
+    ///
+    /// As with `mark_thread_detached`, the `cfg` is the proof: a future production registration
+    /// path breaks the freestanding build and must then answer §3's real question — one lock
+    /// domain, one no-allocation owner, owner-death publication outside every lock, one wake —
+    /// rather than inheriting a refusal that quietly routes it back to the broad dispatcher.
+    #[cfg(any(test, feature = "hosted-dev"))]
     pub fn set_robust_futex_head(
         &mut self,
         tid: u64,

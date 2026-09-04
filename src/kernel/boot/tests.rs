@@ -159071,9 +159071,9 @@ mod u9reap1_reap_transaction {
 mod u9exit1_self_exit_transaction {
     use super::*;
     use crate::kernel::boot::exit_claim::{
-        ExitClaim, ExitDrainVerdict, ExitPreflight, ExitRefusal, claim_self_exit_locked,
-        exit_drain_verdict_locked, exit_preflight_locked, rollback_exit_claim_locked,
-        status_is_self_exitable, wake_joiners_for_locked,
+        ExitClaim, ExitDisposition, ExitDrainVerdict, ExitFailure, ExitPreflight, ExitRefusal,
+        claim_self_exit_locked, exit_drain_verdict_locked, exit_preflight_locked,
+        rollback_exit_claim_locked, status_is_self_exitable, wake_joiners_for_locked,
     };
     use crate::kernel::boot::reap_claim::ClosingReplyLink;
     use crate::kernel::boot::{SenderWaiter, ServerDeathWorkReservation};
@@ -159108,6 +159108,10 @@ mod u9exit1_self_exit_transaction {
         QueueAdvanceTaken,
         /// The server-death queue is full.
         NoDeathCapacity,
+        /// The capacity PROBE says a slot is free and the RESERVE then fails — arm 9 of the
+        /// U9-EXIT2 §1 table, the one step where the two can disagree. Still pre-mutation, so it
+        /// must release the queue advance it already took and settle exactly as the probe does.
+        DeathReserveLosesRace,
         /// The reverse link is reported present by the pre-mutation probe but is gone by the time
         /// it is taken — the reservation must then be released rather than held.
         LinkVanishes,
@@ -159313,7 +159317,10 @@ mod u9exit1_self_exit_transaction {
 
         fn reserve_server_death(&mut self, cpu: CpuId) -> Option<ServerDeathWorkReservation> {
             self.note("reserve_server_death");
-            if self.inject == Inject::NoDeathCapacity || self.death_reserved >= self.death_slots {
+            if self.inject == Inject::NoDeathCapacity
+                || self.inject == Inject::DeathReserveLosesRace
+                || self.death_reserved >= self.death_slots
+            {
                 return None;
             }
             self.death_reserved += 1;
@@ -159450,6 +159457,15 @@ mod u9exit1_self_exit_transaction {
     const CPU: CpuId = CpuId(0);
     const CODE: u64 = 7;
 
+    /// The settlement a class-B refusal owes: pre-mutation, and a state the §5 guards prove
+    /// cannot exist at a userspace NR 16 boundary.
+    const fn impossible(refusal: ExitRefusal) -> ExitFailure {
+        ExitFailure {
+            refusal,
+            disposition: ExitDisposition::ImpossibleState,
+        }
+    }
+
     /// One Running self on CPU 0, one sibling, one joiner blocked on the self.
     fn three_task_world() -> Harness {
         let mut joiner = tcb(3, 1, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
@@ -159532,8 +159548,9 @@ mod u9exit1_self_exit_transaction {
         let mut h = three_task_world();
         h.inject = Inject::QueueAdvanceTaken;
         let before = h.snapshot();
-        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
-        assert!(refusal.may_fall_back());
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(failure.refusal, ExitRefusal::QueueAdvanceHeld);
+        assert_eq!(failure.disposition, ExitDisposition::ImpossibleState);
         assert_eq!(h.snapshot(), before, "a refusal must mutate nothing");
         assert_eq!(h.count("clear_current"), 0);
         assert_eq!(h.count("claim_self_exit"), 0);
@@ -159549,7 +159566,7 @@ mod u9exit1_self_exit_transaction {
         let before = h.snapshot();
         assert_eq!(
             run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
-            ExitRefusal::NoCurrent
+            impossible(ExitRefusal::RouteNotAdmitted)
         );
         assert_eq!(h.snapshot(), before);
 
@@ -159558,7 +159575,7 @@ mod u9exit1_self_exit_transaction {
         let before = h.snapshot();
         assert_eq!(
             run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
-            ExitRefusal::NoCurrent
+            impossible(ExitRefusal::NoCurrent)
         );
         assert_eq!(h.snapshot(), before);
 
@@ -159569,7 +159586,7 @@ mod u9exit1_self_exit_transaction {
         let before = h.snapshot();
         assert_eq!(
             run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
-            ExitRefusal::DetachedThread
+            impossible(ExitRefusal::DetachedThread)
         );
         assert_eq!(h.snapshot(), before);
 
@@ -159584,7 +159601,7 @@ mod u9exit1_self_exit_transaction {
             let before = h.snapshot();
             assert_eq!(
                 run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
-                ExitRefusal::NotRunning,
+                impossible(ExitRefusal::NotRunning),
                 "status {status:?} must not be self-exitable"
             );
             assert_eq!(h.snapshot(), before);
@@ -159596,7 +159613,7 @@ mod u9exit1_self_exit_transaction {
         let before = h.snapshot();
         assert_eq!(
             run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
-            ExitRefusal::RobustFutexList
+            impossible(ExitRefusal::RobustFutexList)
         );
         assert_eq!(h.snapshot(), before);
 
@@ -159612,9 +159629,47 @@ mod u9exit1_self_exit_transaction {
         let before = h.snapshot();
         assert_eq!(
             run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
-            ExitRefusal::DeferredCapacity
+            ExitFailure {
+                refusal: ExitRefusal::DeferredCapacity,
+                disposition: ExitDisposition::InvalidPreLock,
+            }
         );
         assert_eq!(h.snapshot(), before);
+        assert_eq!(h.count("clear_current"), 0);
+    }
+
+    /// Arm 9 of the §1 table: the capacity probe and the reservation disagree.
+    ///
+    /// Still pre-mutation, so it settles exactly as the probe does — but it has already taken the
+    /// queue advance, and releasing that is what keeps a later route from finding the CPU's one
+    /// deferral held by a transaction that refused.
+    #[test]
+    fn a_reservation_that_loses_its_race_releases_the_queue_advance_it_took() {
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 0,
+            reply_record_generation: 1,
+        });
+        h.inject = Inject::DeathReserveLosesRace;
+        let before = h.snapshot();
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(
+            failure,
+            ExitFailure {
+                refusal: ExitRefusal::DeferredCapacity,
+                disposition: ExitDisposition::InvalidPreLock,
+            },
+            "the probe and the reserve must give the SAME userspace answer"
+        );
+        assert_eq!(h.snapshot(), before, "a refusal must mutate nothing");
+        assert_eq!(h.count("reserve_queue_advance"), 1);
+        assert_eq!(h.count("release_queue_advance"), 1);
+        assert_eq!(
+            h.queue_advance[0], None,
+            "the deferral must not be left held"
+        );
         assert_eq!(h.count("clear_current"), 0);
     }
 
@@ -159630,10 +159685,11 @@ mod u9exit1_self_exit_transaction {
             reply_record_generation: 1,
         });
         h.inject = Inject::SchedulerHandsBackAnother;
-        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
-        assert_eq!(refusal, ExitRefusal::VictimChanged);
-        assert!(
-            !refusal.may_fall_back(),
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(failure.refusal, ExitRefusal::VictimChanged);
+        assert_eq!(
+            failure.disposition,
+            ExitDisposition::FailClosed,
             "`current` was already cleared, so the trap must NOT re-enter the broad dispatcher"
         );
         // Nothing of THIS task changed, and neither reservation leaked.
@@ -159653,8 +159709,13 @@ mod u9exit1_self_exit_transaction {
             reply_record_generation: 1,
         });
         h.inject = Inject::ClaimLosesRace;
-        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
-        assert_eq!(refusal, ExitRefusal::NotRunning);
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(failure.refusal, ExitRefusal::NotRunning);
+        // U9-EXIT2 §1: THE defect U9-EXIT1 shipped. This refusal is produced AFTER `current` was
+        // cleared, and it used to answer `may_fall_back() == true`, so the route returned
+        // `NotHandled` and the trap re-entered `handle_exit_current_task` on a CPU with no current
+        // task. The disposition is computed from the POSITION, not from the refusal's name.
+        assert_eq!(failure.disposition, ExitDisposition::FailClosed);
         // The winner's terminal status stands; this transaction wrote nothing over it.
         assert_eq!(h.status_of(1), Some(TaskStatus::Dead));
         assert_eq!(h.queue_advance[0], None);
@@ -159687,8 +159748,8 @@ mod u9exit1_self_exit_transaction {
         run_exit_transaction(&mut h, CPU, CODE).expect("the first exit commits");
         let after_first = h.snapshot();
         // The task is no longer current, so the second attempt cannot even resolve a self.
-        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("the second must refuse");
-        assert_eq!(refusal, ExitRefusal::NoCurrent);
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("the second must refuse");
+        assert_eq!(failure, impossible(ExitRefusal::NoCurrent));
         assert_eq!(h.snapshot(), after_first, "the second exit wrote nothing");
         assert_eq!(h.retired, 1, "exactly one claim was retired");
         assert_eq!(h.count("publish_exit_deferral"), 1);
@@ -159702,8 +159763,8 @@ mod u9exit1_self_exit_transaction {
         h.current[0] = Some(1);
         h.queue_advance[0] = None;
         h.exit_deferral[0] = None;
-        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
-        assert_eq!(refusal, ExitRefusal::NotRunning);
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(failure, impossible(ExitRefusal::NotRunning));
         assert_eq!(h.retired, 1);
     }
 
@@ -160288,28 +160349,458 @@ mod u9exit1_self_exit_transaction {
         );
     }
 
-    /// Every refusal that is NOT safe to fall back from must say so explicitly.
+    /// U9-EXIT2 §1 — THE disposition table, as source classification rather than convention.
+    ///
+    /// Every refusal names a settlement, none of them is "the broad handler may run", and the one
+    /// fact that can override the classification — having passed the point of no return — does so
+    /// for every variant without exception.
     #[test]
-    fn only_the_post_clear_refusal_forbids_the_broad_fallback() {
+    fn every_refusal_carries_a_settlement_and_none_of_them_is_a_fallback() {
         use ExitRefusal::*;
-        for refusal in [
+        const ALL: &[ExitRefusal] = &[
+            RouteNotAdmitted,
             NoCurrent,
+            QueueAdvanceHeld,
             TaskGone,
             IdentityChanged,
             NotRunning,
             DetachedThread,
             RobustFutexList,
             DeferredCapacity,
+            VictimChanged,
+        ];
+        for refusal in ALL {
+            assert!(
+                !refusal.marker().is_empty(),
+                "{refusal:?} needs a wire name"
+            );
+            // Past the point of no return the position decides, for every variant.
+            assert_eq!(
+                refusal.disposition(true),
+                ExitDisposition::FailClosed,
+                "{refusal:?} found after `current` was cleared must fail closed"
+            );
+        }
+        // Class C has exactly one member, and it is the only refusal a correct userspace program
+        // can provoke: the deferred server-death queue was full.
+        let invalid: alloc::vec::Vec<_> = ALL
+            .iter()
+            .filter(|r| r.disposition(false) == ExitDisposition::InvalidPreLock)
+            .collect();
+        assert_eq!(invalid, alloc::vec![&DeferredCapacity]);
+        // Everything else pre-mutation is a state the §5 guards prove cannot exist.
+        for refusal in ALL.iter().filter(|r| **r != DeferredCapacity) {
+            assert_eq!(refusal.disposition(false), ExitDisposition::ImpossibleState);
+        }
+        // The wire names are distinct, so a live marker identifies exactly one arm.
+        let mut names: alloc::vec::Vec<&str> = ALL.iter().map(|r| r.marker()).collect();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique, "two refusals share a wire name");
+    }
+
+    /// U9-EXIT2 §5 — after NR 16 is recognized the route has NO `NotHandled` outcome.
+    ///
+    /// This is the whole stage in one assertion. The only `NotHandled` in the route is the NR gate
+    /// itself, which fires BEFORE recognition and must stay; everything after it settles.
+    #[test]
+    fn the_split_exit_route_never_falls_through_after_recognition() {
+        let route = SPLIT
+            .split("fn try_split_exit_current_task(")
+            .nth(1)
+            .expect("the split route must exist");
+        let route = &route[..route.find("\n/// ").unwrap_or(route.len())];
+        let gate_end = route
+            .find("SYSCALL_EXIT_CURRENT_TASK_NR {\n        return D::NotHandled;\n    }")
+            .expect("the NR gate must be the first statement");
+        let after = &route[gate_end..];
+        // Exactly one code-form `NotHandled`, and it is the NR gate's own. Anchored on the
+        // constructor rather than the bare word, so prose about the property cannot satisfy it —
+        // the mistake this suite has now made twice with marker names.
+        let produced = after.matches("D::NotHandled").count()
+            + after
+                .matches("SplitDispatchDisposition::NotHandled")
+                .count();
+        assert_eq!(
+            produced, 1,
+            "no arm after NR 16 is recognized may hand the trap to the broad dispatcher"
+        );
+        // And the three settlements are all present and typed.
+        for settlement in [
+            "ExitDisposition::InvalidPreLock",
+            "ExitDisposition::ImpossibleState",
+            "ExitDisposition::FailClosed",
         ] {
             assert!(
-                refusal.may_fall_back(),
-                "{refusal:?} is pre-mutation and must permit the broad answer"
+                after.contains(settlement),
+                "the route must settle {settlement}"
             );
-            assert!(!refusal.marker().is_empty());
         }
-        assert!(
-            !VictimChanged.may_fall_back(),
-            "`current` is already cleared: the trap must fail closed"
+        assert!(after.contains("SyscallError::WouldBlock"));
+        // Two distinct `Internal` settlements: the impossible-state one and the fail-closed one.
+        // The latter is deliberately NOT `Ok(())`: both `Complete` arms finalize through
+        // `CompletedInThisTrap`, which always commits the syscall-return ABI into the entering
+        // incarnation, so a success would tell a `VictimChanged` loser — still alive — that its
+        // `exit()` had succeeded.
+        assert_eq!(
+            after.matches("SyscallError::Internal").count(),
+            2,
+            "the impossible-state and fail-closed settlements must both be typed errors"
         );
+        assert!(
+            !after.contains("D::Complete(Ok(()))"),
+            "no NR 16 arm may fabricate a successful syscall return"
+        );
+        // The predicate itself is gone: there is no longer a question the route could ask that
+        // would produce a fallback. Anchored on the definition and the call, not on the name —
+        // both files explain in prose why it used to exist, and `may_fall_back_to_broad` is an
+        // unrelated mechanism belonging to another class on this seam.
+        assert!(
+            !EXIT_CLAIM.contains("fn may_fall_back("),
+            "the exit refusal must not offer a fallback predicate"
+        );
+        assert!(!EXIT_TXN.contains("refusal.may_fall_back()"));
+        assert!(!SPLIT.contains("refusal.may_fall_back()"));
+    }
+}
+
+/// U9-EXIT2 §1/§2/§3/§5 — NR 16 is source-total, and the two populations U9-EXIT1 declined are
+/// production-impossible rather than merely unexercised.
+///
+/// U9-EXIT1 measured its retirement live and reported `3 -> 0`. That was true of the population
+/// the oracle exercises — a Joinable, non-robust, reply-free self-exit — and NOT of the whole
+/// family: the route refused a `Detached` thread and a robust-futex publisher and handed both to
+/// the broad dispatcher, so `EXIT_TASK_BROAD_ENTER = 0` in those boots proved that the exercised
+/// population avoided the edge, not that the edge was unreachable.
+///
+/// This module closes the gap from source. Both refused populations turn out to have no
+/// production writer at all, so the edges they would have taken cannot be reached; the route's
+/// remaining arms are classified and settled without a fallback; and the one arm that was
+/// genuinely wrong — a claim losing its race AFTER `current` was cleared — no longer returns the
+/// trap to a dispatcher that has no current task to work with.
+mod u9exit2_total_nr16_disposition {
+    use super::*;
+
+    const EXIT_CLAIM: &str = include_str!("exit_claim.rs");
+    const EXIT_TXN: &str = include_str!("../syscall/exit_txn.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const SYSCALL: &str = include_str!("../syscall.rs");
+    const THREAD_STATE: &str = include_str!("thread_state.rs");
+    const RESTART_STATE: &str = include_str!("restart_state.rs");
+    const TASK: &str = include_str!("../task.rs");
+    const FORK_OWNERS: &str = include_str!("fork_owners.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const ORCHESTRATOR: &str = include_str!("orchestrator_state.rs");
+    const SPAWN_TXN: &str = include_str!("../syscall/spawn_txn.rs");
+    const SPAWN_THREAD_CORE: &str = include_str!("spawn_thread_core.rs");
+    const EXEC_STATE: &str = include_str!("exec_state.rs");
+    const BOOT_MOD: &str = include_str!("mod.rs");
+    const X86_SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+
+    /// Every production source file a caller could plausibly live in. The two `cfg`-gated writers
+    /// below make the impossibility a BUILD fact rather than a grep, but the grep is kept as the
+    /// cheap first line: it names the file that broke the invariant instead of only the symbol.
+    const PRODUCTION_SOURCES: &[(&str, &str)] = &[
+        ("syscall.rs", SYSCALL),
+        ("syscall_split.rs", SPLIT),
+        ("syscall/exit_txn.rs", EXIT_TXN),
+        ("syscall/spawn_txn.rs", SPAWN_TXN),
+        ("boot/thread_state.rs", THREAD_STATE),
+        ("boot/restart_state.rs", RESTART_STATE),
+        ("boot/exec_state.rs", EXEC_STATE),
+        ("boot/spawn_thread_core.rs", SPAWN_THREAD_CORE),
+        ("boot/fork_owners.rs", FORK_OWNERS),
+        ("boot/orchestrator_state.rs", ORCHESTRATOR),
+        ("boot/mod.rs", BOOT_MOD),
+        ("boot/exit_claim.rs", EXIT_CLAIM),
+        ("runtime.rs", RUNTIME),
+        ("task.rs", TASK),
+        ("arch/trap_entry.rs", TRAP_ENTRY),
+        ("arch/riscv64/trap.rs", RISCV_TRAP),
+    ];
+
+    // ── §2 — Detached is production-impossible ──────────────────────────────────────────────
+
+    /// `Detached` has exactly one writer, that writer has no production caller, and the freestanding
+    /// builds do not compile it at all.
+    #[test]
+    fn no_production_path_can_make_a_task_detached() {
+        // 1. One writer, and it is `mark_thread_detached`.
+        let writers: usize = PRODUCTION_SOURCES
+            .iter()
+            .map(|(_, src)| {
+                src.matches("detach_state = ThreadDetachState::Detached")
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            writers, 1,
+            "`Detached` must have exactly one writer in production source"
+        );
+        assert!(THREAD_STATE.contains("tcb.detach_state = ThreadDetachState::Detached;"));
+
+        // 2. That writer is compiled out of every production build. A future production caller
+        //    therefore breaks the freestanding build rather than silently re-opening the edge.
+        let gated = THREAD_STATE
+            .split("pub fn mark_thread_detached")
+            .next()
+            .expect("the writer must exist");
+        assert!(
+            gated.ends_with("#[cfg(any(test, feature = \"hosted-dev\"))]\n    "),
+            "`mark_thread_detached` must be gated out of production immediately above its signature"
+        );
+
+        // 3. And nothing in production source calls it today.
+        for (name, src) in PRODUCTION_SOURCES {
+            let calls = src.matches("mark_thread_detached(").count()
+                - src.matches("fn mark_thread_detached(").count();
+            assert_eq!(calls, 0, "{name} must not call `mark_thread_detached`");
+        }
+
+        // 4. Every TCB constructor produces `Joinable`, so no task starts detached either.
+        assert_eq!(
+            TASK.matches("detach_state: ThreadDetachState::Joinable")
+                .count(),
+            1,
+            "the one constructor must default to Joinable"
+        );
+        assert!(
+            TASK.contains(
+                "pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self {"
+            ) && TASK
+                .split("pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self {")
+                .nth(1)
+                .expect("the reservation constructor")
+                .starts_with("\n        let mut tcb = Self::new(tid, None);"),
+            "the reservation constructor must delegate to `new`, inheriting Joinable"
+        );
+        for (name, src) in PRODUCTION_SOURCES {
+            assert!(
+                !src.contains("detach_state: ThreadDetachState::Detached"),
+                "{name} must not construct a Detached TCB"
+            );
+        }
+    }
+
+    /// The route's `DetachedThread` arm therefore settles as an impossible state, and the claim
+    /// keeps its own copy of the check so the invariant is enforced at the linearization point too.
+    #[test]
+    fn the_detached_arm_is_an_impossible_state_not_a_declined_population() {
+        use crate::kernel::boot::exit_claim::{ExitDisposition, ExitRefusal};
+        assert_eq!(
+            ExitRefusal::DetachedThread.disposition(false),
+            ExitDisposition::ImpossibleState
+        );
+        // Both the preflight and the claim test it: one acquisition decides, and the other is the
+        // defence in depth that keeps the linearization point from trusting a stale read.
+        assert!(EXIT_TXN.contains("if preflight.detached {"));
+        assert!(EXIT_CLAIM.contains("if tcb.detach_state == ThreadDetachState::Detached {"));
+        // And the broad path's detached branch — `reap_if_detached` -> `mark_task_dead` — is
+        // likewise unreachable, which is why nothing in this stage had to make it allocation-free.
+        assert!(
+            RESTART_STATE.contains("self.reap_if_detached(tid)?"),
+            "the broad detached branch still exists; it is simply unreachable"
+        );
+    }
+
+    // ── §3 — the robust-futex registry is empty in production ───────────────────────────────
+
+    #[test]
+    fn no_production_path_can_register_a_robust_futex_list() {
+        // 1. One writer of the registry, and it is `set_robust_futex_head`.
+        let writers: usize = PRODUCTION_SOURCES
+            .iter()
+            .map(|(_, src)| src.matches("super::RobustFutexRecord {").count())
+            .sum();
+        assert_eq!(writers, 1, "the registry must have exactly one writer");
+        assert!(THREAD_STATE.contains("pub fn set_robust_futex_head("));
+
+        // 2. Compiled out of production, exactly like `mark_thread_detached`.
+        let gated = THREAD_STATE
+            .split("pub fn set_robust_futex_head(")
+            .next()
+            .expect("the writer must exist");
+        assert!(
+            gated.ends_with("#[cfg(any(test, feature = \"hosted-dev\"))]\n    "),
+            "`set_robust_futex_head` must be gated out of production"
+        );
+
+        // 3. No production caller.
+        for (name, src) in PRODUCTION_SOURCES {
+            let calls = src.matches("set_robust_futex_head(").count()
+                - src.matches("fn set_robust_futex_head(").count();
+            assert_eq!(calls, 0, "{name} must not register a robust-futex list");
+        }
+
+        // 4. Fork does not carry one into a child: it CLEARS the child's slot rather than
+        //    inheriting the parent's, so even a hypothetical registered parent could not seed one.
+        assert!(
+            FORK_OWNERS.contains("for slot in self.robust_futex.iter_mut() {")
+                && FORK_OWNERS.contains("*slot = None;"),
+            "the fork publication must clear the child's robust-futex slot"
+        );
+    }
+
+    /// One registry, one lock domain, one exit reader — and the exit's arm is an impossible state.
+    #[test]
+    fn the_robust_registry_has_one_owner_and_one_domain() {
+        use crate::kernel::boot::exit_claim::{ExitDisposition, ExitRefusal};
+        assert_eq!(
+            ExitRefusal::RobustFutexList.disposition(false),
+            ExitDisposition::ImpossibleState
+        );
+        // The registry lives in ONE place.
+        assert_eq!(
+            BOOT_MOD
+                .matches("robust_futex: KernelStorage<[Option<RobustFutexRecord>; MAX_TASKS]>")
+                .count(),
+            1,
+            "there must be exactly one robust-futex registry"
+        );
+        // And every accessor of it goes through the TASK-domain seam — the broad pair through
+        // `with_task_robust_futex{,_mut}`, the split reader through the raw task-lock pointers —
+        // so the domain is real rather than an incidental dependence on the broad guard.
+        assert!(THREAD_STATE.contains("self.with_task_robust_futex_mut(|robust|"));
+        assert!(THREAD_STATE.contains("self.with_task_robust_futex(|robust|"));
+        assert!(RUNTIME.contains("task_robust_futex_split_ptrs_from_raw"));
+        assert!(
+            ORCHESTRATOR.contains("pub(crate) fn with_task_robust_futex<R>(")
+                && ORCHESTRATOR.contains("pub(crate) fn with_task_robust_futex_mut<R>("),
+            "both broad accessors must be the task-domain pair"
+        );
+        // Exactly one exit-side reader, in the broad teardown, and it is now provably dead.
+        assert_eq!(
+            RESTART_STATE
+                .matches("self.robust_futex_state(tid)")
+                .count(),
+            1,
+            "the broad exit is the only robust-futex reader on any exit path"
+        );
+        assert!(
+            !EXIT_TXN.contains("robust_futex_state") && !EXIT_CLAIM.contains("robust_futex_state"),
+            "the split route must not grow a second robust-futex reader"
+        );
+    }
+
+    // ── §1/§4 — the total disposition, from source ──────────────────────────────────────────
+
+    /// Every architecture admits NR 16 into the seam unconditionally, so the source-derived edge
+    /// count is the route's own — there is no arch gate that could send NR 16 to the broad
+    /// dispatcher without the route ever seeing it.
+    #[test]
+    fn every_architecture_admits_nr16_into_the_seam_unconditionally() {
+        // RISC-V: NR 16 sits on `split_eligible` as a bare disjunct, guarded only by `is_syscall`.
+        let eligible = RISCV_TRAP
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .expect("the RISC-V eligibility predicate");
+        let eligible = &eligible[..eligible.find(";\n").unwrap_or(eligible.len())];
+        assert!(
+            eligible.contains("|| nr == crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR"),
+            "RISC-V must admit NR 16 with no further condition"
+        );
+        // x86_64 and AArch64 share `trap_entry`, whose seam call is guarded only by "this trap is
+        // a syscall and no post-work was already committed" — both true for a userspace NR 16 —
+        // plus AArch64's ABI-import allow-list, which carries NR 16.
+        assert!(TRAP_ENTRY.contains("SYSCALL_EXIT_CURRENT_TASK_NR"));
+        assert!(
+            TRAP_ENTRY.contains(
+                "if !post_work_committed && matches!(decode_trap_context(context), TrapEvent::Syscall) {"
+            ),
+            "the shared seam's only gate must be the syscall/post-work one"
+        );
+    }
+
+    /// The broad NR 16 handler still exists — deleting it is U9's job, not this stage's — but no
+    /// production trap can reach it, because the route that runs first never declines.
+    #[test]
+    fn the_broad_nr16_handler_has_no_production_entry() {
+        assert!(
+            SYSCALL.contains("fn handle_exit_current_task("),
+            "the broad handler is retained; U9 deletes the acquisition, not this stage"
+        );
+        // Its edge marker is still emitted at its own entry, so a live run that somehow reached it
+        // would be visible rather than silent.
+        assert!(SYSCALL.contains("\"EXIT_TASK_BROAD_ENTER tid={} asid={}"));
+        // And the route it would have to be reached through has no fallthrough after recognition.
+        let route = SPLIT
+            .split("fn try_split_exit_current_task(")
+            .nth(1)
+            .expect("the route");
+        let after_gate = route
+            .split("return D::NotHandled;")
+            .nth(1)
+            .expect("the NR gate");
+        assert_eq!(
+            after_gate.matches("D::NotHandled").count(),
+            0,
+            "nothing after the NR gate may decline"
+        );
+
+        // And a `Complete` disposition returns from the trap handler BEFORE the broad dispatch on
+        // every architecture — which is what makes "the route never declines" equal to "the broad
+        // handler is never entered" rather than merely "the route answered".
+        let shared_complete = TRAP_ENTRY
+            .split("if let SplitDispatchDisposition::Complete(result) = disposition {")
+            .nth(1)
+            .expect("the shared Complete arm");
+        let shared_complete = &shared_complete[..shared_complete
+            .find("return Err(other);")
+            .expect("the shared propagate arm")];
+        assert_eq!(
+            shared_complete.matches("return Ok(());").count(),
+            2,
+            "both x86_64/AArch64 syscall Complete arms must return before the broad dispatch"
+        );
+        let riscv_complete = RISCV_TRAP
+            .split(
+                "if let crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) =",
+            )
+            .nth(1)
+            .expect("the RISC-V Complete arm");
+        let riscv_complete = &riscv_complete[..riscv_complete
+            .find("Err(other) => return Err(other),")
+            .expect("the RISC-V propagate arm")];
+        // (both slices end at the propagate arm, so a non-syscall trap error is accounted for and
+        // still never reaches the broad dispatcher)
+        assert_eq!(
+            riscv_complete
+                .matches("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);")
+                .count(),
+            2,
+            "both RISC-V syscall Complete arms must return before the broad dispatch"
+        );
+    }
+
+    /// §4 — `QueueAdvanceCommitted` is still reachable ONLY with a reserved deferral, and every
+    /// pre-mutation failure releases what it took.
+    #[test]
+    fn the_committed_advance_still_requires_a_live_reservation() {
+        let txn = EXIT_TXN
+            .split("pub(crate) fn run_exit_transaction")
+            .nth(1)
+            .expect("the transaction");
+        let reserve = txn
+            .find("owners.reserve_queue_advance(cpu, tid)")
+            .expect("the reservation");
+        let ok = txn.find("Ok(outcome)").unwrap_or(txn.len());
+        assert!(reserve < ok, "the reservation precedes the success return");
+        // Every failure arm that runs after the reservation releases it. There are exactly three:
+        // the server-death reserve failure, the victim-changed check, and the claim failure.
+        let after = &txn[reserve..];
+        assert_eq!(
+            after.matches("owners.release_queue_advance(cpu);").count(),
+            3,
+            "every post-reservation failure must release the deferral"
+        );
+        // And the route only answers `QueueAdvanceCommitted` on the success arm.
+        let route = SPLIT
+            .split("fn try_split_exit_current_task(")
+            .nth(1)
+            .expect("the route");
+        assert_eq!(route.matches("D::QueueAdvanceCommitted").count(), 1);
     }
 }
