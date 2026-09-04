@@ -1416,6 +1416,25 @@ impl KernelState {
         }
     }
 
+    /// U9-EXIT1 §3 — raw field pointers for the RESTART subsystem, so the split self-exit can
+    /// mint its restart token through the same monotonic counter the broad `exit_task` uses.
+    pub(crate) unsafe fn restart_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *mut KernelStorage<RestartSubsystem>,
+    ) {
+        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s owning
+        // `SpinLock<KernelState>`. `addr_of!`/`addr_of_mut!` derive raw field pointers without
+        // creating references to the whole KernelState.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).restart_state_lock),
+                core::ptr::addr_of_mut!((*state).restart),
+            )
+        }
+    }
+
     pub(crate) unsafe fn telemetry_split_mut_ptrs_from_raw(
         state: *mut KernelState,
     ) -> (
@@ -2000,6 +2019,46 @@ impl KernelState {
         Self::debug_lock_order_note("vm");
         let _vm_guard = self.vm_state_lock.lock();
         f(kernel_mut(&mut self.user_spaces))
+    }
+
+    /// U9-EXIT1 §3 — the robust-futex registry, under the task lock it belongs to.
+    pub(crate) fn with_task_robust_futex<R>(
+        &self,
+        f: impl FnOnce(&[Option<RobustFutexRecord>; MAX_TASKS]) -> R,
+    ) -> R {
+        Self::debug_lock_order_note("task");
+        let _task_guard = self.task_state_lock.lock();
+        f(kernel_ref(&self.robust_futex))
+    }
+
+    /// The mutable half of the same domain.
+    pub(crate) fn with_task_robust_futex_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut [Option<RobustFutexRecord>; MAX_TASKS]) -> R,
+    ) -> R {
+        Self::debug_lock_order_note("task");
+        let _task_guard = self.task_state_lock.lock();
+        f(kernel_mut(&mut self.robust_futex))
+    }
+
+    /// U9-EXIT1 §3 — raw field pointers so the split self-exit can ask, under the SAME task lock,
+    /// whether the exiting thread published a robust list. It never walks one: a thread that has
+    /// one is refused before any mutation and keeps its broad path.
+    pub(crate) unsafe fn task_robust_futex_split_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *mut KernelStorage<[Option<RobustFutexRecord>; MAX_TASKS]>,
+    ) {
+        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s owning
+        // `SpinLock<KernelState>`; `addr_of!`/`addr_of_mut!` derive raw field pointers without
+        // creating references to the whole KernelState.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).task_state_lock),
+                core::ptr::addr_of_mut!((*state).robust_futex),
+            )
+        }
     }
 
     pub(crate) fn with_tcbs<R>(

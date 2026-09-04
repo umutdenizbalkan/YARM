@@ -813,6 +813,11 @@ pub fn handle_riscv_trap_entry_shared(
             // (sepc+4 once, sstatus preserved, a0 from `set_ok`) and the calling PM is still
             // current when this trap returns.
             || nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
+            // U9-EXIT1 §5: ExitCurrentTask (NR 16). Unlike every other class on this list it is
+            // SWITCHING and never returns: it finalizes no frame, advances no sepc and writes no
+            // a0, because the task it belonged to is gone. Its queue advance is the existing
+            // deferral + drain, exactly as FutexWait's is.
+            || nr == crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -881,9 +886,19 @@ pub fn handle_riscv_trap_entry_shared(
         ) {
             let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
                 .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx));
-            let captured = outgoing
-                .map(|t| shared.capture_outgoing_user_context_split(t, frame))
-                .unwrap_or(false);
+            // U9-EXIT1 §3: never save the exiting frame. This capture exists so a task that will
+            // be RESUMED restarts at the right pc; an exiting task is never resumed, so capturing
+            // would at best be pointless and at worst record a corpse's registers into a TCB a
+            // later reap still reads.
+            let exiting = crate::kernel::boot::exit_queue_advance_pending(cpu_idx)
+                .is_some_and(|(et, _)| Some(et) == outgoing);
+            let captured = if exiting {
+                false
+            } else {
+                outgoing
+                    .map(|t| shared.capture_outgoing_user_context_split(t, frame))
+                    .unwrap_or(false)
+            };
             crate::yarm_log!(
                 "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu={} result=queue_advance_committed outgoing={} captured={}",
                 nr,
@@ -1573,7 +1588,12 @@ pub fn handle_riscv_trap_entry_shared(
         // above — a still-held guard would deadlock) AND confirms the waiter is still
         // `Blocked(Futex)` (guards against a FutexWake race before dispatch).
         let reverify_ok = outgoing
-            .map(|t| shared.futex_wait_reverify_blocked(t))
+            // U9-EXIT1 §3: the third admitted outgoing state, verified by its own predicate.
+            .map(|t| {
+                shared.futex_wait_reverify_blocked(t)
+                    || crate::kernel::boot::exit_queue_advance_pending(cpu_idx)
+                        .is_some_and(|(et, _)| et == t && shared.exit_reverify_ok(t))
+            })
             .unwrap_or(false);
         crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_LOCK_DROPPED_OK cpu={}", cpu.0);
         if reverify_ok {

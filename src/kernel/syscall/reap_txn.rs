@@ -461,7 +461,7 @@ impl ReapOwners for BroadReapOwners<'_> {
     ) -> usize {
         let identity = claim.identity();
         self.kernel.with_ipc_state_mut(|ipc| {
-            body::revoke_reply_caps_for_replier_identity_locked(ipc, identity, closing)
+            body::revoke_reply_caps_for_replier_identity_locked(ipc, identity, None, closing)
         })
     }
     fn detach_reverse_link(&mut self, link: ClosingReplyLink) -> bool {
@@ -633,7 +633,7 @@ impl ReapOwners for SharedReapOwners<'_> {
     ) -> usize {
         let identity = claim.identity();
         self.shared.with_ipc_split_mut(|ipc| {
-            body::revoke_reply_caps_for_replier_identity_locked(ipc, identity, closing)
+            body::revoke_reply_caps_for_replier_identity_locked(ipc, identity, None, closing)
         })
     }
     fn detach_reverse_link(&mut self, link: ClosingReplyLink) -> bool {

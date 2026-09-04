@@ -100283,13 +100283,49 @@ mod stage200d0b3_x86_exit_corrected {
         assert!(RUNNER.contains(
             "\"EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64 cpu=0 broad_lock=0 result=ok\""
         ));
-        // 3. `broad_lock=0` on an in-lock marker fails the run.
-        assert!(RUNNER.contains("in-lock marker falsely claims broad_lock=0"));
-        assert!(RUNNER.contains("in-lock marker does not state broad_lock=1"));
-        // 4. A missing REAL post-lock drain completion fails the run: the marker must attest
-        //    `drains=all`, not merely exist.
-        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
-        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
+        // 3 and 4 — RE-DERIVED by U9-EXIT1, not deleted.
+        //
+        // Stage 200D-0B3 policed the lock-state FIELD on each marker of the broad pipeline,
+        // because that pipeline was where an exiting NR 16 actually ran and the field was the only
+        // thing that could lie about it. U9-EXIT1 retires the pipeline: NR 16 is serviced before
+        // the terminal acquisition, so `DISPOSITION_CONSUMED`, `EXITING_NOT_CURRENT`,
+        // `ABSENCE_VALIDATED`, `RESTORE_OWNER_PREPARED`, `BROAD_LOCK_RELEASED`,
+        // `POST_LOCK_DRAIN_DONE` and `COMMON_EPILOGUE_OWNER` are not reworded — they are
+        // REQUIRED ABSENT.
+        //
+        // That is the STRONGER form of the same refusal, and it is why these two assertions now
+        // read the way they do: a marker that cannot be emitted cannot carry a false lock state,
+        // and a runner satisfied by any of them is a runner accepting an exit that still reached
+        // the acquisition this stage removed.
+        let retired_block = RUNNER
+            .split("The retired broad pipeline, marker for marker")
+            .nth(1)
+            .expect("the retirement block exists");
+        let retired_block = retired_block
+            .split("need_once")
+            .next()
+            .expect("the retirement block ends at the positive list");
+        for retired in [
+            "EXIT_TASK_PREFLIGHT_OK",
+            "EXIT_TASK_DISPOSITION_PUBLISHED",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64",
+            "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64",
+            "EXIT_TASK_ABSENCE_VALIDATED arch=x86_64",
+            "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64",
+            "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64",
+        ] {
+            assert!(
+                retired_block.contains(retired),
+                "the retired broad-pipeline marker must be required ABSENT: {retired}"
+            );
+        }
+        // And the retirement is measured at the edge, not inferred: the broad handler's own entry
+        // marker must count zero, and the split route's must count the accepted exit.
+        assert!(RUNNER.contains("NR 16 still reached the terminal broad dispatcher"));
+        assert!(RUNNER.contains("split-route entries != 1"));
+        assert!(RUNNER.contains("the split route declined an admitted exit"));
         // The superseded in-lock ownership marker must not be accepted either.
         assert!(RUNNER.contains("\"EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64\""));
         // Those four forbidden strings are checked by `need_absent`, i.e. presence = failure.
@@ -100308,13 +100344,25 @@ mod stage200d0b3_x86_exit_corrected {
                 "the old marker must be in the need_absent list: {forbidden}"
             );
         }
-        // And the corrected ordering is enforced across the lock boundary.
+        // And the ordering claim that replaced the lock-boundary one. The broad lock is no longer
+        // in this syscall's path at all, so the boundary that now has to be proven is the
+        // deferral's: the seam commits the advance, the broad dispatch is skipped, and the
+        // EXISTING post-lock drain — not a second one — selects and installs the next task.
         assert!(
-            RUNNER.contains("the post-lock drains run after the broad lock is actually released")
+            RUNNER.contains(
+                "the deferral is published before the seam answers QueueAdvanceCommitted"
+            )
         );
+        assert!(RUNNER.contains("the committed advance skips the broad dispatch exactly once"));
         assert!(
-            RUNNER.contains("the epilogue commits the user frame only after every drain completed")
+            RUNNER
+                .contains("the EXISTING post-lock drain runs after the broad dispatch is skipped")
         );
+        assert!(RUNNER.contains("the drain selects and installs an incoming task"));
+        // The exiting frame is never saved, and the dead task is never resumed.
+        assert!(RUNNER.contains("the exiting frame was captured — §3 forbids saving it"));
+        assert!(RUNNER.contains("the drain reselected the EXITING task"));
+        assert!(RUNNER.contains("a dead task was returned to userspace"));
     }
 
     /// (§2) The six production side effects that must never occur under the broad lock, each
@@ -100685,12 +100733,31 @@ mod stage200d0c1_aarch64_exit_prep {
             .nth(1)
             .expect("bypass marker");
         assert!(!inlock[..inlock.find("result=ok").expect("terminated")].contains("broad_lock=0"));
-        // The runner enforces all of this on the live log, per whole line.
-        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
-        assert!(RUNNER.contains("post-lock marker falsely claims broad_lock=1"));
-        assert!(RUNNER.contains("the in-lock bypass marker falsely claims broad_lock=0"));
-        assert!(RUNNER.contains("release marker does not name the broad-lock holder"));
-        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
+        // The SOURCE-side contract above is unchanged: the broad consumer still exists, and every
+        // marker in it still states the lock condition that actually held where it was emitted.
+        //
+        // What the RUNNER enforces on the live log changed with U9-EXIT1. NR 16 no longer reaches
+        // the terminal acquisition, so none of those markers can be emitted by an exit, and the
+        // runner now requires the whole pipeline ABSENT instead of policing each marker's lock
+        // field. That is strictly stronger: a marker that cannot be emitted cannot lie about its
+        // lock state. The five live checks are re-derived, not dropped.
+        for retired in [
+            "EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64",
+        ] {
+            let block = RUNNER
+                .split("The retired broad pipeline, marker for marker")
+                .nth(1)
+                .expect("the retirement block exists");
+            let block = block.split("need_once").next().expect("bounded");
+            assert!(
+                block.contains(retired),
+                "the retired broad-pipeline marker must be required ABSENT: {retired}"
+            );
+        }
+        assert!(RUNNER.contains("NR 16 still reached the terminal broad dispatcher"));
     }
 
     /// 4. The consumer occurs after ALL shared post-lock drains.
@@ -101709,9 +101776,18 @@ mod stage200d0c1_aarch64_exit_prep {
     #[test]
     fn c26_runner_requires_terminal_health() {
         assert!(RUNNER.contains("\"EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64\""));
+        // U9-EXIT1 moved the ordering claim onto `$SLICE` — the part of the boot log that begins
+        // at the accepted exit. The drain markers it now chains through are shared with FutexWait
+        // and blocking recv, which fire long before the exit, so a whole-log `$NORM` claim would
+        // have been satisfied by somebody else's queue advance. The requirement is the same one;
+        // the evidence it is read from is now the exit's own.
         assert!(RUNNER.contains(
-            "need_order \"$NORM\" \"$L\" \"EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64\" \"EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64\""
+            "need_order \"$SLICE\" \"$L\" \"EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64\" \\\n    \"EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64\""
         ));
+        assert!(
+            RUNNER.contains("awk 'index($0,\"EXIT_TASK_SYSCALL_DISPATCHED nr=16\"){f=1} f'"),
+            "the slice must begin at the accepted exit"
+        );
     }
 
     /// 27. The runner rejects an early QEMU exit and every fatal marker.
@@ -102500,13 +102576,40 @@ mod stage200d0d1_riscv_exit_prep {
     /// 30. The runner rejects false lock ordering, and every declared-but-unwired shape.
     #[test]
     fn r30_runner_rejects_false_ordering_and_unwired_declarations() {
-        // Per-line lock-state, both directions.
-        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
-        assert!(RUNNER.contains("the in-lock bypass marker does not state broad_lock=1"));
-        assert!(RUNNER.contains("the in-lock bypass marker falsely claims broad_lock=0"));
-        // Consumer strictly after the drains.
-        assert!(RUNNER.contains("the consumer runs after every Phase-3 drain"));
-        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
+        // Per-line lock-state and consumer ordering — RE-DERIVED by U9-EXIT1.
+        //
+        // Those checks policed the lock-state FIELD on each marker of the broad pipeline, and the
+        // consumer's position relative to the Phase-3 drains, because that pipeline was where an
+        // exiting NR 16 actually ran. It no longer is: the exit is serviced before the terminal
+        // acquisition, so the runner requires the whole pipeline ABSENT — strictly stronger, since
+        // a marker that cannot be emitted cannot carry a false lock state or a false position.
+        let block = RUNNER
+            .split("The retired broad pipeline, marker for marker")
+            .nth(1)
+            .expect("the retirement block exists");
+        let block = block.split("need_once").next().expect("bounded");
+        for retired in [
+            "EXIT_TASK_INLOCK_BYPASS_ARMED arch=riscv64",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=riscv64",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=riscv64",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=riscv64",
+            "EXIT_TASK_SRET_OWNER arch=riscv64",
+        ] {
+            assert!(
+                block.contains(retired),
+                "the retired broad-pipeline marker must be required ABSENT: {retired}"
+            );
+        }
+        assert!(RUNNER.contains("NR 16 still reached the terminal broad dispatcher"));
+        // What replaced the consumer-after-drains claim: the EXISTING drain runs with the broad
+        // guard already dropped, reverifies THIS exit by exact identity, and arms the SRET for
+        // somebody else.
+        assert!(
+            RUNNER
+                .contains("the EXISTING post-lock drain runs with the broad guard already dropped")
+        );
+        assert!(RUNNER.contains("the drain reverifies THIS exit by exact identity"));
+        assert!(RUNNER.contains("the SRET is armed for the incoming task"));
         // Declared-but-unwritten selector / declared-but-unspawned entry.
         assert!(RUNNER.contains("EXIT_TASK_ORACLE_SLOTS arch=riscv64 slot5=22"));
         assert!(RUNNER.contains("the selector is provisioned before the task is spawned"));
@@ -102520,10 +102623,18 @@ mod stage200d0d1_riscv_exit_prep {
         // `inlock_result_export=0` on the bypass marker — so it exists to fail closed if a
         // future change ever re-introduced an exiting-task result export.
         assert!(RUNNER.contains("EXIT_TASK_EXITING_RESULT_EXPORTED"));
-        assert!(
-            RUNNER.contains("the in-lock bypass did not suppress the exiting task's result export")
-        );
-        assert!(RUNNER.contains("frame_source=replacement_tcb"));
+        // The POSITIVE proof that no result reached the exiting task is re-derived by U9-EXIT1.
+        //
+        // It used to be `inlock_result_export=0` on the in-lock bypass marker, and
+        // `frame_source=replacement_tcb` on the restore. Neither marker exists on this route: the
+        // exit never enters the broad dispatcher, so there is no bypass to arm and no restore to
+        // attribute. What states the same fact now is `captured=0` on the committed advance — the
+        // exiting frame was never saved, so nothing could be written back into it — together with
+        // the drain resuming a different task and never committing the corpse's frame or SATP.
+        assert!(RUNNER.contains("the exiting frame was captured — §3 forbids saving it"));
+        assert!(RUNNER.contains("the drain reselected the EXITING task"));
+        assert!(RUNNER.contains("a dead task's frame was committed for return"));
+        assert!(RUNNER.contains("a dead task's address space was installed for return"));
     }
 
     /// 31. The runner rejects multiple boots, reuse, dirty trees and SHA drift.
@@ -114268,6 +114379,11 @@ mod stage199d_riscv_canonical_admission {
             // yield or change address space by reaping a task the scheduler released at fault
             // time, so it finalizes through that same writeback.
             "SYSCALL_REAP_FAULTED_TASK_NR",
+            // U9-EXIT1 §5: NR 16, and the FIRST SWITCHING member of this list. Every other entry
+            // finalizes through the same-task ecall writeback; NR 16 finalizes nothing at all —
+            // it advances no sepc and writes no a0, because the task it belonged to is gone — and
+            // its queue advance is the existing deferral plus the existing drain.
+            "SYSCALL_EXIT_CURRENT_TASK_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -114279,11 +114395,12 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            11,
-            "exactly eleven literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            12,
+            "exactly twelve literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
-             SpawnFromMemoryObject, (U9-FORK1 §4) Fork and (U9-REAP1 §4) ReapFaultedTask"
+             SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask and \
+             (U9-EXIT1 §5) ExitCurrentTask"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -118874,6 +118991,21 @@ mod stage199d_wa2a_ownership_boundary {
             // slot, so the wake can fire at most once per destruction.
             ("src/kernel/boot/capability_lifecycle_state.rs", 1),
             ("src/kernel/boot/exec_state.rs", 4),
+            // U9-EXIT1 §2: a NEW file with 3 writes — the self-exit claim, its exact inverse, and
+            // the joiner wake the exit owes.
+            //
+            // - `claim_self_exit_locked` writes `Running -> Exited(code)`. This is the write the
+            //   broad `exit_task` performs in its own scoped acquisition; it did not multiply, it
+            //   is now ALSO reachable from the split route, and both routes reach this one body.
+            //   It is not a wake owner: `Exited` is terminal, and the only transition out of it in
+            //   this census is a reap's `-> Dead`.
+            // - `rollback_exit_claim_locked` writes the claim's exact `status_before` back — which
+            //   `status_is_self_exitable` restricts to `Running`, so no reachable rollback can
+            //   produce a `Blocked` task.
+            // - `wake_joiners_for_locked` writes `Blocked(Join) -> Runnable`. It IS a wake owner,
+            //   of exactly the same class as `wake_joiners_for` in thread_state.rs, whose rank-2
+            //   half this is: one body, two owners, with the rank-1 enqueues left to the caller.
+            ("src/kernel/boot/exit_claim.rs", 3),
             ("src/kernel/boot/ipc_state.rs", 9),
             // U9-REAP1 §2: a NEW file with 2 writes, and both are the same site's two halves.
             //
@@ -118893,8 +119025,14 @@ mod stage199d_wa2a_ownership_boundary {
             ("src/kernel/boot/reap_claim.rs", 2),
             // U9-REAP1 §2: 4 -> 3. `reap_faulted_task_noalloc_cleanup`'s direct
             // `tcb.status = Dead` moved into the claim above, which is the reap's linearization
-            // point. The file keeps its other three writers unchanged.
-            ("src/kernel/boot/restart_state.rs", 3),
+            // point.
+            //
+            // U9-EXIT1 §4: 3 -> 2. `exit_task`'s `tcb.status = Exited(code)` moved into
+            // `exit_claim::apply_self_exit_writes_locked`, the ONE body both NR 16 routes run.
+            // It did not multiply and it did not change — the broad path calls that body inside
+            // the same scoped acquisition it always used — so the census records the write at its
+            // new home rather than at two.
+            ("src/kernel/boot/restart_state.rs", 2),
             ("src/kernel/boot/scheduler_state.rs", 1),
             // U9-SPAWN1 SP-2: `spawn_user_thread`'s Runnable write moved to the shared
             // thread-incarnation owner, so thread_state.rs falls 4 -> 3 and the owner gains 1.
@@ -118905,7 +119043,11 @@ mod stage199d_wa2a_ownership_boundary {
             // the child becomes Runnable through `commit_live_spawn` — an already-enumerated
             // writer in `spawn_reservation.rs` — and this file loses a status writer rather than
             // gaining one. The census total falls by one; no new candidate wake owner exists.
-            ("src/kernel/boot/thread_state.rs", 2),
+            // U9-EXIT1 §4: 2 -> 1. `wake_joiners_for`'s `Blocked(Join) -> Runnable` write moved
+            // into `exit_claim::wake_joiners_for_locked`, already enumerated above as one of that
+            // file's three. The broad owner now drives the same rank-2 body the split route's exit
+            // transaction does, and keeps its own rank-1 enqueues after the acquisition releases.
+            ("src/kernel/boot/thread_state.rs", 1),
             ("src/kernel/spawn_reservation.rs", 2),
             ("src/kernel/task.rs", 2),
             ("src/kernel/task_transition.rs", 1),
@@ -118965,15 +119107,18 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            39,
-            "35 raw writes (U6 added `commit_blocking_send_split`; U7 added \
+            40,
+            "38 raw writes (U6 added `commit_blocking_send_split`; U7 added \
              `drain_send_timeout_post_work`; U9-F added \
              `wake_destroyed_notification_waiter_split`; U9-RX3 added the exact BLOCK/UNWIND \
              pair `recv_block_phase_b_split` and `recv_block_unwind_race_split`; U9-FORK1 \
              RETIRED `fork_complete_post_clone`'s direct Runnable write, 36 -> 35, because the \
              fork child now becomes live through the reservation commit; U9-REAP1 MOVED the \
              faulted reap's `-> Dead` write into the claim and added its exact inverse, \
-             35 -> 36), the WA3A barrier's single write, and the WA3B barrier's two"
+             35 -> 36; U9-EXIT1 §2 added the self-exit claim, its inverse and the rank-2 half of \
+             the joiner wake, 36 -> 39, and U9-EXIT1 §4 then made the BROAD NR 16 delegate to \
+             those same two bodies instead of keeping its own copies, 39 -> 37; the rank-2 half of the
+             joiner wake, 36 -> 39), the WA3A barrier's single write, and the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -119273,6 +119418,7 @@ mod stage199d_wa2b_wake_owner_census {
     const POLICY: &str = include_str!("task_policy_state.rs");
     const SPAWN_CORE: &str = include_str!("spawn_thread_core.rs");
     const REAP_CLAIM: &str = include_str!("reap_claim.rs");
+    const EXIT_CLAIM: &str = include_str!("exit_claim.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
@@ -119413,6 +119559,41 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::IntoBlocked,
         ),
+        // ── exit_claim.rs (3) — U9-EXIT1 §2 ─────────────────────────────────────────────────
+        //
+        // The claim and its inverse are CANNOT for the same reason the reap's pair is: the status
+        // that gates the write and the status the write replaces are ONE read, taken inside the
+        // acquisition that performs the write, behind a predicate (`status_is_self_exitable`) that
+        // admits `Running` and nothing else. A blocked task is refused by a precondition no caller
+        // can bypass.
+        // U9-EXIT1 §4: the write is in `apply_self_exit_writes_locked`, the body BOTH routes run,
+        // and its verdict is `Can` rather than the `Cannot` the claim carried. The predicate that
+        // made it `Cannot` — `status_is_self_exitable`, admitting `Running` and nothing else —
+        // still gates `claim_self_exit_locked`, but it does NOT gate the broad `exit_task`, which
+        // reaches the same body with no status precondition. Classifying the shared body by the
+        // stricter of its two callers would be recording the guard that happens to be nearest
+        // rather than the one every caller applies.
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "apply_self_exit_writes_locked",
+            1,
+            Verdict::Can,
+        ),
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "rollback_exit_claim_locked",
+            1,
+            Verdict::Cannot,
+        ),
+        // The joiner wake is a genuine CAN, classified as one rather than excused: it moves a task
+        // out of `Blocked(Join)`. It is the rank-2 half of `wake_joiners_for`, already CAN in
+        // thread_state.rs — the same class and the same body, now reachable from both owners.
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "wake_joiners_for_locked",
+            1,
+            Verdict::Can,
+        ),
         // ── reap_claim.rs (2) — U9-REAP1 §2 ─────────────────────────────────────────────────
         //
         // Both rows are `Cannot`, and that is a strengthening, not a relabelling. The row these
@@ -119436,13 +119617,12 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Cannot,
         ),
-        // ── restart_state.rs (3) ────────────────────────────────────────────────────────────
-        (
-            "src/kernel/boot/restart_state.rs",
-            "exit_task",
-            1,
-            Verdict::Can,
-        ),
+        // ── restart_state.rs (2) — U9-EXIT1 §4 ──────────────────────────────────────────────
+        //
+        // `exit_task`'s row moved to `exit_claim::apply_self_exit_writes_locked`, carrying its
+        // `Can` verdict with it: the shared body has no status precondition of its own, and the
+        // broad caller applies none, so it can still write `Exited` over a `Blocked` task. That
+        // was true of `exit_task` and it is true here; the classification follows the write.
         (
             "src/kernel/boot/restart_state.rs",
             "restart_task",
@@ -119478,12 +119658,9 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::IntoBlocked,
         ),
-        (
-            "src/kernel/boot/thread_state.rs",
-            "wake_joiners_for",
-            1,
-            Verdict::Cannot,
-        ),
+        // U9-EXIT1 §4 RETIRED this row along with the write it classified: `wake_joiners_for`
+        // now drives `exit_claim::wake_joiners_for_locked`, enumerated there as `Can`, and the
+        // `Blocked(Join)`-only gate that made this row `Cannot` moved with the body.
         // U9-SPAWN1 SP-2: `spawn_user_thread`'s status write moved into the shared
         // thread-incarnation owner, so the site is enumerated at its new home. The verdict is
         // unchanged and for the same reason: the TCB it writes sits at a slot index that was
@@ -119827,6 +120004,30 @@ mod stage199d_wa2b_wake_owner_census {
         // write is the CALL to that owner. The status write itself is unchanged, and the
         // ordering it encodes (publish, then Runnable) is exactly what moved with it.
         (
+            "src/kernel/boot/exit_claim.rs",
+            "apply_self_exit_writes_locked",
+            "tcb.status",
+            "TaskStatus::Exited(code)",
+            "}",
+            "tcb.restart.token = Some(token);",
+        ),
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "rollback_exit_claim_locked",
+            "tcb.status",
+            "claim.status_before",
+            "};",
+            "tcb.restart.token = None;",
+        ),
+        (
+            "src/kernel/boot/exit_claim.rs",
+            "wake_joiners_for_locked",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
+            "if n < out.len() {",
+        ),
+        (
             "src/kernel/boot/ipc_state.rs",
             "rt_commit_receiver_runnable",
             "tcb.status",
@@ -119923,14 +120124,9 @@ mod stage199d_wa2b_wake_owner_census {
             "};",
             "tcb.restart.token = claim.restart_token;",
         ),
-        (
-            "src/kernel/boot/restart_state.rs",
-            "exit_task",
-            "tcb.status",
-            "TaskStatus::Exited(code)",
-            "}",
-            "tcb.restart.token = Some(RestartToken(token));",
-        ),
+        // U9-EXIT1 §4 RETIRED this fingerprint along with the write it pinned: the four self-exit
+        // writes are now `exit_claim::apply_self_exit_writes_locked`'s, fingerprinted there with
+        // the same neighbourhood.
         (
             "src/kernel/boot/restart_state.rs",
             "restart_task",
@@ -119971,14 +120167,8 @@ mod stage199d_wa2b_wake_owner_census {
             ".ok_or(KernelError::TaskMissing)?;",
             "Ok::<_, KernelError>(())",
         ),
-        (
-            "src/kernel/boot/thread_state.rs",
-            "wake_joiners_for",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            "}",
-            "if wake_count < wake_tids.len() {",
-        ),
+        // U9-EXIT1 §4 RETIRED this fingerprint along with the write it pinned: the joiner wake is
+        // now `exit_claim::wake_joiners_for_locked`'s, fingerprinted there.
         // U9-FORK1 §4 RETIRED this fingerprint along with the write it pinned.
         (
             "src/kernel/task.rs",
@@ -120171,8 +120361,8 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            35,
-            "32 raw writes (U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
+            36,
+            "35 raw writes (U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
              write, 33 -> 32, when the fork moved onto the spawn reservation lifecycle): U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
              split form of \
@@ -120181,7 +120371,9 @@ mod stage199d_wa2b_wake_owner_census {
              `drain_send_timeout_post_work`, which is the SAME blocking-send timeout wake \
              `process_ipc_timeout_deadlines` used to perform under the broad lock; canonical \
              199E added `drain_recv_timeout_post_work`, the same relocation for the ordinary \
-             receive timeout"
+             receive timeout; U9-EXIT1 §4 retired TWO, `restart_state::exit_task`'s and \
+             `thread_state::wake_joiners_for`'s, when the broad NR 16 began driving the same two \
+             bodies the split route does — 38 -> 36, a de-duplication rather than a removal"
         );
         for (i, (file, function, lhs, rhs, before, after)) in sites.iter().enumerate() {
             let (pf, pfn, plhs, prhs, pbefore, pafter) = FINGERPRINTS[i];
@@ -120248,10 +120440,13 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            44,
+            45,
             "U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43; U9-REAP1 §2 moved \
              the faulted reap's `-> Dead` write into its claim and added the claim's exact \
-             inverse, 43 -> 44. \
+             inverse, 43 -> 44; U9-EXIT1 §2 added the self-exit claim, its exact inverse and the \
+             rank-2 half of the joiner wake, 44 -> 47; U9-EXIT1 §4 then retired the broad \
+             `exit_task` and `wake_joiners_for` rows when both began driving those same bodies, \
+             47 -> 45. \
              36 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
              `commit_blocking_send_split`, U3 (203C)'s `wake_tid_to_runnable_split`, and U7 \
              (199E)'s `drain_send_timeout_post_work`"
@@ -120266,7 +120461,7 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            44,
+            45,
             "35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
              `fork_complete_post_clone`'s, 35 -> 34; U9-REAP1 §2 moved the faulted reap's \
              `-> Dead` write into its claim and added the claim's exact inverse, 34 -> 35) + 8 \
@@ -120603,7 +120798,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            44,
+            45,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -120641,7 +120836,22 @@ mod stage199d_wa2b_wake_owner_census {
             // become `Blocked(EndpointReceive)` in between; the claim reads and writes the status
             // in ONE acquisition behind `status_is_claimable`, and its inverse can only restore a
             // status that predicate already admitted.
-            (14, 18, 9, 2, 1)
+            // U9-EXIT1 §2: CAN 14 -> 15 and CANNOT 18 -> 20. The self-exit claim and its exact
+            // inverse are CANNOT for the same reason the reap pair is — one acquisition behind a
+            // predicate that admits only `Running`. `wake_joiners_for_locked` is a genuine CAN and
+            // is classified as one: it moves a task out of `Blocked(Join)`, and it is the rank-2
+            // half of `wake_joiners_for`, which is already CAN.
+            //
+            // U9-EXIT1 §4: CAN stays 15 and CANNOT 20 -> 18, from THREE movements that net out.
+            // The broad `exit_task` (CAN) and `wake_joiners_for` (CANNOT) rows retire, because
+            // both now drive the bodies the split route already enumerated — the writes were
+            // de-duplicated, not removed. And the surviving self-exit write is reclassified CAN,
+            // because its enclosing function is now `apply_self_exit_writes_locked`, which the
+            // broad caller reaches with NO status precondition. Classifying it `Cannot` on the
+            // strength of the guard its OTHER caller applies would record the nearest guard
+            // rather than the one every caller applies, which is precisely the error this census
+            // exists to catch.
+            (15, 18, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -120701,12 +120911,8 @@ mod stage199d_wa2b_wake_owner_census {
                 "if request_client && self.task_status(client_tid).is_none() {",
                 "let client_tid = base_tid + 1000;",
             ),
-            (
-                "thread_state.rs",
-                "wake_joiners_for",
-                "if tcb.status != TaskStatus::Blocked(WaitReason::Join(ThreadId(target_tid))) {",
-                "for tcb in tcbs.iter_mut().flatten() {",
-            ),
+            // U9-EXIT1 §4 RETIRED this row: the write it guarded moved to
+            // `exit_claim::wake_joiners_for_locked`, which carries the identical gate.
             (
                 "spawn_thread_core.rs",
                 "initialize_thread_incarnation_locked",
@@ -120740,6 +120946,20 @@ mod stage199d_wa2b_wake_owner_census {
             // There is no window between them for a task to become `Blocked`, which is exactly
             // what the base path — reading the status in the handler and writing it in the
             // cleanup — could not say.
+            // U9-EXIT1 §4 RETIRED this proof with the row it justified. The write moved into
+            // `apply_self_exit_writes_locked`, which the broad `exit_task` also calls WITHOUT
+            // `status_is_self_exitable` in front of it, so the site is `Can` and no guard proof is
+            // owed. `claim_self_exit_locked` still applies the predicate for the split route — it
+            // is simply no longer the enclosing function of a status write.
+            // Its inverse: the guard is the exact-incarnation match, and the value it writes is
+            // the claim's captured `status_before`, which `status_is_self_exitable` restricts to
+            // `Running`.
+            (
+                "exit_claim.rs",
+                "rollback_exit_claim_locked",
+                ".find(|tcb| tcb.tid.0 == claim.tid && tcb.asid == claim.asid)",
+                "matches!(status, TaskStatus::Running)",
+            ),
             (
                 "reap_claim.rs",
                 "claim_faulted_task_for_reap_locked",
@@ -120787,6 +121007,7 @@ mod stage199d_wa2b_wake_owner_census {
                 "thread_state.rs" => THREAD,
                 "spawn_thread_core.rs" => SPAWN_CORE,
                 "reap_claim.rs" => REAP_CLAIM,
+                "exit_claim.rs" => EXIT_CLAIM,
                 "runtime.rs" => RUNTIME,
                 other => panic!("unknown census source {other}"),
             };
@@ -134848,10 +135069,17 @@ mod riscv64_async_preemption {
             snap.contains("if tid == 0 {"),
             "the idle identity publishes nothing"
         );
-        // Death clears it.
+        // Death clears it. U9-EXIT1 §4 moved the four self-exit writes — the status, the restart
+        // token, the blocked-receive cancel and this clear — into the ONE body both NR 16 routes
+        // run, so the clear is pinned where it now lives. It did not multiply and it did not
+        // change: `exit_task` calls the same body under the broad guard.
         assert!(
-            include_str!("restart_state.rs").contains("tcb.async_preempted = None;"),
+            include_str!("exit_claim.rs").contains("tcb.async_preempted = None;"),
             "exit must make the snapshot unreachable"
+        );
+        assert!(
+            include_str!("restart_state.rs").contains("apply_self_exit_writes_locked("),
+            "the broad exit must reach that clear through the shared body"
         );
         // Canonical 199E-R2 — the ONE classifier checks three-way identity agreement and fails
         // closed on every path that is not a clean match.
@@ -157960,9 +158188,8 @@ mod u9reap1_reap_transaction {
     use super::*;
     use crate::kernel::boot::reap_claim::{
         ClosingReplyLink, ReapClaim, ReapRefusal, claim_faulted_task_for_reap_locked,
-        collect_process_asids_locked, owner_pid_of_locked,
-        process_has_live_threads_locked, rollback_reap_claim_locked, status_is_claimable,
-        task_asid_locked,
+        collect_process_asids_locked, owner_pid_of_locked, process_has_live_threads_locked,
+        rollback_reap_claim_locked, status_is_claimable, task_asid_locked,
     };
     use crate::kernel::boot::{ActiveTransferMapping, SenderWaiter, TransferEnvelope};
     use crate::kernel::capabilities::{CNodeId, CapObject};
@@ -158826,5 +159053,1263 @@ mod u9reap1_reap_transaction {
             "both owners must emit the retirement marker"
         );
         assert!(REAP_TXN.contains("TASK_REAP_CLAIM_RETIRED tid={} asid={} pid={}"));
+    }
+}
+
+/// U9-EXIT1 §5 — the self-exit's properties, proved two ways.
+///
+/// The behavioural half drives the REAL `run_exit_transaction` over a harness whose rank-1 and
+/// rank-2 owner methods call the REAL `exit_claim` bodies against a real
+/// `[Option<ThreadControlBlock>]` slice, and which records every owner call in order. Ordering,
+/// exactly-once, reservation-before-mutation and zero-mutation claims are therefore checked against
+/// full pre/post state compared BY IDENTITY, and a failure can be injected at any boundary.
+///
+/// The structural half pins what a harness cannot see: that the route is gated on NR 16 and nothing
+/// else, that both routes reach the ONE transaction, that nothing allocates, that the reap's
+/// semantics are untouched, and that each architecture actually admits NR 16 and reverifies the
+/// exit deferral with the exit predicate rather than a status that need not exist.
+mod u9exit1_self_exit_transaction {
+    use super::*;
+    use crate::kernel::boot::exit_claim::{
+        ExitClaim, ExitDrainVerdict, ExitPreflight, ExitRefusal, claim_self_exit_locked,
+        exit_drain_verdict_locked, exit_preflight_locked, rollback_exit_claim_locked,
+        status_is_self_exitable, wake_joiners_for_locked,
+    };
+    use crate::kernel::boot::reap_claim::ClosingReplyLink;
+    use crate::kernel::boot::{SenderWaiter, ServerDeathWorkReservation};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::exit_txn::{ExitOutcome, ExitOwners, run_exit_transaction};
+    use crate::kernel::task::{
+        RestartToken, ServerReplyLink, TaskStatus, ThreadControlBlock, ThreadDetachState,
+        ThreadGroupId, WaitReason,
+    };
+    use crate::kernel::vm::Asid;
+
+    const EXIT_CLAIM: &str = include_str!("exit_claim.rs");
+    const EXIT_TXN: &str = include_str!("../syscall/exit_txn.rs");
+    const REAP_TXN: &str = include_str!("../syscall/reap_txn.rs");
+    const REAP_CLAIM: &str = include_str!("reap_claim.rs");
+    const SYSCALL: &str = include_str!("../syscall.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    // ── the harness ─────────────────────────────────────────────────────────────────────────
+
+    /// Where a failure is injected, so every boundary — before the claim, at the claim, and past
+    /// the linearization point — can be exercised.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Inject {
+        None,
+        /// This CPU has no drainer: the route must refuse before reading anything.
+        RouteNotAdmitted,
+        /// The queue-advance deferral is already held by another route.
+        QueueAdvanceTaken,
+        /// The server-death queue is full.
+        NoDeathCapacity,
+        /// The reverse link is reported present by the pre-mutation probe but is gone by the time
+        /// it is taken — the reservation must then be released rather than held.
+        LinkVanishes,
+        /// `clear_current` hands back a DIFFERENT task than the one named. Post-clear, pre-claim.
+        SchedulerHandsBackAnother,
+        /// Another lifecycle edge writes a terminal status between the preflight and the claim.
+        ClaimLosesRace,
+        /// A post-claim cleanup step fails. It must NOT resurrect the task.
+        ReportsFail,
+    }
+
+    struct Harness {
+        tcbs: alloc::vec::Vec<Option<ThreadControlBlock>>,
+        current: [Option<u64>; 4],
+        /// Set while some route holds this CPU's ONE queue-advance deferral.
+        queue_advance: [Option<u64>; 4],
+        /// The exact incarnation the deferral names, once published.
+        exit_deferral: [Option<(u64, Option<Asid>)>; 4],
+        death_slots: usize,
+        death_reserved: usize,
+        death_published: alloc::vec::Vec<(u64, Asid, ServerReplyLink)>,
+        /// Every reply link the replier sweep was told to EXCLUDE.
+        replier_sweep_excepts: alloc::vec::Vec<Option<ServerReplyLink>>,
+        /// Reverse links the caller/replier sweeps handed back, detached exactly once each.
+        detached_links: alloc::vec::Vec<ClosingReplyLink>,
+        caller_records: alloc::vec::Vec<ClosingReplyLink>,
+        replier_records: alloc::vec::Vec<ClosingReplyLink>,
+        orphans: alloc::vec::Vec<(SenderWaiter, usize)>,
+        settled_orphans: alloc::vec::Vec<usize>,
+        /// Reverse link the exiting server still owes, if any.
+        owed_link: Option<ServerReplyLink>,
+        robust: alloc::vec::Vec<u64>,
+        enqueued: alloc::vec::Vec<u64>,
+        next_token: u64,
+        inject: Inject,
+        retired: usize,
+        log: alloc::vec::Vec<alloc::string::String>,
+    }
+
+    fn tcb(tid: u64, pid: u64, status: TaskStatus) -> ThreadControlBlock {
+        let mut t = ThreadControlBlock::new(ThreadId(tid), Some(Asid((tid + 200) as u16)));
+        t.thread_group_id = ThreadGroupId(pid);
+        t.status = status;
+        t
+    }
+
+    impl Harness {
+        fn new(tasks: &[ThreadControlBlock], current: Option<u64>) -> Self {
+            Self {
+                tcbs: tasks.iter().cloned().map(Some).collect(),
+                current: [current, None, None, None],
+                queue_advance: [None; 4],
+                exit_deferral: [None; 4],
+                death_slots: 1,
+                death_reserved: 0,
+                death_published: alloc::vec::Vec::new(),
+                replier_sweep_excepts: alloc::vec::Vec::new(),
+                detached_links: alloc::vec::Vec::new(),
+                caller_records: alloc::vec::Vec::new(),
+                replier_records: alloc::vec::Vec::new(),
+                orphans: alloc::vec::Vec::new(),
+                settled_orphans: alloc::vec::Vec::new(),
+                owed_link: None,
+                robust: alloc::vec::Vec::new(),
+                enqueued: alloc::vec::Vec::new(),
+                next_token: 900,
+                inject: Inject::None,
+                retired: 0,
+                log: alloc::vec::Vec::new(),
+            }
+        }
+        fn note(&mut self, what: &str) {
+            self.log.push(what.into());
+        }
+        fn at(&self, what: &str) -> usize {
+            self.log
+                .iter()
+                .position(|entry| entry == what)
+                .unwrap_or_else(|| panic!("owner call `{what}` never happened: {:?}", self.log))
+        }
+        fn count(&self, what: &str) -> usize {
+            self.log.iter().filter(|entry| *entry == what).count()
+        }
+        fn status_of(&self, tid: u64) -> Option<TaskStatus> {
+            self.tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.status)
+        }
+        /// The whole observable state, by identity, for a byte-for-byte pre/post comparison.
+        fn snapshot(&self) -> alloc::string::String {
+            let tasks: alloc::vec::Vec<_> = self
+                .tcbs
+                .iter()
+                .flatten()
+                .map(|t| {
+                    (
+                        t.tid.0,
+                        t.asid,
+                        t.thread_group_id.0,
+                        t.status,
+                        t.restart.token,
+                        t.detach_state,
+                    )
+                })
+                .collect();
+            alloc::format!(
+                "{tasks:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+                self.current,
+                self.queue_advance,
+                self.exit_deferral,
+                self.death_published,
+                self.detached_links,
+                self.settled_orphans,
+                self.enqueued,
+                self.death_reserved
+            )
+        }
+    }
+
+    impl ExitOwners for Harness {
+        fn exit_route_admitted(&self, _cpu: CpuId) -> bool {
+            self.inject != Inject::RouteNotAdmitted
+        }
+
+        fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
+            self.current[cpu.0 as usize]
+        }
+
+        fn clear_current(&mut self, cpu: CpuId) -> Option<u64> {
+            self.note("clear_current");
+            if self.inject == Inject::SchedulerHandsBackAnother {
+                // The scheduler moved on: `current` is somebody else's now, and taking it is not
+                // this transaction's to do.
+                return Some(u64::MAX);
+            }
+            self.current[cpu.0 as usize].take()
+        }
+
+        fn enqueue_woken(&mut self, tid: u64) {
+            self.note("enqueue_woken");
+            self.enqueued.push(tid);
+        }
+
+        fn exit_preflight(&self, tid: u64) -> Result<ExitPreflight, ExitRefusal> {
+            exit_preflight_locked(&self.tcbs, tid)
+        }
+
+        fn has_robust_futex_list(&self, tid: u64) -> bool {
+            self.robust.contains(&tid)
+        }
+
+        fn mint_restart_token(&mut self) -> RestartToken {
+            self.note("mint_restart_token");
+            self.next_token += 1;
+            RestartToken(self.next_token)
+        }
+
+        fn claim_self_exit(
+            &mut self,
+            cpu: CpuId,
+            tid: u64,
+            asid: Option<Asid>,
+            code: u64,
+            token: RestartToken,
+        ) -> Result<ExitClaim, ExitRefusal> {
+            self.note("claim_self_exit");
+            if self.inject == Inject::ClaimLosesRace
+                && let Some(t) = self.tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)
+            {
+                // A reap got there first, between the preflight and here.
+                t.status = TaskStatus::Dead;
+            }
+            claim_self_exit_locked(&mut self.tcbs, cpu, tid, asid, code, token)
+        }
+
+        fn rollback_claim(&mut self, claim: &ExitClaim) -> bool {
+            self.note("rollback_claim");
+            rollback_exit_claim_locked(&mut self.tcbs, claim)
+        }
+
+        fn server_reply_link_present(&self, _tid: u64, _asid: Asid) -> bool {
+            self.inject == Inject::LinkVanishes || self.owed_link.is_some()
+        }
+
+        fn take_server_reply_link(&mut self, _tid: u64, _asid: Asid) -> Option<ServerReplyLink> {
+            self.note("take_server_reply_link");
+            if self.inject == Inject::LinkVanishes {
+                return None;
+            }
+            self.owed_link.take()
+        }
+
+        fn wake_joiners(&mut self, target_tid: u64, out: &mut [Option<u64>]) -> usize {
+            self.note("wake_joiners");
+            wake_joiners_for_locked(&mut self.tcbs, target_tid, out)
+        }
+
+        fn server_death_capacity_available(&self, _cpu: CpuId) -> bool {
+            self.inject != Inject::NoDeathCapacity && self.death_reserved < self.death_slots
+        }
+
+        fn reserve_server_death(&mut self, cpu: CpuId) -> Option<ServerDeathWorkReservation> {
+            self.note("reserve_server_death");
+            if self.inject == Inject::NoDeathCapacity || self.death_reserved >= self.death_slots {
+                return None;
+            }
+            self.death_reserved += 1;
+            Some(ServerDeathWorkReservation {
+                cpu_idx: cpu.0 as usize,
+                slot: 0,
+            })
+        }
+
+        fn publish_server_death(
+            &mut self,
+            _reservation: ServerDeathWorkReservation,
+            tid: u64,
+            asid: Asid,
+            link: ServerReplyLink,
+        ) -> bool {
+            self.note("publish_server_death");
+            self.death_published.push((tid, asid, link));
+            true
+        }
+
+        fn release_server_death(&mut self, _reservation: ServerDeathWorkReservation) {
+            self.note("release_server_death");
+            self.death_reserved -= 1;
+        }
+
+        fn note_server_death_reservation(&mut self, _tid: u64, _asid: Asid) {
+            self.note("note_server_death_reservation");
+        }
+
+        fn reserve_queue_advance(&mut self, cpu: CpuId, outgoing: u64) -> bool {
+            self.note("reserve_queue_advance");
+            if self.inject == Inject::QueueAdvanceTaken
+                || self.queue_advance[cpu.0 as usize].is_some()
+            {
+                return false;
+            }
+            self.queue_advance[cpu.0 as usize] = Some(outgoing);
+            true
+        }
+
+        fn release_queue_advance(&mut self, cpu: CpuId) {
+            self.note("release_queue_advance");
+            self.queue_advance[cpu.0 as usize] = None;
+            self.exit_deferral[cpu.0 as usize] = None;
+        }
+
+        fn publish_exit_deferral(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
+            self.note("publish_exit_deferral");
+            if self.exit_deferral[cpu.0 as usize].is_some() {
+                return false;
+            }
+            self.exit_deferral[cpu.0 as usize] = Some((tid, asid));
+            true
+        }
+
+        fn revoke_reply_caps_for_caller(
+            &mut self,
+            _claim: &ExitClaim,
+            closing: &mut [Option<ClosingReplyLink>],
+        ) -> usize {
+            self.note("revoke_reply_caps_for_caller");
+            for (slot, link) in self.caller_records.iter().enumerate() {
+                if slot < closing.len() {
+                    closing[slot] = Some(*link);
+                }
+            }
+            self.caller_records.len()
+        }
+
+        fn revoke_reply_caps_for_replier_except(
+            &mut self,
+            _claim: &ExitClaim,
+            except: Option<ServerReplyLink>,
+            closing: &mut [Option<ClosingReplyLink>],
+        ) -> usize {
+            self.note("revoke_reply_caps_for_replier_except");
+            self.replier_sweep_excepts.push(except);
+            for (slot, link) in self.replier_records.iter().enumerate() {
+                if slot < closing.len() {
+                    closing[slot] = Some(*link);
+                }
+            }
+            self.replier_records.len()
+        }
+
+        fn detach_reverse_link(&mut self, link: ClosingReplyLink) -> bool {
+            self.note("detach_reverse_link");
+            self.detached_links.push(link);
+            true
+        }
+
+        fn clear_ipc_waiters(
+            &mut self,
+            _claim: &ExitClaim,
+            orphaned: &mut [Option<(SenderWaiter, usize)>],
+        ) -> usize {
+            self.note("clear_ipc_waiters");
+            for (slot, entry) in self.orphans.iter().enumerate() {
+                if slot < orphaned.len() {
+                    orphaned[slot] = Some(entry.clone());
+                }
+            }
+            self.orphans.len()
+        }
+
+        fn settle_orphaned_sender(&mut self, _waiter: &SenderWaiter, endpoint_idx: usize) {
+            self.note("settle_orphaned_sender");
+            self.settled_orphans.push(endpoint_idx);
+        }
+
+        fn report_exit_to_supervisor(
+            &mut self,
+            _cpu: CpuId,
+            _tid: u64,
+            _code: u64,
+            _token: RestartToken,
+        ) -> bool {
+            self.note("report_exit_to_supervisor");
+            self.inject != Inject::ReportsFail
+        }
+
+        fn report_exit_to_pm(&mut self, _cpu: CpuId, _tid: u64, _code: u64) -> bool {
+            self.note("report_exit_to_pm");
+            self.inject != Inject::ReportsFail
+        }
+
+        fn retire_exit_claim(&mut self, _outcome: &ExitOutcome) {
+            self.note("retire_exit_claim");
+            self.retired += 1;
+        }
+    }
+
+    const CPU: CpuId = CpuId(0);
+    const CODE: u64 = 7;
+
+    /// One Running self on CPU 0, one sibling, one joiner blocked on the self.
+    fn three_task_world() -> Harness {
+        let mut joiner = tcb(3, 1, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
+        joiner.thread_group_id = ThreadGroupId(1);
+        Harness::new(
+            &[
+                tcb(1, 1, TaskStatus::Running),
+                tcb(2, 1, TaskStatus::Runnable),
+                joiner,
+            ],
+            Some(1),
+        )
+    }
+
+    // ── §5 property 1: reservation precedes irreversible mutation ───────────────────────────
+
+    #[test]
+    fn both_reservations_precede_the_first_irreversible_step() {
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 4,
+            reply_record_generation: 11,
+        });
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert_eq!(outcome.claim.tid(), 1);
+        // Both reservations, then the removal from `current`, then the claim. Nothing before the
+        // reservations may be irreversible, and nothing after the claim may be free.
+        assert!(h.at("reserve_queue_advance") < h.at("clear_current"));
+        assert!(h.at("reserve_server_death") < h.at("clear_current"));
+        assert!(h.at("clear_current") < h.at("claim_self_exit"));
+        // The detach of the reverse link is strictly after its reservation was taken.
+        assert!(h.at("reserve_server_death") < h.at("take_server_reply_link"));
+        assert!(h.at("take_server_reply_link") < h.at("publish_server_death"));
+        // The deferral is attributed to an exact incarnation only after the claim won it.
+        assert!(h.at("claim_self_exit") < h.at("publish_exit_deferral"));
+        // And the claim is retired last, after every owed step settled.
+        assert_eq!(h.at("retire_exit_claim"), h.log.len() - 1);
+    }
+
+    // ── §5 property 2: the current/status transition cannot tear ────────────────────────────
+
+    #[test]
+    fn an_exited_task_is_never_simultaneously_current_and_terminal() {
+        let mut h = three_task_world();
+        // Before: current, and NOT terminal.
+        assert_eq!(h.current[0], Some(1));
+        assert_eq!(h.status_of(1), Some(TaskStatus::Running));
+        run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        // After: terminal, and NOT current. The only ordering that produces both facts without an
+        // intermediate state that is both is clear-then-write, which the log pins.
+        assert_eq!(h.current[0], None);
+        assert_eq!(h.status_of(1), Some(TaskStatus::Exited(CODE)));
+        assert!(h.at("clear_current") < h.at("claim_self_exit"));
+        // And the exiting task was never made runnable again.
+        assert!(!h.enqueued.contains(&1));
+    }
+
+    // ── §5 property 3: one queue-advance owner, published for the exact incarnation ─────────
+
+    #[test]
+    fn the_committed_exit_holds_exactly_one_queue_advance_naming_itself() {
+        let mut h = three_task_world();
+        run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert_eq!(h.queue_advance[0], Some(1), "the deferral stays held");
+        assert_eq!(
+            h.exit_deferral[0],
+            Some((1, Some(Asid(201)))),
+            "the deferral names the EXACT incarnation, not a numeric TID"
+        );
+        assert_eq!(h.count("reserve_queue_advance"), 1);
+        assert_eq!(h.count("release_queue_advance"), 0);
+        assert_eq!(h.count("publish_exit_deferral"), 1);
+    }
+
+    /// A second exit on a CPU whose deferral is already held refuses, having mutated nothing.
+    #[test]
+    fn a_second_route_holding_the_deferral_refuses_for_free() {
+        let mut h = three_task_world();
+        h.inject = Inject::QueueAdvanceTaken;
+        let before = h.snapshot();
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert!(refusal.may_fall_back());
+        assert_eq!(h.snapshot(), before, "a refusal must mutate nothing");
+        assert_eq!(h.count("clear_current"), 0);
+        assert_eq!(h.count("claim_self_exit"), 0);
+    }
+
+    // ── §5 property 4: every pre-claim refusal is free ──────────────────────────────────────
+
+    #[test]
+    fn every_pre_claim_refusal_leaves_the_world_byte_for_byte_unchanged() {
+        // (a) no drainer on this CPU
+        let mut h = three_task_world();
+        h.inject = Inject::RouteNotAdmitted;
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::NoCurrent
+        );
+        assert_eq!(h.snapshot(), before);
+
+        // (b) nothing is current
+        let mut h = Harness::new(&[tcb(1, 1, TaskStatus::Running)], None);
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::NoCurrent
+        );
+        assert_eq!(h.snapshot(), before);
+
+        // (c) a Detached thread — out of the admitted population by construction
+        let mut detached = tcb(1, 1, TaskStatus::Running);
+        detached.detach_state = ThreadDetachState::Detached;
+        let mut h = Harness::new(&[detached], Some(1));
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::DetachedThread
+        );
+        assert_eq!(h.snapshot(), before);
+
+        // (d) not Running — some other lifecycle edge already won
+        for status in [
+            TaskStatus::Runnable,
+            TaskStatus::Faulted,
+            TaskStatus::Dead,
+            TaskStatus::Exited(0),
+        ] {
+            let mut h = Harness::new(&[tcb(1, 1, status)], Some(1));
+            let before = h.snapshot();
+            assert_eq!(
+                run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+                ExitRefusal::NotRunning,
+                "status {status:?} must not be self-exitable"
+            );
+            assert_eq!(h.snapshot(), before);
+        }
+
+        // (e) a robust-futex publisher — no split lock domain for its wakes
+        let mut h = three_task_world();
+        h.robust.push(1);
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::RobustFutexList
+        );
+        assert_eq!(h.snapshot(), before);
+
+        // (f) a reply is owed and no deferred slot is free — the broad `WouldBlock`, reproduced
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 0,
+            reply_record_generation: 1,
+        });
+        h.inject = Inject::NoDeathCapacity;
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::DeferredCapacity
+        );
+        assert_eq!(h.snapshot(), before);
+        assert_eq!(h.count("clear_current"), 0);
+    }
+
+    // ── §5 property 5: no fallback after the claim, and no resurrection ─────────────────────
+
+    #[test]
+    fn a_scheduler_that_hands_back_another_task_fails_closed_with_both_slots_released() {
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 0,
+            reply_record_generation: 1,
+        });
+        h.inject = Inject::SchedulerHandsBackAnother;
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(refusal, ExitRefusal::VictimChanged);
+        assert!(
+            !refusal.may_fall_back(),
+            "`current` was already cleared, so the trap must NOT re-enter the broad dispatcher"
+        );
+        // Nothing of THIS task changed, and neither reservation leaked.
+        assert_eq!(h.status_of(1), Some(TaskStatus::Running));
+        assert_eq!(h.queue_advance[0], None);
+        assert_eq!(h.death_reserved, 0);
+        assert_eq!(h.count("claim_self_exit"), 0);
+    }
+
+    #[test]
+    fn a_claim_that_loses_the_race_releases_both_slots_and_writes_nothing() {
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 0,
+            reply_record_generation: 1,
+        });
+        h.inject = Inject::ClaimLosesRace;
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(refusal, ExitRefusal::NotRunning);
+        // The winner's terminal status stands; this transaction wrote nothing over it.
+        assert_eq!(h.status_of(1), Some(TaskStatus::Dead));
+        assert_eq!(h.queue_advance[0], None);
+        assert_eq!(h.death_reserved, 0);
+        assert_eq!(h.count("take_server_reply_link"), 0);
+        assert_eq!(h.count("publish_exit_deferral"), 0);
+        assert_eq!(h.retired, 0);
+    }
+
+    #[test]
+    fn a_post_claim_cleanup_failure_fails_closed_without_resurrecting_the_task() {
+        let mut h = three_task_world();
+        h.inject = Inject::ReportsFail;
+        let outcome = run_exit_transaction(&mut h, CPU, CODE)
+            .expect("a failed report is not a failed exit — the task is already terminal");
+        assert!(!outcome.supervisor_reported && !outcome.pm_reported);
+        // Fails CLOSED: still terminal, still off the CPU, advance still owed, never rolled back.
+        assert_eq!(h.status_of(1), Some(TaskStatus::Exited(CODE)));
+        assert_eq!(h.current[0], None);
+        assert_eq!(h.queue_advance[0], Some(1));
+        assert_eq!(h.count("rollback_claim"), 0);
+        assert!(!h.enqueued.contains(&1));
+    }
+
+    // ── §5 property 6: duplicate and stale exits are inert ──────────────────────────────────
+
+    #[test]
+    fn a_duplicate_exit_mutates_nothing_and_publishes_no_second_disposition() {
+        let mut h = three_task_world();
+        run_exit_transaction(&mut h, CPU, CODE).expect("the first exit commits");
+        let after_first = h.snapshot();
+        // The task is no longer current, so the second attempt cannot even resolve a self.
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("the second must refuse");
+        assert_eq!(refusal, ExitRefusal::NoCurrent);
+        assert_eq!(h.snapshot(), after_first, "the second exit wrote nothing");
+        assert_eq!(h.retired, 1, "exactly one claim was retired");
+        assert_eq!(h.count("publish_exit_deferral"), 1);
+    }
+
+    /// Even if the scheduler wrongly re-presents the exited task as current, the claim refuses.
+    #[test]
+    fn a_stale_current_pointing_at_an_exited_task_still_refuses() {
+        let mut h = three_task_world();
+        run_exit_transaction(&mut h, CPU, CODE).expect("the first exit commits");
+        h.current[0] = Some(1);
+        h.queue_advance[0] = None;
+        h.exit_deferral[0] = None;
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(refusal, ExitRefusal::NotRunning);
+        assert_eq!(h.retired, 1);
+    }
+
+    // ── §5 property 7: TID reuse matches nothing ────────────────────────────────────────────
+
+    #[test]
+    fn the_claim_and_its_rollback_are_keyed_on_the_incarnation_not_the_number() {
+        let mut tcbs = alloc::vec![Some(tcb(1, 1, TaskStatus::Running))];
+        // A claim resolved against a DIFFERENT ASID matches nothing and writes nothing.
+        assert_eq!(
+            claim_self_exit_locked(&mut tcbs, CPU, 1, Some(Asid(999)), CODE, RestartToken(1)),
+            Err(ExitRefusal::IdentityChanged)
+        );
+        assert_eq!(tcbs[0].as_ref().unwrap().status, TaskStatus::Running);
+
+        let claim =
+            claim_self_exit_locked(&mut tcbs, CPU, 1, Some(Asid(201)), CODE, RestartToken(5))
+                .expect("the exact incarnation claims");
+        assert_eq!(tcbs[0].as_ref().unwrap().status, TaskStatus::Exited(CODE));
+        assert_eq!(
+            tcbs[0].as_ref().unwrap().restart.token,
+            Some(RestartToken(5))
+        );
+
+        // A replacement task reuses the numeric TID with a new ASID: the rollback matches nothing.
+        tcbs[0] = Some(tcb(1, 1, TaskStatus::Running));
+        tcbs[0].as_mut().unwrap().asid = Some(Asid(777));
+        assert!(
+            !rollback_exit_claim_locked(&mut tcbs, &claim),
+            "a rollback must never land on a replacement that reused the TID"
+        );
+        assert_eq!(tcbs[0].as_ref().unwrap().status, TaskStatus::Running);
+    }
+
+    // ── §5 property 8: the exact server-death settlement, exactly once ──────────────────────
+
+    #[test]
+    fn the_owed_reply_is_detached_once_and_excluded_from_the_replier_sweep() {
+        let link = ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 4,
+            reply_record_generation: 11,
+        };
+        let mut h = three_task_world();
+        h.owed_link = Some(link);
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert!(outcome.server_death_published);
+        assert_eq!(h.death_published.len(), 1, "settled exactly once");
+        assert_eq!(h.death_published[0], (1, Asid(201), link));
+        assert_eq!(h.count("take_server_reply_link"), 1);
+        // The replier sweep must be told to leave that record alone: clearing it would destroy the
+        // authority the drain is about to settle `ServerGone` through.
+        assert_eq!(h.replier_sweep_excepts, alloc::vec![Some(link)]);
+    }
+
+    /// With nothing owed, no slot is reserved and the sweep excludes nothing.
+    #[test]
+    fn no_owed_reply_reserves_no_slot_and_excludes_no_record() {
+        let mut h = three_task_world();
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert!(!outcome.server_death_published);
+        assert_eq!(h.count("reserve_server_death"), 0);
+        assert_eq!(h.death_reserved, 0);
+        assert_eq!(h.replier_sweep_excepts, alloc::vec![None]);
+    }
+
+    /// The link went away between the pre-mutation probe and the detach: the slot is RELEASED
+    /// rather than held, so a later route is not starved by a reservation that owes nothing.
+    #[test]
+    fn a_link_that_vanished_after_the_probe_releases_its_reservation() {
+        let mut h = three_task_world();
+        h.inject = Inject::LinkVanishes;
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must still commit");
+        assert!(!outcome.server_death_published);
+        assert_eq!(h.count("reserve_server_death"), 1);
+        assert_eq!(h.count("take_server_reply_link"), 1);
+        assert_eq!(h.count("publish_server_death"), 0);
+        assert_eq!(h.count("release_server_death"), 1);
+        assert_eq!(h.death_reserved, 0, "a slot owing nothing must be released");
+        // Nothing was excluded from the replier sweep, because nothing was detached.
+        assert_eq!(h.replier_sweep_excepts, alloc::vec![None]);
+    }
+
+    // ── §5 property 9: exhaustive, exactly-once cleanup of everything reachable ─────────────
+
+    #[test]
+    fn every_reachable_record_and_waiter_is_settled_exactly_once() {
+        let mut h = three_task_world();
+        h.caller_records = alloc::vec![(10u64, Asid(201), 1usize, 5u64)];
+        h.replier_records = alloc::vec![(11u64, Asid(202), 2usize, 6u64)];
+        h.orphans = alloc::vec![(
+            SenderWaiter {
+                tid: ThreadId(9),
+                msg: crate::kernel::ipc::Message::new(1, b"x").expect("msg"),
+                asid: Some(Asid(9)),
+                send_generation: 0,
+            },
+            3usize
+        )];
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert_eq!(outcome.caller_reply_records_revoked, 1);
+        assert_eq!(outcome.replier_reply_records_revoked, 1);
+        assert_eq!(outcome.reverse_links_detached, 2);
+        assert_eq!(outcome.orphaned_senders_settled, 1);
+        // Exactly once each, and each sweep runs exactly once.
+        assert_eq!(h.count("revoke_reply_caps_for_caller"), 1);
+        assert_eq!(h.count("revoke_reply_caps_for_replier_except"), 1);
+        assert_eq!(h.count("clear_ipc_waiters"), 1);
+        assert_eq!(h.detached_links.len(), 2);
+        assert_eq!(h.settled_orphans, alloc::vec![3usize]);
+        // Caller side before replier side before waiters, so the excluded record is known first.
+        assert!(
+            h.at("revoke_reply_caps_for_caller") < h.at("revoke_reply_caps_for_replier_except")
+        );
+        assert!(h.at("revoke_reply_caps_for_replier_except") < h.at("clear_ipc_waiters"));
+    }
+
+    // ── §5 property 10: joiners wake once, and never the exiting task ───────────────────────
+
+    #[test]
+    fn joiners_wake_exactly_once_and_the_exiting_task_is_never_among_them() {
+        let mut h = three_task_world();
+        // A second joiner on the same target, and one blocked on somebody else.
+        let mut other = tcb(4, 2, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
+        other.thread_group_id = ThreadGroupId(2);
+        h.tcbs.push(Some(other));
+        h.tcbs.push(Some(tcb(
+            5,
+            2,
+            TaskStatus::Blocked(WaitReason::Join(ThreadId(9))),
+        )));
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert_eq!(outcome.joiners_woken, 2);
+        h.enqueued.sort_unstable();
+        assert_eq!(h.enqueued, alloc::vec![3u64, 4u64]);
+        assert!(
+            !h.enqueued.contains(&1),
+            "the exiting task is never enqueued"
+        );
+        assert_eq!(h.status_of(3), Some(TaskStatus::Runnable));
+        assert_eq!(h.status_of(4), Some(TaskStatus::Runnable));
+        // The unrelated joiner is untouched.
+        assert_eq!(
+            h.status_of(5),
+            Some(TaskStatus::Blocked(WaitReason::Join(ThreadId(9))))
+        );
+        // Every enqueue happens AFTER the rank-2 status writes released.
+        assert!(h.at("wake_joiners") < h.at("enqueue_woken"));
+    }
+
+    // ── §5 property 11: the drain's question is answerable when the TCB is gone ─────────────
+
+    #[test]
+    fn the_drain_verdict_represents_removal_explicitly_rather_than_as_failure() {
+        let mut tcbs = alloc::vec![Some(tcb(1, 1, TaskStatus::Exited(CODE)))];
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Terminal
+        );
+        // Reaped between the claim and the drain: the exit SUCCEEDED, so this is not a refusal.
+        tcbs[0].as_mut().unwrap().status = TaskStatus::Dead;
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Terminal
+        );
+        // Removed outright. Absence is `Removed`, NOT a false answer to "is it terminal?".
+        tcbs[0] = None;
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Removed
+        );
+        // A different incarnation at the same numeric TID is likewise `Removed`, never `Terminal`.
+        let mut replacement = tcb(1, 1, TaskStatus::Running);
+        replacement.asid = Some(Asid(777));
+        tcbs[0] = Some(replacement);
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Removed
+        );
+        // Present, matching, and NOT terminal: something resurrected it. The one refusal.
+        tcbs[0].as_mut().unwrap().asid = Some(Asid(201));
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Contradicted
+        );
+    }
+
+    #[test]
+    fn only_running_is_self_exitable() {
+        assert!(status_is_self_exitable(TaskStatus::Running));
+        for status in [
+            TaskStatus::Runnable,
+            TaskStatus::Faulted,
+            TaskStatus::Dead,
+            TaskStatus::Exited(0),
+            TaskStatus::Blocked(WaitReason::Join(ThreadId(2))),
+        ] {
+            assert!(
+                !status_is_self_exitable(status),
+                "{status:?} must not be self-exitable"
+            );
+        }
+    }
+
+    // ═══ the structural half ════════════════════════════════════════════════════════════════
+
+    /// THE defect the first live x86_64 run found: the route ran the exit transaction on every
+    /// trap that reached the seam, so three tasks retired on their first `DebugLog`.
+    ///
+    /// Every switching class on this seam must state its own NR before it does anything else, and
+    /// this pins that ExitCurrentTask does too — against the constant, not a literal.
+    #[test]
+    fn the_split_exit_route_is_gated_on_nr_16_before_anything_else() {
+        let body = SPLIT
+            .split("fn try_split_exit_current_task(")
+            .nth(1)
+            .expect("the split route must exist");
+        let gate = body
+            .find("frame.syscall_num() != crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR")
+            .expect("the route MUST refuse every NR but 16");
+        // Nothing that reads or mutates task state may precede the gate.
+        let txn = body
+            .find("run_exit_transaction(")
+            .expect("the route must run the transaction");
+        assert!(gate < txn, "the NR gate must precede the transaction");
+        for earlier in ["SharedExitOwners {", "current_tid_authoritative"] {
+            if let Some(at) = body.find(earlier) {
+                assert!(gate < at, "`{earlier}` must not precede the NR gate");
+            }
+        }
+        // The other three switching classes state theirs the same way, so the seam has one rule.
+        for (route, nr) in [
+            (
+                "fn try_split_futex_wait_into_frame(",
+                "SYSCALL_FUTEX_WAIT_NR",
+            ),
+            (
+                "fn try_split_exit_current_task(",
+                "SYSCALL_EXIT_CURRENT_TASK_NR",
+            ),
+        ] {
+            let body = SPLIT.split(route).nth(1).expect("the route must exist");
+            let head = &body[..body.len().min(1600)];
+            assert!(
+                head.contains(&alloc::format!(
+                    "frame.syscall_num() != crate::kernel::syscall::{nr}"
+                )),
+                "{route} must gate on {nr} in its first statements"
+            );
+        }
+    }
+
+    /// One transaction, two owners. Neither route may grow a second teardown.
+    #[test]
+    fn both_nr16_routes_reach_the_one_transaction_and_the_one_claim() {
+        assert_eq!(
+            SPLIT.matches("run_exit_transaction(").count(),
+            1,
+            "the split route must call THE transaction exactly once"
+        );
+        assert_eq!(
+            EXIT_TXN
+                .matches("pub(crate) fn run_exit_transaction")
+                .count(),
+            1,
+            "there must be exactly one exit transaction"
+        );
+        assert_eq!(
+            EXIT_CLAIM
+                .matches("pub(crate) fn claim_self_exit_locked")
+                .count(),
+            1,
+            "there must be exactly one linearization point"
+        );
+        // The shared thread-scoped cleanup is REAP1's, driven through REAP1's bodies — not copied.
+        for shared_body in [
+            "revoke_reply_caps_for_caller_identity_locked",
+            "revoke_reply_caps_for_replier_identity_locked",
+            "clear_ipc_waiters_for_identity_locked",
+            "resolve_orphaned_sender_envelope_locked",
+        ] {
+            assert!(
+                REAP_CLAIM.contains(&alloc::format!("pub(crate) fn {shared_body}")),
+                "{shared_body} must live once, in reap_claim"
+            );
+            assert!(
+                EXIT_TXN.contains(shared_body),
+                "the exit owner must drive the SHARED {shared_body}, not a copy"
+            );
+            assert!(
+                !EXIT_CLAIM.contains(&alloc::format!("pub(crate) fn {shared_body}")),
+                "{shared_body} must NOT be reimplemented for the exit"
+            );
+        }
+    }
+
+    /// §4 — the BROAD NR 16 delegates to the same claim and cleanup owners.
+    ///
+    /// It cannot delegate the whole transaction: the broad path admits a population this route
+    /// refuses before any mutation (a `Detached` thread, whose closure reaches `mark_task_dead`'s
+    /// allocating general revoke, and a robust-futex publisher, whose registry has no split lock
+    /// domain), and widening the transaction to cover them would violate §4's own no-allocation
+    /// rule. What it CAN delegate — and now does — is every body the two routes share.
+    #[test]
+    fn the_broad_exit_drives_the_same_bodies_the_split_route_does() {
+        const RESTART: &str = include_str!("restart_state.rs");
+        const THREAD: &str = include_str!("thread_state.rs");
+
+        // 1. The four self-exit TCB writes live ONCE, and both routes call that one body.
+        assert_eq!(
+            EXIT_CLAIM
+                .matches("pub(crate) fn apply_self_exit_writes_locked")
+                .count(),
+            1,
+            "the self-exit writes must live in exactly one body"
+        );
+        assert!(
+            RESTART.contains("exit_claim::apply_self_exit_writes_locked("),
+            "the broad `exit_task` must call the shared body"
+        );
+        assert!(
+            EXIT_CLAIM.contains("apply_self_exit_writes_locked(tcb, code, token);"),
+            "the split claim must call the shared body"
+        );
+        // The broad path no longer carries its own copy of any of the four.
+        for own_copy in [
+            "tcb.status = TaskStatus::Exited(code)",
+            "tcb.restart.token = Some(RestartToken(token))",
+        ] {
+            assert!(
+                !RESTART.contains(own_copy),
+                "the broad exit must not keep its own `{own_copy}`"
+            );
+        }
+
+        // 2. The joiner wake likewise: one rank-2 body, two owners, rank-1 enqueues left to each.
+        assert!(
+            THREAD
+                .contains("exit_claim::wake_joiners_for_locked(tcbs, target_tid, &mut wake_tids)"),
+            "the broad `wake_joiners_for` must drive the shared rank-2 body"
+        );
+        assert!(
+            !THREAD.contains("tcb.status = TaskStatus::Runnable;"),
+            "the broad joiner wake must not keep its own status write"
+        );
+        let broad = THREAD
+            .split("pub(crate) fn wake_joiners_for(")
+            .nth(1)
+            .expect("the broad owner");
+        let broad = &broad[..broad
+            .find(
+                "
+    }",
+            )
+            .unwrap_or(broad.len())];
+        let locked_at = broad
+            .find("wake_joiners_for_locked")
+            .expect("the shared body");
+        let enqueue_at = broad
+            .find("self.enqueue_task(")
+            .expect("the rank-1 enqueues");
+        assert!(
+            locked_at < enqueue_at,
+            "the rank-1 enqueues must follow the rank-2 acquisition, on both owners"
+        );
+
+        // 3. And the reply/waiter sweeps the two routes share are REAP1's, driven from both.
+        for shared_body in [
+            "revoke_reply_caps_for_caller_identity",
+            "clear_ipc_waiters_for",
+        ] {
+            assert!(
+                RESTART.contains(shared_body) && EXIT_TXN.contains(shared_body),
+                "both routes must drive the shared `{shared_body}`"
+            );
+        }
+    }
+
+    /// U9-REAP1's semantics are untouched: the reap still writes `Dead` and still takes the token;
+    /// the exit writes `Exited(code)` and mints one. Factoring shared code was allowed; changing
+    /// what NR 31 means was not.
+    #[test]
+    fn the_reap_and_the_exit_keep_their_distinct_terminal_claims() {
+        assert!(
+            EXIT_CLAIM.contains("tcb.status = TaskStatus::Exited(code)")
+                && EXIT_CLAIM.contains("tcb.restart.token = Some(token)"),
+            "the exit writes Exited(code) and INSTALLS a freshly minted token"
+        );
+        assert!(
+            !EXIT_CLAIM.contains("TaskStatus::Dead;"),
+            "the exit claim must never write the reap's terminal status"
+        );
+        assert!(
+            REAP_CLAIM.contains("TaskStatus::Dead"),
+            "the reap's terminal status is unchanged"
+        );
+        assert!(
+            !REAP_TXN.contains("claim_self_exit_locked") && !REAP_TXN.contains("ExitClaim"),
+            "the reap transaction must not learn about the exit claim"
+        );
+        // The one REAP1 signature this stage widened, and the only one. Both reap owners pass
+        // `None`, so NR 31 excludes nothing and its behavior is byte-for-byte what it was.
+        assert!(
+            REAP_CLAIM.contains("except: Option<crate::kernel::task::ServerReplyLink>"),
+            "the replier sweep gained an exclusion parameter"
+        );
+        assert_eq!(
+            REAP_TXN
+                .matches("revoke_reply_caps_for_replier_identity_locked")
+                .count(),
+            2,
+            "both reap owners drive the shared replier sweep"
+        );
+        for call in REAP_TXN
+            .split("revoke_reply_caps_for_replier_identity_locked")
+            .skip(1)
+        {
+            let args = &call[..call.find(')').unwrap_or(call.len())];
+            assert!(
+                args.contains("None"),
+                "a reap must exclude NOTHING from the replier sweep: {args}"
+            );
+        }
+    }
+
+    /// §4 — no allocation anywhere in the teardown, on either route.
+    #[test]
+    fn nothing_in_the_exit_teardown_allocates() {
+        for (name, src) in [("exit_claim.rs", EXIT_CLAIM), ("exit_txn.rs", EXIT_TXN)] {
+            for forbidden in [
+                "Vec<",
+                "vec!",
+                "Box<",
+                "alloc::",
+                "to_vec(",
+                ".collect(",
+                "String",
+                "BTreeMap",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "{name} must not contain `{forbidden}` — §4 forbids allocation in the teardown"
+                );
+            }
+            // The fixed-capacity buffers the sweeps write into are stack arrays, sized by the
+            // kernel's own compile-time maxima.
+        }
+        assert!(
+            EXIT_TXN.contains("[Option<ClosingReplyLink>; MAX_REPLY_CAPS]")
+                && EXIT_TXN.contains("[Option<u64>; MAX_TASKS]"),
+            "the sweep buffers must be fixed-capacity stack arrays"
+        );
+    }
+
+    /// §3 — one selector, one drain. The transaction never dispatches, never selects and never
+    /// reaches a scheduler policy of its own.
+    #[test]
+    fn the_exit_transaction_owns_no_selector_and_no_second_drain() {
+        for forbidden in [
+            "dispatch_next_task",
+            "block_current_cpu",
+            "select_next",
+            "scheduler_tick",
+        ] {
+            assert!(
+                !EXIT_TXN.contains(forbidden),
+                "the transaction must not contain `{forbidden}` — the EXISTING drain owns that"
+            );
+        }
+        // The deferral it reserves is U9-QA's, by name. A second per-CPU cell of its own would be
+        // a second queue-advance owner, which is exactly what §3 forbids.
+        assert!(
+            EXIT_TXN.contains("futex_wait_dispatch_try_defer"),
+            "the owner must reserve THE existing U9-QA deferral, not invent one"
+        );
+        assert!(EXIT_TXN.contains("fn reserve_queue_advance"));
+        assert!(
+            SPLIT.contains("D::QueueAdvanceCommitted"),
+            "the route hands the advance to the existing post-lock drain"
+        );
+    }
+
+    /// §5 — NR 16 is admitted before BOTH terminal acquisitions, on all three architectures.
+    #[test]
+    fn all_three_architectures_admit_nr16_before_their_terminal_acquisition() {
+        // x86_64 and AArch64 share `trap_entry.rs`; AArch64's ABI-import gate is an allow-list.
+        assert!(
+            TRAP_ENTRY.contains("SYSCALL_EXIT_CURRENT_TASK_NR"),
+            "the shared entry must admit NR 16"
+        );
+        // RISC-V's own eligibility predicate.
+        assert!(
+            RISCV_TRAP.contains("SYSCALL_EXIT_CURRENT_TASK_NR"),
+            "RISC-V must admit NR 16"
+        );
+        // NR 16 is a SWITCHING class, so it must NOT be on the non-switching NR-only whitelist —
+        // whose contract is that every member may be early-returned through the caller's frame.
+        let whitelist = SPLIT
+            .split("fn classify_split_eligible_nr_only")
+            .nth(1)
+            .expect("the whitelist must exist");
+        let whitelist = &whitelist[..whitelist.find("\n}").unwrap_or(whitelist.len())];
+        assert!(
+            !whitelist.contains("SYSCALL_EXIT_CURRENT_TASK_NR"),
+            "an exiting task has no frame to be early-returned through"
+        );
+    }
+
+    /// §6 — the terminal edge is MEASURED at the edge, with a marker per route that cannot leak.
+    #[test]
+    fn the_terminal_edge_has_its_own_marker_on_each_route() {
+        assert_eq!(
+            SYSCALL
+                .matches("EXIT_TASK_BROAD_ENTER tid={} asid={}")
+                .count(),
+            1,
+            "the broad terminal entry must be marked exactly once, at the handler itself"
+        );
+        assert_eq!(
+            SPLIT
+                .matches("EXIT_TASK_SPLIT_ENTER tid={} asid={}")
+                .count(),
+            1,
+            "the split route must be marked exactly once"
+        );
+        // Neither marker may be EMITTED from the other route, or the edge count is meaningless.
+        // Anchored on the log-call format strings: each route's commentary names the other's
+        // marker to explain why the pair exists, and prose is not emission.
+        assert!(!SPLIT.contains("\"EXIT_TASK_BROAD_ENTER tid={}"));
+        assert!(!SYSCALL.contains("\"EXIT_TASK_SPLIT_ENTER tid={}"));
+        // Both routes still emit the shared invocation marker, so the oracle can compare them.
+        assert!(
+            SYSCALL.contains("EXIT_TASK_SYSCALL_DISPATCHED")
+                && SPLIT.contains("EXIT_TASK_SYSCALL_DISPATCHED"),
+            "both routes must emit the shared invocation marker"
+        );
+        // The broad marker is the FIRST thing the handler does, so an edge is counted even when
+        // the broad handler then refuses.
+        let body = SYSCALL
+            .split("fn handle_exit_current_task(")
+            .nth(1)
+            .expect("the broad handler must exist");
+        // Anchored on the FORMAT STRINGS, not the names: the handler's own commentary mentions
+        // both markers, and a guard that matched prose would be measuring the wrong thing.
+        let enter = body
+            .find("\"EXIT_TASK_BROAD_ENTER tid={}")
+            .expect("the edge marker's log call");
+        let dispatched = body
+            .find("\"EXIT_TASK_SYSCALL_DISPATCHED nr={}")
+            .expect("the shared marker's log call");
+        assert!(enter < dispatched, "the edge is counted at the entry");
+        // And nothing that can return precedes it, so a declined broad exit is still an edge.
+        let declined = body
+            .find("reason=deferred_capacity")
+            .expect("the broad decline");
+        assert!(
+            enter < declined,
+            "a refused broad exit still counts as an edge"
+        );
+        // The split edge is counted the same way: at the route's own entry, BEFORE the transaction
+        // that may refuse. An edge counted only on success would make a route that declines every
+        // trap indistinguishable from a route that was never reached — which is precisely the
+        // ambiguity the first live run had to be re-run to resolve.
+        let route = SPLIT
+            .split("fn try_split_exit_current_task(")
+            .nth(1)
+            .expect("the split route must exist");
+        let split_enter = route
+            .find("\"EXIT_TASK_SPLIT_ENTER tid={}")
+            .expect("the split edge marker's log call");
+        let txn = route
+            .find("run_exit_transaction(")
+            .expect("the route must run the transaction");
+        assert!(
+            split_enter < txn,
+            "the split edge must be counted before the transaction can refuse"
+        );
+        assert!(
+            route.contains("EXIT_TASK_SPLIT_DECLINED"),
+            "a declined split must be attributable, or the edge count cannot be read"
+        );
+    }
+
+    /// Every refusal that is NOT safe to fall back from must say so explicitly.
+    #[test]
+    fn only_the_post_clear_refusal_forbids_the_broad_fallback() {
+        use ExitRefusal::*;
+        for refusal in [
+            NoCurrent,
+            TaskGone,
+            IdentityChanged,
+            NotRunning,
+            DetachedThread,
+            RobustFutexList,
+            DeferredCapacity,
+        ] {
+            assert!(
+                refusal.may_fall_back(),
+                "{refusal:?} is pre-mutation and must permit the broad answer"
+            );
+            assert!(!refusal.marker().is_empty());
+        }
+        assert!(
+            !VictimChanged.may_fall_back(),
+            "`current` is already cleared: the trap must fail closed"
+        );
     }
 }

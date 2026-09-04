@@ -2375,27 +2375,35 @@ impl KernelState {
         self.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid))
             .then_some(())
             .ok_or(KernelError::TaskMissing)?;
-        if let Some(slot) = self
-            .robust_futex
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|entry| entry.tid == ThreadId(tid)) || slot.is_none())
-        {
-            *slot = Some(super::RobustFutexRecord {
-                tid: ThreadId(tid),
-                state: RobustFutexState { head, len },
-            });
-            Ok(())
-        } else {
-            Err(KernelError::TaskTableFull)
-        }
+        // U9-EXIT1 §3: the registry is a TASK-domain array — it sits beside `tcbs`,
+        // `task_classes` and `tls_restore_pending`, and is written only for a task that
+        // `with_tcbs` above just proved live. It had no lock of its own because nothing outside
+        // the broad guard ever reached it; a split reader does now, so both accessors take the
+        // task lock and the pairing is real rather than incidental.
+        self.with_task_robust_futex_mut(|robust| {
+            if let Some(slot) = robust
+                .iter_mut()
+                .find(|slot| slot.is_some_and(|entry| entry.tid == ThreadId(tid)) || slot.is_none())
+            {
+                *slot = Some(super::RobustFutexRecord {
+                    tid: ThreadId(tid),
+                    state: RobustFutexState { head, len },
+                });
+                Ok(())
+            } else {
+                Err(KernelError::TaskTableFull)
+            }
+        })
     }
 
     pub fn robust_futex_state(&self, tid: u64) -> Option<RobustFutexState> {
-        self.robust_futex
-            .iter()
-            .flatten()
-            .find(|entry| entry.tid.0 == tid)
-            .map(|entry| entry.state)
+        self.with_task_robust_futex(|robust| {
+            robust
+                .iter()
+                .flatten()
+                .find(|entry| entry.tid.0 == tid)
+                .map(|entry| entry.state)
+        })
     }
 
     pub(crate) fn sync_current_thread_from_frame(
@@ -2565,22 +2573,14 @@ impl KernelState {
     }
 
     pub(crate) fn wake_joiners_for(&mut self, target_tid: u64) -> Result<u32, KernelError> {
-        let wake_tids = self.with_tcbs_mut(|tcbs| {
-            let mut wake_tids = [None; super::MAX_TASKS];
-            let mut wake_count = 0usize;
-            for tcb in tcbs.iter_mut().flatten() {
-                if tcb.status != TaskStatus::Blocked(WaitReason::Join(ThreadId(target_tid))) {
-                    continue;
-                }
-                tcb.status = TaskStatus::Runnable;
-                if wake_count < wake_tids.len() {
-                    wake_tids[wake_count] = Some(tcb.tid.0);
-                    wake_count += 1;
-                }
-            }
-            (wake_tids, wake_count)
+        // U9-EXIT1 §4 — one body, two owners. The rank-2 half lives in `exit_claim`, where the
+        // split route's exit transaction drives it; this is that same body under the broad guard,
+        // so a joiner wake cannot differ by route. The rank-1 enqueues stay here, after the
+        // acquisition releases — which is the property that made the two halves separable at all.
+        let mut wake_tids = [None; super::MAX_TASKS];
+        let wake_count = self.with_tcbs_mut(|tcbs| {
+            super::exit_claim::wake_joiners_for_locked(tcbs, target_tid, &mut wake_tids)
         });
-        let (wake_tids, wake_count) = wake_tids;
         for wake_tid in wake_tids.iter().take(wake_count).flatten() {
             self.enqueue_task(*wake_tid)?;
         }

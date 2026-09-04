@@ -13535,3 +13535,297 @@ three delivered RISC-V boots ran with `attempts=1 stalled=0`.
 The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
 their other residual classes, so ***U9 remains OPEN***: this increment empties the NR 31 population
 that reached them, it does not delete them.
+
+## U9-EXIT1 — ExitCurrentTask (NR16)
+
+### §1 — what NR16 actually does, and how much of REAP1 it can reuse
+
+`handle_exit_current_task` (`src/kernel/syscall.rs`) resolves the exact current incarnation from
+scheduler state — never from userspace — then applies one pre-mutation gate: if the caller still
+owes a reply and no deferred server-death slot is free on this CPU, it declines `WouldBlock` and
+leaves the task Running with its reverse link attached. Only then does it call `exit_task`, publish
+the typed `CurrentTaskExited` disposition, and return without a frame.
+
+`exit_task` (`src/kernel/boot/restart_state.rs`) is the single teardown authority, and it does
+substantially more than a reap:
+
+1. mint a fresh restart token (restart state);
+2. rank 2 — clear `blocked_recv_state`, write `status = Exited(code)`, install the token, clear
+   `async_preempted`;
+3. sweep caller-side reply records on the exact `{tid, asid}`;
+4. **the server-death deferral** — reserve a slot, `take_server_reply_link`, publish a
+   `DeferredServerDeathCompletion`, or release the reservation if nothing is owed. Reserve
+   precedes detach, so a full queue leaves the link attached rather than stranding a caller;
+5. sweep replier-side records **excluding** the record whose terminal the drain now owns;
+6. `clear_ipc_waiters_for_tid`;
+7. report the exit to the supervisor and to PM (each an endpoint send **plus a wake**);
+8. robust-futex wakes from the task's own robust list;
+9. `wake_joiners_for`;
+10. `if current`: `block_current_cpu()` then `dispatch_next_task()` — the in-lock queue advance;
+11. `if detached`: `reap_if_detached` → `mark_task_dead`, which adds reply-record sweeps, reply
+    deadline retirement, kernel-context release, driver-cap revocation and
+    `maybe_cleanup_process_cnode_for_pid`.
+
+Steps 10 and 11 are **independent `if`s, not an if/else**. A self-exiting *detached* thread
+therefore runs both the queue advance and the full death path; a joinable one stays `Exited(code)`
+until it is joined or reaped.
+
+#### The common/distinct ledger, and one correction to the premise
+
+| | REAP1 (NR31) | Exit (NR16) |
+|---|---|---|
+| claim | `Faulted \| Exited(_)` → **`Dead`** | Running on this exact CPU → **`Exited(code)`** |
+| restart token | takes and **clears** it | **mints and installs** a new one |
+| caller-side reply records | yes | yes — *same owner* |
+| replier-side reply records | unconditional | **except** the detached server link |
+| server-death deferral | none | **reserve → detach → publish** |
+| IPC waiters | yes | yes — *same owner* |
+| supervisor / PM report | none | **send + wake, twice** |
+| robust-futex and joiner wakes | none | **yes** |
+| kernel context | always | only via `mark_task_dead` (detached) |
+| process teardown | `maybe_cleanup_process_cnode_for_pid_noalloc_reap` | `maybe_cleanup_process_cnode_for_pid` |
+| general capability revoke | **not reachable** | **reachable** |
+| scheduler advance | none — target is already off-CPU | **block current + dispatch** |
+
+The last three rows matter more than the rest. The two process-teardown variants are *not* the same
+policy: the exit variant runs a general revocation loop over every live capability in the process
+CNode and purges active transfer mappings **through `revoke_capability_in_cnode`**, while the reap
+variant deliberately does neither — which is exactly the asymmetry U9-REAP1 §1 recorded when it
+found no general-revocation branch reachable from a faulted-task reap.
+
+So "reuse REAP1's lifecycle cleanup" cannot mean "run `run_reap_transaction` after an exit claim".
+Doing that would write `Dead` where NR16 writes `Exited(code)`, skip the server-death deferral,
+skip the supervisor/PM/joiner/futex owed work, and **silently narrow NR16's teardown so that
+capabilities NR16 revokes today would leak**. What is genuinely shared is the *thread-scoped* body
+U9-REAP1 already extracted into `kernel/boot/reap_claim.rs` — the two reply-record sweeps and the
+waiter detach, as `*_locked` helpers over borrowed subsystem state. That is the reuse this mission
+takes, and it is real: one implementation, two claims. The process-scoped halves stay distinct
+because they *are* distinct, and a guard pins that they remain so.
+
+#### Where the queue advance has to go
+
+Exit cannot return through its syscall frame, so the existing U9-QA machinery is the right and only
+vehicle: reserve the deferral, publish the terminal transition, return `QueueAdvanceCommitted`, and
+let the existing post-lock drain select and apply the next context. That is the order U9-FT4's
+terminal-fault route already follows, and it is reused verbatim rather than duplicated.
+
+One hazard is specific to exit. Both existing drain predicates —
+`futex_wait_reverify_blocked` and `terminal_fault_reverify_faulted` — resolve the outgoing TCB and
+`.unwrap_or(false)`, i.e. a **missing** TCB reverifies as *not ok*. An exiting task can legitimately
+have been torn further down by the time the drain runs, so exit needs its own predicate that admits
+`Exited(_) | Dead` **and represents "the claim removed it" explicitly**, rather than silently
+reading absence as success. The existing x86_64 disposition consumer already models exactly this
+(`None => true, // fully reaped` alongside `| None` in its terminal match), so the shape is
+established rather than invented.
+
+#### Base measurement
+
+Fresh artifacts at `f12c7c2`, the three existing exit-oracle profiles, all sealing green:
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_SYSCALL_DISPATCHED` | 1 | 1 | 1 |
+| `EXIT_TASK_PREFLIGHT_OK` | 1 | 1 | 1 |
+| `EXIT_TASK_LIFECYCLE_TRANSITION` | 1 | 1 | 1 |
+| `EXIT_TASK_DISPOSITION_PUBLISHED` | 1 | 1 | 1 |
+| `EXIT_TASK_DISPOSITION_CONSUMED` | 1 | 1 | 1 |
+| `EXIT_TASK_SYSCALL_DECLINED` | 0 | 0 | 0 |
+| oracle seal | ok | ok | ok |
+
+Exactly one NR16 per boot on each architecture, taken through the broad handler, with no decline.
+That single edge per architecture is what §6 must drive to zero.
+
+### §2 — The exit claim
+
+`src/kernel/boot/exit_claim.rs`. `ExitClaim` has no public constructor: the only way to hold one is
+to have performed `claim_self_exit_locked`, the transaction's linearization point. It carries
+`{cpu, tid, asid, pid, code, restart_token, status_before}` — the CPU included, so a claim cannot be
+spent on another CPU's run queue, and the ASID included, so a replacement task reusing the numeric
+TID matches nothing. §2's "numeric TID alone is insufficient" is enforced by construction: every
+lookup in the transaction is `tid.0 == tid && asid == asid`, and `rollback_exit_claim_locked`
+refuses a TCB whose ASID differs.
+
+One rank-2 acquisition performs, with no window between them: resolve the TCB (`TaskGone`), match
+the incarnation (`IdentityChanged`), refuse `Detached` (`DetachedThread`), classify the status
+(`NotRunning`), and only then write. `status_is_self_exitable` admits `Running` and nothing else,
+which is what arbitrates against every competing edge:
+
+| competitor | status it leaves | claim result |
+|---|---|---|
+| reap (NR 31) | `Dead` | `NotRunning` |
+| terminal fault | `Faulted` | `NotRunning` |
+| restart | `Runnable` | `NotRunning` |
+| a previous exit | `Exited(_)` | `NotRunning` |
+| TID reuse | any, different ASID | `IdentityChanged` |
+
+The clear-then-write ordering — rank 1 removes the task from `current`, then rank 2 writes the
+terminal status — is what makes "never simultaneously dispatchable and terminal" true rather than
+asserted. Between the two the task is in no run queue and is no CPU's `current`; it is not yet
+terminal, and it is not dispatchable either. That is the same ordering
+`commit_terminal_fault_transition_shared` established.
+
+Admission is narrower than the broad path's, and both narrowings refuse **before any mutation**:
+
+* `DetachedThread` — a detached self-exit additionally runs `reap_if_detached` → `mark_task_dead`,
+  which reaches a general capability-revocation loop over the process CNode and an allocating live-
+  capability snapshot. §4 forbids allocation in the teardown, so that population keeps its broad
+  path.
+* `RobustFutexList` — the robust-futex registry is a `KernelState` array with no split lock domain
+  of its own. Rather than invent one for a wake this route would owe, a thread that published a
+  robust list is refused.
+
+`ExitRefusal::may_fall_back` is `true` for every pre-mutation variant and `false` for exactly one,
+`VictimChanged`, which is reachable only after `current` has been cleared.
+
+### §3 — One transaction, ending in the existing queue advance
+
+`src/kernel/syscall/exit_txn.rs`. The order, and why it is this order:
+
+```
+  pre-lock  admit: this CPU has a drainer and is the authoritative dispatcher
+  rank 2    preflight: identity, Joinable, Running                       (refusal: free)
+  rank 2    does this thread still owe a reply?  -> capacity probe       (refusal: free)
+  ——        RESERVE the queue-advance deferral                          (refusal: free)
+  ——        RESERVE the server-death slot, if a reply is owed            (refusal: free)
+  rank 1    clear `current`
+  rank 2    CLAIM: Running -> Exited(code), install token                (LINEARIZATION POINT)
+  rank 2    detach the exact reverse link -> publish the deferred completion
+  rank 3    sweep caller-side reply records     -> release -> detach each link once
+  rank 3    sweep replier-side records EXCEPT the detached one -> release -> detach once
+  rank 3    detach every waiter this identity owns -> release -> settle each orphan once
+  rank 3/1  report the exit to the supervisor and to PM (send, then wake)
+  rank 1/2  joiner wakes
+  ——        return QueueAdvanceCommitted; the EXISTING drain selects and applies the next task
+```
+
+Both reservations precede the first irreversible step. That is what makes every refusal above them
+free and every step below them owed rather than optional, and it is why `QueueAdvanceCommitted` is
+returned only with a live reservation in hand.
+
+There is no second selector, no second scheduler policy and no second drain. The route reserves
+U9-QA's own deferral through `futex_wait_dispatch_try_defer` and returns; the post-lock drain that
+FutexWait and the terminal fault already share does the selection and the apply.
+
+**Nothing is saved and nothing is returned.** The shared `trap_entry` bridge and the RISC-V wrapper
+both skip the outgoing-frame capture and the syscall finalize when this CPU carries an exit
+deferral, which shows up live as `captured=0` on the committed advance. After the claim there is no
+broad fallback: re-entering `handle_exit_current_task` would mint a second token, publish a second
+disposition and re-sweep records this transaction already retired. A cleanup step that fails
+therefore fails **closed** — the task stays terminal and off the CPU, the advance still happens, and
+nothing is rolled back.
+
+**The drain's question, when the TCB is gone.** Both existing drain predicates end in
+`.unwrap_or(false)`, so a missing TCB reverifies as *not ok*. For an exit that is the wrong answer:
+an exiting task can legitimately have been reaped or joined between the claim and the drain, and
+absence then means *the exit succeeded*. So absence is represented explicitly rather than inferred.
+`ExitDrainVerdict` is three-valued — `Terminal`, `Removed`, `Contradicted` — and only
+`Contradicted` (present, matching, and **not** terminal) refuses. A per-CPU
+`EXIT_QUEUE_ADVANCE_OUTGOING` cell names the exact incarnation so the drain asks the exit's question
+rather than FutexWait's.
+
+### §4 — Through the existing owners, and what the broad path can delegate
+
+Every acquisition in the transaction is one owner method around a body shared with the broad path.
+The transaction holds no lock between owner calls by construction, so no unrelated lock is held
+across an IPC delivery, a wake, a TLB operation or an arch apply. Nothing in `exit_claim.rs` or
+`exit_txn.rs` allocates: the sweep buffers are fixed-capacity stack arrays sized by `MAX_REPLY_CAPS`,
+`MAX_ENDPOINT_SENDER_WAITERS` and `MAX_TASKS`, and a guard forbids `Vec`, `Box`, `alloc::` and
+`collect` in both files.
+
+The broad NR 16 **cannot** delegate the whole transaction, and the reason is a constraint the
+mission itself imposes: the broad path admits a population this route refuses (a `Detached` thread
+and a robust-futex publisher), and widening the transaction to cover them would reach the allocating
+general revoke §4 forbids. Narrowing NR 16's broad semantics to fit is what §5 forbids.
+
+What it can delegate — and now does — is every body the two routes share:
+
+| body | broad owner | split owner |
+|---|---|---|
+| `apply_self_exit_writes_locked` | `KernelState::exit_task` | `claim_self_exit_locked` |
+| `wake_joiners_for_locked` | `KernelState::wake_joiners_for` | `run_exit_transaction` |
+| `revoke_reply_caps_for_caller_identity_locked` | `exit_task` | `SharedExitOwners` |
+| `revoke_reply_caps_for_replier_identity_locked` | `exit_task` | `SharedExitOwners` |
+| `clear_ipc_waiters_for_identity_locked` | `exit_task` | `SharedExitOwners` |
+| the server-death reserve → detach → publish order | `exit_task` | `run_exit_transaction` |
+
+The status **precondition** stays a difference, deliberately: the split claim admits `Running` and
+nothing else, because a split exit is a task's first terminal edge, while the broad path is also
+reached for a task another owner has already moved. Sharing writes is not sharing a precondition
+neither caller wants the other's — and that is exactly why the shared write is classified `Can` in
+the WA2B census rather than inheriting the `Cannot` of the guard nearest to it.
+
+The one U9-REAP1 signature this stage widened is `revoke_reply_caps_for_replier_identity_locked`,
+which gained an `except: Option<ServerReplyLink>`. Both reap owners pass `None`, so NR 31 excludes
+nothing and its behaviour is byte-for-byte what it was. The exit passes the link whose terminal the
+deferred server-death completion now owns: clearing that slot in the sweep would destroy the
+authority the drain is about to settle `ServerGone` through.
+
+### §5 — Routing, and the guards
+
+NR 16 is wired as the **fourth switching class** in `try_split_dispatch_into_frame`, before both
+terminal acquisitions on all three architectures, and deliberately **not** on the NR-only
+non-switching whitelist — whose whole contract is that every member may be early-returned through
+the caller's own frame, which an exiting task does not have. AArch64's ABI-import allow-list admits
+NR 16; RISC-V's `split_eligible` predicate admits it on a per-invocation marker arm.
+
+`u9exit1_self_exit_transaction` is 27 cases in two halves. The behavioural half drives the real
+`run_exit_transaction` over a harness whose rank-1 and rank-2 owner methods call the real
+`exit_claim` bodies against a real `[Option<ThreadControlBlock>]` slice, recording every owner call
+in order, so ordering and exactly-once claims are checked against full pre/post state compared **by
+identity** rather than by count, and a failure can be injected at any boundary. The structural half
+pins what a harness cannot see.
+
+| §5 property | where it is proved |
+|---|---|
+| one cleanup policy, distinct exact claims | `both_nr16_routes_reach_the_one_transaction_and_the_one_claim`, `the_reap_and_the_exit_keep_their_distinct_terminal_claims` |
+| current/status cannot tear | `an_exited_task_is_never_simultaneously_current_and_terminal` |
+| one queue-advance owner and one drain | `the_committed_exit_holds_exactly_one_queue_advance_naming_itself`, `the_exit_transaction_owns_no_selector_and_no_second_drain` |
+| no return or syscall completion for the dead task | live `captured=0` and `EXIT_TASK_SYSCALL_RETURNED=0` |
+| no fallback after the claim | `a_scheduler_that_hands_back_another_task_fails_closed_with_both_slots_released` |
+| exact server-death settlement and wake | `the_owed_reply_is_detached_once_and_excluded_from_the_replier_sweep`, `a_link_that_vanished_after_the_probe_releases_its_reservation` |
+| duplicate and stale exits inert | `a_duplicate_exit_mutates_nothing_and_publishes_no_second_disposition`, `a_stale_current_pointing_at_an_exited_task_still_refuses` |
+| exhaustive reachable cleanup | `every_reachable_record_and_waiter_is_settled_exactly_once` |
+| no locks across wake/TLB/apply | `joiners_wake_exactly_once_and_the_exiting_task_is_never_among_them` (rank-2 writes before rank-1 enqueues) |
+| reservation before irreversible mutation | `both_reservations_precede_the_first_irreversible_step` |
+| the terminal edges are zero | §6 |
+
+One defect this suite exists for was found by the live run before the suite was written: the route
+had no NR gate at all, so it ran the exit transaction on **every** trap that reached the switching
+seam and retired three tasks on their first `DebugLog`
+(`YARM_LOCK_SPLIT_DISPATCH arch=x86_64 nr=15 result=queue_advance_committed`). The guard that would
+have caught it is `the_split_exit_route_is_gated_on_nr_16_before_anything_else`, and it checks the
+same rule for every switching class on the seam.
+
+### §6 — The live matrix
+
+Three consecutive fresh runs per architecture at the delivered commit, using the existing exit
+oracles, re-derived onto the route that now services NR 16. The re-derivation follows U9-REAP1's
+discipline: the broad pipeline's nine markers move from `need_once` to `need_absent`, which is the
+stronger form of what Stage 200D-0B3/0C2/0D2 policed — those runners checked the lock-state *field*
+on each marker because the field was the only thing that could lie about where the marker was
+emitted, and a marker that cannot be emitted at all cannot carry a false lock state.
+
+Every ordering claim about the exit's own queue advance is made against the **slice** of the boot log
+that begins at the accepted exit. The drain's markers are shared with FutexWait and blocking recv,
+which fire 118 times before the exit in the x86_64 boot; a whole-log claim would have been satisfied
+by somebody else's advance — an oracle that proves nothing while appearing to pass.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_BROAD_ENTER` | **0 / 0 / 0** | **0 / 0 / 0** | **0 / 0 / 0** |
+| `EXIT_TASK_SPLIT_ENTER` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_SPLIT_DECLINED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_CLAIM_RETIRED` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_SYSCALL_DISPATCHED nr=16` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_SYSCALL_RETURNED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| exiting frames captured | 0 | 0 | 0 |
+| drain reselected the exiting task | 0 | 0 | 0 |
+| panics / faults / lock warnings | 0 | 0 | 0 |
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+
+The retired broad pipeline — `PREFLIGHT_OK`, `DISPOSITION_PUBLISHED`, `DISPOSITION_CONSUMED`,
+`EXITING_NOT_CURRENT`, `ABSENCE_VALIDATED`, `RESTORE_OWNER_PREPARED` / `RESTORE_OWNER` /
+`RESTORE_DONE` / `SRET_OWNER`, `INLOCK_BYPASS_ARMED`, `BROAD_LOCK_RELEASED`,
+`POST_LOCK_DRAIN_DONE`, `COMMON_EPILOGUE_OWNER`, `TRAP_DEPTH_OWNER` — counted zero on every run of
+every architecture.
+

@@ -326,13 +326,24 @@ pub(crate) fn revoke_reply_caps_for_caller_identity_locked(
 /// to a prior incarnation at the same numeric TID); a record with no stored replier ASID carries
 /// no incarnation evidence and is matched on the numeric TID — the never-leak direction, and the
 /// same rule the base sweep applies.
+///
+/// `except` excludes ONE record whose server-death terminal another owner has already taken. The
+/// reap passes `None` — it detaches no link, so it excludes nothing — and U9-EXIT1 passes the link
+/// its deferral just detached, because clearing that slot here would destroy the authority the
+/// deferred completion is about to settle the blocked caller through. The exclusion is
+/// generation-bearing, so a slot reclaimed and reused since the link was taken does NOT match and
+/// is swept normally.
 pub(crate) fn revoke_reply_caps_for_replier_identity_locked(
     ipc: &mut IpcSubsystem,
     replier: ReceiverWaiterIdentity,
+    except: Option<crate::kernel::task::ServerReplyLink>,
     closing: &mut [Option<ClosingReplyLink>],
 ) -> usize {
     let mut revoked = 0usize;
     for (idx, slot) in ipc.reply_caps.iter_mut().enumerate() {
+        if except.is_some_and(|link| link.matches_record(idx, ipc.reply_cap_generations[idx])) {
+            continue;
+        }
         if slot.is_some_and(|record| {
             record.responder_tid == Some(replier.tid)
                 && record

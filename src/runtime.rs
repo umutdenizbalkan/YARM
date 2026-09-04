@@ -1118,6 +1118,168 @@ impl SharedKernel {
         });
     }
 
+    /// U9-EXIT1 §3 — may the split self-exit route run on this CPU at all?
+    ///
+    /// Two facts, both pre-mutation. A post-lock drainer must be active, or the queue-advance
+    /// deferral this route reserves would never be consumed and the CPU would strand with
+    /// `current` cleared. And this CPU must be the single authoritative dispatcher, because the
+    /// advance the drain performs authenticates against exactly that.
+    ///
+    /// These are the same two admissions `queue_advance_admit_split` makes before it peeks a
+    /// candidate; asking them here, before anything is reserved, is what keeps every exit refusal
+    /// free.
+    pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+            return false;
+        }
+        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
+            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+            let online = s.online_cpu_bitmap();
+            (
+                (online & !s.wake_only_bitmap()).count_ones() as usize,
+                sched.current_cpu,
+            )
+        });
+        dispatching <= 1 && dispatch_cpu == cpu
+    }
+
+    /// The authoritative dispatch CPU, rank 1. Used only to enqueue a woken joiner onto the run
+    /// queue the drain will select from.
+    pub(crate) fn authoritative_dispatch_cpu_split(&self) -> CpuId {
+        self.with_scheduler_split_mut(|sched| sched.current_cpu)
+    }
+
+    /// U9-EXIT1 §3 — did this thread publish a robust-futex list?
+    ///
+    /// Read under the TASK lock, which `set_robust_futex_head` and `robust_futex_state` now also
+    /// take, so the registry has one domain rather than an implicit dependence on the broad guard.
+    /// The route never walks a list: a thread that has one is refused before any mutation.
+    pub(crate) fn has_robust_futex_list_split_read(&self, tid: u64) -> bool {
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by this SharedKernel;
+        // `task_robust_futex_split_ptrs_from_raw` derives raw field pointers without forming a
+        // reference to the whole KernelState, and `task_state_lock` serializes the task domain.
+        let (task_lock, robust) = unsafe {
+            crate::kernel::boot::KernelState::task_robust_futex_split_ptrs_from_raw(
+                self.state.data_ptr(),
+            )
+        };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let robust = unsafe { &*robust };
+        kernel_ref(robust)
+            .iter()
+            .flatten()
+            .any(|entry| entry.tid.0 == tid)
+    }
+
+    /// U9-EXIT1 §3 — report a task exit to the supervisor: endpoint enqueue (rank 3), then wake.
+    ///
+    /// `false` means no supervisor endpoint is bound, which the broad path also treats as success
+    /// rather than an error. The message is built by the SAME encoder the broad reporter uses, so
+    /// the two cannot disagree about the wire format.
+    pub(crate) fn report_task_exit_to_supervisor_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        code: u64,
+        restart_token: u64,
+    ) -> bool {
+        crate::yarm_log!("TASK_EXITED_REPORT_BEGIN tid={}", tid);
+        let Some(endpoint_idx) = self.with_fault_split_mut(|faults| faults.supervisor_endpoint)
+        else {
+            crate::yarm_log!(
+                "TASK_EXITED_REPORT_FAIL tid={} reason=no-supervisor-endpoint",
+                tid
+            );
+            return false;
+        };
+        let Ok(msg) = crate::kernel::ipc::Message::with_header(
+            0,
+            yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TASK_EXITED,
+            0,
+            None,
+            &yarm_ipc_abi::supervisor_abi::encode_task_exited_event(tid, code, restart_token),
+        ) else {
+            crate::yarm_log!("TASK_EXITED_REPORT_FAIL tid={} reason=encode", tid);
+            return false;
+        };
+        if !self.exit_report_send_and_wake_split(cpu, endpoint_idx, msg) {
+            crate::yarm_log!("TASK_EXITED_REPORT_FAIL tid={} reason=queue_full", tid);
+            return false;
+        }
+        crate::yarm_log!("TASK_EXITED_REPORT_SENT tid={} target=supervisor", tid);
+        true
+    }
+
+    /// U9-EXIT1 §3 — report a task exit to PM: endpoint enqueue (rank 3), then wake.
+    pub(crate) fn report_task_exit_to_pm_split(&self, cpu: CpuId, tid: u64, code: u64) -> bool {
+        let Some(endpoint_idx) = self.with_fault_split_mut(|faults| faults.pm_task_exit_endpoint)
+        else {
+            return false;
+        };
+        let payload = yarm_ipc_abi::process_abi::KernelPmTaskExitedPayload::new(tid, code).encode();
+        let Ok(msg) = crate::kernel::ipc::Message::with_header(
+            0,
+            yarm_ipc_abi::process_abi::KERNEL_OP_PM_TASK_EXITED,
+            0,
+            None,
+            &payload,
+        ) else {
+            return false;
+        };
+        self.exit_report_send_and_wake_split(cpu, endpoint_idx, msg)
+    }
+
+    /// The rank-3 enqueue plus the wake, in that order and with the rank-3 claim RELEASED before
+    /// the wake — the same two steps `send_message_to_endpoint_and_wake` performs, split so no
+    /// unrelated lock is held across the wake.
+    fn exit_report_send_and_wake_split(
+        &self,
+        cpu: CpuId,
+        endpoint_idx: usize,
+        msg: crate::kernel::ipc::Message,
+    ) -> bool {
+        let queued = self.with_ipc_split_mut(|ipc| {
+            let Some(ep_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
+            else {
+                return false;
+            };
+            kernel_mut(ep_storage).send(msg).is_ok()
+        });
+        if !queued {
+            return false;
+        }
+        let _ = self.wake_waiter_for_endpoint_split(cpu, endpoint_idx);
+        true
+    }
+
+    /// U9-EXIT1 §3 — the RESTART subsystem, off the broad lock.
+    ///
+    /// The split self-exit mints its restart token from the SAME monotonic counter the broad
+    /// `exit_task` mints from, so the two routes cannot issue the same token or diverge in
+    /// numbering. Nothing else in the exit transaction touches this rank.
+    pub(crate) fn with_restart_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut crate::kernel::boot::RestartSubsystem) -> R,
+    ) -> R {
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by this SharedKernel.
+        // `restart_split_mut_ptrs_from_raw` derives raw field pointers via addr_of!/addr_of_mut!
+        // without forming a reference to the whole KernelState; `restart_state_lock` serializes
+        // access to the `restart` storage.
+        let (restart_lock, restart) =
+            unsafe { KernelState::restart_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let restart_lock = unsafe { &*restart_lock };
+        let _guard = restart_lock.lock();
+        let restart = unsafe { &mut *restart };
+        f(kernel_mut(restart))
+    }
+
     /// # Validation status
     /// - LIVE_OFF_TRAP — mutates only telemetry counters under `telemetry_state_lock`;
     ///   called from off-trap kernel code, not the pre-global-lock trap seam.
@@ -1935,6 +2097,125 @@ impl SharedKernel {
                 .map(|tcb| matches!(tcb.status, crate::kernel::task::TaskStatus::Faulted))
                 .unwrap_or(false)
         })
+    }
+
+    /// U9-EXIT1 §3 — reverify one EXIT deferral, by exact incarnation.
+    ///
+    /// Deliberately not shaped like its two neighbours. `futex_wait_reverify_blocked` and
+    /// `terminal_fault_reverify_faulted` both end in `.unwrap_or(false)`, so a MISSING TCB
+    /// reverifies as *not ok* — correct for them, because a blocked or faulted task must still
+    /// exist. An exiting task need not: it can legitimately have been joined or reaped between the
+    /// claim and this drain, and absence then means the exit SUCCEEDED. Reading absence as failure
+    /// would strand the CPU with `current` already cleared and nothing selected.
+    ///
+    /// So absence is represented explicitly rather than inferred — `Removed` is a distinct verdict
+    /// from `Terminal`, and only `Contradicted` (present and NOT terminal, i.e. something
+    /// resurrected a claimed task) refuses. Neither neighbouring predicate is loosened.
+    pub(crate) fn exit_reverify_terminal(
+        &self,
+        tid: u64,
+        asid: Option<crate::kernel::vm::Asid>,
+    ) -> crate::kernel::boot::exit_claim::ExitDrainVerdict {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::exit_claim::exit_drain_verdict_locked(tcbs, tid, asid)
+        })
+    }
+
+    /// The drain's boolean form: is this outgoing task's exit deferral still owed and sound?
+    ///
+    /// U9-EXIT1 §4 — the exact reverse link an incarnation still holds, read off the broad lock.
+    ///
+    /// The split-domain form of `KernelState::server_reply_link_for`, matched on the same
+    /// `{tid, asid}` incarnation, so a replacement task reusing the numeric TID resolves nothing.
+    pub(crate) fn server_reply_link_for_split_read(
+        &self,
+        server_tid: u64,
+        server_asid: crate::kernel::vm::Asid,
+    ) -> Option<crate::kernel::task::ServerReplyLink> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+                .and_then(|t| t.server_reply_link)
+        })
+    }
+
+    /// U9-EXIT1 §4 — the split-domain form of `KernelState::arm_server_dies_link_scope`.
+    ///
+    /// It exists so the ServerDies scenario is armed from the SAME point on both routes: while the
+    /// deferred reservation is held and the reverse link is still attached. Arming it later, or
+    /// from the terminal arm, is what 199D-SD3 established does not work — the one-shot latch then
+    /// claims whichever reply wait happened to be first in the boot rather than the one that dies.
+    ///
+    /// Diagnostic only, and inert unless the reply-timeout oracle core is compiled in.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn arm_server_dies_link_scope_split(
+        &self,
+        record_index: usize,
+        record_generation: u64,
+    ) {
+        use crate::kernel::boot::server_dies_counters as c;
+        if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            != crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+        {
+            return;
+        }
+        if !c::arm_record(record_index, record_generation) {
+            return;
+        }
+        let bound = self.with_ipc_split_mut(|ipc| {
+            if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+                return None;
+            }
+            ipc.reply_caps
+                .get(record_index)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.responder_tid.zip(r.replier_asid))
+        });
+        let Some((server_tid, server_asid)) = bound else {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} link_present=0 reason=unbound_record result=ok",
+                record_index,
+                record_generation
+            );
+            return;
+        };
+        let _ = c::arm_scenario_server(server_tid.0, server_asid.0);
+        let present = self
+            .server_reply_link_for_split_read(server_tid.0, server_asid)
+            .is_some_and(|link| link.matches_record(record_index, record_generation));
+        if present {
+            c::note_armed_link_present(record_index, record_generation);
+        }
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} server_tid={} server_asid={} link_present={} result=ok",
+            record_index,
+            record_generation,
+            server_tid.0,
+            server_asid.0,
+            u32::from(present)
+        );
+    }
+
+    /// `Terminal` and `Removed` both mean "the advance is owed"; `Contradicted` is the only
+    /// refusal, and it is the one that must never happen after a claim.
+    pub(crate) fn exit_reverify_ok(&self, tid: u64) -> bool {
+        use crate::kernel::boot::exit_claim::ExitDrainVerdict as V;
+        let asid = self.task_asid_opt_split_read(tid);
+        match self.exit_reverify_terminal(tid, asid) {
+            V::Terminal => true,
+            V::Removed => {
+                crate::yarm_log!("EXIT_TASK_DRAIN_REVERIFY_REMOVED tid={}", tid);
+                true
+            }
+            V::Contradicted => {
+                crate::yarm_log!(
+                    "EXIT_TASK_DRAIN_REVERIFY_CONTRADICTED tid={} result=fail",
+                    tid
+                );
+                false
+            }
+        }
     }
 
     pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {
