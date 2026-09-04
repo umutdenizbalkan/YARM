@@ -160438,7 +160438,20 @@ mod u9exit1_self_exit_transaction {
             );
         }
         assert!(after.contains("SyscallError::WouldBlock"));
-        assert!(after.contains("SyscallError::Internal"));
+        // Two distinct `Internal` settlements: the impossible-state one and the fail-closed one.
+        // The latter is deliberately NOT `Ok(())`: both `Complete` arms finalize through
+        // `CompletedInThisTrap`, which always commits the syscall-return ABI into the entering
+        // incarnation, so a success would tell a `VictimChanged` loser — still alive — that its
+        // `exit()` had succeeded.
+        assert_eq!(
+            after.matches("SyscallError::Internal").count(),
+            2,
+            "the impossible-state and fail-closed settlements must both be typed errors"
+        );
+        assert!(
+            !after.contains("D::Complete(Ok(()))"),
+            "no NR 16 arm may fabricate a successful syscall return"
+        );
         // The predicate itself is gone: there is no longer a question the route could ask that
         // would produce a fallback. Anchored on the definition and the call, not on the name —
         // both files explain in prose why it used to exist, and `may_fall_back_to_broad` is an

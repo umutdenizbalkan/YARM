@@ -3925,16 +3925,26 @@ fn try_split_exit_current_task(
                 )))
             }
             // Class D. `current` was already cleared when this was discovered, so the trap can
-            // neither re-enter the broad dispatcher nor return through the caller's frame. Fail
-            // closed: the reservations are released, nothing is resumed, and the existing
-            // terminal-idle settlement runs.
+            // neither re-enter the broad dispatcher nor complete the exit. The reservations are
+            // released, nothing is resumed, and the existing terminal-idle settlement runs.
+            //
+            // The settlement is a typed ERROR rather than `Ok(())`, and the difference matters on
+            // AArch64. Both `Complete` arms finalize through `CompletedInThisTrap`, which always
+            // commits the syscall-return ABI into the ENTERING incarnation — so `Ok(())` would
+            // write a SUCCESS return for an exit that did not happen. When the loser is terminal
+            // that is merely useless; when it is `VictimChanged` the entering task is still alive,
+            // and it would resume believing its `exit()` succeeded. `Internal` is the truthful
+            // answer in both cases: the exit did not occur, and the task must not act as if it
+            // had.
             ExitDisposition::FailClosed => {
                 crate::yarm_log!(
-                    "EXIT_TASK_SPLIT_FAILED_CLOSED cpu={} reason={}",
+                    "EXIT_TASK_SPLIT_FAILED_CLOSED cpu={} reason={} result=fail",
                     cpu.0,
                     failure.refusal.marker()
                 );
-                D::Complete(Ok(()))
+                D::Complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                )))
             }
         },
     }

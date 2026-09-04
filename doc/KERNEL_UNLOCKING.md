@@ -13942,8 +13942,15 @@ residual it exists to measure and would create the very population it purports t
   success                 -> QueueAdvanceCommitted   (existing deferral, existing drain)
   class C (WouldBlock)    -> Complete(Err(Syscall(WouldBlock)))
   class B (impossible)    -> Complete(Err(Syscall(Internal)))
-  class D (post-mutation) -> Complete(Ok(()))        (fail closed, terminal-idle settlement)
+  class D (post-mutation) -> Complete(Err(Syscall(Internal)))   (fail closed, terminal idle)
 ```
+
+Class D is a typed error and not `Ok(())`, and the difference is architectural rather than
+cosmetic. Both `Complete` arms finalize through `SplitFinalizeReason::CompletedInThisTrap`, which
+always commits the syscall-return ABI into the ENTERING incarnation — so a success would write a
+successful `exit()` return into a task whose exit did not happen. When the loser is terminal that is
+merely useless; when it is `VictimChanged` the entering task is still alive and would resume
+believing it had exited. `Internal` is truthful in both cases.
 
 `NotHandled` survives at exactly one place, the NR gate, which fires *before* recognition and must
 stay so the seam's other classes are still tried. After recognition there is none. U9-EXIT1's
