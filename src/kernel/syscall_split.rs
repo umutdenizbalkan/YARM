@@ -724,7 +724,7 @@ pub(crate) fn try_split_dispatch_into_frame(
     // task has no frame to return through. It answers `QueueAdvanceCommitted` so the EXISTING
     // post-lock drain — the one FutexWait and the terminal fault already share — selects and
     // applies the next context.
-    match try_split_exit_current_task(shared, cpu) {
+    match try_split_exit_current_task(shared, cpu, frame) {
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
@@ -3836,11 +3836,22 @@ fn spawn_owners_for(
 /// slot is free, which this route reproduces rather than reinterprets. After the claim there is no
 /// fallback: re-entering the broad handler would mint a second restart token, publish a second
 /// disposition and re-sweep records this transaction already retired.
-fn try_split_exit_current_task(shared: &SharedKernel, cpu: CpuId) -> SplitDispatchDisposition {
+fn try_split_exit_current_task(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &TrapFrame,
+) -> SplitDispatchDisposition {
     use crate::kernel::boot::exit_claim::ExitRefusal;
     use crate::kernel::syscall::exit_txn::{SharedExitOwners, run_exit_transaction};
     type D = SplitDispatchDisposition;
 
+    // The FIRST gate, and the one every other switching class states the same way: this route
+    // services NR 16 and nothing else. Without it the transaction runs on every trap that reaches
+    // this seam and exits the caller of whatever syscall it actually made — which is exactly what
+    // the first live x86_64 run showed, three tasks retiring on their first `DebugLog`.
+    if frame.syscall_num() != crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR {
+        return D::NotHandled;
+    }
     let mut owners = SharedExitOwners { shared };
     match run_exit_transaction(
         &mut owners,

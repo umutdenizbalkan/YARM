@@ -158928,3 +158928,1151 @@ mod u9reap1_reap_transaction {
         assert!(REAP_TXN.contains("TASK_REAP_CLAIM_RETIRED tid={} asid={} pid={}"));
     }
 }
+
+/// U9-EXIT1 §5 — the self-exit's properties, proved two ways.
+///
+/// The behavioural half drives the REAL `run_exit_transaction` over a harness whose rank-1 and
+/// rank-2 owner methods call the REAL `exit_claim` bodies against a real
+/// `[Option<ThreadControlBlock>]` slice, and which records every owner call in order. Ordering,
+/// exactly-once, reservation-before-mutation and zero-mutation claims are therefore checked against
+/// full pre/post state compared BY IDENTITY, and a failure can be injected at any boundary.
+///
+/// The structural half pins what a harness cannot see: that the route is gated on NR 16 and nothing
+/// else, that both routes reach the ONE transaction, that nothing allocates, that the reap's
+/// semantics are untouched, and that each architecture actually admits NR 16 and reverifies the
+/// exit deferral with the exit predicate rather than a status that need not exist.
+mod u9exit1_self_exit_transaction {
+    use super::*;
+    use crate::kernel::boot::exit_claim::{
+        ExitClaim, ExitDrainVerdict, ExitPreflight, ExitRefusal, claim_self_exit_locked,
+        exit_drain_verdict_locked, exit_preflight_locked, rollback_exit_claim_locked,
+        status_is_self_exitable, wake_joiners_for_locked,
+    };
+    use crate::kernel::boot::reap_claim::ClosingReplyLink;
+    use crate::kernel::boot::{SenderWaiter, ServerDeathWorkReservation};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::exit_txn::{ExitOutcome, ExitOwners, run_exit_transaction};
+    use crate::kernel::task::{
+        RestartToken, ServerReplyLink, TaskStatus, ThreadControlBlock, ThreadDetachState,
+        ThreadGroupId, WaitReason,
+    };
+    use crate::kernel::vm::Asid;
+
+    const EXIT_CLAIM: &str = include_str!("exit_claim.rs");
+    const EXIT_TXN: &str = include_str!("../syscall/exit_txn.rs");
+    const REAP_TXN: &str = include_str!("../syscall/reap_txn.rs");
+    const REAP_CLAIM: &str = include_str!("reap_claim.rs");
+    const SYSCALL: &str = include_str!("../syscall.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    // ── the harness ─────────────────────────────────────────────────────────────────────────
+
+    /// Where a failure is injected, so every boundary — before the claim, at the claim, and past
+    /// the linearization point — can be exercised.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Inject {
+        None,
+        /// This CPU has no drainer: the route must refuse before reading anything.
+        RouteNotAdmitted,
+        /// The queue-advance deferral is already held by another route.
+        QueueAdvanceTaken,
+        /// The server-death queue is full.
+        NoDeathCapacity,
+        /// The reverse link is reported present by the pre-mutation probe but is gone by the time
+        /// it is taken — the reservation must then be released rather than held.
+        LinkVanishes,
+        /// `clear_current` hands back a DIFFERENT task than the one named. Post-clear, pre-claim.
+        SchedulerHandsBackAnother,
+        /// Another lifecycle edge writes a terminal status between the preflight and the claim.
+        ClaimLosesRace,
+        /// A post-claim cleanup step fails. It must NOT resurrect the task.
+        ReportsFail,
+    }
+
+    struct Harness {
+        tcbs: alloc::vec::Vec<Option<ThreadControlBlock>>,
+        current: [Option<u64>; 4],
+        /// Set while some route holds this CPU's ONE queue-advance deferral.
+        queue_advance: [Option<u64>; 4],
+        /// The exact incarnation the deferral names, once published.
+        exit_deferral: [Option<(u64, Option<Asid>)>; 4],
+        death_slots: usize,
+        death_reserved: usize,
+        death_published: alloc::vec::Vec<(u64, Asid, ServerReplyLink)>,
+        /// Every reply link the replier sweep was told to EXCLUDE.
+        replier_sweep_excepts: alloc::vec::Vec<Option<ServerReplyLink>>,
+        /// Reverse links the caller/replier sweeps handed back, detached exactly once each.
+        detached_links: alloc::vec::Vec<ClosingReplyLink>,
+        caller_records: alloc::vec::Vec<ClosingReplyLink>,
+        replier_records: alloc::vec::Vec<ClosingReplyLink>,
+        orphans: alloc::vec::Vec<(SenderWaiter, usize)>,
+        settled_orphans: alloc::vec::Vec<usize>,
+        /// Reverse link the exiting server still owes, if any.
+        owed_link: Option<ServerReplyLink>,
+        robust: alloc::vec::Vec<u64>,
+        enqueued: alloc::vec::Vec<u64>,
+        next_token: u64,
+        inject: Inject,
+        retired: usize,
+        log: alloc::vec::Vec<alloc::string::String>,
+    }
+
+    fn tcb(tid: u64, pid: u64, status: TaskStatus) -> ThreadControlBlock {
+        let mut t = ThreadControlBlock::new(ThreadId(tid), Some(Asid((tid + 200) as u16)));
+        t.thread_group_id = ThreadGroupId(pid);
+        t.status = status;
+        t
+    }
+
+    impl Harness {
+        fn new(tasks: &[ThreadControlBlock], current: Option<u64>) -> Self {
+            Self {
+                tcbs: tasks.iter().cloned().map(Some).collect(),
+                current: [current, None, None, None],
+                queue_advance: [None; 4],
+                exit_deferral: [None; 4],
+                death_slots: 1,
+                death_reserved: 0,
+                death_published: alloc::vec::Vec::new(),
+                replier_sweep_excepts: alloc::vec::Vec::new(),
+                detached_links: alloc::vec::Vec::new(),
+                caller_records: alloc::vec::Vec::new(),
+                replier_records: alloc::vec::Vec::new(),
+                orphans: alloc::vec::Vec::new(),
+                settled_orphans: alloc::vec::Vec::new(),
+                owed_link: None,
+                robust: alloc::vec::Vec::new(),
+                enqueued: alloc::vec::Vec::new(),
+                next_token: 900,
+                inject: Inject::None,
+                retired: 0,
+                log: alloc::vec::Vec::new(),
+            }
+        }
+        fn note(&mut self, what: &str) {
+            self.log.push(what.into());
+        }
+        fn at(&self, what: &str) -> usize {
+            self.log
+                .iter()
+                .position(|entry| entry == what)
+                .unwrap_or_else(|| panic!("owner call `{what}` never happened: {:?}", self.log))
+        }
+        fn count(&self, what: &str) -> usize {
+            self.log.iter().filter(|entry| *entry == what).count()
+        }
+        fn status_of(&self, tid: u64) -> Option<TaskStatus> {
+            self.tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.status)
+        }
+        /// The whole observable state, by identity, for a byte-for-byte pre/post comparison.
+        fn snapshot(&self) -> alloc::string::String {
+            let tasks: alloc::vec::Vec<_> = self
+                .tcbs
+                .iter()
+                .flatten()
+                .map(|t| {
+                    (
+                        t.tid.0,
+                        t.asid,
+                        t.thread_group_id.0,
+                        t.status,
+                        t.restart.token,
+                        t.detach_state,
+                    )
+                })
+                .collect();
+            alloc::format!(
+                "{tasks:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+                self.current,
+                self.queue_advance,
+                self.exit_deferral,
+                self.death_published,
+                self.detached_links,
+                self.settled_orphans,
+                self.enqueued,
+                self.death_reserved
+            )
+        }
+    }
+
+    impl ExitOwners for Harness {
+        fn exit_route_admitted(&self, _cpu: CpuId) -> bool {
+            self.inject != Inject::RouteNotAdmitted
+        }
+
+        fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
+            self.current[cpu.0 as usize]
+        }
+
+        fn clear_current(&mut self, cpu: CpuId) -> Option<u64> {
+            self.note("clear_current");
+            if self.inject == Inject::SchedulerHandsBackAnother {
+                // The scheduler moved on: `current` is somebody else's now, and taking it is not
+                // this transaction's to do.
+                return Some(u64::MAX);
+            }
+            self.current[cpu.0 as usize].take()
+        }
+
+        fn enqueue_woken(&mut self, tid: u64) {
+            self.note("enqueue_woken");
+            self.enqueued.push(tid);
+        }
+
+        fn exit_preflight(&self, tid: u64) -> Result<ExitPreflight, ExitRefusal> {
+            exit_preflight_locked(&self.tcbs, tid)
+        }
+
+        fn has_robust_futex_list(&self, tid: u64) -> bool {
+            self.robust.contains(&tid)
+        }
+
+        fn mint_restart_token(&mut self) -> RestartToken {
+            self.note("mint_restart_token");
+            self.next_token += 1;
+            RestartToken(self.next_token)
+        }
+
+        fn claim_self_exit(
+            &mut self,
+            cpu: CpuId,
+            tid: u64,
+            asid: Option<Asid>,
+            code: u64,
+            token: RestartToken,
+        ) -> Result<ExitClaim, ExitRefusal> {
+            self.note("claim_self_exit");
+            if self.inject == Inject::ClaimLosesRace
+                && let Some(t) = self.tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)
+            {
+                // A reap got there first, between the preflight and here.
+                t.status = TaskStatus::Dead;
+            }
+            claim_self_exit_locked(&mut self.tcbs, cpu, tid, asid, code, token)
+        }
+
+        fn rollback_claim(&mut self, claim: &ExitClaim) -> bool {
+            self.note("rollback_claim");
+            rollback_exit_claim_locked(&mut self.tcbs, claim)
+        }
+
+        fn server_reply_link_present(&self, _tid: u64, _asid: Asid) -> bool {
+            self.inject == Inject::LinkVanishes || self.owed_link.is_some()
+        }
+
+        fn take_server_reply_link(&mut self, _tid: u64, _asid: Asid) -> Option<ServerReplyLink> {
+            self.note("take_server_reply_link");
+            if self.inject == Inject::LinkVanishes {
+                return None;
+            }
+            self.owed_link.take()
+        }
+
+        fn wake_joiners(&mut self, target_tid: u64, out: &mut [Option<u64>]) -> usize {
+            self.note("wake_joiners");
+            wake_joiners_for_locked(&mut self.tcbs, target_tid, out)
+        }
+
+        fn server_death_capacity_available(&self, _cpu: CpuId) -> bool {
+            self.inject != Inject::NoDeathCapacity && self.death_reserved < self.death_slots
+        }
+
+        fn reserve_server_death(&mut self, cpu: CpuId) -> Option<ServerDeathWorkReservation> {
+            self.note("reserve_server_death");
+            if self.inject == Inject::NoDeathCapacity || self.death_reserved >= self.death_slots {
+                return None;
+            }
+            self.death_reserved += 1;
+            Some(ServerDeathWorkReservation {
+                cpu_idx: cpu.0 as usize,
+                slot: 0,
+            })
+        }
+
+        fn publish_server_death(
+            &mut self,
+            _reservation: ServerDeathWorkReservation,
+            tid: u64,
+            asid: Asid,
+            link: ServerReplyLink,
+        ) -> bool {
+            self.note("publish_server_death");
+            self.death_published.push((tid, asid, link));
+            true
+        }
+
+        fn release_server_death(&mut self, _reservation: ServerDeathWorkReservation) {
+            self.note("release_server_death");
+            self.death_reserved -= 1;
+        }
+
+        fn reserve_queue_advance(&mut self, cpu: CpuId, outgoing: u64) -> bool {
+            self.note("reserve_queue_advance");
+            if self.inject == Inject::QueueAdvanceTaken
+                || self.queue_advance[cpu.0 as usize].is_some()
+            {
+                return false;
+            }
+            self.queue_advance[cpu.0 as usize] = Some(outgoing);
+            true
+        }
+
+        fn release_queue_advance(&mut self, cpu: CpuId) {
+            self.note("release_queue_advance");
+            self.queue_advance[cpu.0 as usize] = None;
+            self.exit_deferral[cpu.0 as usize] = None;
+        }
+
+        fn publish_exit_deferral(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
+            self.note("publish_exit_deferral");
+            if self.exit_deferral[cpu.0 as usize].is_some() {
+                return false;
+            }
+            self.exit_deferral[cpu.0 as usize] = Some((tid, asid));
+            true
+        }
+
+        fn revoke_reply_caps_for_caller(
+            &mut self,
+            _claim: &ExitClaim,
+            closing: &mut [Option<ClosingReplyLink>],
+        ) -> usize {
+            self.note("revoke_reply_caps_for_caller");
+            for (slot, link) in self.caller_records.iter().enumerate() {
+                if slot < closing.len() {
+                    closing[slot] = Some(*link);
+                }
+            }
+            self.caller_records.len()
+        }
+
+        fn revoke_reply_caps_for_replier_except(
+            &mut self,
+            _claim: &ExitClaim,
+            except: Option<ServerReplyLink>,
+            closing: &mut [Option<ClosingReplyLink>],
+        ) -> usize {
+            self.note("revoke_reply_caps_for_replier_except");
+            self.replier_sweep_excepts.push(except);
+            for (slot, link) in self.replier_records.iter().enumerate() {
+                if slot < closing.len() {
+                    closing[slot] = Some(*link);
+                }
+            }
+            self.replier_records.len()
+        }
+
+        fn detach_reverse_link(&mut self, link: ClosingReplyLink) -> bool {
+            self.note("detach_reverse_link");
+            self.detached_links.push(link);
+            true
+        }
+
+        fn clear_ipc_waiters(
+            &mut self,
+            _claim: &ExitClaim,
+            orphaned: &mut [Option<(SenderWaiter, usize)>],
+        ) -> usize {
+            self.note("clear_ipc_waiters");
+            for (slot, entry) in self.orphans.iter().enumerate() {
+                if slot < orphaned.len() {
+                    orphaned[slot] = Some(entry.clone());
+                }
+            }
+            self.orphans.len()
+        }
+
+        fn settle_orphaned_sender(&mut self, _waiter: &SenderWaiter, endpoint_idx: usize) {
+            self.note("settle_orphaned_sender");
+            self.settled_orphans.push(endpoint_idx);
+        }
+
+        fn report_exit_to_supervisor(
+            &mut self,
+            _cpu: CpuId,
+            _tid: u64,
+            _code: u64,
+            _token: RestartToken,
+        ) -> bool {
+            self.note("report_exit_to_supervisor");
+            self.inject != Inject::ReportsFail
+        }
+
+        fn report_exit_to_pm(&mut self, _cpu: CpuId, _tid: u64, _code: u64) -> bool {
+            self.note("report_exit_to_pm");
+            self.inject != Inject::ReportsFail
+        }
+
+        fn retire_exit_claim(&mut self, _outcome: &ExitOutcome) {
+            self.note("retire_exit_claim");
+            self.retired += 1;
+        }
+    }
+
+    const CPU: CpuId = CpuId(0);
+    const CODE: u64 = 7;
+
+    /// One Running self on CPU 0, one sibling, one joiner blocked on the self.
+    fn three_task_world() -> Harness {
+        let mut joiner = tcb(3, 1, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
+        joiner.thread_group_id = ThreadGroupId(1);
+        Harness::new(
+            &[
+                tcb(1, 1, TaskStatus::Running),
+                tcb(2, 1, TaskStatus::Runnable),
+                joiner,
+            ],
+            Some(1),
+        )
+    }
+
+    // ── §5 property 1: reservation precedes irreversible mutation ───────────────────────────
+
+    #[test]
+    fn both_reservations_precede_the_first_irreversible_step() {
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 4,
+            reply_record_generation: 11,
+        });
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert_eq!(outcome.claim.tid(), 1);
+        // Both reservations, then the removal from `current`, then the claim. Nothing before the
+        // reservations may be irreversible, and nothing after the claim may be free.
+        assert!(h.at("reserve_queue_advance") < h.at("clear_current"));
+        assert!(h.at("reserve_server_death") < h.at("clear_current"));
+        assert!(h.at("clear_current") < h.at("claim_self_exit"));
+        // The detach of the reverse link is strictly after its reservation was taken.
+        assert!(h.at("reserve_server_death") < h.at("take_server_reply_link"));
+        assert!(h.at("take_server_reply_link") < h.at("publish_server_death"));
+        // The deferral is attributed to an exact incarnation only after the claim won it.
+        assert!(h.at("claim_self_exit") < h.at("publish_exit_deferral"));
+        // And the claim is retired last, after every owed step settled.
+        assert_eq!(h.at("retire_exit_claim"), h.log.len() - 1);
+    }
+
+    // ── §5 property 2: the current/status transition cannot tear ────────────────────────────
+
+    #[test]
+    fn an_exited_task_is_never_simultaneously_current_and_terminal() {
+        let mut h = three_task_world();
+        // Before: current, and NOT terminal.
+        assert_eq!(h.current[0], Some(1));
+        assert_eq!(h.status_of(1), Some(TaskStatus::Running));
+        run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        // After: terminal, and NOT current. The only ordering that produces both facts without an
+        // intermediate state that is both is clear-then-write, which the log pins.
+        assert_eq!(h.current[0], None);
+        assert_eq!(h.status_of(1), Some(TaskStatus::Exited(CODE)));
+        assert!(h.at("clear_current") < h.at("claim_self_exit"));
+        // And the exiting task was never made runnable again.
+        assert!(!h.enqueued.contains(&1));
+    }
+
+    // ── §5 property 3: one queue-advance owner, published for the exact incarnation ─────────
+
+    #[test]
+    fn the_committed_exit_holds_exactly_one_queue_advance_naming_itself() {
+        let mut h = three_task_world();
+        run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert_eq!(h.queue_advance[0], Some(1), "the deferral stays held");
+        assert_eq!(
+            h.exit_deferral[0],
+            Some((1, Some(Asid(201)))),
+            "the deferral names the EXACT incarnation, not a numeric TID"
+        );
+        assert_eq!(h.count("reserve_queue_advance"), 1);
+        assert_eq!(h.count("release_queue_advance"), 0);
+        assert_eq!(h.count("publish_exit_deferral"), 1);
+    }
+
+    /// A second exit on a CPU whose deferral is already held refuses, having mutated nothing.
+    #[test]
+    fn a_second_route_holding_the_deferral_refuses_for_free() {
+        let mut h = three_task_world();
+        h.inject = Inject::QueueAdvanceTaken;
+        let before = h.snapshot();
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert!(refusal.may_fall_back());
+        assert_eq!(h.snapshot(), before, "a refusal must mutate nothing");
+        assert_eq!(h.count("clear_current"), 0);
+        assert_eq!(h.count("claim_self_exit"), 0);
+    }
+
+    // ── §5 property 4: every pre-claim refusal is free ──────────────────────────────────────
+
+    #[test]
+    fn every_pre_claim_refusal_leaves_the_world_byte_for_byte_unchanged() {
+        // (a) no drainer on this CPU
+        let mut h = three_task_world();
+        h.inject = Inject::RouteNotAdmitted;
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::NoCurrent
+        );
+        assert_eq!(h.snapshot(), before);
+
+        // (b) nothing is current
+        let mut h = Harness::new(&[tcb(1, 1, TaskStatus::Running)], None);
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::NoCurrent
+        );
+        assert_eq!(h.snapshot(), before);
+
+        // (c) a Detached thread — out of the admitted population by construction
+        let mut detached = tcb(1, 1, TaskStatus::Running);
+        detached.detach_state = ThreadDetachState::Detached;
+        let mut h = Harness::new(&[detached], Some(1));
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::DetachedThread
+        );
+        assert_eq!(h.snapshot(), before);
+
+        // (d) not Running — some other lifecycle edge already won
+        for status in [
+            TaskStatus::Runnable,
+            TaskStatus::Faulted,
+            TaskStatus::Dead,
+            TaskStatus::Exited(0),
+        ] {
+            let mut h = Harness::new(&[tcb(1, 1, status)], Some(1));
+            let before = h.snapshot();
+            assert_eq!(
+                run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+                ExitRefusal::NotRunning,
+                "status {status:?} must not be self-exitable"
+            );
+            assert_eq!(h.snapshot(), before);
+        }
+
+        // (e) a robust-futex publisher — no split lock domain for its wakes
+        let mut h = three_task_world();
+        h.robust.push(1);
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::RobustFutexList
+        );
+        assert_eq!(h.snapshot(), before);
+
+        // (f) a reply is owed and no deferred slot is free — the broad `WouldBlock`, reproduced
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 0,
+            reply_record_generation: 1,
+        });
+        h.inject = Inject::NoDeathCapacity;
+        let before = h.snapshot();
+        assert_eq!(
+            run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
+            ExitRefusal::DeferredCapacity
+        );
+        assert_eq!(h.snapshot(), before);
+        assert_eq!(h.count("clear_current"), 0);
+    }
+
+    // ── §5 property 5: no fallback after the claim, and no resurrection ─────────────────────
+
+    #[test]
+    fn a_scheduler_that_hands_back_another_task_fails_closed_with_both_slots_released() {
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 0,
+            reply_record_generation: 1,
+        });
+        h.inject = Inject::SchedulerHandsBackAnother;
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(refusal, ExitRefusal::VictimChanged);
+        assert!(
+            !refusal.may_fall_back(),
+            "`current` was already cleared, so the trap must NOT re-enter the broad dispatcher"
+        );
+        // Nothing of THIS task changed, and neither reservation leaked.
+        assert_eq!(h.status_of(1), Some(TaskStatus::Running));
+        assert_eq!(h.queue_advance[0], None);
+        assert_eq!(h.death_reserved, 0);
+        assert_eq!(h.count("claim_self_exit"), 0);
+    }
+
+    #[test]
+    fn a_claim_that_loses_the_race_releases_both_slots_and_writes_nothing() {
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 0,
+            reply_record_generation: 1,
+        });
+        h.inject = Inject::ClaimLosesRace;
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(refusal, ExitRefusal::NotRunning);
+        // The winner's terminal status stands; this transaction wrote nothing over it.
+        assert_eq!(h.status_of(1), Some(TaskStatus::Dead));
+        assert_eq!(h.queue_advance[0], None);
+        assert_eq!(h.death_reserved, 0);
+        assert_eq!(h.count("take_server_reply_link"), 0);
+        assert_eq!(h.count("publish_exit_deferral"), 0);
+        assert_eq!(h.retired, 0);
+    }
+
+    #[test]
+    fn a_post_claim_cleanup_failure_fails_closed_without_resurrecting_the_task() {
+        let mut h = three_task_world();
+        h.inject = Inject::ReportsFail;
+        let outcome = run_exit_transaction(&mut h, CPU, CODE)
+            .expect("a failed report is not a failed exit — the task is already terminal");
+        assert!(!outcome.supervisor_reported && !outcome.pm_reported);
+        // Fails CLOSED: still terminal, still off the CPU, advance still owed, never rolled back.
+        assert_eq!(h.status_of(1), Some(TaskStatus::Exited(CODE)));
+        assert_eq!(h.current[0], None);
+        assert_eq!(h.queue_advance[0], Some(1));
+        assert_eq!(h.count("rollback_claim"), 0);
+        assert!(!h.enqueued.contains(&1));
+    }
+
+    // ── §5 property 6: duplicate and stale exits are inert ──────────────────────────────────
+
+    #[test]
+    fn a_duplicate_exit_mutates_nothing_and_publishes_no_second_disposition() {
+        let mut h = three_task_world();
+        run_exit_transaction(&mut h, CPU, CODE).expect("the first exit commits");
+        let after_first = h.snapshot();
+        // The task is no longer current, so the second attempt cannot even resolve a self.
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("the second must refuse");
+        assert_eq!(refusal, ExitRefusal::NoCurrent);
+        assert_eq!(h.snapshot(), after_first, "the second exit wrote nothing");
+        assert_eq!(h.retired, 1, "exactly one claim was retired");
+        assert_eq!(h.count("publish_exit_deferral"), 1);
+    }
+
+    /// Even if the scheduler wrongly re-presents the exited task as current, the claim refuses.
+    #[test]
+    fn a_stale_current_pointing_at_an_exited_task_still_refuses() {
+        let mut h = three_task_world();
+        run_exit_transaction(&mut h, CPU, CODE).expect("the first exit commits");
+        h.current[0] = Some(1);
+        h.queue_advance[0] = None;
+        h.exit_deferral[0] = None;
+        let refusal = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(refusal, ExitRefusal::NotRunning);
+        assert_eq!(h.retired, 1);
+    }
+
+    // ── §5 property 7: TID reuse matches nothing ────────────────────────────────────────────
+
+    #[test]
+    fn the_claim_and_its_rollback_are_keyed_on_the_incarnation_not_the_number() {
+        let mut tcbs = alloc::vec![Some(tcb(1, 1, TaskStatus::Running))];
+        // A claim resolved against a DIFFERENT ASID matches nothing and writes nothing.
+        assert_eq!(
+            claim_self_exit_locked(&mut tcbs, CPU, 1, Some(Asid(999)), CODE, RestartToken(1)),
+            Err(ExitRefusal::IdentityChanged)
+        );
+        assert_eq!(tcbs[0].as_ref().unwrap().status, TaskStatus::Running);
+
+        let claim =
+            claim_self_exit_locked(&mut tcbs, CPU, 1, Some(Asid(201)), CODE, RestartToken(5))
+                .expect("the exact incarnation claims");
+        assert_eq!(tcbs[0].as_ref().unwrap().status, TaskStatus::Exited(CODE));
+        assert_eq!(
+            tcbs[0].as_ref().unwrap().restart.token,
+            Some(RestartToken(5))
+        );
+
+        // A replacement task reuses the numeric TID with a new ASID: the rollback matches nothing.
+        tcbs[0] = Some(tcb(1, 1, TaskStatus::Running));
+        tcbs[0].as_mut().unwrap().asid = Some(Asid(777));
+        assert!(
+            !rollback_exit_claim_locked(&mut tcbs, &claim),
+            "a rollback must never land on a replacement that reused the TID"
+        );
+        assert_eq!(tcbs[0].as_ref().unwrap().status, TaskStatus::Running);
+    }
+
+    // ── §5 property 8: the exact server-death settlement, exactly once ──────────────────────
+
+    #[test]
+    fn the_owed_reply_is_detached_once_and_excluded_from_the_replier_sweep() {
+        let link = ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 4,
+            reply_record_generation: 11,
+        };
+        let mut h = three_task_world();
+        h.owed_link = Some(link);
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert!(outcome.server_death_published);
+        assert_eq!(h.death_published.len(), 1, "settled exactly once");
+        assert_eq!(h.death_published[0], (1, Asid(201), link));
+        assert_eq!(h.count("take_server_reply_link"), 1);
+        // The replier sweep must be told to leave that record alone: clearing it would destroy the
+        // authority the drain is about to settle `ServerGone` through.
+        assert_eq!(h.replier_sweep_excepts, alloc::vec![Some(link)]);
+    }
+
+    /// With nothing owed, no slot is reserved and the sweep excludes nothing.
+    #[test]
+    fn no_owed_reply_reserves_no_slot_and_excludes_no_record() {
+        let mut h = three_task_world();
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert!(!outcome.server_death_published);
+        assert_eq!(h.count("reserve_server_death"), 0);
+        assert_eq!(h.death_reserved, 0);
+        assert_eq!(h.replier_sweep_excepts, alloc::vec![None]);
+    }
+
+    /// The link went away between the pre-mutation probe and the detach: the slot is RELEASED
+    /// rather than held, so a later route is not starved by a reservation that owes nothing.
+    #[test]
+    fn a_link_that_vanished_after_the_probe_releases_its_reservation() {
+        let mut h = three_task_world();
+        h.inject = Inject::LinkVanishes;
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must still commit");
+        assert!(!outcome.server_death_published);
+        assert_eq!(h.count("reserve_server_death"), 1);
+        assert_eq!(h.count("take_server_reply_link"), 1);
+        assert_eq!(h.count("publish_server_death"), 0);
+        assert_eq!(h.count("release_server_death"), 1);
+        assert_eq!(h.death_reserved, 0, "a slot owing nothing must be released");
+        // Nothing was excluded from the replier sweep, because nothing was detached.
+        assert_eq!(h.replier_sweep_excepts, alloc::vec![None]);
+    }
+
+    // ── §5 property 9: exhaustive, exactly-once cleanup of everything reachable ─────────────
+
+    #[test]
+    fn every_reachable_record_and_waiter_is_settled_exactly_once() {
+        let mut h = three_task_world();
+        h.caller_records = alloc::vec![(10u64, Asid(201), 1usize, 5u64)];
+        h.replier_records = alloc::vec![(11u64, Asid(202), 2usize, 6u64)];
+        h.orphans = alloc::vec![(
+            SenderWaiter {
+                tid: ThreadId(9),
+                msg: crate::kernel::ipc::Message::new(1, b"x").expect("msg"),
+                asid: Some(Asid(9)),
+                send_generation: 0,
+            },
+            3usize
+        )];
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert_eq!(outcome.caller_reply_records_revoked, 1);
+        assert_eq!(outcome.replier_reply_records_revoked, 1);
+        assert_eq!(outcome.reverse_links_detached, 2);
+        assert_eq!(outcome.orphaned_senders_settled, 1);
+        // Exactly once each, and each sweep runs exactly once.
+        assert_eq!(h.count("revoke_reply_caps_for_caller"), 1);
+        assert_eq!(h.count("revoke_reply_caps_for_replier_except"), 1);
+        assert_eq!(h.count("clear_ipc_waiters"), 1);
+        assert_eq!(h.detached_links.len(), 2);
+        assert_eq!(h.settled_orphans, alloc::vec![3usize]);
+        // Caller side before replier side before waiters, so the excluded record is known first.
+        assert!(
+            h.at("revoke_reply_caps_for_caller") < h.at("revoke_reply_caps_for_replier_except")
+        );
+        assert!(h.at("revoke_reply_caps_for_replier_except") < h.at("clear_ipc_waiters"));
+    }
+
+    // ── §5 property 10: joiners wake once, and never the exiting task ───────────────────────
+
+    #[test]
+    fn joiners_wake_exactly_once_and_the_exiting_task_is_never_among_them() {
+        let mut h = three_task_world();
+        // A second joiner on the same target, and one blocked on somebody else.
+        let mut other = tcb(4, 2, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
+        other.thread_group_id = ThreadGroupId(2);
+        h.tcbs.push(Some(other));
+        h.tcbs.push(Some(tcb(
+            5,
+            2,
+            TaskStatus::Blocked(WaitReason::Join(ThreadId(9))),
+        )));
+        let outcome = run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert_eq!(outcome.joiners_woken, 2);
+        h.enqueued.sort_unstable();
+        assert_eq!(h.enqueued, alloc::vec![3u64, 4u64]);
+        assert!(
+            !h.enqueued.contains(&1),
+            "the exiting task is never enqueued"
+        );
+        assert_eq!(h.status_of(3), Some(TaskStatus::Runnable));
+        assert_eq!(h.status_of(4), Some(TaskStatus::Runnable));
+        // The unrelated joiner is untouched.
+        assert_eq!(
+            h.status_of(5),
+            Some(TaskStatus::Blocked(WaitReason::Join(ThreadId(9))))
+        );
+        // Every enqueue happens AFTER the rank-2 status writes released.
+        assert!(h.at("wake_joiners") < h.at("enqueue_woken"));
+    }
+
+    // ── §5 property 11: the drain's question is answerable when the TCB is gone ─────────────
+
+    #[test]
+    fn the_drain_verdict_represents_removal_explicitly_rather_than_as_failure() {
+        let mut tcbs = alloc::vec![Some(tcb(1, 1, TaskStatus::Exited(CODE)))];
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Terminal
+        );
+        // Reaped between the claim and the drain: the exit SUCCEEDED, so this is not a refusal.
+        tcbs[0].as_mut().unwrap().status = TaskStatus::Dead;
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Terminal
+        );
+        // Removed outright. Absence is `Removed`, NOT a false answer to "is it terminal?".
+        tcbs[0] = None;
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Removed
+        );
+        // A different incarnation at the same numeric TID is likewise `Removed`, never `Terminal`.
+        let mut replacement = tcb(1, 1, TaskStatus::Running);
+        replacement.asid = Some(Asid(777));
+        tcbs[0] = Some(replacement);
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Removed
+        );
+        // Present, matching, and NOT terminal: something resurrected it. The one refusal.
+        tcbs[0].as_mut().unwrap().asid = Some(Asid(201));
+        assert_eq!(
+            exit_drain_verdict_locked(&tcbs, 1, Some(Asid(201))),
+            ExitDrainVerdict::Contradicted
+        );
+    }
+
+    #[test]
+    fn only_running_is_self_exitable() {
+        assert!(status_is_self_exitable(TaskStatus::Running));
+        for status in [
+            TaskStatus::Runnable,
+            TaskStatus::Faulted,
+            TaskStatus::Dead,
+            TaskStatus::Exited(0),
+            TaskStatus::Blocked(WaitReason::Join(ThreadId(2))),
+        ] {
+            assert!(
+                !status_is_self_exitable(status),
+                "{status:?} must not be self-exitable"
+            );
+        }
+    }
+
+    // ═══ the structural half ════════════════════════════════════════════════════════════════
+
+    /// THE defect the first live x86_64 run found: the route ran the exit transaction on every
+    /// trap that reached the seam, so three tasks retired on their first `DebugLog`.
+    ///
+    /// Every switching class on this seam must state its own NR before it does anything else, and
+    /// this pins that ExitCurrentTask does too — against the constant, not a literal.
+    #[test]
+    fn the_split_exit_route_is_gated_on_nr_16_before_anything_else() {
+        let body = SPLIT
+            .split("fn try_split_exit_current_task(")
+            .nth(1)
+            .expect("the split route must exist");
+        let gate = body
+            .find("frame.syscall_num() != crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR")
+            .expect("the route MUST refuse every NR but 16");
+        // Nothing that reads or mutates task state may precede the gate.
+        let txn = body
+            .find("run_exit_transaction(")
+            .expect("the route must run the transaction");
+        assert!(gate < txn, "the NR gate must precede the transaction");
+        for earlier in ["SharedExitOwners {", "current_tid_authoritative"] {
+            if let Some(at) = body.find(earlier) {
+                assert!(gate < at, "`{earlier}` must not precede the NR gate");
+            }
+        }
+        // The other three switching classes state theirs the same way, so the seam has one rule.
+        for (route, nr) in [
+            (
+                "fn try_split_futex_wait_into_frame(",
+                "SYSCALL_FUTEX_WAIT_NR",
+            ),
+            (
+                "fn try_split_exit_current_task(",
+                "SYSCALL_EXIT_CURRENT_TASK_NR",
+            ),
+        ] {
+            let body = SPLIT.split(route).nth(1).expect("the route must exist");
+            let head = &body[..body.len().min(1600)];
+            assert!(
+                head.contains(&alloc::format!(
+                    "frame.syscall_num() != crate::kernel::syscall::{nr}"
+                )),
+                "{route} must gate on {nr} in its first statements"
+            );
+        }
+    }
+
+    /// One transaction, two owners. Neither route may grow a second teardown.
+    #[test]
+    fn both_nr16_routes_reach_the_one_transaction_and_the_one_claim() {
+        assert_eq!(
+            SPLIT.matches("run_exit_transaction(").count(),
+            1,
+            "the split route must call THE transaction exactly once"
+        );
+        assert_eq!(
+            EXIT_TXN
+                .matches("pub(crate) fn run_exit_transaction")
+                .count(),
+            1,
+            "there must be exactly one exit transaction"
+        );
+        assert_eq!(
+            EXIT_CLAIM
+                .matches("pub(crate) fn claim_self_exit_locked")
+                .count(),
+            1,
+            "there must be exactly one linearization point"
+        );
+        // The shared thread-scoped cleanup is REAP1's, driven through REAP1's bodies — not copied.
+        for shared_body in [
+            "revoke_reply_caps_for_caller_identity_locked",
+            "revoke_reply_caps_for_replier_identity_locked",
+            "clear_ipc_waiters_for_identity_locked",
+            "resolve_orphaned_sender_envelope_locked",
+        ] {
+            assert!(
+                REAP_CLAIM.contains(&alloc::format!("pub(crate) fn {shared_body}")),
+                "{shared_body} must live once, in reap_claim"
+            );
+            assert!(
+                EXIT_TXN.contains(shared_body),
+                "the exit owner must drive the SHARED {shared_body}, not a copy"
+            );
+            assert!(
+                !EXIT_CLAIM.contains(&alloc::format!("pub(crate) fn {shared_body}")),
+                "{shared_body} must NOT be reimplemented for the exit"
+            );
+        }
+    }
+
+    /// U9-REAP1's semantics are untouched: the reap still writes `Dead` and still takes the token;
+    /// the exit writes `Exited(code)` and mints one. Factoring shared code was allowed; changing
+    /// what NR 31 means was not.
+    #[test]
+    fn the_reap_and_the_exit_keep_their_distinct_terminal_claims() {
+        assert!(
+            EXIT_CLAIM.contains("tcb.status = TaskStatus::Exited(code)")
+                && EXIT_CLAIM.contains("tcb.restart.token = Some(token)"),
+            "the exit writes Exited(code) and INSTALLS a freshly minted token"
+        );
+        assert!(
+            !EXIT_CLAIM.contains("TaskStatus::Dead;"),
+            "the exit claim must never write the reap's terminal status"
+        );
+        assert!(
+            REAP_CLAIM.contains("TaskStatus::Dead"),
+            "the reap's terminal status is unchanged"
+        );
+        assert!(
+            !REAP_TXN.contains("claim_self_exit_locked") && !REAP_TXN.contains("ExitClaim"),
+            "the reap transaction must not learn about the exit claim"
+        );
+        // The one REAP1 signature this stage widened, and the only one. Both reap owners pass
+        // `None`, so NR 31 excludes nothing and its behavior is byte-for-byte what it was.
+        assert!(
+            REAP_CLAIM.contains("except: Option<crate::kernel::task::ServerReplyLink>"),
+            "the replier sweep gained an exclusion parameter"
+        );
+        assert_eq!(
+            REAP_TXN
+                .matches("revoke_reply_caps_for_replier_identity_locked")
+                .count(),
+            2,
+            "both reap owners drive the shared replier sweep"
+        );
+        for call in REAP_TXN
+            .split("revoke_reply_caps_for_replier_identity_locked")
+            .skip(1)
+        {
+            let args = &call[..call.find(')').unwrap_or(call.len())];
+            assert!(
+                args.contains("None"),
+                "a reap must exclude NOTHING from the replier sweep: {args}"
+            );
+        }
+    }
+
+    /// §4 — no allocation anywhere in the teardown, on either route.
+    #[test]
+    fn nothing_in_the_exit_teardown_allocates() {
+        for (name, src) in [("exit_claim.rs", EXIT_CLAIM), ("exit_txn.rs", EXIT_TXN)] {
+            for forbidden in [
+                "Vec<",
+                "vec!",
+                "Box<",
+                "alloc::",
+                "to_vec(",
+                ".collect(",
+                "String",
+                "BTreeMap",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "{name} must not contain `{forbidden}` — §4 forbids allocation in the teardown"
+                );
+            }
+            // The fixed-capacity buffers the sweeps write into are stack arrays, sized by the
+            // kernel's own compile-time maxima.
+        }
+        assert!(
+            EXIT_TXN.contains("[Option<ClosingReplyLink>; MAX_REPLY_CAPS]")
+                && EXIT_TXN.contains("[Option<u64>; MAX_TASKS]"),
+            "the sweep buffers must be fixed-capacity stack arrays"
+        );
+    }
+
+    /// §3 — one selector, one drain. The transaction never dispatches, never selects and never
+    /// reaches a scheduler policy of its own.
+    #[test]
+    fn the_exit_transaction_owns_no_selector_and_no_second_drain() {
+        for forbidden in [
+            "dispatch_next_task",
+            "block_current_cpu",
+            "select_next",
+            "scheduler_tick",
+        ] {
+            assert!(
+                !EXIT_TXN.contains(forbidden),
+                "the transaction must not contain `{forbidden}` — the EXISTING drain owns that"
+            );
+        }
+        // The deferral it reserves is U9-QA's, by name. A second per-CPU cell of its own would be
+        // a second queue-advance owner, which is exactly what §3 forbids.
+        assert!(
+            EXIT_TXN.contains("futex_wait_dispatch_try_defer"),
+            "the owner must reserve THE existing U9-QA deferral, not invent one"
+        );
+        assert!(EXIT_TXN.contains("fn reserve_queue_advance"));
+        assert!(
+            SPLIT.contains("D::QueueAdvanceCommitted"),
+            "the route hands the advance to the existing post-lock drain"
+        );
+    }
+
+    /// §5 — NR 16 is admitted before BOTH terminal acquisitions, on all three architectures.
+    #[test]
+    fn all_three_architectures_admit_nr16_before_their_terminal_acquisition() {
+        // x86_64 and AArch64 share `trap_entry.rs`; AArch64's ABI-import gate is an allow-list.
+        assert!(
+            TRAP_ENTRY.contains("SYSCALL_EXIT_CURRENT_TASK_NR"),
+            "the shared entry must admit NR 16"
+        );
+        // RISC-V's own eligibility predicate.
+        assert!(
+            RISCV_TRAP.contains("SYSCALL_EXIT_CURRENT_TASK_NR"),
+            "RISC-V must admit NR 16"
+        );
+        // NR 16 is a SWITCHING class, so it must NOT be on the non-switching NR-only whitelist —
+        // whose contract is that every member may be early-returned through the caller's frame.
+        let whitelist = SPLIT
+            .split("fn classify_split_eligible_nr_only")
+            .nth(1)
+            .expect("the whitelist must exist");
+        let whitelist = &whitelist[..whitelist.find("\n}").unwrap_or(whitelist.len())];
+        assert!(
+            !whitelist.contains("SYSCALL_EXIT_CURRENT_TASK_NR"),
+            "an exiting task has no frame to be early-returned through"
+        );
+    }
+
+    /// §6 — the terminal edge is MEASURED at the edge, with a marker per route that cannot leak.
+    #[test]
+    fn the_terminal_edge_has_its_own_marker_on_each_route() {
+        assert_eq!(
+            SYSCALL
+                .matches("EXIT_TASK_BROAD_ENTER tid={} asid={}")
+                .count(),
+            1,
+            "the broad terminal entry must be marked exactly once, at the handler itself"
+        );
+        assert_eq!(
+            SPLIT
+                .matches("EXIT_TASK_SPLIT_ENTER tid={} asid={}")
+                .count(),
+            1,
+            "the split route must be marked exactly once"
+        );
+        assert!(!SPLIT.contains("EXIT_TASK_BROAD_ENTER"));
+        assert!(!SYSCALL.contains("EXIT_TASK_SPLIT_ENTER"));
+        // Both routes still emit the shared invocation marker, so the oracle can compare them.
+        assert!(
+            SYSCALL.contains("EXIT_TASK_SYSCALL_DISPATCHED")
+                && SPLIT.contains("EXIT_TASK_SYSCALL_DISPATCHED"),
+            "both routes must emit the shared invocation marker"
+        );
+        // The broad marker is the FIRST thing the handler does, so an edge is counted even when
+        // the broad handler then refuses.
+        let body = SYSCALL
+            .split("fn handle_exit_current_task(")
+            .nth(1)
+            .expect("the broad handler must exist");
+        // Anchored on the FORMAT STRINGS, not the names: the handler's own commentary mentions
+        // both markers, and a guard that matched prose would be measuring the wrong thing.
+        let enter = body
+            .find("\"EXIT_TASK_BROAD_ENTER tid={}")
+            .expect("the edge marker's log call");
+        let dispatched = body
+            .find("\"EXIT_TASK_SYSCALL_DISPATCHED nr={}")
+            .expect("the shared marker's log call");
+        assert!(enter < dispatched, "the edge is counted at the entry");
+        // And nothing that can return precedes it, so a declined broad exit is still an edge.
+        let declined = body
+            .find("reason=deferred_capacity")
+            .expect("the broad decline");
+        assert!(
+            enter < declined,
+            "a refused broad exit still counts as an edge"
+        );
+    }
+
+    /// Every refusal that is NOT safe to fall back from must say so explicitly.
+    #[test]
+    fn only_the_post_clear_refusal_forbids_the_broad_fallback() {
+        use ExitRefusal::*;
+        for refusal in [
+            NoCurrent,
+            NotCurrentOnCpu,
+            TaskGone,
+            IdentityChanged,
+            NotRunning,
+            DetachedThread,
+            RobustFutexList,
+            DeferredCapacity,
+        ] {
+            assert!(
+                refusal.may_fall_back(),
+                "{refusal:?} is pre-mutation and must permit the broad answer"
+            );
+            assert!(!refusal.marker().is_empty());
+        }
+        assert!(
+            !VictimChanged.may_fall_back(),
+            "`current` is already cleared: the trap must fail closed"
+        );
+    }
+}
