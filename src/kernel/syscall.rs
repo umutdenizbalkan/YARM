@@ -324,6 +324,7 @@ pub(crate) mod ipc_recv_core;
 // operations a fork needs that a spawn does not.
 pub(crate) mod fork_txn;
 pub(crate) mod process;
+pub(crate) mod reap_txn;
 mod recv_shared_v3;
 mod sched;
 // U9-SPAWN1 SP-3: the ONE compensated image-loading spawn transaction, shared by NR 23, 24, 26

@@ -2326,6 +2326,17 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_fork_into_frame(shared, cpu, frame);
     }
 
+    // U9-REAP1 §4: ReapFaultedTask (NR 31), before the terminal acquisition. It reads no user
+    // memory and takes no capability argument — its only input is a numeric TID in arg0 — so the
+    // route exists identically on every profile, and every gate it applies is the broad handler's
+    // own gate. It declines with `None` in exactly one case: no resolvable caller, which is
+    // pre-mutation and which the broad handler re-derives unchanged. Once a caller resolves the
+    // route owns the syscall completely, so `TASK_REAP_FAULTED_BEGIN` is emitted exactly once per
+    // invocation on either path.
+    if matches!(syscall, Syscall::ReapFaultedTask) {
+        return try_split_reap_faulted_task_into_frame(shared, cpu, frame);
+    }
+
     // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) — a pure read
     // serviced off the global lock. The helper returns `None` for any case it cannot
     // service (hosted-dev, unavailable requester), which propagates UNCHANGED back to
@@ -3803,6 +3814,98 @@ fn spawn_owners_for(
 ///
 /// The child's return lane is not set here. It was installed by the publication, from
 /// `fork_child_context`, which is the single owner of that decision on every path.
+/// U9-REAP1 §4 — NR 31 `ReapFaultedTask`, before the terminal acquisition.
+///
+/// Gate for gate the broad handler: PM-only, never self-targeting, and only a terminal task. The
+/// state gate is deliberately kept here AND enforced again by the claim inside the transaction —
+/// this one produces the exact `TASK_REAP_FAULTED_REJECT` marker the oracle counts, while the
+/// claim is what actually arbitrates, atomically, against a restart or exit that lands between
+/// the two.
+///
+/// NON-SWITCHING. The reaping PM neither blocks nor yields nor changes address space, so the frame
+/// is finalized once here and no queue is advanced. Every refusal is pre-mutation. There is no
+/// broad fallback after the claim: re-entering the broad handler would re-sweep records this
+/// transaction already retired.
+fn try_split_reap_faulted_task_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::boot::reap_claim::ReapRefusal;
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::reap_txn::{SharedReapOwners, run_reap_transaction};
+
+    let fail = |e: SyscallError| -> Option<Result<(), TrapHandleError>> {
+        Some(Err(TrapHandleError::Syscall(e)))
+    };
+
+    // PRE-MUTATION, and the ONLY case this route declines: with no resolvable caller there is no
+    // authorization to check, so the broad handler re-derives the identical answer.
+    let caller = shared.current_tid_authoritative(cpu)?;
+    let target = frame.arg(0) as u64;
+    // U9-REAP1 §6: the split half of the edge measurement. Emitted per invocation, not latched —
+    // §6 asserts that this count equals the successful-reap count, which a one-shot marker could
+    // not express.
+    crate::yarm_log!(
+        "TASK_REAP_SPLIT_ENTER caller_tid={} target_tid={}",
+        caller,
+        target
+    );
+    crate::yarm_log!(
+        "TASK_REAP_FAULTED_BEGIN caller_tid={} target_tid={}",
+        caller,
+        target
+    );
+
+    if caller != crate::kernel::syscall::PM_BOOTSTRAP_TID {
+        crate::yarm_log!(
+            "TASK_REAP_FAULTED_REJECT target_tid={} reason=not_pm",
+            target
+        );
+        return fail(SyscallError::MissingRight);
+    }
+    if target == caller {
+        crate::yarm_log!("TASK_REAP_FAULTED_REJECT target_tid={} reason=self", target);
+        return fail(SyscallError::InvalidArgs);
+    }
+
+    let mut owners = SharedReapOwners { shared };
+    match run_reap_transaction(&mut owners, target) {
+        Ok(_) => {
+            crate::yarm_log!("TASK_REAP_FAULTED_OK target_tid={}", target);
+            frame.set_ok(0, 0, 0);
+            Some(Ok(()))
+        }
+        // Already gone, or already reaped by a winner that got here first. The broad handler
+        // answers `Ok(0, 0, 0)` for a target that no longer exists, and a duplicate reap is the
+        // same fact discovered one step later — so it gets the same answer, having mutated
+        // nothing.
+        Err(refusal) if refusal.is_already_reaped() => {
+            crate::yarm_log!(
+                "TASK_REAP_FAULTED_ALREADY_GONE target_tid={} reason={}",
+                target,
+                refusal.marker()
+            );
+            frame.set_ok(0, 0, 0);
+            Some(Ok(()))
+        }
+        // A live task, a reservation, or a target still resident on a runqueue: the broad
+        // handler's `WrongObject`, with zero mutation behind it.
+        Err(refusal) => {
+            debug_assert!(matches!(
+                refusal,
+                ReapRefusal::NonTerminal | ReapRefusal::StillScheduled | ReapRefusal::NoProcess
+            ));
+            crate::yarm_log!(
+                "TASK_REAP_FAULTED_REJECT target_tid={} reason={}",
+                target,
+                refusal.marker()
+            );
+            fail(SyscallError::WrongObject)
+        }
+    }
+}
+
 fn try_split_fork_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
@@ -4193,6 +4296,12 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // NOTHING from user memory — no startup-args array, no ELF — so the route needs no
         // off-lock user-read seam and exists identically on every profile.
         Syscall::Fork => Some(syscall),
+        // U9-REAP1 §4: ReapFaultedTask (NR 31). It runs the SAME reap transaction the broad
+        // handler runs, over `SharedReapOwners`, and like Fork it reads NOTHING from user memory,
+        // so it needs no off-lock user-read seam. NR 31 is NON-SWITCHING for the calling PM: the
+        // reap never makes the caller block, yield or change address space, so the route finalizes
+        // the caller's frame once and advances no queue.
+        Syscall::ReapFaultedTask => Some(syscall),
         // Stage 197A removed the former NR 27 InitramfsReadChunk split class along with the
         // syscall. Its sibling note — that NR 28 MINTS a capability and therefore "stays
         // global-lock-only" — was retired by U9-MO2 §4: the mint was never the obstacle, the
@@ -4804,8 +4913,9 @@ mod tests {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
         // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A),
         // NR 10 (FutexWake, Stage 191B), NR 28 (CreateInitramfsFileSliceMo, U9-MO2 §4)
-        // NR 11 (SpawnThread, U9-SPAWN1 SP-2), and NR 23 + NR 29 (SpawnProcess and
-        // SpawnFromMemoryObject, U9-SPAWN-TXN3 §4) may pass the NR-only split-eligibility gate.
+        // NR 11 (SpawnThread, U9-SPAWN1 SP-2), NR 23 + NR 29 (SpawnProcess and
+        // SpawnFromMemoryObject, U9-SPAWN-TXN3 §4), NR 12 (Fork, U9-FORK1 §4) and NR 31
+        // (ReapFaultedTask, U9-REAP1 §4) may pass the NR-only split-eligibility gate.
         // (Stage 197A removed NR 27 InitramfsReadChunk from the whitelist and the ABI.)
         // Every other syscall stays global-lock-only. This is an EXHAUSTIVE sweep of the
         // whole NR space, so it is the guard that would catch a sixth admission arriving
@@ -4825,6 +4935,7 @@ mod tests {
                 || nr == SYSCALL_SPAWN_PROCESS_NR
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
                 || nr == crate::kernel::syscall::SYSCALL_FORK_NR
+                || nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {
@@ -4837,32 +4948,39 @@ mod tests {
 
     #[test]
     fn stage188h_reap_faulted_task_excluded_from_split_dispatch() {
-        // SUP-L7K-A ReapFaultedTask (NR 31) is a PM-only, global-lock-only
-        // terminal-task reap. It must NEVER enter the split (no-global-lock)
-        // dispatch path: both the arg-aware and NR-only classifiers default-deny
-        // it, and `try_split_dispatch` must return `None` (defer to global lock).
-        // This pins the invariant explicitly so a future stage cannot silently
-        // whitelist it while wiring the AP/multi-dispatcher path in Stage 189.
-        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        // U9-REAP1 §4 RETIRED this exclusion, and this guard now pins its inverse.
+        //
+        // Stage 188H pinned NR 31 as global-lock-only so a later stage could not "silently
+        // whitelist it while wiring the AP/multi-dispatcher path". That protection did its job:
+        // NR 31 is admitted here deliberately, by a mission whose §1 recomputed the reap closure,
+        // whose §2 gave the reap a linearizable claim and whose §3 put both routes on ONE
+        // transaction. What the guard must now hold is the positive fact — the classifier admits
+        // it, and it admits it through the same NR-only path every other admitted class uses.
         let syscall = decode(crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR);
         assert!(
             matches!(syscall, Syscall::ReapFaultedTask),
             "NR 31 must decode to ReapFaultedTask"
         );
+        assert!(
+            classify_split_eligible_nr_only(syscall).is_some(),
+            "U9-REAP1 §4: ReapFaultedTask must be NR-only split-eligible"
+        );
+        // The route is reached by NUMBER, never by an argument-shaped guess: NR 31's only input
+        // is a target TID, which names nothing the classifier could validate without the rank-2
+        // claim, so admitting it arg-aware would be admitting it on an unchecked number.
         let args = [3u64, 0, 0, 0, 0, 0];
         assert_eq!(
             classify_split_eligible(syscall, 3, args),
             None,
-            "ReapFaultedTask must NOT be arg-aware split-eligible"
+            "ReapFaultedTask is admitted by NR, not by an arg-aware classification"
         );
+        // And the transaction it reaches is the SAME one the broad handler reaches.
+        const SRC: &str = include_str!("syscall_split.rs");
+        const RESTART: &str = include_str!("boot/restart_state.rs");
         assert!(
-            classify_split_eligible_nr_only(syscall).is_none(),
-            "ReapFaultedTask must NOT be NR-only split-eligible"
-        );
-        assert_eq!(
-            try_split_dispatch(&kernel, syscall, 3, args),
-            None,
-            "ReapFaultedTask must fall back to the global-lock dispatch path"
+            SRC.contains("run_reap_transaction(&mut owners, target)")
+                && RESTART.contains("run_reap_transaction(&mut owners, tid)"),
+            "both NR 31 routes must drive the one reap transaction"
         );
     }
 

@@ -59,6 +59,7 @@ mod memory_state;
 mod orchestrator_state;
 pub(crate) mod process_cnode_txn;
 pub(crate) mod provisional_cap;
+pub(crate) mod reap_claim;
 mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
@@ -151,7 +152,7 @@ pub(crate) const MAX_ENDPOINT_SENDER_WAITERS: usize = 4;
 
 // Keep task capacity consistent across hosted-dev and freestanding builds so
 // capacity-sensitive tests match deployed behavior.
-const MAX_TASKS: usize = 512;
+pub(crate) const MAX_TASKS: usize = 512;
 
 const MAX_MEMORY_OBJECTS: usize = 512;
 const MAX_BOOT_MEMORY_REGIONS: usize = 64;
@@ -8554,9 +8555,9 @@ pub(crate) const MAX_REPLY_CAPS: usize = MAX_TASKS;
 /// is a registration/ownership store, NOT a terminal-result authority store.
 pub(crate) const MAX_DEADLINE_TOKENS: usize = 4;
 #[cfg(feature = "hosted-dev")]
-const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
+pub(crate) const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
 #[cfg(not(feature = "hosted-dev"))]
-const MAX_DELEGATED_CAPABILITY_LINKS: usize = 2048;
+pub(crate) const MAX_DELEGATED_CAPABILITY_LINKS: usize = 2048;
 
 /// U9-SPAWN-TXN3 §3: the delegation-link table's bound, for the split reap's per-slot loop.
 ///

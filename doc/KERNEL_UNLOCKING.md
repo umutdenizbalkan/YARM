@@ -13233,3 +13233,305 @@ RISC-V, at base or now, and its isolation witness is intact in every run.
 The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
 their other residual classes, so ***U9 remains OPEN***: this increment empties the AArch64 write-COW
 population that reached them, it does not delete them.
+
+## U9-REAP1 — ReapFaultedTask (NR31)
+
+### §1 — the reap closure, and where a real witness lives
+
+`handle_reap_faulted_task` (`src/kernel/syscall/process.rs`) is a five-gate preamble in front of
+one cleanup owner. It authorizes on `caller == PM_BOOTSTRAP_TID` (`MissingRight`), refuses
+self-targeting (`InvalidArgs`), returns `Ok(0,0,0)` with `TASK_REAP_FAULTED_ALREADY_GONE` when the
+TID names no TCB, rejects `Runnable | Running | Blocked(_) | Reserved` (`WrongObject`), and only
+then calls `reap_faulted_task_noalloc_cleanup`. Everything before the cleanup is pre-mutation, and
+the ABI is `ret0=0` with no other return lane used.
+
+The cleanup (`src/kernel/boot/restart_state.rs`) is five steps: mark the TCB `Dead` and drop its
+restart token (rank 2); revoke reply records on both the caller and replier sides of the exact
+`{tid, asid}` identity; `clear_ipc_waiters_for_tid`; `release_kernel_context`; and
+`maybe_cleanup_process_cnode_for_pid_noalloc_reap`, which is the only step that can reach the VM.
+
+**The closure is narrower than the syscall's name suggests, and the recomputation matters.** No
+general-revocation branch runs: `revoke_capability_in_cnode` is never reached, and — unlike the
+sibling `mark_task_dead` — neither `retire_reply_deadline_for_tid` nor `revoke_driver_runtime_caps`
+is on this path. What *is* reachable, and only under the existing last-thread rule (`return false`
+if any TCB in the group is not `Dead`), is the whole process teardown:
+`destroy_user_address_space_by_asid` per distinct ASID, transfer-envelope purge, active-transfer
+unmaps via `unmap_range_two_phase`, delegation-link removal at rank 4, and `reap_process_cspace_locked`.
+So the closure is narrow per *thread* and wide per *process*, and the width is gated, not optional.
+
+Two properties the existing code already has, and which §3 must not lose: it allocates nothing
+(fixed `[Option<_>; MAX_REPLY_CAPS]` / `[None; MAX_TASKS]` snapshots throughout), and it already
+snapshots under a claim and settles after releasing it, so no rank is ever nested inside another.
+
+**No missing semantic primitive.** Every seam the split side needs already exists —
+`with_task_tcbs_split_mut`, `with_ipc_split_mut`, `with_capability_split_mut`,
+`with_vm_then_memory_split_mut`, `with_memory_split_mut`, `with_scheduler_split_mut`,
+`unmap_range_two_phase_split` — and every body is already factored as a `*_locked` helper over
+borrowed subsystem state. The work is adapters, not a new primitive.
+
+**The linearization point** is today split across two rank-2 acquisitions: the handler reads
+`task_status(target)`, and the cleanup separately writes `status = Dead`. That is sound under the
+broad lock and unsound off it, so §2's claim collapses the two into one compare-and-claim inside a
+single acquisition — which is also what arbitrates restart, exit, duplicate reap and replacement
+under a reused TID.
+
+**Scheduler residency needs no removal, only proof.** A task reaches `Faulted` only through
+`TaskTransition::FaultRunningCurrent`, and both the broad path and
+`commit_terminal_fault_transition_shared` clear `current` (`block_current_on_cpu`) *before* applying
+it; nothing re-enqueues a `Faulted` task, and `CrossCpuWakeApplyResult::SkippedFaulted` refuses to.
+`Exited`/`Dead` are likewise off-queue. So the transaction proves absence rather than performing a
+removal — and refuses pre-mutation if it ever finds otherwise.
+
+#### Base measurement: where NR31 actually fires
+
+Fresh artifacts at `70327f7`, all three manifests attesting
+`commit=70327f7b5ae5bf6e7fe4fa9e75c5e66bd74f35b4`.
+
+The **server-death** profiles are not witnesses. All three produce
+`TASK_REAP_FAULTED_BEGIN = TASK_REAP_FAULTED_OK = PM_RESTART_TEARDOWN_OLD_BEGIN = 0`; server death
+tears a server down without PM ever reaping a faulted task. (x86_64 passes; aarch64 and riscv64 are
+red at base with `RUN_B expected exactly one captured reverse link, saw 0` — a pre-existing failure
+unrelated to NR31, unchanged here.)
+
+The **crash/restart** profile is the witness, by design: its marker oracle already requires
+`TASK_REAP_FAULTED_OK`. Its sole production caller is
+`teardown_old_restart_target(old_tid, replacement_tid)` in the process manager, reached only after a
+replacement has been spawned.
+
+| | x86_64 | aarch64 | riscv64 |
+|---|---|---|---|
+| `CRASH_TEST_SRV_FAULT_NOW` | 4 | 4 | 5 |
+| `PM_RESTART_TEARDOWN_OLD_BEGIN / _OK` | 3 / 3 | 3 / 3 | 4 / 4 |
+| **`TASK_REAP_FAULTED_BEGIN / _OK`** | **3 / 3** | **3 / 3** | **4 / 4** |
+| distinct reaped targets | 3 | 3 | 4 |
+| refusals (`REJECT`, `ALREADY_GONE`) | 0, 0 | 0, 0 | 0, 0 |
+
+riscv64 had no witness only because `scripts/qemu-supervisor-crash-restart-smoke.sh` had no
+`riscv64` arm — not because the chain was missing. The RISC-V artifact builder already stages the
+gated `crash_test_srv`, and the chain runs end to end there:
+`CRASH_TEST_SRV_FAULT_NOW` → `SUPERVISOR_FAULT_LOOKUP_OK` → `SUPERVISOR_RESTART_SCHEDULED` →
+`PM_RESTART_REPLY_ACCEPTED` → `PM_RESTART_TEARDOWN_OLD_BEGIN` → `TASK_REAP_FAULTED_OK`, four times,
+on targets 10008, 10009, 10010 and 10011. So the profile was extended, not invented: no synthetic
+kernel event, no new ABI, no unrelated workload.
+
+The riscv64 arm gets its own acceptance shape (`ARCH_ORACLE=reap_chain`) for one honest reason. On
+x86_64 and aarch64 the supervisor's restart-attempt counter advances monotonically and the chain
+converges on `RESTART_LIMIT_EXCEEDED` + `SERVICE_DEGRADED_FINAL` after exactly four instances. On
+riscv64 that counter **resets** mid-chain — `ATTEMPT_ADVANCE old=2 new=3` is followed by
+`old=0 new=1` — so the limit is never reached and the run is bounded by the clock instead. That
+accounting difference is pre-existing and out of scope (§4 forbids redesigning restart), so the
+riscv64 oracle asserts the reap chain itself and nothing about terminal degradation: at least three
+complete cycles, `teardown_begin == reap_begin == reap_ok == teardown_ok`, one distinct target per
+success, zero refusals, and the fault count bracketing the reap count.
+
+The controlled witness on RISC-V is the deliberate `crash_test_srv` fault, **not** the known
+intermittent RISC-V supervisor fault, which stays exactly as classified.
+
+### §2 — the claim, and the window it closes
+
+The reap's defect was never a missing mechanism. It was that the status which *decides* the reap
+and the status the reap *writes* were read in two different rank-2 acquisitions —
+`handle_reap_faulted_task` reading `task_status(target)`, and `reap_faulted_task_noalloc_cleanup`
+writing `status = Dead` several steps later. Under the broad lock nothing can happen in between.
+Off it, that pair is a check-then-act race against four concurrent lifecycle edges: a scheduled
+restart flipping the same TCB back to `Runnable`, the task's own exit, a second NR 31, and a
+replacement that reuses the numeric TID.
+
+`claim_faulted_task_for_reap_locked` collapses the pair into one acquisition. It resolves the TCB,
+captures the exact incarnation and process, classifies the status, and only then writes `Dead` and
+takes the restart token — every refusal above the write, so a refused claim mutates nothing at all.
+What it returns is a `ReapClaim` with no public constructor: after this point the target can only
+be named by the claim, never by the number PM passed in.
+
+Three details are deliberate rather than incidental.
+
+**The generation is the one that already exists.** The claim carries the TCB's own
+`RestartState::token` and clears it, which is exactly what the base cleanup did. Nothing new is
+minted, and `None` keeps meaning "this target carried no restart token".
+
+**`Dead` is not claimable.** `status_is_claimable` admits `Faulted | Exited(_)` and nothing else,
+so the state a won claim leaves behind is the state a losing claim sees. That is the whole
+arbitration: two reaps race, one writes `Dead`, the other finds it and returns `AlreadyClaimed`
+having touched nothing. `ReapRefusal::is_already_reaped` then puts that loser on the SAME
+disposition the base handler already gave a target that no longer exists — `Ok(0, 0, 0)` — so the
+syscall's return ABI is unchanged and a duplicate reap costs nothing.
+
+**An ASID-less target is still reapable.** The claim stores `Option<Asid>` rather than refusing,
+and the record sweeps key on `sweep_asid()`, which substitutes `Asid(0)` exactly as the base
+cleanup's `task_asid(tid).unwrap_or(Asid(0))` did. Refusing would have been tidier and would have
+leaked.
+
+### §3 — one transaction, two owners
+
+`run_reap_transaction` is the only code that knows what reaping a faulted task means. Both routes
+reach it: `reap_faulted_task_noalloc_cleanup` is now a thin caller through `BroadReapOwners`, and
+the split route reaches the same function through `SharedReapOwners`. The owners supply
+acquisitions and nothing else — order, conditions and counting all live in the transaction — so a
+divergence between the two routes is not expressible.
+
+```text
+  rank 1   prove the target is on no runqueue and is no CPU's current   (refusal: pre-mutation)
+  rank 2   CLAIM: Faulted|Exited -> Dead, take the restart token        (LINEARIZATION POINT)
+  rank 3   sweep caller-side reply records          -> release -> detach each reverse link once
+  rank 3   sweep replier-side reply records         -> release -> detach each reverse link once
+  rank 3   detach every waiter this identity owns   -> release -> settle each orphan once
+  rank 2   release the kernel context and stack
+  rank 2   last-thread rule: any sibling not Dead? -> the process teardown below is SKIPPED
+    rank 2   collect the process's DISTINCT address spaces
+    vm5/6    per address space: drain -> release -> queue TLB work -> reclaim
+    rank 3   purge the process's transfer envelopes, releasing one pin per shared region
+    rank 3   snapshot active transfer mappings -> unmap (vm5/6) -> clear slot -> account
+    rank 4   snapshot delegation links -> rank 2 resolve -> rank 4 clear the matching ones
+    rank 4   reap the process cspace and its process record
+  retire the reap claim                                                             (LAST)
+```
+
+**Scheduler residency is proved, not performed.** A task reaches `Faulted` only through
+`TaskTransition::FaultRunningCurrent`, which both the broad path and
+`commit_terminal_fault_transition_shared` apply only *after* clearing `current`; nothing re-enqueues
+a terminal task, and a cross-CPU wake refuses one outright. So the transaction asserts absence
+rather than performing a removal — and refuses if it ever finds otherwise. The proof is taken twice:
+before the claim, where a refusal costs nothing, and again under it, where it is the one step that
+can still undo the claim cleanly.
+
+**No allocation, and no rank nested inside another.** Every snapshot is a fixed array sized by an
+existing `MAX_*` bound. Every reverse link, orphaned sender, transfer envelope and delegation link
+is collected under its claim and settled after it releases — which is the discipline the base code
+already kept, preserved rather than invented. The delegation sweep is the sharpest case: the base
+loop resolved `process_id(record.source_tid)` while iterating rank-4 records, so the transaction
+snapshots at rank 4, releases, resolves at rank 2, and clears at rank 4.
+
+**The closure stayed narrow.** No general capability revoke is reachable, and the §5 guard forbids
+one from appearing: not `revoke_capability_in_cnode`, not `revoke_driver_runtime_caps`, not
+`retire_reply_deadline_for_tid` — the last two being things the sibling `mark_task_dead` does and
+the reap does not.
+
+### §4 — the route, and the three gates that admit it
+
+NR 31 reads no user memory and takes no capability argument; its only input is a target TID in
+arg0. So the route exists identically on every profile, and the work was three admission gates: the
+classifier, AArch64's ABI-import allow-list (an unlisted NR keeps `nr = 0` and the dispatcher
+declines) and RISC-V's `split_eligible` predicate. NR 31 also joins RISC-V's *per-invocation*
+marker arm rather than its one-shot latch — with a latch, three working reaps and one would look
+the same.
+
+NR 31 is non-switching for the calling PM: reaping a task the scheduler released at fault time
+cannot block, yield or change the caller's address space, so the route finalizes the frame once and
+advances no queue. Its only decline is the pre-mutation caller lookup. Past the claim there is no
+broad fallback, because re-entering the broad handler would re-sweep every record this transaction
+already retired.
+
+### §5 — proved two ways
+
+Twenty-one tests. The behavioural half drives the real transaction over a harness whose rank-2
+owners call the real locked bodies against a real `[Option<ThreadControlBlock>]` slice, comparing
+full pre/post state by identity and injecting failure at each post-claim boundary:
+
+* a duplicate reap makes **exactly one** owner call — the claim it lost — and the whole state
+  snapshot is byte-identical before and after;
+* a restarted, running, blocked or reserved target keeps its status *and* its restart token;
+* residency found only under the claim rolls it back byte-for-byte and runs nothing below it;
+* a reused numeric TID does not have another incarnation's reply records swept;
+* a live sibling preserves the shared CNode and address space, and the sibling's own later reap
+  destroys **both** of the group's distinct address spaces;
+* every shootdown is queued after its drain and before its reclaim;
+* a failed drain reclaims nothing, queues no shootdown, and still retires the claim;
+* the claim retires last, and the `detach_reverse_link` / `clear_delegation_link` /
+  `reap_process_cspace` owners panic on a repeat, so reaching the end *is* the exactly-once proof.
+
+The structural half pins what a harness cannot see: that both routes reach one transaction, that
+neither file allocates or grows, that no general revocation is reachable, that every architecture's
+gate admits NR 31, that the refusal set is closed, and that the only rollback sits before the first
+irreversible step.
+
+Twenty-one guards that pinned NR 31 as global-lock-only were **re-derived, not deleted** — each now
+asserts the admission it used to forbid, so a regression in either direction still breaks a guard.
+Stage 188H's guard is the clearest: it existed so a later stage could not "silently whitelist"
+NR 31 while wiring the AP dispatcher. It did its job; the admission here is deliberate, and the
+guard now says so.
+
+The status-writer census moves **43 → 44**. The reap's `-> Dead` write moved into the claim and
+gained its exact inverse, and both rows are `Cannot` where the row they replace was `Can`: the old
+write could land on a task that had become `Blocked(EndpointReceive)` between the two acquisitions,
+and the claim, reading and writing behind `status_is_claimable` in one acquisition, cannot.
+
+### §6 — the live acceptance
+
+Fresh artifacts, three consecutive boots per architecture, every counter identical across the three.
+Kernel source is unchanged across the runs: the only commit between the x86_64/AArch64 matrix and
+the RISC-V one touches `scripts/qemu-supervisor-crash-restart-smoke.sh` and nothing under `src/`
+or `crates/`.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| **NR31 broad terminal entries** (`TASK_REAP_BROAD_ENTER`) | **0** | **0** | **0** |
+| NR31 split route entries (`TASK_REAP_SPLIT_ENTER`) | 3 | 3 | 4 |
+| successful reaps (`TASK_REAP_FAULTED_OK`) | 3 | 3 | 4 |
+| reap claims retired (`TASK_REAP_CLAIM_RETIRED`) | 3 | 3 | 4 |
+| PM teardowns (`PM_RESTART_TEARDOWN_OLD_OK`) | 3 | 3 | 4 |
+| distinct reaped targets | 3 | 3 | 4 |
+| refusals (`REJECT`, `ALREADY_GONE`) | 0, 0 | 0, 0 | 0, 0 |
+| panics, lock-order warnings | 0, 0 | 0, 0 | 0, 0 |
+| broad-lock census (`with_cpu / with_broad / TOTAL`) | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+Split route entries equal successful reaps equal claims retired equal PM teardowns, on every one of
+the nine boots, and every success reaped a different task. The broad edge is measured at the broad
+handler's own first line, before any gate can return — not inferred from a route count.
+
+The chain behind those numbers is genuine end to end: a user task faults
+(`CRASH_TEST_SRV_FAULT_NOW`), the report reaches the supervisor
+(`SUPERVISOR_FAULT_LOOKUP_OK`), a restart is scheduled and accepted
+(`PM_RESTART_REPLY_ACCEPTED`), PM spawns the replacement and only then invokes NR 31
+(`PM_RESTART_TEARDOWN_OLD_BEGIN` → `TASK_REAP_SPLIT_ENTER`), the split reap commits, and the next
+instance runs. No target ever resumes or wakes after its reap; no orphaned reply record, waiter or
+kernel context survives; the service chain stays healthy through every cycle.
+
+Regressions, all identical to exact base:
+
+| profile | base | now |
+|---|---|---|
+| x86_64 core + `VM_COW=1` | pass | pass |
+| AArch64 core + `TERMINAL_FAULT_ORACLE=1` (U9-FT4) | pass | pass |
+| AArch64 / RISC-V core + `VM_COW=1` | pass | pass |
+| x86_64 server-death | pass | pass |
+| AArch64 / RISC-V server-death | **fail** (pre-existing) | **fail**, same line |
+
+The AArch64 and RISC-V server-death reds are byte-identical to base —
+`RUN_B expected exactly one captured reverse link, saw 0` — and unrelated to NR 31: those profiles
+produce zero reap activity on any architecture, at base and now.
+
+### The RISC-V stall, measured rather than assumed
+
+One RISC-V boot in the first matrix failed, and it is worth stating exactly what it was. The
+crash_test_srv fault report is enqueued on the supervisor's endpoint with
+`TASK_FAULT_REPORT_ENQUEUE_OK ... waiters=0 queued=1 woke=0` — the supervisor is not parked on the
+endpoint when the report lands, nothing wakes it, and the chain stops at exactly one fault with
+**zero** `SUPERVISOR_FAULT_LOOKUP_OK`. No PM teardown and no NR 31 occur on either route, so no
+reap code runs at all.
+
+Rather than assume, a freshly built base at `70327f7` was booted four times: **two of four**
+reproduce the identical signature (`faults=1 lookup=0 teardown=0 reap_ok=0`). No supervisor fault
+is involved in any of them, so this is a *different* phenomenon from the known intermittent RISC-V
+supervisor fault — which stays exactly as classified, and which is deliberately not the controlled
+NR 31 witness here.
+
+A boot whose chain never started proves nothing either way about the reap, so the riscv64 arm now
+retries it — bounded at four attempts, counted, and named in the output. Exhausting the attempts
+prints `result=inconclusive reason=fault_report_rendezvous_stall` and still exits non-zero, so it
+can never be read as a pass. Nothing is weakened: the detector is narrow (a fault was delivered
+**and** the supervisor looked up nothing), so a chain that starts and then breaks is a real failure
+and is reported as one, and every assertion runs at full strength on the boot that does start. All
+three delivered RISC-V boots ran with `attempts=1 stalled=0`.
+
+### Residual terminal-dispatch matrix (source-recomputed)
+
+| edge | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| NR31 `ReapFaultedTask` production terminal edges | **0** | **0** | **0** |
+| NR12 `Fork` | 0 | 0 | 0 |
+| NR23 / NR29 spawn | 0 | 0 | 0 |
+| broad-lock census | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
+their other residual classes, so ***U9 remains OPEN***: this increment empties the NR 31 population
+that reached them, it does not delete them.
