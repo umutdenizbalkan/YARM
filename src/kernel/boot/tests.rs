@@ -160739,6 +160739,40 @@ mod u9exit2_total_nr16_disposition {
             0,
             "nothing after the NR gate may decline"
         );
+
+        // And a `Complete` disposition returns from the trap handler BEFORE the broad dispatch on
+        // every architecture — which is what makes "the route never declines" equal to "the broad
+        // handler is never entered" rather than merely "the route answered".
+        let shared_complete = TRAP_ENTRY
+            .split("if let SplitDispatchDisposition::Complete(result) = disposition {")
+            .nth(1)
+            .expect("the shared Complete arm");
+        let shared_complete = &shared_complete[..shared_complete
+            .find("return Err(other);")
+            .expect("the shared propagate arm")];
+        assert_eq!(
+            shared_complete.matches("return Ok(());").count(),
+            2,
+            "both x86_64/AArch64 syscall Complete arms must return before the broad dispatch"
+        );
+        let riscv_complete = RISCV_TRAP
+            .split(
+                "if let crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) =",
+            )
+            .nth(1)
+            .expect("the RISC-V Complete arm");
+        let riscv_complete = &riscv_complete[..riscv_complete
+            .find("Err(other) => return Err(other),")
+            .expect("the RISC-V propagate arm")];
+        // (both slices end at the propagate arm, so a non-syscall trap error is accounted for and
+        // still never reaches the broad dispatcher)
+        assert_eq!(
+            riscv_complete
+                .matches("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);")
+                .count(),
+            2,
+            "both RISC-V syscall Complete arms must return before the broad dispatch"
+        );
     }
 
     /// §4 — `QueueAdvanceCommitted` is still reachable ONLY with a reserved deferral, and every
