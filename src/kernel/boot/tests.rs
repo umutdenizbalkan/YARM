@@ -157484,3 +157484,322 @@ mod u9a64cow2_argument_mirror {
         }
     }
 }
+
+/// U9-A64-COW2 §5 — the AArch64 write-COW class, routed through the ONE existing transaction.
+///
+/// Every claim here is about a shared owner, so each assertion binds x86_64 and AArch64 at once.
+/// That is the point: §3 admitted AArch64 on the grounds that no second policy was needed, and
+/// these guards are what make "no second policy" checkable rather than asserted.
+mod u9a64cow2_split_route {
+    use super::*;
+    use crate::kernel::boot::{PageFaultClass, PageFaultRoute, page_fault_route_for};
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const FAULT_STATE: &str = include_str!("fault_state.rs");
+    const A64_PT: &str = include_str!("../../arch/aarch64/page_table.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+
+    fn route_body() -> &'static str {
+        SPLIT
+            .split("fn try_split_cow_page_fault_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n/// ").next())
+            .expect("the split COW route")
+    }
+
+    fn transaction_body() -> &'static str {
+        RUNTIME
+            .split("pub(crate) fn cow_recover_private_copy_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// U9-COW1 §3 — the page copy").next())
+            .expect("the split COW transaction")
+    }
+
+    /// ONE recovery policy, and one route that drives it. AArch64 added no second anything.
+    #[test]
+    fn there_is_one_split_cow_recovery_policy_and_one_route() {
+        assert_eq!(
+            RUNTIME
+                .matches("pub(crate) fn cow_recover_private_copy_split(")
+                .count(),
+            1,
+            "one split COW transaction"
+        );
+        assert_eq!(
+            SPLIT
+                .matches("fn try_split_cow_page_fault_into_frame(")
+                .count(),
+            2,
+            "exactly one freestanding route plus its hosted stub"
+        );
+        assert_eq!(
+            route_body()
+                .matches("shared.cow_recover_private_copy_split(facts)")
+                .count(),
+            1,
+            "the route drives that transaction exactly once"
+        );
+    }
+
+    /// The broad arm and the split route share the classifier and the routing matrix, so they
+    /// cannot disagree about what a COW candidate is.
+    #[test]
+    fn broad_and_split_share_the_classifier_and_the_matrix() {
+        assert_eq!(
+            FAULT_STATE
+                .matches("pub(crate) fn page_fault_route_for(")
+                .count(),
+            1,
+            "one routing matrix evaluator"
+        );
+        assert!(
+            route_body().contains("shared.classify_page_fault_shared(cpu, fault)")
+                && route_body().contains("page_fault_route_for(arch, class)"),
+            "the route must classify and route through the shared owners"
+        );
+        // The arch is derived, never hard-coded, so the row is the only thing that admits a port.
+        assert!(
+            route_body().contains("let arch = if cfg!(target_arch = \"x86_64\")")
+                && route_body().contains("} else if cfg!(target_arch = \"aarch64\") {"),
+            "the route derives its architecture from the same string the matrix keys on"
+        );
+    }
+
+    /// AArch64's write-COW class routes split; RISC-V's does not, and demand stays broad
+    /// everywhere. The witness rule is intact in both directions.
+    #[test]
+    fn the_aarch64_write_cow_class_is_routed_and_riscv_is_not() {
+        assert_eq!(
+            page_fault_route_for("aarch64", PageFaultClass::CowCandidate),
+            PageFaultRoute::SplitCow,
+            "AArch64's COW witness was earned in §2"
+        );
+        assert_eq!(
+            page_fault_route_for("riscv64", PageFaultClass::CowCandidate),
+            PageFaultRoute::Broad,
+            "RISC-V has no independent COW witness and stays broad"
+        );
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert_eq!(
+                page_fault_route_for(arch, PageFaultClass::DemandCandidate),
+                PageFaultRoute::Broad,
+                "demand paging is out of scope on {arch}"
+            );
+            assert_eq!(
+                page_fault_route_for(arch, PageFaultClass::KernelOrAbsentTask),
+                PageFaultRoute::Broad,
+                "a kernel or absent-task fault is never split-routed on {arch}"
+            );
+        }
+    }
+
+    /// Every refusal precedes the first mutation, and there is no fallback after it.
+    #[test]
+    fn every_refusal_precedes_the_first_mutation_and_none_follows_it() {
+        let txn = transaction_body();
+        let boundary = txn
+            .find("FIRST MUTATION. Broad fallback is forbidden from here on.")
+            .expect("the marked mutation boundary");
+        let first_alloc = txn
+            .find("alloc_contiguous(1)")
+            .expect("the first allocation");
+        assert!(
+            boundary < first_alloc,
+            "the boundary must be stated before anything is allocated"
+        );
+        // Refusals that may fall back to the broad arm all sit BEFORE the boundary.
+        for refusal in [
+            "R::RefusedNoCnode",
+            "R::RefusedMappingChanged",
+            "R::RefusedIdentityChanged",
+        ] {
+            let at = txn.find(refusal).unwrap_or(usize::MAX);
+            assert!(
+                at < boundary,
+                "`{refusal}` must refuse before the first mutation"
+            );
+        }
+        // And the route's own screens — non-write access, absent mapping, already writable — are
+        // all before it calls the transaction at all.
+        let body = route_body();
+        let call = body
+            .find("shared.cow_recover_private_copy_split(facts)")
+            .expect("the transaction call");
+        for screen in [
+            "if !matches!(fault.access, FaultAccess::Write)",
+            "if facts.mapping_writable || !facts.mapping_present",
+        ] {
+            assert!(
+                body.find(screen).map(|at| at < call).unwrap_or(false),
+                "the route must screen `{screen}` before the transaction"
+            );
+        }
+    }
+
+    /// PTE and refcount move together and in one acquisition: the old mapping's refcount comes
+    /// down, the COW mark is cleared and the new mapping's goes up, all under a single rank-6
+    /// acquisition, and the OLD frame is reclaimed only after the shootdown acknowledged.
+    #[test]
+    fn the_pte_and_refcount_transitions_are_symmetric_and_ordered() {
+        let txn = transaction_body();
+        let refcounts = txn
+            .split("self.with_memory_split_mut(|memory| {")
+            .find(|block| block.contains("note_mapping_inserted_locked"))
+            .expect("the refcount acquisition");
+        for step in [
+            "note_mapping_removed_locked(memory, old_phys)",
+            "clear_cow_page_locked(memory, asid, page)",
+            "note_mapping_inserted_locked(memory, new_phys)",
+        ] {
+            assert!(
+                refcounts.contains(step),
+                "`{step}` must be part of the one refcount acquisition"
+            );
+        }
+        let shootdown = txn
+            .find("self.complete_unmap_shootdown_split(asid, page)")
+            .expect("the shootdown");
+        let reclaim = txn
+            .find("reclaim_memory_object_for_phys_locked(memory, old_phys)")
+            .expect("the old-frame reclaim");
+        assert!(
+            shootdown < reclaim,
+            "the old frame may only be reclaimed after the shootdown"
+        );
+        assert!(
+            txn.contains("if old_entry.is_some() && shootdown_acked {"),
+            "an unacknowledged shootdown must leave the old frame unreclaimed"
+        );
+    }
+
+    /// No domain lock is held across the TLB completion.
+    #[test]
+    fn no_domain_lock_is_held_across_the_tlb_completion() {
+        let txn = transaction_body();
+        let shootdown_line = txn
+            .lines()
+            .find(|l| l.contains("self.complete_unmap_shootdown_split(asid, page)"))
+            .expect("the shootdown line");
+        assert!(
+            !shootdown_line.contains("with_memory_split_mut")
+                && !shootdown_line.contains("with_vm_user_spaces_split_mut"),
+            "the shootdown must not be taken inside an acquisition closure"
+        );
+        assert!(
+            txn.contains("(9) The shootdown, with NO domain lock held."),
+            "the ordering must be stated where it is performed"
+        );
+    }
+
+    /// AArch64's own invalidation is the complete architected sequence, which is why the route
+    /// needs nothing extra before returning to EL0.
+    #[test]
+    fn the_aarch64_invalidation_is_complete_before_the_transaction_returns() {
+        let inv = A64_PT
+            .split("pub fn invalidate_page(virt: VirtAddr) {")
+            .nth(1)
+            .and_then(|s| s.split("\npub fn ").next())
+            .expect("aarch64 invalidate_page");
+        for step in ["dsb ishst", "tlbi vaae1is", "dsb ish", "isb"] {
+            assert!(
+                inv.contains(step),
+                "AArch64 page invalidation must include `{step}`"
+            );
+        }
+        // Order matters: store barrier, broadcast, completion, context synchronization.
+        let (a, b, c, d) = (
+            inv.find("dsb ishst").unwrap(),
+            inv.find("tlbi vaae1is").unwrap(),
+            inv.find("dsb ish\"")
+                .or_else(|| inv.find("dsb ish"))
+                .unwrap(),
+            inv.find("isb").unwrap(),
+        );
+        assert!(a < b && b < c && c < d, "the barrier order must be exact");
+        // And it is reached from the mapper, so it has run before the transaction returns.
+        assert!(
+            A64_PT.contains("    invalidate_page(virt);"),
+            "map_page must invalidate before returning"
+        );
+    }
+
+    /// A recovered COW fault is non-switching: it settles the frame once, skips broad dispatch
+    /// once, and claims no queue advance.
+    #[test]
+    fn a_recovered_fault_settles_once_and_advances_no_queue() {
+        let ingress = TRAP_ENTRY
+            .split("try_split_cow_page_fault_dispatch(shared, cpu, pf)")
+            .nth(1)
+            .and_then(|s| s.split("\n        }").next())
+            .expect("the COW ingress arm");
+        assert!(
+            ingress.contains("cow_recovered = true;")
+                && ingress.contains("cow_result = Some(result);"),
+            "a handled COW fault must settle its own result and suppress the broad handler"
+        );
+        for forbidden in ["QueueAdvanceCommitted", "PostWorkCommitted"] {
+            assert!(
+                !ingress.contains(forbidden),
+                "a non-switching COW recovery must not claim `{forbidden}`"
+            );
+        }
+        assert!(
+            TRAP_ENTRY.contains("&& !cow_recovered"),
+            "the route must be attempted at most once per fault"
+        );
+    }
+
+    /// The rollback is exhaustive: every post-allocation failure returns the frame and the object
+    /// slot it took, so a refused recovery leaks neither.
+    #[test]
+    fn the_post_allocation_rollback_is_exhaustive() {
+        let txn = transaction_body();
+        let boundary = txn
+            .find("FIRST MUTATION. Broad fallback is forbidden from here on.")
+            .expect("the boundary");
+        let after = &txn[boundary..];
+        // The inverse is expressed ONCE, as a closure, and every arm defined after it calls that
+        // closure; the two arms that precede its definition carry their own exact release,
+        // because at those points there is less to give back.
+        assert!(
+            after.contains("let rollback = |shared: &Self| {")
+                && after.contains("shared.rollback_minted_cap_split(cnode, new_mem_cap, object);")
+                && after.contains("KS::reclaim_memory_object_for_phys_locked(memory, new_phys)"),
+            "the post-mint inverse must revoke the cap AND reclaim the object/frame"
+        );
+        let closure_at = after
+            .find("let rollback = |shared: &Self| {")
+            .expect("the rollback closure");
+        // Every give-up arm after the closure calls it; every one before it releases inline.
+        let mut checked = 0usize;
+        let mut at = 0usize;
+        while let Some(rel) = after[at..].find("return R::") {
+            let arm = at + rel;
+            let window_start = arm.saturating_sub(700);
+            let window = &after[window_start..arm];
+            if arm > closure_at {
+                assert!(
+                    window.contains("rollback(self);"),
+                    "a post-mint failure arm at byte {arm} must run the one inverse"
+                );
+            } else if window.contains("alloc_contiguous(1)") && !window.contains("let new_phys =") {
+                // The allocation itself failed: nothing was taken, so nothing is owed. This is
+                // the one vacuous case, and it is recognised explicitly rather than skipped.
+            } else {
+                assert!(
+                    window.contains("free_frame(new_phys.0)")
+                        || window
+                            .contains("reclaim_memory_object_for_phys_locked(memory, new_phys)"),
+                    "a pre-mint failure arm at byte {arm} must release exactly what it took"
+                );
+            }
+            checked += 1;
+            at = arm + "return R::".len();
+        }
+        assert_eq!(
+            checked, 8,
+            "every post-mutation give-up arm must be accounted for"
+        );
+    }
+}
