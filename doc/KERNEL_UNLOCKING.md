@@ -13829,3 +13829,147 @@ The retired broad pipeline — `PREFLIGHT_OK`, `DISPOSITION_PUBLISHED`, `DISPOSI
 `POST_LOCK_DRAIN_DONE`, `COMMON_EPILOGUE_OWNER`, `TRAP_DEPTH_OWNER` — counted zero on every run of
 every architecture.
 
+---
+
+## U9-EXIT2 — NR 16 made source-total
+
+### Correction to U9-EXIT1's retirement claim
+
+U9-EXIT1 reported the NR 16 terminal edge as retired on the strength of the live matrix above:
+`EXIT_TASK_BROAD_ENTER` counted zero on nine boots. That measurement is accurate and it is
+reproduced here, but the conclusion drawn from it was too strong, and this correction is recorded
+in its own right.
+
+The exit oracle exercises ONE population: a `Joinable`, non-robust self-exit that owes no reply.
+The route U9-EXIT1 delivered refused two other populations — a `Detached` thread and a robust-futex
+publisher — and refused them by returning `NotHandled`, which hands the trap to the terminal broad
+dispatcher. So `EXIT_TASK_BROAD_ENTER = 0` in those boots proved that *the exercised population*
+avoided the edge. It did not prove the edge unreachable, and U9-EXIT1's summary should have said
+"the admitted population" wherever it said "NR 16".
+
+Worse, one arm was simply wrong. A claim that lost its race between the preflight and the
+linearization point produced `NotRunning`, whose `may_fall_back()` answered `true` — but that
+refusal is produced AFTER `current` has been cleared. The route therefore returned `NotHandled` and
+`handle_exit_current_task` ran on a CPU with no current task, where its first statement resolves
+`current_tid()` to `None` and returns `SyscallError::Internal` to a task that is no longer
+schedulable, with the queue advance never performed. That is a fall-back into a broken state, not a
+graceful decline, and it was reachable from any concurrent reap, fault or restart of the exiting
+task.
+
+### §1 — the complete disposition table
+
+Every arm from NR 16 recognition to the end of the transaction, on all three architectures.
+Classification is A (reachable, must be serviced), B (mechanically impossible at a userspace
+syscall boundary), C (invalid invocation, typed error pre-lock), D (fatal after mutation).
+
+| # | arm | refusal | class | settlement | why |
+|---|---|---|---|---|---|
+| 0 | `frame.syscall_num() != 16` | — | — | `NotHandled` | before recognition; the seam's other classes must still be tried |
+| 1 | no trap drainer / not the dispatch CPU | `RouteNotAdmitted` | **B** | `Complete(Err(Internal))` | the flag is set before any userspace task runs; the dispatching-CPU count is 1 in every production configuration (the only site that clears an AP's wake-only bit is unreachable — Stage 189B, "trap_return_ready is never set"); a wake-only AP dispatches no user task, so no userspace syscall can originate on one |
+| 2 | no current task | `NoCurrent` | **B** | `Complete(Err(Internal))` | this trap IS a userspace syscall taken on `cpu` |
+| 3 | no TCB for the current TID | `TaskGone` | **B** | `Complete(Err(Internal))` | the current task has a TCB by construction |
+| 4 | thread is `Detached` | `DetachedThread` | **B** | `Complete(Err(Internal))` | §2 — no production writer exists |
+| 5 | status is not `Running` | `NotRunning` | **B** | `Complete(Err(Internal))` | the dispatcher writes `Running` when it selects, and nothing moves an executing task out of it |
+| 6 | robust-futex list registered | `RobustFutexList` | **B** | `Complete(Err(Internal))` | §3 — no production writer exists |
+| 7 | owes a reply, no deferred slot | `DeferredCapacity` | **C** | `Complete(Err(WouldBlock))` | the broad handler's own answer, reproduced: still `Running`, link still attached |
+| 8 | queue-advance deferral already held | `QueueAdvanceHeld` | **B** | `Complete(Err(Internal))` | per-CPU, single-shot, and consumed by the drain before this CPU returns to userspace |
+| 9 | server-death reserve fails after the probe | `DeferredCapacity` | **C** | `Complete(Err(WouldBlock))` | same condition, one step later; the queue advance is released first |
+| 10 | scheduler hands back another task | `VictimChanged` | **D** | `Complete(Ok(()))` | `current` already cleared |
+| 11 | claim loses the race | any | **D** | `Complete(Ok(()))` | `current` already cleared — **this is the arm U9-EXIT1 got wrong** |
+| 12 | cleanup step fails after the claim | — | **D** | success, fail-closed | the task is terminal and off the CPU; the advance is still owed |
+| 13 | success | — | — | `QueueAdvanceCommitted` | the existing deferral and the existing drain |
+
+Class A is empty: there is no NR 16 outcome that is reachable, unserviceable, and needs the broad
+path. The disposition is computed from *position*, not from the refusal's name — past the point of
+no return every variant is class D, which is exactly what arm 11 needed and did not have.
+
+There are no class-C *invocation* errors in the ordinary sense, because NR 16 takes no arguments.
+Its single class-C member is a resource condition.
+
+### §2 — Detached is production-impossible
+
+`ThreadDetachState::Detached` has exactly one writer in the whole kernel,
+`KernelState::mark_thread_detached`, and that writer has no production caller: no syscall number
+reaches it (the ABI exposes 20 NRs and none is a detach), no boot or spawn path calls it, and every
+TCB constructor produces `Joinable` — `ThreadControlBlock::reserved` delegates to
+`ThreadControlBlock::new`, which sets it. The fork publication builds the child through the same
+constructor.
+
+The proof is enforced by the build, not by a comment: `mark_thread_detached` is
+`#[cfg(any(test, feature = "hosted-dev"))]`, so the three freestanding kernels do not compile it at
+all. A future production path that detaches a thread breaks those builds and is forced to answer
+§2's real question — what the smallest no-allocation terminal cleanup for a detached self-exit is —
+rather than silently reopening the edge by inheriting a refusal that falls back.
+
+Because no task can be `Detached`, the broad path's `reap_if_detached` → `mark_task_dead` branch,
+whose allocating general-revoke closure was U9-EXIT1's stated reason for refusing this population,
+is itself unreachable on the exit path. Nothing in this stage had to be made allocation-free to
+close it.
+
+### §3 — the robust-futex registry is empty in production
+
+Same shape, and it is the whole §3 lifecycle answer.
+
+* **Registry.** One array, `KernelState::robust_futex: [Option<RobustFutexRecord>; MAX_TASKS]`, in
+  the TASK domain beside `tcbs` and `tls_restore_pending`.
+* **Writers.** Exactly one, `set_robust_futex_head` — and it has no production caller. There is no
+  `SetRobustFutexHead` syscall, no boot path registers a list, and the fork publication explicitly
+  CLEARS the child's slot rather than inheriting the parent's.
+* **Readers.** `robust_futex_state`, called once, by the broad `exit_task`; and
+  `has_robust_futex_list_split_read`, called once, by the split route's preflight. Both take the
+  task lock, so the registry has one real domain rather than an incidental dependence on the broad
+  guard (U9-EXIT1 gave it that domain).
+* **Owner-death publication, waiter selection, wake, teardown.** The broad `exit_task` walks the
+  registered range and calls `futex_wake_on_exit` per address. That loop is dead code: the registry
+  it walks can never be non-empty.
+
+So the ordered no-allocation owner §3 specifies — exact registration claim, owner-death user-memory
+publication outside every lock, waiter mutation through the existing split owner, one wake — has
+nothing to own. Building it would mean writing a lock domain, a fixed-capacity snapshot and a
+user-memory fault path for a registry that no production code can populate, and then having no way
+to witness any of it live. The honest deliverable is the proof plus the same build-enforced gate:
+`set_robust_futex_head` is compiled out of production, and a future registration path breaks the
+build and must then implement §3's order for real.
+
+**This is also why §6's robust-exit live sequence is not merely unwitnessed but unconstructible.**
+The sequence begins "task registers robust futex", and there is no production syscall that does so.
+Extending the oracle would mean adding one — a new ABI surface, which is a larger change than the
+residual it exists to measure and would create the very population it purports to observe.
+
+### §4 — the route is total
+
+```text
+  success                 -> QueueAdvanceCommitted   (existing deferral, existing drain)
+  class C (WouldBlock)    -> Complete(Err(Syscall(WouldBlock)))
+  class B (impossible)    -> Complete(Err(Syscall(Internal)))
+  class D (post-mutation) -> Complete(Ok(()))        (fail closed, terminal-idle settlement)
+```
+
+`NotHandled` survives at exactly one place, the NR gate, which fires *before* recognition and must
+stay so the seam's other classes are still tried. After recognition there is none. U9-EXIT1's
+`ExitRefusal::may_fall_back` is deleted rather than corrected: it asked a question whose only honest
+answer is now "never", and a predicate that always returns the same value is a place for the next
+mistake to hide.
+
+Nothing else about EXIT1 moves. The claim is still `{cpu, tid, asid}`-exact, the server-death
+reservation still precedes every detach, the drain still reverifies a removed TCB as success, and
+the incoming-context apply is untouched.
+
+### §5 — what is proved mechanically
+
+| property | guard |
+|---|---|
+| zero fallback outcomes after recognition | `the_split_exit_route_never_falls_through_after_recognition` |
+| every refusal carries a settlement, and position overrides name | `every_refusal_carries_a_settlement_and_none_of_them_is_a_fallback` |
+| no production path can make a task `Detached` | `no_production_path_can_make_a_task_detached` + the freestanding builds |
+| no production path can register a robust list | `no_production_path_can_register_a_robust_futex_list` + the freestanding builds |
+| one registry, one lock domain, one exit reader | `the_robust_registry_has_one_owner_and_one_domain` |
+| every architecture admits NR 16 unconditionally | `every_architecture_admits_nr16_into_the_seam_unconditionally` |
+| the broad handler has no production entry | `the_broad_nr16_handler_has_no_production_entry` |
+| a committed advance still requires a live reservation, and every post-reservation failure releases it | `the_committed_advance_still_requires_a_live_reservation` |
+
+The behavioural half of `u9exit1_self_exit_transaction` continues to drive the real transaction and
+now asserts the *settlement* of each injected failure, not merely its refusal — including the
+claim-loses-race case, which is the one that used to fall back.
+
+

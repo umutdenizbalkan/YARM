@@ -3841,7 +3841,7 @@ fn try_split_exit_current_task(
     cpu: CpuId,
     frame: &TrapFrame,
 ) -> SplitDispatchDisposition {
-    use crate::kernel::boot::exit_claim::ExitRefusal;
+    use crate::kernel::boot::exit_claim::ExitDisposition;
     use crate::kernel::syscall::exit_txn::{SharedExitOwners, run_exit_transaction};
     type D = SplitDispatchDisposition;
 
@@ -3893,26 +3893,50 @@ fn try_split_exit_current_task(
             );
             D::QueueAdvanceCommitted
         }
-        Err(refusal) if refusal.may_fall_back() => {
-            crate::yarm_log!(
-                "EXIT_TASK_SPLIT_DECLINED cpu={} reason={} task_mutation=none",
-                cpu.0,
-                refusal.marker()
-            );
-            D::NotHandled
-        }
-        Err(refusal) => {
-            // `current` was already cleared when this was discovered, so the trap cannot re-enter
-            // the broad dispatcher. Fail closed: the deferral is released, nothing is resumed, and
-            // the existing terminal-idle settlement runs.
-            debug_assert!(matches!(refusal, ExitRefusal::VictimChanged));
-            crate::yarm_log!(
-                "EXIT_TASK_SPLIT_FAILED_CLOSED cpu={} reason={}",
-                cpu.0,
-                refusal.marker()
-            );
-            D::Complete(Ok(()))
-        }
+        // U9-EXIT2 §4 — THE total settlement. Three arms, none of them `NotHandled`: once NR 16
+        // is recognized this route owns the answer, and the terminal broad dispatcher is not a
+        // destination any production outcome can reach.
+        Err(failure) => match failure.disposition {
+            // Class C. The broad handler's own answer, reproduced exactly: a task that still owes
+            // a reply and finds no free deferred slot gets `WouldBlock` and stays Running, with
+            // its reverse link still attached. Same marker text, same meaning, mutation-free.
+            ExitDisposition::InvalidPreLock => {
+                crate::yarm_log!(
+                    "EXIT_TASK_SYSCALL_DECLINED tid={} reason={} link_retained=1 result=would_block",
+                    entering,
+                    failure.refusal.marker()
+                );
+                D::Complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::WouldBlock,
+                )))
+            }
+            // Class B. A state the U9-EXIT2 §5 guards prove cannot exist at a userspace NR 16
+            // boundary. Handing it to the broad dispatcher would be the one edge this stage
+            // removes, taken for a reason that cannot occur — so it is a typed invariant error
+            // instead, pre-mutation, exactly as the impossible IpcSend classes are refused.
+            ExitDisposition::ImpossibleState => {
+                crate::yarm_log!(
+                    "EXIT_TASK_SPLIT_IMPOSSIBLE cpu={} reason={} task_mutation=none result=fail",
+                    cpu.0,
+                    failure.refusal.marker()
+                );
+                D::Complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                )))
+            }
+            // Class D. `current` was already cleared when this was discovered, so the trap can
+            // neither re-enter the broad dispatcher nor return through the caller's frame. Fail
+            // closed: the reservations are released, nothing is resumed, and the existing
+            // terminal-idle settlement runs.
+            ExitDisposition::FailClosed => {
+                crate::yarm_log!(
+                    "EXIT_TASK_SPLIT_FAILED_CLOSED cpu={} reason={}",
+                    cpu.0,
+                    failure.refusal.marker()
+                );
+                D::Complete(Ok(()))
+            }
+        },
     }
 }
 

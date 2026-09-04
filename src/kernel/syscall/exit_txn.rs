@@ -49,7 +49,7 @@
 //! the task stays terminal and off the CPU, and the advance still happens.
 
 use crate::kernel::boot::exit_claim::{
-    ExitClaim, ExitPreflight, ExitRefusal, exit_preflight_locked,
+    ExitClaim, ExitFailure, ExitPreflight, ExitRefusal, exit_preflight_locked,
 };
 use crate::kernel::boot::reap_claim::ClosingReplyLink;
 use crate::kernel::boot::{
@@ -201,50 +201,79 @@ pub(crate) trait ExitOwners {
 
 /// U9-EXIT1 §3 — exit the task currently Running on `cpu`, or refuse having mutated nothing.
 ///
-/// A refusal whose [`ExitRefusal::may_fall_back`] is true is pre-mutation and the broad handler may
-/// run. `VictimChanged` is the one that is not, and it is reached only after `current` has already
-/// been cleared — the caller must fail closed rather than re-enter the broad dispatcher.
+/// U9-EXIT2 §1/§4 — every failure carries the settlement it owes, and none of them is "the broad
+/// handler may run". `past_point_of_no_return` is the single fact that decides class D, and it
+/// flips exactly once, at the `clear_current` below.
 pub(crate) fn run_exit_transaction<O: ExitOwners>(
     owners: &mut O,
     cpu: CpuId,
     code: u64,
-) -> Result<ExitOutcome, ExitRefusal> {
+) -> Result<ExitOutcome, ExitFailure> {
+    // Every early return goes through this, so a failure can never be constructed without stating
+    // which side of the point of no return it was found on.
+    const fn refuse(refusal: ExitRefusal) -> ExitFailure {
+        ExitFailure {
+            refusal,
+            disposition: refusal.disposition(false),
+        }
+    }
+
     // (1) Admission. No drainer, or not the authoritative dispatcher, means the deferral this
-    // route depends on would never be consumed — refuse before touching anything.
+    // route depends on would never be consumed.
+    //
+    // U9-EXIT2 §1: class B. `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` is set before any userspace
+    // task runs on that CPU; the dispatching-CPU count is 1 in every production configuration
+    // because the only site that clears an AP's wake-only bit is unreachable (Stage 189B, its own
+    // comment: "Unreachable in Stage 189B — trap_return_ready is never set"); and a wake-only AP
+    // dispatches no user task, so no userspace syscall can originate on one.
     if !owners.exit_route_admitted(cpu) {
-        return Err(ExitRefusal::NoCurrent);
+        return Err(refuse(ExitRefusal::RouteNotAdmitted));
     }
 
     // (2) rank 1 — the self is defined by the scheduler, never by an argument.
+    //
+    // Class B: this trap IS a userspace syscall taken on `cpu`, so `cpu` has a current task by
+    // construction.
     let tid = owners
         .current_tid_on_cpu(cpu)
-        .ok_or(ExitRefusal::NoCurrent)?;
+        .ok_or(refuse(ExitRefusal::NoCurrent))?;
 
     // (3) rank 2 — the exiting thread's own facts. Every refusal below is free.
-    let preflight = owners.exit_preflight(tid)?;
+    //
+    // Class B for all four: the current task has a TCB (`TaskGone`); no production writer can
+    // produce `Detached` (U9-EXIT2 §2); the dispatcher writes `Running` when it selects a task and
+    // nothing else moves it while it executes (`NotRunning`); and no production writer can register
+    // a robust-futex list (U9-EXIT2 §3). Each is a guarded invariant, not an assumption.
+    let preflight = owners.exit_preflight(tid).map_err(refuse)?;
     if preflight.detached {
-        return Err(ExitRefusal::DetachedThread);
+        return Err(refuse(ExitRefusal::DetachedThread));
     }
     if !crate::kernel::boot::exit_claim::status_is_self_exitable(preflight.status) {
-        return Err(ExitRefusal::NotRunning);
+        return Err(refuse(ExitRefusal::NotRunning));
     }
     if owners.has_robust_futex_list(tid) {
-        return Err(ExitRefusal::RobustFutexList);
+        return Err(refuse(ExitRefusal::RobustFutexList));
     }
     let sweep_asid = preflight.asid.unwrap_or(Asid(0));
 
     // (4) The deferred-capacity gate, exactly as the broad handler applies it: a task that still
     // owes a reply must not reach the point of no return unless its completion can be handed off,
     // or the blocked caller is stranded.
+    // Class C — the one genuinely reachable refusal, and the route reproduces the broad handler's
+    // answer rather than reinterpreting it: `WouldBlock`, task still Running, link still attached.
     let owes_reply = owners.server_reply_link_present(tid, sweep_asid);
     if owes_reply && !owners.server_death_capacity_available(cpu) {
-        return Err(ExitRefusal::DeferredCapacity);
+        return Err(refuse(ExitRefusal::DeferredCapacity));
     }
 
     // (5) RESERVE THE QUEUE ADVANCE BEFORE ANY MUTATION. Holding it is what guarantees the drain
     // will run; returning `QueueAdvanceCommitted` without one is what U9-FT3 got wrong.
+    //
+    // Class B: the cell is per-CPU and single-shot, and every route that publishes one has its
+    // deferral consumed by the drain before this CPU returns to userspace — so a trap that is
+    // executing a userspace NR 16 cannot find one already held.
     if !owners.reserve_queue_advance(cpu, tid) {
-        return Err(ExitRefusal::NoCurrent);
+        return Err(refuse(ExitRefusal::QueueAdvanceHeld));
     }
 
     // (6) RESERVE THE SERVER-DEATH SLOT, still before any mutation. Reserve precedes detach so a
@@ -266,8 +295,10 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
                 death_reservation = Some(reservation);
             }
             None => {
+                // Still pre-mutation: the queue advance is released and nothing of the task
+                // changed, so this settles exactly as the capacity probe above does.
                 owners.release_queue_advance(cpu);
-                return Err(ExitRefusal::DeferredCapacity);
+                return Err(refuse(ExitRefusal::DeferredCapacity));
             }
         }
     }
@@ -282,7 +313,10 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
             owners.release_server_death(reservation);
         }
         owners.release_queue_advance(cpu);
-        return Err(ExitRefusal::VictimChanged);
+        return Err(ExitFailure {
+            refusal: ExitRefusal::VictimChanged,
+            disposition: ExitRefusal::VictimChanged.disposition(true),
+        });
     }
 
     // (8) rank 2 — THE LINEARIZATION POINT. Exactly one of exit / reap / fault / restart wins.
@@ -290,15 +324,23 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
     let claim = match owners.claim_self_exit(cpu, tid, preflight.asid, code, token) {
         Ok(claim) => claim,
         Err(refusal) => {
-            // Another edge won between (3) and here. `current` is already cleared, so this cannot
-            // fall back — but nothing of THIS transaction was written either, and whichever edge
-            // won has left the task terminal and off the CPU. Release the reservations and report
-            // the refusal; the caller fails closed.
+            // Another edge won between (3) and here. `current` is ALREADY CLEARED, so this cannot
+            // fall back — and U9-EXIT1 let it, because the refusal it reports (`NotRunning`,
+            // `TaskGone`, `IdentityChanged`) answered `may_fall_back() == true` and the route
+            // handed the trap to `handle_exit_current_task` with no current task on the CPU. It is
+            // class D by position, not by name, which is why the disposition is computed from the
+            // position and not from the refusal alone.
+            //
+            // Nothing of THIS transaction was written, and whichever edge won left the task
+            // terminal and off the CPU. Release the reservations and fail closed.
             if let Some(reservation) = death_reservation {
                 owners.release_server_death(reservation);
             }
             owners.release_queue_advance(cpu);
-            return Err(refusal);
+            return Err(ExitFailure {
+                refusal,
+                disposition: refusal.disposition(true),
+            });
         }
     };
 
