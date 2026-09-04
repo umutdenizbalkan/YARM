@@ -66,9 +66,15 @@ pub(crate) enum ExitDisposition {
     /// error. NR 16 has exactly one member: a task that still owes a reply and finds no free
     /// deferred server-death slot is `WouldBlock`, unchanged, and still Running.
     InvalidPreLock,
-    /// **Class D** — discovered after `current` was cleared. The task is off this CPU and must
-    /// never be resumed; the route fails closed and the existing terminal-idle settlement runs.
-    FailClosed,
+    /// **Class D, restored** — discovered after `current` was cleared, and the victim was proved
+    /// still Running, still ours and placed on no CPU, so it was restored as this CPU's current.
+    /// The entering frame is its own again, which is the ONLY state in which a `Complete`
+    /// disposition may return through it.
+    PostClearRestored,
+    /// **Class D, advanced** — discovered after `current` was cleared, and the victim is terminal,
+    /// removed or replaced. The already-reserved deferral names the old incarnation and the
+    /// EXISTING drain selects somebody else. The trap must NOT return through the entering frame.
+    PostClearAdvance,
 }
 
 /// A refusal, together with the settlement the route owes it. Produced only by
@@ -147,10 +153,12 @@ impl ExitRefusal {
     /// Before that point the split is by source classification, not by convenience:
     /// `DeferredCapacity` is the one real condition (class C); everything else names a state that
     /// cannot exist at a userspace NR 16 boundary (class B).
-    pub(crate) const fn disposition(self, past_point_of_no_return: bool) -> ExitDisposition {
-        if past_point_of_no_return {
-            return ExitDisposition::FailClosed;
-        }
+    /// U9-EXIT3 §1: `past_point_of_no_return` is no longer a parameter a caller may pass `true`
+    /// to. Past the clear the settlement is not a classification at all — it is whichever of
+    /// restore/advance/fatal the victim's observed state licenses, decided by
+    /// `settle_failed_claim` through the `ClearedCurrentToken`. This function therefore answers
+    /// only for the PRE-clear arms, and its one caller passes nothing.
+    pub(crate) const fn disposition(self) -> ExitDisposition {
         match self {
             Self::DeferredCapacity => ExitDisposition::InvalidPreLock,
             Self::RouteNotAdmitted
