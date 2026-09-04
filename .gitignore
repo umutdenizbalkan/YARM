@@ -5,6 +5,8 @@
 /build-riscv64/
 /build-rpi5/
 /build-x86_64/
+/build-aarch64-crash-restart/
+/build-riscv64-crash-restart/
 /build-x86_64-crash-restart/
 /ipc-oracle-markers-*.txt
 /rustc-ice-*.txt

@@ -107,6 +107,11 @@ impl ReapClaim {
     }
     /// The address space that, together with [`Self::tid`], names the EXACT incarnation this
     /// claim won. Every later step matches on this pair, never on the TID alone.
+    ///
+    /// The transaction itself never needs to ask: each step re-validates the pair inside its own
+    /// acquisition, through the locked bodies below. This accessor exists so the §5 proofs can
+    /// compare pre/post state BY IDENTITY rather than by count.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn asid(&self) -> Option<Asid> {
         self.asid
     }
@@ -125,7 +130,9 @@ impl ReapClaim {
     pub(crate) const fn restart_token(&self) -> Option<RestartToken> {
         self.restart_token
     }
-    /// The status the target was in when the claim won it.
+    /// The status the target was in when the claim won it. Written back by
+    /// [`rollback_reap_claim_locked`] through the field, and read here by the §5 proofs.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn status_before(&self) -> TaskStatus {
         self.status_before
     }
@@ -211,19 +218,6 @@ pub(crate) fn rollback_reap_claim_locked(
     tcb.status = claim.status_before;
     tcb.restart.token = claim.restart_token;
     true
-}
-
-/// Does the exact incarnation this claim names still exist? Rank 2, read-only.
-///
-/// Every owner step past the claim calls this through its own acquisition before touching
-/// incarnation-scoped state, so a TID recycled mid-transaction cannot be mistaken for the target.
-pub(crate) fn claim_incarnation_is_live_locked(
-    tcbs: &[Option<ThreadControlBlock>],
-    claim: &ReapClaim,
-) -> bool {
-    tcbs.iter()
-        .flatten()
-        .any(|tcb| tcb.tid.0 == claim.tid && tcb.asid == claim.asid)
 }
 
 /// The last-thread rule, read-only at rank 2.
@@ -396,29 +390,6 @@ pub(crate) fn clear_ipc_waiters_for_identity_locked(
 
 // ── rank 4 (capability) bodies ─────────────────────────────────────────────────────────────
 
-/// Remove every delegation link with this process on either end. Returns how many were removed.
-///
-/// `resolve` maps a recorded TID to its owning process id — supplied by the caller because the
-/// resolution reads rank 2, which must have been read and released BEFORE this rank-4 claim was
-/// taken.
-pub(crate) fn remove_delegation_links_for_pid_locked(
-    capability: &mut CapabilitySubsystem,
-    pid: u64,
-    resolve: impl Fn(u64) -> u64,
-) -> usize {
-    let mut removed = 0usize;
-    for idx in 0..MAX_DELEGATED_CAPABILITY_LINKS {
-        let Some(record) = capability.delegated_capability_links[idx] else {
-            continue;
-        };
-        if resolve(record.source_tid) == pid || resolve(record.dest_tid) == pid {
-            capability.delegated_capability_links[idx] = None;
-            removed = removed.saturating_add(1);
-        }
-    }
-    removed
-}
-
 /// The CNode a process is bound to. Rank 4, read-only.
 pub(crate) fn process_cnode_for_pid_locked(
     capability: &CapabilitySubsystem,
@@ -443,35 +414,6 @@ pub(crate) fn cnode_slot_capacity_locked(
         .flatten()
         .find(|space| space.id == cnode)
         .map_or(0, |space| space.slot_capacity)
-}
-
-// ── the cross-rank orderings, expressed exactly once ───────────────────────────────────────
-
-/// Destroy one address space in the order the two-phase-unmap contract requires: **drain, then
-/// release, then queue TLB work, then reclaim**.
-///
-/// The three closures are the caller's own acquisitions — the broad owner takes the broad lock,
-/// the split owner takes vm(5)→memory(6) and rank 3 — but the ORDER between them lives here and
-/// nowhere else, so the two owners cannot drift. Shootdown submission is fire-and-forget exactly
-/// as at base: a full queue is silenced because the ASID is already retired and frames must be
-/// reclaimed regardless, and frame reuse before invalidation still cannot happen because a
-/// retired ASID is not reusable until every CPU acknowledges it.
-pub(crate) fn destroy_address_space_ordered<D>(
-    asid: Asid,
-    pending_cpu_bitmap: u64,
-    drain: impl FnOnce(Asid, u64) -> Result<D, KernelError>,
-    mut submit_shootdown: impl FnMut(crate::kernel::scheduler::CpuId, Asid),
-    reclaim: impl FnOnce(D),
-) -> Result<(), KernelError> {
-    let drained = drain(asid, pending_cpu_bitmap)?;
-    for cpu in 0..u64::BITS as usize {
-        if (pending_cpu_bitmap & (1u64 << cpu)) == 0 {
-            continue;
-        }
-        submit_shootdown(crate::kernel::scheduler::CpuId(cpu as u8), asid);
-    }
-    reclaim(drained);
-    Ok(())
 }
 
 /// Resolve which transfer envelope an orphaned blocking sender's handle names, and who must clean

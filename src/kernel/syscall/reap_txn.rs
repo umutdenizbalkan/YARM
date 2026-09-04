@@ -108,8 +108,6 @@ pub(crate) trait ReapOwners {
     fn claim_faulted_task(&mut self, tid: u64) -> Result<ReapClaim, ReapRefusal>;
     /// Restore the exact incarnation a claim won, byte for byte.
     fn rollback_claim(&mut self, claim: &ReapClaim) -> bool;
-    /// Does the exact `{tid, asid}` incarnation the claim names still exist?
-    fn claim_is_live(&self, claim: &ReapClaim) -> bool;
     /// The last-thread rule: is any TCB of this process in a state other than `Dead`?
     fn process_has_live_threads(&self, pid: u64) -> bool;
     /// Fill `out` with the process's DISTINCT address spaces; returns how many.
@@ -265,10 +263,7 @@ pub(crate) fn run_reap_transaction<O: ReapOwners>(
     let mut orphaned: [Option<(SenderWaiter, usize)>; MAX_ENDPOINT_SENDER_WAITERS] =
         [const { None }; MAX_ENDPOINT_SENDER_WAITERS];
     let orphaned_n = owners.clear_ipc_waiters(&claim, &mut orphaned);
-    for idx in 0..orphaned_n {
-        let Some((waiter, endpoint_idx)) = orphaned[idx] else {
-            continue;
-        };
+    for (waiter, endpoint_idx) in orphaned.into_iter().take(orphaned_n).flatten() {
         owners.settle_orphaned_sender(&waiter, endpoint_idx);
         outcome.orphaned_senders_settled += 1;
     }
@@ -321,10 +316,7 @@ fn reap_process_resources<O: ReapOwners>(owners: &mut O, pid: u64, outcome: &mut
     let mut envelopes: [Option<(usize, TransferEnvelope)>; MAX_TRANSFER_ENVELOPES] =
         [None; MAX_TRANSFER_ENVELOPES];
     let envelope_n = owners.snapshot_transfer_envelopes(&mut envelopes);
-    for idx in 0..envelope_n {
-        let Some((slot, envelope)) = envelopes[idx] else {
-            continue;
-        };
+    for (slot, envelope) in envelopes.into_iter().take(envelope_n).flatten() {
         let source_pid = owners.owner_pid_of(envelope.source_tid.0);
         let receiver_pid = envelope.receiver_tid.map(|tid| owners.owner_pid_of(tid.0));
         let source_matches = source_pid == pid || envelope.source_tid.0 == pid;
@@ -349,10 +341,7 @@ fn reap_process_resources<O: ReapOwners>(owners: &mut O, pid: u64, outcome: &mut
     let mut mappings: [Option<(usize, ActiveTransferMapping)>; MAX_TRANSFER_ENVELOPES] =
         [None; MAX_TRANSFER_ENVELOPES];
     let mapping_n = owners.snapshot_active_transfer_mappings(&mut mappings);
-    for idx in 0..mapping_n {
-        let Some((slot, mapping)) = mappings[idx] else {
-            continue;
-        };
+    for (slot, mapping) in mappings.into_iter().take(mapping_n).flatten() {
         let owner_pid = owners.owner_pid_of(mapping.owner_tid.0);
         if owner_pid != pid && mapping.owner_tid.0 != pid {
             continue;
@@ -377,10 +366,7 @@ fn reap_process_resources<O: ReapOwners>(owners: &mut O, pid: u64, outcome: &mut
     let mut links: [Option<DelegationEndpoints>; MAX_DELEGATED_CAPABILITY_LINKS] =
         [None; MAX_DELEGATED_CAPABILITY_LINKS];
     let link_n = owners.snapshot_delegation_links(&mut links);
-    for idx in 0..link_n {
-        let Some((slot, source_tid, dest_tid)) = links[idx] else {
-            continue;
-        };
+    for (slot, source_tid, dest_tid) in links.into_iter().take(link_n).flatten() {
         if owners.owner_pid_of(source_tid) != pid && owners.owner_pid_of(dest_tid) != pid {
             continue;
         }
@@ -437,10 +423,6 @@ impl ReapOwners for BroadReapOwners<'_> {
     fn rollback_claim(&mut self, claim: &ReapClaim) -> bool {
         self.kernel
             .with_tcbs_mut(|tcbs| body::rollback_reap_claim_locked(tcbs, claim))
-    }
-    fn claim_is_live(&self, claim: &ReapClaim) -> bool {
-        self.kernel
-            .with_tcbs(|tcbs| body::claim_incarnation_is_live_locked(tcbs, claim))
     }
     fn process_has_live_threads(&self, pid: u64) -> bool {
         self.kernel
@@ -611,10 +593,6 @@ impl ReapOwners for SharedReapOwners<'_> {
     fn rollback_claim(&mut self, claim: &ReapClaim) -> bool {
         self.shared
             .with_task_tcbs_split_mut(|tcbs| body::rollback_reap_claim_locked(tcbs, claim))
-    }
-    fn claim_is_live(&self, claim: &ReapClaim) -> bool {
-        self.shared
-            .with_task_tcbs_split_mut(|tcbs| body::claim_incarnation_is_live_locked(tcbs, claim))
     }
     fn process_has_live_threads(&self, pid: u64) -> bool {
         self.shared

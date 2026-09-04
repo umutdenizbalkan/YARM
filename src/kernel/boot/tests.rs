@@ -157960,7 +157960,7 @@ mod u9reap1_reap_transaction {
     use super::*;
     use crate::kernel::boot::reap_claim::{
         ClosingReplyLink, ReapClaim, ReapRefusal, claim_faulted_task_for_reap_locked,
-        claim_incarnation_is_live_locked, collect_process_asids_locked, owner_pid_of_locked,
+        collect_process_asids_locked, owner_pid_of_locked,
         process_has_live_threads_locked, rollback_reap_claim_locked, status_is_claimable,
         task_asid_locked,
     };
@@ -158122,9 +158122,6 @@ mod u9reap1_reap_transaction {
         fn rollback_claim(&mut self, claim: &ReapClaim) -> bool {
             self.note("rollback_claim");
             rollback_reap_claim_locked(&mut self.tcbs, claim)
-        }
-        fn claim_is_live(&self, claim: &ReapClaim) -> bool {
-            claim_incarnation_is_live_locked(&self.tcbs, claim)
         }
         fn process_has_live_threads(&self, pid: u64) -> bool {
             process_has_live_threads_locked(&self.tcbs, pid)
@@ -158769,6 +158766,53 @@ mod u9reap1_reap_transaction {
         assert!(
             latch.contains("SYSCALL_REAP_FAULTED_TASK_NR"),
             "NR 31 must be on the per-invocation marker arm, not a one-shot latch"
+        );
+    }
+
+    /// The terminal edge is MEASURED, not inferred from a route count.
+    ///
+    /// Both routes emit `TASK_REAP_FAULTED_BEGIN` on purpose — that marker counts reap
+    /// invocations, and a marker only one route emitted would leave the oracle blind. The edge
+    /// therefore gets its own pair: `TASK_REAP_BROAD_ENTER` at the broad handler's own entry, and
+    /// `TASK_REAP_SPLIT_ENTER` at the split route's. §6's retirement claim is that the first
+    /// counts zero and the second equals the successful-reap count.
+    #[test]
+    fn the_terminal_edge_has_its_own_marker_on_each_route() {
+        const PROCESS: &str = include_str!("../syscall/process.rs");
+        assert_eq!(
+            PROCESS
+                .matches("TASK_REAP_BROAD_ENTER caller_tid={} target_tid={}")
+                .count(),
+            1,
+            "the broad terminal entry must be marked exactly once, at the handler itself"
+        );
+        assert_eq!(
+            SPLIT
+                .matches("TASK_REAP_SPLIT_ENTER caller_tid={} target_tid={}")
+                .count(),
+            1,
+            "the split route must be marked exactly once"
+        );
+        // Neither marker may leak into the other route, or the edge count is meaningless.
+        assert!(!SPLIT.contains("TASK_REAP_BROAD_ENTER"));
+        assert!(!PROCESS.contains("TASK_REAP_SPLIT_ENTER"));
+        // Both still emit the shared invocation marker, so the oracle can compare the two.
+        assert!(
+            PROCESS.contains("TASK_REAP_FAULTED_BEGIN caller_tid={} target_tid={}")
+                && SPLIT.contains("TASK_REAP_FAULTED_BEGIN caller_tid={} target_tid={}"),
+            "both routes must emit the shared invocation marker"
+        );
+        // The broad marker is the FIRST thing the handler does, so an edge is counted even when
+        // the reap then refuses.
+        let body = PROCESS
+            .split("pub(super) fn handle_reap_faulted_task(")
+            .nth(1)
+            .expect("the broad handler must exist");
+        let enter = body.find("TASK_REAP_BROAD_ENTER").expect("the marker");
+        let first_gate = body.find("reason=not_pm").expect("the first gate");
+        assert!(
+            enter < first_gate,
+            "the broad edge must be counted before any gate can return"
         );
     }
 

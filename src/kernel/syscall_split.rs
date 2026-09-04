@@ -3843,6 +3843,14 @@ fn try_split_reap_faulted_task_into_frame(
     // authorization to check, so the broad handler re-derives the identical answer.
     let caller = shared.current_tid_authoritative(cpu)?;
     let target = frame.arg(0) as u64;
+    // U9-REAP1 §6: the split half of the edge measurement. Emitted per invocation, not latched —
+    // §6 asserts that this count equals the successful-reap count, which a one-shot marker could
+    // not express.
+    crate::yarm_log!(
+        "TASK_REAP_SPLIT_ENTER caller_tid={} target_tid={}",
+        caller,
+        target
+    );
     crate::yarm_log!(
         "TASK_REAP_FAULTED_BEGIN caller_tid={} target_tid={}",
         caller,
