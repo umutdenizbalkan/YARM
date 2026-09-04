@@ -13535,3 +13535,102 @@ three delivered RISC-V boots ran with `attempts=1 stalled=0`.
 The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
 their other residual classes, so ***U9 remains OPEN***: this increment empties the NR 31 population
 that reached them, it does not delete them.
+
+## U9-EXIT1 — ExitCurrentTask (NR16)
+
+### §1 — what NR16 actually does, and how much of REAP1 it can reuse
+
+`handle_exit_current_task` (`src/kernel/syscall.rs`) resolves the exact current incarnation from
+scheduler state — never from userspace — then applies one pre-mutation gate: if the caller still
+owes a reply and no deferred server-death slot is free on this CPU, it declines `WouldBlock` and
+leaves the task Running with its reverse link attached. Only then does it call `exit_task`, publish
+the typed `CurrentTaskExited` disposition, and return without a frame.
+
+`exit_task` (`src/kernel/boot/restart_state.rs`) is the single teardown authority, and it does
+substantially more than a reap:
+
+1. mint a fresh restart token (restart state);
+2. rank 2 — clear `blocked_recv_state`, write `status = Exited(code)`, install the token, clear
+   `async_preempted`;
+3. sweep caller-side reply records on the exact `{tid, asid}`;
+4. **the server-death deferral** — reserve a slot, `take_server_reply_link`, publish a
+   `DeferredServerDeathCompletion`, or release the reservation if nothing is owed. Reserve
+   precedes detach, so a full queue leaves the link attached rather than stranding a caller;
+5. sweep replier-side records **excluding** the record whose terminal the drain now owns;
+6. `clear_ipc_waiters_for_tid`;
+7. report the exit to the supervisor and to PM (each an endpoint send **plus a wake**);
+8. robust-futex wakes from the task's own robust list;
+9. `wake_joiners_for`;
+10. `if current`: `block_current_cpu()` then `dispatch_next_task()` — the in-lock queue advance;
+11. `if detached`: `reap_if_detached` → `mark_task_dead`, which adds reply-record sweeps, reply
+    deadline retirement, kernel-context release, driver-cap revocation and
+    `maybe_cleanup_process_cnode_for_pid`.
+
+Steps 10 and 11 are **independent `if`s, not an if/else**. A self-exiting *detached* thread
+therefore runs both the queue advance and the full death path; a joinable one stays `Exited(code)`
+until it is joined or reaped.
+
+#### The common/distinct ledger, and one correction to the premise
+
+| | REAP1 (NR31) | Exit (NR16) |
+|---|---|---|
+| claim | `Faulted \| Exited(_)` → **`Dead`** | Running on this exact CPU → **`Exited(code)`** |
+| restart token | takes and **clears** it | **mints and installs** a new one |
+| caller-side reply records | yes | yes — *same owner* |
+| replier-side reply records | unconditional | **except** the detached server link |
+| server-death deferral | none | **reserve → detach → publish** |
+| IPC waiters | yes | yes — *same owner* |
+| supervisor / PM report | none | **send + wake, twice** |
+| robust-futex and joiner wakes | none | **yes** |
+| kernel context | always | only via `mark_task_dead` (detached) |
+| process teardown | `maybe_cleanup_process_cnode_for_pid_noalloc_reap` | `maybe_cleanup_process_cnode_for_pid` |
+| general capability revoke | **not reachable** | **reachable** |
+| scheduler advance | none — target is already off-CPU | **block current + dispatch** |
+
+The last three rows matter more than the rest. The two process-teardown variants are *not* the same
+policy: the exit variant runs a general revocation loop over every live capability in the process
+CNode and purges active transfer mappings **through `revoke_capability_in_cnode`**, while the reap
+variant deliberately does neither — which is exactly the asymmetry U9-REAP1 §1 recorded when it
+found no general-revocation branch reachable from a faulted-task reap.
+
+So "reuse REAP1's lifecycle cleanup" cannot mean "run `run_reap_transaction` after an exit claim".
+Doing that would write `Dead` where NR16 writes `Exited(code)`, skip the server-death deferral,
+skip the supervisor/PM/joiner/futex owed work, and **silently narrow NR16's teardown so that
+capabilities NR16 revokes today would leak**. What is genuinely shared is the *thread-scoped* body
+U9-REAP1 already extracted into `kernel/boot/reap_claim.rs` — the two reply-record sweeps and the
+waiter detach, as `*_locked` helpers over borrowed subsystem state. That is the reuse this mission
+takes, and it is real: one implementation, two claims. The process-scoped halves stay distinct
+because they *are* distinct, and a guard pins that they remain so.
+
+#### Where the queue advance has to go
+
+Exit cannot return through its syscall frame, so the existing U9-QA machinery is the right and only
+vehicle: reserve the deferral, publish the terminal transition, return `QueueAdvanceCommitted`, and
+let the existing post-lock drain select and apply the next context. That is the order U9-FT4's
+terminal-fault route already follows, and it is reused verbatim rather than duplicated.
+
+One hazard is specific to exit. Both existing drain predicates —
+`futex_wait_reverify_blocked` and `terminal_fault_reverify_faulted` — resolve the outgoing TCB and
+`.unwrap_or(false)`, i.e. a **missing** TCB reverifies as *not ok*. An exiting task can legitimately
+have been torn further down by the time the drain runs, so exit needs its own predicate that admits
+`Exited(_) | Dead` **and represents "the claim removed it" explicitly**, rather than silently
+reading absence as success. The existing x86_64 disposition consumer already models exactly this
+(`None => true, // fully reaped` alongside `| None` in its terminal match), so the shape is
+established rather than invented.
+
+#### Base measurement
+
+Fresh artifacts at `f12c7c2`, the three existing exit-oracle profiles, all sealing green:
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_SYSCALL_DISPATCHED` | 1 | 1 | 1 |
+| `EXIT_TASK_PREFLIGHT_OK` | 1 | 1 | 1 |
+| `EXIT_TASK_LIFECYCLE_TRANSITION` | 1 | 1 | 1 |
+| `EXIT_TASK_DISPOSITION_PUBLISHED` | 1 | 1 | 1 |
+| `EXIT_TASK_DISPOSITION_CONSUMED` | 1 | 1 | 1 |
+| `EXIT_TASK_SYSCALL_DECLINED` | 0 | 0 | 0 |
+| oracle seal | ok | ok | ok |
+
+Exactly one NR16 per boot on each architecture, taken through the broad handler, with no decline.
+That single edge per architecture is what §6 must drive to zero.
