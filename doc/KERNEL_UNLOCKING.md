@@ -13233,3 +13233,96 @@ RISC-V, at base or now, and its isolation witness is intact in every run.
 The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
 their other residual classes, so ***U9 remains OPEN***: this increment empties the AArch64 write-COW
 population that reached them, it does not delete them.
+
+## U9-REAP1 — ReapFaultedTask (NR31)
+
+### §1 — the reap closure, and where a real witness lives
+
+`handle_reap_faulted_task` (`src/kernel/syscall/process.rs`) is a five-gate preamble in front of
+one cleanup owner. It authorizes on `caller == PM_BOOTSTRAP_TID` (`MissingRight`), refuses
+self-targeting (`InvalidArgs`), returns `Ok(0,0,0)` with `TASK_REAP_FAULTED_ALREADY_GONE` when the
+TID names no TCB, rejects `Runnable | Running | Blocked(_) | Reserved` (`WrongObject`), and only
+then calls `reap_faulted_task_noalloc_cleanup`. Everything before the cleanup is pre-mutation, and
+the ABI is `ret0=0` with no other return lane used.
+
+The cleanup (`src/kernel/boot/restart_state.rs`) is five steps: mark the TCB `Dead` and drop its
+restart token (rank 2); revoke reply records on both the caller and replier sides of the exact
+`{tid, asid}` identity; `clear_ipc_waiters_for_tid`; `release_kernel_context`; and
+`maybe_cleanup_process_cnode_for_pid_noalloc_reap`, which is the only step that can reach the VM.
+
+**The closure is narrower than the syscall's name suggests, and the recomputation matters.** No
+general-revocation branch runs: `revoke_capability_in_cnode` is never reached, and — unlike the
+sibling `mark_task_dead` — neither `retire_reply_deadline_for_tid` nor `revoke_driver_runtime_caps`
+is on this path. What *is* reachable, and only under the existing last-thread rule (`return false`
+if any TCB in the group is not `Dead`), is the whole process teardown:
+`destroy_user_address_space_by_asid` per distinct ASID, transfer-envelope purge, active-transfer
+unmaps via `unmap_range_two_phase`, delegation-link removal at rank 4, and `reap_process_cspace_locked`.
+So the closure is narrow per *thread* and wide per *process*, and the width is gated, not optional.
+
+Two properties the existing code already has, and which §3 must not lose: it allocates nothing
+(fixed `[Option<_>; MAX_REPLY_CAPS]` / `[None; MAX_TASKS]` snapshots throughout), and it already
+snapshots under a claim and settles after releasing it, so no rank is ever nested inside another.
+
+**No missing semantic primitive.** Every seam the split side needs already exists —
+`with_task_tcbs_split_mut`, `with_ipc_split_mut`, `with_capability_split_mut`,
+`with_vm_then_memory_split_mut`, `with_memory_split_mut`, `with_scheduler_split_mut`,
+`unmap_range_two_phase_split` — and every body is already factored as a `*_locked` helper over
+borrowed subsystem state. The work is adapters, not a new primitive.
+
+**The linearization point** is today split across two rank-2 acquisitions: the handler reads
+`task_status(target)`, and the cleanup separately writes `status = Dead`. That is sound under the
+broad lock and unsound off it, so §2's claim collapses the two into one compare-and-claim inside a
+single acquisition — which is also what arbitrates restart, exit, duplicate reap and replacement
+under a reused TID.
+
+**Scheduler residency needs no removal, only proof.** A task reaches `Faulted` only through
+`TaskTransition::FaultRunningCurrent`, and both the broad path and
+`commit_terminal_fault_transition_shared` clear `current` (`block_current_on_cpu`) *before* applying
+it; nothing re-enqueues a `Faulted` task, and `CrossCpuWakeApplyResult::SkippedFaulted` refuses to.
+`Exited`/`Dead` are likewise off-queue. So the transaction proves absence rather than performing a
+removal — and refuses pre-mutation if it ever finds otherwise.
+
+#### Base measurement: where NR31 actually fires
+
+Fresh artifacts at `70327f7`, all three manifests attesting
+`commit=70327f7b5ae5bf6e7fe4fa9e75c5e66bd74f35b4`.
+
+The **server-death** profiles are not witnesses. All three produce
+`TASK_REAP_FAULTED_BEGIN = TASK_REAP_FAULTED_OK = PM_RESTART_TEARDOWN_OLD_BEGIN = 0`; server death
+tears a server down without PM ever reaping a faulted task. (x86_64 passes; aarch64 and riscv64 are
+red at base with `RUN_B expected exactly one captured reverse link, saw 0` — a pre-existing failure
+unrelated to NR31, unchanged here.)
+
+The **crash/restart** profile is the witness, by design: its marker oracle already requires
+`TASK_REAP_FAULTED_OK`. Its sole production caller is
+`teardown_old_restart_target(old_tid, replacement_tid)` in the process manager, reached only after a
+replacement has been spawned.
+
+| | x86_64 | aarch64 | riscv64 |
+|---|---|---|---|
+| `CRASH_TEST_SRV_FAULT_NOW` | 4 | 4 | 5 |
+| `PM_RESTART_TEARDOWN_OLD_BEGIN / _OK` | 3 / 3 | 3 / 3 | 4 / 4 |
+| **`TASK_REAP_FAULTED_BEGIN / _OK`** | **3 / 3** | **3 / 3** | **4 / 4** |
+| distinct reaped targets | 3 | 3 | 4 |
+| refusals (`REJECT`, `ALREADY_GONE`) | 0, 0 | 0, 0 | 0, 0 |
+
+riscv64 had no witness only because `scripts/qemu-supervisor-crash-restart-smoke.sh` had no
+`riscv64` arm — not because the chain was missing. The RISC-V artifact builder already stages the
+gated `crash_test_srv`, and the chain runs end to end there:
+`CRASH_TEST_SRV_FAULT_NOW` → `SUPERVISOR_FAULT_LOOKUP_OK` → `SUPERVISOR_RESTART_SCHEDULED` →
+`PM_RESTART_REPLY_ACCEPTED` → `PM_RESTART_TEARDOWN_OLD_BEGIN` → `TASK_REAP_FAULTED_OK`, four times,
+on targets 10008, 10009, 10010 and 10011. So the profile was extended, not invented: no synthetic
+kernel event, no new ABI, no unrelated workload.
+
+The riscv64 arm gets its own acceptance shape (`ARCH_ORACLE=reap_chain`) for one honest reason. On
+x86_64 and aarch64 the supervisor's restart-attempt counter advances monotonically and the chain
+converges on `RESTART_LIMIT_EXCEEDED` + `SERVICE_DEGRADED_FINAL` after exactly four instances. On
+riscv64 that counter **resets** mid-chain — `ATTEMPT_ADVANCE old=2 new=3` is followed by
+`old=0 new=1` — so the limit is never reached and the run is bounded by the clock instead. That
+accounting difference is pre-existing and out of scope (§4 forbids redesigning restart), so the
+riscv64 oracle asserts the reap chain itself and nothing about terminal degradation: at least three
+complete cycles, `teardown_begin == reap_begin == reap_ok == teardown_ok`, one distinct target per
+success, zero refusals, and the fault count bracketing the reap count.
+
+The controlled witness on RISC-V is the deliberate `crash_test_srv` fault, **not** the known
+intermittent RISC-V supervisor fault, which stays exactly as classified.

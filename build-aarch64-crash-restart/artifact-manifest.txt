@@ -1,0 +1,5 @@
+commit=70327f7b5ae5bf6e7fe4fa9e75c5e66bd74f35b4
+arch=aarch64
+build_start=2026-09-04T04:57:42Z epoch=1788497862
+artifact build-aarch64-crash-restart/yarm-aarch64.bin sha256=4d0f344d6ea0b7da62cfd78aa21fbdaac28272db9b16279632abcfacdc7e7c86 size=1248864 mtime=1788497870
+artifact /home/user/YARM/build-aarch64-crash-restart/initramfs-core.cpio sha256=4122367ad25e4415d921d74f2293d3543152ffd74be3d96511cc66ec7fcde457 size=932184 mtime=1788497870

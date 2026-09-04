@@ -1,0 +1,5 @@
+commit=70327f7b5ae5bf6e7fe4fa9e75c5e66bd74f35b4
+arch=riscv64
+build_start=2026-09-04T05:06:15Z epoch=1788498375
+artifact build-riscv64-crash-restart/yarm-riscv64.bin sha256=21a0390a66f010147445cb1551519f60da979b823c5fcc052f8f2f6607fa4060 size=1025568 mtime=1788498377
+artifact /home/user/YARM/build-riscv64-crash-restart/initramfs-core.cpio sha256=6c11ed5ffedd0b99da9cabcd65fde71b6b49c216dbd1bf4a52928137af676271 size=1327112 mtime=1788498377
