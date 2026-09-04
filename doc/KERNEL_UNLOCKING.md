@@ -13979,4 +13979,75 @@ The behavioural half of `u9exit1_self_exit_transaction` continues to drive the r
 now asserts the *settlement* of each injected failure, not merely its refusal — including the
 claim-loses-race case, which is the one that used to fall back.
 
+Failure injection covers every arm that can be injected: deferral held (arm 8), deferred capacity
+at the probe (arm 7) and at the reservation (arm 9, where the two disagree and the queue advance
+already taken must be released), task replacement (arm 10), a claim losing its race (arm 11), and a
+post-claim cleanup failure (arm 12). The four injections §5 lists for the robust-futex lifecycle —
+registration missing or stale, an owner-word fault, a waiter timeout race, a duplicate wake — have
+nothing to inject into: there is no production registration, so there is no owner word to fault, no
+waiter to race and no wake to duplicate.
+
+### §6 — the live matrix
+
+Three consecutive fresh runs per architecture at the delivered tree.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_BROAD_ENTER` | **0 / 0 / 0** | **0 / 0 / 0** | **0 / 0 / 0** |
+| `EXIT_TASK_SPLIT_ENTER` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_SPLIT_DECLINED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SPLIT_IMPOSSIBLE` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SPLIT_FAILED_CLOSED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SYSCALL_RETURNED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| panics / faults / lock warnings | 0 | 0 | 0 |
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+
+The two new markers counting zero is the expected result and is itself informative: no production
+boot took a class-B or class-D arm, which is what the source classification predicts.
+
+Regressions at the delivered tree: x86_64 server-dies `result=ok`; REAP1 crash-restart `result=ok`
+on all three (RISC-V needed its bounded retry once — `attempts=2 stalled=1`, then
+`faults=5 teardowns=4 reaps=4 distinct_targets=4` — which is the known upstream boot stall and is
+NOT counted as an additional clean run); VM-COW and fault-delivery core smokes green on all three.
+The AArch64 and RISC-V server-dies runners keep their exact-base result: they fail identically at
+base with `BOOT_FATAL_INITRAMFS_MISSING`, having never reached userspace.
+
+**The robust-exit live sequence is not delivered, and could not be.** §6 asks for "task registers
+robust futex → waiter blocks → owner exits via NR 16 → OwnerDied is published → waiter wakes once".
+The first step has no production implementation, so constructing the sequence would mean adding the
+registration ABI — creating the population in order to observe it. The proof that replaces it is
+§3's: the registry has one writer, it has no production caller, and it is compiled out of every
+production build.
+
+### Source-derived edge delta
+
+| | before U9-EXIT1 | after U9-EXIT1 | after U9-EXIT2 |
+|---|---|---|---|
+| x86_64 NR 16 terminal edges | 1 | 0 for the admitted population, reachable otherwise | **0, source-proved** |
+| AArch64 | 1 | same | **0, source-proved** |
+| RISC-V | 1 | same | **0, source-proved** |
+
+"Source-proved" is the conjunction of four guarded facts: every architecture admits NR 16 into the
+seam unconditionally; the route has no `NotHandled` outcome after recognition; every `Complete`
+disposition returns from the trap handler before the broad dispatch on all three; and a committed
+queue advance skips it too. There is no path from a userspace NR 16 to
+`handle_exit_current_task`.
+
+### Census and residual
+
+`with_cpu / with_broad / TOTAL = 2 / 0 / 2`, unchanged — CENSUS-DELTA 0. **U9 remains OPEN**: both
+terminal acquisitions still exist, and now service strictly less than they did.
+
+The next residual family on those two dispatchers is no longer inside NR 16. What remains is the
+set of syscall classes that still have a production terminal edge — every NR not yet on a split
+route — plus the non-syscall traps (page fault, IRQ, notification) the two dispatchers also serve.
+U9's remaining work is to retire those, and only then to delete the acquisitions themselves.
+
+One residual inside this stage is worth naming rather than leaving implicit. Class B and class D
+both settle as `SyscallError::Internal`, which a caller cannot distinguish. That is deliberate —
+both are states no correct program can produce, and the markers `EXIT_TASK_SPLIT_IMPOSSIBLE` and
+`EXIT_TASK_SPLIT_FAILED_CLOSED` distinguish them for an operator — but if a future stage ever needs
+userspace to tell them apart, it will need a second code.
+
+
 
