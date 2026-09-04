@@ -3851,6 +3851,12 @@ fn try_split_exit_current_task(shared: &SharedKernel, cpu: CpuId) -> SplitDispat
             let claim = &outcome.claim;
             // The same three markers the broad handler emits, in the broad handler's causal order,
             // so an observer sees one vocabulary for one syscall regardless of route.
+            // U9-EXIT1 §6: the split half of the edge measurement, per invocation.
+            crate::yarm_log!(
+                "EXIT_TASK_SPLIT_ENTER tid={} asid={} result=ok",
+                claim.tid(),
+                claim.sweep_asid().0
+            );
             crate::yarm_log!(
                 "EXIT_TASK_SYSCALL_DISPATCHED nr={} tid={} asid={} target=self result=ok",
                 crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR,
