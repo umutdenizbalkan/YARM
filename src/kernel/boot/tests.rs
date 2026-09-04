@@ -144237,6 +144237,11 @@ mod u9pf_classification {
                 let got = page_fault_route_for(arch, class);
                 let want = match (arch, class) {
                     ("x86_64", CowCandidate) => SplitCow,
+                    // U9-A64-COW2 §4: admitted on a witness earned in that increment — six
+                    // private-copy COW faults per boot with parent AND child completing the
+                    // userspace isolation check. Before it, AArch64's post-Fork COW workload
+                    // died at the first recovered fault for a reason outside COW entirely.
+                    ("aarch64", CowCandidate) => SplitCow,
                     ("aarch64", TerminallyUnhandled) => SplitTerminal,
                     _ => Broad,
                 };
@@ -144263,10 +144268,13 @@ mod u9pf_classification {
     /// architecture whose witness does not exist.
     #[test]
     fn neither_split_route_is_claimed_beyond_its_witness() {
+        // U9-A64-COW2 §4 moved AArch64's COW class out of this list — it now HAS a witness, and
+        // the rule the list encodes is "no route without one", not "never widen". The positive
+        // claim is asserted here so the row cannot be silently dropped either.
         assert_eq!(
             page_fault_route_for("aarch64", PageFaultClass::CowCandidate),
-            PageFaultRoute::Broad,
-            "AArch64 has no COW witness"
+            PageFaultRoute::SplitCow,
+            "AArch64's COW witness was earned in U9-A64-COW2 and must keep its route"
         );
         assert_eq!(
             page_fault_route_for("riscv64", PageFaultClass::CowCandidate),
@@ -144707,6 +144715,11 @@ mod u9ft2_one_evaluator {
             ] {
                 let want = match (arch, class) {
                     ("x86_64", CowCandidate) => SplitCow,
+                    // U9-A64-COW2 §4: admitted on a witness earned in that increment — six
+                    // private-copy COW faults per boot with parent AND child completing the
+                    // userspace isolation check. Before it, AArch64's post-Fork COW workload
+                    // died at the first recovered fault for a reason outside COW entirely.
+                    ("aarch64", CowCandidate) => SplitCow,
                     ("aarch64", TerminallyUnhandled) => SplitTerminal,
                     _ => Broad,
                 };
