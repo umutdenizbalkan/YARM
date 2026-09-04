@@ -113,6 +113,12 @@ pub(crate) trait ExitOwners {
         token: RestartToken,
     ) -> Result<ExitClaim, ExitRefusal>;
     /// Restore the exact incarnation a claim won, byte for byte.
+    ///
+    /// Never called by [`run_exit_transaction`], and that is the design: past the claim there is no
+    /// fallback and a cleanup failure fails CLOSED. The owner exists so the claim is reversible by
+    /// construction — a linearization point whose inverse cannot be written is one whose failure
+    /// modes cannot be reasoned about — and §5's harness exercises it.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn rollback_claim(&mut self, claim: &ExitClaim) -> bool;
     /// Does this exact incarnation still hold a reverse link? Pre-mutation probe.
     fn server_reply_link_present(&self, tid: u64, asid: Asid) -> bool;

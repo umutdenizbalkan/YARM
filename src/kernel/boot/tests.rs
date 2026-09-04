@@ -160294,7 +160294,6 @@ mod u9exit1_self_exit_transaction {
         use ExitRefusal::*;
         for refusal in [
             NoCurrent,
-            NotCurrentOnCpu,
             TaskGone,
             IdentityChanged,
             NotRunning,

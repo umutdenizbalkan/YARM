@@ -1162,9 +1162,12 @@ pub(crate) fn futex_wait_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
 //     corpse's registers. The cell is what tells the capture site to skip.
 //
 // Per-CPU, single-shot, and generation-bearing by construction (`{tid, asid}`, never a bare TID).
-static EXIT_QUEUE_ADVANCE_OUTGOING: [crate::kernel::lock::SpinLockIrq<
-    Option<(u64, Option<Asid>)>,
->; crate::kernel::scheduler::MAX_CPUS] =
+/// The exact incarnation a CPU's exit deferral names. Never a bare TID: the ASID is what makes a
+/// replacement task at the same numeric TID resolve to nothing.
+pub(crate) type ExitingIncarnation = (u64, Option<Asid>);
+
+static EXIT_QUEUE_ADVANCE_OUTGOING: [crate::kernel::lock::SpinLockIrq<Option<ExitingIncarnation>>;
+    crate::kernel::scheduler::MAX_CPUS] =
     [const { crate::kernel::lock::SpinLockIrq::new(None) }; crate::kernel::scheduler::MAX_CPUS];
 
 /// Publish the exiting incarnation for this CPU's queue-advance deferral. Returns `false` WITHOUT

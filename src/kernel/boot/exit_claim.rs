@@ -55,9 +55,6 @@ use crate::kernel::vm::Asid;
 pub(crate) enum ExitRefusal {
     /// This CPU has no resolvable current task, so there is no self to exit.
     NoCurrent,
-    /// The TID is not this CPU's `current`. A self-exit is defined by the scheduler, never by an
-    /// argument, so this is a refusal and not a redirection.
-    NotCurrentOnCpu,
     /// No TCB carries this TID.
     TaskGone,
     /// The TCB's ASID is not the one the claim was resolved against: a different incarnation now
@@ -87,7 +84,6 @@ impl ExitRefusal {
     pub(crate) const fn marker(self) -> &'static str {
         match self {
             Self::NoCurrent => "no_current",
-            Self::NotCurrentOnCpu => "not_current_on_cpu",
             Self::TaskGone => "task_gone",
             Self::IdentityChanged => "identity_changed",
             Self::NotRunning => "not_running",
@@ -107,7 +103,6 @@ impl ExitRefusal {
     pub(crate) const fn may_fall_back(self) -> bool {
         match self {
             Self::NoCurrent
-            | Self::NotCurrentOnCpu
             | Self::TaskGone
             | Self::IdentityChanged
             | Self::NotRunning
@@ -137,6 +132,15 @@ pub(crate) struct ExitClaim {
     status_before: TaskStatus,
 }
 
+/// The accessors and the inverse below are `dead_code` in a production build ON PURPOSE, and the
+/// allow is narrowed to that build so a test-only reader still counts.
+///
+/// `rollback_exit_claim_locked` exists because the claim must be *reversible by construction* — a
+/// linearization point that cannot be undone is one whose failure modes cannot be reasoned about —
+/// while the transaction deliberately never calls it: past the claim there is no fallback, and a
+/// cleanup failure fails CLOSED rather than resurrecting the task (§3). Its coverage drives it
+/// directly, including the TID-reuse case where it must match nothing.
+#[cfg_attr(not(test), allow(dead_code))]
 impl ExitClaim {
     /// The CPU the claim was taken on. Every scheduler step of the transaction is authenticated
     /// against it, so a claim cannot be spent on another CPU's run queue.
@@ -317,6 +321,7 @@ pub(crate) fn apply_self_exit_writes_locked(
 /// Deliberately does NOT restore `blocked_recv_state`: the broad path clears it unconditionally at
 /// the same point and never restores it either, and a rollback that resurrected a blocked receive
 /// would be inventing state rather than undoing a write.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn rollback_exit_claim_locked(
     tcbs: &mut [Option<ThreadControlBlock>],
     claim: &ExitClaim,
