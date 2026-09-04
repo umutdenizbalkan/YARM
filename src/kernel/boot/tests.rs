@@ -157309,3 +157309,165 @@ mod u9fork1_cow_fork_transaction {
         );
     }
 }
+
+/// U9-A64-COW2 §2 — THE regression proof for the first incorrect boundary.
+///
+/// `apply_restored_thread_state`'s argument mirror copies the frame's ARGUMENT lanes over x0..x5.
+/// It ran on every non-syscall resume, and a fault frame's argument lanes are never imported — so
+/// a handled AArch64 page fault returned to userspace with six live registers zeroed. Measured
+/// live at `b545e65`: on the COW write that follows a Fork, x0 entered the trap holding a
+/// format-string pointer (`0x40ef3a`) and left holding `0x0`, and userspace then dereferenced it
+/// inside `core::fmt::write` and died at `addr=0x0 rip=0x402090`. COW recovery itself was correct
+/// throughout — the trace shows metadata → frame-alloc → PT-update → local-TLB-flush → done with a
+/// fresh private frame on every attempt.
+///
+/// `src/arch/aarch64/*` is `#[cfg(target_arch = "aarch64")]`, so its own tests cannot run in the
+/// hosted suite. The decision therefore lives in an arch-neutral predicate that IS host-compiled,
+/// and this module proves both halves: the predicate's behaviour, and that the AArch64 mirror is
+/// gated on it.
+mod u9a64cow2_argument_mirror {
+    use super::*;
+    use crate::kernel::task::UserRegisterContext;
+    use crate::kernel::vm::VirtAddr;
+
+    const A64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+
+    /// An ordinary resume — a handled page fault — whose argument lanes are zero because a fault
+    /// never imports them.
+    fn fault_shaped_context() -> UserRegisterContext {
+        let mut user_gprs = [0usize; 32];
+        // The exact register the live defect destroyed, and five neighbours.
+        user_gprs[0] = 0x40ef3a;
+        user_gprs[1] = 0x1111;
+        user_gprs[2] = 0x2222;
+        user_gprs[3] = 0x3333;
+        user_gprs[4] = 0x4444;
+        user_gprs[5] = 0x5555;
+        user_gprs[19] = 0x4007f0;
+        UserRegisterContext {
+            instruction_ptr: VirtAddr(0x409160),
+            stack_ptr: VirtAddr(0x3fbff8a0),
+            user_gprs,
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        }
+    }
+
+    /// THE regression: a fault resume's argument lanes are NOT authoritative, so nothing may be
+    /// copied over its live registers.
+    #[test]
+    fn a_fault_resume_never_authorizes_the_argument_mirror() {
+        let context = fault_shaped_context();
+        assert!(
+            !context.is_first_resume_shape(),
+            "a fault frame carries live registers, so it is not a first resume"
+        );
+        assert!(
+            !context.argument_lanes_are_authoritative(false),
+            "a handled fault must never authorize copying zeroed argument lanes over x0..x5"
+        );
+    }
+
+    /// A first resume — a freshly published task — carries its startup ABI in the argument lanes,
+    /// and the mirror is the only thing that delivers it.
+    #[test]
+    fn a_first_resume_still_authorizes_the_mirror() {
+        let context = UserRegisterContext {
+            instruction_ptr: VirtAddr(0x400000),
+            stack_ptr: VirtAddr(0x7000),
+            user_gprs: [0; 32],
+            arg0: 41,
+            arg1: 42,
+            arg2: 43,
+            arg3: 44,
+            arg4: 45,
+            arg5: 46,
+        };
+        assert!(context.is_first_resume_shape());
+        assert!(
+            context.argument_lanes_are_authoritative(false),
+            "a startup frame's argument lanes ARE the authoritative copy"
+        );
+    }
+
+    /// A blocked completion writes its result into the argument lanes precisely so the mirror
+    /// delivers it, so it authorizes the mirror even on an otherwise ordinary frame.
+    #[test]
+    fn an_encoded_completion_still_authorizes_the_mirror() {
+        let context = fault_shaped_context();
+        assert!(
+            context.argument_lanes_are_authoritative(true),
+            "an encoded completion must still reach the result lane"
+        );
+    }
+
+    /// The AArch64 mirror is gated on that predicate — not on `!syscall_return` alone, which is
+    /// true for every fault.
+    #[test]
+    fn the_aarch64_mirror_is_gated_on_the_predicate() {
+        let body = A64_TRAP
+            .split("pub(crate) fn apply_restored_thread_state(")
+            .nth(1)
+            .and_then(|s| s.split("\npub(crate) fn ").next())
+            .expect("apply_restored_thread_state body");
+        assert!(
+            body.contains("argument_lanes_are_authoritative(completion_encoded)"),
+            "the mirror must ask the shared predicate whether the argument lanes are authoritative"
+        );
+        assert!(
+            body.contains(
+                "let completion_encoded = facts.send_completion.is_some() || facts.recv_completion.is_some();"
+            ),
+            "both completion classes must authorize the mirror, or one would be silently dropped"
+        );
+        // The six mirror writes exist exactly once, and all six sit inside the gate.
+        let gate = body
+            .split("argument_lanes_are_authoritative(completion_encoded)")
+            .nth(1)
+            .expect("the gated block");
+        let gated_writes = gate
+            .split("\n    }")
+            .next()
+            .map(|block| {
+                block
+                    .matches("frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X")
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            gated_writes, 6,
+            "all six argument-mirror writes must sit inside the gate"
+        );
+    }
+
+    /// The faulting instruction is retried, never advanced: no syscall PC policy may touch a
+    /// fault's ELR.
+    #[test]
+    fn the_restore_never_advances_the_faulting_instruction() {
+        let body = A64_TRAP
+            .split("pub(crate) fn apply_restored_thread_state(")
+            .nth(1)
+            .and_then(|s| s.split("\npub(crate) fn ").next())
+            .expect("apply_restored_thread_state body");
+        // Read CODE, never the prose explaining it: the surrounding comments legitimately
+        // discuss an ELR that was advanced once at block time, which is a different owner.
+        let mut code = alloc::string::String::with_capacity(body.len());
+        for line in body.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            code.push_str(line);
+            code.push('\n');
+        }
+        for forbidden in ["set_saved_pc", "saved_pc() + 4", "elr_policy", "advance"] {
+            assert!(
+                !code.contains(forbidden),
+                "the restore must not touch the resume PC (`{forbidden}`)"
+            );
+        }
+    }
+}

@@ -419,10 +419,10 @@ pub(crate) fn apply_restored_thread_state(
         crate::arch::aarch64::syscall_abi::REG_X18_TLS,
         tls.unwrap_or(0),
     );
-    // For a freshly created task the saved user_gprs are [0; 32] while
-    // arg0..arg5 hold the startup ABI values, so we mirror args into user_gprs.
-    // For a resumed task capture_user_context already wrote user_gprs[i] into
-    // arg_i, so the assignment is idempotent.
+    // For a freshly created task the saved user_gprs are [0; 32] while arg0..arg5 hold the
+    // startup ABI values, so those have to be mirrored into user_gprs for the task to receive
+    // them. A blocked completion is the same shape by construction: `encode_blocked_completion_result`
+    // writes the result into the ARGUMENT lanes, and the mirror is how it reaches x0..x5.
     //
     // Skip the mirror on a direct syscall return (!task_switched && Syscall):
     // export_syscall_result_to_user_gprs runs immediately after and sets
@@ -474,12 +474,49 @@ pub(crate) fn apply_restored_thread_state(
             #[cfg(feature = "ipc-reply-timeout-oracle-core")]
             crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
         }
-        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0));
-        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, frame.arg(1));
-        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, frame.arg(2));
-        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, frame.arg(3));
-        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X4, frame.arg(4));
-        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X5, frame.arg(5));
+        // U9-A64-COW2 §2 — THE argument mirror, and the exact condition under which it is
+        // allowed to run.
+        //
+        // The mirror copies the frame's ARGUMENT lanes over x0..x5. That is right for a frame
+        // whose argument lanes are authoritative, and catastrophic for one whose are not,
+        // because the write is unconditional.
+        //
+        // The two authoritative shapes, and nothing else:
+        //
+        // 1. A FIRST RESUME. A freshly published task has `user_gprs == [0; 32]` and its startup
+        //    ABI in `arg0..arg5`; the mirror is how that ABI reaches userspace.
+        //    `is_first_resume_shape` is that exact test and is already the predicate the x86_64
+        //    new-task path uses.
+        // 2. A JUST-ENCODED BLOCKED COMPLETION. `encode_blocked_completion_result` writes the
+        //    result into the argument lanes a few lines above, and the mirror is how it reaches
+        //    x0..x5. Both completion classes are handled, so neither can be silently dropped.
+        //
+        // Every other resume that lands here is an ORDINARY one — most importantly a page-fault
+        // return, whose faulting instruction is about to be retried with its live registers. The
+        // previous justification for mirroring unconditionally was that
+        // "capture_user_context already wrote user_gprs[i] into arg_i, so the assignment is
+        // idempotent". That is false: `capture_user_context` copies `args` verbatim and never
+        // mirrors GPRs into them. It is idempotent only for a SYSCALL frame, where
+        // `import_syscall_abi_from_user_gprs` populated the argument lanes from x0..x5 on the way
+        // in. A fault frame's argument lanes are never imported and stay zero, so the mirror
+        // wrote zeros over six live user registers on every handled AArch64 fault.
+        //
+        // That is the U9-A64-COW2 §1 defect, measured: on the COW write that follows a Fork, x0
+        // entered the trap holding a format-string pointer and left holding zero, and userspace
+        // then dereferenced it inside `core::fmt::write` and died at `addr=0x0`. COW recovery
+        // itself was correct throughout.
+        let completion_encoded = facts.send_completion.is_some() || facts.recv_completion.is_some();
+        if facts
+            .context
+            .argument_lanes_are_authoritative(completion_encoded)
+        {
+            frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0));
+            frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, frame.arg(1));
+            frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, frame.arg(2));
+            frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, frame.arg(3));
+            frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X4, frame.arg(4));
+            frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X5, frame.arg(5));
+        }
     }
     trap_trace!(
         "AARCH64_FIRST_ENTRY_ARGS tid={} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x} x4=0x{:x} x5=0x{:x}",
