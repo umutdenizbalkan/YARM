@@ -79,7 +79,8 @@ IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid=${SD_SERVER_TID} server_asid=${SD_
 IPC_SERVER_DEATH_SCOPE_ARMED record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION} server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID} link_present=1
 IPC_SERVER_DEATH_LINK_CAPTURED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID} record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION}
 IPC_SERVER_DEATH_DEFERRED_PUBLISHED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID} record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION}
-EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG} tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}
+EXIT_TASK_SPLIT_ENTER tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID} result=ok
+EXIT_TASK_CLAIM_RETIRED tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}
 IPC_SERVER_DEATH_BROAD_LOCK_RELEASED
 IPC_SERVER_DEATH_POST_LOCK_DRAIN_BEGIN
 IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won record_index=${SD_RECORD_INDEX} record_generation=${SD_RECORD_GENERATION} caller_tid=${SD_CALLER_TID} caller_asid=${SD_CALLER_ASID}
@@ -282,10 +283,27 @@ serverdies_run_b_live_cell() {
   local dup
   for line in \
     "IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID}" \
-    "EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG} tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}"; do
+    "EXIT_TASK_CLAIM_RETIRED tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}"; do
     dup=$(grep -c -F "$line" "$log" || true)
     [[ "$dup" == "1" ]] || die "RUN_B scoped marker seen $dup times (expected 1): $line"
   done
+
+  # U9-EXIT1 §6 — the dying server's exit no longer reaches the terminal broad dispatcher, so
+  # `EXIT_TASK_DISPOSITION_CONSUMED` (which only the in-lock consumer emits) is re-derived above
+  # into the pair the split route emits for the SAME incarnation: the edge marker at the route's
+  # entry, and the retired claim. Two facts that marker used to carry are asserted directly here
+  # rather than left implied — the broad edge counted zero, and the retired claim states that this
+  # exit actually owed and handed off a server-death completion.
+  local broad_edges retired
+  broad_edges=$(grep -c -F "EXIT_TASK_BROAD_ENTER" "$log" || true)
+  [[ "$broad_edges" == "0" ]] \
+    || die "RUN_B the dying server's NR 16 still reached the terminal broad dispatcher ($broad_edges)"
+  retired=$(grep -m1 -F "EXIT_TASK_CLAIM_RETIRED tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID} " "$log" || true)
+  [[ -n "$retired" ]] || die "RUN_B no retired exit claim for the witnessed server"
+  case "$retired" in
+    *"server_death=1"*) ;;
+    *) die "RUN_B the retired claim does not attest the server-death handoff: $retired" ;;
+  esac
 
   # Forbidden markers.
   while read -r line; do
