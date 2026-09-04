@@ -2123,6 +2123,80 @@ impl SharedKernel {
 
     /// The drain's boolean form: is this outgoing task's exit deferral still owed and sound?
     ///
+    /// U9-EXIT1 §4 — the exact reverse link an incarnation still holds, read off the broad lock.
+    ///
+    /// The split-domain form of `KernelState::server_reply_link_for`, matched on the same
+    /// `{tid, asid}` incarnation, so a replacement task reusing the numeric TID resolves nothing.
+    pub(crate) fn server_reply_link_for_split_read(
+        &self,
+        server_tid: u64,
+        server_asid: crate::kernel::vm::Asid,
+    ) -> Option<crate::kernel::task::ServerReplyLink> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+                .and_then(|t| t.server_reply_link)
+        })
+    }
+
+    /// U9-EXIT1 §4 — the split-domain form of `KernelState::arm_server_dies_link_scope`.
+    ///
+    /// It exists so the ServerDies scenario is armed from the SAME point on both routes: while the
+    /// deferred reservation is held and the reverse link is still attached. Arming it later, or
+    /// from the terminal arm, is what 199D-SD3 established does not work — the one-shot latch then
+    /// claims whichever reply wait happened to be first in the boot rather than the one that dies.
+    ///
+    /// Diagnostic only, and inert unless the reply-timeout oracle core is compiled in.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn arm_server_dies_link_scope_split(
+        &self,
+        record_index: usize,
+        record_generation: u64,
+    ) {
+        use crate::kernel::boot::server_dies_counters as c;
+        if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            != crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+        {
+            return;
+        }
+        if !c::arm_record(record_index, record_generation) {
+            return;
+        }
+        let bound = self.with_ipc_split_mut(|ipc| {
+            if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+                return None;
+            }
+            ipc.reply_caps
+                .get(record_index)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.responder_tid.zip(r.replier_asid))
+        });
+        let Some((server_tid, server_asid)) = bound else {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} link_present=0 reason=unbound_record result=ok",
+                record_index,
+                record_generation
+            );
+            return;
+        };
+        let _ = c::arm_scenario_server(server_tid.0, server_asid.0);
+        let present = self
+            .server_reply_link_for_split_read(server_tid.0, server_asid)
+            .is_some_and(|link| link.matches_record(record_index, record_generation));
+        if present {
+            c::note_armed_link_present(record_index, record_generation);
+        }
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} server_tid={} server_asid={} link_present={} result=ok",
+            record_index,
+            record_generation,
+            server_tid.0,
+            server_asid.0,
+            u32::from(present)
+        );
+    }
+
     /// `Terminal` and `Removed` both mean "the advance is owed"; `Contradicted` is the only
     /// refusal, and it is the one that must never happen after a claim.
     pub(crate) fn exit_reverify_ok(&self, tid: u64) -> bool {

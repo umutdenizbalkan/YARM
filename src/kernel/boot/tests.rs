@@ -159340,6 +159340,10 @@ mod u9exit1_self_exit_transaction {
             self.death_reserved -= 1;
         }
 
+        fn note_server_death_reservation(&mut self, _tid: u64, _asid: Asid) {
+            self.note("note_server_death_reservation");
+        }
+
         fn reserve_queue_advance(&mut self, cpu: CpuId, outgoing: u64) -> bool {
             self.note("reserve_queue_advance");
             if self.inject == Inject::QueueAdvanceTaken

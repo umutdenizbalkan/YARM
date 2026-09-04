@@ -136,6 +136,14 @@ pub(crate) trait ExitOwners {
     ) -> bool;
     /// Release a held reservation that turned out to owe nothing.
     fn release_server_death(&mut self, reservation: ServerDeathWorkReservation);
+    /// Attribute a HELD reservation to the armed ServerDies scenario, from the dying server's
+    /// identity, while its reverse link is still attached.
+    ///
+    /// The reservation itself carries no record identity — it is taken before the link is read —
+    /// so this is the first point at which it can be attributed at all, and the broad `exit_task`
+    /// attributes it from exactly here. Diagnostic, and inert unless the oracle core is compiled
+    /// in; it exists so an observer sees ONE server-death vocabulary regardless of route.
+    fn note_server_death_reservation(&mut self, tid: u64, asid: Asid);
 
     // ── the queue-advance deferral ──────────────────────────────────────────────────────────
     /// Reserve the ONE queue-advance deferral for this CPU. `false` means another route holds it.
@@ -238,7 +246,19 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
     let mut death_reservation: Option<ServerDeathWorkReservation> = None;
     if owes_reply {
         match owners.reserve_server_death(cpu) {
-            Some(reservation) => death_reservation = Some(reservation),
+            Some(reservation) => {
+                // Attested BEFORE the detach, because the detach is the irreversible step and the
+                // order — reserve, then detach, then publish — is exactly what prevents a stranded
+                // caller. Same marker, same fields and same position as the broad `exit_task`'s.
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid={} server_asid={} cpu={} slots=1 result=ok",
+                    tid,
+                    sweep_asid.0,
+                    cpu.0
+                );
+                owners.note_server_death_reservation(tid, sweep_asid);
+                death_reservation = Some(reservation);
+            }
             None => {
                 owners.release_queue_advance(cpu);
                 return Err(ExitRefusal::DeferredCapacity);
@@ -310,8 +330,47 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
                 // means some owner holds this record's terminal, and clearing the slot here would
                 // destroy it.
                 death_link = Some(link);
-                outcome.server_death_published =
+                // The EXACT link this server owned, detached by full incarnation, carrying the
+                // exact reply-record coordinates it was attached to.
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_LINK_CAPTURED server_tid={} server_asid={} record_index={} record_generation={} detached=1 result=ok",
+                    tid,
+                    claim.sweep_asid().0,
+                    link.reply_record_index,
+                    link.reply_record_generation
+                );
+                let published =
                     owners.publish_server_death(reservation, tid, claim.sweep_asid(), link);
+                outcome.server_death_published = published;
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DEFERRED server_tid={} server_asid={} record_index={} record_generation={} published={} result=ok",
+                    tid,
+                    claim.sweep_asid().0,
+                    link.reply_record_index,
+                    link.reply_record_generation,
+                    u32::from(published)
+                );
+                // One published item per exiting server. A duplicate exit collapses here: the
+                // publish returns false and releases the slot rather than queueing a second owner
+                // for the same record.
+                if published {
+                    crate::yarm_log!(
+                        "IPC_SERVER_DEATH_DEFERRED_PUBLISHED server_tid={} server_asid={} record_index={} record_generation={} cpu={} items=1 result=ok",
+                        tid,
+                        claim.sweep_asid().0,
+                        link.reply_record_index,
+                        link.reply_record_generation,
+                        cpu.0
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "IPC_SERVER_DEATH_DUPLICATE_DEFERRED server_tid={} server_asid={} record_index={} record_generation={} result=fail",
+                        tid,
+                        claim.sweep_asid().0,
+                        link.reply_record_index,
+                        link.reply_record_generation
+                    );
+                }
             }
             None => {
                 // Nothing owed after all — the link went away between the probe and here. Release
@@ -483,6 +542,22 @@ impl ExitOwners for SharedExitOwners<'_> {
     }
     fn release_server_death(&mut self, reservation: ServerDeathWorkReservation) {
         crate::kernel::boot::server_death_work_release(reservation);
+    }
+    fn note_server_death_reservation(&mut self, tid: u64, asid: Asid) {
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        {
+            if let Some(link) = self.shared.server_reply_link_for_split_read(tid, asid) {
+                self.shared.arm_server_dies_link_scope_split(
+                    link.reply_record_index,
+                    link.reply_record_generation,
+                );
+            }
+            crate::kernel::boot::server_dies_counters::note_deferred_reserved(tid, asid.0);
+        }
+        #[cfg(not(feature = "ipc-reply-timeout-oracle-core"))]
+        {
+            let _ = (tid, asid);
+        }
     }
 
     fn reserve_queue_advance(&mut self, cpu: CpuId, outgoing: u64) -> bool {
