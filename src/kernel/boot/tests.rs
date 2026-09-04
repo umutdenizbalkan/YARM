@@ -159108,6 +159108,10 @@ mod u9exit1_self_exit_transaction {
         QueueAdvanceTaken,
         /// The server-death queue is full.
         NoDeathCapacity,
+        /// The capacity PROBE says a slot is free and the RESERVE then fails — arm 9 of the
+        /// U9-EXIT2 §1 table, the one step where the two can disagree. Still pre-mutation, so it
+        /// must release the queue advance it already took and settle exactly as the probe does.
+        DeathReserveLosesRace,
         /// The reverse link is reported present by the pre-mutation probe but is gone by the time
         /// it is taken — the reservation must then be released rather than held.
         LinkVanishes,
@@ -159313,7 +159317,10 @@ mod u9exit1_self_exit_transaction {
 
         fn reserve_server_death(&mut self, cpu: CpuId) -> Option<ServerDeathWorkReservation> {
             self.note("reserve_server_death");
-            if self.inject == Inject::NoDeathCapacity || self.death_reserved >= self.death_slots {
+            if self.inject == Inject::NoDeathCapacity
+                || self.inject == Inject::DeathReserveLosesRace
+                || self.death_reserved >= self.death_slots
+            {
                 return None;
             }
             self.death_reserved += 1;
@@ -159628,6 +159635,41 @@ mod u9exit1_self_exit_transaction {
             }
         );
         assert_eq!(h.snapshot(), before);
+        assert_eq!(h.count("clear_current"), 0);
+    }
+
+    /// Arm 9 of the §1 table: the capacity probe and the reservation disagree.
+    ///
+    /// Still pre-mutation, so it settles exactly as the probe does — but it has already taken the
+    /// queue advance, and releasing that is what keeps a later route from finding the CPU's one
+    /// deferral held by a transaction that refused.
+    #[test]
+    fn a_reservation_that_loses_its_race_releases_the_queue_advance_it_took() {
+        let mut h = three_task_world();
+        h.owed_link = Some(ServerReplyLink {
+            server_tid: 1,
+            server_asid: Asid(201),
+            reply_record_index: 0,
+            reply_record_generation: 1,
+        });
+        h.inject = Inject::DeathReserveLosesRace;
+        let before = h.snapshot();
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(
+            failure,
+            ExitFailure {
+                refusal: ExitRefusal::DeferredCapacity,
+                disposition: ExitDisposition::InvalidPreLock,
+            },
+            "the probe and the reserve must give the SAME userspace answer"
+        );
+        assert_eq!(h.snapshot(), before, "a refusal must mutate nothing");
+        assert_eq!(h.count("reserve_queue_advance"), 1);
+        assert_eq!(h.count("release_queue_advance"), 1);
+        assert_eq!(
+            h.queue_advance[0], None,
+            "the deferral must not be left held"
+        );
         assert_eq!(h.count("clear_current"), 0);
     }
 
