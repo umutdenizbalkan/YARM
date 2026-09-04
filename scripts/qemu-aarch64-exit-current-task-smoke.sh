@@ -202,10 +202,32 @@ if (( ! fail )); then
     "EXIT_TASK_ORACLE_SPAWN_FAIL" \
     "KERNEL PANIC" "RUST PANIC" "panicked at" "SYNCHRONOUS EXCEPTION" "Unhandled" "FATAL"
 
-  need_once "$NORM" "$L" \
-    "EXIT_TASK_USER_ENTERED role=disposable arch=aarch64" \
+  # ── U9-EXIT1 §6 — THE terminal-edge retirement ────────────────────────────────────
+  #
+  # Stage 200D-0C2 proved the BROAD pipeline: NR 16 reached the terminal broad-locked
+  # dispatcher, armed an in-lock bypass, and the post-lock consumer got the exiting task off the
+  # CPU before the ERET. U9-EXIT1 retires that edge, so every marker of that pipeline is now
+  # REQUIRED ABSENT rather than reworded — a run still emitting them is a run whose exit still
+  # reached the acquisition this stage exists to remove.
+  #
+  # Each retired assertion is replaced below by the one that states the admission it used to
+  # forbid, which is the discipline U9-REAP1 applied to its 21 NR-31 guards.
+  broad_enters=$(count_of "$NORM" "EXIT_TASK_BROAD_ENTER")
+  split_enters=$(count_of "$NORM" "EXIT_TASK_SPLIT_ENTER")
+  split_declines=$(count_of "$NORM" "EXIT_TASK_SPLIT_DECLINED")
+  claims=$(count_of "$NORM" "EXIT_TASK_CLAIM_RETIRED")
+  dispatches=$(count_of "$NORM" "EXIT_TASK_SYSCALL_DISPATCHED nr=16")
+  note "terminal edge: broad=$broad_enters split=$split_enters declined=$split_declines claims=$claims dispatches=$dispatches"
+  [[ "$broad_enters" == "0" ]] \
+    || die "[$L] NR 16 still reached the terminal broad dispatcher ($broad_enters entries)"
+  [[ "$split_enters" == "1" ]] || die "[$L] split-route entries != 1 (got $split_enters)"
+  [[ "$split_declines" == "0" ]] || die "[$L] the split route declined an admitted exit ($split_declines)"
+  [[ "$claims" == "1" ]] || die "[$L] exit claims retired != 1 (got $claims)"
+  [[ "$dispatches" == "1" ]] || die "[$L] NR16 dispatches != 1 (got $dispatches)"
+
+  # The retired broad pipeline, marker for marker. Its ABSENCE is the retirement.
+  need_absent "$NORM" "$L" \
     "EXIT_TASK_PREFLIGHT_OK" \
-    "EXIT_TASK_LIFECYCLE_TRANSITION" \
     "EXIT_TASK_DISPOSITION_PUBLISHED" \
     "EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64" \
     "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64" \
@@ -214,68 +236,88 @@ if (( ! fail )); then
     "EXIT_TASK_EXITING_NOT_CURRENT arch=aarch64" \
     "EXIT_TASK_ABSENCE_VALIDATED arch=aarch64" \
     "EXIT_TASK_TRAP_DEPTH_OWNER arch=aarch64" \
+    "EXIT_TASK_RESTORE_OWNER arch=aarch64" \
+    "EXIT_TASK_SPLIT_FAILED_CLOSED" \
+    "EXIT_TASK_DUPLICATE_DEFERRAL"
+
+  need_once "$NORM" "$L" \
+    "EXIT_TASK_USER_ENTERED role=disposable arch=aarch64" \
+    "EXIT_TASK_SPLIT_ENTER" \
+    "EXIT_TASK_CLAIM_RETIRED" \
+    "EXIT_TASK_LIFECYCLE_TRANSITION" \
+    "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=exit_current_task_switch_required" \
+    "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=16 cpu=0 result=queue_advance_committed" \
     "EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64" \
     "EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64"
-  [[ "$(count_of "$NORM" "EXIT_TASK_SYSCALL_DISPATCHED nr=16")" == "1" ]] \
-    || die "[$L] NR16 dispatches != 1"
-  [[ "$(count_of "$NORM" "EXIT_TASK_RESTORE_OWNER arch=aarch64")" == "1" ]] \
-    || die "[$L] restore-owner attestations != 1"
-  # ── lock-state correctness, marker by marker (Stage 200D-0C2) ─────────────────────
-  # Every marker emitted from the post-lock section must STATE the lock condition that held
-  # where it was emitted, not merely be positioned after the boundary. Stage 200D-0B3 removed
-  # markers that named a lock state they did not have; this is the AArch64 sibling check, and
-  # it is a whole-line assertion so a marker cannot pass on its name alone.
-  for m in "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64" \
-           "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64" \
-           "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64"; do
-    rg -a -F "$m" "$NORM" | rg -a -q -F "broad_lock=0" \
-      || die "[$L] post-lock marker does not state broad_lock=0: $m"
-    rg -a -F "$m" "$NORM" | rg -a -q -F "broad_lock=1" \
-      && die "[$L] post-lock marker falsely claims broad_lock=1: $m"
-  done
-  # The in-lock bypass decision is the one AArch64 exit marker emitted UNDER the broad lock,
-  # and it must not claim otherwise.
-  rg -a -F "EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64" "$NORM" | rg -a -q -F "broad_lock=0" \
-    && die "[$L] the in-lock bypass marker falsely claims broad_lock=0"
-  # The release marker must name the guard it outlived.
-  rg -a -F "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64" "$NORM" | rg -a -q -F "holder=with_cpu" \
-    || die "[$L] release marker does not name the broad-lock holder"
-  # The drain marker must attest that ALL drains ran, not merely that a drain point exists.
-  rg -a -F "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64" "$NORM" | rg -a -q -F "drains=all" \
-    || die "[$L] post-lock drain marker does not attest drains=all"
 
-  # Trap-depth ownership: AArch64 has no software depth counter, so the consumer must attest
-  # exactly zero clears. A non-zero count would mean a second cleanup owner appeared.
-  [[ "$(count_of "$NORM" "EXIT_TASK_TRAP_DEPTH_OWNER arch=aarch64 cpu=0 owner=hardware_eret clears=0")" == "1" ]] \
-    || die "[$L] trap-depth ownership is not the single hardware-ERET owner with zero clears"
+  # ── the exiting task's identity, read from the log rather than assumed ─────────────
+  EXITING_TID=$(rg -a -o -r '$1' "EXIT_TASK_SYSCALL_DISPATCHED nr=16 tid=([0-9]+)" "$NORM" | head -1)
+  [[ -n "$EXITING_TID" ]] || die "[$L] could not resolve the exiting tid"
+  note "exiting tid=$EXITING_TID"
+  rg -a -q -F "EXIT_TASK_CLAIM_RETIRED tid=$EXITING_TID " "$NORM" \
+    || die "[$L] the retired claim does not name the dispatched tid"
+  rg -a -q -F "EXIT_TASK_SPLIT_ENTER tid=$EXITING_TID " "$NORM" \
+    || die "[$L] the split edge does not name the dispatched tid"
 
-  # Semantic ordering of the whole chain.
+  # ── the exiting frame is never saved, and never returned through ───────────────────
+  # AArch64 is the architecture that made this concrete: its ABI-import gate is an allow-list
+  # and its `split_finalize_handled_syscall` gate commits results into the ENTERING incarnation.
+  # `captured=0` is the live statement that neither happened for the corpse.
+  rg -a -F "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=16 cpu=0 result=queue_advance_committed" "$NORM" \
+    | rg -a -q -F "captured=0" \
+    || die "[$L] the exiting frame was captured — §3 forbids saving it"
+  rg -a -F "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=16 cpu=0 result=queue_advance_committed" "$NORM" \
+    | rg -a -q -F "outgoing=$EXITING_TID" \
+    || die "[$L] the committed advance names a different outgoing task"
+
+  # ── the ONE queue advance, checked in the slice that belongs to this exit ──────────
+  #
+  # The drain's markers are SHARED with FutexWait and blocking recv, which fire long before the
+  # exit, so a whole-log ordering claim about them would be satisfied by somebody else's advance.
+  SLICE="$LOGDIR/exit.after.log"
+  awk 'index($0,"EXIT_TASK_SYSCALL_DISPATCHED nr=16"){f=1} f' "$NORM" >"$SLICE"
+  [[ -s "$SLICE" ]] || die "[$L] could not slice the log at the accepted exit"
+
+  need_order "$SLICE" "$L" "EXIT_TASK_SYSCALL_DISPATCHED nr=16" "EXIT_TASK_LIFECYCLE_TRANSITION" \
+    "the dispatched exit precedes its lifecycle transition"
+  need_order "$SLICE" "$L" "EXIT_TASK_LIFECYCLE_TRANSITION" \
+    "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=exit_current_task_switch_required" \
+    "the transition precedes the queue-advance deferral it commits"
+  need_order "$SLICE" "$L" "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=exit_current_task_switch_required" \
+    "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=16 cpu=0 result=queue_advance_committed" \
+    "the deferral is published before the seam answers QueueAdvanceCommitted"
+  need_order "$SLICE" "$L" "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=16 cpu=0 result=queue_advance_committed" \
+    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed" \
+    "the committed advance skips the broad dispatch exactly once"
+  need_order "$SLICE" "$L" "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed" \
+    "AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid=$EXITING_TID" \
+    "the EXISTING drain reverifies THIS exit by exact identity"
+  need_order "$SLICE" "$L" "AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid=$EXITING_TID" \
+    "AARCH64_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu=0" \
+    "the drain selects and installs an incoming task"
+  need_order "$SLICE" "$L" "AARCH64_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu=0" \
+    "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok" \
+    "the drain completes"
+  need_order "$SLICE" "$L" "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok" \
+    "EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64" \
+    "a surviving task makes progress after the exit"
+  need_order "$SLICE" "$L" "EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64" \
+    "EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64" \
+    "terminal health is the last thing proven"
   need_order "$NORM" "$L" "EXIT_TASK_USER_ENTERED" "EXIT_TASK_SYSCALL_DISPATCHED nr=16" \
     "userspace entry precedes the syscall"
-  need_order "$NORM" "$L" "EXIT_TASK_SYSCALL_DISPATCHED nr=16" "EXIT_TASK_PREFLIGHT_OK" \
-    "dispatch precedes preflight"
-  need_order "$NORM" "$L" "EXIT_TASK_PREFLIGHT_OK" "EXIT_TASK_LIFECYCLE_TRANSITION" \
-    "preflight precedes the lifecycle transition"
-  need_order "$NORM" "$L" "EXIT_TASK_LIFECYCLE_TRANSITION" "EXIT_TASK_DISPOSITION_PUBLISHED" \
-    "teardown precedes the disposition"
-  need_order "$NORM" "$L" "EXIT_TASK_DISPOSITION_PUBLISHED" "EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64" \
-    "the in-lock bypass is armed from the published disposition"
-  need_order "$NORM" "$L" "EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64" "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64" \
-    "the bypass is decided under the lock, the release attested after"
-  need_order "$NORM" "$L" "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64" "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64" \
-    "the consumer runs after the broad lock is released"
-  need_order "$NORM" "$L" "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64" "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64" \
-    "the consumer runs after every post-lock drain"
-  need_order "$NORM" "$L" "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64" "EXIT_TASK_EXITING_NOT_CURRENT arch=aarch64" \
-    "identity is validated after consumption"
-  need_order "$NORM" "$L" "EXIT_TASK_EXITING_NOT_CURRENT arch=aarch64" "EXIT_TASK_ABSENCE_VALIDATED arch=aarch64" \
-    "full-identity absence follows the not-current check"
-  need_order "$NORM" "$L" "EXIT_TASK_ABSENCE_VALIDATED arch=aarch64" "EXIT_TASK_RESTORE_OWNER arch=aarch64" \
-    "the restore owner is named after absence is established"
-  need_order "$NORM" "$L" "EXIT_TASK_RESTORE_OWNER arch=aarch64" "EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64" \
-    "a surviving task makes progress after the exit"
-  need_order "$NORM" "$L" "EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64" "EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64" \
-    "terminal health is the last thing proven"
+  need_order "$NORM" "$L" "EXIT_TASK_SPLIT_ENTER" "EXIT_TASK_SYSCALL_DISPATCHED nr=16" \
+    "the split edge is counted at the route's entry"
+
+  # ── the dead task is never reselected, and never eret'd back into ─────────────────
+  RESUMED=$(rg -a -o -r '$1' "AARCH64_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu=0 tid=([0-9]+)" "$SLICE" | head -1)
+  [[ -n "$RESUMED" ]] || die "[$L] the drain installed no incoming task"
+  note "advance resumed tid=$RESUMED (exiting tid=$EXITING_TID)"
+  [[ "$RESUMED" != "$EXITING_TID" ]] || die "[$L] the drain reselected the EXITING task"
+  rg -a -q -F "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid=$EXITING_TID" "$SLICE" \
+    && die "[$L] a dead task's frame was committed for return"
+  rg -a -q -F "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid=$EXITING_TID" "$SLICE" \
+    && die "[$L] a dead task's address space was installed for return"
 
   # Single boot instance: one QEMU launch, one firmware banner, one kernel entry, one boot
   # completion and exactly one distinct boot nonce.
@@ -297,5 +339,9 @@ if (( fail )); then
 fi
 
 echo "$SEAL arch=aarch64 sha=$SHA0 tree=$TREE0 live_cells=1 boots=1 nr16_dispatches=1 \
-consumer_after_broad_lock_release=1 consumer_after_post_lock_drain=1 consumer_before_arch_restore=1 \
-old_frame_restores=0 syscall_returns=0 trap_depth_clears=0 feature_off_oracle_literals=0 result=ok"
+terminal_broad_dispatcher_entries=0 split_route_entries=1 split_route_declines=0 exit_claims_retired=1 \
+dispositions_published=0 dispositions_consumed=0 inlock_bypass_armings=0 \
+queue_advance_deferrals_committed=1 exiting_frames_captured=0 broad_dispatch_skips_after_commit=1 \
+post_lock_drain_selections=1 exiting_task_reselections=0 dead_task_user_returns=0 \
+old_frame_restores=0 syscall_returns=0 trap_depth_clears=0 duplicate_deferrals=0 \
+retired_broad_pipeline_markers_remaining=0 feature_off_oracle_literals=0 result=ok"

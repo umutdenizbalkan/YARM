@@ -100733,12 +100733,31 @@ mod stage200d0c1_aarch64_exit_prep {
             .nth(1)
             .expect("bypass marker");
         assert!(!inlock[..inlock.find("result=ok").expect("terminated")].contains("broad_lock=0"));
-        // The runner enforces all of this on the live log, per whole line.
-        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
-        assert!(RUNNER.contains("post-lock marker falsely claims broad_lock=1"));
-        assert!(RUNNER.contains("the in-lock bypass marker falsely claims broad_lock=0"));
-        assert!(RUNNER.contains("release marker does not name the broad-lock holder"));
-        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
+        // The SOURCE-side contract above is unchanged: the broad consumer still exists, and every
+        // marker in it still states the lock condition that actually held where it was emitted.
+        //
+        // What the RUNNER enforces on the live log changed with U9-EXIT1. NR 16 no longer reaches
+        // the terminal acquisition, so none of those markers can be emitted by an exit, and the
+        // runner now requires the whole pipeline ABSENT instead of policing each marker's lock
+        // field. That is strictly stronger: a marker that cannot be emitted cannot lie about its
+        // lock state. The five live checks are re-derived, not dropped.
+        for retired in [
+            "EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64",
+        ] {
+            let block = RUNNER
+                .split("The retired broad pipeline, marker for marker")
+                .nth(1)
+                .expect("the retirement block exists");
+            let block = block.split("need_once").next().expect("bounded");
+            assert!(
+                block.contains(retired),
+                "the retired broad-pipeline marker must be required ABSENT: {retired}"
+            );
+        }
+        assert!(RUNNER.contains("NR 16 still reached the terminal broad dispatcher"));
     }
 
     /// 4. The consumer occurs after ALL shared post-lock drains.
@@ -101757,9 +101776,18 @@ mod stage200d0c1_aarch64_exit_prep {
     #[test]
     fn c26_runner_requires_terminal_health() {
         assert!(RUNNER.contains("\"EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64\""));
+        // U9-EXIT1 moved the ordering claim onto `$SLICE` — the part of the boot log that begins
+        // at the accepted exit. The drain markers it now chains through are shared with FutexWait
+        // and blocking recv, which fire long before the exit, so a whole-log `$NORM` claim would
+        // have been satisfied by somebody else's queue advance. The requirement is the same one;
+        // the evidence it is read from is now the exit's own.
         assert!(RUNNER.contains(
-            "need_order \"$NORM\" \"$L\" \"EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64\" \"EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64\""
+            "need_order \"$SLICE\" \"$L\" \"EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64\" \\\n    \"EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64\""
         ));
+        assert!(
+            RUNNER.contains("awk 'index($0,\"EXIT_TASK_SYSCALL_DISPATCHED nr=16\"){f=1} f'"),
+            "the slice must begin at the accepted exit"
+        );
     }
 
     /// 27. The runner rejects an early QEMU exit and every fatal marker.
@@ -102548,13 +102576,40 @@ mod stage200d0d1_riscv_exit_prep {
     /// 30. The runner rejects false lock ordering, and every declared-but-unwired shape.
     #[test]
     fn r30_runner_rejects_false_ordering_and_unwired_declarations() {
-        // Per-line lock-state, both directions.
-        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
-        assert!(RUNNER.contains("the in-lock bypass marker does not state broad_lock=1"));
-        assert!(RUNNER.contains("the in-lock bypass marker falsely claims broad_lock=0"));
-        // Consumer strictly after the drains.
-        assert!(RUNNER.contains("the consumer runs after every Phase-3 drain"));
-        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
+        // Per-line lock-state and consumer ordering — RE-DERIVED by U9-EXIT1.
+        //
+        // Those checks policed the lock-state FIELD on each marker of the broad pipeline, and the
+        // consumer's position relative to the Phase-3 drains, because that pipeline was where an
+        // exiting NR 16 actually ran. It no longer is: the exit is serviced before the terminal
+        // acquisition, so the runner requires the whole pipeline ABSENT — strictly stronger, since
+        // a marker that cannot be emitted cannot carry a false lock state or a false position.
+        let block = RUNNER
+            .split("The retired broad pipeline, marker for marker")
+            .nth(1)
+            .expect("the retirement block exists");
+        let block = block.split("need_once").next().expect("bounded");
+        for retired in [
+            "EXIT_TASK_INLOCK_BYPASS_ARMED arch=riscv64",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=riscv64",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=riscv64",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=riscv64",
+            "EXIT_TASK_SRET_OWNER arch=riscv64",
+        ] {
+            assert!(
+                block.contains(retired),
+                "the retired broad-pipeline marker must be required ABSENT: {retired}"
+            );
+        }
+        assert!(RUNNER.contains("NR 16 still reached the terminal broad dispatcher"));
+        // What replaced the consumer-after-drains claim: the EXISTING drain runs with the broad
+        // guard already dropped, reverifies THIS exit by exact identity, and arms the SRET for
+        // somebody else.
+        assert!(
+            RUNNER
+                .contains("the EXISTING post-lock drain runs with the broad guard already dropped")
+        );
+        assert!(RUNNER.contains("the drain reverifies THIS exit by exact identity"));
+        assert!(RUNNER.contains("the SRET is armed for the incoming task"));
         // Declared-but-unwritten selector / declared-but-unspawned entry.
         assert!(RUNNER.contains("EXIT_TASK_ORACLE_SLOTS arch=riscv64 slot5=22"));
         assert!(RUNNER.contains("the selector is provisioned before the task is spawned"));
@@ -102568,10 +102623,18 @@ mod stage200d0d1_riscv_exit_prep {
         // `inlock_result_export=0` on the bypass marker — so it exists to fail closed if a
         // future change ever re-introduced an exiting-task result export.
         assert!(RUNNER.contains("EXIT_TASK_EXITING_RESULT_EXPORTED"));
-        assert!(
-            RUNNER.contains("the in-lock bypass did not suppress the exiting task's result export")
-        );
-        assert!(RUNNER.contains("frame_source=replacement_tcb"));
+        // The POSITIVE proof that no result reached the exiting task is re-derived by U9-EXIT1.
+        //
+        // It used to be `inlock_result_export=0` on the in-lock bypass marker, and
+        // `frame_source=replacement_tcb` on the restore. Neither marker exists on this route: the
+        // exit never enters the broad dispatcher, so there is no bypass to arm and no restore to
+        // attribute. What states the same fact now is `captured=0` on the committed advance — the
+        // exiting frame was never saved, so nothing could be written back into it — together with
+        // the drain resuming a different task and never committing the corpse's frame or SATP.
+        assert!(RUNNER.contains("the exiting frame was captured — §3 forbids saving it"));
+        assert!(RUNNER.contains("the drain reselected the EXITING task"));
+        assert!(RUNNER.contains("a dead task's frame was committed for return"));
+        assert!(RUNNER.contains("a dead task's address space was installed for return"));
     }
 
     /// 31. The runner rejects multiple boots, reuse, dirty trees and SHA drift.
