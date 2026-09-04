@@ -262,15 +262,7 @@ pub(crate) fn claim_self_exit_locked(
     }
     let pid = tcb.thread_group_id.0;
     // ── the claim. Nothing above this line wrote anything. ─────────────────────────────────
-    if tcb.blocked_recv_state.take().is_some() {
-        crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=cancel", tid);
-    }
-    tcb.status = TaskStatus::Exited(code);
-    tcb.restart.token = Some(token);
-    // A dead task's asynchronously preempted register file is dead with it. Cleared here for the
-    // same reason the broad path clears it: "cannot match" and "is not there" are different
-    // strengths of the same claim, and the cheaper one belongs at the point of death.
-    tcb.async_preempted = None;
+    apply_self_exit_writes_locked(tcb, code, token);
     Ok(ExitClaim {
         cpu,
         tid,
@@ -280,6 +272,41 @@ pub(crate) fn claim_self_exit_locked(
         restart_token: token,
         status_before,
     })
+}
+
+/// U9-EXIT1 §4 — THE self-exit's TCB writes, in the exact order both routes perform them.
+///
+/// One body, two owners. `claim_self_exit_locked` calls it after its status precondition, under
+/// the split route's rank-2 acquisition; the broad `KernelState::exit_task` calls it inside its own
+/// scoped `with_tcbs_mut`. Neither route can drift from the other, and a fifth write added here
+/// lands on both by construction.
+///
+/// The writes themselves are unchanged from the broad path that has always performed them:
+///
+/// 1. cancel any blocked receive — a corpse has no receive to complete;
+/// 2. `Exited(code)` — the terminal status a later reap is still allowed to claim;
+/// 3. install the caller's freshly minted restart token;
+/// 4. drop the asynchronously preempted register file.
+///
+/// (4) is defence in depth rather than the primary guarantee: the tag is validated against the
+/// exact `{tid, asid, generation}` incarnation at every consumer, so a replacement task reusing the
+/// numeric TID would be refused even without it. It is cleared anyway, because "cannot match" and
+/// "is not there" are different strengths of the same claim and the cheaper one belongs at the
+/// point of death. It is placed AFTER the status and token writes on purpose: the Stage 199D-WA2B
+/// census fingerprints each status assignment by its immediate neighbourhood, and this clear has no
+/// ordering requirement of its own.
+pub(crate) fn apply_self_exit_writes_locked(
+    tcb: &mut ThreadControlBlock,
+    code: u64,
+    token: RestartToken,
+) {
+    let tid = tcb.tid.0;
+    if tcb.blocked_recv_state.take().is_some() {
+        crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=cancel", tid);
+    }
+    tcb.status = TaskStatus::Exited(code);
+    tcb.restart.token = Some(token);
+    tcb.async_preempted = None;
 }
 
 /// Undo a claim, restoring the exact incarnation to its exact pre-claim state.

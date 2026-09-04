@@ -96,26 +96,21 @@ impl KernelState {
                 .flatten()
                 .find(|tcb| tcb.tid.0 == tid)
                 .ok_or(KernelError::TaskMissing)?;
-            if tcb.blocked_recv_state.take().is_some() {
-                crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=cancel", tid);
-            }
-            tcb.status = TaskStatus::Exited(code);
-            tcb.restart.token = Some(RestartToken(token));
-            // Canonical 199E-R1D: a dead task's asynchronously preempted register file is dead
-            // with it. Dropping the tag here makes the snapshot UNREACHABLE at the moment the
-            // task stops being resumable, so nothing can later restore a corpse's registers.
+            // U9-EXIT1 §4 — THE self-exit writes, delegated to the one body the split route's
+            // claim also runs. Canonical 199E-R1D's `async_preempted` clear moved with them; the
+            // order, the log line and the four fields are byte-for-byte what this closure always
+            // performed, and now neither route can drift from the other.
             //
-            // This is defence in depth rather than the primary guarantee: the tag is validated
-            // against the exact `{tid, asid, generation}` incarnation at every consumer, so a
-            // replacement task reusing the numeric TID would be refused even without this. It is
-            // cleared anyway, because "cannot match" and "is not there" are different strengths
-            // of the same claim and the cheaper one belongs at the point of death.
-            //
-            // Placed AFTER the status/restart writes on purpose: the Stage 199D-WA2B wake-owner
-            // census fingerprints each status assignment by its immediate neighbourhood, and
-            // this clear has no ordering requirement of its own — it runs in the same closure,
-            // under the same lock, before anything can observe the exit.
-            tcb.async_preempted = None;
+            // The status PRECONDITION stays a difference between the two routes, deliberately:
+            // `claim_self_exit_locked` admits `Running` and nothing else, because a split exit is
+            // a task's first terminal edge, while this path is also reached for a task some other
+            // owner has already moved. Sharing the writes does not share a precondition neither
+            // route wants the other's.
+            crate::kernel::boot::exit_claim::apply_self_exit_writes_locked(
+                tcb,
+                code,
+                RestartToken(token),
+            );
             Ok::<_, KernelError>(())
         })?;
         // Stage 173 (CAP-CNODE): default-off on-exit cap-revoke markers. Diagnostic

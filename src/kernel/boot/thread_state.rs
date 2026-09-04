@@ -2573,22 +2573,14 @@ impl KernelState {
     }
 
     pub(crate) fn wake_joiners_for(&mut self, target_tid: u64) -> Result<u32, KernelError> {
-        let wake_tids = self.with_tcbs_mut(|tcbs| {
-            let mut wake_tids = [None; super::MAX_TASKS];
-            let mut wake_count = 0usize;
-            for tcb in tcbs.iter_mut().flatten() {
-                if tcb.status != TaskStatus::Blocked(WaitReason::Join(ThreadId(target_tid))) {
-                    continue;
-                }
-                tcb.status = TaskStatus::Runnable;
-                if wake_count < wake_tids.len() {
-                    wake_tids[wake_count] = Some(tcb.tid.0);
-                    wake_count += 1;
-                }
-            }
-            (wake_tids, wake_count)
+        // U9-EXIT1 §4 — one body, two owners. The rank-2 half lives in `exit_claim`, where the
+        // split route's exit transaction drives it; this is that same body under the broad guard,
+        // so a joiner wake cannot differ by route. The rank-1 enqueues stay here, after the
+        // acquisition releases — which is the property that made the two halves separable at all.
+        let mut wake_tids = [None; super::MAX_TASKS];
+        let wake_count = self.with_tcbs_mut(|tcbs| {
+            super::exit_claim::wake_joiners_for_locked(tcbs, target_tid, &mut wake_tids)
         });
-        let (wake_tids, wake_count) = wake_tids;
         for wake_tid in wake_tids.iter().take(wake_count).flatten() {
             self.enqueue_task(*wake_tid)?;
         }

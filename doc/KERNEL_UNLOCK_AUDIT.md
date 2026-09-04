@@ -4046,6 +4046,19 @@ rank order (task 2, then scheduler 1). It cannot act on a receiver that any send
 because no waiter exists for it to be found through.
 | `capability_lifecycle_state.rs` | `wake_destroyed_notification_waiter_split` | 1 |
 | `exit_claim.rs` | `wake_joiners_for_locked` | 1 |
+| `exit_claim.rs` | `apply_self_exit_writes_locked` | 1 |
+
+**U9-EXIT1 §4 — `apply_self_exit_writes_locked`.** The self-exit's four TCB writes — cancel the
+blocked receive, `Exited(code)`, install the freshly minted restart token, drop the asynchronously
+preempted register file — in the one body BOTH NR 16 routes run. It replaces two rows rather than
+adding one: `restart_state::exit_task`'s status write and `thread_state::wake_joiners_for`'s joiner
+wake both now delegate here and to `wake_joiners_for_locked`, so the census falls 47 -> 45 by
+de-duplication. It is a CAN path, and deliberately not classified by the guard nearest to it:
+`claim_self_exit_locked` applies `status_is_self_exitable` (`Running` and nothing else) before
+calling it, but the broad `exit_task` applies no status precondition at all, so the shared body can
+still write `Exited` over a `Blocked` task exactly as `exit_task` always could. Its origins are
+exactly two: the split route's `run_exit_transaction`, through the claim, and the broad
+`handle_exit_current_task`, through `exit_task`.
 
 **Layer 2 — logical origins**, i.e. every direct production caller of each helper writer:
 

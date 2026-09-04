@@ -119025,8 +119025,14 @@ mod stage199d_wa2a_ownership_boundary {
             ("src/kernel/boot/reap_claim.rs", 2),
             // U9-REAP1 §2: 4 -> 3. `reap_faulted_task_noalloc_cleanup`'s direct
             // `tcb.status = Dead` moved into the claim above, which is the reap's linearization
-            // point. The file keeps its other three writers unchanged.
-            ("src/kernel/boot/restart_state.rs", 3),
+            // point.
+            //
+            // U9-EXIT1 §4: 3 -> 2. `exit_task`'s `tcb.status = Exited(code)` moved into
+            // `exit_claim::apply_self_exit_writes_locked`, the ONE body both NR 16 routes run.
+            // It did not multiply and it did not change — the broad path calls that body inside
+            // the same scoped acquisition it always used — so the census records the write at its
+            // new home rather than at two.
+            ("src/kernel/boot/restart_state.rs", 2),
             ("src/kernel/boot/scheduler_state.rs", 1),
             // U9-SPAWN1 SP-2: `spawn_user_thread`'s Runnable write moved to the shared
             // thread-incarnation owner, so thread_state.rs falls 4 -> 3 and the owner gains 1.
@@ -119037,7 +119043,11 @@ mod stage199d_wa2a_ownership_boundary {
             // the child becomes Runnable through `commit_live_spawn` — an already-enumerated
             // writer in `spawn_reservation.rs` — and this file loses a status writer rather than
             // gaining one. The census total falls by one; no new candidate wake owner exists.
-            ("src/kernel/boot/thread_state.rs", 2),
+            // U9-EXIT1 §4: 2 -> 1. `wake_joiners_for`'s `Blocked(Join) -> Runnable` write moved
+            // into `exit_claim::wake_joiners_for_locked`, already enumerated above as one of that
+            // file's three. The broad owner now drives the same rank-2 body the split route's exit
+            // transaction does, and keeps its own rank-1 enqueues after the acquisition releases.
+            ("src/kernel/boot/thread_state.rs", 1),
             ("src/kernel/spawn_reservation.rs", 2),
             ("src/kernel/task.rs", 2),
             ("src/kernel/task_transition.rs", 1),
@@ -119097,7 +119107,7 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            42,
+            40,
             "38 raw writes (U6 added `commit_blocking_send_split`; U7 added \
              `drain_send_timeout_post_work`; U9-F added \
              `wake_destroyed_notification_waiter_split`; U9-RX3 added the exact BLOCK/UNWIND \
@@ -119105,7 +119115,9 @@ mod stage199d_wa2a_ownership_boundary {
              RETIRED `fork_complete_post_clone`'s direct Runnable write, 36 -> 35, because the \
              fork child now becomes live through the reservation commit; U9-REAP1 MOVED the \
              faulted reap's `-> Dead` write into the claim and added its exact inverse, \
-             35 -> 36; U9-EXIT1 added the self-exit claim, its inverse and the rank-2 half of the \
+             35 -> 36; U9-EXIT1 §2 added the self-exit claim, its inverse and the rank-2 half of \
+             the joiner wake, 36 -> 39, and U9-EXIT1 §4 then made the BROAD NR 16 delegate to \
+             those same two bodies instead of keeping its own copies, 39 -> 37; the rank-2 half of the
              joiner wake, 36 -> 39), the WA3A barrier's single write, and the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
@@ -119554,11 +119566,18 @@ mod stage199d_wa2b_wake_owner_census {
         // acquisition that performs the write, behind a predicate (`status_is_self_exitable`) that
         // admits `Running` and nothing else. A blocked task is refused by a precondition no caller
         // can bypass.
+        // U9-EXIT1 §4: the write is in `apply_self_exit_writes_locked`, the body BOTH routes run,
+        // and its verdict is `Can` rather than the `Cannot` the claim carried. The predicate that
+        // made it `Cannot` — `status_is_self_exitable`, admitting `Running` and nothing else —
+        // still gates `claim_self_exit_locked`, but it does NOT gate the broad `exit_task`, which
+        // reaches the same body with no status precondition. Classifying the shared body by the
+        // stricter of its two callers would be recording the guard that happens to be nearest
+        // rather than the one every caller applies.
         (
             "src/kernel/boot/exit_claim.rs",
-            "claim_self_exit_locked",
+            "apply_self_exit_writes_locked",
             1,
-            Verdict::Cannot,
+            Verdict::Can,
         ),
         (
             "src/kernel/boot/exit_claim.rs",
@@ -119598,13 +119617,12 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::Cannot,
         ),
-        // ── restart_state.rs (3) ────────────────────────────────────────────────────────────
-        (
-            "src/kernel/boot/restart_state.rs",
-            "exit_task",
-            1,
-            Verdict::Can,
-        ),
+        // ── restart_state.rs (2) — U9-EXIT1 §4 ──────────────────────────────────────────────
+        //
+        // `exit_task`'s row moved to `exit_claim::apply_self_exit_writes_locked`, carrying its
+        // `Can` verdict with it: the shared body has no status precondition of its own, and the
+        // broad caller applies none, so it can still write `Exited` over a `Blocked` task. That
+        // was true of `exit_task` and it is true here; the classification follows the write.
         (
             "src/kernel/boot/restart_state.rs",
             "restart_task",
@@ -119640,12 +119658,9 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::IntoBlocked,
         ),
-        (
-            "src/kernel/boot/thread_state.rs",
-            "wake_joiners_for",
-            1,
-            Verdict::Cannot,
-        ),
+        // U9-EXIT1 §4 RETIRED this row along with the write it classified: `wake_joiners_for`
+        // now drives `exit_claim::wake_joiners_for_locked`, enumerated there as `Can`, and the
+        // `Blocked(Join)`-only gate that made this row `Cannot` moved with the body.
         // U9-SPAWN1 SP-2: `spawn_user_thread`'s status write moved into the shared
         // thread-incarnation owner, so the site is enumerated at its new home. The verdict is
         // unchanged and for the same reason: the TCB it writes sits at a slot index that was
@@ -119990,7 +120005,7 @@ mod stage199d_wa2b_wake_owner_census {
         // ordering it encodes (publish, then Runnable) is exactly what moved with it.
         (
             "src/kernel/boot/exit_claim.rs",
-            "claim_self_exit_locked",
+            "apply_self_exit_writes_locked",
             "tcb.status",
             "TaskStatus::Exited(code)",
             "}",
@@ -120109,14 +120124,9 @@ mod stage199d_wa2b_wake_owner_census {
             "};",
             "tcb.restart.token = claim.restart_token;",
         ),
-        (
-            "src/kernel/boot/restart_state.rs",
-            "exit_task",
-            "tcb.status",
-            "TaskStatus::Exited(code)",
-            "}",
-            "tcb.restart.token = Some(RestartToken(token));",
-        ),
+        // U9-EXIT1 §4 RETIRED this fingerprint along with the write it pinned: the four self-exit
+        // writes are now `exit_claim::apply_self_exit_writes_locked`'s, fingerprinted there with
+        // the same neighbourhood.
         (
             "src/kernel/boot/restart_state.rs",
             "restart_task",
@@ -120157,14 +120167,8 @@ mod stage199d_wa2b_wake_owner_census {
             ".ok_or(KernelError::TaskMissing)?;",
             "Ok::<_, KernelError>(())",
         ),
-        (
-            "src/kernel/boot/thread_state.rs",
-            "wake_joiners_for",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            "}",
-            "if wake_count < wake_tids.len() {",
-        ),
+        // U9-EXIT1 §4 RETIRED this fingerprint along with the write it pinned: the joiner wake is
+        // now `exit_claim::wake_joiners_for_locked`'s, fingerprinted there.
         // U9-FORK1 §4 RETIRED this fingerprint along with the write it pinned.
         (
             "src/kernel/task.rs",
@@ -120357,7 +120361,7 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            38,
+            36,
             "35 raw writes (U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
              write, 33 -> 32, when the fork moved onto the spawn reservation lifecycle): U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
@@ -120367,7 +120371,9 @@ mod stage199d_wa2b_wake_owner_census {
              `drain_send_timeout_post_work`, which is the SAME blocking-send timeout wake \
              `process_ipc_timeout_deadlines` used to perform under the broad lock; canonical \
              199E added `drain_recv_timeout_post_work`, the same relocation for the ordinary \
-             receive timeout"
+             receive timeout; U9-EXIT1 §4 retired TWO, `restart_state::exit_task`'s and \
+             `thread_state::wake_joiners_for`'s, when the broad NR 16 began driving the same two \
+             bodies the split route does — 38 -> 36, a de-duplication rather than a removal"
         );
         for (i, (file, function, lhs, rhs, before, after)) in sites.iter().enumerate() {
             let (pf, pfn, plhs, prhs, pbefore, pafter) = FINGERPRINTS[i];
@@ -120434,11 +120440,13 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            47,
+            45,
             "U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43; U9-REAP1 §2 moved \
              the faulted reap's `-> Dead` write into its claim and added the claim's exact \
              inverse, 43 -> 44; U9-EXIT1 §2 added the self-exit claim, its exact inverse and the \
-             rank-2 half of the joiner wake, 44 -> 47. \
+             rank-2 half of the joiner wake, 44 -> 47; U9-EXIT1 §4 then retired the broad \
+             `exit_task` and `wake_joiners_for` rows when both began driving those same bodies, \
+             47 -> 45. \
              36 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
              `commit_blocking_send_split`, U3 (203C)'s `wake_tid_to_runnable_split`, and U7 \
              (199E)'s `drain_send_timeout_post_work`"
@@ -120453,7 +120461,7 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            47,
+            45,
             "35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
              `fork_complete_post_clone`'s, 35 -> 34; U9-REAP1 §2 moved the faulted reap's \
              `-> Dead` write into its claim and added the claim's exact inverse, 34 -> 35) + 8 \
@@ -120790,7 +120798,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            47,
+            45,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -120833,7 +120841,17 @@ mod stage199d_wa2b_wake_owner_census {
             // predicate that admits only `Running`. `wake_joiners_for_locked` is a genuine CAN and
             // is classified as one: it moves a task out of `Blocked(Join)`, and it is the rank-2
             // half of `wake_joiners_for`, which is already CAN.
-            (15, 20, 9, 2, 1)
+            //
+            // U9-EXIT1 §4: CAN stays 15 and CANNOT 20 -> 18, from THREE movements that net out.
+            // The broad `exit_task` (CAN) and `wake_joiners_for` (CANNOT) rows retire, because
+            // both now drive the bodies the split route already enumerated — the writes were
+            // de-duplicated, not removed. And the surviving self-exit write is reclassified CAN,
+            // because its enclosing function is now `apply_self_exit_writes_locked`, which the
+            // broad caller reaches with NO status precondition. Classifying it `Cannot` on the
+            // strength of the guard its OTHER caller applies would record the nearest guard
+            // rather than the one every caller applies, which is precisely the error this census
+            // exists to catch.
+            (15, 18, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -120893,12 +120911,8 @@ mod stage199d_wa2b_wake_owner_census {
                 "if request_client && self.task_status(client_tid).is_none() {",
                 "let client_tid = base_tid + 1000;",
             ),
-            (
-                "thread_state.rs",
-                "wake_joiners_for",
-                "if tcb.status != TaskStatus::Blocked(WaitReason::Join(ThreadId(target_tid))) {",
-                "for tcb in tcbs.iter_mut().flatten() {",
-            ),
+            // U9-EXIT1 §4 RETIRED this row: the write it guarded moved to
+            // `exit_claim::wake_joiners_for_locked`, which carries the identical gate.
             (
                 "spawn_thread_core.rs",
                 "initialize_thread_incarnation_locked",
@@ -120932,16 +120946,11 @@ mod stage199d_wa2b_wake_owner_census {
             // There is no window between them for a task to become `Blocked`, which is exactly
             // what the base path — reading the status in the handler and writing it in the
             // cleanup — could not say.
-            // U9-EXIT1 §2: the self-exit claim, and the same closure argument as the reap's. The
-            // target is the CPU's own `current`, so it is not caller-selected at all; and the
-            // status the guard tests is the same read the write replaces, taken inside one
-            // acquisition, so there is no window in which the task could become `Blocked`.
-            (
-                "exit_claim.rs",
-                "claim_self_exit_locked",
-                "if !status_is_self_exitable(status_before) {",
-                "let status_before = tcb.status;",
-            ),
+            // U9-EXIT1 §4 RETIRED this proof with the row it justified. The write moved into
+            // `apply_self_exit_writes_locked`, which the broad `exit_task` also calls WITHOUT
+            // `status_is_self_exitable` in front of it, so the site is `Can` and no guard proof is
+            // owed. `claim_self_exit_locked` still applies the predicate for the split route — it
+            // is simply no longer the enclosing function of a status write.
             // Its inverse: the guard is the exact-incarnation match, and the value it writes is
             // the claim's captured `status_before`, which `status_is_self_exitable` restricts to
             // `Running`.
@@ -135060,10 +135069,17 @@ mod riscv64_async_preemption {
             snap.contains("if tid == 0 {"),
             "the idle identity publishes nothing"
         );
-        // Death clears it.
+        // Death clears it. U9-EXIT1 §4 moved the four self-exit writes — the status, the restart
+        // token, the blocked-receive cancel and this clear — into the ONE body both NR 16 routes
+        // run, so the clear is pinned where it now lives. It did not multiply and it did not
+        // change: `exit_task` calls the same body under the broad guard.
         assert!(
-            include_str!("restart_state.rs").contains("tcb.async_preempted = None;"),
+            include_str!("exit_claim.rs").contains("tcb.async_preempted = None;"),
             "exit must make the snapshot unreachable"
+        );
+        assert!(
+            include_str!("restart_state.rs").contains("apply_self_exit_writes_locked("),
+            "the broad exit must reach that clear through the shared body"
         );
         // Canonical 199E-R2 — the ONE classifier checks three-way identity agreement and fails
         // closed on every path that is not a clean match.
@@ -159977,6 +159993,88 @@ mod u9exit1_self_exit_transaction {
             assert!(
                 !EXIT_CLAIM.contains(&alloc::format!("pub(crate) fn {shared_body}")),
                 "{shared_body} must NOT be reimplemented for the exit"
+            );
+        }
+    }
+
+    /// §4 — the BROAD NR 16 delegates to the same claim and cleanup owners.
+    ///
+    /// It cannot delegate the whole transaction: the broad path admits a population this route
+    /// refuses before any mutation (a `Detached` thread, whose closure reaches `mark_task_dead`'s
+    /// allocating general revoke, and a robust-futex publisher, whose registry has no split lock
+    /// domain), and widening the transaction to cover them would violate §4's own no-allocation
+    /// rule. What it CAN delegate — and now does — is every body the two routes share.
+    #[test]
+    fn the_broad_exit_drives_the_same_bodies_the_split_route_does() {
+        const RESTART: &str = include_str!("restart_state.rs");
+        const THREAD: &str = include_str!("thread_state.rs");
+
+        // 1. The four self-exit TCB writes live ONCE, and both routes call that one body.
+        assert_eq!(
+            EXIT_CLAIM
+                .matches("pub(crate) fn apply_self_exit_writes_locked")
+                .count(),
+            1,
+            "the self-exit writes must live in exactly one body"
+        );
+        assert!(
+            RESTART.contains("exit_claim::apply_self_exit_writes_locked("),
+            "the broad `exit_task` must call the shared body"
+        );
+        assert!(
+            EXIT_CLAIM.contains("apply_self_exit_writes_locked(tcb, code, token);"),
+            "the split claim must call the shared body"
+        );
+        // The broad path no longer carries its own copy of any of the four.
+        for own_copy in [
+            "tcb.status = TaskStatus::Exited(code)",
+            "tcb.restart.token = Some(RestartToken(token))",
+        ] {
+            assert!(
+                !RESTART.contains(own_copy),
+                "the broad exit must not keep its own `{own_copy}`"
+            );
+        }
+
+        // 2. The joiner wake likewise: one rank-2 body, two owners, rank-1 enqueues left to each.
+        assert!(
+            THREAD
+                .contains("exit_claim::wake_joiners_for_locked(tcbs, target_tid, &mut wake_tids)"),
+            "the broad `wake_joiners_for` must drive the shared rank-2 body"
+        );
+        assert!(
+            !THREAD.contains("tcb.status = TaskStatus::Runnable;"),
+            "the broad joiner wake must not keep its own status write"
+        );
+        let broad = THREAD
+            .split("pub(crate) fn wake_joiners_for(")
+            .nth(1)
+            .expect("the broad owner");
+        let broad = &broad[..broad
+            .find(
+                "
+    }",
+            )
+            .unwrap_or(broad.len())];
+        let locked_at = broad
+            .find("wake_joiners_for_locked")
+            .expect("the shared body");
+        let enqueue_at = broad
+            .find("self.enqueue_task(")
+            .expect("the rank-1 enqueues");
+        assert!(
+            locked_at < enqueue_at,
+            "the rank-1 enqueues must follow the rank-2 acquisition, on both owners"
+        );
+
+        // 3. And the reply/waiter sweeps the two routes share are REAP1's, driven from both.
+        for shared_body in [
+            "revoke_reply_caps_for_caller_identity",
+            "clear_ipc_waiters_for",
+        ] {
+            assert!(
+                RESTART.contains(shared_body) && EXIT_TXN.contains(shared_body),
+                "both routes must drive the shared `{shared_body}`"
             );
         }
     }
