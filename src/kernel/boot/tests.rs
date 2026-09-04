@@ -100283,13 +100283,49 @@ mod stage200d0b3_x86_exit_corrected {
         assert!(RUNNER.contains(
             "\"EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64 cpu=0 broad_lock=0 result=ok\""
         ));
-        // 3. `broad_lock=0` on an in-lock marker fails the run.
-        assert!(RUNNER.contains("in-lock marker falsely claims broad_lock=0"));
-        assert!(RUNNER.contains("in-lock marker does not state broad_lock=1"));
-        // 4. A missing REAL post-lock drain completion fails the run: the marker must attest
-        //    `drains=all`, not merely exist.
-        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
-        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
+        // 3 and 4 — RE-DERIVED by U9-EXIT1, not deleted.
+        //
+        // Stage 200D-0B3 policed the lock-state FIELD on each marker of the broad pipeline,
+        // because that pipeline was where an exiting NR 16 actually ran and the field was the only
+        // thing that could lie about it. U9-EXIT1 retires the pipeline: NR 16 is serviced before
+        // the terminal acquisition, so `DISPOSITION_CONSUMED`, `EXITING_NOT_CURRENT`,
+        // `ABSENCE_VALIDATED`, `RESTORE_OWNER_PREPARED`, `BROAD_LOCK_RELEASED`,
+        // `POST_LOCK_DRAIN_DONE` and `COMMON_EPILOGUE_OWNER` are not reworded — they are
+        // REQUIRED ABSENT.
+        //
+        // That is the STRONGER form of the same refusal, and it is why these two assertions now
+        // read the way they do: a marker that cannot be emitted cannot carry a false lock state,
+        // and a runner satisfied by any of them is a runner accepting an exit that still reached
+        // the acquisition this stage removed.
+        let retired_block = RUNNER
+            .split("The retired broad pipeline, marker for marker")
+            .nth(1)
+            .expect("the retirement block exists");
+        let retired_block = retired_block
+            .split("need_once")
+            .next()
+            .expect("the retirement block ends at the positive list");
+        for retired in [
+            "EXIT_TASK_PREFLIGHT_OK",
+            "EXIT_TASK_DISPOSITION_PUBLISHED",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64",
+            "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64",
+            "EXIT_TASK_ABSENCE_VALIDATED arch=x86_64",
+            "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64",
+            "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64",
+        ] {
+            assert!(
+                retired_block.contains(retired),
+                "the retired broad-pipeline marker must be required ABSENT: {retired}"
+            );
+        }
+        // And the retirement is measured at the edge, not inferred: the broad handler's own entry
+        // marker must count zero, and the split route's must count the accepted exit.
+        assert!(RUNNER.contains("NR 16 still reached the terminal broad dispatcher"));
+        assert!(RUNNER.contains("split-route entries != 1"));
+        assert!(RUNNER.contains("the split route declined an admitted exit"));
         // The superseded in-lock ownership marker must not be accepted either.
         assert!(RUNNER.contains("\"EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64\""));
         // Those four forbidden strings are checked by `need_absent`, i.e. presence = failure.
@@ -100308,13 +100344,25 @@ mod stage200d0b3_x86_exit_corrected {
                 "the old marker must be in the need_absent list: {forbidden}"
             );
         }
-        // And the corrected ordering is enforced across the lock boundary.
+        // And the ordering claim that replaced the lock-boundary one. The broad lock is no longer
+        // in this syscall's path at all, so the boundary that now has to be proven is the
+        // deferral's: the seam commits the advance, the broad dispatch is skipped, and the
+        // EXISTING post-lock drain — not a second one — selects and installs the next task.
         assert!(
-            RUNNER.contains("the post-lock drains run after the broad lock is actually released")
+            RUNNER.contains(
+                "the deferral is published before the seam answers QueueAdvanceCommitted"
+            )
         );
+        assert!(RUNNER.contains("the committed advance skips the broad dispatch exactly once"));
         assert!(
-            RUNNER.contains("the epilogue commits the user frame only after every drain completed")
+            RUNNER
+                .contains("the EXISTING post-lock drain runs after the broad dispatch is skipped")
         );
+        assert!(RUNNER.contains("the drain selects and installs an incoming task"));
+        // The exiting frame is never saved, and the dead task is never resumed.
+        assert!(RUNNER.contains("the exiting frame was captured — §3 forbids saving it"));
+        assert!(RUNNER.contains("the drain reselected the EXITING task"));
+        assert!(RUNNER.contains("a dead task was returned to userspace"));
     }
 
     /// (§2) The six production side effects that must never occur under the broad lock, each
@@ -160017,8 +160065,11 @@ mod u9exit1_self_exit_transaction {
             1,
             "the split route must be marked exactly once"
         );
-        assert!(!SPLIT.contains("EXIT_TASK_BROAD_ENTER"));
-        assert!(!SYSCALL.contains("EXIT_TASK_SPLIT_ENTER"));
+        // Neither marker may be EMITTED from the other route, or the edge count is meaningless.
+        // Anchored on the log-call format strings: each route's commentary names the other's
+        // marker to explain why the pair exists, and prose is not emission.
+        assert!(!SPLIT.contains("\"EXIT_TASK_BROAD_ENTER tid={}"));
+        assert!(!SYSCALL.contains("\"EXIT_TASK_SPLIT_ENTER tid={}"));
         // Both routes still emit the shared invocation marker, so the oracle can compare them.
         assert!(
             SYSCALL.contains("EXIT_TASK_SYSCALL_DISPATCHED")
@@ -160047,6 +160098,28 @@ mod u9exit1_self_exit_transaction {
         assert!(
             enter < declined,
             "a refused broad exit still counts as an edge"
+        );
+        // The split edge is counted the same way: at the route's own entry, BEFORE the transaction
+        // that may refuse. An edge counted only on success would make a route that declines every
+        // trap indistinguishable from a route that was never reached — which is precisely the
+        // ambiguity the first live run had to be re-run to resolve.
+        let route = SPLIT
+            .split("fn try_split_exit_current_task(")
+            .nth(1)
+            .expect("the split route must exist");
+        let split_enter = route
+            .find("\"EXIT_TASK_SPLIT_ENTER tid={}")
+            .expect("the split edge marker's log call");
+        let txn = route
+            .find("run_exit_transaction(")
+            .expect("the route must run the transaction");
+        assert!(
+            split_enter < txn,
+            "the split edge must be counted before the transaction can refuse"
+        );
+        assert!(
+            route.contains("EXIT_TASK_SPLIT_DECLINED"),
+            "a declined split must be attributable, or the edge count cannot be read"
         );
     }
 

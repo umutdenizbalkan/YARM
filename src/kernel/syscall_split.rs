@@ -3852,6 +3852,19 @@ fn try_split_exit_current_task(
     if frame.syscall_num() != crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR {
         return D::NotHandled;
     }
+    // U9-EXIT1 §6 — the split half of the terminal-edge measurement, emitted at the route's OWN
+    // entry for the same reason `EXIT_TASK_BROAD_ENTER` is: an edge that were counted only on
+    // success would report a route that declines every trap as a route that was never reached.
+    // Paired with `EXIT_TASK_SPLIT_DECLINED`, this is what makes the retirement claim falsifiable.
+    let entering = shared.current_tid_authoritative(cpu).unwrap_or(0);
+    crate::yarm_log!(
+        "EXIT_TASK_SPLIT_ENTER tid={} asid={} result=ok",
+        entering,
+        shared
+            .task_asid_opt_split_read(entering)
+            .unwrap_or(crate::kernel::vm::Asid(0))
+            .0
+    );
     let mut owners = SharedExitOwners { shared };
     match run_exit_transaction(
         &mut owners,
@@ -3860,14 +3873,8 @@ fn try_split_exit_current_task(
     ) {
         Ok(outcome) => {
             let claim = &outcome.claim;
-            // The same three markers the broad handler emits, in the broad handler's causal order,
-            // so an observer sees one vocabulary for one syscall regardless of route.
-            // U9-EXIT1 §6: the split half of the edge measurement, per invocation.
-            crate::yarm_log!(
-                "EXIT_TASK_SPLIT_ENTER tid={} asid={} result=ok",
-                claim.tid(),
-                claim.sweep_asid().0
-            );
+            // The same markers the broad handler emits, so an observer sees one vocabulary for one
+            // syscall regardless of route.
             crate::yarm_log!(
                 "EXIT_TASK_SYSCALL_DISPATCHED nr={} tid={} asid={} target=self result=ok",
                 crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR,
