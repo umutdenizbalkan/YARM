@@ -54,6 +54,7 @@ pub(crate) use ipc_state::{
     enqueue_reply_into_endpoint_locked, publish_recv_waiter_locked, reclaim_reply_authority_with,
     release_reply_terminal_locked, reserve_direct_reply_record_locked,
 };
+pub(crate) mod cleared_current;
 pub(crate) mod exit_claim;
 mod memory_lifecycle_state;
 mod memory_state;

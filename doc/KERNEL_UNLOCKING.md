@@ -14049,5 +14049,139 @@ both are states no correct program can produce, and the markers `EXIT_TASK_SPLIT
 `EXIT_TASK_SPLIT_FAILED_CLOSED` distinguish them for an operator — but if a future stage ever needs
 userspace to tell them apart, it will need a second code.
 
+---
+
+## U9-EXIT3 — the post-clear settlements
+
+### §1 — what `Complete(Err)` actually does, and why EXIT2 was unsafe
+
+U9-EXIT2 settled a post-clear failure with `Complete(Err(SyscallError::Internal))` and reasoned
+about it as "a typed fail-closed answer". Reading the trap bridge rather than the disposition's name
+shows what it is:
+
+```rust
+Err(TrapHandleError::Syscall(e)) => {
+    frame.set_err(e.code());
+    finalize_split_handled_syscall(shared, cpu, entering, frame, CompletedInThisTrap);
+    return Ok(());        // -> the arch tail irets/erets/srets THROUGH `frame`
+}
+```
+
+The error reaches userspace by **resuming the entering task** — with `current[cpu] == None`. RISC-V
+is the same shape (`return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)`), and on AArch64
+`CompletedInThisTrap` additionally commits that return into the victim's own TCB, bypassing the
+per-class NR list.
+
+The consequences are not subtle:
+
+* the scheduler believes nothing runs on this CPU while a task runs on it;
+* the task is on no run queue, so once it blocks it is never selected again;
+* every later trap resolves `current_tid()` to `None`;
+* and when the victim lost its claim to a **reap**, the frame resumed belongs to a task that is
+  already `Dead` and whose address space is being torn down.
+
+**Frame finalization is not scheduler ownership.** A settlement may return through the entering
+frame only if that exact incarnation is this CPU's current again. The delivered EXIT2 behaviour is
+recorded here as unsafe, and this stage repairs it.
+
+A second defect fell out of the same trace. `ExitOwners::clear_current` was `block_current_on`, an
+**unconditional** clear. When the scheduler had moved on it removed whatever task was current,
+returned a mismatch, and refused — leaving that task current nowhere and queued nowhere. EXIT2's
+`VictimChanged` arm was not merely mis-settled; it was destructive to a third party.
+
+### §1 — the complete post-clear table
+
+| # | outcome | victim state | who won | frame resumable? | owes advance | settlement |
+|---|---|---|---|---|---|---|
+| 1 | claim succeeds | `Exited(code)` | this transaction | no | yes | advance (`Claimed`) |
+| 2 | claim loses to reap | `Dead` | NR 31 | no | yes | advance |
+| 3 | claim loses to duplicate exit | `Exited(_)` | another NR 16 | no | yes | advance |
+| 4 | TCB disappears | absent | reap + join | no | yes | advance |
+| 5 | TID recycled | replacement, new ASID | spawn | no | yes | advance past the OLD incarnation |
+| 6 | claim finds `Detached` | `Running`, ours, unplaced | nobody | **yes, after restore** | no | **restore** |
+| 7 | claim loses to restart | `Runnable`, requeued | restart | no | drain would refuse | **fatal** |
+| 8 | claim loses to terminal fault | `Faulted` | fault | no | drain would refuse | **fatal** |
+| 9 | cleanup/publication fails after a successful claim | `Exited(code)` | this transaction | no | yes | advance; never rolled back to Running |
+| — | scheduler moved on before the clear | untouched | scheduler | n/a | n/a | **pre-mutation refusal** — nothing was cleared |
+
+Rows 7 and 8 diverge rather than advancing because the existing exit drain's reverify admits
+`Exited | Dead | absent`. Committing an advance past a `Runnable` or `Faulted` victim would hand the
+CPU to a drain that then refuses, leaving an empty current slot and no selection — a different
+unsafe state, reached by a different route. A settlement only commits an advance the drain is
+guaranteed to honour.
+
+### §2 — the token
+
+`ClearedCurrentToken` carries `{cpu, tid, asid}` plus **the priority the removed task held**, which
+is the only record of its placement and therefore the only thing that makes an exact restore
+possible rather than invented.
+
+It is minted by, and only by, `clear_current_exact` — a **compare-and-clear** that mutates nothing
+unless the slot names exactly `tid`. That is the repair for the destructive `VictimChanged` arm, and
+it turns that outcome into a pre-mutation refusal.
+
+The token is `#[must_use]`, has no `Clone`/`Copy`, exposes no fields, and its `Drop` diverges; one
+private `consume` is the only path past `Drop`, so a fourth exit cannot be added without going
+through it. Three consuming settlements, each taking `self`:
+
+1. **`restore_current_exact`** — proves, in order and each under its own acquisition, that the exact
+   `{tid, asid}` incarnation is present, still `Running`, and current-or-queued on **no** CPU; then
+   asks the scheduler for an exact restore, which refuses unless the slot is still empty and the
+   task unqueued. On refusal the token is *returned*, because a failed restore is not a settlement.
+2. **`publish_queue_advance`** — takes an unforgeable `AdvanceAuthority`: either this transaction's
+   own `ExitClaim` (whose `{tid, asid}` is asserted to be the victim's) or an observed
+   non-resumable victim. Uses the already-reserved U9-QA deferral; no second reservation, no second
+   drain.
+3. **`fatal`** — diverges, on the reasoning `dispatch_torn_fatal` already established for the same
+   class of scheduler/task-table disagreement.
+
+Three narrow scheduler primitives support it: `block_current_exact` (compare-and-clear returning the
+removed priority), `restore_exact_current` (refuses into a non-empty slot or a queued task), and
+`tid_present_anywhere`, which asks the placement question of **every** CPU rather than one.
+
+### §3/§4 — what is proved
+
+The queue-advance reservation is released only on the restore arm, where there is genuinely nothing
+to advance past. Everywhere else the advance settlement consumes it.
+
+Ten forced hosted interleavings drive the real transaction over a harness that now holds a **real
+`SmpScheduler`** — the post-clear settlements are scheduler decisions, and a fake current array
+would prove nothing about them. Each asserts full state by identity: the victim current nowhere and
+queued nowhere, the deferral naming the exact incarnation, the replacement untouched, the
+reservation held or released as the arm requires.
+
+| guard | property |
+|---|---|
+| `the_cleared_current_token_cannot_be_forged_cloned_or_dropped` | one mint and it is the compare-and-clear; no clone/copy; `#[must_use]`; diverging `Drop`; three `self`-consuming exits; one `forget` |
+| `a_complete_after_the_clear_requires_a_completed_restoration` | `Complete` post-clear is reachable only from a completed restore; the advance arm can only answer `QueueAdvanceCommitted` |
+| `restoration_checks_the_exact_incarnation_and_every_cpu` | exact `{tid, asid}`, then all-CPU placement, then the write |
+| `the_old_unconditional_clear_and_post_clear_complete_are_rejected` | no `block_current_on_cpu_split` in the exit owners, no `FailClosed`, no post-clear `ExitFailure` built without settling |
+| `the_advance_is_reserved_once_and_published_once` | one publication site; two authorities, neither usable on the other's path |
+| `every_settlement_arm_is_matched_without_a_wildcard` | the Class-D enum is exhaustive at the route |
+| `a_dropped_token_diverges` | an unsettled post-clear state is a runtime failure, not a review claim |
+
+### §5 — live
+
+Three fresh exit-oracle boots per architecture at the delivered tree, with the ordinary successful
+path unchanged.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_BROAD_ENTER` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SPLIT_ENTER` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| exit claims retired | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `CLEARED_CURRENT_RESTORED` / `_ADVANCE` (post-clear) | 0 / 1 | 0 / 1 | 0 / 1 |
+| `CLEARED_CURRENT_FATAL` / `_TOKEN_DROPPED` | 0 | 0 | 0 |
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+
+`CLEARED_CURRENT_ADVANCE` counting one per boot is the ordinary successful exit: the success path
+settles its cleared slot through the same token, with the claim as authority. No boot took a
+restore, a fatal, or a post-clear failure — which is what the source classification predicts, since
+every competing owner needs a concurrency the single dispatching CPU does not provide.
+
+**No live race is manufactured.** The competing-owner interleavings are hosted and deterministic;
+inventing timing in QEMU would prove nothing that the forced races do not prove better.
+
+
 
 

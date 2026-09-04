@@ -3924,27 +3924,40 @@ fn try_split_exit_current_task(
                     crate::kernel::syscall::SyscallError::Internal,
                 )))
             }
-            // Class D. `current` was already cleared when this was discovered, so the trap can
-            // neither re-enter the broad dispatcher nor complete the exit. The reservations are
-            // released, nothing is resumed, and the existing terminal-idle settlement runs.
+            // Class D, RESTORED. The transaction proved the victim was still Running, still ours
+            // and placed on no CPU, and restored it as this CPU's current. The entering frame is
+            // therefore its own again, which is the ONLY state in which a `Complete` may return
+            // through it: the bridge delivers this error by RESUMING that task.
             //
-            // The settlement is a typed ERROR rather than `Ok(())`, and the difference matters on
-            // AArch64. Both `Complete` arms finalize through `CompletedInThisTrap`, which always
-            // commits the syscall-return ABI into the ENTERING incarnation — so `Ok(())` would
-            // write a SUCCESS return for an exit that did not happen. When the loser is terminal
-            // that is merely useless; when it is `VictimChanged` the entering task is still alive,
-            // and it would resume believing its `exit()` succeeded. `Internal` is the truthful
-            // answer in both cases: the exit did not occur, and the task must not act as if it
-            // had.
-            ExitDisposition::FailClosed => {
+            // `Internal` rather than `Ok(())` because the exit did not happen and the task must
+            // not act as if it had.
+            ExitDisposition::PostClearRestored => {
                 crate::yarm_log!(
-                    "EXIT_TASK_SPLIT_FAILED_CLOSED cpu={} reason={} result=fail",
+                    "EXIT_TASK_SPLIT_POST_CLEAR_RESTORED cpu={} reason={} result=fail",
                     cpu.0,
                     failure.refusal.marker()
                 );
                 D::Complete(Err(TrapHandleError::Syscall(
                     crate::kernel::syscall::SyscallError::Internal,
                 )))
+            }
+            // Class D, ADVANCED. Another owner made the victim terminal, removed or replaced, so
+            // there is no frame to return through: the entering task must never run again. The
+            // already-reserved deferral names the old incarnation and the EXISTING drain selects
+            // somebody else — the same answer the success path gives, reached for a different
+            // reason.
+            //
+            // This is the arm U9-EXIT2 got wrong. It answered `Complete(Err(Internal))`, and the
+            // bridge delivers that by resuming the entering frame with `current[cpu] == None` —
+            // and, when a reap or a fault won the claim, by resuming a task that is already
+            // terminal.
+            ExitDisposition::PostClearAdvance => {
+                crate::yarm_log!(
+                    "EXIT_TASK_SPLIT_POST_CLEAR_ADVANCE cpu={} reason={} result=fail",
+                    cpu.0,
+                    failure.refusal.marker()
+                );
+                D::QueueAdvanceCommitted
             }
         },
     }

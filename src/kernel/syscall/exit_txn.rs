@@ -48,8 +48,11 @@
 //! records this transaction already retired. A cleanup step that fails therefore fails **closed** —
 //! the task stays terminal and off the CPU, and the advance still happens.
 
+use crate::kernel::boot::cleared_current::{
+    AdvanceAuthority, ClearedCurrentOwners, ClearedCurrentSettlement, ClearedCurrentToken,
+};
 use crate::kernel::boot::exit_claim::{
-    ExitClaim, ExitFailure, ExitPreflight, ExitRefusal, exit_preflight_locked,
+    ExitClaim, ExitDisposition, ExitFailure, ExitPreflight, ExitRefusal, exit_preflight_locked,
 };
 use crate::kernel::boot::reap_claim::ClosingReplyLink;
 use crate::kernel::boot::{
@@ -80,7 +83,7 @@ pub(crate) struct ExitOutcome {
 /// ONE rank around a body shared with the broad path.
 ///
 /// No method here decides anything: conditions, ordering and counting live in the transaction.
-pub(crate) trait ExitOwners {
+pub(crate) trait ExitOwners: ClearedCurrentOwners {
     // ── admission ───────────────────────────────────────────────────────────────────────────
     /// Is this CPU running a post-lock drainer AND the authoritative dispatcher? Pre-mutation.
     fn exit_route_admitted(&self, cpu: CpuId) -> bool;
@@ -88,9 +91,17 @@ pub(crate) trait ExitOwners {
     // ── rank 1 — scheduler ──────────────────────────────────────────────────────────────────
     /// This CPU's `current`, read authoritatively from scheduler state — never from userspace.
     fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64>;
-    /// Clear `current` on this CPU, returning what was removed. The task is NOT re-enqueued, so
-    /// between this and the claim it is in no run queue and is no CPU's current.
-    fn clear_current(&mut self, cpu: CpuId) -> Option<u64>;
+    /// U9-EXIT3 §2 — COMPARE-and-clear `current` on this CPU, minting the settlement obligation.
+    ///
+    /// `None` means the slot did not name this incarnation and NOTHING was mutated, which is a
+    /// pre-mutation refusal. U9-EXIT2 cleared unconditionally and then refused, which removed
+    /// whatever task the scheduler had moved on to and left it current nowhere and queued nowhere.
+    fn clear_current_exact(
+        &mut self,
+        cpu: CpuId,
+        tid: u64,
+        asid: Option<Asid>,
+    ) -> Option<ClearedCurrentToken>;
     /// Enqueue a woken task. Used only for joiners and robust-futex waiters — never for the
     /// exiting task, which this transaction must never make runnable again.
     fn enqueue_woken(&mut self, tid: u64);
@@ -156,10 +167,6 @@ pub(crate) trait ExitOwners {
     fn reserve_queue_advance(&mut self, cpu: CpuId, outgoing: u64) -> bool;
     /// Release it. Only ever called on a pre-mutation refusal path.
     fn release_queue_advance(&mut self, cpu: CpuId);
-    /// Name the exact exiting incarnation for this CPU's deferral, so the drain reverifies with
-    /// the exit predicate and the bridges skip capturing a corpse's frame. `false` means one is
-    /// already pending, which is a duplicate and must refuse.
-    fn publish_exit_deferral(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool;
 
     // ── rank 3 — IPC (SHARED with U9-REAP1) ─────────────────────────────────────────────────
     fn revoke_reply_caps_for_caller(
@@ -201,6 +208,65 @@ pub(crate) trait ExitOwners {
 
 /// U9-EXIT1 §3 — exit the task currently Running on `cpu`, or refuse having mutated nothing.
 ///
+/// U9-EXIT3 §3 — settle a cleared current slot whose claim lost its race.
+///
+/// The rules are derived from what the victim actually is, not from which refusal was reported:
+///
+/// * **still Running and ours, placed nowhere** — the only state in which the entering frame is
+///   still this task's to return through. Restore it as current, release the advance (there is
+///   nothing to advance past), and let the route answer a typed error. Reachable only for a
+///   `DetachedThread` refusal, which U9-EXIT2 proved production-impossible — so this arm is the
+///   typed capability for a state that cannot occur rather than a path production takes.
+/// * **terminal, removed, or a replacement incarnation** — exactly the set the existing exit drain
+///   honours. Publish the already-reserved deferral naming the OLD incarnation and let the drain
+///   select somebody else. The replacement is never touched.
+/// * **anything else** — a `Runnable` requeue or a `Faulted` victim would be advanced past by a
+///   drain that then REFUSES the reverify, leaving the CPU with an empty current slot and no
+///   selection. That cannot be settled, so it diverges.
+fn settle_failed_claim<O: ExitOwners>(
+    owners: &mut O,
+    token: ClearedCurrentToken,
+    cpu: CpuId,
+    tid: u64,
+    asid: Option<Asid>,
+    refusal: ExitRefusal,
+) -> ExitFailure {
+    let token = match token.restore_current_exact(owners) {
+        Ok(ClearedCurrentSettlement::Restored) => {
+            // Restored: the task is current again and nothing is being advanced past, so the
+            // reservation this transaction took must not be left held for a drain with no work.
+            owners.release_queue_advance(cpu);
+            return ExitFailure {
+                refusal,
+                disposition: ExitDisposition::PostClearRestored,
+            };
+        }
+        Ok(ClearedCurrentSettlement::AdvanceCommitted) => {
+            // `restore_current_exact` never produces this; the match stays exhaustive rather than
+            // wildcarding a variant whose meaning would be wrong here.
+            unreachable!("restore settles as Restored or returns the token")
+        }
+        Err((token, why)) => {
+            crate::yarm_log!(
+                "CLEARED_CURRENT_RESTORE_REFUSED cpu={} tid={} reason={}",
+                cpu.0,
+                tid,
+                why.marker()
+            );
+            token
+        }
+    };
+    if owners.victim_is_drain_honourable(tid, asid) {
+        let settlement = token.publish_queue_advance(owners, AdvanceAuthority::VictimNonResumable);
+        debug_assert_eq!(settlement, ClearedCurrentSettlement::AdvanceCommitted);
+        return ExitFailure {
+            refusal,
+            disposition: ExitDisposition::PostClearAdvance,
+        };
+    }
+    token.fatal("post_clear_victim_neither_restorable_nor_drain_honourable")
+}
+
 /// U9-EXIT2 §1/§4 — every failure carries the settlement it owes, and none of them is "the broad
 /// handler may run". `past_point_of_no_return` is the single fact that decides class D, and it
 /// flips exactly once, at the `clear_current` below.
@@ -214,7 +280,7 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
     const fn refuse(refusal: ExitRefusal) -> ExitFailure {
         ExitFailure {
             refusal,
-            disposition: refusal.disposition(false),
+            disposition: refusal.disposition(),
         }
     }
 
@@ -303,57 +369,62 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
         }
     }
 
-    // (7) rank 1 — clear `current`. The task is now in no run queue and is no CPU's current, so it
-    // is not dispatchable; it is also not yet terminal. Nothing can observe it as both.
-    let removed = owners.clear_current(cpu);
-    if removed != Some(tid) {
-        // The scheduler handed back somebody else. Undo both reservations and refuse; `current`
-        // was not ours to clear, so nothing of this task changed.
+    // (7) rank 1 — COMPARE-and-clear `current`. From here the task is in no run queue and is no
+    // CPU's current, so it is not dispatchable; it is also not yet terminal. Nothing can observe it
+    // as both.
+    //
+    // The token minted here is the obligation to settle that state, and it is the only thing that
+    // licenses what happens next: past this line a `Complete` disposition would return through the
+    // entering frame with the CPU's current slot empty, so every exit from the transaction must go
+    // through one of the token's three settlements.
+    let Some(token) = owners.clear_current_exact(cpu, tid, preflight.asid) else {
+        // The scheduler had already moved on. NOTHING was mutated — not even the slot's actual
+        // occupant — so this is a pre-mutation refusal and no settlement is owed.
         if let Some(reservation) = death_reservation {
             owners.release_server_death(reservation);
         }
         owners.release_queue_advance(cpu);
-        return Err(ExitFailure {
-            refusal: ExitRefusal::VictimChanged,
-            disposition: ExitRefusal::VictimChanged.disposition(true),
-        });
-    }
+        return Err(refuse(ExitRefusal::VictimChanged));
+    };
 
     // (8) rank 2 — THE LINEARIZATION POINT. Exactly one of exit / reap / fault / restart wins.
-    let token = owners.mint_restart_token();
-    let claim = match owners.claim_self_exit(cpu, tid, preflight.asid, code, token) {
+    let restart_token = owners.mint_restart_token();
+    let claim = match owners.claim_self_exit(cpu, tid, preflight.asid, code, restart_token) {
         Ok(claim) => claim,
         Err(refusal) => {
-            // Another edge won between (3) and here. `current` is ALREADY CLEARED, so this cannot
-            // fall back — and U9-EXIT1 let it, because the refusal it reports (`NotRunning`,
-            // `TaskGone`, `IdentityChanged`) answered `may_fall_back() == true` and the route
-            // handed the trap to `handle_exit_current_task` with no current task on the CPU. It is
-            // class D by position, not by name, which is why the disposition is computed from the
-            // position and not from the refusal alone.
+            // Another edge won between (3) and here, and `current` is ALREADY CLEARED.
             //
-            // Nothing of THIS transaction was written, and whichever edge won left the task
-            // terminal and off the CPU. Release the reservations and fail closed.
+            // U9-EXIT1 handed this to the broad dispatcher. U9-EXIT2 stopped that but settled it
+            // with `Complete(Err(Internal))`, which the trap bridge delivers by RESUMING the
+            // entering task — on a CPU whose current slot is empty, and, when a reap or a fault
+            // won, resuming a task that is already terminal. Neither is a settlement.
+            //
+            // The token decides instead, from the victim's observed state. Nothing of THIS
+            // transaction was written, so the server-death slot is released either way; the queue
+            // advance is released only if the victim turns out to be restorable, because the
+            // advance settlement needs it.
             if let Some(reservation) = death_reservation {
                 owners.release_server_death(reservation);
             }
-            owners.release_queue_advance(cpu);
-            return Err(ExitFailure {
+            return Err(settle_failed_claim(
+                owners,
+                token,
+                cpu,
+                tid,
+                preflight.asid,
                 refusal,
-                disposition: refusal.disposition(true),
-            });
+            ));
         }
     };
 
-    // The deferral is now attributable to an exact incarnation. Published AFTER the claim so the
-    // cell can never name a task that did not actually exit, and BEFORE any cleanup so the drain
-    // cannot observe a reserved-but-unattributed advance.
-    if !owners.publish_exit_deferral(cpu, tid, preflight.asid) {
-        crate::yarm_log!(
-            "EXIT_TASK_DUPLICATE_DEFERRAL tid={} cpu={} result=fail",
-            tid,
-            cpu.0
-        );
-    }
+    // THE settlement of the cleared slot on the success path, and the deferral publication in one
+    // step. Published AFTER the claim so the cell can never name a task that did not actually exit,
+    // and BEFORE any cleanup so the drain cannot observe a reserved-but-unattributed advance.
+    //
+    // `AdvanceAuthority::Claimed` is what makes it legal: the claim is unforgeable, so this arm is
+    // unreachable on any path where the exit did not happen.
+    let settlement = token.publish_queue_advance(owners, AdvanceAuthority::Claimed(&claim));
+    debug_assert_eq!(settlement, ClearedCurrentSettlement::AdvanceCommitted);
 
     let mut outcome = ExitOutcome {
         claim,
@@ -462,7 +533,7 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
 
     // (12) The owed reports. Each is an endpoint send followed by a wake, and each runs with no
     // unrelated lock held — the transaction holds none between owner calls by construction.
-    outcome.supervisor_reported = owners.report_exit_to_supervisor(cpu, tid, code, token);
+    outcome.supervisor_reported = owners.report_exit_to_supervisor(cpu, tid, code, restart_token);
     outcome.pm_reported = owners.report_exit_to_pm(cpu, tid, code);
 
     // (13) Robust-futex wakes are NOT owed here: a thread that published a robust list is refused
@@ -503,6 +574,33 @@ pub(crate) struct SharedExitOwners<'a> {
     pub(crate) shared: &'a crate::runtime::SharedKernel,
 }
 
+impl ClearedCurrentOwners for SharedExitOwners<'_> {
+    fn victim_is_running_exact(&mut self, tid: u64, asid: Option<Asid>) -> bool {
+        self.shared.victim_is_running_exact_split(tid, asid)
+    }
+    fn victim_is_drain_honourable(&mut self, tid: u64, asid: Option<Asid>) -> bool {
+        use crate::kernel::boot::exit_claim::ExitDrainVerdict as V;
+        matches!(
+            self.shared.exit_reverify_terminal(tid, asid),
+            V::Terminal | V::Removed
+        )
+    }
+    fn tid_placed_anywhere(&mut self, tid: u64) -> bool {
+        self.shared.tid_placed_anywhere_split(tid)
+    }
+    fn restore_current_exact(
+        &mut self,
+        cpu: CpuId,
+        tid: u64,
+        priority: crate::kernel::scheduler::TaskPriority,
+    ) -> bool {
+        self.shared.restore_current_exact_split(cpu, tid, priority)
+    }
+    fn publish_advance_for(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
+        crate::kernel::boot::exit_queue_advance_publish(cpu.0 as usize, tid, asid)
+    }
+}
+
 impl ExitOwners for SharedExitOwners<'_> {
     fn exit_route_admitted(&self, cpu: CpuId) -> bool {
         self.shared.exit_route_admitted_split(cpu)
@@ -511,8 +609,13 @@ impl ExitOwners for SharedExitOwners<'_> {
     fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
         self.shared.current_tid_authoritative(cpu)
     }
-    fn clear_current(&mut self, cpu: CpuId) -> Option<u64> {
-        self.shared.block_current_on_cpu_split(cpu).ok().flatten()
+    fn clear_current_exact(
+        &mut self,
+        cpu: CpuId,
+        tid: u64,
+        asid: Option<Asid>,
+    ) -> Option<ClearedCurrentToken> {
+        self.shared.clear_current_exact_split(cpu, tid, asid)
     }
     fn enqueue_woken(&mut self, tid: u64) {
         let cpu = self.shared.authoritative_dispatch_cpu_split();
@@ -614,9 +717,6 @@ impl ExitOwners for SharedExitOwners<'_> {
     fn release_queue_advance(&mut self, cpu: CpuId) {
         // `futex_wait_dispatch_clear` clears the exit cell too — the two are released as one.
         crate::kernel::boot::futex_wait_dispatch_clear(cpu.0 as usize);
-    }
-    fn publish_exit_deferral(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
-        crate::kernel::boot::exit_queue_advance_publish(cpu.0 as usize, tid, asid)
     }
 
     fn revoke_reply_caps_for_caller(

@@ -159070,6 +159070,9 @@ mod u9reap1_reap_transaction {
 /// exit deferral with the exit predicate rather than a status that need not exist.
 mod u9exit1_self_exit_transaction {
     use super::*;
+    use crate::kernel::boot::cleared_current::{
+        ClearedCurrentOwners, ClearedCurrentSettlement, ClearedCurrentToken, RestoreRefusal,
+    };
     use crate::kernel::boot::exit_claim::{
         ExitClaim, ExitDisposition, ExitDrainVerdict, ExitFailure, ExitPreflight, ExitRefusal,
         claim_self_exit_locked, exit_drain_verdict_locked, exit_preflight_locked,
@@ -159088,6 +159091,9 @@ mod u9exit1_self_exit_transaction {
 
     const EXIT_CLAIM: &str = include_str!("exit_claim.rs");
     const EXIT_TXN: &str = include_str!("../syscall/exit_txn.rs");
+    const CLEARED_CURRENT: &str = include_str!("cleared_current.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SCHEDULER: &str = include_str!("../scheduler.rs");
     const REAP_TXN: &str = include_str!("../syscall/reap_txn.rs");
     const REAP_CLAIM: &str = include_str!("reap_claim.rs");
     const SYSCALL: &str = include_str!("../syscall.rs");
@@ -159119,13 +159125,26 @@ mod u9exit1_self_exit_transaction {
         SchedulerHandsBackAnother,
         /// Another lifecycle edge writes a terminal status between the preflight and the claim.
         ClaimLosesRace,
+        /// U9-EXIT3 §4 — the competing owner is named, so each post-clear settlement is forced
+        /// deterministically rather than inferred from one generic "lost the race".
+        ClaimLosesTo(TaskStatus),
+        /// The victim is detached between the preflight and the claim: the one competing outcome
+        /// that leaves it still `Running` and therefore RESTORABLE.
+        ClaimFindsDetached,
+        /// The TCB disappears between the preflight and the claim.
+        ClaimFindsRemoved,
+        /// A replacement incarnation reuses the numeric TID between the preflight and the claim.
+        ClaimFindsReplacement,
         /// A post-claim cleanup step fails. It must NOT resurrect the task.
         ReportsFail,
     }
 
     struct Harness {
         tcbs: alloc::vec::Vec<Option<ThreadControlBlock>>,
-        current: [Option<u64>; 4],
+        /// U9-EXIT3 §4: a REAL `SmpScheduler`, not a fake current array. The post-clear
+        /// settlements are scheduler decisions — compare-and-clear, "placed on any CPU?", exact
+        /// restore — and a stand-in would prove nothing about them.
+        sched: crate::kernel::scheduler::SmpScheduler,
         /// Set while some route holds this CPU's ONE queue-advance deferral.
         queue_advance: [Option<u64>; 4],
         /// The exact incarnation the deferral names, once published.
@@ -159160,9 +159179,23 @@ mod u9exit1_self_exit_transaction {
 
     impl Harness {
         fn new(tasks: &[ThreadControlBlock], current: Option<u64>) -> Self {
+            let mut sched = crate::kernel::scheduler::SmpScheduler::default();
+            if !sched.cpu_is_online(CPU) {
+                sched.bring_up_cpu(CPU).expect("cpu 0 online");
+            }
+            if let Some(tid) = current {
+                sched
+                    .enqueue_on(CPU, ThreadId(tid))
+                    .expect("enqueue the current task");
+                assert_eq!(
+                    sched.dispatch_next_on(CPU),
+                    Some(ThreadId(tid)),
+                    "the harness must start with the victim actually current"
+                );
+            }
             Self {
                 tcbs: tasks.iter().cloned().map(Some).collect(),
-                current: [current, None, None, None],
+                sched,
                 queue_advance: [None; 4],
                 exit_deferral: [None; 4],
                 death_slots: 1,
@@ -159195,6 +159228,12 @@ mod u9exit1_self_exit_transaction {
         fn count(&self, what: &str) -> usize {
             self.log.iter().filter(|entry| *entry == what).count()
         }
+        /// This CPU's current, read from the REAL scheduler.
+        fn current_of(&self, cpu: u8) -> Option<u64> {
+            self.sched
+                .current_tid_on(crate::kernel::scheduler::CpuId(cpu))
+                .map(|t| t.0)
+        }
         fn status_of(&self, tid: u64) -> Option<TaskStatus> {
             self.tcbs
                 .iter()
@@ -159219,9 +159258,21 @@ mod u9exit1_self_exit_transaction {
                     )
                 })
                 .collect();
+            let current: alloc::vec::Vec<_> = (0..4u8)
+                .map(|c| {
+                    self.sched
+                        .current_tid_on(crate::kernel::scheduler::CpuId(c))
+                        .map(|t| t.0)
+                })
+                .collect();
+            let placed: alloc::vec::Vec<_> = self
+                .tcbs
+                .iter()
+                .flatten()
+                .map(|t| (t.tid.0, self.sched.tid_present_anywhere(t.tid)))
+                .collect();
             alloc::format!(
-                "{tasks:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
-                self.current,
+                "{tasks:?}|{current:?}|{placed:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
                 self.queue_advance,
                 self.exit_deferral,
                 self.death_published,
@@ -159233,23 +159284,79 @@ mod u9exit1_self_exit_transaction {
         }
     }
 
+    /// The task the injected scheduler race hands back instead of the victim.
+    const OTHER_TID: u64 = 2;
+
+    impl ClearedCurrentOwners for Harness {
+        fn victim_is_running_exact(&mut self, tid: u64, asid: Option<Asid>) -> bool {
+            self.note("victim_is_running_exact");
+            self.tcbs
+                .iter()
+                .flatten()
+                .any(|t| t.tid.0 == tid && t.asid == asid && t.status == TaskStatus::Running)
+        }
+        fn victim_is_drain_honourable(&mut self, tid: u64, asid: Option<Asid>) -> bool {
+            self.note("victim_is_drain_honourable");
+            matches!(
+                exit_drain_verdict_locked(&self.tcbs, tid, asid),
+                ExitDrainVerdict::Terminal | ExitDrainVerdict::Removed
+            )
+        }
+        fn tid_placed_anywhere(&mut self, tid: u64) -> bool {
+            self.note("tid_placed_anywhere");
+            self.sched.tid_present_anywhere(ThreadId(tid))
+        }
+        fn restore_current_exact(
+            &mut self,
+            cpu: CpuId,
+            tid: u64,
+            priority: crate::kernel::scheduler::TaskPriority,
+        ) -> bool {
+            self.note("restore_current_exact");
+            self.sched
+                .restore_exact_current_on(cpu, ThreadId(tid), priority)
+        }
+        fn publish_advance_for(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
+            self.note("publish_advance_for");
+            if self.exit_deferral[cpu.0 as usize].is_some() {
+                return false;
+            }
+            self.exit_deferral[cpu.0 as usize] = Some((tid, asid));
+            true
+        }
+    }
+
     impl ExitOwners for Harness {
         fn exit_route_admitted(&self, _cpu: CpuId) -> bool {
             self.inject != Inject::RouteNotAdmitted
         }
 
         fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
-            self.current[cpu.0 as usize]
+            self.sched.current_tid_on(cpu).map(|t| t.0)
         }
 
-        fn clear_current(&mut self, cpu: CpuId) -> Option<u64> {
-            self.note("clear_current");
+        fn clear_current_exact(
+            &mut self,
+            cpu: CpuId,
+            tid: u64,
+            asid: Option<Asid>,
+        ) -> Option<ClearedCurrentToken> {
+            self.note("clear_current_exact");
             if self.inject == Inject::SchedulerHandsBackAnother {
-                // The scheduler moved on: `current` is somebody else's now, and taking it is not
-                // this transaction's to do.
-                return Some(u64::MAX);
+                // The scheduler moved on between the read and the clear: the slot now names
+                // somebody else, so the compare-and-clear must mutate NOTHING.
+                self.sched.block_current_exact_on(cpu, ThreadId(tid));
+                self.sched
+                    .enqueue_on(cpu, ThreadId(OTHER_TID))
+                    .expect("the replacement enqueues");
+                assert_eq!(self.sched.dispatch_next_on(cpu), Some(ThreadId(OTHER_TID)));
             }
-            self.current[cpu.0 as usize].take()
+            crate::kernel::boot::cleared_current::clear_current_exact(
+                &mut self.sched,
+                cpu,
+                tid,
+                asid,
+            )
         }
 
         fn enqueue_woken(&mut self, tid: u64) {
@@ -159280,11 +159387,40 @@ mod u9exit1_self_exit_transaction {
             token: RestartToken,
         ) -> Result<ExitClaim, ExitRefusal> {
             self.note("claim_self_exit");
-            if self.inject == Inject::ClaimLosesRace
-                && let Some(t) = self.tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)
-            {
-                // A reap got there first, between the preflight and here.
-                t.status = TaskStatus::Dead;
+            match self.inject {
+                Inject::ClaimLosesRace => {
+                    if let Some(t) = self.tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                        // A reap got there first, between the preflight and here.
+                        t.status = TaskStatus::Dead;
+                    }
+                }
+                Inject::ClaimLosesTo(status) => {
+                    if let Some(t) = self.tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                        t.status = status;
+                    }
+                }
+                Inject::ClaimFindsDetached => {
+                    if let Some(t) = self.tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                        t.detach_state = ThreadDetachState::Detached;
+                    }
+                }
+                Inject::ClaimFindsRemoved => {
+                    if let Some(slot) = self
+                        .tcbs
+                        .iter_mut()
+                        .find(|slot| slot.as_ref().is_some_and(|t| t.tid.0 == tid))
+                    {
+                        *slot = None;
+                    }
+                }
+                Inject::ClaimFindsReplacement => {
+                    if let Some(t) = self.tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                        // Same numeric TID, new incarnation: a fresh ASID and a fresh status.
+                        t.asid = Some(Asid(999));
+                        t.status = TaskStatus::Running;
+                    }
+                }
+                _ => {}
             }
             claim_self_exit_locked(&mut self.tcbs, cpu, tid, asid, code, token)
         }
@@ -159366,15 +159502,6 @@ mod u9exit1_self_exit_transaction {
             self.note("release_queue_advance");
             self.queue_advance[cpu.0 as usize] = None;
             self.exit_deferral[cpu.0 as usize] = None;
-        }
-
-        fn publish_exit_deferral(&mut self, cpu: CpuId, tid: u64, asid: Option<Asid>) -> bool {
-            self.note("publish_exit_deferral");
-            if self.exit_deferral[cpu.0 as usize].is_some() {
-                return false;
-            }
-            self.exit_deferral[cpu.0 as usize] = Some((tid, asid));
-            true
         }
 
         fn revoke_reply_caps_for_caller(
@@ -159495,14 +159622,14 @@ mod u9exit1_self_exit_transaction {
         assert_eq!(outcome.claim.tid(), 1);
         // Both reservations, then the removal from `current`, then the claim. Nothing before the
         // reservations may be irreversible, and nothing after the claim may be free.
-        assert!(h.at("reserve_queue_advance") < h.at("clear_current"));
-        assert!(h.at("reserve_server_death") < h.at("clear_current"));
-        assert!(h.at("clear_current") < h.at("claim_self_exit"));
+        assert!(h.at("reserve_queue_advance") < h.at("clear_current_exact"));
+        assert!(h.at("reserve_server_death") < h.at("clear_current_exact"));
+        assert!(h.at("clear_current_exact") < h.at("claim_self_exit"));
         // The detach of the reverse link is strictly after its reservation was taken.
         assert!(h.at("reserve_server_death") < h.at("take_server_reply_link"));
         assert!(h.at("take_server_reply_link") < h.at("publish_server_death"));
         // The deferral is attributed to an exact incarnation only after the claim won it.
-        assert!(h.at("claim_self_exit") < h.at("publish_exit_deferral"));
+        assert!(h.at("claim_self_exit") < h.at("publish_advance_for"));
         // And the claim is retired last, after every owed step settled.
         assert_eq!(h.at("retire_exit_claim"), h.log.len() - 1);
     }
@@ -159513,14 +159640,14 @@ mod u9exit1_self_exit_transaction {
     fn an_exited_task_is_never_simultaneously_current_and_terminal() {
         let mut h = three_task_world();
         // Before: current, and NOT terminal.
-        assert_eq!(h.current[0], Some(1));
+        assert_eq!(h.current_of(0), Some(1));
         assert_eq!(h.status_of(1), Some(TaskStatus::Running));
         run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
         // After: terminal, and NOT current. The only ordering that produces both facts without an
         // intermediate state that is both is clear-then-write, which the log pins.
-        assert_eq!(h.current[0], None);
+        assert_eq!(h.current_of(0), None);
         assert_eq!(h.status_of(1), Some(TaskStatus::Exited(CODE)));
-        assert!(h.at("clear_current") < h.at("claim_self_exit"));
+        assert!(h.at("clear_current_exact") < h.at("claim_self_exit"));
         // And the exiting task was never made runnable again.
         assert!(!h.enqueued.contains(&1));
     }
@@ -159539,7 +159666,7 @@ mod u9exit1_self_exit_transaction {
         );
         assert_eq!(h.count("reserve_queue_advance"), 1);
         assert_eq!(h.count("release_queue_advance"), 0);
-        assert_eq!(h.count("publish_exit_deferral"), 1);
+        assert_eq!(h.count("publish_advance_for"), 1);
     }
 
     /// A second exit on a CPU whose deferral is already held refuses, having mutated nothing.
@@ -159552,7 +159679,7 @@ mod u9exit1_self_exit_transaction {
         assert_eq!(failure.refusal, ExitRefusal::QueueAdvanceHeld);
         assert_eq!(failure.disposition, ExitDisposition::ImpossibleState);
         assert_eq!(h.snapshot(), before, "a refusal must mutate nothing");
-        assert_eq!(h.count("clear_current"), 0);
+        assert_eq!(h.count("clear_current_exact"), 0);
         assert_eq!(h.count("claim_self_exit"), 0);
     }
 
@@ -159635,7 +159762,7 @@ mod u9exit1_self_exit_transaction {
             }
         );
         assert_eq!(h.snapshot(), before);
-        assert_eq!(h.count("clear_current"), 0);
+        assert_eq!(h.count("clear_current_exact"), 0);
     }
 
     /// Arm 9 of the §1 table: the capacity probe and the reservation disagree.
@@ -159670,7 +159797,7 @@ mod u9exit1_self_exit_transaction {
             h.queue_advance[0], None,
             "the deferral must not be left held"
         );
-        assert_eq!(h.count("clear_current"), 0);
+        assert_eq!(h.count("clear_current_exact"), 0);
     }
 
     // ── §5 property 5: no fallback after the claim, and no resurrection ─────────────────────
@@ -159687,10 +159814,18 @@ mod u9exit1_self_exit_transaction {
         h.inject = Inject::SchedulerHandsBackAnother;
         let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
         assert_eq!(failure.refusal, ExitRefusal::VictimChanged);
+        // U9-EXIT3 §1: this is now a PRE-mutation refusal. The compare-and-clear mutates nothing
+        // when the slot names somebody else, so there is no cleared state to settle — and, unlike
+        // U9-EXIT2's unconditional clear, the task the scheduler moved on to is left alone.
         assert_eq!(
             failure.disposition,
-            ExitDisposition::FailClosed,
-            "`current` was already cleared, so the trap must NOT re-enter the broad dispatcher"
+            ExitDisposition::ImpossibleState,
+            "nothing was cleared, so nothing is owed a settlement"
+        );
+        assert_eq!(
+            h.current_of(0),
+            Some(OTHER_TID),
+            "the task the scheduler moved on to must still be current"
         );
         // Nothing of THIS task changed, and neither reservation leaked.
         assert_eq!(h.status_of(1), Some(TaskStatus::Running));
@@ -159711,17 +159846,26 @@ mod u9exit1_self_exit_transaction {
         h.inject = Inject::ClaimLosesRace;
         let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
         assert_eq!(failure.refusal, ExitRefusal::NotRunning);
-        // U9-EXIT2 §1: THE defect U9-EXIT1 shipped. This refusal is produced AFTER `current` was
-        // cleared, and it used to answer `may_fall_back() == true`, so the route returned
-        // `NotHandled` and the trap re-entered `handle_exit_current_task` on a CPU with no current
-        // task. The disposition is computed from the POSITION, not from the refusal's name.
-        assert_eq!(failure.disposition, ExitDisposition::FailClosed);
+        // THE arm two stages got wrong. U9-EXIT1 answered `NotHandled` and re-entered the broad
+        // dispatcher on a CPU with no current task. U9-EXIT2 answered `Complete(Err(Internal))`,
+        // which the bridge delivers by RESUMING the entering frame — here, a task a reap has
+        // already made `Dead`. U9-EXIT3 advances instead.
+        assert_eq!(failure.disposition, ExitDisposition::PostClearAdvance);
         // The winner's terminal status stands; this transaction wrote nothing over it.
         assert_eq!(h.status_of(1), Some(TaskStatus::Dead));
-        assert_eq!(h.queue_advance[0], None);
+        // The dead task is current NOWHERE and queued NOWHERE, and the advance the drain needs is
+        // held and published for it — the reservation is deliberately NOT released here.
+        assert_eq!(h.current_of(0), None);
+        assert!(!h.sched.tid_present_anywhere(ThreadId(1)));
+        assert_eq!(h.queue_advance[0], Some(1));
+        assert_eq!(h.exit_deferral[0], Some((1, Some(Asid(201)))));
+        assert_eq!(h.count("release_queue_advance"), 0);
+        assert_eq!(h.count("publish_advance_for"), 1);
+        // Restoration was ATTEMPTED and correctly refused: the victim is not Running.
+        assert_eq!(h.count("victim_is_running_exact"), 1);
+        assert_eq!(h.count("restore_current_exact"), 0);
         assert_eq!(h.death_reserved, 0);
         assert_eq!(h.count("take_server_reply_link"), 0);
-        assert_eq!(h.count("publish_exit_deferral"), 0);
         assert_eq!(h.retired, 0);
     }
 
@@ -159734,7 +159878,7 @@ mod u9exit1_self_exit_transaction {
         assert!(!outcome.supervisor_reported && !outcome.pm_reported);
         // Fails CLOSED: still terminal, still off the CPU, advance still owed, never rolled back.
         assert_eq!(h.status_of(1), Some(TaskStatus::Exited(CODE)));
-        assert_eq!(h.current[0], None);
+        assert_eq!(h.current_of(0), None);
         assert_eq!(h.queue_advance[0], Some(1));
         assert_eq!(h.count("rollback_claim"), 0);
         assert!(!h.enqueued.contains(&1));
@@ -159752,20 +159896,32 @@ mod u9exit1_self_exit_transaction {
         assert_eq!(failure, impossible(ExitRefusal::NoCurrent));
         assert_eq!(h.snapshot(), after_first, "the second exit wrote nothing");
         assert_eq!(h.retired, 1, "exactly one claim was retired");
-        assert_eq!(h.count("publish_exit_deferral"), 1);
+        assert_eq!(h.count("publish_advance_for"), 1);
     }
 
-    /// Even if the scheduler wrongly re-presents the exited task as current, the claim refuses.
+    /// Even if the scheduler wrongly re-presents the exited task as current, the claim refuses —
+    /// and now it refuses BEFORE the clear, because the preflight sees `Exited` first. The exited
+    /// task is left exactly as it was.
     #[test]
     fn a_stale_current_pointing_at_an_exited_task_still_refuses() {
         let mut h = three_task_world();
         run_exit_transaction(&mut h, CPU, CODE).expect("the first exit commits");
-        h.current[0] = Some(1);
+        h.sched
+            .enqueue_on(CPU, ThreadId(1))
+            .expect("re-present the corpse");
+        assert_eq!(h.sched.dispatch_next_on(CPU), Some(ThreadId(1)));
         h.queue_advance[0] = None;
         h.exit_deferral[0] = None;
+        let before = h.snapshot();
         let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
         assert_eq!(failure, impossible(ExitRefusal::NotRunning));
         assert_eq!(h.retired, 1);
+        assert_eq!(h.snapshot(), before, "a pre-clear refusal mutates nothing");
+        assert_eq!(
+            h.count("clear_current_exact"),
+            1,
+            "only the FIRST exit cleared"
+        );
     }
 
     // ── §5 property 7: TID reuse matches nothing ────────────────────────────────────────────
@@ -160374,23 +160530,28 @@ mod u9exit1_self_exit_transaction {
                 !refusal.marker().is_empty(),
                 "{refusal:?} needs a wire name"
             );
-            // Past the point of no return the position decides, for every variant.
-            assert_eq!(
-                refusal.disposition(true),
-                ExitDisposition::FailClosed,
-                "{refusal:?} found after `current` was cleared must fail closed"
-            );
         }
+        // U9-EXIT3 §1: there is no longer a "past the point of no return" ANSWER here, because
+        // past the clear the settlement is not a classification of the refusal at all — it is
+        // whichever of restore/advance/fatal the victim's observed state licenses, decided by
+        // `settle_failed_claim` through the `ClearedCurrentToken`. A `bool` parameter that turned
+        // every refusal into one disposition was the shape that hid U9-EXIT2's defect: it made
+        // "fail closed" look like an answer when the real question — is the entering frame still
+        // this CPU's to return through? — had not been asked.
+        assert!(
+            !EXIT_CLAIM.contains("past_point_of_no_return: bool"),
+            "the post-clear settlement must not be a classification of the refusal"
+        );
         // Class C has exactly one member, and it is the only refusal a correct userspace program
         // can provoke: the deferred server-death queue was full.
         let invalid: alloc::vec::Vec<_> = ALL
             .iter()
-            .filter(|r| r.disposition(false) == ExitDisposition::InvalidPreLock)
+            .filter(|r| r.disposition() == ExitDisposition::InvalidPreLock)
             .collect();
         assert_eq!(invalid, alloc::vec![&DeferredCapacity]);
         // Everything else pre-mutation is a state the §5 guards prove cannot exist.
         for refusal in ALL.iter().filter(|r| **r != DeferredCapacity) {
-            assert_eq!(refusal.disposition(false), ExitDisposition::ImpossibleState);
+            assert_eq!(refusal.disposition(), ExitDisposition::ImpossibleState);
         }
         // The wire names are distinct, so a live marker identifies exactly one arm.
         let mut names: alloc::vec::Vec<&str> = ALL.iter().map(|r| r.marker()).collect();
@@ -160398,6 +160559,474 @@ mod u9exit1_self_exit_transaction {
         let unique = names.len();
         names.dedup();
         assert_eq!(names.len(), unique, "two refusals share a wire name");
+    }
+
+    // ═══ U9-EXIT3 — the post-clear settlements, forced one competing owner at a time ═════════
+
+    /// The shape every forced race asserts: nothing about markers, everything about state.
+    fn assert_advanced_and_unreachable(h: &Harness, tid: u64, asid: Option<Asid>) {
+        assert_eq!(h.current_of(0), None, "the victim must not be current");
+        assert!(
+            !h.sched.tid_present_anywhere(ThreadId(tid)),
+            "the victim must be queued on no CPU"
+        );
+        assert_eq!(
+            h.queue_advance[0],
+            Some(tid),
+            "the reservation must be HELD for the drain, not released"
+        );
+        assert_eq!(
+            h.exit_deferral[0],
+            Some((tid, asid)),
+            "and published for the EXACT incarnation that was cleared"
+        );
+        assert_eq!(h.count("publish_advance_for"), 1, "published exactly once");
+        assert_eq!(h.count("release_queue_advance"), 0);
+        assert_eq!(
+            h.count("restore_current_exact"),
+            0,
+            "a corpse is never restored"
+        );
+        assert_eq!(h.retired, 0, "no claim was retired");
+    }
+
+    /// **Claim loses to a reap.** The victim is `Dead`: never resumable, and exactly what the
+    /// existing drain honours. Advance.
+    #[test]
+    fn a_claim_that_loses_to_a_reap_advances_and_never_resumes_the_corpse() {
+        let mut h = three_task_world();
+        h.inject = Inject::ClaimLosesTo(TaskStatus::Dead);
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(failure.refusal, ExitRefusal::NotRunning);
+        assert_eq!(failure.disposition, ExitDisposition::PostClearAdvance);
+        assert_eq!(
+            h.status_of(1),
+            Some(TaskStatus::Dead),
+            "the reap's result stands"
+        );
+        assert_advanced_and_unreachable(&h, 1, Some(Asid(201)));
+    }
+
+    /// **Claim loses to a duplicate exit.** `Exited(_)` is likewise drain-honourable.
+    #[test]
+    fn a_claim_that_loses_to_a_duplicate_exit_advances() {
+        let mut h = three_task_world();
+        h.inject = Inject::ClaimLosesTo(TaskStatus::Exited(9));
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(failure.disposition, ExitDisposition::PostClearAdvance);
+        assert_eq!(
+            h.status_of(1),
+            Some(TaskStatus::Exited(9)),
+            "the winner's exit code stands; this transaction wrote nothing over it"
+        );
+        assert_advanced_and_unreachable(&h, 1, Some(Asid(201)));
+    }
+
+    /// **The TCB disappears.** Removal is drain-honourable — `exit_drain_verdict_locked` reports
+    /// `Removed` rather than reading absence as failure — so this advances too.
+    #[test]
+    fn a_claim_that_finds_the_tcb_removed_advances() {
+        let mut h = three_task_world();
+        h.inject = Inject::ClaimFindsRemoved;
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(failure.refusal, ExitRefusal::TaskGone);
+        assert_eq!(failure.disposition, ExitDisposition::PostClearAdvance);
+        assert!(h.status_of(1).is_none());
+        assert_advanced_and_unreachable(&h, 1, Some(Asid(201)));
+    }
+
+    /// **A replacement reuses the numeric TID.** The advance names the OLD incarnation, and the
+    /// replacement is not touched: not restored, not cleared, not enqueued, status unchanged.
+    #[test]
+    fn a_claim_that_finds_a_replacement_advances_past_the_old_incarnation_only() {
+        let mut h = three_task_world();
+        h.inject = Inject::ClaimFindsReplacement;
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(failure.refusal, ExitRefusal::IdentityChanged);
+        assert_eq!(failure.disposition, ExitDisposition::PostClearAdvance);
+        // The deferral names `{1, Asid(201)}` — the incarnation that was cleared — so the drain's
+        // exact-identity reverify reports `Removed` and never resolves the replacement.
+        assert_eq!(h.exit_deferral[0], Some((1, Some(Asid(201)))));
+        let replacement = h
+            .tcbs
+            .iter()
+            .flatten()
+            .find(|t| t.tid.0 == 1)
+            .expect("present");
+        assert_eq!(replacement.asid, Some(Asid(999)));
+        assert_eq!(
+            replacement.status,
+            TaskStatus::Running,
+            "the replacement must be untouched"
+        );
+        assert_eq!(h.count("restore_current_exact"), 0);
+        assert_eq!(h.current_of(0), None);
+    }
+
+    /// **Claim finds the victim `Detached`.** The one competing outcome that leaves it still
+    /// `Running`, still ours and placed nowhere — so it is RESTORED, and only then may the route
+    /// answer through the entering frame.
+    #[test]
+    fn a_claim_that_finds_the_victim_detached_restores_it_as_current() {
+        let mut h = three_task_world();
+        h.inject = Inject::ClaimFindsDetached;
+        let failure = run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse");
+        assert_eq!(failure.refusal, ExitRefusal::DetachedThread);
+        assert_eq!(failure.disposition, ExitDisposition::PostClearRestored);
+        // The scheduler owns it again — which is the ONLY state in which the trap bridge's
+        // `Complete(Err(..))` may return through the entering frame.
+        assert_eq!(h.current_of(0), Some(1));
+        assert_eq!(h.status_of(1), Some(TaskStatus::Running));
+        assert_eq!(h.count("restore_current_exact"), 1);
+        // Restoration proved the exact incarnation AND its absence from every CPU before writing.
+        assert!(h.at("victim_is_running_exact") < h.at("tid_placed_anywhere"));
+        assert!(h.at("tid_placed_anywhere") < h.at("restore_current_exact"));
+        // Nothing is advanced past, so the reservation it took is released.
+        assert_eq!(h.queue_advance[0], None);
+        assert_eq!(h.exit_deferral[0], None);
+        assert_eq!(h.count("publish_advance_for"), 0);
+        assert_eq!(h.count("release_queue_advance"), 1);
+    }
+
+    /// **Claim loses to a restart.** `Runnable` is neither restorable (a restart owns it now) nor
+    /// drain-honourable (the reverify would refuse and leave the CPU with no selection). There is
+    /// no settlement, so it diverges rather than inventing one.
+    #[test]
+    #[should_panic(expected = "cleared current slot cannot be settled")]
+    fn a_claim_that_loses_to_a_restart_is_fatal_rather_than_guessed() {
+        let mut h = three_task_world();
+        h.inject = Inject::ClaimLosesTo(TaskStatus::Runnable);
+        let _ = run_exit_transaction(&mut h, CPU, CODE);
+    }
+
+    /// **Claim loses to a terminal fault.** `Faulted` is the same class of unsettleable state, and
+    /// for the same reason: the exit drain's reverify admits `Exited | Dead | absent`, so advancing
+    /// past a `Faulted` victim would be committing to a drain that refuses.
+    #[test]
+    #[should_panic(expected = "cleared current slot cannot be settled")]
+    fn a_claim_that_loses_to_a_terminal_fault_is_fatal() {
+        let mut h = three_task_world();
+        h.inject = Inject::ClaimLosesTo(TaskStatus::Faulted);
+        let _ = run_exit_transaction(&mut h, CPU, CODE);
+    }
+
+    /// **A `Runnable` victim that a restart also re-queued** is not restored even though it is
+    /// present and ours: `tid_placed_anywhere` is what refuses it, and it is checked on EVERY CPU.
+    #[test]
+    fn a_requeued_victim_is_never_restored_even_while_present() {
+        // The slot is genuinely cleared, and then a restart re-queues the victim.
+        let mut h = three_task_world();
+        let token = crate::kernel::boot::cleared_current::clear_current_exact(
+            &mut h.sched,
+            CPU,
+            1,
+            Some(Asid(201)),
+        )
+        .expect("the exact clear succeeds");
+        h.sched
+            .enqueue_on(CPU, ThreadId(1))
+            .expect("a restart re-queues the victim");
+        let refused = token
+            .restore_current_exact(&mut h)
+            .expect_err("must refuse");
+        assert_eq!(refused.1, RestoreRefusal::PlacedElsewhere);
+        assert_eq!(h.current_of(0), None, "and nothing was written");
+        // Settle the token so the harness does not diverge on drop.
+        refused.0.publish_queue_advance(
+            &mut h,
+            crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+        );
+    }
+
+    /// The compare-and-clear is the whole repair for `VictimChanged`: it mutates NOTHING when the
+    /// slot names somebody else, where U9-EXIT2's unconditional clear removed that task and left
+    /// it current nowhere and queued nowhere.
+    #[test]
+    fn the_compare_and_clear_never_removes_a_task_it_did_not_name() {
+        let mut h = three_task_world();
+        // The scheduler moved on to tid 2.
+        h.sched.block_current_exact_on(CPU, ThreadId(1));
+        h.sched.enqueue_on(CPU, ThreadId(2)).expect("enqueue");
+        assert_eq!(h.sched.dispatch_next_on(CPU), Some(ThreadId(2)));
+        let before = h.snapshot();
+        let token = crate::kernel::boot::cleared_current::clear_current_exact(
+            &mut h.sched,
+            CPU,
+            1,
+            Some(Asid(201)),
+        );
+        assert!(token.is_none());
+        assert_eq!(h.current_of(0), Some(2), "tid 2 must still be current");
+        assert_eq!(
+            h.snapshot(),
+            before,
+            "the compare-and-clear mutated nothing"
+        );
+    }
+
+    /// An unconsumed token diverges. This is the property that makes "every post-clear state is
+    /// settled" a runtime fact and not only a review claim.
+    #[test]
+    #[should_panic(expected = "cleared current slot left unsettled")]
+    fn a_dropped_token_diverges() {
+        let mut h = three_task_world();
+        let token = crate::kernel::boot::cleared_current::clear_current_exact(
+            &mut h.sched,
+            CPU,
+            1,
+            Some(Asid(201)),
+        )
+        .expect("the exact clear succeeds");
+        drop(token);
+    }
+
+    // ── structural proof ────────────────────────────────────────────────────────────────────
+
+    /// The token is unforgeable, undroppable and single-use, and it has exactly three exits.
+    #[test]
+    fn the_cleared_current_token_cannot_be_forged_cloned_or_dropped() {
+        // One mint, and it is the compare-and-clear.
+        assert_eq!(
+            CLEARED_CURRENT
+                .matches("pub(crate) fn clear_current_exact(")
+                .count(),
+            1,
+            "there must be exactly one mint"
+        );
+        let ctor = CLEARED_CURRENT
+            .split("pub(crate) fn clear_current_exact(")
+            .nth(1)
+            .expect("the mint");
+        assert!(
+            ctor.contains("sched.block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid))?"),
+            "the mint must be a COMPARE-and-clear, so a mismatched slot yields no token"
+        );
+        assert_eq!(
+            CLEARED_CURRENT
+                .matches("Some(ClearedCurrentToken {")
+                .count(),
+            1,
+            "exactly one place constructs a token, and it is inside the compare-and-clear"
+        );
+        // Not copyable, not cloneable, must be used, and dropping diverges.
+        let decl = CLEARED_CURRENT
+            .split("pub(crate) struct ClearedCurrentToken {")
+            .next()
+            .expect("the declaration prefix");
+        assert!(decl.ends_with(
+            "#[must_use = \"a cleared current slot must be settled: restore, advance, or fatal\"]\n#[derive(Debug)]\n"
+        ));
+        // The `ends_with` above already pins the token's own derive to `#[derive(Debug)]`; this
+        // is the other half — no hand-written `Clone`/`Copy` for it either. (The file's other
+        // types ARE `Clone`; they carry no obligation.)
+        assert!(
+            !CLEARED_CURRENT.contains("impl Clone for ClearedCurrentToken")
+                && !CLEARED_CURRENT.contains("impl Copy for ClearedCurrentToken"),
+            "the token must not be cloneable — two settlements of one clear is the bug"
+        );
+        assert!(CLEARED_CURRENT.contains("impl Drop for ClearedCurrentToken {"));
+        assert!(CLEARED_CURRENT.contains("panic!(\"cleared current slot left unsettled\")"));
+        // Exactly three consuming exits, each taking `self` by value.
+        for consumer in [
+            "pub(crate) fn restore_current_exact<O: ClearedCurrentOwners>(\n        self,",
+            "pub(crate) fn publish_queue_advance<O: ClearedCurrentOwners>(\n        self,",
+            "pub(crate) fn fatal(self, reason: &'static str) -> ! {",
+        ] {
+            assert!(
+                CLEARED_CURRENT.contains(consumer),
+                "missing consuming settlement: {consumer}"
+            );
+        }
+        // And the private `consume` is the only way past `Drop`, so a fourth exit cannot be added
+        // without going through it.
+        assert_eq!(
+            CLEARED_CURRENT.matches("core::mem::forget(self)").count(),
+            1,
+            "one place suppresses Drop, and it is the shared consume"
+        );
+        // Three call sites: one per settlement, and no other.
+        assert_eq!(CLEARED_CURRENT.matches("self.consume()").count(), 3);
+    }
+
+    /// A `Complete` disposition after the clear is reachable ONLY through a completed restore.
+    ///
+    /// This is the safety property the whole stage exists for. `Complete(Err(..))` is delivered by
+    /// the trap bridge as `frame.set_err(..); finalize(..); return Ok(())` — i.e. by RESUMING the
+    /// entering task — so it is legal only when that task is this CPU's current again.
+    #[test]
+    fn a_complete_after_the_clear_requires_a_completed_restoration() {
+        // The only post-clear disposition the route answers with `Complete` is the restored one.
+        let route = SPLIT
+            .split("fn try_split_exit_current_task(")
+            .nth(1)
+            .expect("the route");
+        let restored = route
+            .split("ExitDisposition::PostClearRestored => {")
+            .nth(1)
+            .expect("the restored arm");
+        let restored = &restored[..restored.find("\n            }").unwrap_or(restored.len())];
+        assert!(restored.contains("D::Complete(Err(TrapHandleError::Syscall("));
+        let advance = route
+            .split("ExitDisposition::PostClearAdvance => {")
+            .nth(1)
+            .expect("the advance arm");
+        let advance = &advance[..advance.find("\n            }").unwrap_or(advance.len())];
+        assert!(
+            advance.contains("D::QueueAdvanceCommitted") && !advance.contains("D::Complete"),
+            "an advanced victim must never return through the entering frame"
+        );
+        // And the ONLY producer of `PostClearRestored` is the arm that observed a completed
+        // restore, in the settlement itself.
+        assert_eq!(
+            EXIT_TXN
+                .matches("ExitDisposition::PostClearRestored")
+                .count(),
+            1
+        );
+        let produced = EXIT_TXN
+            .split("ExitDisposition::PostClearRestored")
+            .next()
+            .expect("the producing arm's prefix");
+        assert!(
+            produced
+                .rfind("Ok(ClearedCurrentSettlement::Restored) => {")
+                .is_some_and(|at| at > produced.rfind("Err((token, why))").unwrap_or(0)),
+            "`PostClearRestored` may only be produced from a completed restore"
+        );
+    }
+
+    /// The restoration proof is exact on identity and total on placement.
+    #[test]
+    fn restoration_checks_the_exact_incarnation_and_every_cpu() {
+        let restore = CLEARED_CURRENT
+            .split("pub(crate) fn restore_current_exact<O: ClearedCurrentOwners>(")
+            .nth(1)
+            .expect("the restore settlement");
+        let restore = &restore[..restore
+            .find("\n    /// **Settlement 2**")
+            .unwrap_or(restore.len())];
+        // Order: exact incarnation and status, THEN placement, THEN the write.
+        let running = restore
+            .find("victim_is_running_exact(tid, asid)")
+            .expect("status");
+        let placed = restore.find("tid_placed_anywhere(tid)").expect("placement");
+        let write = restore
+            .find("owners.restore_current_exact(cpu, tid, priority)")
+            .expect("write");
+        assert!(running < placed && placed < write);
+        // The placement question is asked of EVERY CPU, not this one.
+        assert!(
+            RUNTIME.contains("tid_present_anywhere(crate::kernel::ipc::ThreadId(tid))"),
+            "the split reader must use the all-CPU predicate"
+        );
+        let anywhere = SCHEDULER
+            .split("pub fn tid_present_anywhere(&self, tid: ThreadId) -> bool {")
+            .nth(1)
+            .expect("the all-CPU predicate");
+        assert!(
+            anywhere.contains("self.schedulers\n            .iter()\n            .any(|sched| sched.contains_or_current(tid))"),
+            "it must scan every CPU's current slot AND run queues"
+        );
+        // The scheduler write itself refuses unless the slot is still empty and the task unqueued.
+        let seam = SCHEDULER
+            .split("pub fn restore_exact_current(&mut self, tid: ThreadId, priority: TaskPriority) -> bool {")
+            .nth(1)
+            .expect("the scheduler seam");
+        assert!(seam.contains("if self.current.is_some() || self.contains_tid(tid) {"));
+        // And the exact-identity check is on `{tid, asid}`, never a bare TID.
+        let running_reader = RUNTIME
+            .split("pub(crate) fn victim_is_running_exact_split(")
+            .nth(1)
+            .expect("the exact running reader");
+        let running_reader = &running_reader[..running_reader
+            .find("\n    /// U9-EXIT3 §2 — rank 1: is `tid` current on")
+            .unwrap_or(running_reader.len())];
+        assert!(
+            running_reader.contains("t.tid.0 == tid")
+                && running_reader.contains("t.asid == asid")
+                && running_reader.contains("TaskStatus::Running"),
+            "the running check must be exact on the incarnation, not on a bare TID"
+        );
+    }
+
+    /// NEGATIVE — the U9-EXIT2 shape is gone and cannot come back by accident.
+    #[test]
+    fn the_old_unconditional_clear_and_post_clear_complete_are_rejected() {
+        // (1) The exit owners no longer reach the unconditional clear.
+        assert!(
+            !EXIT_TXN.contains("block_current_on_cpu_split"),
+            "the exit must not clear whatever happens to be current"
+        );
+        assert!(
+            !EXIT_TXN.contains("fn clear_current(&mut self, cpu: CpuId) -> Option<u64>"),
+            "the unconditional owner method must not exist"
+        );
+        // (2) There is no longer a single `FailClosed` disposition standing in for the settlement.
+        assert!(
+            !EXIT_CLAIM.contains("FailClosed"),
+            "a post-clear state is settled, not classified"
+        );
+        // (3) And the transaction cannot reach a bare `ExitFailure` construction after the clear:
+        //     every post-clear failure goes through the settlement helper.
+        let after_clear = EXIT_TXN
+            .split("let Some(token) = owners.clear_current_exact(")
+            .nth(1)
+            .expect("the clear");
+        let after_clear = &after_clear[..after_clear
+            .find("/// U9-EXIT3 §3 — settle a cleared current slot")
+            .unwrap_or(after_clear.len())];
+        assert!(
+            !after_clear.contains("ExitFailure {"),
+            "no post-clear path may build a failure without settling the token"
+        );
+        assert!(after_clear.contains("settle_failed_claim("));
+    }
+
+    /// Every settlement publishes at most one advance, and only with a live reservation.
+    #[test]
+    fn the_advance_is_reserved_once_and_published_once() {
+        assert_eq!(
+            CLEARED_CURRENT
+                .matches("owners.publish_advance_for(cpu, tid, asid)")
+                .count(),
+            1,
+            "one publication site, inside the one advance settlement"
+        );
+        assert_eq!(
+            EXIT_TXN.matches("publish_queue_advance(owners,").count(),
+            2,
+            "the success arm and the post-clear advance arm, and nothing else"
+        );
+        // The success arm's authority is the unforgeable claim; the post-clear arm's is the
+        // observed non-resumability. Neither can be produced on the other's path.
+        assert!(EXIT_TXN.contains("AdvanceAuthority::Claimed(&claim)"));
+        assert!(EXIT_TXN.contains("AdvanceAuthority::VictimNonResumable"));
+    }
+
+    /// The Class-D settlement enum is exhaustive and the route matches every arm.
+    #[test]
+    fn every_settlement_arm_is_matched_without_a_wildcard() {
+        let route = SPLIT
+            .split("Err(failure) => match failure.disposition {")
+            .nth(1)
+            .expect("the settlement match");
+        let route = &route[..route.find("\n        },").unwrap_or(route.len())];
+        for arm in [
+            "ExitDisposition::InvalidPreLock =>",
+            "ExitDisposition::ImpossibleState =>",
+            "ExitDisposition::PostClearRestored =>",
+            "ExitDisposition::PostClearAdvance =>",
+        ] {
+            assert!(route.contains(arm), "the route must match {arm}");
+        }
+        assert!(
+            !route.contains("_ =>"),
+            "a wildcard would let a new disposition inherit somebody else's settlement"
+        );
+        assert_eq!(
+            ClearedCurrentSettlement::Restored,
+            ClearedCurrentSettlement::Restored
+        );
     }
 
     /// U9-EXIT2 §5 — after NR 16 is recognized the route has NO `NotHandled` outcome.
@@ -160430,7 +161059,8 @@ mod u9exit1_self_exit_transaction {
         for settlement in [
             "ExitDisposition::InvalidPreLock",
             "ExitDisposition::ImpossibleState",
-            "ExitDisposition::FailClosed",
+            "ExitDisposition::PostClearRestored",
+            "ExitDisposition::PostClearAdvance",
         ] {
             assert!(
                 after.contains(settlement),
@@ -160591,7 +161221,7 @@ mod u9exit2_total_nr16_disposition {
     fn the_detached_arm_is_an_impossible_state_not_a_declined_population() {
         use crate::kernel::boot::exit_claim::{ExitDisposition, ExitRefusal};
         assert_eq!(
-            ExitRefusal::DetachedThread.disposition(false),
+            ExitRefusal::DetachedThread.disposition(),
             ExitDisposition::ImpossibleState
         );
         // Both the preflight and the claim test it: one acquisition decides, and the other is the
@@ -160649,7 +161279,7 @@ mod u9exit2_total_nr16_disposition {
     fn the_robust_registry_has_one_owner_and_one_domain() {
         use crate::kernel::boot::exit_claim::{ExitDisposition, ExitRefusal};
         assert_eq!(
-            ExitRefusal::RobustFutexList.disposition(false),
+            ExitRefusal::RobustFutexList.disposition(),
             ExitDisposition::ImpossibleState
         );
         // The registry lives in ONE place.
@@ -160791,16 +161421,36 @@ mod u9exit2_total_nr16_disposition {
         // Every failure arm that runs after the reservation releases it. There are exactly three:
         // the server-death reserve failure, the victim-changed check, and the claim failure.
         let after = &txn[reserve..];
+        // U9-EXIT3: two, not three. The pre-clear failures release what they took; the
+        // post-clear one does NOT, because the advance settlement is what consumes it. Releasing
+        // it there would leave the CPU with an empty current slot and no drain work — which is
+        // exactly the state U9-EXIT2 produced and then returned to userspace through.
         assert_eq!(
             after.matches("owners.release_queue_advance(cpu);").count(),
-            3,
-            "every post-reservation failure must release the deferral"
+            2,
+            "the pre-clear failures release the deferral; the advance settlement consumes it"
+        );
+        // The third release lives in the settlement, and only on the RESTORE arm, where there is
+        // genuinely nothing to advance past.
+        let restore_arm = EXIT_TXN
+            .split("Ok(ClearedCurrentSettlement::Restored) => {")
+            .nth(1)
+            .expect("the restore settlement");
+        assert!(
+            restore_arm[..restore_arm
+                .find("return ExitFailure")
+                .unwrap_or(restore_arm.len())]
+                .contains("owners.release_queue_advance(cpu);"),
+            "a restored victim advances past nothing, so its reservation must be released"
         );
         // And the route only answers `QueueAdvanceCommitted` on the success arm.
         let route = SPLIT
             .split("fn try_split_exit_current_task(")
             .nth(1)
             .expect("the route");
-        assert_eq!(route.matches("D::QueueAdvanceCommitted").count(), 1);
+        // Two: the success arm, and the post-clear ADVANCE arm — which is the same answer for
+        // the same reason, reached because a competing owner rather than this transaction made the
+        // victim terminal. Both are licensed by a live reservation.
+        assert_eq!(route.matches("D::QueueAdvanceCommitted").count(), 2);
     }
 }

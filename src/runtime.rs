@@ -2197,6 +2197,68 @@ impl SharedKernel {
         );
     }
 
+    /// U9-EXIT3 §2 — the ONE rank-1 compare-and-clear that mints a post-clear settlement duty.
+    ///
+    /// Nothing is mutated unless `cpu`'s current slot names exactly `tid`.
+    pub(crate) fn clear_current_exact_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: Option<crate::kernel::vm::Asid>,
+    ) -> Option<crate::kernel::boot::cleared_current::ClearedCurrentToken> {
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .ok()?;
+            sched.current_cpu = cpu;
+            crate::kernel::boot::cleared_current::clear_current_exact(
+                crate::kernel::boot::kernel_mut(&mut sched.scheduler),
+                cpu,
+                tid,
+                asid,
+            )
+        })
+    }
+
+    /// U9-EXIT3 §2 — rank 2: is this EXACT incarnation present and `Running`?
+    pub(crate) fn victim_is_running_exact_split(
+        &self,
+        tid: u64,
+        asid: Option<crate::kernel::vm::Asid>,
+    ) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter().flatten().any(|t| {
+                t.tid.0 == tid
+                    && t.asid == asid
+                    && matches!(t.status, crate::kernel::task::TaskStatus::Running)
+            })
+        })
+    }
+
+    /// U9-EXIT3 §2 — rank 1: is `tid` current on, or queued on, ANY CPU?
+    pub(crate) fn tid_placed_anywhere_split(&self, tid: u64) -> bool {
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler)
+                .tid_present_anywhere(crate::kernel::ipc::ThreadId(tid))
+        })
+    }
+
+    /// U9-EXIT3 §2 — rank 1: the exact inverse of `clear_current_exact_split`.
+    pub(crate) fn restore_current_exact_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        priority: crate::kernel::scheduler::TaskPriority,
+    ) -> bool {
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_mut(&mut sched.scheduler).restore_exact_current_on(
+                cpu,
+                crate::kernel::ipc::ThreadId(tid),
+                priority,
+            )
+        })
+    }
+
     /// `Terminal` and `Removed` both mean "the advance is owed"; `Contradicted` is the only
     /// refusal, and it is the one that must never happen after a claim.
     pub(crate) fn exit_reverify_ok(&self, tid: u64) -> bool {

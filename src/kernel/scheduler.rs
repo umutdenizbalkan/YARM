@@ -549,6 +549,40 @@ impl PriorityScheduler {
         Some(current.tid)
     }
 
+    /// U9-EXIT3 §1/§2 — COMPARE-and-clear, returning the removed task's exact priority.
+    ///
+    /// [`Self::block_current`] clears whatever is current. A caller that means "clear MY task"
+    /// therefore clears somebody else's slot whenever the scheduler has moved on, and the task it
+    /// removed is then current nowhere and queued nowhere. This form mutates nothing unless the
+    /// current slot names exactly `tid`.
+    ///
+    /// The returned priority is the restoration authority: it is the only record of what the
+    /// removed task's placement was, and without it a later restore would have to invent one.
+    pub fn block_current_exact(&mut self, tid: ThreadId) -> Option<TaskPriority> {
+        if self.current.map(|task| task.tid) != Some(tid) {
+            return None;
+        }
+        let current = self.current.take()?;
+        if !self.membership_tracking_exhausted {
+            self.membership_remove(current.tid);
+        }
+        Some(current.priority)
+    }
+
+    /// U9-EXIT3 §2 — the exact inverse of [`Self::block_current_exact`].
+    ///
+    /// Restores `tid` as this CPU's current at the priority it was removed with. Refuses — and
+    /// mutates nothing — unless the slot is still empty and the task is in no queue on this CPU,
+    /// so a restore can never displace a task the scheduler chose in the meantime nor create a
+    /// second placement for one that was re-queued.
+    pub fn restore_exact_current(&mut self, tid: ThreadId, priority: TaskPriority) -> bool {
+        if self.current.is_some() || self.contains_tid(tid) {
+            return false;
+        }
+        self.current = Some(ScheduledTask { tid, priority });
+        true
+    }
+
     pub fn current_tid(&self) -> Option<ThreadId> {
         self.current.map(|task| task.tid)
     }
@@ -859,6 +893,38 @@ impl SmpScheduler {
     pub fn block_current_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
         let idx = self.check_online_cpu(cpu).ok()?;
         self.schedulers[idx].block_current()
+    }
+
+    /// U9-EXIT3 §2 — compare-and-clear on one CPU. See [`PriorityScheduler::block_current_exact`].
+    pub fn block_current_exact_on(&mut self, cpu: CpuId, tid: ThreadId) -> Option<TaskPriority> {
+        let idx = self.check_online_cpu(cpu).ok()?;
+        self.schedulers[idx].block_current_exact(tid)
+    }
+
+    /// U9-EXIT3 §2 — restore on one CPU. See [`PriorityScheduler::restore_exact_current`].
+    ///
+    /// The `tid_present_anywhere` check is the caller's, not this seam's: this one refuses only on
+    /// its own CPU, and a restore must additionally prove the task is on no OTHER CPU.
+    pub fn restore_exact_current_on(
+        &mut self,
+        cpu: CpuId,
+        tid: ThreadId,
+        priority: TaskPriority,
+    ) -> bool {
+        let Ok(idx) = self.check_online_cpu(cpu) else {
+            return false;
+        };
+        self.schedulers[idx].restore_exact_current(tid, priority)
+    }
+
+    /// U9-EXIT3 §2 — is `tid` current on, or queued on, ANY CPU?
+    ///
+    /// Read-only, and deliberately every CPU rather than one: "absent from every runqueue and
+    /// current slot" is the precondition a restore needs, and a per-CPU answer cannot state it.
+    pub fn tid_present_anywhere(&self, tid: ThreadId) -> bool {
+        self.schedulers
+            .iter()
+            .any(|sched| sched.contains_or_current(tid))
     }
 
     /// Stage 199D: withdraw one queued incarnation of `tid` from `cpu`'s runqueue.
