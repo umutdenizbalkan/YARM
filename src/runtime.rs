@@ -11365,6 +11365,44 @@ impl SharedKernel {
     /// nothing can wake it while that is true, so this check does not race. Declining here keeps
     /// the dangerous `AlreadyQueued`-after-publication branch off the ordinary path entirely —
     /// the branch remains, and fails closed, for a genuine invariant violation.
+    /// U9-REAP1 §3 — rank 1: the CPUs that must acknowledge a shootdown for a destroyed address
+    /// space.
+    ///
+    /// Online, minus wake-only APs. Stage 183.5's exclusion is preserved verbatim: a wake-only AP
+    /// has no dispatcher, no user page table and no user-VA access, so it can hold no translation
+    /// for this ASID — and including one would leave the retired-ASID slot pending forever, which
+    /// after 32 destroys turns every later teardown into `VmError::Full`.
+    pub(crate) fn reap_shootdown_cpu_bitmap_split(&self) -> u64 {
+        self.with_scheduler_split_mut(|sched| {
+            let scheduler = kernel_ref(&sched.scheduler);
+            scheduler.online_cpu_bitmap() & !scheduler.wake_only_bitmap()
+        })
+    }
+
+    /// U9-REAP1 §3 — rank 3: queue one fire-and-forget TLB shootdown for a destroyed address
+    /// space.
+    ///
+    /// A full queue is silenced, exactly as the broad owner silences it: the ASID is already
+    /// retired and its frames must be reclaimed regardless, and frame reuse before invalidation
+    /// still cannot happen because a retired ASID is not reusable until every CPU acknowledges it.
+    pub(crate) fn reap_submit_tlb_shootdown_split(
+        &self,
+        cpu: CpuId,
+        asid: crate::kernel::vm::Asid,
+    ) {
+        let _ = self.with_ipc_split_mut(|ipc| {
+            ipc.cross_cpu_work.send_to(
+                cpu,
+                crate::kernel::smp::WorkItem::TlbShootdown {
+                    asid,
+                    va_range: None,
+                    requester: None,
+                    sequence: 0,
+                },
+            )
+        });
+    }
+
     pub(crate) fn receiver_has_scheduler_membership_split_read(&self, tid: u64) -> bool {
         use crate::kernel::ipc::ThreadId;
         self.with_scheduler_split_mut(|sched| {

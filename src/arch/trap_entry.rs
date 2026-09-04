@@ -2682,6 +2682,14 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // child is enqueued, never dispatched, so the caller is still current when the trap
         // returns, and the parent's return lane is written into its own frame.
         || raw_nr == crate::kernel::syscall::SYSCALL_FORK_NR
+        // U9-REAP1 §4: ReapFaultedTask (NR 31). Listed for the same reason — the route is
+        // architecture-neutral but reachable here only for a listed NR, and an unlisted one keeps
+        // `nr = 0` so the dispatcher declines. NR 31 takes ONE argument, the target TID in x0,
+        // which is the first argument the ABI import already carries. It is non-switching for the
+        // calling PM: reaping a task the scheduler already released cannot block, yield or change
+        // the caller's address space, so the caller is still current when the trap returns and its
+        // return lane is written into its own frame.
+        || raw_nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

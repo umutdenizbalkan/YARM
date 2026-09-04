@@ -61928,7 +61928,10 @@ mod stage191a_lock_retire_inventory {
             // U9-FORK1 §4 removed NR 12 for the reason the family was listed at all: it had no
             // exact rollback. It has one now — the spawn reservation lifecycle plus the COW
             // clone's own inverse — and the positive assertion above pins its admission.
-            "Syscall::ReapFaultedTask => Some",
+            // U9-REAP1 §4 removed NR 31 for the same shape of reason NR 12 left: the obstacle
+            // was never the seam, it was that a reap read the target's status in one acquisition
+            // and wrote it in another. The claim collapses the two, and the dedicated guard above
+            // pins the admission.
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
             "Syscall::IpcReply => Some",
@@ -61986,17 +61989,26 @@ mod stage191a_lock_retire_inventory {
             || body.contains("switch_frames")
     }
 
-    // ReapFaultedTask stays GLOBAL-LOCK-ONLY (explicitly excluded from split dispatch).
+    // U9-REAP1 §4: ReapFaultedTask LEFT the global-lock-only set, and this guard now pins its
+    // admission rather than its exclusion. Stage 191A listed NR 31 as global-lock-only because a
+    // faulted-task reap had no linearizable claim and no shared cleanup transaction; §2 and §3
+    // supplied both, so the reason for the exclusion is gone and the exclusion goes with it.
     #[test]
     fn reap_faulted_task_stays_global_lock_only() {
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must never be split-eligible"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask must be split-eligible"
         );
-        // The dedicated exclusion guard still exists in syscall_split tests.
         assert!(
-            SPLIT_SRC.contains("fn stage188h_reap_faulted_task_excluded_from_split_dispatch()"),
-            "the ReapFaultedTask split-exclusion guard must remain"
+            SPLIT_SRC.contains("fn try_split_reap_faulted_task_into_frame("),
+            "the NR 31 split route must exist"
+        );
+        // Its Stage 188H counterpart was re-derived the same way, in the same increment.
+        assert!(
+            SPLIT_SRC.contains("fn stage188h_reap_faulted_task_excluded_from_split_dispatch()")
+                && SPLIT_SRC
+                    .contains("U9-REAP1 §4: ReapFaultedTask must be NR-only split-eligible"),
+            "the Stage 188H guard must survive as the inverse assertion, not be deleted"
         );
     }
 
@@ -62336,7 +62348,8 @@ mod stage191c_split_user_copy_seam {
             // U9-SPAWN-TXN3 §4: NR 23 left this list, for the same kind of reason NR 11 did —
             // the obstacle was never the seam, it was the rollback, and §2 replaced it with the
             // exact provisional-capability closure.
-            "Syscall::ReapFaultedTask => Some",
+            // U9-REAP1 §4 removed NR 31 from this list; its admission is pinned by
+            // `reap_faulted_task_stays_global_lock_only` above, re-derived in the same increment.
             "Syscall::FutexWait => Some",
             "Syscall::Yield => Some",
         ] {
@@ -62642,9 +62655,12 @@ mod stage191d_futex_wait_block_publish {
             !SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
             "the removed NR 27 InitramfsReadChunk split class must not be whitelisted"
         );
+        // U9-REAP1 §4: NR 31 is admitted, so what remains intact here is the PRIOR retirements
+        // plus the removed NR 27 class above — the reap exclusion is deliberately no longer part
+        // of this guard's claim.
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must stay global-lock-only"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask is split-eligible"
         );
     }
 }
@@ -62705,7 +62721,8 @@ mod stage191e_dispatch_next_candidate_seam {
             // SEAM adds no live class — it does not, and did not, own the whitelist's contents;
             // NR 28's admission came from §4 and is pinned by its own guards.
             "Syscall::RecvSharedV3 => Some",
-            "Syscall::ReapFaultedTask => Some",
+            // U9-REAP1 §4 removed NR 31. Stage 191E's claim is unaffected and unchanged: the
+            // CANDIDATE SEAM adds no live class, and NR 31's admission came from §4, not from it.
         ] {
             assert!(
                 !SPLIT_SRC.contains(locked),
@@ -62895,11 +62912,13 @@ mod stage192a_queue_advancing_dispatch {
             MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=FutexWait result=ok"),
             "the x86_64 FutexWait retirement marker must exist (Stage 197 arch-tagged)"
         );
-        // ReapFaultedTask stays global-lock-only.
+        // U9-REAP1 §4: ReapFaultedTask is split-eligible. Neither this stage's markers nor its
+        // queue-advancing dispatch depend on that either way — NR 31 is non-switching and
+        // advances no queue — so the assertion is inverted, not dropped.
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must stay global-lock-only"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask is split-eligible"
         );
     }
 
@@ -63267,9 +63286,10 @@ mod stage192b_yield_queue_advancing_dispatch {
                 && RUNTIME_SRC.contains("dispatch_next_selection_on(dispatch_cpu)"),
             "the re-enqueue-only split + authoritative dispatch-step must exist"
         );
-        // ReapFaultedTask stays global-lock-only.
+        // U9-REAP1 §4: ReapFaultedTask is split-eligible, and is non-switching, so it neither
+        // re-enqueues nor advances the queue this stage's seam owns.
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
-        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+        assert!(SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"));
     }
 
     fn make_current(state: &mut crate::kernel::boot::KernelState, tid: u64, cpu: CpuId) {
@@ -63635,7 +63655,10 @@ mod stage193a_ipc_send_boundary_plain {
             );
         }
         // ReapFaultedTask stays global-lock-only.
-        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+        // U9-REAP1 §4: NR 31 is split-eligible. It is non-switching and touches no IPC send
+        // boundary, so this stage's claims are unaffected; the assertion is inverted, not
+        // dropped, so a regression in either direction still breaks a guard.
+        assert!(SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"));
     }
 
     // The origin flag helpers are a clean set/peek/take cycle.
@@ -64065,7 +64088,10 @@ mod stage193b_ipc_send_plain_oracle {
     // 193A + prior retirements + the ReapFaultedTask split-exclusion are intact.
     #[test]
     fn prior_guarantees_intact() {
-        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+        // U9-REAP1 §4: NR 31 is split-eligible. It is non-switching and touches no IPC send
+        // boundary, so this stage's claims are unaffected; the assertion is inverted, not
+        // dropped, so a regression in either direction still breaks a guard.
+        assert!(SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"));
         assert!(
             MOD_SRC.contains("class=IpcSendPlain")
                 && MOD_SRC.contains("class=FutexWait result=ok")
@@ -64417,7 +64443,10 @@ mod stage193c_ipc_send_ordinary_cap {
             ),
             "the IpcSendOrdinaryCap retirement marker must exist (arch-tagged as of Stage 198B)"
         );
-        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+        // U9-REAP1 §4: NR 31 is split-eligible. It is non-switching and touches no IPC send
+        // boundary, so this stage's claims are unaffected; the assertion is inverted, not
+        // dropped, so a regression in either direction still breaks a guard.
+        assert!(SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"));
     }
 
     // The cap-origin flag helpers are a clean set/peek/take cycle, independent of the
@@ -64660,7 +64689,10 @@ mod stage193d_ipc_send_reply_cap {
                 "the arch-tagged IpcSendReplyCap retirement marker must exist: {needle}"
             );
         }
-        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+        // U9-REAP1 §4: NR 31 is split-eligible. It is non-switching and touches no IPC send
+        // boundary, so this stage's claims are unaffected; the assertion is inverted, not
+        // dropped, so a regression in either direction still breaks a guard.
+        assert!(SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"));
     }
 
     // The reply-cap-origin flag is a clean set/peek/take cycle, independent of the
@@ -64915,7 +64947,10 @@ mod stage193e_ipc_send_plain_enqueue {
             MOD_SRC.contains("fn maybe_log_ipc_send_plain_enqueue_retired()"),
             "the IpcSendPlainEnqueue retirement latch must exist"
         );
-        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+        // U9-REAP1 §4: NR 31 is split-eligible. It is non-switching and touches no IPC send
+        // boundary, so this stage's claims are unaffected; the assertion is inverted, not
+        // dropped, so a regression in either direction still breaks a guard.
+        assert!(SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"));
     }
 
     // The wrapper adds NO user copy / cap materialization / receiver wake / sender block —
@@ -65125,7 +65160,10 @@ mod stage193f_ipc_send_cap_enqueue {
             ) && MOD_SRC.contains("fn maybe_log_ipc_send_ordinary_cap_enqueue_retired()"),
             "the IpcSendOrdinaryCapEnqueue retirement marker (arch-tagged, Stage 198B) + latch must exist"
         );
-        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+        // U9-REAP1 §4: NR 31 is split-eligible. It is non-switching and touches no IPC send
+        // boundary, so this stage's claims are unaffected; the assertion is inverted, not
+        // dropped, so a regression in either direction still breaks a guard.
+        assert!(SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"));
     }
 
     // No cap materialization / user copy at enqueue time — the envelope is preserved and the
@@ -73471,12 +73509,14 @@ mod stage194_cross_arch_portability_audit {
         }
     }
 
-    // ReapFaultedTask remains excluded from split dispatch (default-deny whitelist).
+    // U9-REAP1 §4: ReapFaultedTask is now a split-eligible arm. What still matters here — and
+    // what this guard keeps asserting — is that the classifier remains DEFAULT-DENY: NR 31 was
+    // admitted by naming it, not by loosening the fallthrough.
     #[test]
     fn reap_faulted_task_remains_excluded_from_split() {
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask =>"),
-            "ReapFaultedTask must never be a split-eligible arm"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask must be a split-eligible arm"
         );
         assert!(
             SPLIT_SRC.contains("// Default-deny: every other syscall falls back"),
@@ -73682,12 +73722,19 @@ mod stage195a_aarch64_debuglog_live {
         );
     }
 
-    // ReapFaultedTask remains excluded from split dispatch.
+    // U9-REAP1 §4: ReapFaultedTask is no longer excluded, and this guard pins the inverse.
+    // Stage 194's cross-arch portability claim is unaffected either way — the NR 31 route reads
+    // no user memory and takes no architecture-specific path — so what it now asserts is that
+    // every architecture's gate admits it, not that none does.
     #[test]
     fn reap_faulted_task_still_excluded() {
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must never pass the split NR gate"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask must pass the split NR gate"
+        );
+        assert!(
+            SPLIT_SRC.contains("fn try_split_reap_faulted_task_into_frame("),
+            "and reach its own route"
         );
     }
 
@@ -75270,10 +75317,10 @@ mod stage196b_riscv_debuglog_split {
         ] {
             assert!(RISCV_SMOKE.contains(bad), "smoke must reject: {bad}");
         }
-        // ReapFaultedTask must never be split-eligible.
+        // U9-REAP1 §4: ReapFaultedTask is split-eligible.
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must never pass the split NR gate"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask must pass the split NR gate"
         );
     }
 }
@@ -75430,9 +75477,10 @@ mod stage196c_riscv_futex_wake_split {
         ] {
             assert!(RISCV_SMOKE.contains(bad), "smoke must still reject: {bad}");
         }
+        // U9-REAP1 §4: ReapFaultedTask is split-eligible; the assertion is inverted, not dropped.
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must never be split-eligible"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask must be split-eligible"
         );
         assert!(
             RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
@@ -75704,9 +75752,10 @@ mod stage196d_riscv_queue_switch_foundation {
     // preserved (the switch-drain path adds no new stack debt beyond the bounded re-acquire).
     #[test]
     fn reap_excluded_and_trap_stack_preserved() {
+        // U9-REAP1 §4: ReapFaultedTask is split-eligible; the assertion is inverted, not dropped.
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must never be split-eligible"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask must be split-eligible"
         );
         assert!(
             RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
@@ -76054,9 +76103,10 @@ mod stage196e_riscv_futex_wait_retirement {
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
             "NR 27 must never be a retired RISC-V class"
         );
+        // U9-REAP1 §4: ReapFaultedTask is split-eligible; the assertion is inverted, not dropped.
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must never be split-eligible"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask must be split-eligible"
         );
         assert!(
             RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
@@ -76525,9 +76575,15 @@ mod stage196g_riscv_yield_default_on {
             "DebugLog + FutexWake must stay live"
         );
         assert!(
-            !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk")
-                && !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "NR27 + ReapFaultedTask must stay excluded"
+            !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
+            "NR 27 must stay excluded"
+        );
+        // U9-REAP1 §4: NR 31 left this pairing — it is split-eligible, and on RISC-V its
+        // admission is the `split_eligible` predicate's own NR list, pinned by
+        // `u9reap1_reap_transaction::every_architecture_admits_nr31`.
+        assert!(
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask must be split-eligible"
         );
         assert!(
             RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
@@ -76847,9 +76903,10 @@ mod stage197_first_cohort_seal {
     // RISC-V 2 MiB trap-stack guard remains.
     #[test]
     fn exclusions_and_debts() {
+        // U9-REAP1 §4: ReapFaultedTask is split-eligible; the assertion is inverted, not dropped.
         assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must never be split-eligible"
+            SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "U9-REAP1 §4: ReapFaultedTask must be split-eligible"
         );
         // NR27 is not sealed into the cohort.
         assert!(
@@ -114207,6 +114264,10 @@ mod stage199d_riscv_canonical_admission {
             // both finalize through that same writeback.
             "SYSCALL_SPAWN_PROCESS_NR",
             "SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR",
+            // U9-REAP1 §4: the fifth NON-switching member — NR 31. The reaping PM cannot block,
+            // yield or change address space by reaping a task the scheduler released at fault
+            // time, so it finalizes through that same writeback.
+            "SYSCALL_REAP_FAULTED_TASK_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -114218,11 +114279,11 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            10,
-            "exactly ten literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            11,
+            "exactly eleven literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
-             SpawnFromMemoryObject and (U9-FORK1 §4) Fork"
+             SpawnFromMemoryObject, (U9-FORK1 §4) Fork and (U9-REAP1 §4) ReapFaultedTask"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -118814,7 +118875,26 @@ mod stage199d_wa2a_ownership_boundary {
             ("src/kernel/boot/capability_lifecycle_state.rs", 1),
             ("src/kernel/boot/exec_state.rs", 4),
             ("src/kernel/boot/ipc_state.rs", 9),
-            ("src/kernel/boot/restart_state.rs", 4),
+            // U9-REAP1 §2: a NEW file with 2 writes, and both are the same site's two halves.
+            //
+            // - `claim_faulted_task_for_reap_locked` writes `Faulted|Exited -> Dead`. This is the
+            //   write `reap_faulted_task_noalloc_cleanup` used to perform (restart_state.rs falls
+            //   4 -> 3 below); it did not multiply, it MOVED, so that the status read that decides
+            //   the reap and the status write that commits it happen in ONE rank-2 acquisition.
+            //   It is not a wake owner in any sense: `Dead` is terminal, and no transition out of
+            //   it exists anywhere in this census.
+            // - `rollback_reap_claim_locked` writes the claim's exact `status_before` back. It is
+            //   the EXACT inverse of the writer above, reachable only from the residency re-proof
+            //   that runs before the transaction's first irreversible step, and it matches on
+            //   `{tid, asid}` so it can never restore a status onto a replacement task that
+            //   reused the numeric TID.
+            //
+            // Net census effect: +1 site (2 added here, 1 removed from restart_state.rs).
+            ("src/kernel/boot/reap_claim.rs", 2),
+            // U9-REAP1 §2: 4 -> 3. `reap_faulted_task_noalloc_cleanup`'s direct
+            // `tcb.status = Dead` moved into the claim above, which is the reap's linearization
+            // point. The file keeps its other three writers unchanged.
+            ("src/kernel/boot/restart_state.rs", 3),
             ("src/kernel/boot/scheduler_state.rs", 1),
             // U9-SPAWN1 SP-2: `spawn_user_thread`'s Runnable write moved to the shared
             // thread-incarnation owner, so thread_state.rs falls 4 -> 3 and the owner gains 1.
@@ -118885,14 +118965,15 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            38,
+            39,
             "35 raw writes (U6 added `commit_blocking_send_split`; U7 added \
              `drain_send_timeout_post_work`; U9-F added \
              `wake_destroyed_notification_waiter_split`; U9-RX3 added the exact BLOCK/UNWIND \
              pair `recv_block_phase_b_split` and `recv_block_unwind_race_split`; U9-FORK1 \
              RETIRED `fork_complete_post_clone`'s direct Runnable write, 36 -> 35, because the \
-             fork child now becomes live through the reservation commit), the WA3A barrier's \
-             single write, and the WA3B barrier's two"
+             fork child now becomes live through the reservation commit; U9-REAP1 MOVED the \
+             faulted reap's `-> Dead` write into the claim and added its exact inverse, \
+             35 -> 36), the WA3A barrier's single write, and the WA3B barrier's two"
         );
         // The nine barriered sites are enumerated by the WA2B census module, which adds them
         // back to reach the total of 38 transition sites.
@@ -119191,6 +119272,7 @@ mod stage199d_wa2b_wake_owner_census {
     const THREAD: &str = include_str!("thread_state.rs");
     const POLICY: &str = include_str!("task_policy_state.rs");
     const SPAWN_CORE: &str = include_str!("spawn_thread_core.rs");
+    const REAP_CLAIM: &str = include_str!("reap_claim.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
 
@@ -119331,7 +119413,30 @@ mod stage199d_wa2b_wake_owner_census {
             1,
             Verdict::IntoBlocked,
         ),
-        // ── restart_state.rs (4) ────────────────────────────────────────────────────────────
+        // ── reap_claim.rs (2) — U9-REAP1 §2 ─────────────────────────────────────────────────
+        //
+        // Both rows are `Cannot`, and that is a strengthening, not a relabelling. The row these
+        // two replace — `reap_faulted_task_noalloc_cleanup` — was `Can`: it wrote `Dead` over
+        // whatever status it found, having read that status in a DIFFERENT acquisition, so
+        // nothing in its own source stopped it landing on a task that had become
+        // `Blocked(EndpointReceive)` in between. The claim reads and writes in ONE acquisition
+        // behind `status_is_claimable`, which admits `Faulted | Exited(_)` and nothing else, so a
+        // blocked task is now refused by a precondition no caller can bypass.
+        (
+            "src/kernel/boot/reap_claim.rs",
+            "claim_faulted_task_for_reap_locked",
+            1,
+            Verdict::Cannot,
+        ),
+        // The exact inverse: it can only write back a `status_before` the claim above captured,
+        // which is `Faulted` or `Exited(_)` by construction.
+        (
+            "src/kernel/boot/reap_claim.rs",
+            "rollback_reap_claim_locked",
+            1,
+            Verdict::Cannot,
+        ),
+        // ── restart_state.rs (3) ────────────────────────────────────────────────────────────
         (
             "src/kernel/boot/restart_state.rs",
             "exit_task",
@@ -119347,12 +119452,6 @@ mod stage199d_wa2b_wake_owner_census {
         (
             "src/kernel/boot/restart_state.rs",
             "mark_task_dead",
-            1,
-            Verdict::Can,
-        ),
-        (
-            "src/kernel/boot/restart_state.rs",
-            "reap_faulted_task_noalloc_cleanup",
             1,
             Verdict::Can,
         ),
@@ -119809,6 +119908,22 @@ mod stage199d_wa2b_wake_owner_census {
             "tcb.ipc_timeout_deadline = deadline;",
         ),
         (
+            "src/kernel/boot/reap_claim.rs",
+            "claim_faulted_task_for_reap_locked",
+            "tcb.status",
+            "TaskStatus::Dead",
+            "let restart_token = tcb.restart.token;",
+            "tcb.restart.token = None;",
+        ),
+        (
+            "src/kernel/boot/reap_claim.rs",
+            "rollback_reap_claim_locked",
+            "tcb.status",
+            "claim.status_before",
+            "};",
+            "tcb.restart.token = claim.restart_token;",
+        ),
+        (
             "src/kernel/boot/restart_state.rs",
             "exit_task",
             "tcb.status",
@@ -119827,14 +119942,6 @@ mod stage199d_wa2b_wake_owner_census {
         (
             "src/kernel/boot/restart_state.rs",
             "mark_task_dead",
-            "tcb.status",
-            "TaskStatus::Dead",
-            ".ok_or(KernelError::TaskMissing)?;",
-            "tcb.restart.token = None;",
-        ),
-        (
-            "src/kernel/boot/restart_state.rs",
-            "reap_faulted_task_noalloc_cleanup",
             "tcb.status",
             "TaskStatus::Dead",
             ".ok_or(KernelError::TaskMissing)?;",
@@ -120064,7 +120171,7 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            34,
+            35,
             "32 raw writes (U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
              write, 33 -> 32, when the fork moved onto the spawn reservation lifecycle): U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
@@ -120141,8 +120248,10 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            43,
-            "U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43. \
+            44,
+            "U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43; U9-REAP1 §2 moved \
+             the faulted reap's `-> Dead` write into its claim and added the claim's exact \
+             inverse, 43 -> 44. \
              36 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
              `commit_blocking_send_split`, U3 (203C)'s `wake_tid_to_runnable_split`, and U7 \
              (199E)'s `drain_send_timeout_post_work`"
@@ -120157,10 +120266,11 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            43,
-            "34 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
-             `fork_complete_post_clone`'s, 35 -> 34) + 8 transition-barriered sites + 1 \
-             reservation-barriered site"
+            44,
+            "35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
+             `fork_complete_post_clone`'s, 35 -> 34; U9-REAP1 §2 moved the faulted reap's \
+             `-> Dead` write into its claim and added the claim's exact inverse, 34 -> 35) + 8 \
+             transition-barriered sites + 1 reservation-barriered site"
         );
     }
 
@@ -120493,7 +120603,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            43,
+            44,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -120522,7 +120632,16 @@ mod stage199d_wa2b_wake_owner_census {
             // U9-FORK1 §4: CANNOT 17 -> 16. `fork_complete_post_clone`'s Runnable write was a
             // CANNOT row (it wrote a slot the fork had just registered, so it could wake nothing);
             // retiring the write retires the row.
-            (15, 16, 9, 2, 1)
+            //
+            // U9-REAP1 §2: CAN 15 -> 14 and CANNOT 16 -> 18, and nothing else moves. The faulted
+            // reap's single CAN row (`reap_faulted_task_noalloc_cleanup`) is replaced by the two
+            // halves of its claim, and BOTH are CANNOT. That is a real strengthening, not an
+            // accounting change: the old row could write `Dead` over a status it had read in a
+            // different acquisition, so its source did not stop it landing on a task that had
+            // become `Blocked(EndpointReceive)` in between; the claim reads and writes the status
+            // in ONE acquisition behind `status_is_claimable`, and its inverse can only restore a
+            // status that predicate already admitted.
+            (14, 18, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -120614,6 +120733,29 @@ mod stage199d_wa2b_wake_owner_census {
                 "if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointSend(_))) {",
                 "while let Some(work) = crate::kernel::boot::send_timeout_work_drain_next(cpu_idx)",
             ),
+            // U9-REAP1 §2: the reap claim. Unlike every other row here the target TID IS supplied
+            // from outside (PM names it), so the closure fact is not "no caller selects a victim"
+            // — it is that the status the guard tests and the status the write replaces are the
+            // SAME read, taken from the same `&mut` TCB borrow inside one rank-2 acquisition.
+            // There is no window between them for a task to become `Blocked`, which is exactly
+            // what the base path — reading the status in the handler and writing it in the
+            // cleanup — could not say.
+            (
+                "reap_claim.rs",
+                "claim_faulted_task_for_reap_locked",
+                "if !status_is_claimable(status_before) {",
+                "let status_before = tcb.status;",
+            ),
+            // The inverse. Its guard is the exact-incarnation match, so it can only ever write to
+            // the task the claim won; and the value it writes is the claim's captured
+            // `status_before`, which `status_is_claimable` restricts to `Faulted | Exited(_)` —
+            // so no reachable rollback can produce a `Blocked` task.
+            (
+                "reap_claim.rs",
+                "rollback_reap_claim_locked",
+                ".find(|tcb| tcb.tid.0 == claim.tid && tcb.asid == claim.asid)",
+                "matches!(status, TaskStatus::Faulted | TaskStatus::Exited(_))",
+            ),
         ];
         // Exactly one proof per CANNOT assignment.
         let cannot_sites: usize = CENSUS
@@ -120644,6 +120786,7 @@ mod stage199d_wa2b_wake_owner_census {
                 "exec_state.rs" => EXEC,
                 "thread_state.rs" => THREAD,
                 "spawn_thread_core.rs" => SPAWN_CORE,
+                "reap_claim.rs" => REAP_CLAIM,
                 "runtime.rs" => RUNTIME,
                 other => panic!("unknown census source {other}"),
             };
@@ -157801,5 +157944,843 @@ mod u9a64cow2_split_route {
             checked, 8,
             "every post-mutation give-up arm must be accounted for"
         );
+    }
+}
+
+/// U9-REAP1 §5 — the reap transaction's properties, proved two ways.
+///
+/// The behavioural half drives the REAL `run_reap_transaction` over a harness whose rank-2 owner
+/// methods call the REAL locked bodies against a real `[Option<ThreadControlBlock>]` slice, and
+/// which records every owner call in order. Ordering, exactly-once and zero-mutation claims are
+/// therefore checked against full pre/post state compared BY IDENTITY, not by count, and a failure
+/// can be injected at any post-claim boundary. The structural half pins what a harness cannot see:
+/// that both routes reach the one transaction, that nothing allocates, and that each architecture
+/// actually admits NR 31.
+mod u9reap1_reap_transaction {
+    use super::*;
+    use crate::kernel::boot::reap_claim::{
+        ClosingReplyLink, ReapClaim, ReapRefusal, claim_faulted_task_for_reap_locked,
+        claim_incarnation_is_live_locked, collect_process_asids_locked, owner_pid_of_locked,
+        process_has_live_threads_locked, rollback_reap_claim_locked, status_is_claimable,
+        task_asid_locked,
+    };
+    use crate::kernel::boot::{ActiveTransferMapping, SenderWaiter, TransferEnvelope};
+    use crate::kernel::capabilities::{CNodeId, CapObject};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::syscall::reap_txn::{
+        DelegationEndpoints, DrainedBatch, ReapOwners, run_reap_transaction,
+    };
+    use crate::kernel::task::{RestartToken, TaskStatus, ThreadControlBlock, ThreadGroupId};
+    use crate::kernel::vm::Asid;
+
+    const REAP_CLAIM: &str = include_str!("reap_claim.rs");
+    const REAP_TXN: &str = include_str!("../syscall/reap_txn.rs");
+    const RESTART_STATE: &str = include_str!("restart_state.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    // ── the harness ─────────────────────────────────────────────────────────────────────────
+
+    /// Where a post-claim failure is injected, so every boundary past the linearization point can
+    /// be exercised.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Inject {
+        None,
+        /// The target is found resident on a runqueue only AFTER the claim won it.
+        ResidentAfterClaim,
+        /// The address-space drain refuses.
+        DrainFails,
+    }
+
+    struct Harness {
+        tcbs: alloc::vec::Vec<Option<ThreadControlBlock>>,
+        scheduled: alloc::vec::Vec<u64>,
+        /// `(slot, caller tid, caller asid, replier tid, replier asid, generation)`.
+        reply_records: alloc::vec::Vec<(usize, u64, Asid, u64, Asid, u64)>,
+        detached_links: alloc::vec::Vec<ClosingReplyLink>,
+        cnodes: alloc::vec::Vec<(u64, CNodeId)>,
+        delegation_links: alloc::vec::Vec<DelegationEndpoints>,
+        cleared_delegation_links: alloc::vec::Vec<usize>,
+        drained_asids: alloc::vec::Vec<Asid>,
+        reclaimed_asids: alloc::vec::Vec<Asid>,
+        shootdowns: alloc::vec::Vec<(u8, Asid)>,
+        reaped_cspaces: alloc::vec::Vec<u64>,
+        kernel_contexts_released: alloc::vec::Vec<u64>,
+        inject: Inject,
+        claim_calls: usize,
+        /// Every owner call, in the order the transaction made it.
+        log: alloc::vec::Vec<alloc::string::String>,
+    }
+
+    fn tcb(tid: u64, pid: u64, status: TaskStatus) -> ThreadControlBlock {
+        let mut t = ThreadControlBlock::new(ThreadId(tid), Some(Asid((tid + 100) as u16)));
+        t.thread_group_id = ThreadGroupId(pid);
+        t.status = status;
+        t.restart.token = Some(RestartToken(tid));
+        t
+    }
+
+    impl Harness {
+        fn new(tasks: &[ThreadControlBlock]) -> Self {
+            Self {
+                tcbs: tasks.iter().cloned().map(Some).collect(),
+                scheduled: alloc::vec::Vec::new(),
+                reply_records: alloc::vec::Vec::new(),
+                detached_links: alloc::vec::Vec::new(),
+                cnodes: alloc::vec![(7u64, CNodeId(7))],
+                delegation_links: alloc::vec::Vec::new(),
+                cleared_delegation_links: alloc::vec::Vec::new(),
+                drained_asids: alloc::vec::Vec::new(),
+                reclaimed_asids: alloc::vec::Vec::new(),
+                shootdowns: alloc::vec::Vec::new(),
+                reaped_cspaces: alloc::vec::Vec::new(),
+                kernel_contexts_released: alloc::vec::Vec::new(),
+                inject: Inject::None,
+                claim_calls: 0,
+                log: alloc::vec::Vec::new(),
+            }
+        }
+        fn note(&mut self, what: &str) {
+            self.log.push(what.into());
+        }
+        fn at(&self, what: &str) -> usize {
+            self.log
+                .iter()
+                .position(|entry| entry == what)
+                .unwrap_or_else(|| panic!("owner call `{what}` never happened: {:?}", self.log))
+        }
+        fn count(&self, what: &str) -> usize {
+            self.log.iter().filter(|entry| *entry == what).count()
+        }
+        fn status_of(&self, tid: u64) -> Option<TaskStatus> {
+            self.tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.status)
+        }
+        fn restart_token_of(&self, tid: u64) -> Option<Option<RestartToken>> {
+            self.tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.restart.token)
+        }
+        /// The whole observable state, by identity, for a byte-for-byte pre/post comparison.
+        fn snapshot(&self) -> alloc::string::String {
+            let tasks: alloc::vec::Vec<_> = self
+                .tcbs
+                .iter()
+                .flatten()
+                .map(|t| {
+                    (
+                        t.tid.0,
+                        t.asid,
+                        t.thread_group_id.0,
+                        t.status,
+                        t.restart.token,
+                    )
+                })
+                .collect();
+            alloc::format!(
+                "{tasks:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                self.reply_records,
+                self.detached_links,
+                self.cleared_delegation_links,
+                self.drained_asids,
+                self.reclaimed_asids,
+                self.shootdowns,
+                self.reaped_cspaces,
+                self.kernel_contexts_released
+            )
+        }
+    }
+
+    impl ReapOwners for Harness {
+        fn target_is_scheduled(&self, tid: u64) -> bool {
+            // The injection fires only on the SECOND probe — the one taken under the claim — so
+            // the transaction reaches its rollback arm rather than refusing before the claim.
+            if self.inject == Inject::ResidentAfterClaim && self.claim_calls > 0 {
+                return true;
+            }
+            self.scheduled.contains(&tid)
+        }
+        fn shootdown_cpu_bitmap(&self) -> u64 {
+            0b101
+        }
+        fn submit_tlb_shootdown(&mut self, cpu: crate::kernel::scheduler::CpuId, asid: Asid) {
+            self.note("submit_tlb_shootdown");
+            self.shootdowns.push((cpu.0, asid));
+        }
+
+        fn claim_faulted_task(&mut self, tid: u64) -> Result<ReapClaim, ReapRefusal> {
+            self.note("claim");
+            self.claim_calls += 1;
+            claim_faulted_task_for_reap_locked(&mut self.tcbs, tid)
+        }
+        fn rollback_claim(&mut self, claim: &ReapClaim) -> bool {
+            self.note("rollback_claim");
+            rollback_reap_claim_locked(&mut self.tcbs, claim)
+        }
+        fn claim_is_live(&self, claim: &ReapClaim) -> bool {
+            claim_incarnation_is_live_locked(&self.tcbs, claim)
+        }
+        fn process_has_live_threads(&self, pid: u64) -> bool {
+            process_has_live_threads_locked(&self.tcbs, pid)
+        }
+        fn collect_process_asids(&self, pid: u64, out: &mut [Option<Asid>]) -> usize {
+            collect_process_asids_locked(&self.tcbs, pid, out)
+        }
+        fn owner_pid_of(&self, tid: u64) -> u64 {
+            owner_pid_of_locked(&self.tcbs, tid)
+        }
+        fn task_asid(&self, tid: u64) -> Option<Asid> {
+            task_asid_locked(&self.tcbs, tid)
+        }
+        fn release_kernel_context(&mut self, claim: &ReapClaim) {
+            self.note("release_kernel_context");
+            self.kernel_contexts_released.push(claim.tid());
+        }
+
+        fn revoke_reply_caps_for_caller(
+            &mut self,
+            claim: &ReapClaim,
+            closing: &mut [Option<ClosingReplyLink>],
+        ) -> usize {
+            self.note("revoke_reply_caps_for_caller");
+            let (tid, asid) = (claim.tid(), claim.sweep_asid());
+            let mut n = 0usize;
+            let mut kept = alloc::vec::Vec::new();
+            for record in core::mem::take(&mut self.reply_records) {
+                let (slot, ctid, casid, rtid, rasid, generation) = record;
+                if ctid == tid && casid == asid {
+                    if slot < closing.len() {
+                        closing[slot] = Some((rtid, rasid, slot, generation));
+                    }
+                    n += 1;
+                } else {
+                    kept.push(record);
+                }
+            }
+            self.reply_records = kept;
+            n
+        }
+        fn revoke_reply_caps_for_replier(
+            &mut self,
+            claim: &ReapClaim,
+            closing: &mut [Option<ClosingReplyLink>],
+        ) -> usize {
+            self.note("revoke_reply_caps_for_replier");
+            let (tid, asid) = (claim.tid(), claim.sweep_asid());
+            let mut n = 0usize;
+            let mut kept = alloc::vec::Vec::new();
+            for record in core::mem::take(&mut self.reply_records) {
+                let (slot, _ctid, _casid, rtid, rasid, generation) = record;
+                if rtid == tid && rasid == asid {
+                    if slot < closing.len() {
+                        closing[slot] = Some((rtid, rasid, slot, generation));
+                    }
+                    n += 1;
+                } else {
+                    kept.push(record);
+                }
+            }
+            self.reply_records = kept;
+            n
+        }
+        fn detach_reverse_link(&mut self, link: ClosingReplyLink) -> bool {
+            self.note("detach_reverse_link");
+            assert!(
+                !self.detached_links.contains(&link),
+                "a reverse link was detached twice: {link:?}"
+            );
+            self.detached_links.push(link);
+            true
+        }
+        fn clear_ipc_waiters(
+            &mut self,
+            _claim: &ReapClaim,
+            _orphaned: &mut [Option<(SenderWaiter, usize)>],
+        ) -> usize {
+            self.note("clear_ipc_waiters");
+            0
+        }
+        fn settle_orphaned_sender(&mut self, _waiter: &SenderWaiter, _endpoint_idx: usize) {
+            self.note("settle_orphaned_sender");
+        }
+        fn snapshot_transfer_envelopes(
+            &self,
+            _out: &mut [Option<(usize, TransferEnvelope)>],
+        ) -> usize {
+            0
+        }
+        fn purge_transfer_envelope(&mut self, _idx: usize, _release_pin: Option<CapObject>) {
+            self.note("purge_transfer_envelope");
+        }
+        fn snapshot_active_transfer_mappings(
+            &self,
+            _out: &mut [Option<(usize, ActiveTransferMapping)>],
+        ) -> usize {
+            0
+        }
+        fn clear_active_transfer_mapping(&mut self, _idx: usize, _len: usize) {
+            self.note("clear_active_transfer_mapping");
+        }
+
+        fn drain_address_space(
+            &mut self,
+            asid: Asid,
+            _pending_cpu_bitmap: u64,
+        ) -> Result<DrainedBatch, crate::kernel::boot::KernelError> {
+            self.note("drain_address_space");
+            if self.inject == Inject::DrainFails {
+                return Err(crate::kernel::boot::KernelError::TaskMissing);
+            }
+            self.drained_asids.push(asid);
+            Ok([None; crate::kernel::vm::MAX_MAPPINGS])
+        }
+        fn reclaim_drained(&mut self, _drained: DrainedBatch) {
+            self.note("reclaim_drained");
+            if let Some(asid) = self.drained_asids.last().copied() {
+                self.reclaimed_asids.push(asid);
+            }
+        }
+        fn unmap_transfer_range(&mut self, _asid: Asid, _base: usize, _len: usize) {
+            self.note("unmap_transfer_range");
+        }
+
+        fn snapshot_delegation_links(&self, out: &mut [Option<DelegationEndpoints>]) -> usize {
+            let mut n = 0usize;
+            for link in &self.delegation_links {
+                if n < out.len() {
+                    out[n] = Some(*link);
+                    n += 1;
+                }
+            }
+            n
+        }
+        fn clear_delegation_link(&mut self, idx: usize) -> bool {
+            self.note("clear_delegation_link");
+            assert!(
+                !self.cleared_delegation_links.contains(&idx),
+                "a delegation link was cleared twice: {idx}"
+            );
+            self.cleared_delegation_links.push(idx);
+            true
+        }
+        fn process_cnode(&self, pid: u64) -> Option<CNodeId> {
+            self.cnodes.iter().find(|(p, _)| *p == pid).map(|(_, c)| *c)
+        }
+        fn cnode_slot_capacity(&self, _cnode: CNodeId) -> usize {
+            32
+        }
+        fn reap_process_cspace(&mut self, pid: u64, _cnode: CNodeId) -> (bool, bool) {
+            self.note("reap_process_cspace");
+            assert!(
+                !self.reaped_cspaces.contains(&pid),
+                "a process cspace was reaped twice: {pid}"
+            );
+            self.reaped_cspaces.push(pid);
+            (true, true)
+        }
+        fn retire_reap_claim(&mut self, _claim: ReapClaim) {
+            self.note("retire_reap_claim");
+        }
+    }
+
+    // ── §5 property 1: the claim is the linearization point, and it arbitrates ──────────────
+
+    /// One winner. A second reap of the same target loses and mutates NOTHING.
+    #[test]
+    fn a_duplicate_reap_loses_the_claim_and_changes_no_state() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        let first = run_reap_transaction(&mut h, 10).expect("the first reap wins");
+        assert_eq!(first.claim.tid(), 10);
+        assert_eq!(h.status_of(10), Some(TaskStatus::Dead));
+
+        let before = h.snapshot();
+        let log_before = h.log.len();
+        let refusal = run_reap_transaction(&mut h, 10).expect_err("the duplicate must lose");
+        assert_eq!(refusal, ReapRefusal::AlreadyClaimed);
+        assert!(
+            refusal.is_already_reaped(),
+            "a duplicate reap is `already reaped`, so the syscall still answers Ok"
+        );
+        assert_eq!(before, h.snapshot(), "the losing reap mutated something");
+        assert_eq!(
+            h.log.len() - log_before,
+            1,
+            "the loser must make exactly one owner call — the claim it lost"
+        );
+    }
+
+    /// Restart wins the race: the target is `Runnable` again by the time the reap arrives, and the
+    /// reap refuses before touching anything.
+    #[test]
+    fn a_restarted_target_refuses_the_claim_with_zero_mutation() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Runnable)]);
+        let before = h.snapshot();
+        let refusal = run_reap_transaction(&mut h, 10).expect_err("a live task is not reapable");
+        assert_eq!(refusal, ReapRefusal::NonTerminal);
+        assert!(!refusal.is_already_reaped());
+        assert_eq!(before, h.snapshot());
+        assert_eq!(h.status_of(10), Some(TaskStatus::Runnable));
+        assert_eq!(
+            h.restart_token_of(10),
+            Some(Some(RestartToken(10))),
+            "a refused claim must not consume the restart token"
+        );
+    }
+
+    /// A blocked task is refused by the same gate. This is the case the base path could not state:
+    /// it read the status in one acquisition and wrote it in another.
+    #[test]
+    fn a_blocked_target_is_never_claimable() {
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Blocked(crate::kernel::task::WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(1),
+            )),
+            TaskStatus::Reserved,
+        ] {
+            assert!(
+                !status_is_claimable(status),
+                "{status:?} must never be claimable"
+            );
+            let mut h = Harness::new(&[tcb(10, 7, status)]);
+            let before = h.snapshot();
+            assert_eq!(
+                run_reap_transaction(&mut h, 10),
+                Err(ReapRefusal::NonTerminal)
+            );
+            assert_eq!(before, h.snapshot());
+        }
+    }
+
+    /// A numeric TID alone authorizes nothing: a target that does not exist is refused, and the
+    /// refusal is the "already reaped" kind so the syscall's Ok/0 ABI is preserved.
+    #[test]
+    fn an_unknown_tid_is_refused_and_is_treated_as_already_reaped() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        let before = h.snapshot();
+        let refusal = run_reap_transaction(&mut h, 999).expect_err("no such task");
+        assert_eq!(refusal, ReapRefusal::TaskGone);
+        assert!(refusal.is_already_reaped());
+        assert_eq!(before, h.snapshot());
+    }
+
+    /// The claim carries the EXISTING restart token; nothing invents a generation.
+    #[test]
+    fn the_claim_carries_the_targets_own_restart_token_and_retires_it() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        let outcome = run_reap_transaction(&mut h, 10).expect("reaped");
+        assert_eq!(outcome.claim.restart_token(), Some(RestartToken(10)));
+        assert_eq!(outcome.claim.status_before(), TaskStatus::Faulted);
+        assert_eq!(outcome.claim.asid(), Some(Asid(110u16)));
+        assert_eq!(
+            h.restart_token_of(10),
+            Some(None),
+            "the claim must clear the token it took"
+        );
+    }
+
+    // ── §5 property 2: residency is proved, and its refusal is clean ────────────────────────
+
+    /// A target still on a runqueue is refused BEFORE the claim: nothing at all happens.
+    #[test]
+    fn a_resident_target_is_refused_before_the_claim() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        h.scheduled.push(10);
+        let before = h.snapshot();
+        assert_eq!(
+            run_reap_transaction(&mut h, 10),
+            Err(ReapRefusal::StillScheduled)
+        );
+        assert_eq!(before, h.snapshot());
+        assert_eq!(h.count("claim"), 0, "the claim must never have been taken");
+    }
+
+    /// Residency discovered only AFTER the claim rolls the claim back exactly, and stops there.
+    #[test]
+    fn residency_found_under_the_claim_rolls_it_back_byte_for_byte() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        let before = h.snapshot();
+        h.inject = Inject::ResidentAfterClaim;
+        assert_eq!(
+            run_reap_transaction(&mut h, 10),
+            Err(ReapRefusal::StillScheduled)
+        );
+        h.inject = Inject::None;
+        assert_eq!(
+            before,
+            h.snapshot(),
+            "the rollback must restore the exact pre-claim state"
+        );
+        assert_eq!(h.count("rollback_claim"), 1);
+        assert_eq!(
+            h.count("revoke_reply_caps_for_caller"),
+            0,
+            "nothing past the claim may run once it is rolled back"
+        );
+        assert_eq!(h.count("retire_reap_claim"), 0);
+    }
+
+    // ── §5 property 3: order, and exactly-once ──────────────────────────────────────────────
+
+    /// The full order the transaction documents is the order it performs, and the claim retires
+    /// LAST.
+    #[test]
+    fn the_transaction_runs_its_documented_order_and_retires_the_claim_last() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        h.reply_records
+            .push((0, 10, Asid(110u16), 20, Asid(120u16), 5));
+        h.delegation_links.push((0, 10, 20));
+        let outcome = run_reap_transaction(&mut h, 10).expect("reaped");
+
+        let order = [
+            "claim",
+            "revoke_reply_caps_for_caller",
+            "revoke_reply_caps_for_replier",
+            "clear_ipc_waiters",
+            "release_kernel_context",
+            "drain_address_space",
+            "submit_tlb_shootdown",
+            "reclaim_drained",
+            "clear_delegation_link",
+            "reap_process_cspace",
+            "retire_reap_claim",
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                h.at(pair[0]) < h.at(pair[1]),
+                "`{}` must precede `{}` — log: {:?}",
+                pair[0],
+                pair[1],
+                h.log
+            );
+        }
+        assert_eq!(
+            *h.log.last().expect("a non-empty log"),
+            "retire_reap_claim",
+            "the claim must retire after every other owned step"
+        );
+        assert!(outcome.process_reaped);
+        assert_eq!(outcome.caller_reply_records_revoked, 1);
+        assert_eq!(outcome.reverse_links_detached, 1);
+        assert_eq!(outcome.delegation_links_removed, 1);
+    }
+
+    /// unmap → release → TLB → reclaim. Every shootdown for an address space is queued after its
+    /// drain and before its reclaim, which is the direction that cannot hand back a frame a remote
+    /// CPU still has a translation for.
+    #[test]
+    fn every_shootdown_is_queued_after_the_drain_and_before_the_reclaim() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        let outcome = run_reap_transaction(&mut h, 10).expect("reaped");
+        assert_eq!(outcome.address_spaces_destroyed, 1);
+        assert!(h.at("drain_address_space") < h.at("submit_tlb_shootdown"));
+        assert!(h.at("submit_tlb_shootdown") < h.at("reclaim_drained"));
+        // One shootdown per CPU in the bitmap (0b101 => CPUs 0 and 2), and no others.
+        assert_eq!(
+            h.shootdowns,
+            alloc::vec![(0u8, Asid(110u16)), (2u8, Asid(110u16))]
+        );
+        assert_eq!(h.drained_asids, alloc::vec![Asid(110u16)]);
+        assert_eq!(h.reclaimed_asids, alloc::vec![Asid(110u16)]);
+    }
+
+    /// Each owned step happens exactly once, and the kernel context is released for the claimed
+    /// TID and no other.
+    #[test]
+    fn every_owned_step_happens_exactly_once_for_the_claimed_identity() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        h.reply_records
+            .push((0, 10, Asid(110u16), 20, Asid(120u16), 5));
+        h.reply_records
+            .push((1, 30, Asid(130u16), 10, Asid(110u16), 6));
+        run_reap_transaction(&mut h, 10).expect("reaped");
+        for step in [
+            "claim",
+            "revoke_reply_caps_for_caller",
+            "revoke_reply_caps_for_replier",
+            "clear_ipc_waiters",
+            "release_kernel_context",
+            "reap_process_cspace",
+            "retire_reap_claim",
+        ] {
+            assert_eq!(h.count(step), 1, "`{step}` must happen exactly once");
+        }
+        assert_eq!(h.kernel_contexts_released, alloc::vec![10u64]);
+        // Both sides of the identity were swept, and each reverse link closed once. The
+        // `detach_reverse_link` owner panics on a repeat, so reaching here IS the exactly-once
+        // proof.
+        assert_eq!(h.detached_links.len(), 2);
+        assert!(h.reply_records.is_empty());
+    }
+
+    /// A record belonging to a DIFFERENT incarnation at the same numeric TID is left alone.
+    #[test]
+    fn a_reused_numeric_tid_does_not_have_its_records_swept() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        // Same numeric TID, a different address space: a replacement, not the target.
+        h.reply_records
+            .push((0, 10, Asid(999u16), 20, Asid(120u16), 5));
+        let outcome = run_reap_transaction(&mut h, 10).expect("reaped");
+        assert_eq!(outcome.caller_reply_records_revoked, 0);
+        assert_eq!(outcome.replier_reply_records_revoked, 0);
+        assert_eq!(
+            h.reply_records.len(),
+            1,
+            "a record naming a different incarnation must survive the reap"
+        );
+        assert!(h.detached_links.is_empty());
+    }
+
+    // ── §5 property 4: the last-thread rule ─────────────────────────────────────────────────
+
+    /// A sibling that is still alive keeps the shared CNode and the shared address space.
+    #[test]
+    fn a_live_sibling_preserves_the_shared_cnode_and_address_space() {
+        let mut h = Harness::new(&[
+            tcb(10, 7, TaskStatus::Faulted),
+            tcb(11, 7, TaskStatus::Runnable),
+        ]);
+        let outcome = run_reap_transaction(&mut h, 10).expect("reaped");
+        assert!(
+            !outcome.process_reaped,
+            "the process half must be skipped while a sibling lives"
+        );
+        assert_eq!(outcome.address_spaces_destroyed, 0);
+        assert!(h.drained_asids.is_empty());
+        assert!(h.reaped_cspaces.is_empty());
+        assert!(h.cleared_delegation_links.is_empty());
+        // The per-thread half still ran in full.
+        assert_eq!(h.status_of(10), Some(TaskStatus::Dead));
+        assert_eq!(h.kernel_contexts_released, alloc::vec![10u64]);
+        assert_eq!(h.status_of(11), Some(TaskStatus::Runnable));
+        // …and the sibling's own reap, once it is terminal, DOES reach the process half.
+        h.tcbs
+            .iter_mut()
+            .flatten()
+            .find(|t| t.tid.0 == 11)
+            .expect("sibling")
+            .status = TaskStatus::Faulted;
+        let second = run_reap_transaction(&mut h, 11).expect("reaped");
+        assert!(second.process_reaped);
+        assert_eq!(
+            second.address_spaces_destroyed, 2,
+            "the last thread destroys BOTH of the group's distinct address spaces"
+        );
+        assert_eq!(h.reaped_cspaces, alloc::vec![7u64]);
+    }
+
+    /// A failing drain does not abort the transaction, and the claim still retires.
+    #[test]
+    fn a_failed_drain_skips_that_address_space_and_still_retires_the_claim() {
+        let mut h = Harness::new(&[tcb(10, 7, TaskStatus::Faulted)]);
+        h.inject = Inject::DrainFails;
+        let outcome = run_reap_transaction(&mut h, 10).expect("the reap still completes");
+        assert_eq!(outcome.address_spaces_destroyed, 0);
+        assert!(h.reclaimed_asids.is_empty(), "nothing may be reclaimed");
+        assert_eq!(
+            h.shootdowns.len(),
+            0,
+            "a drain that refused queues no shootdown for a still-live translation"
+        );
+        assert_eq!(h.count("retire_reap_claim"), 1);
+        assert_eq!(h.status_of(10), Some(TaskStatus::Dead));
+    }
+
+    // ── §5 structural half ──────────────────────────────────────────────────────────────────
+
+    /// Both NR 31 routes drive the ONE transaction. There is no second task-death implementation.
+    #[test]
+    fn both_routes_drive_the_one_reap_transaction() {
+        assert!(
+            RESTART_STATE.contains("run_reap_transaction(&mut owners, tid)")
+                && RESTART_STATE.contains("BroadReapOwners { kernel: self }"),
+            "the broad NR 31 owner must delegate to the shared transaction"
+        );
+        assert!(
+            SPLIT.contains("run_reap_transaction(&mut owners, target)")
+                && SPLIT.contains("SharedReapOwners { shared }"),
+            "the split NR 31 route must delegate to the same transaction"
+        );
+        assert_eq!(
+            REAP_TXN
+                .matches("pub(crate) fn run_reap_transaction")
+                .count(),
+            1,
+            "there must be exactly one reap transaction"
+        );
+        // Both owners implement the same trait, and neither re-states policy.
+        for owner in [
+            "impl ReapOwners for BroadReapOwners",
+            "impl ReapOwners for SharedReapOwners",
+        ] {
+            assert!(REAP_TXN.contains(owner), "missing owner impl: {owner}");
+        }
+    }
+
+    /// The reap never reaches a general capability revoke. §1's recomputation says the closure is
+    /// narrow per thread; this keeps it that way.
+    #[test]
+    fn the_reap_closure_reaches_no_general_capability_revoke() {
+        for forbidden in [
+            "revoke_capability_in_cnode",
+            "revoke_driver_runtime_caps",
+            "retire_reply_deadline_for_tid",
+            "mark_task_dead",
+        ] {
+            assert!(
+                !REAP_TXN.contains(forbidden),
+                "the reap transaction must not reach `{forbidden}` — it is not in the closure \
+                 §1 derived, and the base reap does not run it either"
+            );
+        }
+    }
+
+    /// Nothing in the transaction or its bodies allocates or grows.
+    #[test]
+    fn the_transaction_allocates_nothing() {
+        for (name, src) in [("reap_txn.rs", REAP_TXN), ("reap_claim.rs", REAP_CLAIM)] {
+            for forbidden in [
+                "Vec::new()",
+                "vec![",
+                "Box::new",
+                "alloc::vec",
+                ".push(",
+                ".collect()",
+                "String::",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "{name}: `{forbidden}` would allocate or grow inside a no-allocation reap"
+                );
+            }
+            // Every snapshot is a fixed array sized by an existing bound.
+            assert!(
+                src.contains("[None;") || src.contains("[const { None }"),
+                "{name}: snapshots must be fixed-capacity arrays"
+            );
+        }
+    }
+
+    /// Every refusal the transaction can return is produced before its first mutation, and the
+    /// refusal set is closed.
+    #[test]
+    fn every_refusal_is_pre_mutation_and_the_set_is_closed() {
+        // The claim is the only place a refusal originates, plus the residency proof around it.
+        assert_eq!(
+            REAP_TXN
+                .matches("return Err(ReapRefusal::StillScheduled)")
+                .count(),
+            2,
+            "residency refuses exactly twice: before the claim, and under it"
+        );
+        // …and the rollback is what makes the second one clean.
+        let after_claim = REAP_TXN
+            .split("let claim = owners.claim_faulted_task(tid)?;")
+            .nth(1)
+            .expect("the claim must exist");
+        let rollback_at = after_claim
+            .find("owners.rollback_claim(&claim);")
+            .expect("the post-claim residency arm must roll the claim back");
+        let first_sweep = after_claim
+            .find("owners.revoke_reply_caps_for_caller(")
+            .expect("the first irreversible step must exist");
+        assert!(
+            rollback_at < first_sweep,
+            "the only rollback must sit before the first irreversible step"
+        );
+        // The refusal enum is closed and every variant is classified as already-reaped or not.
+        for variant in [
+            "TaskGone",
+            "NoProcess",
+            "NonTerminal",
+            "AlreadyClaimed",
+            "StillScheduled",
+        ] {
+            assert!(
+                REAP_CLAIM.contains(&alloc::format!("Self::{variant} =>")),
+                "`{variant}` must have a stable marker name"
+            );
+        }
+    }
+
+    /// There is no broad fallback after the claim: the split route answers `Some(..)` for every
+    /// outcome once a caller resolves, so the broad handler can never re-sweep.
+    #[test]
+    fn the_split_route_never_falls_back_after_the_claim() {
+        let body = SPLIT
+            .split("fn try_split_reap_faulted_task_into_frame(")
+            .nth(1)
+            .expect("the NR 31 route must exist");
+        // Bound the slice at the NEXT top-level item, so nothing from a neighbouring route can
+        // be mistaken for this one's.
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        assert_eq!(
+            body.matches("return None").count() + body.matches("=> None").count(),
+            0,
+            "the route must not decline explicitly"
+        );
+        // Its single decline is the `?` on the caller lookup, which is strictly pre-mutation.
+        assert!(
+            body.contains("let caller = shared.current_tid_authoritative(cpu)?;"),
+            "the one decline must be the pre-mutation caller lookup"
+        );
+        // Every gate the broad handler applies is applied here, in the same order, before the
+        // transaction.
+        let not_pm = body.find("reason=not_pm").expect("the PM gate");
+        let is_self = body.find("reason=self").expect("the self-target gate");
+        let txn = body
+            .find("run_reap_transaction(&mut owners, target)")
+            .expect("the transaction");
+        assert!(
+            not_pm < is_self && is_self < txn,
+            "gate order must match the broad handler"
+        );
+    }
+
+    /// All three architectures actually admit NR 31 — the split dispatcher is neutral, the gates
+    /// are not.
+    #[test]
+    fn every_architecture_admits_nr31() {
+        assert!(
+            SPLIT.contains("Syscall::ReapFaultedTask => Some(syscall),"),
+            "the classifier must admit NR 31 (x86_64 reaches the dispatcher directly)"
+        );
+        assert!(
+            TRAP_ENTRY
+                .contains("|| raw_nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR"),
+            "AArch64 must import NR 31's ABI, or `nr` stays 0 and the dispatcher declines"
+        );
+        assert!(
+            RISCV_TRAP.contains("|| nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR"),
+            "RISC-V's split_eligible predicate must list NR 31"
+        );
+        // RISC-V's marker must be per-invocation, or three working reaps look like one.
+        let latch = RISCV_TRAP
+            .split("} else if nr == crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR")
+            .nth(1)
+            .expect("the per-invocation marker arm must exist");
+        let latch = &latch[..latch.find('{').unwrap_or(latch.len())];
+        assert!(
+            latch.contains("SYSCALL_REAP_FAULTED_TASK_NR"),
+            "NR 31 must be on the per-invocation marker arm, not a one-shot latch"
+        );
+    }
+
+    /// The retirement marker is emitted from BOTH owners, so a log cannot tell the routes apart by
+    /// its absence — the oracle-blindness trap U9-SPAWN-TXN3 and U9-FORK1 each hit once.
+    #[test]
+    fn the_claim_retirement_marker_is_emitted_from_both_owners() {
+        assert_eq!(
+            REAP_TXN.matches("emit_reap_claim_retired(&claim)").count(),
+            2,
+            "both owners must emit the retirement marker"
+        );
+        assert!(REAP_TXN.contains("TASK_REAP_CLAIM_RETIRED tid={} asid={} pid={}"));
     }
 }

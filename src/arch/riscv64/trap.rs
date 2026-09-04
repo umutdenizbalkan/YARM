@@ -807,6 +807,12 @@ pub fn handle_riscv_trap_entry_shared(
             // sstatus preserved, a0 from `set_ok`), and enqueues the child rather than
             // dispatching it, so the caller is still current when this trap returns.
             || nr == crate::kernel::syscall::SYSCALL_FORK_NR
+            // U9-REAP1 §4: ReapFaultedTask (NR 31). Same shape as the classes above — it neither
+            // blocks nor switches (the target was released by the scheduler at fault time, long
+            // before this call), so it finalizes through the same same-task ecall writeback
+            // (sepc+4 once, sstatus preserved, a0 from `set_ok`) and the calling PM is still
+            // current when this trap returns.
+            || nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -819,6 +825,11 @@ pub fn handle_riscv_trap_entry_shared(
         } else if nr == crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR
             || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
             || nr == crate::kernel::syscall::SYSCALL_FORK_NR
+            // U9-REAP1 §4/§6: NR 31 joins the per-invocation list for the same reason. §6 asserts
+            // that split NR 31 equals the successful-reap count, which a one-shot latch could not
+            // express: after the first reap the marker would stop, and three working reaps would
+            // look identical to one.
+            || nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
         {
             // U9-SPAWN-TXN3 §4/§6: NOT latched, deliberately.
             //
