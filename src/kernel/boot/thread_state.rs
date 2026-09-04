@@ -2375,27 +2375,35 @@ impl KernelState {
         self.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid))
             .then_some(())
             .ok_or(KernelError::TaskMissing)?;
-        if let Some(slot) = self
-            .robust_futex
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|entry| entry.tid == ThreadId(tid)) || slot.is_none())
-        {
-            *slot = Some(super::RobustFutexRecord {
-                tid: ThreadId(tid),
-                state: RobustFutexState { head, len },
-            });
-            Ok(())
-        } else {
-            Err(KernelError::TaskTableFull)
-        }
+        // U9-EXIT1 §3: the registry is a TASK-domain array — it sits beside `tcbs`,
+        // `task_classes` and `tls_restore_pending`, and is written only for a task that
+        // `with_tcbs` above just proved live. It had no lock of its own because nothing outside
+        // the broad guard ever reached it; a split reader does now, so both accessors take the
+        // task lock and the pairing is real rather than incidental.
+        self.with_task_robust_futex_mut(|robust| {
+            if let Some(slot) = robust
+                .iter_mut()
+                .find(|slot| slot.is_some_and(|entry| entry.tid == ThreadId(tid)) || slot.is_none())
+            {
+                *slot = Some(super::RobustFutexRecord {
+                    tid: ThreadId(tid),
+                    state: RobustFutexState { head, len },
+                });
+                Ok(())
+            } else {
+                Err(KernelError::TaskTableFull)
+            }
+        })
     }
 
     pub fn robust_futex_state(&self, tid: u64) -> Option<RobustFutexState> {
-        self.robust_futex
-            .iter()
-            .flatten()
-            .find(|entry| entry.tid.0 == tid)
-            .map(|entry| entry.state)
+        self.with_task_robust_futex(|robust| {
+            robust
+                .iter()
+                .flatten()
+                .find(|entry| entry.tid.0 == tid)
+                .map(|entry| entry.state)
+        })
     }
 
     pub(crate) fn sync_current_thread_from_frame(

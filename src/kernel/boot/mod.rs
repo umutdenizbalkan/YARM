@@ -59,6 +59,7 @@ mod memory_state;
 mod orchestrator_state;
 pub(crate) mod process_cnode_txn;
 pub(crate) mod provisional_cap;
+pub(crate) mod exit_claim;
 pub(crate) mod reap_claim;
 mod reply_cap_rank_split;
 mod restart_state;

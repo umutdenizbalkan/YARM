@@ -1118,6 +1118,170 @@ impl SharedKernel {
         });
     }
 
+    /// U9-EXIT1 §3 — may the split self-exit route run on this CPU at all?
+    ///
+    /// Two facts, both pre-mutation. A post-lock drainer must be active, or the queue-advance
+    /// deferral this route reserves would never be consumed and the CPU would strand with
+    /// `current` cleared. And this CPU must be the single authoritative dispatcher, because the
+    /// advance the drain performs authenticates against exactly that.
+    ///
+    /// These are the same two admissions `queue_advance_admit_split` makes before it peeks a
+    /// candidate; asking them here, before anything is reserved, is what keeps every exit refusal
+    /// free.
+    pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+            return false;
+        }
+        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
+            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+            let online = s.online_cpu_bitmap();
+            (
+                (online & !s.wake_only_bitmap()).count_ones() as usize,
+                sched.current_cpu,
+            )
+        });
+        dispatching <= 1 && dispatch_cpu == cpu
+    }
+
+    /// The authoritative dispatch CPU, rank 1. Used only to enqueue a woken joiner onto the run
+    /// queue the drain will select from.
+    pub(crate) fn authoritative_dispatch_cpu_split(&self) -> CpuId {
+        self.with_scheduler_split_mut(|sched| sched.current_cpu)
+    }
+
+    /// U9-EXIT1 §3 — did this thread publish a robust-futex list?
+    ///
+    /// Read under the TASK lock, which `set_robust_futex_head` and `robust_futex_state` now also
+    /// take, so the registry has one domain rather than an implicit dependence on the broad guard.
+    /// The route never walks a list: a thread that has one is refused before any mutation.
+    pub(crate) fn has_robust_futex_list_split_read(&self, tid: u64) -> bool {
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by this SharedKernel;
+        // `task_robust_futex_split_ptrs_from_raw` derives raw field pointers without forming a
+        // reference to the whole KernelState, and `task_state_lock` serializes the task domain.
+        let (task_lock, robust) = unsafe {
+            crate::kernel::boot::KernelState::task_robust_futex_split_ptrs_from_raw(
+                self.state.data_ptr(),
+            )
+        };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let robust = unsafe { &*robust };
+        kernel_ref(robust)
+            .iter()
+            .flatten()
+            .any(|entry| entry.tid.0 == tid)
+    }
+
+    /// U9-EXIT1 §3 — report a task exit to the supervisor: endpoint enqueue (rank 3), then wake.
+    ///
+    /// `false` means no supervisor endpoint is bound, which the broad path also treats as success
+    /// rather than an error. The message is built by the SAME encoder the broad reporter uses, so
+    /// the two cannot disagree about the wire format.
+    pub(crate) fn report_task_exit_to_supervisor_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        code: u64,
+        restart_token: u64,
+    ) -> bool {
+        crate::yarm_log!("TASK_EXITED_REPORT_BEGIN tid={}", tid);
+        let Some(endpoint_idx) = self.with_fault_split_mut(|faults| faults.supervisor_endpoint)
+        else {
+            crate::yarm_log!(
+                "TASK_EXITED_REPORT_FAIL tid={} reason=no-supervisor-endpoint",
+                tid
+            );
+            return false;
+        };
+        let Ok(msg) = crate::kernel::ipc::Message::with_header(
+            0,
+            yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TASK_EXITED,
+            0,
+            None,
+            &yarm_ipc_abi::supervisor_abi::encode_task_exited_event(tid, code, restart_token),
+        ) else {
+            crate::yarm_log!("TASK_EXITED_REPORT_FAIL tid={} reason=encode", tid);
+            return false;
+        };
+        if !self.exit_report_send_and_wake_split(cpu, endpoint_idx, msg) {
+            crate::yarm_log!("TASK_EXITED_REPORT_FAIL tid={} reason=queue_full", tid);
+            return false;
+        }
+        crate::yarm_log!("TASK_EXITED_REPORT_SENT tid={} target=supervisor", tid);
+        true
+    }
+
+    /// U9-EXIT1 §3 — report a task exit to PM: endpoint enqueue (rank 3), then wake.
+    pub(crate) fn report_task_exit_to_pm_split(&self, cpu: CpuId, tid: u64, code: u64) -> bool {
+        let Some(endpoint_idx) =
+            self.with_fault_split_mut(|faults| faults.pm_task_exit_endpoint)
+        else {
+            return false;
+        };
+        let payload =
+            yarm_ipc_abi::process_abi::KernelPmTaskExitedPayload::new(tid, code).encode();
+        let Ok(msg) = crate::kernel::ipc::Message::with_header(
+            0,
+            yarm_ipc_abi::process_abi::KERNEL_OP_PM_TASK_EXITED,
+            0,
+            None,
+            &payload,
+        ) else {
+            return false;
+        };
+        self.exit_report_send_and_wake_split(cpu, endpoint_idx, msg)
+    }
+
+    /// The rank-3 enqueue plus the wake, in that order and with the rank-3 claim RELEASED before
+    /// the wake — the same two steps `send_message_to_endpoint_and_wake` performs, split so no
+    /// unrelated lock is held across the wake.
+    fn exit_report_send_and_wake_split(
+        &self,
+        cpu: CpuId,
+        endpoint_idx: usize,
+        msg: crate::kernel::ipc::Message,
+    ) -> bool {
+        let queued = self.with_ipc_split_mut(|ipc| {
+            let Some(ep_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
+            else {
+                return false;
+            };
+            kernel_mut(ep_storage).send(msg).is_ok()
+        });
+        if !queued {
+            return false;
+        }
+        let _ = self.wake_waiter_for_endpoint_split(cpu, endpoint_idx);
+        true
+    }
+
+    /// U9-EXIT1 §3 — the RESTART subsystem, off the broad lock.
+    ///
+    /// The split self-exit mints its restart token from the SAME monotonic counter the broad
+    /// `exit_task` mints from, so the two routes cannot issue the same token or diverge in
+    /// numbering. Nothing else in the exit transaction touches this rank.
+    pub(crate) fn with_restart_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut crate::kernel::boot::RestartSubsystem) -> R,
+    ) -> R {
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by this SharedKernel.
+        // `restart_split_mut_ptrs_from_raw` derives raw field pointers via addr_of!/addr_of_mut!
+        // without forming a reference to the whole KernelState; `restart_state_lock` serializes
+        // access to the `restart` storage.
+        let (restart_lock, restart) =
+            unsafe { KernelState::restart_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let restart_lock = unsafe { &*restart_lock };
+        let _guard = restart_lock.lock();
+        let restart = unsafe { &mut *restart };
+        f(kernel_mut(restart))
+    }
+
     /// # Validation status
     /// - LIVE_OFF_TRAP — mutates only telemetry counters under `telemetry_state_lock`;
     ///   called from off-trap kernel code, not the pre-global-lock trap seam.

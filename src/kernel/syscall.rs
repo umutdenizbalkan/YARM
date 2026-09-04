@@ -323,6 +323,7 @@ pub(crate) mod ipc_recv_core;
 // U9-FORK1 §3/§4: THE fork transaction, over the delivered `SpawnTxnOwners` plus the seven
 // operations a fork needs that a spawn does not.
 pub(crate) mod fork_txn;
+pub(crate) mod exit_txn;
 pub(crate) mod process;
 pub(crate) mod reap_txn;
 mod recv_shared_v3;
