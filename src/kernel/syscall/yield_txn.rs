@@ -54,6 +54,31 @@
 //! There is no broad fallback *after* the publication, and none is needed: past the rank-1 step the
 //! caller is queued exactly once, `current` is empty, and the drain that consumes the deferral is
 //! the same one FutexWait and the terminal fault already share.
+//!
+//! # U9-YIELD2 §1 — NR 0 is NOT closed, and this file is where the honest statement belongs
+//!
+//! Every [`YieldDecline`] above makes `try_split_yield_into_frame` answer `NotHandled`, and
+//! `NotHandled` is an entry into the terminal broad dispatcher. U9-RESIDUAL1 §5 reported "no
+//! refusal occurred in nine qualifying boots" and was careful not to claim source totality; the
+//! matrix row it wrote nonetheless reads as a closed family, so it is corrected here.
+//!
+//! Of the six declines, four are unreachable for a **userspace** NR 0 by construction (`NoCurrent`,
+//! `DeferralHeld`, `RouteNotAdmitted::CpuOutOfRange` and `RouteNotAdmitted::NoTrapDrainer`), and
+//! two more are unreachable only on the single-dispatcher default. Two are genuinely reachable in
+//! supported configurations, and both are witnessed or constructible rather than inferred:
+//!
+//! * **`RouteNotAdmitted::MultiDispatcher`** under the default-off `yarm.ap_user_dispatch` knob.
+//!   Live at base: `YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu` in
+//!   `scripts/qemu-x86_64-ap-saved-return-smoke.sh`, on the AP, for a real userspace `Yield`.
+//! * **`ArchGateOff`** on x86_64 under `yarm.d6_switch_proof` / `yarm.d6_switch_a`, where
+//!   `d6_genuine_enabled()` is false — and where the Yield DRAIN in `arch/trap_entry.rs` is gated
+//!   off by the same two predicates, so no deferral could be consumed even if one were published.
+//!
+//! Neither can be closed by this route. The reason is not Yield's: it is that
+//! `SharedKernel::queue_advance_select_step_split` — the ONE selection owner every queue-advancing
+//! drain uses — authenticates `sched.current_cpu == cpu` before dequeuing, and `current_cpu` is a
+//! single global field that any CPU's `with_cpu` rebinds. See `doc/KERNEL_UNLOCKING.md`, U9-YIELD2
+//! §2/§3, for the derivation and the exact missing contract.
 
 use crate::kernel::scheduler::CpuId;
 

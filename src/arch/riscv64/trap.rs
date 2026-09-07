@@ -1267,9 +1267,17 @@ pub fn handle_riscv_trap_entry_shared(
                 // explicitly. A refusal has already undone exactly what the selection did, so
                 // this drain returns to the unchanged current — except `RefusedTorn`, which is
                 // fatal and must never return to userspace or continue scheduling.
+                //
+                // U9-YIELD2 §3: each refusal SETTLES THE DEFERRAL before returning. It used not
+                // to, and the cell it left set outlives the trap — so the next trap on this CPU
+                // re-entered this drain against a stale outgoing identity, and any later
+                // userspace NR 0 was refused `DeferralHeld` by `colliding_deferral_pending_for`,
+                // which counts this cell on RISC-V. The refusal itself is unchanged; what is
+                // added is the settlement a refusal owes.
                 let token = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
                     Mark::Marked(token) => token,
                     Mark::Idle => {
+                        crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
                             cpu.0,
@@ -1278,6 +1286,7 @@ pub fn handle_riscv_trap_entry_shared(
                         return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                     }
                     Mark::RefusedRolledBack => {
+                        crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_dequeue_undone",
                             cpu.0,
@@ -1286,6 +1295,7 @@ pub fn handle_riscv_trap_entry_shared(
                         return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                     }
                     Mark::RefusedNoSchedulerChange => {
+                        crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_scheduler_untouched",
                             cpu.0,
@@ -1652,9 +1662,13 @@ pub fn handle_riscv_trap_entry_shared(
                 // explicitly. A refusal has already undone exactly what the selection did, so
                 // this drain returns to the unchanged current — except `RefusedTorn`, which is
                 // fatal and must never return to userspace or continue scheduling.
+                // U9-YIELD2 §3: each refusal SETTLES THE DEFERRAL before returning — see the
+                // foundation drain above for why. This cell is in RISC-V's Yield collision set
+                // too, so leaking it refused every later userspace NR 0 with `DeferralHeld`.
                 let token = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
                     Mark::Marked(token) => token,
                     Mark::Idle => {
+                        crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
                             cpu.0,
@@ -1663,6 +1677,7 @@ pub fn handle_riscv_trap_entry_shared(
                         return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                     }
                     Mark::RefusedRolledBack => {
+                        crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_dequeue_undone",
                             cpu.0,
@@ -1671,6 +1686,7 @@ pub fn handle_riscv_trap_entry_shared(
                         return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                     }
                     Mark::RefusedNoSchedulerChange => {
+                        crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_scheduler_untouched",
                             cpu.0,
@@ -1830,9 +1846,15 @@ pub fn handle_riscv_trap_entry_shared(
                 // explicitly. A refusal has already undone exactly what the selection did, so
                 // this drain returns to the unchanged current — except `RefusedTorn`, which is
                 // fatal and must never return to userspace or continue scheduling.
+                // U9-YIELD2 §3: each refusal SETTLES THE DEFERRAL before returning. This is the
+                // Yield cell itself: leaking it meant every later userspace NR 0 on this CPU was
+                // refused `DeferralHeld` and fell into the terminal broad dispatcher — the exact
+                // edge this family exists to remove — and the next trap re-entered this drain
+                // against a stale outgoing identity.
                 let token = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
                     Mark::Marked(token) => token,
                     Mark::Idle => {
+                        crate::kernel::boot::yield_dispatch_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
                             cpu.0,
@@ -1841,6 +1863,7 @@ pub fn handle_riscv_trap_entry_shared(
                         return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                     }
                     Mark::RefusedRolledBack => {
+                        crate::kernel::boot::yield_dispatch_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_dequeue_undone",
                             cpu.0,
@@ -1849,6 +1872,7 @@ pub fn handle_riscv_trap_entry_shared(
                         return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                     }
                     Mark::RefusedNoSchedulerChange => {
+                        crate::kernel::boot::yield_dispatch_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_scheduler_untouched",
                             cpu.0,

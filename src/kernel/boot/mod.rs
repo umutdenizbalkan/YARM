@@ -3524,12 +3524,21 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # DISABLED on every architecture — Stage 199D-WA1-GATE
+/// # ENABLED on all three architectures — and this heading used to say the opposite
 ///
-/// Ordinary `IpcCall`/`IpcReply` traffic on **every** architecture, x86_64 included, falls back
-/// to the legacy path. Admission and blocked-waiter acknowledgement publication both require an
-/// explicit proof/oracle selector; request/reply endpoint confinement is whatever those
-/// selectors authorize. The rationale is below the blocker history.
+/// U9-YIELD2 §1: the heading here read "**DISABLED on every architecture — Stage 199D-WA1-GATE**",
+/// followed by "ordinary `IpcCall`/`IpcReply` traffic on **every** architecture, x86_64 included,
+/// falls back to the legacy path". The WA1-GATE state it described was later reversed twice — by
+/// WA3C2 for x86_64 (recorded further down this comment) and by DIRECT3-CAP-FINAL for AArch64 and
+/// RISC-V — and the body below already says so, but the heading was never updated. The function
+/// returns `true` on all three architectures, so `ipccall_direct_admission_enabled()` and
+/// `ipccall_direct_publication_enabled()` short-circuit before any proof/oracle selector is read,
+/// and ordinary NR6/NR7 traffic IS admitted to the off-lock request/reply handlers on every
+/// ordinary boot.
+///
+/// Two consumers were reading the retired heading rather than the code: the split dispatcher's
+/// NR6/NR7 admission note and U9-RESIDUAL1 §2's residual matrix, which listed NR 6 and NR 7 as
+/// having "no split route". Both are corrected; see `doc/KERNEL_UNLOCKING.md`, U9-YIELD2 §1.
 ///
 /// ## Historical — the x86_64 production default (`0b5ec254`, since RECLASSIFIED)
 ///
