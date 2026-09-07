@@ -165553,3 +165553,222 @@ mod u9dispatchcpu1_contracts {
         drop(window);
     }
 }
+
+/// U9-DISPATCH-CPU1 §1 — **the authority's PROVENANCE**, which is what makes it a proof.
+///
+/// Every other guard in this stage asserts what an authority authorizes. This one asserts where
+/// one can come from, because the whole construction collapses if it can come from anywhere else.
+///
+/// `DispatchAuthority` is `{ cpu, epoch }` — two integers. Nothing in the type prevents an adapter
+/// from assembling one out of a `CpuId` it happens to be holding, and an adapter that did would
+/// have reinvented exactly the ambient authority §1 removed: a CPU number asserted by whoever felt
+/// like asserting it. What makes the value a proof is not its shape but the fact that the ONLY
+/// place it is minted is `TrapPathWindow::establish`, which is the one point in the tree that
+/// knows a trap has just begun on a hardware-identified CPU, and which opens the window the
+/// liveness check reads in the same breath.
+///
+/// So the seal is a source guard, and it has to be: no runtime test can observe the absence of a
+/// second minting site. The `#[cfg(test)]` fixtures are named and excluded explicitly rather than
+/// silently — they are minting sites, they open real windows to do it, and pretending otherwise
+/// would make this guard a lie about a smaller tree than the one that ships.
+#[cfg(test)]
+mod u9dispatchcpu1_authority {
+    /// Source with `#[cfg(test)]` modules removed — the tree that actually ships.
+    fn production_source(rel: &str) -> alloc::string::String {
+        let src: &str = match rel {
+            "src/runtime.rs" => include_str!("../../runtime.rs"),
+            "src/arch/trap_entry.rs" => include_str!("../../arch/trap_entry.rs"),
+            other => panic!("unknown source: {other}"),
+        };
+        // Drop each `#[cfg(test)]` / `#[cfg(any(test, feature = "hosted-dev"))]` item: from the
+        // attribute through the closing brace at the attribute's own indentation (or, for a
+        // one-line item, through that line). rustfmt keeps that brace column-aligned with the
+        // attribute, so the rule is exact rather than heuristic. The fixtures this excludes are
+        // named in `the_test_fixtures_are_named_and_open_real_windows`, so the exclusion cannot
+        // quietly grow into hiding a production minting site.
+        let mut out = alloc::string::String::new();
+        let mut skipping: Option<usize> = None;
+        for line in src.lines() {
+            if let Some(depth) = skipping {
+                let closer = line.len() == depth + 1 && line.trim_start() == "}";
+                let one_liner = line.trim_end().ends_with(';')
+                    && (line.len() - line.trim_start().len()) == depth;
+                if closer || one_liner {
+                    skipping = None;
+                }
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let t = line.trim_start();
+            if t.starts_with("#[cfg(test)]")
+                || t.starts_with("#[cfg(any(test, feature = \"hosted-dev\"))]")
+            {
+                skipping = Some(indent);
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        assert!(
+            skipping.is_none(),
+            "the cfg-stripper must close every item it opened, or it is silently eating the rest \
+             of the file — and a guard reading an empty tree proves nothing"
+        );
+        out
+    }
+
+    /// **Authority is minted at exactly one place, and that place is the trap boundary.**
+    #[test]
+    fn authority_is_minted_only_by_the_trap_window() {
+        // In production source, `mint` is called from ONE site.
+        let runtime = production_source("src/runtime.rs");
+        let entry = production_source("src/arch/trap_entry.rs");
+        assert_eq!(
+            runtime.matches("DispatchAuthority::mint(").count()
+                + runtime.matches("Self::mint(").count(),
+            0,
+            "runtime.rs must contain no production minting site: the only two it had are the \
+             test-only `live_for_test` / `stale_for_test` fixtures, which this view removes"
+        );
+        assert_eq!(
+            entry
+                .matches("crate::runtime::DispatchAuthority::mint(cpu, epoch)")
+                .count(),
+            1,
+            "there must be exactly ONE production minting site"
+        );
+        // And it is inside `TrapPathWindow::establish`, after the window is opened.
+        let establish = entry
+            .split_once("pub(crate) fn establish(cpu: CpuId) -> Self {")
+            .map(|(_, r)| r.split_once("\n    }").map(|(b, _)| b).unwrap_or(r))
+            .expect("TrapPathWindow::establish");
+        let open = establish
+            .find("crate::kernel::boot::open_trap_dispatch_window(cpu_idx)")
+            .expect("the window must be opened here");
+        let mint = establish
+            .find("crate::runtime::DispatchAuthority::mint(cpu, epoch)")
+            .expect("the one minting site must be inside establish");
+        assert!(
+            open < mint,
+            "the window must be OPEN before an authority naming its epoch exists — an authority \
+             minted first would name a window that is not yet live"
+        );
+        // The out-of-range arm mints the never-live value instead, which is why `CpuOutOfRange`
+        // stopped being a reachable selection refusal.
+        assert!(
+            establish.contains("crate::runtime::DispatchAuthority::none(cpu)"),
+            "an out-of-range CPU must get the never-live authority, not a minted one"
+        );
+    }
+
+    /// **No adapter manufactures an authority from a bare `CpuId`.**
+    ///
+    /// The drains and the seams take an authority as a PARAMETER and pass it along; none of them
+    /// constructs one. This is the property that would be silently lost first — a single
+    /// `DispatchAuthority::mint(cpu, 0)` in an adapter compiles, reads as harmless, and reinstates
+    /// the ambient authority.
+    #[test]
+    fn no_adapter_manufactures_an_authority_from_a_bare_cpu_id() {
+        for rel in ["src/runtime.rs", "src/arch/trap_entry.rs"] {
+            let src = production_source(rel);
+            for forbidden in [
+                "DispatchAuthority::none(",
+                "DispatchAuthority { cpu",
+                "DispatchAuthority { epoch",
+            ] {
+                let count = src.matches(forbidden).count();
+                let allowed = match (rel, forbidden) {
+                    // `none` is constructed once, in `establish`'s out-of-range arm, and defined
+                    // once in runtime.rs.
+                    ("src/arch/trap_entry.rs", "DispatchAuthority::none(") => 1,
+                    _ => 0,
+                };
+                assert_eq!(
+                    count, allowed,
+                    "{rel}: `{forbidden}` may appear {allowed} time(s); an authority assembled \
+                     outside the trap boundary is the ambient authority under a new name"
+                );
+            }
+        }
+        // The struct literal form is confined to the two constructors, both in runtime.rs.
+        let runtime = production_source("src/runtime.rs");
+        assert_eq!(
+            runtime.matches("Self { cpu, epoch }").count()
+                + runtime.matches("Self { cpu, epoch: 0 }").count(),
+            2,
+            "the only two struct literals are `mint` and `none`, both on the type itself"
+        );
+    }
+
+    /// **The fields are private and there is no setter.**
+    ///
+    /// An authority whose CPU could be reassigned after the mint would authenticate a trap on one
+    /// CPU and then be used to advance another's queue — the exact cross-CPU mutation §1 exists to
+    /// make unrepresentable.
+    #[test]
+    fn an_authority_cannot_be_retargeted_after_it_is_minted() {
+        let runtime = production_source("src/runtime.rs");
+        let decl = runtime
+            .split_once("pub struct DispatchAuthority {")
+            .map(|(_, r)| r.split_once("}").map(|(b, _)| b).unwrap_or(r))
+            .expect("the type declaration");
+        assert!(
+            decl.contains("cpu: CpuId,") && decl.contains("epoch: u64,"),
+            "both fields must be private — no `pub` on either"
+        );
+        assert!(
+            !decl.contains("pub cpu") && !decl.contains("pub epoch"),
+            "a public field is a setter"
+        );
+        assert!(
+            !runtime.contains("fn set_cpu(") && !runtime.contains("fn set_epoch("),
+            "and there must be no setter"
+        );
+        // The accessor is read-only and takes `self` by value on a `Copy` type, so a caller can
+        // read the CPU but can never hand back a modified authority.
+        assert!(
+            runtime.contains("pub(crate) const fn cpu(self) -> CpuId {"),
+            "the CPU accessor must be a by-value read"
+        );
+    }
+
+    /// **The test fixtures are minting sites, and they open REAL windows.**
+    ///
+    /// Named here rather than left implicit: `production_source` removes them, so this is where
+    /// the record of what was removed lives. Neither builds an epoch by arithmetic — a fixture
+    /// that did would be testing a number rather than the lifetime the number stands for.
+    #[test]
+    fn the_test_fixtures_are_named_and_open_real_windows() {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        for (fixture, must_call) in [
+            ("live_for_test", "open_trap_dispatch_window"),
+            ("stale_for_test", "close_trap_dispatch_window"),
+        ] {
+            let body = RUNTIME
+                .split_once(&alloc::format!(
+                    "pub(crate) fn {fixture}(cpu: CpuId) -> Self {{"
+                ))
+                .map(|(_, r)| r.split_once("\n    }").map(|(b, _)| b).unwrap_or(r))
+                .unwrap_or_else(|| panic!("the {fixture} fixture"));
+            assert!(
+                body.contains(must_call),
+                "{fixture} must drive the REAL window owner (`{must_call}`), not fabricate an epoch"
+            );
+            assert!(
+                !body.contains("epoch + 1") && !body.contains("epoch - 1"),
+                "{fixture} must not build a lifetime out of arithmetic"
+            );
+        }
+        // And both are gated out of every shipping build.
+        for fixture in ["live_for_test", "stale_for_test"] {
+            let at = RUNTIME
+                .find(&alloc::format!("pub(crate) fn {fixture}("))
+                .expect("the fixture");
+            let before = &RUNTIME[at.saturating_sub(400)..at];
+            assert!(
+                before.contains("#[cfg(any(test, feature = \"hosted-dev\"))]"),
+                "{fixture} must be excluded from production builds"
+            );
+        }
+    }
+}
