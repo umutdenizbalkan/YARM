@@ -849,6 +849,26 @@ impl SmpScheduler {
             .map_err(|_| SchedulerError::CpuOffline)
     }
 
+    /// U9-DISPATCH-CPU1 D1 — visit every queued entry on `cpu` in dispatch order
+    /// (High → Normal → Low, FIFO within each).
+    ///
+    /// Read-only, and test/hosted-only: the D1 contracts assert that a rejected candidate keeps
+    /// its exact priority AND its exact FIFO position, which a count cannot express and which is
+    /// precisely what the rollback form got wrong.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub fn for_each_queued_on(&self, cpu: CpuId, mut f: impl FnMut(TaskPriority, ThreadId)) {
+        let Ok(idx) = self.check_online_cpu(cpu) else {
+            return;
+        };
+        let sched = &self.schedulers[idx];
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            let q = &sched.queues[PriorityScheduler::priority_index(priority)];
+            for offset in 0..q.len {
+                f(priority, q.tids[RingQueue::index(q.head + offset)]);
+            }
+        }
+    }
+
     pub fn cpu_is_online(&self, cpu: CpuId) -> bool {
         Self::check_cpu(cpu)
             .ok()

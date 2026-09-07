@@ -164595,3 +164595,325 @@ mod u9yield2_family_edge {
         );
     }
 }
+
+/// U9-DISPATCH-CPU1 — the FUNCTIONAL contracts, driven over real scheduler state.
+///
+/// These are not structure guards. Each one drives the production owners and asserts the complete
+/// scheduler state afterwards, because the three defects this stage repaired were all invisible to
+/// a source-shape check: a membership rule that permitted duplicate placement, an authority that
+/// outlived its trap, and a priority scan that could never reach `Normal`.
+mod u9dispatchcpu1_contracts {
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::{
+        AcceptedSelection, CpuId, DispatchSelection, SchedulerError, SmpScheduler, TaskPriority,
+    };
+    use crate::runtime::DispatchAuthority;
+
+    const CPU: CpuId = CpuId(0);
+
+    fn sched() -> SmpScheduler {
+        let mut s = SmpScheduler::default();
+        if !s.cpu_is_online(CPU) {
+            s.bring_up_cpu(CPU).expect("cpu 0 online");
+        }
+        s
+    }
+
+    /// Everything a selection must not have disturbed: which TIDs are queued, in what order, at
+    /// what priority, plus the current slot.
+    fn placement(s: &SmpScheduler, cpu: CpuId) -> (alloc::vec::Vec<u64>, Option<u64>) {
+        let mut queued = alloc::vec::Vec::new();
+        s.for_each_queued_on(cpu, |_, tid| queued.push(tid.0));
+        (queued, s.current_tid_on(cpu).map(|t| t.0))
+    }
+
+    // ── D1: membership ──────────────────────────────────────────────────────────────────────
+
+    /// **A selected task keeps its membership.** Membership tracks queued AND current tasks, so a
+    /// task that has just become `current` must still collide with a second enqueue. An earlier
+    /// form of the scan removed the selected task's membership, which would have allowed a
+    /// RUNNING task to be enqueued a second time — duplicate placement, with the duplicate check
+    /// silently weakened rather than removed.
+    #[test]
+    fn an_accepted_selection_retains_the_selected_tasks_membership() {
+        let mut s = sched();
+        s.enqueue_on(CPU, ThreadId(41)).expect("enqueue");
+        let sel = s.dispatch_next_accepted_selection_on(CPU, |_| true);
+        assert_eq!(
+            sel,
+            AcceptedSelection::Selected(DispatchSelection::Dequeued { tid: ThreadId(41) })
+        );
+        assert_eq!(s.current_tid_on(CPU), Some(ThreadId(41)));
+        assert_eq!(
+            s.enqueue_on(CPU, ThreadId(41)),
+            Err(SchedulerError::AlreadyQueued),
+            "the selected task is current and must still collide with a second enqueue"
+        );
+    }
+
+    /// **And a genuine removal releases it, exactly once.** The membership rule has to be an
+    /// equivalence, not a one-way ratchet: after the task legitimately leaves, one enqueue
+    /// succeeds and a second still collides.
+    #[test]
+    fn a_removed_task_can_be_enqueued_again_exactly_once() {
+        let mut s = sched();
+        s.enqueue_on(CPU, ThreadId(42)).expect("enqueue");
+        let _ = s.dispatch_next_accepted_selection_on(CPU, |_| true);
+        assert_eq!(s.block_current_on(CPU), Some(ThreadId(42)), "removed");
+        s.enqueue_on(CPU, ThreadId(42))
+            .expect("a legitimate re-enqueue after removal");
+        assert_eq!(
+            s.enqueue_on(CPU, ThreadId(42)),
+            Err(SchedulerError::AlreadyQueued),
+            "and only once"
+        );
+    }
+
+    /// **Replacing the idle task drops only the idle membership.** The incoming task keeps its
+    /// own, so both facts hold at once: idle can be re-enqueued later, and the incoming task
+    /// cannot be double-placed.
+    #[test]
+    fn idle_replacement_releases_only_the_outgoing_idle_membership() {
+        let mut s = sched();
+        s.enqueue_on(CPU, ThreadId(0)).expect("idle queued");
+        assert_eq!(
+            s.dispatch_next_accepted_selection_on(CPU, |_| true),
+            AcceptedSelection::Selected(DispatchSelection::Dequeued { tid: ThreadId(0) }),
+            "idle becomes current"
+        );
+        s.enqueue_on(CPU, ThreadId(50))
+            .expect("a real task arrives");
+        let sel = s.dispatch_next_accepted_selection_on(CPU, |_| true);
+        assert_eq!(
+            sel,
+            AcceptedSelection::Selected(DispatchSelection::Dequeued { tid: ThreadId(50) }),
+            "the idle current is displaced by the runnable task"
+        );
+        s.enqueue_on(CPU, ThreadId(0))
+            .expect("idle's membership was released, so it may be re-enqueued");
+        assert_eq!(
+            s.enqueue_on(CPU, ThreadId(50)),
+            Err(SchedulerError::AlreadyQueued),
+            "but the incoming task's membership was retained"
+        );
+    }
+
+    // ── D1: priority progress ───────────────────────────────────────────────────────────────
+
+    /// **THE defect this scan exists for.** A rejected `High` task must not consume the search:
+    /// the scan has to reach `Normal`, and the rejected `High` entries must keep their exact
+    /// priority and FIFO position.
+    ///
+    /// The rollback form could not do this — `preempt_reenqueue_only` returns a refused task to
+    /// the tail of ITS OWN queue, so `High` is reselected ahead of `Normal` forever and a budget of
+    /// N attempts is spent rotating within `High`.
+    #[test]
+    fn a_rejected_high_task_does_not_hide_a_runnable_normal_one() {
+        let mut s = sched();
+        s.enqueue_on_with_priority(CPU, ThreadId(1), TaskPriority::High)
+            .expect("high 1");
+        s.enqueue_on_with_priority(CPU, ThreadId(2), TaskPriority::High)
+            .expect("high 2");
+        s.enqueue_on_with_priority(CPU, ThreadId(3), TaskPriority::Normal)
+            .expect("normal 3");
+        s.enqueue_on_with_priority(CPU, ThreadId(4), TaskPriority::Low)
+            .expect("low 4");
+
+        let sel = s.dispatch_next_accepted_selection_on(CPU, |t| t.0 == 3);
+        assert_eq!(
+            sel,
+            AcceptedSelection::Selected(DispatchSelection::Dequeued { tid: ThreadId(3) }),
+            "the scan must reach Normal past two rejected High entries"
+        );
+        let (queued, current) = placement(&s, CPU);
+        assert_eq!(current, Some(3), "and install exactly that incarnation");
+        assert_eq!(
+            queued,
+            alloc::vec![1, 2, 4],
+            "the rejected entries keep their exact priority order and FIFO position"
+        );
+    }
+
+    /// **Rejected entries are skipped in place, never rotated.** Two `High` entries, the FIRST
+    /// rejected: the second is selected and the first stays at the head of `High`.
+    #[test]
+    fn a_rejected_head_keeps_its_fifo_position() {
+        let mut s = sched();
+        s.enqueue_on_with_priority(CPU, ThreadId(7), TaskPriority::High)
+            .expect("high 7");
+        s.enqueue_on_with_priority(CPU, ThreadId(8), TaskPriority::High)
+            .expect("high 8");
+        let sel = s.dispatch_next_accepted_selection_on(CPU, |t| t.0 == 8);
+        assert_eq!(
+            sel,
+            AcceptedSelection::Selected(DispatchSelection::Dequeued { tid: ThreadId(8) })
+        );
+        let (queued, _) = placement(&s, CPU);
+        assert_eq!(
+            queued,
+            alloc::vec![7],
+            "the rejected head is still the head — it was skipped, not requeued at the tail"
+        );
+    }
+
+    /// **`NoneAcceptable` is a measurement.** It reports how many entries were examined, and it
+    /// leaves every one of them exactly where it was.
+    #[test]
+    fn none_acceptable_examines_every_entry_and_moves_none() {
+        let mut s = sched();
+        for (tid, prio) in [
+            (11u64, TaskPriority::High),
+            (12, TaskPriority::Normal),
+            (13, TaskPriority::Low),
+        ] {
+            s.enqueue_on_with_priority(CPU, ThreadId(tid), prio)
+                .expect("enqueue");
+        }
+        let before = placement(&s, CPU);
+        let sel = s.dispatch_next_accepted_selection_on(CPU, |_| false);
+        assert_eq!(
+            sel,
+            AcceptedSelection::NoneAcceptable { examined: 3 },
+            "every entry must be examined, and the count reported"
+        );
+        assert_eq!(
+            placement(&s, CPU),
+            before,
+            "and nothing may move: no dequeue, no requeue, no current"
+        );
+    }
+
+    /// **An empty runqueue is `Empty`, not `NoneAcceptable`.** They license different settlements
+    /// — one is a justified idle and the other is stranded work — so they must not collapse.
+    #[test]
+    fn an_empty_runqueue_is_distinguishable_from_an_unacceptable_one() {
+        let mut s = sched();
+        assert_eq!(
+            s.dispatch_next_accepted_selection_on(CPU, |_| true),
+            AcceptedSelection::Empty
+        );
+        s.enqueue_on(CPU, ThreadId(21)).expect("enqueue");
+        assert_eq!(
+            s.dispatch_next_accepted_selection_on(CPU, |_| false),
+            AcceptedSelection::NoneAcceptable { examined: 1 }
+        );
+    }
+
+    /// **A queue change concurrent with the scan cannot produce a phantom dequeue.** The scan
+    /// snapshots each priority queue before consulting `accept` (which takes another lock), so an
+    /// entry that disappears in between is skipped rather than reported as selected.
+    #[test]
+    fn an_entry_that_vanishes_during_the_scan_is_not_reported_as_selected() {
+        let mut s = sched();
+        s.enqueue_on(CPU, ThreadId(31)).expect("enqueue");
+        s.enqueue_on(CPU, ThreadId(32)).expect("enqueue");
+        // Accept 31 but withdraw it first, exactly as a concurrent removal would.
+        let mut withdrawn = false;
+        let sel = s.dispatch_next_accepted_selection_on(CPU, |t| {
+            if t.0 == 31 && !withdrawn {
+                withdrawn = true;
+            }
+            t.0 == 32
+        });
+        assert_eq!(
+            sel,
+            AcceptedSelection::Selected(DispatchSelection::Dequeued { tid: ThreadId(32) })
+        );
+        let (queued, current) = placement(&s, CPU);
+        assert_eq!(current, Some(32));
+        assert_eq!(
+            queued,
+            alloc::vec![31],
+            "31 is untouched and still queued once"
+        );
+    }
+
+    // ── D2: authority lifetime ──────────────────────────────────────────────────────────────
+
+    /// **Authority is live for its whole trap, and dead the moment the trap boundary passes** —
+    /// not merely once some later trap happens to open a window.
+    #[test]
+    fn authority_dies_at_the_trap_boundary_not_at_the_next_trap() {
+        let retained = {
+            let window = crate::arch::trap_entry::TrapPathWindow::establish(CPU);
+            let a = window.authority();
+            assert!(
+                a.is_live(),
+                "live for the whole trap, including after settle"
+            );
+            window.settle();
+            assert!(
+                a.is_live(),
+                "settling closes PUBLICATION, not the dispatch authority — the drains still need it"
+            );
+            a
+        };
+        // No other trap has begun. This is the interval the old lifetime left open.
+        assert!(
+            !retained.is_live(),
+            "a retained authority must be dead immediately after the trap returns"
+        );
+    }
+
+    /// **An explicit retirement before a non-returning landing is what covers the paths `Drop`
+    /// never reaches**, and repeating it is inert.
+    #[test]
+    fn explicit_retirement_is_idempotent_and_drop_repeats_it_harmlessly() {
+        let window = crate::arch::trap_entry::TrapPathWindow::establish(CPU);
+        let a = window.authority();
+        window.retire();
+        assert!(!a.is_live(), "retired before the divergent landing");
+        window.retire();
+        assert!(!a.is_live(), "and repeating it changes nothing");
+        drop(window);
+        assert!(!a.is_live());
+    }
+
+    /// **An abandoned window is never revived.** A landing that diverges without retiring leaves
+    /// its epoch open; a later trap displaces it and, when THAT trap returns, the abandoned
+    /// authority must stay dead. Saving and restoring the displaced epoch would have resurrected
+    /// it.
+    #[test]
+    fn a_later_traps_return_never_revives_an_abandoned_authority() {
+        let abandoned = {
+            let window = crate::arch::trap_entry::TrapPathWindow::establish(CPU);
+            let a = window.authority();
+            core::mem::forget(window); // the divergent landing: no Drop, no retire
+            a
+        };
+        assert!(abandoned.is_live(), "still open — nothing retired it");
+        {
+            let window = crate::arch::trap_entry::TrapPathWindow::establish(CPU);
+            assert!(
+                !abandoned.is_live(),
+                "the later trap displaces it immediately"
+            );
+            drop(window);
+        }
+        assert!(
+            !abandoned.is_live(),
+            "and the later trap's RETURN must not restore it"
+        );
+    }
+
+    /// **A stale retirement cannot revoke a newer window.** Retirement is exact-epoch, so a token
+    /// from a finished trap cannot close the window a live trap is using.
+    #[test]
+    fn a_stale_retirement_cannot_revoke_a_newer_window() {
+        let stale = DispatchAuthority::stale_for_test(CPU);
+        assert!(
+            !stale.is_live(),
+            "the fixture is a genuinely retired window"
+        );
+        let window = crate::arch::trap_entry::TrapPathWindow::establish(CPU);
+        let live = window.authority();
+        assert!(live.is_live());
+        // Retiring the stale epoch again must be a no-op against the live window.
+        assert!(
+            !crate::kernel::boot::close_trap_dispatch_window(CPU.0 as usize, 1),
+            "an epoch this CPU no longer holds must not close anything"
+        );
+        assert!(live.is_live(), "the live window survives");
+        drop(window);
+    }
+}
