@@ -101,6 +101,23 @@ impl YieldDecline {
     }
 }
 
+/// Which `Running → Runnable` the rank-2 step actually applied — and therefore what its inverse
+/// must undo.
+///
+/// The ordinary transition writes a field; the idle-only twin is `Runnable → Runnable` and writes
+/// nothing. An inverse that did not know which had run would promote a never-`Running` idle task to
+/// `Running` on the rollback path — a corruption invented by the undo. So the forward step reports
+/// what it did, and the inverse is chosen by that report rather than guessed from the current
+/// status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreemptApplied {
+    /// `Running → Runnable` on an ordinary task. Undone by `RollbackPreemptOutgoing`.
+    Ordinary,
+    /// `Runnable → Runnable` on [`crate::kernel::task_transition::IDLE_TID`]. Nothing was written,
+    /// so nothing is undone.
+    IdleNoop,
+}
+
 /// The acquisitions [`run_yield_transaction`] needs. Each method is ONE acquisition of ONE rank in
 /// the split adapter, and one direct field access in the broad adapter. No method decides anything.
 pub(crate) trait YieldOwners {
@@ -123,11 +140,12 @@ pub(crate) trait YieldOwners {
     /// Release it. Only ever called on a path that mutated nothing else.
     fn release_yield_deferral(&mut self, cpu: CpuId);
 
-    /// rank 2 — the EXACT `Running → Runnable` transition, with the idle-only twin.
-    fn preempt_outgoing(&mut self, tid: u64) -> bool;
-    /// rank 2 — its exact inverse, `Runnable → Running`. Called only to undo a transition this
-    /// same transaction applied.
-    fn rollback_preempt_outgoing(&mut self, tid: u64) -> bool;
+    /// rank 2 — the EXACT `Running → Runnable` transition, with the idle-only twin. Reports WHICH
+    /// of the two it applied, because that is what its inverse has to undo.
+    fn preempt_outgoing(&mut self, tid: u64) -> Option<PreemptApplied>;
+    /// rank 2 — the exact inverse of what `preempt_outgoing` reported. Called only to undo a
+    /// transition this same transaction applied.
+    fn rollback_preempt_outgoing(&mut self, tid: u64, applied: PreemptApplied) -> bool;
 
     /// rank 1 — re-enqueue the current task at its priority tail and clear `current`, as one
     /// scheduler operation. `None` means the scheduler refused and **restored `current` itself**.
@@ -211,10 +229,10 @@ pub(crate) fn run_yield_transaction<O: YieldOwners>(
 
     // (5) rank 2 — the exact `Running → Runnable` transition. Fail-closed: a refusal writes no
     // field, so releasing the reservation restores the entry state exactly.
-    if !owners.preempt_outgoing(outgoing) {
+    let Some(applied) = owners.preempt_outgoing(outgoing) else {
         owners.release_yield_deferral(cpu);
         return Err(YieldDecline::NotRunning);
-    }
+    };
 
     // (6) rank 1 — re-enqueue at the priority tail and clear `current`, as ONE scheduler
     // operation. This is the only step that can fail after something was written, and its failure
@@ -224,7 +242,7 @@ pub(crate) fn run_yield_transaction<O: YieldOwners>(
         // Undo (5), then (4). Order matters: the reservation must outlive the rollback, or a
         // concurrent route could take it and observe a caller that is briefly `Runnable` and
         // current at once.
-        let rolled_back = owners.rollback_preempt_outgoing(outgoing);
+        let rolled_back = owners.rollback_preempt_outgoing(outgoing, applied);
         owners.release_yield_deferral(cpu);
         debug_assert!(
             rolled_back,
@@ -275,13 +293,13 @@ impl YieldOwners for SharedYieldOwners<'_> {
         crate::kernel::boot::yield_dispatch_clear(cpu.0 as usize);
     }
 
-    fn preempt_outgoing(&mut self, tid: u64) -> bool {
+    fn preempt_outgoing(&mut self, tid: u64) -> Option<PreemptApplied> {
         self.shared
             .with_task_tcbs_split_mut(|tcbs| apply_preempt_outgoing_locked(tcbs, tid))
     }
-    fn rollback_preempt_outgoing(&mut self, tid: u64) -> bool {
+    fn rollback_preempt_outgoing(&mut self, tid: u64, applied: PreemptApplied) -> bool {
         self.shared
-            .with_task_tcbs_split_mut(|tcbs| apply_rollback_preempt_locked(tcbs, tid))
+            .with_task_tcbs_split_mut(|tcbs| apply_rollback_preempt_locked(tcbs, tid, applied))
     }
 
     fn reenqueue_and_clear_current(&mut self, cpu: CpuId) -> Option<u64> {
@@ -346,13 +364,13 @@ impl YieldOwners for BroadYieldOwners<'_> {
         crate::kernel::boot::yield_dispatch_clear(cpu.0 as usize);
     }
 
-    fn preempt_outgoing(&mut self, tid: u64) -> bool {
+    fn preempt_outgoing(&mut self, tid: u64) -> Option<PreemptApplied> {
         self.kernel
             .with_tcbs_mut(|tcbs| apply_preempt_outgoing_locked(tcbs, tid))
     }
-    fn rollback_preempt_outgoing(&mut self, tid: u64) -> bool {
+    fn rollback_preempt_outgoing(&mut self, tid: u64, applied: PreemptApplied) -> bool {
         self.kernel
-            .with_tcbs_mut(|tcbs| apply_rollback_preempt_locked(tcbs, tid))
+            .with_tcbs_mut(|tcbs| apply_rollback_preempt_locked(tcbs, tid, applied))
     }
 
     fn reenqueue_and_clear_current(&mut self, _cpu: CpuId) -> Option<u64> {
@@ -385,47 +403,47 @@ fn colliding_deferral_pending_for(cpu_idx: usize) -> bool {
 }
 
 /// `Running → Runnable` for the outgoing task, with the idle-only twin — the EXACT transition the
-/// in-lock path has always applied, through the same owner.
+/// in-lock path has always applied, through the same owner. Reports which twin ran.
 pub(crate) fn apply_preempt_outgoing_locked(
     tcbs: &mut [Option<crate::kernel::task::ThreadControlBlock>],
     tid: u64,
-) -> bool {
+) -> Option<PreemptApplied> {
     use crate::kernel::task_transition::{TaskTransition, apply_task_transition};
-    apply_task_transition(tcbs, tid, None, TaskTransition::PreemptOutgoing)
-        .or_else(|first| {
-            apply_task_transition(tcbs, tid, None, TaskTransition::PreemptOutgoingIdle)
-                .map_err(|_| first)
-        })
-        .map_err(|refusal| {
-            crate::kernel::task_transition::log_transition_refusal(
-                "yield_txn/preempt_outgoing",
-                tid,
-                TaskTransition::PreemptOutgoing,
-                refusal,
-            );
-        })
-        .is_ok()
+    match apply_task_transition(tcbs, tid, None, TaskTransition::PreemptOutgoing) {
+        Ok(_) => Some(PreemptApplied::Ordinary),
+        Err(first) => {
+            // Idle-only fallback: the idle task is made `current` by the rank-1 scheduler without a
+            // mark-running step, so preempting it out is `Runnable → Runnable`. Restricted to
+            // `IDLE_TID` inside the primitive, so an ordinary task cannot reach it.
+            match apply_task_transition(tcbs, tid, None, TaskTransition::PreemptOutgoingIdle) {
+                Ok(_) => Some(PreemptApplied::IdleNoop),
+                Err(_) => {
+                    crate::kernel::task_transition::log_transition_refusal(
+                        "yield_txn/preempt_outgoing",
+                        tid,
+                        TaskTransition::PreemptOutgoing,
+                        first,
+                    );
+                    None
+                }
+            }
+        }
+    }
 }
 
-/// The exact inverse of [`apply_preempt_outgoing_locked`]. Both idle twins are `Runnable →
-/// Runnable`, so an idle task needs no rollback and reports success without a write.
-fn apply_rollback_preempt_locked(
+/// The exact inverse of what [`apply_preempt_outgoing_locked`] reported.
+///
+/// `IdleNoop` wrote nothing, so its inverse writes nothing. Undoing it with
+/// `RollbackPreemptOutgoing` would be worse than a no-op: `Runnable → Running` is a legal
+/// transition for the idle task's status, so the write would SUCCEED and leave a never-`Running`
+/// idle task marked `Running` — a corruption invented by the undo itself.
+pub(crate) fn apply_rollback_preempt_locked(
     tcbs: &mut [Option<crate::kernel::task::ThreadControlBlock>],
     tid: u64,
+    applied: PreemptApplied,
 ) -> bool {
-    use crate::kernel::task_transition::{
-        IDLE_TID, TaskTransition, apply_task_transition, task_transition_would_be_accepted,
-    };
-    if tid == IDLE_TID
-        && task_transition_would_be_accepted(
-            tcbs,
-            tid,
-            None,
-            TaskTransition::RollbackPreemptOutgoing,
-        )
-        .is_err()
-    {
-        // `PreemptOutgoingIdle` is `Runnable → Runnable`: it wrote nothing to undo.
+    use crate::kernel::task_transition::{TaskTransition, apply_task_transition};
+    if applied == PreemptApplied::IdleNoop {
         return true;
     }
     apply_task_transition(tcbs, tid, None, TaskTransition::RollbackPreemptOutgoing)

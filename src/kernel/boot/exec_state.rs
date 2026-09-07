@@ -2440,7 +2440,7 @@ impl KernelState {
             let applied = self.with_tcbs_mut(|tcbs| {
                 crate::kernel::syscall::yield_txn::apply_preempt_outgoing_locked(tcbs, tid)
             });
-            if !applied {
+            if applied.is_none() {
                 return Err(KernelError::TaskMissing);
             }
         }

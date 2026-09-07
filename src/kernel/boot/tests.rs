@@ -76519,7 +76519,7 @@ mod stage196g_riscv_yield_default_on {
         assert!(
             YIELD_TXN_SRC2.contains("YieldDecline::ReenqueueRefused => \"reenqueue_failed\",")
                 && YIELD_TXN_SRC2.contains("RISCV_YIELD_DISPATCH_FALLBACK reason={} tid={}")
-                && YIELD_TXN_SRC2.contains("owners.rollback_preempt_outgoing(outgoing)")
+                && YIELD_TXN_SRC2.contains("owners.rollback_preempt_outgoing(outgoing, applied)")
                 && YIELD_TXN_SRC2.contains("owners.release_yield_deferral(cpu);"),
             "a re-enqueue failure must roll back exactly, release the deferral and name itself"
         );
@@ -163404,6 +163404,520 @@ mod u9residual1_terminal_admission {
         assert!(
             SMP.contains("fn ap_ring3_entry_path_ready() -> bool {"),
             "and it must stay a named predicate rather than an inlined constant"
+        );
+    }
+}
+
+/// U9-RESIDUAL1 §4 — the yield family, driven as a transaction over owners.
+///
+/// # What these prove
+///
+/// The claim the whole stage rests on is that **every decline is pre-mutation**. That is what makes
+/// handing back to the unchanged broad path safe rather than merely convenient, and it is the only
+/// reason a split route may answer `NotHandled` at all. So each decline below is compared against a
+/// full state snapshot — every TCB's `{tid, status}`, every CPU's current slot, per-task placement,
+/// the deferral cell, and the yield count — and must leave it byte for byte.
+///
+/// The one step that can fail after a write is the rank-1 re-enqueue. Its rollback is proved
+/// EXACTLY: the scheduler primitive restores `current` itself, and the transaction undoes the
+/// rank-2 write through `TaskTransition::RollbackPreemptOutgoing`, the named inverse added for this
+/// purpose.
+#[cfg(test)]
+mod u9residual1_yield_family {
+    use super::*;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::yield_txn::{
+        YieldDecline, YieldOwners, run_yield_transaction, yield_deferral_arch_gate,
+    };
+    use crate::kernel::task::{TaskStatus, ThreadControlBlock};
+
+    const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const EXEC_STATE: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+
+    const CPU: CpuId = CpuId(0);
+    const CALLER: u64 = 1;
+    const OTHER: u64 = 2;
+
+    /// A real `SmpScheduler` and real TCBs — the transaction's decisions are scheduler and task
+    /// decisions, and a stand-in would prove nothing about them.
+    struct Harness {
+        tcbs: alloc::vec::Vec<Option<ThreadControlBlock>>,
+        sched: crate::kernel::scheduler::SmpScheduler,
+        deferral: [Option<u64>; 4],
+        /// Forced answers, so each gate can be exercised in isolation.
+        force_collision: bool,
+        force_admission: Option<crate::kernel::boot::TerminalAdmissionRefusal>,
+        /// Makes the rank-1 re-enqueue refuse, WITHOUT the scheduler having moved anything — the
+        /// primitive's own contract on failure.
+        force_reenqueue_refusal: bool,
+        yields_counted: usize,
+        log: alloc::vec::Vec<&'static str>,
+    }
+
+    fn tcb(tid: u64, status: TaskStatus) -> ThreadControlBlock {
+        let mut t =
+            ThreadControlBlock::new(ThreadId(tid), Some(crate::kernel::vm::Asid(tid as u16)));
+        t.status = status;
+        t
+    }
+
+    impl Harness {
+        fn new(tasks: &[ThreadControlBlock], current: Option<u64>) -> Self {
+            let mut sched = crate::kernel::scheduler::SmpScheduler::default();
+            if !sched.cpu_is_online(CPU) {
+                sched.bring_up_cpu(CPU).expect("cpu 0 online");
+            }
+            if let Some(tid) = current {
+                sched.enqueue_on(CPU, ThreadId(tid)).expect("enqueue");
+                assert_eq!(sched.dispatch_next_on(CPU), Some(ThreadId(tid)));
+            }
+            Self {
+                tcbs: tasks.iter().cloned().map(Some).collect(),
+                sched,
+                deferral: [None; 4],
+                force_collision: false,
+                force_admission: None,
+                force_reenqueue_refusal: false,
+                yields_counted: 0,
+                log: alloc::vec::Vec::new(),
+            }
+        }
+        fn status_of(&self, tid: u64) -> Option<TaskStatus> {
+            self.tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.status)
+        }
+        fn current_of(&self, cpu: u8) -> Option<u64> {
+            self.sched.current_tid_on(CpuId(cpu)).map(|t| t.0)
+        }
+        /// Everything a decline must not have changed.
+        fn snapshot(&self) -> alloc::string::String {
+            let tasks: alloc::vec::Vec<_> = self
+                .tcbs
+                .iter()
+                .flatten()
+                .map(|t| (t.tid.0, t.status))
+                .collect();
+            let current: alloc::vec::Vec<_> = (0..4u8).map(|c| self.current_of(c)).collect();
+            let placed: alloc::vec::Vec<_> = self
+                .tcbs
+                .iter()
+                .flatten()
+                .map(|t| (t.tid.0, self.sched.tid_present_anywhere(t.tid)))
+                .collect();
+            alloc::format!(
+                "{tasks:?}|{current:?}|{placed:?}|{:?}|{}",
+                self.deferral,
+                self.yields_counted
+            )
+        }
+        fn count(&self, what: &str) -> usize {
+            self.log.iter().filter(|e| **e == what).count()
+        }
+        fn at(&self, what: &str) -> usize {
+            self.log
+                .iter()
+                .position(|e| *e == what)
+                .unwrap_or_else(|| panic!("`{what}` never happened: {:?}", self.log))
+        }
+    }
+
+    impl YieldOwners for Harness {
+        fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
+            self.sched.current_tid_on(cpu).map(|t| t.0)
+        }
+        fn is_bootstrap_cpu(&self, cpu: CpuId) -> bool {
+            cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+        }
+        fn colliding_deferral_pending(&self, cpu: CpuId) -> bool {
+            self.force_collision || self.deferral[cpu.0 as usize].is_some()
+        }
+        fn queue_advance_admission(
+            &self,
+            _cpu: CpuId,
+        ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
+            match self.force_admission {
+                Some(why) => Err(why),
+                None => Ok(()),
+            }
+        }
+        fn reserve_yield_deferral(&mut self, cpu: CpuId, outgoing: u64) -> bool {
+            self.log.push("reserve");
+            let slot = &mut self.deferral[cpu.0 as usize];
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(outgoing);
+            true
+        }
+        fn release_yield_deferral(&mut self, cpu: CpuId) {
+            self.log.push("release");
+            self.deferral[cpu.0 as usize] = None;
+        }
+        fn preempt_outgoing(
+            &mut self,
+            tid: u64,
+        ) -> Option<crate::kernel::syscall::yield_txn::PreemptApplied> {
+            self.log.push("preempt");
+            crate::kernel::syscall::yield_txn::apply_preempt_outgoing_locked(&mut self.tcbs, tid)
+        }
+        fn rollback_preempt_outgoing(
+            &mut self,
+            tid: u64,
+            applied: crate::kernel::syscall::yield_txn::PreemptApplied,
+        ) -> bool {
+            self.log.push("rollback");
+            crate::kernel::syscall::yield_txn::apply_rollback_preempt_locked(
+                &mut self.tcbs,
+                tid,
+                applied,
+            )
+        }
+        fn reenqueue_and_clear_current(&mut self, cpu: CpuId) -> Option<u64> {
+            self.log.push("reenqueue");
+            if self.force_reenqueue_refusal {
+                // The primitive's contract on failure: `current` is left exactly as it was.
+                return None;
+            }
+            self.sched.preempt_reenqueue_only_on(cpu).map(|t| t.0)
+        }
+    }
+
+    fn two_task_world() -> Harness {
+        Harness::new(
+            &[
+                tcb(CALLER, TaskStatus::Running),
+                tcb(OTHER, TaskStatus::Runnable),
+            ],
+            Some(CALLER),
+        )
+    }
+
+    // ── the committed path ───────────────────────────────────────────────────────────────────
+
+    /// **A yield commits exactly once, and leaves the CPU ready for the drain.** The caller is
+    /// `Runnable`, queued exactly once, and `current` is empty — which is precisely the state the
+    /// post-lock Yield drain reverifies before it dispatches.
+    #[test]
+    fn a_committed_yield_requeues_the_caller_and_clears_current() {
+        let mut h = two_task_world();
+        let outcome = run_yield_transaction(&mut h, CPU).expect("the ordinary yield must commit");
+        assert_eq!(outcome.outgoing, CALLER);
+        assert_eq!(h.status_of(CALLER), Some(TaskStatus::Runnable));
+        assert_eq!(h.current_of(0), None, "the drain owns the CPU now");
+        assert!(h.sched.tid_present_anywhere(ThreadId(CALLER)));
+        assert_eq!(h.deferral[0], Some(CALLER), "the deferral names the caller");
+        assert_eq!(h.count("reserve"), 1);
+        assert_eq!(h.count("release"), 0, "a committed yield releases nothing");
+        assert_eq!(h.count("rollback"), 0);
+        // The order that makes every decline free: reserve, then the rank-2 write, then rank 1.
+        assert!(h.at("reserve") < h.at("preempt"));
+        assert!(h.at("preempt") < h.at("reenqueue"));
+    }
+
+    /// **A lone task yields to itself.** The caller is re-enqueued and then genuinely selected
+    /// again by the drain — there is always an incoming, which is why this route has no idle
+    /// outcome.
+    #[test]
+    fn a_lone_task_yields_to_itself_without_an_idle_outcome() {
+        let mut h = Harness::new(&[tcb(CALLER, TaskStatus::Running)], Some(CALLER));
+        run_yield_transaction(&mut h, CPU).expect("a lone yield still commits");
+        assert_eq!(h.current_of(0), None);
+        assert_eq!(
+            h.sched.dispatch_next_on(CPU),
+            Some(ThreadId(CALLER)),
+            "the drain finds the re-enqueued caller — never nothing"
+        );
+    }
+
+    // ── every decline, proved free ───────────────────────────────────────────────────────────
+
+    /// **Every decline leaves the world byte for byte.** This is the property the split route's
+    /// `NotHandled` depends on.
+    #[test]
+    fn every_decline_is_pre_mutation() {
+        use crate::kernel::boot::TerminalAdmissionRefusal as R;
+
+        // (a) nothing is current
+        let mut h = Harness::new(&[tcb(CALLER, TaskStatus::Runnable)], None);
+        let before = h.snapshot();
+        assert_eq!(
+            run_yield_transaction(&mut h, CPU).expect_err("must decline"),
+            YieldDecline::NoCurrent
+        );
+        assert_eq!(h.snapshot(), before);
+
+        // (b) a colliding deferral is already pending
+        let mut h = two_task_world();
+        h.force_collision = true;
+        let before = h.snapshot();
+        assert_eq!(
+            run_yield_transaction(&mut h, CPU).expect_err("must decline"),
+            YieldDecline::DeferralHeld
+        );
+        assert_eq!(h.snapshot(), before);
+        assert_eq!(
+            h.count("reserve"),
+            0,
+            "nothing is reserved after a collision"
+        );
+
+        // (c) each of the three admission refusals, individually
+        for why in [R::NoTrapDrainer, R::MultiDispatcher, R::NotDispatchCpu] {
+            let mut h = two_task_world();
+            h.force_admission = Some(why);
+            let before = h.snapshot();
+            assert_eq!(
+                run_yield_transaction(&mut h, CPU).expect_err("must decline"),
+                YieldDecline::RouteNotAdmitted(why)
+            );
+            assert_eq!(h.snapshot(), before, "{why:?} must mutate nothing");
+            assert_eq!(h.count("reserve"), 0, "{why:?} must reserve nothing");
+        }
+
+        // (d) the caller is not Running — another edge moved it first
+        let mut h = Harness::new(
+            &[
+                tcb(CALLER, TaskStatus::Blocked(WaitReason::Join(ThreadId(9)))),
+                tcb(OTHER, TaskStatus::Runnable),
+            ],
+            Some(CALLER),
+        );
+        let before = h.snapshot();
+        assert_eq!(
+            run_yield_transaction(&mut h, CPU).expect_err("must decline"),
+            YieldDecline::NotRunning
+        );
+        assert_eq!(h.snapshot(), before);
+        assert_eq!(
+            h.count("release"),
+            1,
+            "the reservation taken before the transition must be released"
+        );
+    }
+
+    /// **The one post-write failure rolls back EXACTLY.** `ReenqueueRefused` is the only decline
+    /// reached after the rank-2 write, and the world it hands back is indistinguishable from the
+    /// one it found: status `Running`, `current` intact, the deferral released.
+    #[test]
+    fn a_refused_reenqueue_rolls_the_transition_back_exactly() {
+        let mut h = two_task_world();
+        h.force_reenqueue_refusal = true;
+        let before = h.snapshot();
+        assert_eq!(
+            run_yield_transaction(&mut h, CPU).expect_err("must decline"),
+            YieldDecline::ReenqueueRefused
+        );
+        assert_eq!(
+            h.status_of(CALLER),
+            Some(TaskStatus::Running),
+            "the rank-2 write must be undone"
+        );
+        assert_eq!(
+            h.current_of(0),
+            Some(CALLER),
+            "and `current` must be intact"
+        );
+        assert_eq!(h.deferral[0], None, "and the reservation released");
+        assert_eq!(h.snapshot(), before, "byte for byte");
+        // The rollback precedes the release: a route that released first could hand the deferral
+        // to somebody else while this caller is briefly Runnable AND current.
+        assert!(h.at("rollback") < h.at("release"));
+        assert_eq!(h.count("rollback"), 1);
+    }
+
+    /// **The idle task's preempt is `Runnable → Runnable`, so its rollback writes nothing** — and
+    /// must still report success, or an idle yield would look like a corrupt state.
+    #[test]
+    fn the_idle_twin_needs_no_rollback_and_says_so() {
+        let idle = crate::kernel::task_transition::IDLE_TID;
+        let mut h = Harness::new(&[tcb(idle, TaskStatus::Runnable)], Some(idle));
+        h.force_reenqueue_refusal = true;
+        let before = h.snapshot();
+        assert_eq!(
+            run_yield_transaction(&mut h, CPU).expect_err("must decline"),
+            YieldDecline::ReenqueueRefused
+        );
+        assert_eq!(
+            h.status_of(idle),
+            Some(TaskStatus::Runnable),
+            "idle was never made Running, so nothing is undone"
+        );
+        assert_eq!(h.snapshot(), before);
+    }
+
+    /// The arch gate is consulted BEFORE the admission and before any reservation, and reports the
+    /// colliding-deferral case itself.
+    #[test]
+    fn the_arch_gate_precedes_the_admission_and_the_reservation() {
+        let mut h = two_task_world();
+        h.force_collision = true;
+        h.force_admission = Some(crate::kernel::boot::TerminalAdmissionRefusal::MultiDispatcher);
+        // Both would refuse; the ARCH gate is asked first, so its reason is the one reported.
+        assert_eq!(
+            yield_deferral_arch_gate(&h, CPU).expect_err("the gate must refuse"),
+            YieldDecline::DeferralHeld
+        );
+        assert_eq!(
+            run_yield_transaction(&mut h, CPU).expect_err("must decline"),
+            YieldDecline::DeferralHeld,
+            "the arch gate is consulted before the admission"
+        );
+    }
+
+    // ── structural: the route, the fallback boundary and the vocabulary ─────────────────────
+
+    /// **No broad fallback after the commit**, and the route answers with the disposition the drain
+    /// requires.
+    #[test]
+    fn the_split_route_falls_back_only_before_it_commits() {
+        let route = SPLIT
+            .split("fn try_split_yield_into_frame(\n    shared: &SharedKernel,")
+            .nth(1)
+            .expect("the split Yield route");
+        let route = &route[..route
+            .find("\n#[cfg(feature = \"hosted-dev\")]")
+            .expect("its end")];
+        let commit = route.find("Ok(outcome) => {").expect("the commit arm");
+        let decline = route.find("Err(decline) => {").expect("the decline arm");
+        assert!(commit < decline);
+        let commit_arm = &route[commit..decline];
+        assert!(
+            commit_arm.contains("D::QueueAdvanceCommitted")
+                && !commit_arm.contains("D::NotHandled"),
+            "a committed yield must never hand back to the broad path"
+        );
+        assert!(
+            route[decline..].contains("D::NotHandled"),
+            "and a decline must, because every decline is pre-mutation"
+        );
+        // The result lands in the outgoing frame before the switch, exactly as `handle_yield` does.
+        assert!(
+            commit_arm.contains("frame.set_ok(0, 0, 0);"),
+            "the syscall's own result must be written into the outgoing frame"
+        );
+        assert!(
+            commit_arm.find("frame.set_ok(0, 0, 0);").unwrap()
+                < commit_arm.find("D::QueueAdvanceCommitted").unwrap(),
+            "and before the disposition that hands the CPU to the drain"
+        );
+    }
+
+    /// **Both routes count exactly one yield.** The broad path counts on entry; the split route
+    /// counts only what it commits, and a declined split is counted by the broad path that then
+    /// runs.
+    #[test]
+    fn a_yield_is_counted_exactly_once_on_either_route() {
+        // The broad entry increment is unchanged and unconditional.
+        let body = EXEC_STATE
+            .split("pub fn yield_current(&mut self) -> Result<(), KernelError> {")
+            .nth(1)
+            .expect("yield_current");
+        let head = &body[..body
+            .find("crate::kernel::syscall::yield_txn::run_yield_transaction")
+            .expect("the policy call")];
+        assert!(
+            head.contains("ipc.telemetry.scheduler_yield_calls.saturating_add(1)"),
+            "the broad path must still count on entry, before it knows whether it will defer"
+        );
+        // The transaction itself owns no telemetry — counting is the route's.
+        for line in YIELD_TXN.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") || t.starts_with("*") {
+                continue;
+            }
+            assert!(
+                !line.contains("scheduler_yield_calls"),
+                "the policy must not count; the two routes reach the counter at different points"
+            );
+        }
+        // And the split route counts once, on the commit arm only.
+        assert_eq!(
+            SPLIT.matches("shared.count_yield_split_mut();").count(),
+            1,
+            "the split route counts exactly once"
+        );
+    }
+
+    /// **The per-architecture vocabulary is preserved byte for byte**, in one owner. The three
+    /// post-lock drains and the live oracles each match their own prefix, so a unified string would
+    /// have silently zeroed every architecture's Yield evidence.
+    #[test]
+    fn each_architecture_keeps_its_delivered_yield_vocabulary() {
+        for marker in [
+            // x86_64 (192B)
+            "YIELD_DISPATCH_DEFER_BEGIN cpu={} tid={}",
+            "YIELD_DISPATCH_REENQUEUE_OK cpu={} tid={}",
+            "YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
+            // AArch64 (195G)
+            "AARCH64_YIELD_DISPATCH_DEFER_BEGIN cpu={} tid={}",
+            "AARCH64_YIELD_DISPATCH_REENQUEUE_OK cpu={} tid={}",
+            "AARCH64_YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
+            // RISC-V (196G)
+            "RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu={} outgoing={}",
+            "RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu={} outgoing={}",
+            "RISCV_YIELD_DISPATCH_FALLBACK reason={} tid={}",
+        ] {
+            assert!(
+                YIELD_TXN.contains(marker),
+                "the delivered marker `{marker}` must survive verbatim"
+            );
+        }
+        // The legacy reason strings, so no attribution is lost.
+        for reason in [
+            "\"no_trap_drainer\"",
+            "\"multi_cpu\"",
+            "\"not_bsp\"",
+            "\"already_deferred\"",
+            "\"reenqueue_failed\"",
+        ] {
+            // `no_trap_drainer` and `multi_cpu` are owned by `TerminalAdmissionRefusal::marker`,
+            // which the policy delegates to; the rest are the policy's own.
+            const BOOT_MOD: &str = include_str!("mod.rs");
+            assert!(
+                YIELD_TXN.contains(reason) || BOOT_MOD.contains(reason),
+                "the delivered reason `{reason}` must survive"
+            );
+        }
+        // The split route's decline uses its OWN marker, so it cannot double-count the in-lock
+        // fallback the broad path is about to emit.
+        assert!(
+            SPLIT.contains("YIELD_SPLIT_REFUSED cpu={} reason={}"),
+            "the split attempt must name itself distinctly from the in-lock fallback"
+        );
+    }
+
+    /// **NR 0's ingress is architecture-specific, and the route accounts for it.**
+    #[test]
+    fn the_route_reads_the_raw_trapped_number_on_aarch64() {
+        assert!(
+            TRAP_ENTRY.contains("|| raw_nr == crate::kernel::syscall::SYSCALL_YIELD_NR"),
+            "NR 0 must be on the AArch64 import allowlist, or its ABI never reaches the frame"
+        );
+        let helper = SPLIT
+            .split("fn trapped_syscall_nr(frame: &TrapFrame) -> usize {")
+            .nth(1)
+            .expect("the arch-correct number reader");
+        let helper = &helper[..helper.find("\n}").expect("its end")];
+        assert!(
+            helper.contains("#[cfg(target_arch = \"aarch64\")]")
+                && helper.contains("frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8)"),
+            "on AArch64 the trapped number must come from the raw x8"
+        );
+        assert!(
+            helper.contains("frame.syscall_num()"),
+            "and from the decoded frame everywhere else"
+        );
+        assert!(
+            SPLIT.contains(
+                "if trapped_syscall_nr(frame) != crate::kernel::syscall::SYSCALL_YIELD_NR {"
+            ),
+            "the route must gate on it"
         );
     }
 }
