@@ -545,22 +545,46 @@ fn drain_switch_plan_stash(
 /// they never unwind. That is why `settle` is also called explicitly at the single point after
 /// the broad dispatcher and before the drains: by the time any divergence is reachable, the
 /// window is already closed, and the later `Drop` is a no-op.
+/// U9-DISPATCH-CPU1 §1 — this type is also the **sole mint** of
+/// [`crate::runtime::DispatchAuthority`].
+///
+/// It is the right place and the only right place. `establish` is called once per trap, from the
+/// architecture entry, with the `CpuId` that entry derived from hardware — x86_64's per-CPU
+/// record, AArch64's `MPIDR_EL1`, RISC-V's hart id. Nothing downstream can manufacture that fact,
+/// and nothing upstream of it exists. The authority's lifetime is deliberately the WHOLE trap and
+/// not the publication window: [`Self::settle`] closes the "publications welcome" flag before the
+/// drains run, and the drains are exactly who needs the authority.
 pub(crate) struct TrapPathWindow {
     cpu_idx: usize,
+    authority: crate::runtime::DispatchAuthority,
     settled: core::cell::Cell<bool>,
 }
 
 impl TrapPathWindow {
     pub(crate) fn establish(cpu: CpuId) -> Self {
         let cpu_idx = cpu.0 as usize;
-        if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        let authority = if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
             crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
                 .store(true, core::sync::atomic::Ordering::Relaxed);
-        }
+            // Bump BEFORE any authority is handed out, so an authority minted for an earlier trap
+            // on this CPU is already stale by the time this one can be used.
+            crate::runtime::DispatchAuthority::mint(
+                cpu,
+                crate::kernel::boot::open_trap_dispatch_window(cpu_idx),
+            )
+        } else {
+            crate::runtime::DispatchAuthority::none(cpu)
+        };
         Self {
             cpu_idx,
+            authority,
             settled: core::cell::Cell::new(false),
         }
+    }
+
+    /// This trap's dispatch authority. Valid for the whole trap, including after [`Self::settle`].
+    pub(crate) fn authority(&self) -> crate::runtime::DispatchAuthority {
+        self.authority
     }
 
     /// Close the window. Idempotent by construction, so an explicit call before a divergence
@@ -1222,7 +1246,7 @@ pub fn handle_trap_entry_shared(
                 crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_REVERIFY_OK tid={}", t);
             }
             crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
-            let dispatch = shared.d2_send_dispatch_step_mut(cpu);
+            let dispatch = shared.d2_send_dispatch_step_mut(trap_path.authority());
             // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
             // with its own evidence. `RefusedTorn` is fatal — it may never fall through to a
             // resume, an ordinary fallback dispatch, an idle halt or a return to userspace.
@@ -1337,7 +1361,7 @@ pub fn handle_trap_entry_shared(
                 crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid={}", t);
             }
             crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
-            let dispatch = shared.d2_recv_dispatch_step_mut(cpu);
+            let dispatch = shared.d2_recv_dispatch_step_mut(trap_path.authority());
             // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
             // with its own evidence. `RefusedTorn` is fatal — it may never fall through to a
             // resume, an ordinary fallback dispatch, an idle halt or a return to userspace.
@@ -1495,7 +1519,7 @@ pub fn handle_trap_entry_shared(
                     // (2) ONE authoritative dequeue under the rank-1 scheduler seam. This is the
                     //     single queue-advancing step for the cycle. It may legitimately select
                     //     the outgoing caller itself, if a reply re-queued it.
-                    let dispatch = shared.futex_wait_dispatch_step_mut(cpu);
+                    let dispatch = shared.futex_wait_dispatch_step_mut(trap_path.authority());
                     match dispatch.tid().map(|t| t.0) {
                         None => {
                             // SETTLE (idle). The run queue is empty: the outgoing caller stays
@@ -1661,7 +1685,7 @@ pub fn handle_trap_entry_shared(
             .unwrap_or(false);
         if reverify_ok {
             // Queue-advancing dequeue (emits QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK).
-            let dispatch = shared.futex_wait_dispatch_step_mut(cpu);
+            let dispatch = shared.futex_wait_dispatch_step_mut(trap_path.authority());
             // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
             // with its own evidence. `RefusedTorn` is fatal — it may never fall through to a
             // resume, an ordinary fallback dispatch, an idle halt or a return to userspace.
@@ -1810,7 +1834,7 @@ pub fn handle_trap_entry_shared(
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}", t);
                 }
                 // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
-                let dispatch = shared.futex_wait_dispatch_step_mut(cpu);
+                let dispatch = shared.futex_wait_dispatch_step_mut(trap_path.authority());
                 // Stage 199D-WA3A-R2-SEAL (item E): mark Running through the exact rank-2
                 // transition FIRST, then match all five outcomes explicitly. A refusal has
                 // already undone exactly what the selection did, so the drain resumes nothing
@@ -1996,7 +2020,7 @@ pub fn handle_trap_entry_shared(
                     crate::yarm_log!("AARCH64_YIELD_DISPATCH_REVERIFY_OK tid={}", t);
                 }
                 // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
-                let dispatch = shared.yield_dispatch_step_mut(cpu);
+                let dispatch = shared.yield_dispatch_step_mut(trap_path.authority());
                 // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly,
                 // each with its own evidence. `RefusedTorn` is fatal and never returns.
                 let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
@@ -2106,7 +2130,7 @@ pub fn handle_trap_entry_shared(
         crate::yarm_log!("YIELD_DISPATCH_DEFER_BEGIN cpu={} drain=1", cpu.0);
         let reverify_ok = shared.yield_reverify_ready(cpu);
         if reverify_ok {
-            let dispatch = shared.yield_dispatch_step_mut(cpu);
+            let dispatch = shared.yield_dispatch_step_mut(trap_path.authority());
             // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
             // with its own evidence. `RefusedTorn` is fatal and never returns.
             let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {

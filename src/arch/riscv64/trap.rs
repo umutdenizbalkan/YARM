@@ -1250,7 +1250,7 @@ pub fn handle_riscv_trap_entry_shared(
         );
         if reverify_ok {
             // Queue-advancing dequeue of the FIFO head (the incoming task B).
-            let dispatch = shared.yield_dispatch_step_mut(cpu);
+            let dispatch = shared.yield_dispatch_step_mut(trap_path.authority());
             if let Some(inc) = dispatch.tid().map(|t| t.0) {
                 crate::yarm_log!(
                     "RISCV_QUEUE_SWITCH_FOUNDATION_DEQUEUE_OK cpu={} incoming={}",
@@ -1383,7 +1383,7 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_REVERIFY_OK tid={}", out);
             }
             crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
-            let dispatch = shared.d2_send_dispatch_step_mut(cpu);
+            let dispatch = shared.d2_send_dispatch_step_mut(trap_path.authority());
             // All five WA3A outcomes matched explicitly, each with its own evidence.
             let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
                 Mark::Marked(token) => Some(token),
@@ -1488,7 +1488,7 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid={}", out);
             }
             crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
-            let dispatch = shared.d2_recv_dispatch_step_mut(cpu);
+            let dispatch = shared.d2_recv_dispatch_step_mut(trap_path.authority());
             // All five WA3A outcomes matched explicitly, each with its own evidence.
             // 199E-R1(A): only a CLEAN idle outcome may publish return provenance. The two
             // refusal outcomes below also produce `None`, and they are errors — they must
@@ -1645,7 +1645,7 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}", out);
             }
             // Queue-advancing dequeue of the FIFO head (the incoming task B).
-            let dispatch = shared.futex_wait_dispatch_step_mut(cpu);
+            let dispatch = shared.futex_wait_dispatch_step_mut(trap_path.authority());
             if let Some(inc) = dispatch.tid().map(|t| t.0) {
                 crate::yarm_log!(
                     "RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
@@ -1829,7 +1829,7 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_REVERIFY_OK outgoing={}", out);
             }
             // Queue-advancing dequeue of the FIFO head.
-            let dispatch = shared.yield_dispatch_step_mut(cpu);
+            let dispatch = shared.yield_dispatch_step_mut(trap_path.authority());
             if let Some(inc) = dispatch.tid().map(|t| t.0) {
                 crate::yarm_log!(
                     "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu={} incoming={}",

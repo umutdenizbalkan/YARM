@@ -762,6 +762,28 @@ pub(crate) static GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE: [core::sync::atomic::Atomic
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
 
+/// U9-DISPATCH-CPU1 §1 — the per-CPU trap-window counter that makes a
+/// [`crate::runtime::DispatchAuthority`] one-shot.
+///
+/// Bumped by `arch::trap_entry::TrapPathWindow::establish` — the single place a trap window opens
+/// — so an authority minted for an earlier trap on the same CPU no longer matches and authorizes
+/// nothing. It is deliberately NOT a lock and NOT per-CPU scheduler state: it is a monotonically
+/// increasing tag whose only reader is [`crate::runtime::DispatchAuthority::is_live`], so
+/// `doc/AI_AGENT_RULES.md` §14.4's prohibition on new per-CPU scheduler lock types is untouched.
+///
+/// Starts at 0, and `u64::MAX` is reserved as the never-live sentinel for an out-of-range CPU, so
+/// the first minted epoch is 1 and no live authority can ever collide with the sentinel.
+pub(crate) static TRAP_DISPATCH_EPOCH: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// U9-DISPATCH-CPU1 §1 — open a new trap window on `cpu` and return its epoch.
+///
+/// The ONLY caller is `TrapPathWindow::establish`.
+pub(crate) fn open_trap_dispatch_window(cpu_idx: usize) -> u64 {
+    TRAP_DISPATCH_EPOCH[cpu_idx].fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1
+}
+
 /// Stage 120: x86_64-only controlled one-shot unlocked `switch_frames` proof
 /// harness gate. This is diagnostic/smoke-only, default-off, single-CPU-only,
 /// and does not alter scheduler policy. VALIDATION: D6_CONTROLLED_SWITCH_PROOF_BEGIN
