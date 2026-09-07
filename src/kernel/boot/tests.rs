@@ -159071,7 +159071,8 @@ mod u9reap1_reap_transaction {
 mod u9exit1_self_exit_transaction {
     use super::*;
     use crate::kernel::boot::cleared_current::{
-        ClearedCurrentOwners, ClearedCurrentSettlement, ClearedCurrentToken, RestoreRefusal,
+        AdvanceRefusal, ClearedCurrentOwners, ClearedCurrentSettlement, ClearedCurrentToken,
+        RestoreRefusal,
     };
     use crate::kernel::boot::exit_claim::{
         ExitClaim, ExitDisposition, ExitDrainVerdict, ExitFailure, ExitPreflight, ExitRefusal,
@@ -160712,6 +160713,12 @@ mod u9exit1_self_exit_transaction {
 
     /// **A `Runnable` victim that a restart also re-queued** is not restored even though it is
     /// present and ours: `tid_placed_anywhere` is what refuses it, and it is checked on EVERY CPU.
+    ///
+    /// U9-EXIT4 §2 extends this to the OTHER settlement. Under U9-EXIT3 the token would happily
+    /// publish an advance past this victim — the caller was expected to have asked
+    /// `victim_is_drain_honourable` first — so a caller that forgot got a deferral the drain
+    /// answers `Contradicted` to. The admission now lives inside `publish_queue_advance`, so the
+    /// same requeued victim is refused there too, and the token comes back rather than a settlement.
     #[test]
     fn a_requeued_victim_is_never_restored_even_while_present() {
         // The slot is genuinely cleared, and then a restart re-queues the victim.
@@ -160726,16 +160733,407 @@ mod u9exit1_self_exit_transaction {
         h.sched
             .enqueue_on(CPU, ThreadId(1))
             .expect("a restart re-queues the victim");
+        let before = h.snapshot();
         let refused = token
             .restore_current_exact(&mut h)
             .expect_err("must refuse");
         assert_eq!(refused.1, RestoreRefusal::PlacedElsewhere);
         assert_eq!(h.current_of(0), None, "and nothing was written");
-        // Settle the token so the harness does not diverge on drop.
-        refused.0.publish_queue_advance(
-            &mut h,
-            crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+        // U9-EXIT4 §2: the advance refuses this exact state by itself, with the token handed back.
+        let refused = refused
+            .0
+            .publish_queue_advance(
+                &mut h,
+                crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+            )
+            .expect_err("a requeued victim is not drain-honourable");
+        assert_eq!(refused.1, AdvanceRefusal::DrainWouldRefuse);
+        assert_eq!(
+            h.exit_deferral[0], None,
+            "a refused advance publishes nothing"
         );
+        assert_eq!(
+            h.snapshot(),
+            before,
+            "and neither refusal mutated anything at all"
+        );
+        // Settle the token so the harness does not diverge on drop. The victim becoming terminal
+        // is what makes the SAME settlement succeed, which is the property under test stated the
+        // other way round: the admission tracks the victim's state, not the caller's intent.
+        h.tcbs
+            .iter_mut()
+            .flatten()
+            .find(|t| t.tid.0 == 1)
+            .expect("the victim")
+            .status = TaskStatus::Exited(0);
+        assert_eq!(
+            refused
+                .0
+                .publish_queue_advance(
+                    &mut h,
+                    crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+                )
+                .expect("a terminal victim is drain-honourable"),
+            ClearedCurrentSettlement::AdvanceCommitted
+        );
+        assert_eq!(h.exit_deferral[0], Some((1, Some(Asid(201)))));
+    }
+
+    // ── U9-EXIT4 §4 — the forced interleavings ──────────────────────────────────────────────
+
+    /// One competing transition, applied at the exact post-clear instant.
+    ///
+    /// Each variant is a real production edge named by U9-EXIT4 §1. They are applied by hand rather
+    /// than through `Inject` because this table needs the window held OPEN across three
+    /// observations — after the clear, after the restore, after the advance — which the transaction
+    /// deliberately does not allow a caller to do.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Competitor {
+        /// Nothing raced. The victim is still `Running`, ours, and placed nowhere.
+        Nothing,
+        /// `restart_task` wrote `Runnable` and re-enqueued the victim on this CPU.
+        RestartRequeued,
+        /// The victim is still `Running` but somebody placed it in a run queue — the shape a
+        /// scheduler-level enqueue produces before any status write lands.
+        EnqueuedWhileStillRunning,
+        /// `restart_task` wrote `Runnable` but the enqueue has not happened yet.
+        RestartNotYetQueued,
+        /// `TaskTransition::FaultRunningCurrent` wrote `Faulted`.
+        TerminalFault,
+        /// A reap claimed it: `Dead`.
+        Reap,
+        /// A duplicate exit won: `Exited(9)`.
+        DuplicateExit,
+        /// The TCB is gone entirely — joined, or reaped through to removal.
+        Removal,
+        /// A replacement incarnation reused the numeric TID under a different ASID.
+        TidReuse,
+    }
+
+    impl Competitor {
+        fn apply(self, h: &mut Harness) {
+            let set = |h: &mut Harness, status: TaskStatus| {
+                h.tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("the victim")
+                    .status = status;
+            };
+            match self {
+                Self::Nothing => {}
+                Self::RestartRequeued => {
+                    set(h, TaskStatus::Runnable);
+                    h.sched
+                        .enqueue_on(CPU, ThreadId(1))
+                        .expect("the restart re-enqueues");
+                }
+                Self::RestartNotYetQueued => set(h, TaskStatus::Runnable),
+                Self::EnqueuedWhileStillRunning => {
+                    h.sched
+                        .enqueue_on(CPU, ThreadId(1))
+                        .expect("the placement lands first");
+                }
+                Self::TerminalFault => set(h, TaskStatus::Faulted),
+                Self::Reap => set(h, TaskStatus::Dead),
+                Self::DuplicateExit => set(h, TaskStatus::Exited(9)),
+                Self::Removal => {
+                    let slot = h
+                        .tcbs
+                        .iter_mut()
+                        .find(|slot| slot.as_ref().is_some_and(|t| t.tid.0 == 1))
+                        .expect("the victim's slot");
+                    *slot = None;
+                }
+                Self::TidReuse => {
+                    let t = h
+                        .tcbs
+                        .iter_mut()
+                        .flatten()
+                        .find(|t| t.tid.0 == 1)
+                        .expect("the victim");
+                    t.asid = Some(Asid(999));
+                    t.status = TaskStatus::Running;
+                }
+            }
+        }
+    }
+
+    /// **U9-EXIT4 §4 — every competing transition, forced at the post-clear instant, settles
+    /// exactly once and by identity.**
+    ///
+    /// The window is opened by hand and held open across three observations, so each row states
+    /// what BOTH settlements answer rather than only which one the transaction happened to take.
+    /// Every refusal is additionally proved to have mutated nothing at all — the whole `Harness`
+    /// snapshot, which carries each TCB's `{tid, asid, pid, status, restart token, detach state}`,
+    /// every CPU's current slot, and `tid_present_anywhere` per task — so a refusal is
+    /// observationally identical to never having been called.
+    #[test]
+    fn every_competing_transition_settles_the_cleared_slot_by_identity() {
+        // (competitor, restore answer, advance answer)
+        type Answer = Result<(), &'static str>;
+        const OK: Answer = Ok(());
+        let rows: [(Competitor, Answer, Answer); 9] = [
+            // Still ours and unplaced: the ONE state in which the entering frame may be resumed.
+            (Competitor::Nothing, OK, OK),
+            // A restart owns it now: `Runnable`, with or without the enqueue having landed. The
+            // restore refuses on status — it asks `victim_is_running_exact` FIRST, so placement
+            // never gets a say for a task that is no longer `Running` — and the advance refuses
+            // because the drain would answer `Contradicted`.
+            (
+                Competitor::RestartRequeued,
+                Err("not_running"),
+                Err("drain_would_refuse"),
+            ),
+            (
+                Competitor::RestartNotYetQueued,
+                Err("not_running"),
+                Err("drain_would_refuse"),
+            ),
+            // Placement alone is also disqualifying, even for a victim that IS still `Running` and
+            // ours: restoring it would make it simultaneously current here and queued there.
+            (
+                Competitor::EnqueuedWhileStillRunning,
+                Err("placed_elsewhere"),
+                Err("drain_would_refuse"),
+            ),
+            // A terminal fault is the same class: never resumable, never drain-honourable.
+            (
+                Competitor::TerminalFault,
+                Err("not_running"),
+                Err("drain_would_refuse"),
+            ),
+            // The three terminal/absent outcomes: not restorable, but exactly what the drain
+            // honours, so the advance settles them.
+            (Competitor::Reap, Err("incarnation_gone"), OK),
+            (Competitor::DuplicateExit, Err("incarnation_gone"), OK),
+            (Competitor::Removal, Err("incarnation_gone"), OK),
+            // A replacement at the same numeric TID resolves to nothing under the exact identity,
+            // so it is `Removed` for the advance and is never touched.
+            (Competitor::TidReuse, Err("incarnation_gone"), OK),
+        ];
+        for (competitor, want_restore, want_advance) in rows {
+            let mut h = three_task_world();
+            let token = crate::kernel::boot::cleared_current::clear_current_exact(
+                &mut h.sched,
+                CPU,
+                1,
+                Some(Asid(201)),
+            )
+            .unwrap_or_else(|| panic!("{competitor:?}: the exact clear must succeed"));
+            assert_eq!(
+                h.current_of(0),
+                None,
+                "{competitor:?}: the window must actually be open"
+            );
+            competitor.apply(&mut h);
+            let opened = h.snapshot();
+
+            // (1) the restore.
+            let token = match (token.restore_current_exact(&mut h), want_restore) {
+                (Ok(ClearedCurrentSettlement::Restored), Ok(())) => {
+                    assert_eq!(
+                        h.current_of(0),
+                        Some(1),
+                        "{competitor:?}: a restored victim is this CPU's current again"
+                    );
+                    assert_eq!(h.status_of(1), Some(TaskStatus::Running));
+                    continue;
+                }
+                (Err((token, why)), Err(marker)) => {
+                    assert_eq!(
+                        why.marker(),
+                        marker,
+                        "{competitor:?}: wrong restore refusal"
+                    );
+                    assert_eq!(
+                        h.snapshot(),
+                        opened,
+                        "{competitor:?}: a refused restore must mutate nothing"
+                    );
+                    token
+                }
+                (got, want) => {
+                    panic!("{competitor:?}: restore answered {got:?}, expected {want:?}")
+                }
+            };
+
+            // (2) the advance, on the SAME token.
+            let token = match (
+                token.publish_queue_advance(
+                    &mut h,
+                    crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+                ),
+                want_advance,
+            ) {
+                (Ok(ClearedCurrentSettlement::AdvanceCommitted), Ok(())) => {
+                    assert_eq!(
+                        h.exit_deferral[0],
+                        Some((1, Some(Asid(201)))),
+                        "{competitor:?}: the deferral names the CLEARED incarnation, never a \
+                         replacement"
+                    );
+                    assert_eq!(
+                        h.current_of(0),
+                        None,
+                        "{competitor:?}: an advanced CPU has no current until the drain selects"
+                    );
+                    assert_eq!(
+                        h.count("restore_current_exact"),
+                        0,
+                        "{competitor:?}: a non-resumable victim is never restored"
+                    );
+                    if competitor == Competitor::TidReuse {
+                        let replacement = h
+                            .tcbs
+                            .iter()
+                            .flatten()
+                            .find(|t| t.tid.0 == 1)
+                            .expect("the replacement is present");
+                        assert_eq!(replacement.asid, Some(Asid(999)));
+                        assert_eq!(
+                            replacement.status,
+                            TaskStatus::Running,
+                            "the replacement must be untouched by the old incarnation's exit"
+                        );
+                        assert!(
+                            !h.sched.tid_present_anywhere(ThreadId(1)),
+                            "and it must not be placed by this settlement either"
+                        );
+                    }
+                    continue;
+                }
+                (Err((token, why)), Err(marker)) => {
+                    assert_eq!(
+                        why.marker(),
+                        marker,
+                        "{competitor:?}: wrong advance refusal"
+                    );
+                    assert_eq!(
+                        h.exit_deferral[0], None,
+                        "{competitor:?}: a refused advance publishes nothing"
+                    );
+                    assert_eq!(
+                        h.snapshot(),
+                        opened,
+                        "{competitor:?}: and mutates nothing at all"
+                    );
+                    token
+                }
+                (got, want) => {
+                    panic!("{competitor:?}: advance answered {got:?}, expected {want:?}")
+                }
+            };
+
+            // (3) Both refused, so production would diverge here. The harness settles instead — by
+            // making the victim terminal, which is the ONLY thing that changes the answer. That is
+            // the property stated the other way round: the admission tracks the victim's state, not
+            // the caller's intent, and no amount of retrying moves it.
+            let placement = h.sched.tid_present_anywhere(ThreadId(1));
+            h.tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == 1)
+                .expect("the victim")
+                .status = TaskStatus::Exited(0);
+            assert_eq!(
+                token
+                    .publish_queue_advance(
+                        &mut h,
+                        crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+                    )
+                    .unwrap_or_else(|_| panic!("{competitor:?}: a terminal victim is honourable")),
+                ClearedCurrentSettlement::AdvanceCommitted
+            );
+            assert_eq!(
+                h.sched.tid_present_anywhere(ThreadId(1)),
+                placement,
+                "{competitor:?}: a settlement never disturbs the victim's legitimate placement"
+            );
+        }
+    }
+
+    /// **U9-EXIT4 §4, negative — EXIT3's fatal-on-legitimate-race shape is rejected.**
+    ///
+    /// The shape was: the CALLER asks its own drain-honourability predicate, then calls an
+    /// infallible `publish_queue_advance`, then diverges. Two defects follow from it and both are
+    /// guarded here. The caller's predicate could drift from the drain's, and then a fatal would be
+    /// taken on a race the drain would in fact have honoured — a legitimate race killed by a stale
+    /// second opinion. And a caller that simply forgot the predicate would publish an advance the
+    /// drain refuses, which is the failure the token exists to prevent.
+    #[test]
+    fn the_caller_side_drain_predicate_and_the_infallible_advance_are_rejected() {
+        // (1) The advance is fallible. A settlement that cannot refuse cannot be the place the
+        // admission lives.
+        assert!(
+            CLEARED_CURRENT
+                .contains("    ) -> Result<ClearedCurrentSettlement, (Self, AdvanceRefusal)> {"),
+            "publish_queue_advance must be able to refuse and hand the obligation back"
+        );
+        // (2) It asks the drain itself, before publishing, and returns the token on refusal.
+        let advance = CLEARED_CURRENT
+            .split("pub(crate) fn publish_queue_advance<O: ClearedCurrentOwners>(")
+            .nth(1)
+            .expect("the advance settlement");
+        let advance = &advance[..advance.find("\n    /// **Settlement 3**").expect("its end")];
+        let admission = advance
+            .find("if !owners.victim_is_drain_honourable(tid, asid) {")
+            .expect("the advance must consult the drain's own verdict");
+        let publish = advance
+            .find("if !owners.publish_advance_for(cpu, tid, asid) {")
+            .expect("and then publish");
+        assert!(
+            admission < publish,
+            "the admission must precede the publication, or a refused advance would already have \
+             been taken"
+        );
+        assert!(
+            advance.contains("return Err((self, AdvanceRefusal::DrainWouldRefuse));")
+                && advance.contains("return Err((self, AdvanceRefusal::AlreadyPublished));"),
+            "both refusals must hand the token back rather than settle it"
+        );
+        assert!(
+            advance[..admission].find("self.settle()").is_none(),
+            "nothing may be settled before the admission has passed"
+        );
+        // (3) No DECIDER keeps a second copy of the predicate next to its own divergence. The
+        // owner impls below the banner legitimately implement it — that is where the acquisition
+        // lives — so the census is over the transaction and the route, which decide.
+        let deciding = EXIT_TXN
+            .split("// ═══")
+            .next()
+            .expect("the transaction, above the owner impls");
+        for (name, src) in [("exit_txn.rs", deciding), ("syscall_split.rs", SPLIT)] {
+            for line in src.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("*") {
+                    continue;
+                }
+                assert!(
+                    !line.contains("victim_is_drain_honourable"),
+                    "{name} keeps a caller-side copy of the drain's admission: {line}"
+                );
+            }
+        }
+        // (4) And no caller treats the advance as infallible.
+        for (name, src) in [("exit_txn.rs", EXIT_TXN)] {
+            for (i, line) in src.lines().enumerate() {
+                if !line.contains("publish_queue_advance(") {
+                    continue;
+                }
+                let tail: alloc::string::String = src
+                    .lines()
+                    .skip(i)
+                    .take(16)
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join("\n");
+                assert!(
+                    tail.contains("Err((token, why))") || tail.contains("Err((token, _))"),
+                    "{name}: every advance call must handle the refusal that hands the token \
+                     back: {line}"
+                );
+            }
+        }
     }
 
     /// The compare-and-clear is the whole repair for `VictimChanged`: it mutates NOTHING when the
@@ -160826,26 +161224,132 @@ mod u9exit1_self_exit_transaction {
         );
         assert!(CLEARED_CURRENT.contains("impl Drop for ClearedCurrentToken {"));
         assert!(CLEARED_CURRENT.contains("panic!(\"cleared current slot left unsettled\")"));
-        // Exactly three consuming exits, each taking `self` by value.
+        // Exactly three consuming exits, each taking `self` by value. `mut self` is still by
+        // value — U9-EXIT4 §3 needs the binding mutable so `settle` can mark the token rather
+        // than `mem::forget` it — so the guard pins the by-value receiver without pinning the
+        // mutability, and separately forbids every by-reference form.
         for consumer in [
-            "pub(crate) fn restore_current_exact<O: ClearedCurrentOwners>(\n        self,",
-            "pub(crate) fn publish_queue_advance<O: ClearedCurrentOwners>(\n        self,",
-            "pub(crate) fn fatal(self, reason: &'static str) -> ! {",
+            "pub(crate) fn restore_current_exact<O: ClearedCurrentOwners>(\n        mut self,",
+            "pub(crate) fn publish_queue_advance<O: ClearedCurrentOwners>(\n        mut self,",
+            "pub(crate) fn fatal(mut self, reason: &'static str) -> ! {",
         ] {
             assert!(
                 CLEARED_CURRENT.contains(consumer),
                 "missing consuming settlement: {consumer}"
             );
         }
-        // And the private `consume` is the only way past `Drop`, so a fourth exit cannot be added
-        // without going through it.
+        // Scoped to the token's own inherent impl: the `ClearedCurrentOwners` trait in the same
+        // file legitimately takes `&mut self`, and it carries no obligation.
+        let token_impl = CLEARED_CURRENT
+            .split("impl ClearedCurrentToken {")
+            .nth(1)
+            .expect("the token's inherent impl")
+            .split("\n/// What licenses a queue advance")
+            .next()
+            .expect("its end");
+        assert!(
+            !token_impl.contains("pub(crate) fn restore_current_exact(&")
+                && !token_impl.contains("(&self,")
+                && !token_impl.contains("(&mut self,"),
+            "a settlement that borrows would leave the obligation alive after it returned"
+        );
+        // Exactly four methods on the token: the private `settle` and the three settlements.
         assert_eq!(
-            CLEARED_CURRENT.matches("core::mem::forget(self)").count(),
+            token_impl.matches("    fn ").count()
+                + token_impl.matches("    pub(crate) fn ").count(),
+            4,
+            "the token has exactly one private helper (`settle`) and three settlements, \
+             so a fourth exit cannot be added without this guard noticing"
+        );
+        // U9-EXIT4 §3: the private `settle` is the only way past `Drop`, and it is a FLAG rather
+        // than an abandonment primitive — see `the_token_is_never_abandoned_through_a_forget_primitive`.
+        assert_eq!(
+            CLEARED_CURRENT.matches("fn settle(&mut self)").count(),
             1,
-            "one place suppresses Drop, and it is the shared consume"
+            "one place defuses Drop, and it is the shared settle"
+        );
+        assert_eq!(
+            CLEARED_CURRENT.matches("self.settled = true;").count(),
+            1,
+            "and it is the only writer of the flag"
         );
         // Three call sites: one per settlement, and no other.
-        assert_eq!(CLEARED_CURRENT.matches("self.consume()").count(), 3);
+        assert_eq!(CLEARED_CURRENT.matches("self.settle()").count(), 3);
+    }
+
+    /// U9-EXIT4 §3 — the token cannot be abandoned through `mem::forget`, `ManuallyDrop` or any
+    /// equivalent, ANYWHERE in the kernel.
+    ///
+    /// U9-EXIT3's private `consume` defused the drop bomb with `core::mem::forget(self)`. That was
+    /// correct, but it made the property unprovable by inspection: a reader could not distinguish
+    /// the one sanctioned forget from a second one smuggled into the same module, and a caller
+    /// outside the module could always have written `mem::forget(token)` itself — the type is
+    /// `pub(crate)`, and forgetting is safe Rust.
+    ///
+    /// The bomb is now conditional on a private flag no other module can set, so abandonment
+    /// primitives are not merely discouraged: there is no reason for one to exist, and this guard
+    /// says so across every production source file that can name the type.
+    #[test]
+    fn the_token_is_never_abandoned_through_a_forget_primitive() {
+        /// Only CODE lines count. Both files below discuss these primitives in prose — this guard
+        /// exists because U9-EXIT3 used one — and a doc comment naming a hazard is the opposite of
+        /// committing it.
+        fn code_lines(src: &str) -> impl Iterator<Item = &str> {
+            src.lines().filter(|line| {
+                let t = line.trim_start();
+                !t.starts_with("//") && !t.starts_with("*") && !t.is_empty()
+            })
+        }
+        // (1) The module that owns the token executes no abandonment primitive at all.
+        for primitive in [
+            "mem::forget",
+            "ManuallyDrop",
+            "ptr::read",
+            "ptr::write",
+            "transmute",
+            "Box::leak",
+        ] {
+            for line in code_lines(CLEARED_CURRENT) {
+                assert!(
+                    !line.contains(primitive),
+                    "`{primitive}` must not appear in the token's own module: the drop bomb is \
+                     defused by the private `settled` flag, so nothing here needs one — {line}"
+                );
+            }
+        }
+        // (2) Nor does any production file that can name the token. `tests.rs` is excluded on
+        // purpose — this file IS the guard, and it quotes the primitives above verbatim.
+        for (name, src) in [
+            ("exit_txn.rs", EXIT_TXN),
+            ("exit_claim.rs", EXIT_CLAIM),
+            ("syscall_split.rs", SPLIT),
+            ("runtime.rs", RUNTIME),
+        ] {
+            for primitive in ["mem::forget", "ManuallyDrop"] {
+                for line in code_lines(src) {
+                    if !line.contains(primitive) {
+                        continue;
+                    }
+                    assert!(
+                        !line.contains("ClearedCurrentToken") && !line.contains("token"),
+                        "{name} abandons a cleared-current obligation: {line}"
+                    );
+                }
+            }
+        }
+        // (3) The flag itself is private and is initialised unsettled at the ONE mint.
+        assert!(
+            CLEARED_CURRENT.contains("    settled: bool,"),
+            "the flag must be a private field, not a pub(crate) one"
+        );
+        assert!(
+            CLEARED_CURRENT.contains("settled: false,"),
+            "a freshly minted token must start as an unsettled obligation"
+        );
+        assert!(
+            CLEARED_CURRENT.contains("if self.settled {\n            return;\n        }"),
+            "Drop must be a no-op for a settled token and a divergence otherwise"
+        );
     }
 
     /// A `Complete` disposition after the clear is reachable ONLY through a completed restore.
@@ -161452,5 +161956,752 @@ mod u9exit2_total_nr16_disposition {
         // the same reason, reached because a competing owner rather than this transaction made the
         // victim terminal. Both are licensed by a live reservation.
         assert_eq!(route.matches("D::QueueAdvanceCommitted").count(), 2);
+    }
+}
+
+/// U9-EXIT4 §1 — the post-clear writer census, encoded.
+///
+/// # What the window is
+///
+/// `run_exit_transaction` clears `current[cpu]` at step (7) and settles the resulting
+/// [`ClearedCurrentToken`] at step (8) or in `settle_failed_claim`. Between the two the victim is
+/// this CPU's current **nowhere** and queued **nowhere**, while its trap frame is still live on the
+/// stack. U9-EXIT3 proved that a `Complete` disposition in that window resumes a task the scheduler
+/// does not own. U9-EXIT4 asks the prior question: what can change the exact `{tid, asid}` while the
+/// window is open?
+///
+/// # The census
+///
+/// Every production writer that can move a `Running` task falls into exactly one of four rows, and
+/// each row is guarded below by the source fact that puts it there:
+///
+/// | # | writer | how it names its victim | reaches a post-clear victim? |
+/// |---|--------|-------------------------|------------------------------|
+/// | 1 | `TaskTransition::FaultRunningCurrent` — `fault_state::fault_current_task_with_fault`, `runtime::commit_terminal_fault_transition_shared` | `current_tid()` / `block_current_on_cpu_split`, both re-checked against the victim | **no** — the slot is empty, so both refuse before any write |
+/// | 2 | `TaskTransition::PreemptOutgoing`/`ContinueCurrent`/`DispatchIncoming` — `yield_current`, `yield_current_to`, the two dispatch owners | the outgoing `current_tid()`, or a TID dequeued from a run queue | **no** — empty current, and the victim is in no queue |
+/// | 3 | `apply_cross_cpu_wake_task` | an explicit TID from another CPU's wake | **no** — it transitions `Blocked(_)` only; a `Running` victim is skipped |
+/// | 4 | the explicit-TID writers — `restart_task`, `mark_task_dead`, `wake_tid_to_runnable_split`, `apply_split_sender_wake_plan_split` | a TID a *caller* supplies | **no** — every such caller must itself be executing on the single dispatching CPU, which is executing this transaction, and the window is not preemptible |
+///
+/// Row 4 is the only one that is not refused by a status or placement gate, and it is the one this
+/// module spends the most guards on. Two independent facts close it:
+///
+/// * **the window contains no wake.** Between the clear and the settlement `run_exit_transaction`
+///   calls exactly two owners — `mint_restart_token` (the restart domain's counter) and
+///   `claim_self_exit` (one rank-2 acquisition). Neither enqueues, wakes or dispatches;
+/// * **the window is not preemptible, on any of the three architectures.** x86_64 masks `RFLAGS.IF`
+///   on every `syscall` via `IA32_FMASK`; AArch64 masks `DAIF` in hardware on exception entry and
+///   the trap path contains no `daifclr`; RISC-V hardware clears `sstatus.SIE` on trap entry and the
+///   single re-enable is confined to the audited terminal-idle boundary.
+///
+/// Together with the single-dispatching-CPU fact U9-EXIT2 §1 established, no agent exists that
+/// could run row 4 while the window is open.
+///
+/// # The consequence
+///
+/// A claim refusal is itself production-impossible: `exit_preflight_locked` at step (3) established
+/// `{present, asid, !detached, Running}`, `claim_self_exit_locked` re-checks exactly those four, and
+/// steps (4)–(7) between them write no TCB. So `settle_failed_claim` — and the `fatal` inside it —
+/// is the typed capability for states that cannot occur, which is precisely what §2 permits a fatal
+/// settlement to be. §4's forced interleavings construct those states by injection instead.
+#[cfg(test)]
+mod u9exit4_post_clear_totality {
+    const EXIT_TXN: &str = include_str!("../syscall/exit_txn.rs");
+    const EXIT_CLAIM: &str = include_str!("exit_claim.rs");
+    const CLEARED_CURRENT: &str = include_str!("cleared_current.rs");
+    const TASK_TRANSITION: &str = include_str!("../task_transition.rs");
+    const FAULT_STATE: &str = include_str!("fault_state.rs");
+    const SCHEDULER_STATE: &str = include_str!("scheduler_state.rs");
+    const RESTART_STATE: &str = include_str!("restart_state.rs");
+    const EXEC_STATE: &str = include_str!("exec_state.rs");
+    const THREAD_STATE: &str = include_str!("thread_state.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TASK: &str = include_str!("../task.rs");
+    const SPAWN_THREAD_CORE: &str = include_str!("spawn_thread_core.rs");
+    const REAP_CLAIM: &str = include_str!("reap_claim.rs");
+    const CAP_LIFECYCLE: &str = include_str!("capability_lifecycle_state.rs");
+    const SPAWN_RESERVATION: &str = include_str!("../spawn_reservation.rs");
+    const X86_DESCRIPTORS: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TIMER: &str = include_str!("../../arch/riscv64/timer.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+
+    /// Every production file that writes `tcb.status`, so a census claim can be made over the whole
+    /// cohort rather than over the files that happened to be convenient.
+    fn status_writing_files() -> [(&'static str, &'static str); 13] {
+        [
+            ("runtime.rs", RUNTIME),
+            ("restart_state.rs", RESTART_STATE),
+            ("exec_state.rs", EXEC_STATE),
+            ("thread_state.rs", THREAD_STATE),
+            ("scheduler_state.rs", SCHEDULER_STATE),
+            ("ipc_state.rs", IPC_STATE),
+            ("exit_claim.rs", EXIT_CLAIM),
+            ("spawn_thread_core.rs", SPAWN_THREAD_CORE),
+            ("reap_claim.rs", REAP_CLAIM),
+            ("capability_lifecycle_state.rs", CAP_LIFECYCLE),
+            ("spawn_reservation.rs", SPAWN_RESERVATION),
+            ("task.rs", TASK),
+            ("fault_state.rs", FAULT_STATE),
+        ]
+    }
+
+    /// Only CODE lines. Every guard here is about what the kernel *does*, and these files discuss
+    /// the same transitions in prose at length.
+    fn code_lines(src: &str) -> impl Iterator<Item = &str> {
+        src.lines().filter(|line| {
+            let t = line.trim_start();
+            !t.starts_with("//") && !t.starts_with("*") && !t.is_empty()
+        })
+    }
+
+    // ── row 1 — `Faulted` ───────────────────────────────────────────────────────────────────
+
+    /// **`Faulted` has exactly one writer in the kernel, and it is a typed transition FROM
+    /// `Running`.** No production file assigns the status directly, so "a fault victim must have
+    /// been `Running`" is a compiled-in fact rather than a convention.
+    #[test]
+    fn faulted_is_written_only_through_the_typed_running_transition() {
+        for (name, src) in status_writing_files() {
+            for line in code_lines(src) {
+                assert!(
+                    !line.contains("status = TaskStatus::Faulted")
+                        && !line.contains("status: TaskStatus::Faulted"),
+                    "{name} writes `Faulted` directly; it must go through \
+                     `TaskTransition::FaultRunningCurrent`: {line}"
+                );
+            }
+        }
+        // And the transition itself is `Running -> Faulted`, exactly.
+        assert!(
+            TASK_TRANSITION.contains("| Self::FaultRunningCurrent => TaskStatus::Running,"),
+            "the fault transition must be applicable only FROM Running"
+        );
+        assert!(
+            TASK_TRANSITION.contains("Self::FaultRunningCurrent => TaskStatus::Faulted,"),
+            "and it must produce exactly Faulted"
+        );
+    }
+
+    /// **Both `FaultRunningCurrent` owners name their victim through `current`, and re-check it.**
+    ///
+    /// This is what makes row 1 unreachable: during the window `current[cpu]` is empty, so the
+    /// broad owner's `current_tid()` resolves to `None` and refuses `TaskMissing` before it writes
+    /// anything, and the split owner's `block_current_on_cpu_split` returns a different (or no)
+    /// victim and refuses `RefusedVictimChanged`.
+    #[test]
+    fn a_fault_can_only_claim_the_cpus_current_task() {
+        let broad = FAULT_STATE
+            .split("fn fault_current_task_with_fault(")
+            .nth(1)
+            .expect("the broad fault owner");
+        let broad = &broad[..broad
+            .find("apply_task_transition")
+            .expect("it applies the transition")];
+        assert!(
+            broad.contains("let running_tid = self.current_tid().ok_or_else(||"),
+            "the broad fault owner must resolve its victim from `current`, never from an argument"
+        );
+        assert!(
+            broad.contains("let faulted_tid = self.block_current_cpu().ok_or_else(||")
+                && broad.contains("if faulted_tid != running_tid {"),
+            "and it must refuse when the scheduler hands back somebody else"
+        );
+        let split = RUNTIME
+            .split("crate::kernel::task_transition::TaskTransition::FaultRunningCurrent,")
+            .nth(1)
+            .expect("between the split owner's probe and its apply");
+        assert!(
+            split.contains("let removed = match self.block_current_on_cpu_split(cpu) {")
+                && split.contains("if removed != Some(tid) {"),
+            "the split fault owner must clear `current` itself and refuse a different victim"
+        );
+    }
+
+    // ── row 2 — `Running -> Runnable` through the dispatch/preempt cohort ────────────────────
+
+    /// **Every `Running -> Runnable` preempt names the OUTGOING current task**, and skips entirely
+    /// when there is none. `yield_current` and `yield_current_to` both guard the transition with
+    /// `if let Some(tid) = outgoing_tid`, so an empty current slot means no status write at all.
+    #[test]
+    fn a_preempt_can_only_move_the_cpus_outgoing_current_task() {
+        for owner in ["fn yield_current(", "fn yield_current_to("] {
+            let body = EXEC_STATE.split(owner).nth(1).expect(owner);
+            let head = &body[..body
+                .find("TaskTransition::PreemptOutgoing,")
+                .expect("it preempts")];
+            assert!(
+                head.contains("let outgoing_tid = self.current_tid();")
+                    && head.contains("if let Some(tid) = outgoing_tid {"),
+                "{owner} must derive its victim from `current` and do nothing when it is empty"
+            );
+        }
+    }
+
+    /// **A dispatch names a task the scheduler SELECTED**, i.e. one that was in a run queue or
+    /// already current. The post-clear victim is in neither, so no dispatch can name it.
+    #[test]
+    fn a_dispatch_can_only_move_a_task_the_scheduler_selected() {
+        for (name, src) in [
+            ("scheduler_state.rs", SCHEDULER_STATE),
+            ("runtime.rs", RUNTIME),
+        ] {
+            assert!(
+                src.contains(
+                    "DispatchSelection::Dequeued { tid } => (tid.0, TaskTransition::DispatchIncoming),"
+                ) && src.contains(
+                    "DispatchSelection::ContinuedCurrent { tid } => (tid.0, TaskTransition::ContinueCurrent),"
+                ),
+                "{name}: a dispatch's victim must come from a typed selection, never a bare TID"
+            );
+        }
+        // And the incoming transition is applicable only FROM Runnable, so a task that is neither
+        // queued nor current cannot be laundered into Running by it.
+        assert!(
+            TASK_TRANSITION.contains("Self::DispatchIncoming => TaskStatus::Runnable,"),
+            "a dispatch may only promote a Runnable task"
+        );
+    }
+
+    // ── row 3 — the cross-CPU wake ──────────────────────────────────────────────────────────
+
+    /// **A cross-CPU wake transitions `Blocked(_)` and nothing else.** Every other status,
+    /// `Running` included, takes a `Skipped*` arm that writes no field — so an AP that services a
+    /// wake IPI while this window is open cannot touch the victim.
+    #[test]
+    fn a_cross_cpu_wake_skips_a_running_victim() {
+        // `apply_cross_cpu_wake_task_for_test` is a thin wrapper declared just above; the paren
+        // is what selects the real owner rather than it.
+        let body = SCHEDULER_STATE
+            .split("fn apply_cross_cpu_wake_task(")
+            .nth(1)
+            .expect("the cross-CPU wake owner");
+        let body = &body[..body.find("\n    pub").unwrap_or(body.len())];
+        assert!(
+            body.contains("TaskStatus::Blocked(_) => {"),
+            "the wake must gate on Blocked"
+        );
+        assert_eq!(
+            body.matches("tcb.status = TaskStatus::").count(),
+            1,
+            "and it must write a status exactly once, inside that arm"
+        );
+        for skipped in [
+            "TaskStatus::Dead => Ok(CrossCpuWakeApplyResult::SkippedDead)",
+            "TaskStatus::Faulted => Ok(CrossCpuWakeApplyResult::SkippedFaulted)",
+        ] {
+            assert!(
+                body.contains(skipped),
+                "every non-Blocked status must take a skip arm: {skipped}"
+            );
+        }
+    }
+
+    // ── row 4 — the explicit-TID writers, and the window that excludes them ─────────────────
+
+    /// **The post-clear window calls exactly two owners, and neither writes a TCB or wakes
+    /// anything.**
+    ///
+    /// This is the load-bearing guard for row 4. `restart_task`, `mark_task_dead` and the two
+    /// `Running`-accepting wakes all take a TID from a caller, so no status or placement gate stops
+    /// them reaching the victim — what stops them is that they are not called, and cannot be called
+    /// by anybody else, while the window is open.
+    #[test]
+    fn the_post_clear_window_contains_no_wake_and_no_tcb_write() {
+        let txn = EXIT_TXN
+            .split("pub(crate) fn run_exit_transaction<O: ExitOwners>(")
+            .nth(1)
+            .expect("the transaction");
+        let window = txn
+            .split("let Some(token) = owners.clear_current_exact(cpu, tid, preflight.asid) else {")
+            .nth(1)
+            .expect("the clear");
+        let window = &window[..window
+            .find("let claim = match owners.claim_self_exit(")
+            .expect("the claim closes the window's first half")];
+        // Exactly one owner call between the clear and the claim, and it is the token mint.
+        let calls: alloc::vec::Vec<&str> = code_lines(window)
+            .filter(|line| line.contains("owners."))
+            .collect();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the window's first half must contain only the pre-mutation release pair and the \
+             restart-token mint: {calls:?}"
+        );
+        for expected in [
+            "owners.release_server_death(reservation);",
+            "owners.release_queue_advance(cpu);",
+            "let restart_token = owners.mint_restart_token();",
+        ] {
+            assert!(
+                calls.iter().any(|line| line.contains(expected)),
+                "missing expected window call `{expected}` in {calls:?}"
+            );
+        }
+        // The two releases are on the `clear_current_exact` REFUSAL path, which never opened a
+        // window at all — the compare-and-clear mutated nothing. So the open window's only call is
+        // the mint.
+        let refusal = window
+            .split("return Err(refuse(ExitRefusal::VictimChanged));")
+            .next()
+            .expect("the pre-mutation refusal arm");
+        assert!(
+            refusal.contains("owners.release_server_death(reservation);")
+                && refusal.contains("owners.release_queue_advance(cpu);"),
+            "both releases must sit on the arm where NOTHING was cleared"
+        );
+        // Neither window owner enqueues, wakes or dispatches.
+        for forbidden in [
+            "enqueue_woken",
+            "wake_joiners",
+            "report_exit_to_supervisor",
+            "report_exit_to_pm",
+            "settle_orphaned_sender",
+            "publish_server_death",
+        ] {
+            assert!(
+                !window.contains(forbidden),
+                "the post-clear window must not reach `{forbidden}`: a wake is the one thing that \
+                 could move the victim while it is current nowhere and queued nowhere"
+            );
+        }
+    }
+
+    /// **A claim refusal requires the victim's TCB to have changed since the preflight**, and the
+    /// preflight already established every fact the claim re-checks.
+    ///
+    /// So `settle_failed_claim` is entered only if some writer ran between steps (3) and (8) — which
+    /// the window guard above, together with the interrupt-masking guards below, shows cannot
+    /// happen. This is what makes the retained `fatal` a settlement for an impossible state.
+    #[test]
+    fn a_claim_refusal_requires_a_tcb_write_the_window_forbids() {
+        let preflight = EXIT_CLAIM
+            .split("pub(crate) fn exit_preflight_locked(")
+            .nth(1)
+            .expect("the preflight");
+        let preflight = &preflight[..preflight.find("\n}").expect("its end")];
+        let claim = EXIT_CLAIM
+            .split("pub(crate) fn claim_self_exit_locked(")
+            .nth(1)
+            .expect("the claim");
+        let claim = &claim[..claim
+            .find("apply_self_exit_writes_locked(tcb, code, token);")
+            .expect("the claim's write")];
+        // The claim's four refusals, each matched by a fact the preflight already read.
+        for (refusal, preflight_fact) in [
+            (
+                ".ok_or(ExitRefusal::TaskGone)?",
+                ".ok_or(ExitRefusal::TaskGone)?",
+            ),
+            (
+                "return Err(ExitRefusal::IdentityChanged);",
+                "asid: tcb.asid,",
+            ),
+            (
+                "return Err(ExitRefusal::DetachedThread);",
+                "detached: tcb.detach_state == ThreadDetachState::Detached,",
+            ),
+            (
+                "return Err(ExitRefusal::NotRunning);",
+                "status: tcb.status,",
+            ),
+        ] {
+            assert!(
+                claim.contains(refusal),
+                "the claim must refuse with `{refusal}`"
+            );
+            assert!(
+                preflight.contains(preflight_fact),
+                "and the preflight must already have read the fact it refuses on: \
+                 `{preflight_fact}`"
+            );
+        }
+        // Nothing between the preflight and the claim writes a TCB. Steps (4)-(7) are a read-only
+        // link probe, two per-CPU cells, the rank-1 current slot, and the restart counter.
+        let txn = EXIT_TXN
+            .split("let preflight = owners.exit_preflight(tid).map_err(refuse)?;")
+            .nth(1)
+            .expect("after the preflight");
+        let txn = &txn[..txn
+            .find("let claim = match owners.claim_self_exit(")
+            .expect("up to the claim")];
+        for owner_call in code_lines(txn).filter(|line| line.contains("owners.")) {
+            assert!(
+                [
+                    "has_robust_futex_list",
+                    "server_reply_link_present",
+                    "server_death_capacity_available",
+                    "reserve_queue_advance",
+                    "release_queue_advance",
+                    "reserve_server_death",
+                    "release_server_death",
+                    "note_server_death_reservation",
+                    "clear_current_exact",
+                    "mint_restart_token",
+                ]
+                .iter()
+                .any(|allowed| owner_call.contains(allowed)),
+                "an owner between the preflight and the claim could write the victim's TCB: \
+                 {owner_call}"
+            );
+        }
+    }
+
+    /// **`restart_task` is the one status writer that both takes a caller's TID and accepts ANY
+    /// previous status** — it writes `Runnable` without consulting `task_transition`. Its single
+    /// production caller is a kernel-IPC handler, which requires a running sender; there is no such
+    /// sender while this CPU is inside the window.
+    #[test]
+    fn the_restart_writer_is_driven_only_by_a_kernel_ipc_handler() {
+        assert_eq!(
+            RESTART_STATE
+                .matches("pub fn restart_task(&mut self, tid: u64, token: u64)")
+                .count(),
+            1,
+            "one restart owner"
+        );
+        let mut callers = 0usize;
+        for (name, src) in status_writing_files() {
+            if name == "restart_state.rs" {
+                continue;
+            }
+            callers += code_lines(src)
+                .filter(|line| line.contains(".restart_task("))
+                .count();
+        }
+        assert_eq!(
+            callers, 1,
+            "restart_task must have exactly one production caller outside its own module"
+        );
+        let caller = IPC_STATE
+            .split("fn handle_restart_control_kernel_ipc")
+            .nth(1)
+            .expect("the kernel-IPC restart handler");
+        assert!(
+            caller[..caller.find("\n    fn ").unwrap_or(caller.len())].contains(".restart_task("),
+            "and that caller is the PROC_OP_EXECUTE_RESTART kernel-IPC handler, which needs a \
+             running sender — impossible while this CPU is mid-transaction"
+        );
+    }
+
+    // ── the window is not preemptible ───────────────────────────────────────────────────────
+
+    /// **x86_64 masks `RFLAGS.IF` on every `syscall`.** `IA32_FMASK` is programmed with exactly the
+    /// IF bit, on the BSP and on every AP that will service a ring-3 `syscall`, so a userspace NR 16
+    /// enters with interrupts already off and nothing on the trap path turns them back on.
+    #[test]
+    fn the_x86_syscall_window_runs_with_interrupts_masked() {
+        assert!(
+            X86_DESCRIPTORS.contains("const RFLAGS_IF_MASK: u64 = 1 << 9;"),
+            "the mask must be the interrupt-enable flag itself"
+        );
+        assert!(
+            X86_DESCRIPTORS.contains("write_msr(IA32_FMASK_MSR, RFLAGS_IF_MASK);"),
+            "and every syscall-capable CPU must program it"
+        );
+        for (name, src) in [("trap_entry.rs", TRAP_ENTRY)] {
+            for line in code_lines(src) {
+                assert!(
+                    !line.contains("\"sti\""),
+                    "{name} re-enables interrupts on the shared trap path: {line}"
+                );
+            }
+        }
+    }
+
+    /// **AArch64 enters EL1 with `DAIF` masked and the trap path never unmasks.** The architecture
+    /// masks on synchronous exception entry; the guard is that no `daifclr` appears in either the
+    /// AArch64 trap handler or the shared trap bridge.
+    #[test]
+    fn the_aarch64_trap_window_runs_with_interrupts_masked() {
+        for (name, src) in [
+            ("aarch64/trap.rs", AARCH64_TRAP),
+            ("trap_entry.rs", TRAP_ENTRY),
+        ] {
+            for line in code_lines(src) {
+                assert!(
+                    !line.contains("daifclr"),
+                    "{name} unmasks IRQs on the trap path: {line}"
+                );
+            }
+        }
+    }
+
+    /// **RISC-V enters S-mode with `sstatus.SIE` clear and re-enables it at exactly one program
+    /// point** — the audited terminal-idle boundary, which is not on the NR 16 path.
+    #[test]
+    fn the_riscv_trap_window_runs_with_interrupts_masked() {
+        // The file's own `mod tests` quotes the call in its assertions, so the census is taken
+        // over the production half only.
+        let production = RISCV_TIMER
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the production half of the timer module");
+        assert_eq!(
+            code_lines(production)
+                .filter(|line| line.contains("set_sstatus_sie();"))
+                .count(),
+            1,
+            "exactly one program point may set sstatus.SIE"
+        );
+        let boundary = RISCV_TIMER
+            .split("pub fn reestablish_idle_boundary() {")
+            .nth(1)
+            .expect("the idle boundary");
+        assert!(
+            boundary[..boundary.find("\n}").expect("its end")].contains("set_sstatus_sie();"),
+            "and it is the idle boundary, not the trap path"
+        );
+        for line in code_lines(RISCV_TRAP) {
+            assert!(
+                !line.contains("set_sstatus_sie"),
+                "the RISC-V trap handler must not unmask S-mode interrupts: {line}"
+            );
+        }
+    }
+
+    // ── the settlement table itself ─────────────────────────────────────────────────────────
+
+    /// **Every post-clear state has exactly one settlement, and `fatal` is reached only when both
+    /// of the other two have REFUSED.**
+    ///
+    /// U9-EXIT3 reached `fatal` through a caller's own `victim_is_drain_honourable` predicate, so
+    /// "the fatal is only for an impossible state" depended on that predicate matching the drain's.
+    /// U9-EXIT4 moved the admission inside `publish_queue_advance`, so the fatal is now reachable
+    /// only from that settlement's own `Err` arm — the two predicates cannot drift apart because
+    /// there is only one.
+    #[test]
+    fn the_fatal_is_reached_only_through_two_refused_settlements() {
+        let settle = EXIT_TXN
+            .split("fn settle_failed_claim<O: ExitOwners>(")
+            .nth(1)
+            .expect("the settlement");
+        let settle = &settle[..settle
+            .find("pub(crate) fn run_exit_transaction")
+            .expect("its end")];
+        assert_eq!(
+            settle.matches("token.fatal(").count(),
+            1,
+            "one divergence in the settlement"
+        );
+        let before_fatal = settle
+            .split("token.fatal(")
+            .next()
+            .expect("everything before the divergence");
+        assert!(
+            before_fatal.contains("token.restore_current_exact(owners)"),
+            "the restore must have been tried"
+        );
+        assert!(
+            before_fatal.contains(
+                "token.publish_queue_advance(owners, AdvanceAuthority::VictimNonResumable)"
+            ),
+            "and the advance must have been tried"
+        );
+        // The fatal sits inside the LAST refusal arm — the advance's — so it cannot be reached
+        // while the advance would have succeeded. The restore's own refusal arm hands the token on
+        // instead of diverging, which is what gives the advance its chance to run at all.
+        assert_eq!(
+            settle.matches("Err((token, why)) => {").count(),
+            2,
+            "exactly two refusal arms: the restore's and the advance's"
+        );
+        let advance_err = settle
+            .rsplit("Err((token, why)) => {")
+            .next()
+            .expect("the advance's refusal arm");
+        assert!(
+            advance_err.contains("CLEARED_CURRENT_ADVANCE_REFUSED")
+                && advance_err.contains("token.fatal("),
+            "the divergence must sit in the advance's refusal arm"
+        );
+        let restore_err = settle
+            .split("Err((token, why)) => {")
+            .nth(1)
+            .expect("the restore's refusal arm");
+        let restore_err = &restore_err[..restore_err
+            .find("Err((token, why)) => {")
+            .unwrap_or(restore_err.len())];
+        assert!(
+            restore_err.contains("CLEARED_CURRENT_RESTORE_REFUSED")
+                && !restore_err.contains("token.fatal(")
+                && restore_err.contains("            token\n"),
+            "a refused restore must hand the token to the advance, never diverge on its own"
+        );
+        // And the caller-side predicate U9-EXIT3 used is gone from the settlement entirely.
+        assert!(
+            !settle.contains("owners.victim_is_drain_honourable("),
+            "the drain's admission belongs to the settlement, not to this caller — a second copy \
+             is exactly how the two predicates would drift"
+        );
+        assert_eq!(
+            CLEARED_CURRENT
+                .matches("owners.victim_is_drain_honourable(tid, asid)")
+                .count(),
+            2,
+            "the token asks it twice: once to name a restore refusal, once to admit an advance"
+        );
+    }
+
+    /// U9-EXIT4 §3 — **no settlement can run, and no `Drop` can fire, while a domain lock is
+    /// held.**
+    ///
+    /// The token's `Drop` and its `fatal` both `panic!`. A panic taken under a `SpinLockIrq` guard
+    /// would leave that domain locked for the rest of the boot, turning a diagnosable divergence
+    /// into a silent hang — so "the bomb is never armed under a lock" is part of what makes the
+    /// bomb usable at all.
+    ///
+    /// Two facts give it. The transaction takes no lock itself: every acquisition lives inside an
+    /// owner method, which takes exactly one rank and releases it before returning. And neither the
+    /// transaction body nor the token's own module contains an acquisition, so there is no guard
+    /// alive at any point where a token is constructed, moved, settled or dropped.
+    #[test]
+    fn a_settlement_never_runs_under_a_held_lock() {
+        // (1) The transaction body takes no lock. It is sliced from the `run_exit_transaction`
+        // signature to the start of the owner impls, which legitimately do take one each.
+        let txn = EXIT_TXN
+            .split("pub(crate) fn run_exit_transaction<O: ExitOwners>(")
+            .nth(1)
+            .expect("the transaction");
+        let txn = &txn[..txn
+            .find("// ═══")
+            .expect("the banner that separates the transaction from its owners")];
+        let settle = EXIT_TXN
+            .split("fn settle_failed_claim<O: ExitOwners>(")
+            .nth(1)
+            .expect("the settlement");
+        let settle = &settle[..settle
+            .find("pub(crate) fn run_exit_transaction")
+            .expect("its end")];
+        for (what, body) in [
+            ("run_exit_transaction", txn),
+            ("settle_failed_claim", settle),
+        ] {
+            for line in code_lines(body) {
+                assert!(
+                    !line.contains(".with_"),
+                    "{what} acquires a lock in the transaction body; a settlement or a Drop \
+                     taken under it would panic with the domain still locked: {line}"
+                );
+            }
+        }
+        // (2) Nor does the token's own module — it decides, and the owners acquire.
+        for line in code_lines(CLEARED_CURRENT) {
+            assert!(
+                !line.contains(".with_") && !line.contains(".lock()"),
+                "the token module must hold no guard when it panics: {line}"
+            );
+        }
+        // (3) Each owner method is ONE acquisition that returns its answer, so no guard survives
+        // the call. The two that the post-clear settlements use are checked by name.
+        for owner in [
+            "fn victim_is_running_exact(&mut self, tid: u64, asid: Option<Asid>) -> bool {",
+            "fn victim_is_drain_honourable(&mut self, tid: u64, asid: Option<Asid>) -> bool {",
+        ] {
+            let body = EXIT_TXN.split(owner).nth(1).expect(owner);
+            let body = &body[..body.find("\n    fn ").unwrap_or(body.len())];
+            assert!(
+                !body.contains("token") && !body.contains("Settlement"),
+                "an owner must answer and return, never settle a token while it holds a guard: \
+                 {owner}"
+            );
+        }
+    }
+
+    /// U9-EXIT4 §3 — **a `Complete` disposition after the clear requires a completed restoration,
+    /// and an advance is never answered with one.**
+    ///
+    /// `Complete(..)` is delivered by the trap bridge as `frame.set_err(..); finalize(..); return
+    /// Ok(())` — it RESUMES the entering task. `ExitDisposition` is the type that decides, and only
+    /// `PostClearRestored` — produced by the one arm that put the victim back in `current` — may map
+    /// to it. `PostClearAdvance` must map to `QueueAdvanceCommitted`, which returns through no frame
+    /// at all.
+    #[test]
+    fn an_advance_disposition_never_resumes_the_entering_frame() {
+        let route = SPLIT
+            .split("fn try_split_exit_current_task(")
+            .nth(1)
+            .expect("the route");
+        let route = &route[..route.find("\n}").expect("its end")];
+        for (disposition, answer, forbidden) in [
+            (
+                "ExitDisposition::PostClearRestored => {",
+                "D::Complete(Err(",
+                "D::QueueAdvanceCommitted",
+            ),
+            (
+                "ExitDisposition::PostClearAdvance => {",
+                "D::QueueAdvanceCommitted",
+                "D::Complete(",
+            ),
+        ] {
+            let arm = route
+                .split(disposition)
+                .nth(1)
+                .unwrap_or_else(|| panic!("the route must map {disposition}"));
+            // One arm, sliced at the next arm's label or at the end of the match.
+            let arm = &arm[..arm.find("ExitDisposition::").unwrap_or(arm.len())];
+            assert!(
+                arm.contains(answer),
+                "{disposition} must answer {answer}, got: {arm}"
+            );
+            assert!(
+                !arm.contains(forbidden),
+                "{disposition} must NOT be able to answer {forbidden}: {arm}"
+            );
+        }
+        // And the ONLY producer of `PostClearRestored` is the completed restore.
+        let settle = EXIT_TXN
+            .split("fn settle_failed_claim<O: ExitOwners>(")
+            .nth(1)
+            .expect("the settlement");
+        let restored = settle
+            .split("Ok(ClearedCurrentSettlement::Restored) => {")
+            .nth(1)
+            .expect("the restored arm");
+        let restored = &restored[..restored.find("}\n        Ok(").unwrap_or(restored.len())];
+        assert!(
+            restored.contains("disposition: ExitDisposition::PostClearRestored,"),
+            "the restored disposition must be produced by the restore arm and nowhere else"
+        );
+        assert_eq!(
+            EXIT_TXN
+                .matches("disposition: ExitDisposition::PostClearRestored,")
+                .count(),
+            1,
+            "exactly one producer"
+        );
+    }
+
+    /// **A `Runnable`/requeued or `Faulted` victim can never be handed to the drain.** Both answer
+    /// `Contradicted`, and the advance settlement refuses that state by construction rather than by
+    /// the caller's diligence.
+    #[test]
+    fn the_drain_admits_exactly_terminal_and_removed() {
+        let verdict = EXIT_CLAIM
+            .split("pub(crate) fn exit_drain_verdict_locked(")
+            .nth(1)
+            .expect("the drain verdict");
+        let verdict = &verdict[..verdict.find("\n}").expect("its end")];
+        assert!(
+            verdict.contains(
+                "Some(tcb) if matches!(tcb.status, TaskStatus::Exited(_) | TaskStatus::Dead) => {"
+            ),
+            "terminal is Exited|Dead, and nothing else"
+        );
+        assert!(
+            verdict.contains("Some(_) => ExitDrainVerdict::Contradicted,")
+                && verdict.contains("None => ExitDrainVerdict::Removed,"),
+            "present-and-not-terminal contradicts; absent is removed"
+        );
+        // The admission the advance settlement uses is the SAME verdict, narrowed to the two the
+        // drain honours — so broadening one without the other is not possible.
+        assert!(
+            EXIT_TXN.contains("V::Terminal | V::Removed"),
+            "the owner must admit exactly Terminal and Removed"
+        );
     }
 }

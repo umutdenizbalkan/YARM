@@ -45,6 +45,30 @@
 //!    non-resumable, or this transaction's own claim made it terminal; the already-reserved
 //!    U9-QA deferral is published and the EXISTING drain selects and applies somebody else;
 //! 3. [`ClearedCurrentToken::fatal`] — neither could be proven. Diverges.
+//!
+//! # U9-EXIT4 §3 — what "linear" is made to mean here
+//!
+//! The type-level half (no `Clone`, no `Copy`, no public constructor, no field access, `#[must_use]`)
+//! was U9-EXIT3's. Three properties it did NOT have are added here, because a convention a caller
+//! must remember is not a property the token has:
+//!
+//! * **No `mem::forget` anywhere, including inside this module.** U9-EXIT3's private `consume`
+//!   defused the bomb with `core::mem::forget(self)`. That works, but it makes "this module contains
+//!   no abandonment primitive" unprovable by inspection — a reader cannot tell the sanctioned forget
+//!   from a smuggled one. The bomb is now *conditional* on a private `settled` flag instead, so the
+//!   crate contains no `mem::forget`, `ManuallyDrop` or `ptr::read` naming this type at all and a
+//!   guard can say so mechanically (§4, `the_token_is_never_abandoned_through_a_forget_primitive`).
+//!   A settled token's `Drop` is a no-op, so the three settlements may run it freely — including
+//!   [`ClearedCurrentToken::fatal`], whose `panic!` unwinds through `self` under a hosted test.
+//! * **The drain's admission is the token's, not the caller's.** U9-EXIT3 let
+//!   `publish_queue_advance` publish whatever it was handed and relied on `settle_failed_claim` to
+//!   have asked `victim_is_drain_honourable` first. So "cannot publish an advance the drain will
+//!   refuse" held only for the one call site that remembered. The check now lives INSIDE the
+//!   settlement, which returns the token on refusal — a caller that skips it does not get an
+//!   advance, it gets its obligation back. See [`AdvanceRefusal`].
+//! * **`fatal` names an impossible state, not a lost race.** With the admission moved inward, the
+//!   only way to reach `fatal` is for the victim to be simultaneously not-restorable and
+//!   not-drain-honourable, which U9-EXIT4 §1 proves no production writer can produce.
 
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::scheduler::TaskPriority;
@@ -87,6 +111,32 @@ impl RestoreRefusal {
     }
 }
 
+/// U9-EXIT4 §2/§3 — why an advance was refused **by the settlement itself**.
+///
+/// U9-EXIT3 had no such type: `publish_queue_advance` was infallible and the drain's admission was
+/// evaluated by the one caller that remembered to. Both refusals below are states in which
+/// publishing would hand the drain something it rejects, and a rejected drain leaves this CPU with
+/// an empty current slot and no selection — the exact failure the token exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdvanceRefusal {
+    /// The victim is neither terminal nor removed. `exit_reverify_ok` would answer `Contradicted`,
+    /// the drain would decline, and the trap would fall through to a frame whose task the scheduler
+    /// does not own. This is the `Runnable`/requeued and `Faulted` shape.
+    DrainWouldRefuse,
+    /// A deferral is already published on this CPU. A second one is a duplicate, and the cell
+    /// refuses rather than overwriting — so the advance this token owes was never taken.
+    AlreadyPublished,
+}
+
+impl AdvanceRefusal {
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::DrainWouldRefuse => "drain_would_refuse",
+            Self::AlreadyPublished => "already_published",
+        }
+    }
+}
+
 /// The acquisitions a post-clear settlement needs. Each method is ONE owner-local acquisition;
 /// none of them decides anything.
 pub(crate) trait ClearedCurrentOwners {
@@ -118,10 +168,20 @@ pub(crate) struct ClearedCurrentToken {
     tid: u64,
     asid: Option<Asid>,
     priority: TaskPriority,
+    /// U9-EXIT4 §3 — has one of the three settlements run? Private, never read outside this module,
+    /// and the ONLY thing that defuses [`Drop`]. It replaces U9-EXIT3's `core::mem::forget(self)`
+    /// so that no abandonment primitive appears anywhere in the crate for this type.
+    settled: bool,
 }
 
 impl Drop for ClearedCurrentToken {
     fn drop(&mut self) {
+        // U9-EXIT4 §3: a SETTLED token has already handed its obligation to a restore, an advance
+        // or a divergence, so running its destructor is a no-op. This is what lets the module hold
+        // no `mem::forget`: the bomb is conditional rather than defused by forgetting.
+        if self.settled {
+            return;
+        }
         // Reached only if a future edit adds a path that leaves the token unconsumed. There is no
         // safe continuation from here: the CPU's current slot is empty, the entering frame is live,
         // and nothing has decided which of the two it belongs to.
@@ -135,12 +195,20 @@ impl Drop for ClearedCurrentToken {
 }
 
 impl ClearedCurrentToken {
-    /// Consume without running `Drop`. Private: every public exit from the token goes through one
-    /// of the three settlements below.
-    fn consume(self) -> (CpuId, u64, Option<Asid>, TaskPriority) {
-        let parts = (self.cpu, self.tid, self.asid, self.priority);
-        core::mem::forget(self);
-        parts
+    /// Mark this token settled and hand back the identity it carried. Private: every public exit
+    /// from the token goes through one of the three settlements below.
+    ///
+    /// Takes `&mut self` rather than `self` deliberately — a by-value `consume` would need
+    /// `mem::forget` (or `ManuallyDrop`) to stop `Drop` running, and §3's whole point is that no
+    /// such primitive exists for this type. The `debug_assert` states the linearity the flag
+    /// enforces: a token settles exactly once, and no settlement calls another.
+    fn settle(&mut self) -> (CpuId, u64, Option<Asid>, TaskPriority) {
+        debug_assert!(
+            !self.settled,
+            "a cleared-current token settles exactly once"
+        );
+        self.settled = true;
+        (self.cpu, self.tid, self.asid, self.priority)
     }
 
     /// **Settlement 1** — restore the exact incarnation as this CPU's current.
@@ -156,7 +224,7 @@ impl ClearedCurrentToken {
     /// On refusal the token is returned so the caller must still settle it — a failed restore is
     /// not a settlement.
     pub(crate) fn restore_current_exact<O: ClearedCurrentOwners>(
-        self,
+        mut self,
         owners: &mut O,
     ) -> Result<ClearedCurrentSettlement, (Self, RestoreRefusal)> {
         let (cpu, tid, asid, priority) = (self.cpu, self.tid, self.asid, self.priority);
@@ -182,21 +250,41 @@ impl ClearedCurrentToken {
             tid,
             asid.unwrap_or(Asid(0)).0
         );
-        let _ = self.consume();
+        let _ = self.settle();
         Ok(ClearedCurrentSettlement::Restored)
     }
 
     /// **Settlement 2** — hand the CPU to the existing queue-advance drain.
     ///
     /// `authority` is what makes this legal, and it is unforgeable in both forms: either this
-    /// transaction's own [`ExitClaim`] made the victim terminal, or a competing owner did and the
-    /// drain will honour the result. The already-reserved U9-QA deferral is used, never a second
-    /// one, and this is the only place the exit cell is named for a post-clear settlement.
+    /// transaction's own [`ExitClaim`] made the victim terminal, or a competing owner did. The
+    /// already-reserved U9-QA deferral is used, never a second one, and this is the only place the
+    /// exit cell is named for a post-clear settlement.
+    ///
+    /// # U9-EXIT4 §2 — the drain's admission is checked HERE
+    ///
+    /// U9-EXIT3 published unconditionally and left `victim_is_drain_honourable` to the caller, so
+    /// "cannot publish an advance the drain will refuse" was true of one call site rather than of
+    /// the token. Both gates now run inside the settlement, in the order that matters:
+    ///
+    /// 1. the victim must be exactly what `exit_reverify_ok` honours — terminal or removed. A
+    ///    `Runnable`/requeued or `Faulted` victim answers `Contradicted`, the drain declines, and
+    ///    the trap falls through to a frame the scheduler does not own;
+    /// 2. the per-CPU cell must actually accept the publication. It refuses a duplicate rather than
+    ///    overwriting, and a refused publication means the advance this token owes did not happen.
+    ///
+    /// Either refusal hands the token BACK, so a caller that would have skipped the check does not
+    /// get an advance — it gets its obligation returned and must still settle it. `AdvanceAuthority`
+    /// therefore states *who* licensed the advance; it never substitutes for *whether* the drain
+    /// will take it, including on the `Claimed` path, where the claim's own `Exited(code)` write is
+    /// what makes gate (1) pass.
+    ///
+    /// Both gates are read-only up to the publication, so a refusal mutates nothing.
     pub(crate) fn publish_queue_advance<O: ClearedCurrentOwners>(
-        self,
+        mut self,
         owners: &mut O,
         authority: AdvanceAuthority<'_>,
-    ) -> ClearedCurrentSettlement {
+    ) -> Result<ClearedCurrentSettlement, (Self, AdvanceRefusal)> {
         let (cpu, tid, asid) = (self.cpu, self.tid, self.asid);
         // The authority is not decoration: a claim may only license an advance past the exact
         // incarnation it claimed. Reading it here is what makes `Claimed` unable to stand in for
@@ -205,17 +293,21 @@ impl ClearedCurrentToken {
             debug_assert_eq!(claim.tid(), tid, "a claim licenses only its own victim");
             debug_assert_eq!(claim.asid(), asid, "and only its own incarnation");
         }
-        let published = owners.publish_advance_for(cpu, tid, asid);
+        if !owners.victim_is_drain_honourable(tid, asid) {
+            return Err((self, AdvanceRefusal::DrainWouldRefuse));
+        }
+        if !owners.publish_advance_for(cpu, tid, asid) {
+            return Err((self, AdvanceRefusal::AlreadyPublished));
+        }
         crate::yarm_log!(
-            "CLEARED_CURRENT_ADVANCE cpu={} tid={} asid={} authority={} published={} result=ok",
+            "CLEARED_CURRENT_ADVANCE cpu={} tid={} asid={} authority={} published=1 result=ok",
             cpu.0,
             tid,
             asid.unwrap_or(Asid(0)).0,
-            authority.marker(),
-            u8::from(published)
+            authority.marker()
         );
-        let _ = self.consume();
-        ClearedCurrentSettlement::AdvanceCommitted
+        let _ = self.settle();
+        Ok(ClearedCurrentSettlement::AdvanceCommitted)
     }
 
     /// **Settlement 3** — neither restoration nor a safe advance can be proven.
@@ -224,8 +316,21 @@ impl ClearedCurrentToken {
     /// empty current slot and no selection. Halting with a diagnosable marker is the only correct
     /// disposition, which is the same conclusion `dispatch_torn_fatal` reached for the same class
     /// of disagreement. Never returns.
-    pub(crate) fn fatal(self, reason: &'static str) -> ! {
-        let (cpu, tid, asid, _) = self.consume();
+    ///
+    /// # U9-EXIT4 §2 — what reaching this means
+    ///
+    /// The victim is simultaneously not restorable (absent, not `Running`, or placed on some CPU)
+    /// and not drain-honourable (present and NOT terminal). U9-EXIT4 §1 enumerates every production
+    /// writer of the exiting `{tid, asid}` and shows none can produce that combination inside the
+    /// post-clear window, so this is a settlement for a source-proven-impossible state rather than
+    /// for a legitimate restart or fault race. §4's forced interleavings construct the state in the
+    /// hosted harness — where the window can be opened by injection — precisely so that the
+    /// divergence is exercised without ever being production-reachable.
+    ///
+    /// `self` is settled before the panic, so unwinding through it under a hosted `should_panic`
+    /// test runs a no-op destructor rather than a second, misleading `TOKEN_DROPPED` marker.
+    pub(crate) fn fatal(mut self, reason: &'static str) -> ! {
+        let (cpu, tid, asid, _) = self.settle();
         crate::yarm_log!(
             "CLEARED_CURRENT_FATAL cpu={} tid={} asid={} reason={}",
             cpu.0,
@@ -278,5 +383,8 @@ pub(crate) fn clear_current_exact(
         tid,
         asid,
         priority,
+        // U9-EXIT4 §3: a freshly minted token is an unsettled obligation. Nothing outside this
+        // module can construct one, and nothing anywhere can set this field except `settle`.
+        settled: false,
     })
 }
