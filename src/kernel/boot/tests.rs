@@ -62963,6 +62963,9 @@ mod stage192a_queue_advancing_dispatch {
             .register_task_with_class(next, TaskClass::App)
             .expect("reg-next");
         state.enqueue_on_cpu(CpuId(0), next).expect("enq-next");
+        // U9-DISPATCH-CPU1 D1: the selection now admits only a task the mark will take, so an
+        // ordinarily dispatchable fixture must carry an incarnation — as production does.
+        super::give_task_an_incarnation(&mut state, next);
         // Publish Blocked(Futex) + clear current (mirrors the in-lock futex block).
         state.with_tcbs_mut(|tcbs| {
             for tcb in tcbs.iter_mut().flatten() {
@@ -63275,13 +63278,27 @@ mod stage192b_yield_queue_advancing_dispatch {
         );
         // U3 (203C): same retirement as the FutexWait drain — the restore is the shared
         // exact-token transaction, the rest of the chain is unchanged.
+        // U9-DISPATCH-CPU1 §2: the chain is unchanged in what it does and moved in where it is
+        // written. Selection + mark are now ONE owner, `queue_advance_acquire_incoming_split`,
+        // which the drain drives with its own class step so the delivered dequeue vocabulary is
+        // preserved. The guard follows them to that owner rather than requiring the mark to be
+        // inlined in every drain — which is what let four different outcomes collapse into
+        // `incoming=idle` at nine sites.
+        const RUNTIME_SRC_LOCAL: &str = include_str!("../../runtime.rs");
         assert!(
             TRAP_SRC.contains("yield_was_deferred")
                 && TRAP_SRC.contains("shared.yield_reverify_ready(cpu)")
-                && TRAP_SRC.contains("shared.yield_dispatch_step_mut(trap_path.authority())")
-                && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
+                && TRAP_SRC.contains("|k, a| k.yield_dispatch_step_mut(a)")
+                && TRAP_SRC.contains("queue_advance_acquire_incoming_split(")
                 && TRAP_SRC.contains("x86_post_lock_resume_marked_incoming("),
-            "the trap-entry yield drain must reverify + dispatch-step + mark-running + restore"
+            "the trap-entry yield drain must reverify + acquire (through its own class step) + \
+             restore"
+        );
+        assert!(
+            RUNTIME_SRC_LOCAL.contains("fn queue_advance_acquire_incoming_split(")
+                && RUNTIME_SRC_LOCAL
+                    .contains("self.d6_genuine_mark_running_via_task_seam(dispatch)"),
+            "and the acquire owner is where the mark now lives — exactly once, for every drain"
         );
     }
 
@@ -63347,6 +63364,7 @@ mod stage192b_yield_queue_advancing_dispatch {
             .register_task_with_class(other, TaskClass::App)
             .expect("reg-other");
         state.enqueue_on_cpu(CpuId(0), other).expect("enq-other");
+        super::give_task_an_incarnation(&mut state, other);
         // Caller is Runnable (yield sets it so before the preempt).
         state.with_tcbs_mut(|tcbs| {
             for tcb in tcbs.iter_mut().flatten() {
@@ -63419,6 +63437,7 @@ mod stage192b_yield_queue_advancing_dispatch {
                 }
             }
         });
+        super::give_task_an_incarnation(&mut state, solo);
         assert_eq!(state.preempt_reenqueue_current_cpu(), Some(solo));
         let shared = SharedKernel::new(state);
         assert_eq!(
@@ -63540,14 +63559,21 @@ mod stage192b_yield_queue_advancing_dispatch {
     /// no second dispatch, no duplicate re-enqueue.
     #[test]
     fn u3_yield_defensive_idle_path_is_unchanged() {
+        // U9-DISPATCH-CPU1 §2: this branch is no longer "defensive idle" and no longer claims
+        // `incoming=idle` — that claim was false for three of the four outcomes that reached it.
+        // It is the SETTLEMENT, and it names which outcome brought it here. What this guard
+        // protects is unchanged and still exactly right: the settlement restores no frame, runs no
+        // second dispatch and re-enqueues nothing.
         let src = u3_code_only(TRAP_SRC);
         let idle = src
-            .split("YIELD_DISPATCH_DONE result=ok cpu={} incoming=idle")
+            .split(
+                "\"YIELD_DISPATCH_SETTLED cpu={} incoming=none reason={} settlement=terminal_idle",
+            )
             .nth(1)
-            .expect("the defensive idle branch")
+            .expect("the settlement branch")
             .split("YIELD_DISPATCH_DEFERRED reason=state_changed")
             .next()
-            .expect("bounded by the state-changed branch");
+            .unwrap_or("");
         assert!(
             !idle.contains("x86_post_lock_resume_marked_incoming(")
                 && !idle.contains("post_switch_restore_arch_thread_state")
@@ -63562,7 +63588,7 @@ mod stage192b_yield_queue_advancing_dispatch {
         );
         assert!(
             idle.contains("maybe_log_yield_retired"),
-            "the defensive idle branch keeps its retirement marker"
+            "the settlement keeps its retirement marker"
         );
         let changed = src
             .split("YIELD_DISPATCH_DEFERRED reason=state_changed")
@@ -63580,29 +63606,38 @@ mod stage192b_yield_queue_advancing_dispatch {
     /// All five WA3A mark outcomes stay explicit, and `RefusedTorn` stays fatal.
     #[test]
     fn u3_yield_mark_outcomes_remain_explicit() {
-        let src = u3_code_only(TRAP_SRC);
-        let arms = src
-            .split("shared.yield_dispatch_step_mut(trap_path.authority())")
+        // U9-DISPATCH-CPU1 §2: all five outcomes are still matched explicitly — in the ONE
+        // owner that now performs the mark, instead of being re-matched at every drain. That is
+        // the point of the move: nine copies of a five-way match is how four outcomes came to
+        // share one settlement.
+        const RUNTIME_SRC_LOCAL: &str = include_str!("../../runtime.rs");
+        let owner = RUNTIME_SRC_LOCAL
+            .split("fn queue_advance_acquire_incoming_split(")
             .nth(1)
-            .expect("the yield mark site")
-            .split("YIELD_DISPATCH_CURRENT_SET_OK")
+            .expect("the acquire owner")
+            .split("\n    /// ")
             .next()
-            .expect("bounded by the switch-success region");
+            .expect("bounded by the next item");
         for arm in [
-            "Mark::Marked(token)",
-            "Mark::Idle",
-            "Mark::RefusedRolledBack",
-            "Mark::RefusedNoSchedulerChange",
-            "Mark::RefusedTorn",
+            "DispatchMarkOutcome::Marked(token)",
+            "DispatchMarkOutcome::Idle",
+            "DispatchMarkOutcome::RefusedRolledBack",
+            "DispatchMarkOutcome::RefusedNoSchedulerChange",
+            "DispatchMarkOutcome::RefusedTorn",
         ] {
             assert!(
-                arms.contains(arm),
-                "the yield drain must match {arm} explicitly"
+                owner.contains(arm),
+                "the acquire owner must match {arm} explicitly"
             );
         }
+        // And every drain still routes the torn outcome to the divergent fatal itself, because
+        // that is the one outcome an owner may not settle on a caller's behalf.
+        let src = u3_code_only(TRAP_SRC);
         assert!(
-            arms.contains("dispatch_torn_fatal("),
-            "RefusedTorn remains fatal"
+            src.contains("DispatchAcquire::Torn { tid } = acquired")
+                && src
+                    .contains("dispatch_torn_fatal(cpu, tid, \"yield_queue_advancing_dispatch\")"),
+            "RefusedTorn remains fatal at the drain"
         );
     }
 }
@@ -121634,10 +121669,34 @@ mod stage199d_wa3a_transition_barriers {
         });
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
         // Commit the rank-1 dequeue exactly as a drain does, then mark.
-        let dispatch = kernel.futex_wait_dispatch_step_mut(
+        // U9-DISPATCH-CPU1 D1 — the selection owner no longer dequeues a task it knows the mark
+        // will refuse: a blocked entry is SKIPPED IN PLACE, which is strictly stronger than
+        // dequeuing it and undoing that.
+        let selection_refused = kernel.futex_wait_dispatch_step_mut(
             crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
         );
-        assert_eq!(dispatch.tid().map(|t| t.0), Some(BLOCKED));
+        assert_eq!(
+            selection_refused,
+            crate::runtime::CpuDispatch::NoneAcceptable { examined: 1 },
+            "the blocked entry is examined and skipped, never dequeued"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "so it is still queued, in place"
+        );
+        // The rollback itself still has to work: it covers the residual window where a candidate
+        // is accepted and then stops being markable. Drive it by handing the seam the dispatch
+        // that window would produce.
+        let dispatch = crate::runtime::CpuDispatch::Selected {
+            cpu: CpuId(0),
+            selection: crate::kernel::scheduler::DispatchSelection::Dequeued {
+                tid: crate::kernel::ipc::ThreadId(BLOCKED),
+            },
+        };
+        kernel.with(|s| {
+            let _ = s.dispatch_next_on_cpu(CpuId(0));
+        });
         assert_eq!(
             kernel.d6_genuine_mark_running_via_task_seam(dispatch),
             crate::runtime::DispatchMarkOutcome::RefusedRolledBack,
@@ -121811,18 +121870,23 @@ mod stage199d_wa3a_transition_barriers {
             );
         });
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
-        let dispatch = kernel.futex_wait_dispatch_step_mut(
-            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
-        );
+        // U9-DISPATCH-CPU1 D1: the selection skips it in place; the rollback is proven on the
+        // residual accepted-then-unmarkable window instead.
         assert_eq!(
-            dispatch,
-            crate::runtime::CpuDispatch::Selected {
-                cpu: CpuId(0),
-                selection: crate::kernel::scheduler::DispatchSelection::Dequeued {
-                    tid: crate::kernel::ipc::ThreadId(BLOCKED)
-                }
-            }
+            kernel.futex_wait_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(
+                CpuId(0)
+            )),
+            crate::runtime::CpuDispatch::NoneAcceptable { examined: 1 }
         );
+        kernel.with(|s| {
+            let _ = s.dispatch_next_on_cpu(CpuId(0));
+        });
+        let dispatch = crate::runtime::CpuDispatch::Selected {
+            cpu: CpuId(0),
+            selection: crate::kernel::scheduler::DispatchSelection::Dequeued {
+                tid: crate::kernel::ipc::ThreadId(BLOCKED),
+            },
+        };
         assert_eq!(
             kernel.d6_genuine_mark_running_via_task_seam(dispatch),
             crate::runtime::DispatchMarkOutcome::RefusedRolledBack
@@ -122027,18 +122091,24 @@ mod stage199d_wa3a_transition_barriers {
         );
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
 
-        let dispatch = kernel.futex_wait_dispatch_step_mut(
-            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
-        );
+        // U9-DISPATCH-CPU1 D1: an ASID-less entry has no supported exact identity, so the
+        // selection never dequeues it — there is nothing to restore, which is why this is the
+        // stronger guarantee.
         assert_eq!(
-            dispatch,
-            crate::runtime::CpuDispatch::Selected {
-                cpu: CpuId(0),
-                selection: crate::kernel::scheduler::DispatchSelection::Dequeued {
-                    tid: ThreadId(OTHER)
-                }
-            }
+            kernel.futex_wait_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(
+                CpuId(0)
+            )),
+            crate::runtime::CpuDispatch::NoneAcceptable { examined: 1 }
         );
+        kernel.with(|s| {
+            let _ = s.dispatch_next_on_cpu(CpuId(0));
+        });
+        let dispatch = crate::runtime::CpuDispatch::Selected {
+            cpu: CpuId(0),
+            selection: crate::kernel::scheduler::DispatchSelection::Dequeued {
+                tid: ThreadId(OTHER),
+            },
+        };
         let outcome = kernel.d6_genuine_mark_running_via_task_seam(dispatch);
         assert_eq!(
             outcome,
@@ -164602,6 +164672,23 @@ mod u9yield2_family_edge {
 /// scheduler state afterwards, because the three defects this stage repaired were all invisible to
 /// a source-shape check: a membership rule that permitted duplicate placement, an authority that
 /// outlived its trap, and a priority scan that could never reach `Normal`.
+/// U9-DISPATCH-CPU1 D1 — give a registered task a real incarnation.
+///
+/// `register_task` leaves `asid: None`, which was harmless while the selection dequeued the head
+/// unconditionally and discovered the missing incarnation at the MARK. The selection now filters by
+/// acceptance, so a task with no incarnation is never dequeued at all — which is the improvement,
+/// and which means a fixture that wants an ordinarily dispatchable task has to say so. Production
+/// already does: `spawn_thread_core` sets `tcb.asid = parent.asid` and `status = Runnable` BEFORE
+/// the enqueue, so no real task is ever queued without one.
+#[cfg(any(test, feature = "hosted-dev"))]
+pub(crate) fn give_task_an_incarnation(state: &mut crate::kernel::boot::KernelState, tid: u64) {
+    state.with_tcbs_mut(|tcbs| {
+        if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+            tcb.asid = Some(crate::kernel::vm::Asid((tid & 0xffff) as u16));
+        }
+    });
+}
+
 mod u9dispatchcpu1_contracts {
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::scheduler::{
