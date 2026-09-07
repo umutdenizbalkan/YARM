@@ -75264,10 +75264,14 @@ mod stage196b_riscv_debuglog_split {
                 && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR"),
             "the wrapper must gate split dispatch on NR 15 + NR 10"
         );
-        // No queue-advancing / blocking class NR appears as a split gate in the wrapper, EXCEPT
-        // FutexWait, which U9-QA §2 admits as the one switching class (it settles through the
-        // existing Stage 196E drain rather than early-returning).
-        for other in ["SYSCALL_YIELD_NR", "SYSCALL_INITRAMFS_READ_CHUNK_NR"] {
+        // The switching classes the wrapper admits, each with its own drain: FutexWait (U9-QA §2,
+        // Stage 196E drain), ExitCurrentTask (U9-EXIT1 §5) and Yield (U9-RESIDUAL1 §3, Stage 196G
+        // drain). A retired syscall must still never appear.
+        assert!(
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_YIELD_NR"),
+            "the wrapper admits Yield (NR 0) as of U9-RESIDUAL1 §3"
+        );
+        for other in ["SYSCALL_INITRAMFS_READ_CHUNK_NR"] {
             assert!(
                 !RISCV_TRAP_SRC.contains(other),
                 "wrapper must not gate split dispatch on {other}"
@@ -76802,29 +76806,32 @@ mod stage197_first_cohort_seal {
         );
     }
 
-    // DebugLog + FutexWake use the pre-lock split path; FutexWait + Yield are NOT in the pre-lock
-    // NR gate (they retire via in-lock publish + post-lock drain).
+    // DebugLog + FutexWake are the NON-SWITCHING pre-lock members; FutexWait, ExitCurrentTask and
+    // Yield are the SWITCHING ones, which settle through a post-lock drain instead of
+    // early-returning.
     #[test]
     fn prelock_split_membership() {
-        // The RISC-V wrapper's pre-lock gate is DebugLog + FutexWake only.
-        // U9-QA §2: DebugLog + FutexWake remain the NON-SWITCHING members; FutexWait is admitted
-        // as the one SWITCHING member, which settles through the drains instead of early-returning.
-        // Yield is still excluded — it has no pre-lock route.
+        // U9-QA §2 admitted FutexWait as the first switching member; U9-EXIT1 §5 added
+        // ExitCurrentTask; U9-RESIDUAL1 §3 added Yield, once it had a pre-lock route and the
+        // Stage 196G drain to settle through — which is the condition this guard held it to, not a
+        // bar on the class.
         assert!(
             RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
                 && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR")
                 && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR")
-                && !RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_YIELD_NR"),
-            "the pre-lock split gate is DebugLog + FutexWake + FutexWait"
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_YIELD_NR"),
+            "the pre-lock split gate is DebugLog + FutexWake + FutexWait + Yield"
         );
-        // FutexWait publishes Blocked; Yield re-enqueues Runnable.
+        // FutexWait publishes Blocked; Yield re-enqueues Runnable — now through the one yield
+        // policy, whose broad adapter reaches the same preempt seam `yield_current` always used.
         assert!(
             EXEC_STATE_SRC
                 .contains("TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"),
             "FutexWait must publish Blocked(Futex)"
         );
+        const YIELD_TXN_SRC: &str = include_str!("../syscall/yield_txn.rs");
         assert!(
-            EXEC_STATE_SRC.contains("preempt_reenqueue_current_cpu()"),
+            YIELD_TXN_SRC.contains("self.kernel.preempt_reenqueue_current_cpu()"),
             "Yield must re-enqueue Runnable via the preempt seam"
         );
     }
@@ -114479,6 +114486,7 @@ mod stage199d_riscv_canonical_admission {
             // it advances no sepc and writes no a0, because the task it belonged to is gone — and
             // its queue advance is the existing deferral plus the existing drain.
             "SYSCALL_EXIT_CURRENT_TASK_NR",
+            "SYSCALL_YIELD_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -114490,12 +114498,12 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            12,
-            "exactly twelve literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            13,
+            "exactly thirteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
-             SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask and \
-             (U9-EXIT1 §5) ExitCurrentTask"
+             SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask, \
+             (U9-EXIT1 §5) ExitCurrentTask and (U9-RESIDUAL1 §3) Yield"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -163892,12 +163900,43 @@ mod u9residual1_yield_family {
         );
     }
 
-    /// **NR 0's ingress is architecture-specific, and the route accounts for it.**
+    /// **NR 0's ingress is architecture-specific — in three different ways — and the route
+    /// accounts for all of them.**
+    ///
+    /// Each architecture decides independently whether a syscall number even REACHES the shared
+    /// seam, and the three mechanisms are not alike:
+    ///
+    /// * **x86_64** — no gate. The decoded number is in the frame and the seam sees every syscall.
+    /// * **AArch64** — `pre_split_import_syscall_abi` is a whitelist; an unlisted number leaves the
+    ///   frame reading `nr = 0`, which is Yield's own number, so listing is necessary but NOT
+    ///   sufficient and the route must read the raw `x8`.
+    /// * **RISC-V** — `split_eligible` in its own trap bridge is a second, independent whitelist.
+    ///   The ABI is always imported here, so the frame is honest; what is gated is whether the seam
+    ///   is called at all.
+    ///
+    /// Missing the RISC-V gate is not a theoretical risk: three qualifying boots showed the route
+    /// committing 0 yields AND refusing 0 — it was never reached — while the oracle still passed,
+    /// because the unchanged in-lock path served every yield exactly as before. A route that is
+    /// silently unreachable on one architecture looks identical to one that is working.
     #[test]
     fn the_route_reads_the_raw_trapped_number_on_aarch64() {
+        const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
         assert!(
             TRAP_ENTRY.contains("|| raw_nr == crate::kernel::syscall::SYSCALL_YIELD_NR"),
             "NR 0 must be on the AArch64 import allowlist, or its ABI never reaches the frame"
+        );
+        // RISC-V's own whitelist, which decides whether the shared seam runs at all.
+        let eligible = RISCV_TRAP
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .expect("the RISC-V split-eligibility gate")
+            .split("|| is_ipc_direct);")
+            .next()
+            .expect("its end");
+        assert!(
+            eligible.contains("nr == crate::kernel::syscall::SYSCALL_YIELD_NR"),
+            "NR 0 must be on the RISC-V split-eligibility whitelist, or the shared seam is never \
+             called for it and the route is silently unreachable on that architecture"
         );
         let helper = SPLIT
             .split("fn trapped_syscall_nr(frame: &TrapFrame) -> usize {")
