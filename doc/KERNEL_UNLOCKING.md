@@ -14644,3 +14644,83 @@ genuinely have no pre-lock route; the EXIT2 reservation guard's slice is bounded
 and the WA2B status-writer census moves `yield_current`'s row to the two halves of the transition —
 45 → 46 raw sites, CANNOT 18 → 19 — the same shape U9-REAP1 §2 produced when it moved the reap's
 write into its claim and added the claim's inverse.
+
+### §5 — live, gates, and what the numbers do and do not say
+
+Nine exit-oracle boots (three per architecture), the workload §2 selected because it is the one that
+witnesses NR 0 on every architecture.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+| `YIELD_SPLIT_COMMITTED` | 4096 / 4096 / 4096 | 4096 / 4096 / 4096 | 64 / 64 / 64 |
+| `YIELD_SPLIT_REFUSED` | 0 | 0 | 0 |
+| in-lock fallback (`*_YIELD_*_FALLBACK`) | 0 | 0 | 0 |
+| `EXIT_TASK_BROAD_ENTER` | 0 | 0 | 0 |
+| `terminal_broad_dispatcher_entries` | 0 | 0 | 0 |
+
+**The family-edge reduction.** Every NR 0 that reached the seam was served off the broad lock, on
+all three architectures, with zero refusals across nine boots. Before this stage every NR 0 entered
+a terminal broad acquisition to decide whether to defer; now none does.
+
+**What that does NOT say.** The route's decline path is a fallback into the broad handler, by
+design and before any consumption. So the honest statement is *no refusal occurred in nine
+qualifying boots*, not *no refusal can occur*. `ArchGateOff` and the three `RouteNotAdmitted`
+reasons remain reachable in configurations these workloads do not produce — a second dispatching
+CPU under `yarm.ap_user_dispatch`, or the RISC-V colliding-deferral case — and each of those falls
+back to the unchanged in-lock path, which is exactly what the pre-mutation property is for.
+
+**The RISC-V gap between 64 and 77.** `RISCV_YIELD_DISPATCH_DONE` counts 77 drain completions
+against 64 split-committed yields. The 13-yield difference is the four kernel-internal
+`yield_current` callers — `scheduler_state::apply_cross_cpu_work`, the `memory_state` TLB-shootdown
+wait, `task_core_state` and `fault_state` — which are already inside the broad lock when they call
+it and were never part of NR 0's family edge. They are not a residue of this work.
+
+| gate | result |
+|---|---|
+| hosted suite (`--test-threads=1`) | 5366 passed / 0 failed / 2 ignored (base `34e4748`: 5343) |
+| freestanding x86_64 / AArch64 / RISC-V | built ×3 |
+| `cargo clippy --lib --features hosted-dev` | 371 warnings, **identical class set** to base `34e4748` (base total 372) |
+| `rustfmt --edition 2024 --check` on all 14 changed files | clean |
+| contract/doc enforcement | `[ok] contract-doc enforcement gate passed` |
+| core smoke | x86_64 ok, AArch64 ok, RISC-V ok |
+| Fork/COW (`VM_COW=1`) | ok |
+| fault delivery (`FAULT_DELIVERY=1`) | ok |
+| x86_64 server-death | `result=ok` |
+| REAP1 supervisor crash-restart | `fault_observed=1 supervisor_notified=1 restart_observed=1 stale_reply_objects=0 result=ok` |
+| broad-lock census | `with_cpu / with_broad / TOTAL = 2 / 0 / 2`, **unchanged** |
+| artifact residue | `git status --short` = 0, untracked = 0 |
+
+**CENSUS-DELTA: 0. Family-edge reduction: NR 0, complete on all three architectures.** Reported
+separately because they are different claims. Both terminal acquisitions still stand and still serve
+the eight NRs §2's matrix lists as having no split route; this stage removed one family's edge, not
+an acquisition. **U9 remains OPEN.**
+
+#### Three defects this stage found, two of them in its own work
+
+Recorded because each was invisible in pass/fail, and the mission's instruction not to infer closure
+from markers cuts both ways — a green run with the wrong marker counts is not a qualified run.
+
+1. **The route was silently unreachable on RISC-V.** Three boots passed with
+   `YIELD_SPLIT_COMMITTED = 0` **and** `YIELD_SPLIT_REFUSED = 0`. RISC-V has a third, independent
+   ingress whitelist (`split_eligible`); the shared seam was simply never called for NR 0, and the
+   unchanged in-lock path served every yield exactly as before. A silently unreachable route looks
+   identical to a working one.
+2. **Admitting NR 0 there then broke the boot** — three yields, then no progress. The RISC-V
+   bridge's outgoing-context capture reads the FutexWait and D2-recv deferrals; this route publishes
+   the Yield deferral. That bridge calls no finalizer and pre-advances `sepc`, so the capture is the
+   **only** thing carrying the advanced pc into the TCB: nothing captured meant the caller re-entered
+   at its own `ecall` and yielded forever. The shared bridge survives the identical omission because
+   `finalize_split_handled_syscall` commits the advanced PC separately — which is why x86_64 and
+   AArch64 were green over 24 576 yields while RISC-V was not. Fixed on RISC-V only; the shared
+   bridge's Yield path is proven live and was left alone.
+3. **The idle twin's rollback invented a corruption.** `PreemptOutgoingIdle` is
+   `Runnable → Runnable` and writes nothing, but the rollback applied `RollbackPreemptOutgoing`
+   unconditionally — a legal transition for a `Runnable` idle task, so the undo *succeeded* and left
+   a never-`Running` idle task marked `Running`, on the one path that exists to make sure nothing is
+   left half-done. Found by §4's own coverage; fixed by making the inverse know what it inverts.
+
+A fourth, smaller one: collapsing three per-architecture blocks into one policy accidentally gave
+`NoCurrent` a fallback marker the delivered code never emitted (each block sat inside `if let
+Some(out_tid)`), adding ~35 lines a boot on RISC-V that read like failures. Restored to silent, so
+the delivered vocabulary's volume is preserved as well as its strings.
