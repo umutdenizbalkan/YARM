@@ -10,17 +10,25 @@
 //! unit-tested under `hosted-dev`; the bare-metal driver in [`super::smp`] applies
 //! exactly this logic.
 //!
-//! # Stage 189B scope — scaffold / inert
+//! # Scope — scaffold in 189B, live behind a knob since 189C6
 //!
-//! No AP user task is scheduled in this pass. The audited transition
-//! [`ApReadiness::evaluate_clear`] REFUSES unless all four readiness conditions
-//! hold, and `trap_return_ready` is deliberately **false** in 189B because the
-//! live AP user trap-return path (`arch::x86_64::trap::ensure_user_return_cr3`
-//! still resolves a global active-ASID and a BSP-tuned return-context stack) is
-//! not yet proven per-CPU. The boot audit therefore emits the readiness markers
-//! plus an honest `X86_AP_USER_DISPATCH_DEFERRED` and never clears a wake-only
-//! bit. Stage 189C flips `trap_return_ready` once the live return path is proven,
-//! and only then does the audited transition clear wake-only.
+//! The audited transition [`ApReadiness::evaluate_clear`] REFUSES unless all four readiness
+//! conditions hold. In Stage 189B `trap_return_ready` was deliberately **false**, because the
+//! live AP user trap-return path (`arch::x86_64::trap::ensure_user_return_cr3` still resolved a
+//! global active-ASID and a BSP-tuned return-context stack) was not yet proven per-CPU, so the
+//! boot audit emitted readiness markers plus an honest `X86_AP_USER_DISPATCH_DEFERRED` and never
+//! cleared a wake-only bit.
+//!
+//! **U9-RESIDUAL1 §1 — that is no longer the state of the code.** Stage 189C6 wired the live
+//! dispatcher and bound `trap_return_ready` to `ap_usermode_entry_ready(cpu)`, whose last
+//! conjunct is `ap_ring3_entry_path_ready()` = `kernel::boot::ap_user_dispatch_enabled()` — the
+//! default-off but real `yarm.ap_user_dispatch` boot knob. With the knob set, the transition
+//! clears wake-only and a second CPU dispatches user tasks.
+//!
+//! The distinction matters beyond this module: "no AP can dispatch" is a **default**, not an
+//! invariant, and no other subsystem may treat it as one. Consumers that need at most one
+//! dispatching CPU must check it themselves, before mutating — as
+//! `SharedKernel::exit_route_admitted_split` does.
 //!
 //! # Invariants
 //!

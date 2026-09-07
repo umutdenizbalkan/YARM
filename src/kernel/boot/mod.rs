@@ -1163,6 +1163,37 @@ pub(crate) fn futex_wait_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
 //     corpse's registers. The cell is what tells the capture site to skip.
 //
 // Per-CPU, single-shot, and generation-bearing by construction (`{tid, asid}`, never a bare TID).
+/// U9-RESIDUAL1 §1/§3 — which condition of the split terminal-route admission refused.
+///
+/// The admission itself is `SharedKernel::split_terminal_route_admission`. The reason is typed at
+/// its source because two callers need to tell the cases apart in a live log — NR 0's delivered
+/// vocabulary already distinguished `no_trap_drainer` from `multi_cpu` — and a refusal that cannot
+/// be told apart in a log cannot be diagnosed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalAdmissionRefusal {
+    /// The CPU id is at or beyond `MAX_CPUS`. Refused before the per-CPU drainer array is indexed.
+    CpuOutOfRange,
+    /// No post-lock drainer is active on this CPU, so a published deferral would never be consumed.
+    NoTrapDrainer,
+    /// More than one CPU dispatches. Wake-only APs do not count; a second REAL dispatcher does.
+    MultiDispatcher,
+    /// This CPU is not the scheduler's bound dispatcher, so the drain would run somewhere else.
+    NotDispatchCpu,
+}
+
+impl TerminalAdmissionRefusal {
+    /// The live vocabulary. `no_trap_drainer` and `multi_cpu` are the exact strings the delivered
+    /// in-lock Yield fallback logged, so a log reader sees no change.
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::CpuOutOfRange => "cpu_out_of_range",
+            Self::NoTrapDrainer => "no_trap_drainer",
+            Self::MultiDispatcher => "multi_cpu",
+            Self::NotDispatchCpu => "not_dispatch_cpu",
+        }
+    }
+}
+
 /// The exact incarnation a CPU's exit deferral names. Never a bare TID: the ASID is what makes a
 /// replacement task at the same numeric TID resolve to nothing.
 pub(crate) type ExitingIncarnation = (u64, Option<Asid>);

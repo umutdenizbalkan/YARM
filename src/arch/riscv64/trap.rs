@@ -818,6 +818,23 @@ pub fn handle_riscv_trap_entry_shared(
             // a0, because the task it belonged to is gone. Its queue advance is the existing
             // deferral + drain, exactly as FutexWait's is.
             || nr == crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR
+            // U9-RESIDUAL1 §3: Yield (NR 0). Same reason as every class above — the route is
+            // architecture-neutral but reachable here only for a listed NR, and without this line
+            // NR 0 would keep its terminal broad edge on this architecture no matter what the route
+            // admits. Its absence was measured, not assumed: three qualifying RISC-V boots showed
+            // `YIELD_SPLIT_COMMITTED = 0` AND `YIELD_SPLIT_REFUSED = 0` — the route was not
+            // declining, it was never being reached.
+            //
+            // It is SWITCHING, like NR 16 and NR 9: it finalizes the caller's own frame (a0 = 0
+            // from `set_ok`, with `sepc` already pre-advanced by this bridge) and then hands the
+            // CPU to the post-lock Yield drain, which performs the authoritative queue-advancing
+            // dispatch, the SATP activation and the incoming frame restore. That drain
+            // (`RISCV_YIELD_DISPATCH_*`, Stage 196G) has been live and default-on here since it
+            // landed, so what the class needs from this architecture it demonstrably has.
+            //
+            // Unlike NR 16, the caller IS resumed later, so its frame must be finalized — which is
+            // the same requirement FutexWait has, and it is met the same way.
+            || nr == crate::kernel::syscall::SYSCALL_YIELD_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -884,8 +901,25 @@ pub fn handle_riscv_trap_entry_shared(
             disposition,
             crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted
         ) {
+            //
+            // U9-RESIDUAL1 §3: the Yield deferral joins the chain, and it had to. This bridge does
+            // NOT call `finalize_split_handled_syscall` — RISC-V pre-advances `sepc` before this
+            // point, so THIS CAPTURE is the only thing that carries the advanced pc into the
+            // outgoing task's TCB. With NR 0 published on a deferral no accessor here read,
+            // `outgoing` was `None`, `captured=0`, and the yielding caller's saved context still
+            // named its own `ecall`; the drain's exact-token resume then re-entered at that `ecall`
+            // and the task yielded again, forever. Live: three yields and the boot made no further
+            // progress.
+            //
+            // That is the third time this exact chain has been the defect — FutexWait alone missed
+            // the blocking receive (199G-B §2) and the blocking send (199D-DW2) the same way — and
+            // it is why the shared x86_64/AArch64 bridge survives the same omission while this one
+            // does not: there `finalize_split_handled_syscall` commits the advanced PC separately,
+            // so the capture is the register file only. That bridge is deliberately left unchanged;
+            // its Yield path is proven live over 4096 yields per boot on both architectures.
             let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
-                .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx));
+                .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx))
+                .or_else(|| crate::kernel::boot::yield_dispatch_outgoing(cpu_idx));
             // U9-EXIT1 §3: never save the exiting frame. This capture exists so a task that will
             // be RESUMED restarts at the right pc; an exiting task is never resumed, so capturing
             // would at best be pointless and at worst record a corpse's registers into a TCB a

@@ -2728,6 +2728,22 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // to the dead task". FutexWait needs it because its blocked caller will be resumed; an
         // exiting task never is.
         || raw_nr == crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR
+        // U9-RESIDUAL1 §3: Yield (NR 0). Listed for the same reason as the classes above — the
+        // route is architecture-neutral but reachable here only for a listed NR. It takes NO
+        // arguments, so the import carries everything it needs by construction.
+        //
+        // NR 0 is the ONE class for which listing is not sufficient, and the reason is this
+        // function's own design: an unlisted syscall keeps `nr = 0` in the frame, and 0 IS Yield's
+        // number. So `frame.syscall_num() == 0` cannot distinguish "this trap is Yield" from "this
+        // trap was never imported" — on AArch64 it is true for BOTH, and a route gated on it alone
+        // would fire for every unlisted syscall on this architecture. Every other split class is
+        // safe from this only by the accident of having a non-zero number.
+        //
+        // The split Yield route therefore reads the raw `x8` this function peeks, through
+        // `syscall_split::trapped_syscall_nr`, rather than the frame's decoded number. Listing NR 0
+        // here is still required: it is what puts the decoded ABI in the frame so the committed
+        // syscall result lands in the right lane, exactly as it does for FutexWait.
+        || raw_nr == crate::kernel::syscall::SYSCALL_YIELD_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

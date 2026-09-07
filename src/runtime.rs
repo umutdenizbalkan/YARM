@@ -1129,14 +1129,82 @@ impl SharedKernel {
     /// candidate; asking them here, before anything is reserved, is what keeps every exit refusal
     /// free.
     pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {
+        self.split_terminal_route_admitted(cpu)
+    }
+    /// U9-RESIDUAL1 §3 — count one yield, rank 3.
+    ///
+    /// The broad `yield_current` increments `scheduler_yield_calls` on entry, before it knows
+    /// whether it will defer, because it counts the in-lock yields too. The split route never
+    /// reaches that increment, so it owes the count for exactly the yields it commits — and a
+    /// declined split is counted by the broad path that then runs. One increment per NR 0 either
+    /// way; the counter's meaning is unchanged.
+    pub(crate) fn count_yield_split_mut(&self) {
+        self.with_ipc_split_mut(|ipc| {
+            ipc.telemetry.scheduler_yield_calls =
+                ipc.telemetry.scheduler_yield_calls.saturating_add(1);
+        });
+    }
+
+    /// U9-RESIDUAL1 §1/§3 — **THE** topology admission for a split route that publishes a
+    /// queue-advance deferral, and the only place its three conditions are decided.
+    ///
+    /// It was `exit_route_admitted_split`'s body until U9-RESIDUAL1 §3 gave NR 0 a split route with
+    /// the same requirement. Extracting it rather than copying it is the point: a second copy is
+    /// how one route would come to admit a topology another refuses, and the whole meaning of "at
+    /// most one dispatcher" would then depend on which route asked.
+    ///
+    /// The three conditions, in the order that makes each refusal cheaper than the next:
+    ///
+    /// 1. **the CPU is in range** — checked before the per-CPU drainer array is indexed;
+    /// 2. **an active post-lock drainer on this CPU** — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]`.
+    ///    Without one the deferral this route is about to publish would never be consumed, and the
+    ///    CPU would return to userspace with its queue advanced and nothing selected;
+    /// 3. **at most one dispatching CPU, and it is this one** — `(online & !wake_only)` counts
+    ///    dispatchers, so wake-only APs are excluded by construction: they are online for wake and
+    ///    accounting but run no dispatcher, and can neither originate a userspace syscall nor race
+    ///    a settlement. `sched.current_cpu` is the scheduler's bound dispatcher, and the drain that
+    ///    consumes the deferral runs there.
+    ///
+    /// Both scheduler facts come from **one** rank-1 acquisition, so the count and the bound CPU
+    /// cannot be torn against each other.
+    ///
+    /// # This is a check, not an assumption
+    ///
+    /// U9-EXIT2 §1 called the refusal mechanically impossible, citing a Stage-189B note claiming an
+    /// AP can never become a dispatching CPU. Stage 189C6 had already bound that site to the
+    /// default-off `yarm.ap_user_dispatch` knob, so a second dispatcher is producible in a
+    /// production build. The topology is a **default**, and this function is what makes relying on
+    /// it safe: it re-derives the fact from scheduler state on every trap, before any mutation.
+    ///
+    /// It is also stable for the window it admits: both bitmap writers (`bring_up_cpu`,
+    /// `mark_cpu_wake_only`) take `&mut KernelState` and every call site is on the boot
+    /// orchestrator's one-shot SMP bring-up, which runs before any userspace task exists.
+    ///
+    /// Purely a read — a refusal mutates nothing, which is what lets every caller treat it as free.
+    pub(crate) fn split_terminal_route_admitted(&self, cpu: CpuId) -> bool {
+        self.split_terminal_route_admission(cpu).is_ok()
+    }
+
+    /// The same admission, reporting **which** condition refused.
+    ///
+    /// A boolean was enough while the only caller mapped every refusal to one disposition. NR 0
+    /// distinguishes them in its live vocabulary — the delivered in-lock Yield logged
+    /// `no_trap_drainer` and `multi_cpu` as separate `YIELD_INLOCK_DISPATCH_FALLBACK` reasons — and
+    /// a refusal that cannot be told apart in a log cannot be diagnosed. So the reason is typed at
+    /// its source rather than reconstructed by each caller.
+    pub(crate) fn split_terminal_route_admission(
+        &self,
+        cpu: CpuId,
+    ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
+        use crate::kernel::boot::TerminalAdmissionRefusal as R;
         let cpu_idx = cpu.0 as usize;
         if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-            return false;
+            return Err(R::CpuOutOfRange);
         }
         if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
             .load(core::sync::atomic::Ordering::Relaxed)
         {
-            return false;
+            return Err(R::NoTrapDrainer);
         }
         let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
             let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
@@ -1146,7 +1214,13 @@ impl SharedKernel {
                 sched.current_cpu,
             )
         });
-        dispatching <= 1 && dispatch_cpu == cpu
+        if dispatching > 1 {
+            return Err(R::MultiDispatcher);
+        }
+        if dispatch_cpu != cpu {
+            return Err(R::NotDispatchCpu);
+        }
+        Ok(())
     }
 
     /// The authoritative dispatch CPU, rank 1. Used only to enqueue a woken joiner onto the run

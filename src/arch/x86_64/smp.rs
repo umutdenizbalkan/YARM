@@ -1955,8 +1955,31 @@ fn ap_usermode_entry_ready(cpu: CpuId) -> bool {
 /// Stage 189B: the AUDITED, sole authority for clearing an AP's wake-only bit for
 /// dispatch. Refuses unless every readiness condition holds; on success it clears
 /// wake-only and emits `X86_AP_WAKE_ONLY_CLEAR`. No other code path may clear an
-/// AP's wake-only bit for dispatch. In Stage 189B `readiness.trap_return_ready`
-/// is always false, so this function always refuses and never clears wake-only.
+/// AP's wake-only bit for dispatch.
+///
+/// # U9-RESIDUAL1 §1 — this is REACHABLE, and the old note said otherwise
+///
+/// The Stage-189B note here read "`readiness.trap_return_ready` is always false, so this
+/// function always refuses and never clears wake-only". That has not been true since Stage
+/// 189C6 wired the live dispatcher. The only caller,
+/// [`run_ap_dispatch_scaffold_audit`], now passes `trap_return_ready: ap_usermode_entry_ready(cpu)`,
+/// and `ap_usermode_entry_ready` ends in `ap_ring3_entry_path_ready()` — which is exactly
+/// `crate::kernel::boot::ap_user_dispatch_enabled()`, the **default-off but real**
+/// `yarm.ap_user_dispatch` boot knob. With that knob set, every readiness bit can hold, this
+/// function clears wake-only, and the AP becomes a second DISPATCHING CPU.
+///
+/// The stale note was load-bearing outside this file: U9-EXIT2 §1 and U9-EXIT4 §1 both cited it
+/// as proof that the dispatching-CPU count is 1 in every production configuration. It is not a
+/// topological fact and must not be used as one. What actually protects the split terminal
+/// routes is their own admission owner — `SharedKernel::exit_route_admitted_split`, which counts
+/// `online & !wake_only` and refuses, before any mutation, unless that count is at most one and
+/// names this CPU. Under `yarm.ap_user_dispatch=1` the count is two and the route simply never
+/// admits; it does not proceed on a stale assumption.
+///
+/// What IS still true, and is what the admitted window relies on: this site takes
+/// `&mut KernelState` (the broad lock) and is reached only from the boot orchestrator's
+/// one-shot SMP bring-up, before any userspace task runs. So the topology an admission reads
+/// cannot change underneath it. See `u9residual1_terminal_admission`.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub fn try_enable_ap_user_dispatch(
     kernel: &mut KernelState,
@@ -1973,8 +1996,13 @@ pub fn try_enable_ap_user_dispatch(
         );
         return Err(refusal);
     }
-    // All readiness bits hold: this is the ONLY site that clears wake-only for
-    // dispatch. (Unreachable in Stage 189B — trap_return_ready is never set.)
+    // All readiness bits hold: this is the ONLY site that clears wake-only for dispatch.
+    //
+    // U9-RESIDUAL1 §1: the note that used to sit here — "Unreachable in Stage 189B —
+    // trap_return_ready is never set" — is WRONG and has been since 189C6. `trap_return_ready`
+    // is `ap_usermode_entry_ready(cpu)`, whose last conjunct is the default-off `yarm.ap_user_dispatch`
+    // knob. Under that knob this line runs and a second CPU starts dispatching. Nothing downstream
+    // may assume otherwise; the split terminal routes protect themselves at their own admission.
     kernel
         .mark_cpu_wake_only(cpu, false)
         .map_err(|_| ap_dispatch::ClearRefusal::RunQueueNotReady)?;

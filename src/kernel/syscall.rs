@@ -333,7 +333,9 @@ mod sched;
 // owner the broad handlers use.
 pub(crate) mod spawn_image_txn;
 pub(crate) mod spawn_txn;
+// U9-RESIDUAL1 §3: THE cooperative-yield policy, over owners, with a broad and a split adapter.
 mod vm;
+pub(crate) mod yield_txn;
 
 // Stage 149: [S] shared helper re-exports so sibling modules and external
 // callers (runtime.rs) keep their existing use-paths unchanged.
