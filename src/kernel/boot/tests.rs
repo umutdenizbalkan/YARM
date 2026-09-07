@@ -160779,6 +160779,363 @@ mod u9exit1_self_exit_transaction {
         assert_eq!(h.exit_deferral[0], Some((1, Some(Asid(201)))));
     }
 
+    // ── U9-EXIT4 §4 — the forced interleavings ──────────────────────────────────────────────
+
+    /// One competing transition, applied at the exact post-clear instant.
+    ///
+    /// Each variant is a real production edge named by U9-EXIT4 §1. They are applied by hand rather
+    /// than through `Inject` because this table needs the window held OPEN across three
+    /// observations — after the clear, after the restore, after the advance — which the transaction
+    /// deliberately does not allow a caller to do.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Competitor {
+        /// Nothing raced. The victim is still `Running`, ours, and placed nowhere.
+        Nothing,
+        /// `restart_task` wrote `Runnable` and re-enqueued the victim on this CPU.
+        RestartRequeued,
+        /// The victim is still `Running` but somebody placed it in a run queue — the shape a
+        /// scheduler-level enqueue produces before any status write lands.
+        EnqueuedWhileStillRunning,
+        /// `restart_task` wrote `Runnable` but the enqueue has not happened yet.
+        RestartNotYetQueued,
+        /// `TaskTransition::FaultRunningCurrent` wrote `Faulted`.
+        TerminalFault,
+        /// A reap claimed it: `Dead`.
+        Reap,
+        /// A duplicate exit won: `Exited(9)`.
+        DuplicateExit,
+        /// The TCB is gone entirely — joined, or reaped through to removal.
+        Removal,
+        /// A replacement incarnation reused the numeric TID under a different ASID.
+        TidReuse,
+    }
+
+    impl Competitor {
+        fn apply(self, h: &mut Harness) {
+            let set = |h: &mut Harness, status: TaskStatus| {
+                h.tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("the victim")
+                    .status = status;
+            };
+            match self {
+                Self::Nothing => {}
+                Self::RestartRequeued => {
+                    set(h, TaskStatus::Runnable);
+                    h.sched
+                        .enqueue_on(CPU, ThreadId(1))
+                        .expect("the restart re-enqueues");
+                }
+                Self::RestartNotYetQueued => set(h, TaskStatus::Runnable),
+                Self::EnqueuedWhileStillRunning => {
+                    h.sched
+                        .enqueue_on(CPU, ThreadId(1))
+                        .expect("the placement lands first");
+                }
+                Self::TerminalFault => set(h, TaskStatus::Faulted),
+                Self::Reap => set(h, TaskStatus::Dead),
+                Self::DuplicateExit => set(h, TaskStatus::Exited(9)),
+                Self::Removal => {
+                    let slot = h
+                        .tcbs
+                        .iter_mut()
+                        .find(|slot| slot.as_ref().is_some_and(|t| t.tid.0 == 1))
+                        .expect("the victim's slot");
+                    *slot = None;
+                }
+                Self::TidReuse => {
+                    let t = h
+                        .tcbs
+                        .iter_mut()
+                        .flatten()
+                        .find(|t| t.tid.0 == 1)
+                        .expect("the victim");
+                    t.asid = Some(Asid(999));
+                    t.status = TaskStatus::Running;
+                }
+            }
+        }
+    }
+
+    /// **U9-EXIT4 §4 — every competing transition, forced at the post-clear instant, settles
+    /// exactly once and by identity.**
+    ///
+    /// The window is opened by hand and held open across three observations, so each row states
+    /// what BOTH settlements answer rather than only which one the transaction happened to take.
+    /// Every refusal is additionally proved to have mutated nothing at all — the whole `Harness`
+    /// snapshot, which carries each TCB's `{tid, asid, pid, status, restart token, detach state}`,
+    /// every CPU's current slot, and `tid_present_anywhere` per task — so a refusal is
+    /// observationally identical to never having been called.
+    #[test]
+    fn every_competing_transition_settles_the_cleared_slot_by_identity() {
+        // (competitor, restore answer, advance answer)
+        type Answer = Result<(), &'static str>;
+        const OK: Answer = Ok(());
+        let rows: [(Competitor, Answer, Answer); 9] = [
+            // Still ours and unplaced: the ONE state in which the entering frame may be resumed.
+            (Competitor::Nothing, OK, OK),
+            // A restart owns it now: `Runnable`, with or without the enqueue having landed. The
+            // restore refuses on status — it asks `victim_is_running_exact` FIRST, so placement
+            // never gets a say for a task that is no longer `Running` — and the advance refuses
+            // because the drain would answer `Contradicted`.
+            (
+                Competitor::RestartRequeued,
+                Err("not_running"),
+                Err("drain_would_refuse"),
+            ),
+            (
+                Competitor::RestartNotYetQueued,
+                Err("not_running"),
+                Err("drain_would_refuse"),
+            ),
+            // Placement alone is also disqualifying, even for a victim that IS still `Running` and
+            // ours: restoring it would make it simultaneously current here and queued there.
+            (
+                Competitor::EnqueuedWhileStillRunning,
+                Err("placed_elsewhere"),
+                Err("drain_would_refuse"),
+            ),
+            // A terminal fault is the same class: never resumable, never drain-honourable.
+            (
+                Competitor::TerminalFault,
+                Err("not_running"),
+                Err("drain_would_refuse"),
+            ),
+            // The three terminal/absent outcomes: not restorable, but exactly what the drain
+            // honours, so the advance settles them.
+            (Competitor::Reap, Err("incarnation_gone"), OK),
+            (Competitor::DuplicateExit, Err("incarnation_gone"), OK),
+            (Competitor::Removal, Err("incarnation_gone"), OK),
+            // A replacement at the same numeric TID resolves to nothing under the exact identity,
+            // so it is `Removed` for the advance and is never touched.
+            (Competitor::TidReuse, Err("incarnation_gone"), OK),
+        ];
+        for (competitor, want_restore, want_advance) in rows {
+            let mut h = three_task_world();
+            let token = crate::kernel::boot::cleared_current::clear_current_exact(
+                &mut h.sched,
+                CPU,
+                1,
+                Some(Asid(201)),
+            )
+            .unwrap_or_else(|| panic!("{competitor:?}: the exact clear must succeed"));
+            assert_eq!(
+                h.current_of(0),
+                None,
+                "{competitor:?}: the window must actually be open"
+            );
+            competitor.apply(&mut h);
+            let opened = h.snapshot();
+
+            // (1) the restore.
+            let token = match (token.restore_current_exact(&mut h), want_restore) {
+                (Ok(ClearedCurrentSettlement::Restored), Ok(())) => {
+                    assert_eq!(
+                        h.current_of(0),
+                        Some(1),
+                        "{competitor:?}: a restored victim is this CPU's current again"
+                    );
+                    assert_eq!(h.status_of(1), Some(TaskStatus::Running));
+                    continue;
+                }
+                (Err((token, why)), Err(marker)) => {
+                    assert_eq!(
+                        why.marker(),
+                        marker,
+                        "{competitor:?}: wrong restore refusal"
+                    );
+                    assert_eq!(
+                        h.snapshot(),
+                        opened,
+                        "{competitor:?}: a refused restore must mutate nothing"
+                    );
+                    token
+                }
+                (got, want) => {
+                    panic!("{competitor:?}: restore answered {got:?}, expected {want:?}")
+                }
+            };
+
+            // (2) the advance, on the SAME token.
+            let token = match (
+                token.publish_queue_advance(
+                    &mut h,
+                    crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+                ),
+                want_advance,
+            ) {
+                (Ok(ClearedCurrentSettlement::AdvanceCommitted), Ok(())) => {
+                    assert_eq!(
+                        h.exit_deferral[0],
+                        Some((1, Some(Asid(201)))),
+                        "{competitor:?}: the deferral names the CLEARED incarnation, never a \
+                         replacement"
+                    );
+                    assert_eq!(
+                        h.current_of(0),
+                        None,
+                        "{competitor:?}: an advanced CPU has no current until the drain selects"
+                    );
+                    assert_eq!(
+                        h.count("restore_current_exact"),
+                        0,
+                        "{competitor:?}: a non-resumable victim is never restored"
+                    );
+                    if competitor == Competitor::TidReuse {
+                        let replacement = h
+                            .tcbs
+                            .iter()
+                            .flatten()
+                            .find(|t| t.tid.0 == 1)
+                            .expect("the replacement is present");
+                        assert_eq!(replacement.asid, Some(Asid(999)));
+                        assert_eq!(
+                            replacement.status,
+                            TaskStatus::Running,
+                            "the replacement must be untouched by the old incarnation's exit"
+                        );
+                        assert!(
+                            !h.sched.tid_present_anywhere(ThreadId(1)),
+                            "and it must not be placed by this settlement either"
+                        );
+                    }
+                    continue;
+                }
+                (Err((token, why)), Err(marker)) => {
+                    assert_eq!(
+                        why.marker(),
+                        marker,
+                        "{competitor:?}: wrong advance refusal"
+                    );
+                    assert_eq!(
+                        h.exit_deferral[0], None,
+                        "{competitor:?}: a refused advance publishes nothing"
+                    );
+                    assert_eq!(
+                        h.snapshot(),
+                        opened,
+                        "{competitor:?}: and mutates nothing at all"
+                    );
+                    token
+                }
+                (got, want) => {
+                    panic!("{competitor:?}: advance answered {got:?}, expected {want:?}")
+                }
+            };
+
+            // (3) Both refused, so production would diverge here. The harness settles instead — by
+            // making the victim terminal, which is the ONLY thing that changes the answer. That is
+            // the property stated the other way round: the admission tracks the victim's state, not
+            // the caller's intent, and no amount of retrying moves it.
+            let placement = h.sched.tid_present_anywhere(ThreadId(1));
+            h.tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == 1)
+                .expect("the victim")
+                .status = TaskStatus::Exited(0);
+            assert_eq!(
+                token
+                    .publish_queue_advance(
+                        &mut h,
+                        crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+                    )
+                    .unwrap_or_else(|_| panic!("{competitor:?}: a terminal victim is honourable")),
+                ClearedCurrentSettlement::AdvanceCommitted
+            );
+            assert_eq!(
+                h.sched.tid_present_anywhere(ThreadId(1)),
+                placement,
+                "{competitor:?}: a settlement never disturbs the victim's legitimate placement"
+            );
+        }
+    }
+
+    /// **U9-EXIT4 §4, negative — EXIT3's fatal-on-legitimate-race shape is rejected.**
+    ///
+    /// The shape was: the CALLER asks its own drain-honourability predicate, then calls an
+    /// infallible `publish_queue_advance`, then diverges. Two defects follow from it and both are
+    /// guarded here. The caller's predicate could drift from the drain's, and then a fatal would be
+    /// taken on a race the drain would in fact have honoured — a legitimate race killed by a stale
+    /// second opinion. And a caller that simply forgot the predicate would publish an advance the
+    /// drain refuses, which is the failure the token exists to prevent.
+    #[test]
+    fn the_caller_side_drain_predicate_and_the_infallible_advance_are_rejected() {
+        // (1) The advance is fallible. A settlement that cannot refuse cannot be the place the
+        // admission lives.
+        assert!(
+            CLEARED_CURRENT
+                .contains("    ) -> Result<ClearedCurrentSettlement, (Self, AdvanceRefusal)> {"),
+            "publish_queue_advance must be able to refuse and hand the obligation back"
+        );
+        // (2) It asks the drain itself, before publishing, and returns the token on refusal.
+        let advance = CLEARED_CURRENT
+            .split("pub(crate) fn publish_queue_advance<O: ClearedCurrentOwners>(")
+            .nth(1)
+            .expect("the advance settlement");
+        let advance = &advance[..advance.find("\n    /// **Settlement 3**").expect("its end")];
+        let admission = advance
+            .find("if !owners.victim_is_drain_honourable(tid, asid) {")
+            .expect("the advance must consult the drain's own verdict");
+        let publish = advance
+            .find("if !owners.publish_advance_for(cpu, tid, asid) {")
+            .expect("and then publish");
+        assert!(
+            admission < publish,
+            "the admission must precede the publication, or a refused advance would already have \
+             been taken"
+        );
+        assert!(
+            advance.contains("return Err((self, AdvanceRefusal::DrainWouldRefuse));")
+                && advance.contains("return Err((self, AdvanceRefusal::AlreadyPublished));"),
+            "both refusals must hand the token back rather than settle it"
+        );
+        assert!(
+            advance[..admission].find("self.settle()").is_none(),
+            "nothing may be settled before the admission has passed"
+        );
+        // (3) No DECIDER keeps a second copy of the predicate next to its own divergence. The
+        // owner impls below the banner legitimately implement it — that is where the acquisition
+        // lives — so the census is over the transaction and the route, which decide.
+        let deciding = EXIT_TXN
+            .split("// ═══")
+            .next()
+            .expect("the transaction, above the owner impls");
+        for (name, src) in [("exit_txn.rs", deciding), ("syscall_split.rs", SPLIT)] {
+            for line in src.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("*") {
+                    continue;
+                }
+                assert!(
+                    !line.contains("victim_is_drain_honourable"),
+                    "{name} keeps a caller-side copy of the drain's admission: {line}"
+                );
+            }
+        }
+        // (4) And no caller treats the advance as infallible.
+        for (name, src) in [("exit_txn.rs", EXIT_TXN)] {
+            for (i, line) in src.lines().enumerate() {
+                if !line.contains("publish_queue_advance(") {
+                    continue;
+                }
+                let tail: alloc::string::String = src
+                    .lines()
+                    .skip(i)
+                    .take(16)
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join("\n");
+                assert!(
+                    tail.contains("Err((token, why))") || tail.contains("Err((token, _))"),
+                    "{name}: every advance call must handle the refusal that hands the token \
+                     back: {line}"
+                );
+            }
+        }
+    }
+
     /// The compare-and-clear is the whole repair for `VictimChanged`: it mutates NOTHING when the
     /// slot names somebody else, where U9-EXIT2's unconditional clear removed that task and left
     /// it current nowhere and queued nowhere.
