@@ -63237,16 +63237,32 @@ mod stage192b_yield_queue_advancing_dispatch {
     // dispatch; the in-lock on_preempt fallback is preserved.
     #[test]
     fn yield_defers_dispatch_and_trap_drain_exists() {
+        // U9-RESIDUAL1 §3: the re-enqueue and the deferral reservation are unchanged, but they
+        // are now owned by `run_yield_transaction` — ONE policy driven by both the broad adapter
+        // (`yield_current`, through `BroadYieldOwners`) and the split NR 0 route. This guard
+        // follows them to their owner rather than asserting they are still inlined here.
+        const YIELD_TXN_SRC: &str = include_str!("../syscall/yield_txn.rs");
         assert!(
-            EXEC_SRC.contains("self.preempt_reenqueue_current_cpu()")
-                && EXEC_SRC
-                    .contains("crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)"),
-            "yield_current must re-enqueue + defer the queue-advancing dispatch when eligible"
+            YIELD_TXN_SRC.contains("owners.reenqueue_and_clear_current(cpu)")
+                && YIELD_TXN_SRC.contains("owners.reserve_yield_deferral(cpu, outgoing)"),
+            "the yield transaction must re-enqueue + reserve the deferral"
         );
         assert!(
-            EXEC_SRC.contains("YIELD_INLOCK_DISPATCH_FALLBACK")
+            YIELD_TXN_SRC.contains("fn reenqueue_and_clear_current(&mut self, _cpu: CpuId) -> Option<u64> {\n        self.kernel.preempt_reenqueue_current_cpu()")
+                && YIELD_TXN_SRC.contains("crate::kernel::boot::yield_dispatch_try_defer(cpu.0 as usize, outgoing)"),
+            "and the BROAD adapter must reach the same two owners `yield_current` always used"
+        );
+        assert!(
+            EXEC_SRC.contains(
+                "crate::kernel::syscall::yield_txn::run_yield_transaction(&mut owners, cpu)"
+            ),
+            "yield_current must drive that transaction"
+        );
+        assert!(
+            YIELD_TXN_SRC.contains("YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}")
                 && EXEC_SRC.contains("let selection = self.on_preempt_current_cpu_selection();"),
-            "the in-lock on_preempt fallback must be preserved"
+            "the in-lock on_preempt fallback must be preserved, and its decline must still name \
+             itself in the x86_64 vocabulary"
         );
         // U3 (203C): same retirement as the FutexWait drain — the restore is the shared
         // exact-token transaction, the rest of the chain is unchanged.
@@ -63271,8 +63287,14 @@ mod stage192b_yield_queue_advancing_dispatch {
             "YIELD_DISPATCH_FRAME_OK",
             "YIELD_DISPATCH_DONE result=ok",
         ] {
+            // U9-RESIDUAL1 §3: the two publish-side markers moved to the ONE vocabulary owner
+            // (`yield_txn::log_yield_deferred`), byte for byte — the drain-side ones did not move.
+            const YIELD_TXN_MARKERS: &str = include_str!("../syscall/yield_txn.rs");
             assert!(
-                TRAP_SRC.contains(m) || EXEC_SRC.contains(m) || RUNTIME_SRC.contains(m),
+                TRAP_SRC.contains(m)
+                    || EXEC_SRC.contains(m)
+                    || RUNTIME_SRC.contains(m)
+                    || YIELD_TXN_MARKERS.contains(m),
                 "yield marker `{m}` must exist"
             );
         }
@@ -74544,19 +74566,35 @@ mod stage195g_aarch64_yield_dispatch {
             .map(|(_, r)| r.split_once("\n    pub ").map(|(b, _)| b).unwrap_or(r))
             .unwrap_or("");
         assert!(!body.is_empty(), "yield_current body must exist");
+        // U9-RESIDUAL1 §3: every fact this inventory pins is unchanged, but it now lives in the
+        // ONE yield policy `yield_current` drives (and the split NR 0 route drives too), rather
+        // than in an AArch64-specific block inlined here. Following it to its owner is the point of
+        // the extraction; asserting it is still inlined would be asserting the duplication.
+        const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+        assert!(
+            body.contains(
+                "crate::kernel::syscall::yield_txn::run_yield_transaction(&mut owners, cpu)"
+            ),
+            "yield_current must drive the one yield policy"
+        );
         for needle in [
+            // the topology admission, through the broad adapter
             "GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE",
-            "dispatching_cpu_count() <= 1",
+            "self.kernel.dispatching_cpu_count() > 1",
+            // the AArch64 half of the arch gate
             "BOOTSTRAP_CPU_ID",
-            "yield_dispatch_try_defer",
-            "preempt_reenqueue_current_cpu()",
-            "maybe_log_yield_default_on()",
-            "AARCH64_YIELD_DISPATCH_DEFER_BEGIN",
-            "AARCH64_YIELD_DISPATCH_REENQUEUE_OK",
+            // the two owners the deferral has always used
+            "crate::kernel::boot::yield_dispatch_try_defer(cpu.0 as usize, outgoing)",
+            "self.kernel.preempt_reenqueue_current_cpu()",
+            // and the AArch64 live vocabulary, byte for byte
+            "crate::kernel::boot::maybe_log_yield_default_on();",
+            "AARCH64_YIELD_DISPATCH_DEFER_BEGIN cpu={} tid={}",
+            "AARCH64_YIELD_DISPATCH_REENQUEUE_OK cpu={} tid={}",
+            "AARCH64_YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
         ] {
             assert!(
-                body.contains(needle),
-                "yield deferral must reference `{needle}`"
+                YIELD_TXN.contains(needle),
+                "the yield policy must reference `{needle}`"
             );
         }
         // Not gated on any enable knob (default-on) and keeps the legacy fallback.
@@ -76367,19 +76405,27 @@ mod stage196g_riscv_yield_default_on {
     // one-shot informational marker. It does NOT depend on the 196D foundation oracle latch.
     #[test]
     fn yield_default_on_no_oracle_dependency() {
-        let block = EXEC_STATE_SRC
-            .split("Stage 196G (RISC-V YIELD QUEUE-ADVANCING RETIREMENT")
+        // U9-RESIDUAL1 §3: the 196G conditions moved into the one yield policy, unchanged. The
+        // three "pending" checks are now `colliding_deferral_pending_for`, whose RISC-V arm names
+        // exactly the same three cells for exactly the same reason (one drain tail serves all
+        // three).
+        const YIELD_TXN_SRC: &str = include_str!("../syscall/yield_txn.rs");
+        let block = YIELD_TXN_SRC
+            .split("fn colliding_deferral_pending_for(cpu_idx: usize) -> bool {")
             .nth(1)
-            .expect("196G production Yield block present")
-            .split("let next_tid = self.on_preempt_current_cpu();")
+            .expect("the colliding-deferral owner")
+            .split("\n}")
             .next()
             .unwrap();
         assert!(
-            block.contains("&& !yield_pending")
-                && block.contains("&& !futex_pending")
-                && block.contains("&& !foundation_pending")
-                && block
-                    .contains("crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)"),
+            block.contains("crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx)")
+                && block.contains("crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx)")
+                && block.contains(
+                    "crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx)"
+                )
+                && YIELD_TXN_SRC.contains(
+                    "crate::kernel::boot::yield_dispatch_try_defer(cpu.0 as usize, outgoing)"
+                ),
             "the Yield publish must be structurally gated (no oracle) + exclude conflicting deferrals"
         );
         assert!(
@@ -76395,7 +76441,8 @@ mod stage196g_riscv_yield_default_on {
             "the DEFAULT_ON marker must be a one-shot latch"
         );
         assert!(
-            block.contains("maybe_log_riscv_yield_retire_default_on()"),
+            YIELD_TXN_SRC
+                .contains("crate::kernel::boot::maybe_log_riscv_yield_retire_default_on();"),
             "the Yield publish must log the DEFAULT_ON marker"
         );
     }
@@ -76421,16 +76468,35 @@ mod stage196g_riscv_yield_default_on {
     // accepted preempt seam; publish failure clears + falls back to legacy.
     #[test]
     fn reenqueue_publication_and_fallback() {
+        // U9-RESIDUAL1 §3: same seam, same markers, now owned by the one yield policy. The
+        // 196D foundation block still uses the in-lock `match self.preempt_reenqueue_current_cpu()`
+        // shape directly, which is why that string is still expected in exec_state.
+        const YIELD_TXN_SRC2: &str = include_str!("../syscall/yield_txn.rs");
         assert!(
-            EXEC_STATE_SRC.contains("match self.preempt_reenqueue_current_cpu() {")
-                && EXEC_STATE_SRC.contains("RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu={} outgoing={}")
-                && EXEC_STATE_SRC.contains("RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu={} outgoing={}"),
-            "the in-lock publish must re-enqueue via the accepted preempt seam"
+            EXEC_STATE_SRC.contains("match self.preempt_reenqueue_current_cpu() {"),
+            "the 196D foundation publish must keep the accepted preempt seam"
         );
         assert!(
-            EXEC_STATE_SRC.contains("RISCV_YIELD_DISPATCH_FALLBACK reason=reenqueue_failed")
-                && EXEC_STATE_SRC.contains("self.on_preempt_current_cpu_selection();"),
-            "a re-enqueue failure must clear + fall back to the legacy on_preempt path"
+            YIELD_TXN_SRC2.contains("self.kernel.preempt_reenqueue_current_cpu()")
+                && YIELD_TXN_SRC2.contains("RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu={} outgoing={}")
+                && YIELD_TXN_SRC2.contains("RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu={} outgoing={}"),
+            "the yield policy must re-enqueue via the accepted preempt seam and keep the RISC-V \
+             vocabulary"
+        );
+        // The re-enqueue failure now names itself through `YieldDecline::ReenqueueRefused`, whose
+        // legacy reason string is unchanged (`reenqueue_failed`) and whose rollback is EXACT: the
+        // scheduler primitive restores `current` itself, and the policy undoes the rank-2 write
+        // through the named inverse before releasing the reservation.
+        assert!(
+            YIELD_TXN_SRC2.contains("YieldDecline::ReenqueueRefused => \"reenqueue_failed\",")
+                && YIELD_TXN_SRC2.contains("RISCV_YIELD_DISPATCH_FALLBACK reason={} tid={}")
+                && YIELD_TXN_SRC2.contains("owners.rollback_preempt_outgoing(outgoing)")
+                && YIELD_TXN_SRC2.contains("owners.release_yield_deferral(cpu);"),
+            "a re-enqueue failure must roll back exactly, release the deferral and name itself"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("self.on_preempt_current_cpu_selection();"),
+            "and the legacy in-lock on_preempt fallback must still be the path it falls back to"
         );
     }
 
@@ -119484,9 +119550,17 @@ mod stage199d_wa2b_wake_owner_census {
         // (`scheduler_state.rs::commit_dispatch_selection_in_lock`), so it has no row of its own.
         // WA3A: barriered, Running -> Runnable (idle-only Runnable -> Runnable). The dispatch
         // half moved to the shared in-lock commit.
+        // U9-RESIDUAL1 §3: `yield_current` no longer writes a status — the write moved into the
+        // ONE yield policy, together with its exact inverse. Both owners are barriered.
         (
-            "src/kernel/boot/exec_state.rs",
-            "yield_current",
+            "src/kernel/syscall/yield_txn.rs",
+            "apply_preempt_outgoing_locked",
+            1,
+            Verdict::Cannot,
+        ),
+        (
+            "src/kernel/syscall/yield_txn.rs",
+            "apply_rollback_preempt_locked",
             1,
             Verdict::Cannot,
         ),
@@ -119822,11 +119896,25 @@ mod stage199d_wa2b_wake_owner_census {
             3,
             &["DispatchIncoming", "ContinueCurrent"],
         ),
+        // U9-RESIDUAL1 §3: `yield_current`'s `Running -> Runnable` moved into the ONE yield
+        // policy, which both it and the split NR 0 route drive. The census follows the write to
+        // its owner — `yield_txn::apply_preempt_outgoing_locked`, which applies exactly the same
+        // pair with exactly the same idle-only twin — rather than dropping the row.
+        //
+        // The row still names `exec_state.rs::yield_current` too, because the DECLINED path owes
+        // the same transition before it falls through to the in-lock dispatch, and calls the same
+        // owner to apply it.
         (
-            "src/kernel/boot/exec_state.rs",
-            "yield_current",
+            "src/kernel/syscall/yield_txn.rs",
+            "apply_preempt_outgoing_locked",
             1,
             &["PreemptOutgoing", "PreemptOutgoingIdle"],
+        ),
+        (
+            "src/kernel/syscall/yield_txn.rs",
+            "apply_rollback_preempt_locked",
+            1,
+            &["RollbackPreemptOutgoing"],
         ),
         (
             "src/kernel/boot/exec_state.rs",
@@ -120440,13 +120528,16 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            45,
+            46,
             "U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43; U9-REAP1 §2 moved \
              the faulted reap's `-> Dead` write into its claim and added the claim's exact \
              inverse, 43 -> 44; U9-EXIT1 §2 added the self-exit claim, its exact inverse and the \
              rank-2 half of the joiner wake, 44 -> 47; U9-EXIT1 §4 then retired the broad \
              `exit_task` and `wake_joiners_for` rows when both began driving those same bodies, \
-             47 -> 45. \
+             47 -> 45; U9-RESIDUAL1 §3 moved `yield_current`'s `Running -> Runnable` into the ONE \
+             yield policy and added that write's exact inverse, 45 -> 46 — the same shape U9-REAP1 \
+             §2 produced, and reporting 46 is the honest result: the transition did not multiply, \
+             it moved and gained a named way back. \
              36 pinned by WA2A-R1, `ThreadControlBlock::reserved`, U6 (199C)'s \
              `commit_blocking_send_split`, U3 (203C)'s `wake_tid_to_runnable_split`, and U7 \
              (199E)'s `drain_send_timeout_post_work`"
@@ -120461,8 +120552,10 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            45,
-            "35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
+            46,
+            "U9-RESIDUAL1 §3 moved `yield_current`'s transition-barriered write into the ONE yield \
+             policy and added its exact inverse, 45 -> 46 — the same shape U9-REAP1 §2 produced. \
+             35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
              `fork_complete_post_clone`'s, 35 -> 34; U9-REAP1 §2 moved the faulted reap's \
              `-> Dead` write into its claim and added the claim's exact inverse, 34 -> 35) + 8 \
              transition-barriered sites + 1 reservation-barriered site"
@@ -120798,7 +120891,7 @@ mod stage199d_wa2b_wake_owner_census {
 
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            45,
+            46,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -120822,6 +120915,11 @@ mod stage199d_wa2b_wake_owner_census {
         // mirrors. `recv_block_phase_b_split` joins INTO-BLOCKED (8 → 9): it only ever moves a
         // task INTO `Blocked(EndpointReceive)`, in the same rank-2 acquisition that mints the
         // fresh wait generation, so it is never a transition out.
+        // U9-RESIDUAL1 §3: CANNOT 18 -> 19. `yield_current`'s single CANNOT row is replaced by the
+        // two halves of the yield policy's transition — the barriered `Running -> Runnable` and
+        // its named exact inverse — and both are CANNOT for the same reason the reap claim's two
+        // halves are: each reads and writes the status inside one acquisition, through
+        // `apply_task_transition`, so neither can land on a task that moved in between.
         assert_eq!(
             (can, cannot, into_blocked, fresh, non_production),
             // U9-FORK1 §4: CANNOT 17 -> 16. `fork_complete_post_clone`'s Runnable write was a
@@ -120851,7 +120949,7 @@ mod stage199d_wa2b_wake_owner_census {
             // strength of the guard its OTHER caller applies would record the nearest guard
             // rather than the one every caller applies, which is precisely the error this census
             // exists to catch.
-            (15, 18, 9, 2, 1)
+            (15, 19, 9, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -162194,8 +162292,12 @@ mod u9exit4_post_clear_totality {
         // And the incoming transition is applicable only FROM Runnable, so a task that is neither
         // queued nor current cannot be laundered into Running by it.
         assert!(
-            TASK_TRANSITION.contains("Self::DispatchIncoming => TaskStatus::Runnable,"),
-            "a dispatch may only promote a Runnable task"
+            TASK_TRANSITION.contains(
+                "Self::DispatchIncoming | Self::RollbackPreemptOutgoing => TaskStatus::Runnable,"
+            ),
+            "a dispatch may only promote a Runnable task (U9-RESIDUAL1 §3 added the exact inverse \
+             of PreemptOutgoing to the same arm — it is `Runnable -> Running` too, and it is NOT a \
+             dispatch: it has no idle twin and runs only as a rollback)"
         );
     }
 
@@ -163005,8 +163107,18 @@ mod u9residual1_terminal_admission {
     /// The admission's three checks, in the order that makes each refusal free.
     #[test]
     fn the_admission_checks_the_drainer_first_and_the_topology_in_one_acquisition() {
+        // U9-RESIDUAL1 §3 extracted the body so NR 0's split route shares it verbatim;
+        // `exit_route_admitted_split` is now a thin alias onto it.
+        assert!(
+            RUNTIME.contains(
+                "pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {\n        self.split_terminal_route_admitted(cpu)\n    }"
+            ) && RUNTIME.contains(
+                "pub(crate) fn split_terminal_route_admitted(&self, cpu: CpuId) -> bool {\n        self.split_terminal_route_admission(cpu).is_ok()\n    }"
+            ),
+            "the exit route must delegate to the shared admission, not keep a copy"
+        );
         let body = RUNTIME
-            .split("pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {")
+            .split("pub(crate) fn split_terminal_route_admission(")
             .nth(1)
             .expect("the admission owner");
         let body = &body[..body.find("\n    }").expect("its end")];
@@ -163035,8 +163147,10 @@ mod u9residual1_terminal_admission {
             "wake-only CPUs must be excluded from the dispatching count by construction"
         );
         assert!(
-            body.contains("dispatching <= 1 && dispatch_cpu == cpu"),
-            "the verdict is: at most one dispatcher, and it is this CPU"
+            body.contains("if dispatching > 1 {") && body.contains("if dispatch_cpu != cpu {"),
+            "the verdict is: at most one dispatcher, and it is this CPU — U9-RESIDUAL1 §3 made \
+             the two conditions report themselves separately, because NR 0's live vocabulary \
+             distinguishes `multi_cpu` from a wrong-CPU refusal"
         );
         // Nothing in the admission writes.
         for line in code_lines(body) {
@@ -163176,12 +163290,12 @@ mod u9residual1_terminal_admission {
         );
         // The two split admissions, which read the count and the bound CPU together.
         for (name, src) in [
-            ("exit_route_admitted_split", RUNTIME),
+            ("split_terminal_route_admission", RUNTIME),
             ("queue_advance_admit_split", EXEC_STATE),
         ] {
             let body = src
-                .split(if name == "exit_route_admitted_split" {
-                    "pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {"
+                .split(if name == "split_terminal_route_admission" {
+                    "pub(crate) fn split_terminal_route_admission("
                 } else {
                     "pub(crate) fn queue_advance_admit_split("
                 })
@@ -163196,16 +163310,17 @@ mod u9residual1_terminal_admission {
                 "{name} must read the bound dispatch CPU in the SAME acquisition as the count"
             );
         }
-        // And both split admissions refuse the same two topology shapes.
-        assert!(
-            RUNTIME.contains("dispatching <= 1 && dispatch_cpu == cpu"),
-            "the exit admission's verdict"
-        );
-        assert!(
-            EXEC_STATE.contains("if dispatching > 1 {")
-                && EXEC_STATE.contains("if dispatch_cpu != cpu {"),
-            "the queue-advance admission's two refusals"
-        );
+        // And both split admissions refuse the same two topology shapes, in the same order, each
+        // naming which condition failed.
+        for (name, src) in [
+            ("split_terminal_route_admission", RUNTIME),
+            ("queue_advance_admit_split", EXEC_STATE),
+        ] {
+            assert!(
+                src.contains("if dispatching > 1 {") && src.contains("if dispatch_cpu != cpu {"),
+                "{name} must refuse a second dispatcher and a wrong CPU, separately"
+            );
+        }
     }
 
     /// **Negative — the stale unreachability claim must not come back.**
