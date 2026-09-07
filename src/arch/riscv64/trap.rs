@@ -901,8 +901,25 @@ pub fn handle_riscv_trap_entry_shared(
             disposition,
             crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted
         ) {
+            //
+            // U9-RESIDUAL1 §3: the Yield deferral joins the chain, and it had to. This bridge does
+            // NOT call `finalize_split_handled_syscall` — RISC-V pre-advances `sepc` before this
+            // point, so THIS CAPTURE is the only thing that carries the advanced pc into the
+            // outgoing task's TCB. With NR 0 published on a deferral no accessor here read,
+            // `outgoing` was `None`, `captured=0`, and the yielding caller's saved context still
+            // named its own `ecall`; the drain's exact-token resume then re-entered at that `ecall`
+            // and the task yielded again, forever. Live: three yields and the boot made no further
+            // progress.
+            //
+            // That is the third time this exact chain has been the defect — FutexWait alone missed
+            // the blocking receive (199G-B §2) and the blocking send (199D-DW2) the same way — and
+            // it is why the shared x86_64/AArch64 bridge survives the same omission while this one
+            // does not: there `finalize_split_handled_syscall` commits the advanced PC separately,
+            // so the capture is the register file only. That bridge is deliberately left unchanged;
+            // its Yield path is proven live over 4096 yields per boot on both architectures.
             let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
-                .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx));
+                .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx))
+                .or_else(|| crate::kernel::boot::yield_dispatch_outgoing(cpu_idx));
             // U9-EXIT1 §3: never save the exiting frame. This capture exists so a task that will
             // be RESUMED restarts at the right pc; an exiting task is never resumed, so capturing
             // would at best be pointless and at worst record a corpse's registers into a TCB a

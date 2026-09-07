@@ -163959,4 +163959,57 @@ mod u9residual1_yield_family {
             "the route must gate on it"
         );
     }
+    /// **The outgoing capture must read the deferral the route ACTUALLY published.**
+    ///
+    /// This chain has now been the defect three times. `futex_wait_dispatch_outgoing` alone missed
+    /// the blocking receive (199G-B §2), then the blocking send (199D-DW2), then the yield
+    /// (U9-RESIDUAL1 §3) — each time leaving a parked task's saved context naming its own trapping
+    /// instruction, so the later exact-token resume re-entered at the wrong pc.
+    ///
+    /// The two bridges are NOT symmetric here, and the asymmetry is why RISC-V broke while the
+    /// other two did not: the shared bridge calls `finalize_split_handled_syscall`, which commits
+    /// the advanced PC into the outgoing incarnation separately, so its capture is the register
+    /// file only. The RISC-V bridge pre-advances `sepc` and calls no finalizer, so its capture is
+    /// the ONLY thing carrying the advanced pc into the TCB. A missed capture there is an infinite
+    /// re-entry, not a stale register file — live, the boot made three yields and stopped.
+    #[test]
+    fn the_riscv_capture_reads_every_deferral_a_route_may_publish() {
+        const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+        let block = RISCV_TRAP
+            .split("result=queue_advance_committed outgoing={} captured={}")
+            .next()
+            .expect("up to the RISC-V committed-disposition marker");
+        let block = &block[block
+            .rfind("let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)")
+            .expect("the RISC-V capture chain")..];
+        for accessor in [
+            "crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)",
+            "crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx)",
+            "crate::kernel::boot::yield_dispatch_outgoing(cpu_idx)",
+        ] {
+            assert!(
+                block.contains(accessor),
+                "the RISC-V capture must read `{accessor}` — a route whose deferral is not in this \
+                 chain captures nothing, and on this bridge that is an infinite re-entry"
+            );
+        }
+        // The shared bridge reads the three deferrals its own switching routes publish, and commits
+        // the advanced PC through the finalizer — which is why its Yield path is correct without
+        // the yield deferral in this chain, and it is proven live at 4096 yields per boot on
+        // x86_64 and AArch64, so it is deliberately left unchanged.
+        let shared = TRAP_ENTRY
+            .split("let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)")
+            .nth(1)
+            .expect("the shared capture chain");
+        let shared = &shared[..shared.find("let captured").expect("its end")];
+        assert!(
+            shared.contains("d2_recv_dispatch_outgoing(cpu_idx)")
+                && shared.contains("d2_send_dispatch_outgoing(cpu_idx)"),
+            "the shared capture chain must read the D2 deferrals"
+        );
+        assert!(
+            TRAP_ENTRY.contains("SplitFinalizeReason::PublishedTransition"),
+            "the shared bridge must keep committing the advanced PC through the finalizer"
+        );
+    }
 }
