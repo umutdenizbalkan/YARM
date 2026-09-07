@@ -2418,6 +2418,14 @@ impl KernelState {
                     );
                     return Err(KernelError::TaskMissing);
                 }
+                // `NoCurrent` is deliberately silent. The delivered per-architecture blocks were
+                // each wrapped in `if let Some(out_tid) = outgoing_tid`, so a yield with no current
+                // task never reached their fallback markers at all — it is not a declined deferral,
+                // it is a yield with nothing to yield. The kernel-internal callers
+                // (`apply_cross_cpu_work`, the TLB-shootdown wait, `task_core_state`,
+                // `fault_state`) reach it routinely, and logging them would add ~35 lines a boot of
+                // new output that reads like a failure and that the delivered vocabulary never had.
+                Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {}
                 Err(decline) => {
                     crate::kernel::syscall::yield_txn::log_yield_declined(
                         cpu,

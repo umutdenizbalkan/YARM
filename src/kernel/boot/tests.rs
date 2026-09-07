@@ -163892,6 +163892,16 @@ mod u9residual1_yield_family {
                 "the delivered reason `{reason}` must survive"
             );
         }
+        // `NoCurrent` is silent on the broad path, exactly as the delivered blocks were: each was
+        // wrapped in `if let Some(out_tid) = outgoing_tid`, so a yield with nothing to yield never
+        // produced a fallback marker. The kernel-internal callers reach it routinely (measured: 35
+        // a boot on RISC-V), and logging them would be ~35 lines of new output that reads like a
+        // failure.
+        assert!(
+            EXEC_STATE
+                .contains("Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {}"),
+            "a yield with no current task must stay silent, as it always was"
+        );
         // The split route's decline uses its OWN marker, so it cannot double-count the in-lock
         // fallback the broad path is about to emit.
         assert!(
