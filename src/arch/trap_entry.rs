@@ -1571,10 +1571,25 @@ pub fn handle_trap_entry_shared(
                     let dispatch = shared.futex_wait_dispatch_step_mut(trap_path.authority());
                     match dispatch.tid().map(|t| t.0) {
                         None => {
-                            // SETTLE (idle). The run queue is empty: the outgoing caller stays
+                            // SETTLE (idle). Nothing was dequeued: the outgoing caller stays
                             // parked, `current` stays clear, no frame is restored and no incoming
                             // task is fabricated. A success, not a failure.
-                            crate::yarm_log!("AARCH64_DIRECT_DISPATCH_NO_INCOMING cpu={}", cpu.0);
+                            //
+                            // U9-DISPATCH-CPU1 D3: "nothing selected" is no longer one fact, and
+                            // this marker must not flatten it. `idle` means the queue was EMPTY;
+                            // `none_acceptable` means it was NOT — every entry was examined and
+                            // none could be marked `Running` at this instant, which is a stall to
+                            // investigate, not an idle system; `refused_no_authority` means the
+                            // authority itself was not accepted and nothing was even examined.
+                            // The landing is the same for all three because there is nothing to
+                            // resume in any of them, and it is recoverable in all three: the
+                            // entries stayed queued, in order, and this CPU's next dispatch
+                            // re-examines them. What differs is only what the log says happened.
+                            crate::yarm_log!(
+                                "AARCH64_DIRECT_DISPATCH_NO_INCOMING cpu={} reason={}",
+                                cpu.0,
+                                dispatch.marker()
+                            );
                             dd::note_outcome(DrainOutcome::Settled(Settlement::Idle));
                             crate::yarm_log!(
                                 "AARCH64_DIRECT_DISPATCH_DONE result=idle settled=1 broad_lock=0"

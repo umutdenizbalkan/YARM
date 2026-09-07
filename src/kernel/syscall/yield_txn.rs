@@ -365,16 +365,6 @@ impl YieldOwners for BroadYieldOwners<'_> {
         &self,
         cpu: CpuId,
     ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
-        use crate::kernel::boot::TerminalAdmissionRefusal as R;
-        let cpu_idx = cpu.0 as usize;
-        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-            return Err(R::CpuOutOfRange);
-        }
-        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(R::NoTrapDrainer);
-        }
         // U9-DISPATCH-CPU1 §3: the broad adapter moves to AUTHORITY-BOUND with the split one, and
         // it has to. The whole point of one transaction driven by two adapters is that the two
         // routes cannot come to disagree about when a yield may be deferred; leaving the
@@ -390,7 +380,11 @@ impl YieldOwners for BroadYieldOwners<'_> {
         //
         // `current_cpu == cpu` was trivially true here anyway: `yield_current` derives `cpu` from
         // `self.current_cpu()`, which IS the scheduler's bound dispatcher.
-        Ok(())
+        //
+        // This adapter holds a `&mut KernelState` and so cannot reach
+        // `SharedKernel::split_terminal_route_admission`; it calls the SAME route-local function
+        // that method calls, rather than keeping a hand-written copy of the two conditions.
+        crate::runtime::terminal_route_admission_authority_bound(cpu)
     }
 
     fn reserve_yield_deferral(&mut self, cpu: CpuId, outgoing: u64) -> bool {

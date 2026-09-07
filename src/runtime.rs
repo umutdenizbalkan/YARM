@@ -614,6 +614,34 @@ pub(crate) enum TerminalRouteTopology {
     AuthorityBound,
 }
 
+/// U9-DISPATCH-CPU1 §3 — the ROUTE-LOCAL half of the terminal admission: this CPU has cells, and
+/// something will consume what the route publishes.
+///
+/// It is the whole of an [`TerminalRouteTopology::AuthorityBound`] admission, and it is the prefix
+/// of an `AmbientBound` one. Both `SharedKernel::split_terminal_route_admission` and the BROAD
+/// Yield adapter — which holds a `&mut KernelState` and so has no `SharedKernel` to reach that
+/// method through — call this one function, so the two adapters that drive the single yield
+/// transaction cannot come to disagree about when a yield may be deferred. That drift is precisely
+/// what U9-RESIDUAL1 §3 extracted the transaction to prevent, and a second hand-written copy of
+/// these two conditions would reintroduce it.
+///
+/// Purely a read: a refusal mutates nothing, which is what lets every caller treat it as free.
+pub(crate) fn terminal_route_admission_authority_bound(
+    cpu: CpuId,
+) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
+    use crate::kernel::boot::TerminalAdmissionRefusal as R;
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return Err(R::CpuOutOfRange);
+    }
+    if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+        .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return Err(R::NoTrapDrainer);
+    }
+    Ok(())
+}
+
 /// Why a selection step refused. **Every variant is produced strictly before any mutation**:
 /// nothing was dequeued, nothing became current, and no token can exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1445,15 +1473,9 @@ impl SharedKernel {
         topology: TerminalRouteTopology,
     ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
         use crate::kernel::boot::TerminalAdmissionRefusal as R;
-        let cpu_idx = cpu.0 as usize;
-        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-            return Err(R::CpuOutOfRange);
-        }
-        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(R::NoTrapDrainer);
-        }
+        // Conditions (1) and (2) — the route-local half, shared verbatim with every caller that
+        // has no `SharedKernel` to reach this method through.
+        terminal_route_admission_authority_bound(cpu)?;
         if topology == TerminalRouteTopology::AuthorityBound {
             // The drain this route publishes into authenticates the trap window, not the ambient
             // binding, and every scheduler operation between here and it addresses this CPU's own
@@ -1461,6 +1483,7 @@ impl SharedKernel {
             // invalidate, so there is nothing left to refuse.
             return Ok(());
         }
+        let cpu_idx = cpu.0 as usize;
         let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
             let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
             let online = s.online_cpu_bitmap();
@@ -2811,26 +2834,15 @@ impl SharedKernel {
     /// on its runqueue. Ordinary fallback dispatch is permitted." This is that fallback dispatch,
     /// written once instead of at nine call sites.
     ///
-    /// # Bounded, and why the bound is the right one
+    /// # Exhaustion is its own outcome
     ///
-    /// A `RefusedRolledBack` means the candidate that was dequeued could not be marked `Running`
-    /// — it has no exact incarnation (a queued task with no ASID) or its status is not `Runnable`.
-    /// `undo_dispatch_selection` has already put it back, at the TAIL, so the next selection sees
-    /// a different head and the retry makes progress. The bound is the number of runnable entries
-    /// observed at entry: every candidate is tried at most once, and the loop cannot outlive the
-    /// queue. It adds no side effect of its own — the requeue-at-tail is the rollback's, not the
-    /// retry's — and it introduces no scheduler policy: each iteration is the SAME
-    /// `dispatch_next_selection_on` + `apply_dispatch_transition` pair the broad path runs.
+    /// A CPU whose queue is non-empty but none of whose entries can be marked `Running` is NOT
+    /// idle and must not be logged as idle. It is reported as
+    /// [`DispatchAcquire::NoneAcceptable`], carrying the number of entries actually examined, and
+    /// the caller settles it through the architecture's established idle terminal under a marker
+    /// that names the refusal. That settlement is recoverable — §3's recovery contract — because
+    /// the entries stayed queued, in order, and the next dispatch on this CPU re-examines them.
     ///
-    /// Exhausting the bound is reported as its own outcome. It is NOT idle and must not be
-    /// logged as idle: the queue is non-empty, the CPU simply cannot run anything in it right now.
-    /// The caller settles it through the architecture's established idle terminal — which is
-    /// recoverable, because the periodic timer will re-dispatch — and says so in its own marker.
-    #[cfg(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
-    ))]
     /// `step` is the CLASS's own selection wrapper — `yield_dispatch_step_mut`,
     /// `futex_wait_dispatch_step_mut` — so each drain keeps emitting its own delivered dequeue
     /// vocabulary. The selection policy underneath is the one owner either way; what the closure

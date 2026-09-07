@@ -54504,17 +54504,41 @@ mod stage168b_d2_recv_genuine_completion {
         );
         // The recv dispatch seam calls the MUTATING dispatch_next_on (advancing),
         // distinct from the queue-neutral observe.
+        // U9-DISPATCH-CPU1 §3: the seam no longer carries its own copy of the acquisition, the
+        // authentication or the dequeue — it DELEGATES to the one selection owner, keeping only
+        // this class's telemetry. The two properties this guard has always been about are
+        // unchanged and are now asserted where they actually live: the dispatch is the
+        // queue-ADVANCING selection (never the queue-neutral observe), and the CPU is
+        // authenticated before any mutation.
         let m_idx = RUNTIME_SRC
             .find("fn d2_recv_dispatch_step_mut")
             .expect("recv dispatch seam");
         let body = &RUNTIME_SRC[m_idx..m_idx + 1600];
         assert!(
-            body.contains("dispatch_next_selection_on(dispatch_cpu)"),
-            "the recv dispatch must be the authoritative queue-advancing dispatch_next_on"
+            body.contains(
+                "self.queue_advance_select_step_split(authority, \"d2_recv_dispatch_step_mut\")"
+            ),
+            "the recv dispatch must reach the run queue through the one queue-advancing owner"
         );
-        // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates the CPU before mutating.
         assert!(
-            body.contains("DISPATCH_STEP_REFUSED_CPU_MISMATCH"),
+            !body.contains("d6_genuine_local_dispatch_observe"),
+            "and never through the queue-NEUTRAL observe, which advances nothing"
+        );
+        let owner = RUNTIME_SRC
+            .find("pub(crate) fn queue_advance_select_step_split(")
+            .expect("the one selection owner");
+        let owner_body = &RUNTIME_SRC[owner..owner + 2400];
+        assert!(
+            owner_body.contains("dispatch_next_accepted_selection_on(cpu, |tid| {"),
+            "the owner must call the authoritative queue-advancing scheduler primitive"
+        );
+        // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates before mutating. U9-DISPATCH-CPU1
+        // §1 replaced the ambient CPU-mismatch check with the minted authority's own two-part
+        // authentication — the window first, OUTSIDE rank 1, then the CPU's onlineness inside it.
+        assert!(
+            owner_body.contains("if !authority.is_live() {")
+                && owner_body.contains("reason=stale_window")
+                && owner_body.contains("reason=cpu_offline"),
             "the recv dispatch seam must authenticate the caller's CPU before any mutation"
         );
     }
@@ -54882,17 +54906,41 @@ mod stage169_d2_send_genuine {
             TRAP_ENTRY_SRC.contains("D2_SEND_GENUINE_DISPATCH_REVERIFY_OK"),
             "the drain must emit the reverify-ok marker before dispatching"
         );
+        // U9-DISPATCH-CPU1 §3: the seam no longer carries its own copy of the acquisition, the
+        // authentication or the dequeue — it DELEGATES to the one selection owner, keeping only
+        // this class's telemetry. The two properties this guard has always been about are
+        // unchanged and are now asserted where they actually live: the dispatch is the
+        // queue-ADVANCING selection (never the queue-neutral observe), and the CPU is
+        // authenticated before any mutation.
         let m_idx = RUNTIME_SRC
             .find("fn d2_send_dispatch_step_mut")
             .expect("send dispatch seam");
         let body = &RUNTIME_SRC[m_idx..m_idx + 1600];
         assert!(
-            body.contains("dispatch_next_selection_on(dispatch_cpu)"),
-            "the send dispatch must be the authoritative queue-advancing dispatch_next_on"
+            body.contains(
+                "self.queue_advance_select_step_split(authority, \"d2_send_dispatch_step_mut\")"
+            ),
+            "the send dispatch must reach the run queue through the one queue-advancing owner"
         );
-        // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates the CPU before mutating.
         assert!(
-            body.contains("DISPATCH_STEP_REFUSED_CPU_MISMATCH"),
+            !body.contains("d6_genuine_local_dispatch_observe"),
+            "and never through the queue-NEUTRAL observe, which advances nothing"
+        );
+        let owner = RUNTIME_SRC
+            .find("pub(crate) fn queue_advance_select_step_split(")
+            .expect("the one selection owner");
+        let owner_body = &RUNTIME_SRC[owner..owner + 2400];
+        assert!(
+            owner_body.contains("dispatch_next_accepted_selection_on(cpu, |tid| {"),
+            "the owner must call the authoritative queue-advancing scheduler primitive"
+        );
+        // Stage 199D-WA3A-R2-SEAL (item D): and it authenticates before mutating. U9-DISPATCH-CPU1
+        // §1 replaced the ambient CPU-mismatch check with the minted authority's own two-part
+        // authentication — the window first, OUTSIDE rank 1, then the CPU's onlineness inside it.
+        assert!(
+            owner_body.contains("if !authority.is_live() {")
+                && owner_body.contains("reason=stale_window")
+                && owner_body.contains("reason=cpu_offline"),
             "the send dispatch seam must authenticate the caller's CPU before any mutation"
         );
     }
@@ -74215,7 +74263,11 @@ mod stage195e_aarch64_futex_wait_drain {
         for needle in [
             "futex_wait_reverify_blocked",
             "futex_wait_dispatch_step_mut",
-            "d6_genuine_mark_running_via_task_seam",
+            // U9-DISPATCH-CPU1 §2: the mark is no longer written in the drain. The drain acquires
+            // through the ONE owner, which performs the same `Runnable -> Running` transition
+            // through the same rank-2 task seam and hands back only the outcomes this drain can
+            // act on. That seam is asserted below, on the owner itself.
+            "queue_advance_acquire_incoming_split",
             "direct_dispatch_resume_incoming_core",
             "futex_wait_dispatch_clear",
             "maybe_log_futex_wait_retired",
@@ -74229,6 +74281,18 @@ mod stage195e_aarch64_futex_wait_drain {
         ] {
             assert!(block.contains(needle), "the drain must use/emit `{needle}`");
         }
+        // And the transition itself still runs through the ONE rank-2 mark seam — moved, not
+        // removed. U9-DISPATCH-CPU1 §2 relocated it into the shared acquire owner so all five
+        // WA3A outcomes are matched in one place instead of at nine call sites; the transition,
+        // its provenance and its exact inverse are unchanged.
+        let acquire_owner = RUNTIME_SRC
+            .split_once("pub(crate) fn queue_advance_acquire_incoming_split(")
+            .map(|(_, r)| r.split_once("\n    /// ").map(|(b, _)| b).unwrap_or(r))
+            .expect("the one acquire owner");
+        assert!(
+            acquire_owner.contains("self.d6_genuine_mark_running_via_task_seam(dispatch)"),
+            "the acquire owner must perform the mark through the existing rank-2 task seam"
+        );
         // No x86_64 CR3 switch logic — the AArch64 drain uses the generic HAL ASID hook. (Check
         // for the x86 CR3 helper names, not the word "CR3" which appears in explanatory prose.)
         assert!(
@@ -74657,9 +74721,15 @@ mod stage195g_aarch64_yield_dispatch {
             "yield_current must drive the one yield policy"
         );
         for needle in [
-            // the topology admission, through the broad adapter
-            "GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE",
-            "self.kernel.dispatching_cpu_count() > 1",
+            // U9-DISPATCH-CPU1 §3: `self.kernel.dispatching_cpu_count() > 1` used to appear here.
+            // It existed to keep the ambient `sched.current_cpu` binding stable between this
+            // admission and the drain that consumed the deferral. That drain now authenticates
+            // the trap's own minted `DispatchAuthority` and addresses this CPU's queue and
+            // current slot explicitly, so there is no ambient binding left for a second
+            // dispatcher to invalidate — and nothing left for the condition to protect. It is
+            // replaced, not deleted: NR 0 declares its topology by name, and the condition
+            // survives verbatim for every family still declaring `AmbientBound`.
+            "TerminalRouteTopology::AuthorityBound",
             // the AArch64 half of the arch gate
             "BOOTSTRAP_CPU_ID",
             // the two owners the deferral has always used
@@ -74676,6 +74746,42 @@ mod stage195g_aarch64_yield_dispatch {
                 "the yield policy must reference `{needle}`"
             );
         }
+        // BOTH adapters declare the SAME topology. One transaction driven by two adapters exists
+        // so the split and broad NR 0 routes cannot come to disagree about when a yield may be
+        // deferred; an adapter left on the ambient conditions would make the broad NR 0 refuse a
+        // topology the split NR 0 admits — exactly the drift U9-RESIDUAL1 §3 extracted this
+        // transaction to prevent.
+        assert!(
+            YIELD_TXN.contains("TerminalRouteTopology::AuthorityBound"),
+            "the split adapter must declare the authority-bound topology by name"
+        );
+        assert!(
+            YIELD_TXN.contains("crate::runtime::terminal_route_admission_authority_bound(cpu)"),
+            "and the broad adapter — which has no SharedKernel to reach the shared admission \
+             through — must call the SAME route-local function that admission calls, not keep a \
+             hand-written copy of its two conditions"
+        );
+        assert!(
+            !YIELD_TXN.contains("dispatching_cpu_count"),
+            "neither may keep a private copy of the ambient stability condition"
+        );
+        assert!(
+            !YIELD_TXN.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE"),
+            "and neither may re-derive the drainer condition — it moved to the one owner, and a \
+             second reader of that flag is a second admission policy"
+        );
+        // The drainer condition still EXISTS; it moved, and this is where it moved to.
+        const RUNTIME_ADMISSION: &str = include_str!("../../runtime.rs");
+        let shared_half = RUNTIME_ADMISSION
+            .split_once("pub(crate) fn terminal_route_admission_authority_bound(")
+            .map(|(_, r)| r.split_once("\n}").map(|(b, _)| b).unwrap_or(r))
+            .expect("the one route-local admission");
+        assert!(
+            shared_half.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+                && shared_half.contains("R::NoTrapDrainer")
+                && shared_half.contains("R::CpuOutOfRange"),
+            "the one route-local admission must own both conditions and report which refused"
+        );
         // Not gated on any enable knob (default-on) and keeps the legacy fallback.
         assert!(
             !body.contains("aarch64_yield_oracle_enabled()")
@@ -74711,7 +74817,11 @@ mod stage195g_aarch64_yield_dispatch {
         for needle in [
             "yield_reverify_ready",
             "yield_dispatch_step_mut",
-            "d6_genuine_mark_running_via_task_seam",
+            // U9-DISPATCH-CPU1 §2: the mark is no longer written in the drain. The drain acquires
+            // through the ONE owner, which performs the same `Runnable -> Running` transition
+            // through the same rank-2 task seam and hands back only the outcomes this drain can
+            // act on. That seam is asserted below, on the owner itself.
+            "queue_advance_acquire_incoming_split",
             "direct_dispatch_resume_incoming_core",
             "yield_dispatch_clear",
             "maybe_log_yield_retired",
@@ -74728,10 +74838,62 @@ mod stage195g_aarch64_yield_dispatch {
                 "the Yield drain must use/emit `{needle}`"
             );
         }
-        // No idle outcome (a published Yield always has an incoming); no CR3.
+        // And the transition itself still runs through the ONE rank-2 mark seam — moved, not
+        // removed. U9-DISPATCH-CPU1 §2 relocated it into the shared acquire owner so all five
+        // WA3A outcomes are matched in one place instead of at nine call sites.
+        let acquire_owner = RUNTIME_SRC
+            .split_once("pub(crate) fn queue_advance_acquire_incoming_split(")
+            .map(|(_, r)| r.split_once("\n    /// ").map(|(b, _)| b).unwrap_or(r))
+            .expect("the one acquire owner");
         assert!(
-            !block.contains("enter_post_lock_idle") && !block.contains("result=idle"),
-            "the Yield drain must NOT have an idle outcome"
+            acquire_owner.contains("self.d6_genuine_mark_running_via_task_seam(dispatch)"),
+            "the acquire owner must perform the mark through the existing rank-2 task seam"
+        );
+
+        // **No idle OUTCOME — re-derived.** The original claim was "a published Yield always has
+        // an incoming, so this path must never fire", and the drain enforced it by RETURNING with
+        // `current` empty and the caller queued, leaving the vector epilogue to `eret` through a
+        // frame belonging to a task sitting on a runqueue. U9-DISPATCH-CPU1 §2 keeps the claim
+        // about the SELECTION and corrects the settlement: a path that must never fire still has
+        // to be settled correctly when it does.
+        //
+        // So what is asserted now is the honest pair. There is still no `result=idle` and no
+        // `result=ok` on a settlement — a Yield that acquired nothing is not a success and is not
+        // an idle system. But the landing IS the established post-lock idle terminal, which
+        // diverges instead of returning, and it is reached only after the deferral is cleared,
+        // the acquire's own reason is reported, and the exact authority is retired.
+        assert!(
+            !block.contains("AARCH64_YIELD_DISPATCH_DONE result=idle"),
+            "a Yield that acquired nothing must never be reported as an idle success"
+        );
+        let settled = block
+            .find("AARCH64_YIELD_DISPATCH_SETTLED")
+            .expect("the settlement must report itself");
+        assert!(
+            block[..settled].contains("crate::kernel::boot::yield_dispatch_clear(cpu_idx);"),
+            "the deferral must be cleared BEFORE the settlement is reported — the cell outlives \
+             the trap and a later trap would re-enter this drain against a stale identity"
+        );
+        let tail = &block[settled..];
+        assert!(
+            tail.contains("settlement=terminal_idle") && tail.contains("acquired.marker()"),
+            "the settlement must name the acquire's OWN reason, not a generic no_incoming"
+        );
+        let retire = tail
+            .find("trap_path.retire();")
+            .expect("D2: the exact authority must be retired before the ownership transfer");
+        let land = tail
+            .find("enter_post_lock_idle_after_direct_dispatch(cpu, outgoing)")
+            .expect("the ESTABLISHED post-lock idle terminal, which diverges");
+        assert!(
+            retire < land,
+            "the retirement must precede the non-returning landing: an epoch left open lets a \
+             later trap save and restore an abandoned window"
+        );
+        assert!(
+            !tail[..land].contains("return;") && !tail[..land].contains("return Ok("),
+            "and the settlement must NOT return — returning is what would eret through the \
+             outgoing caller's frame while that caller sits on a runqueue"
         );
         assert!(
             !block.contains("switch_cr3")
@@ -76624,7 +76786,11 @@ mod stage196g_riscv_yield_default_on {
             "shared.yield_reverify_ready(cpu)",
             "RISCV_YIELD_DISPATCH_LOCK_DROPPED_OK cpu={}",
             "RISCV_YIELD_DISPATCH_REVERIFY_OK outgoing={}",
-            "shared.yield_dispatch_step_mut(trap_path.authority())",
+            // U9-DISPATCH-CPU1 §2: the drain reaches the run queue through the ONE acquire owner,
+            // threading its own class wrapper as the step so `YIELD_DISPATCH_DEQUEUE_OK` and the
+            // rest of this family's live vocabulary survive the migration.
+            "shared.queue_advance_acquire_incoming_split(",
+            "|k, a| k.yield_dispatch_step_mut(a),",
             "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
             "RISCV_YIELD_DISPATCH_CURRENT_SET_OK cpu={} incoming={}",
             "RISCV_YIELD_DISPATCH_RUNNING_OK incoming={}",
@@ -76638,12 +76804,44 @@ mod stage196g_riscv_yield_default_on {
         ] {
             assert!(drain.contains(m), "the Yield drain must contain `{m}`");
         }
+        // **No idle outcome — re-derived, and the distinction is the whole point.**
+        //
+        // A published Yield always has an incoming: the re-enqueued caller is itself a candidate.
+        // So a GENUINE `Idle` selection — the queue was EMPTY — is still an invariant failure and
+        // is still reported as one: not idle, not a success, no `Err(Internal)` sentinel, no
+        // fabricated task.
+        //
+        // U9-DISPATCH-CPU1 §2 separates that from the case the old drain could not express. An
+        // acquire can now come back with the queue NON-empty and nothing takeable — every entry
+        // examined and none markable, or the authority refused. That is not "no incoming" and must
+        // not wear its marker; it settles under its own reason through the architecture's idle
+        // terminal, which diverges instead of returning through the outgoing caller's frame.
         assert!(
             !drain.contains("POST_LOCK_IDLE_BEGIN")
                 && !drain.contains("SyscallError::Internal")
                 && drain.contains("RISCV_YIELD_DISPATCH_FAIL reason=no_incoming")
                 && drain.contains("RISCV_YIELD_DISPATCH_DEFERRED reason=state_changed"),
-            "no-incoming must be a FAIL (not idle / not Err(Internal)); state_changed declines"
+            "an EMPTY queue must be a FAIL (not idle / not Err(Internal)); state_changed declines"
+        );
+        let settle = drain
+            .find("RISCV_YIELD_DISPATCH_SETTLED")
+            .expect("a non-resumable acquire must settle under its own marker");
+        let fail = drain
+            .find("RISCV_YIELD_DISPATCH_FAIL reason=no_incoming")
+            .expect("checked above");
+        assert!(
+            settle < fail,
+            "the settlement must be taken BEFORE the empty-queue FAIL, or a stall would be              misreported as `no_incoming`"
+        );
+        assert!(
+            drain[settle..].contains("acquired.marker()")
+                && drain[settle..fail].contains("RiscvIdleReason::QueueAdvanceNoIncoming"),
+            "and it must carry the acquire's own reason into a typed idle landing"
+        );
+        assert!(
+            drain[..settle]
+                .contains("if !matches!(acquired, crate::runtime::DispatchAcquire::Idle)"),
+            "a GENUINE Idle must be excluded from that settlement — it keeps the FAIL that says              the published Yield's own invariant was violated"
         );
         assert!(
             !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
@@ -76911,11 +77109,28 @@ mod stage197_first_cohort_seal {
             .split("RISCV_POST_LOCK_DRAIN_DONE")
             .next()
             .unwrap();
+        // U9-DISPATCH-CPU1 §2: "Yield never idles" is re-derived, not dropped. A published Yield
+        // still may not report an EMPTY queue as idle — that is its own invariant failure, and
+        // the FAIL marker is still what says so. What the drain may now do, and must, is settle a
+        // REFUSAL (nothing markable, or no authority) through the typed idle landing under its
+        // own reason, because the return it used to take sret'd through the outgoing caller's
+        // frame while that caller sat on a runqueue. FutexWait's idle is a different fact — an
+        // empty queue is a legitimate outcome there — and the two must not share a marker.
         assert!(
             !yld.contains("POST_LOCK_IDLE_BEGIN")
                 && !yld.contains("SyscallError::Internal")
                 && yld.contains("RISCV_YIELD_DISPATCH_FAIL reason=no_incoming"),
-            "the Yield drain must NEVER idle; no-incoming is a FAIL (no Err(Internal) sentinel)"
+            "the Yield drain must NEVER report an empty queue as idle; that is a FAIL (and no              Err(Internal) sentinel)"
+        );
+        assert!(
+            !yld.contains("RISCV_YIELD_DISPATCH_DONE result=idle")
+                && !yld.contains("RiscvIdleReason::FutexWaitNoIncoming"),
+            "and it must never borrow FutexWait's idle vocabulary, where an empty queue IS a              legitimate settlement"
+        );
+        assert!(
+            yld.contains("RISCV_YIELD_DISPATCH_SETTLED")
+                && yld.contains("RiscvIdleReason::QueueAdvanceNoIncoming"),
+            "a refusal settles through the typed landing under the queue-advance reason"
         );
     }
 
@@ -77031,9 +77246,30 @@ mod stage197_first_cohort_seal {
             .split("RISCV_POST_LOCK_DRAIN_DONE")
             .next()
             .unwrap();
+        // U9-DISPATCH-CPU1 §2 re-derives the "never idles" half. What the Yield drain must never
+        // do is settle a REFUSAL as though it were idle, or reach for an `Err(Internal)` sentinel
+        // — and both remain true. But `EnterKernelIdle` is no longer a synonym for either: it is
+        // the TYPED landing a non-resumable acquire is settled through, carrying its own reason,
+        // because the alternative the drain used to take (returning with `current` empty and the
+        // caller queued) sret'd through a frame belonging to a task on a runqueue.
         assert!(
-            !yld.contains("SyscallError::Internal") && !yld.contains("EnterKernelIdle"),
-            "the Yield drain must never idle and never use an Internal sentinel"
+            !yld.contains("SyscallError::Internal"),
+            "the Yield drain must never use an Internal sentinel"
+        );
+        assert_eq!(
+            yld.matches("RiscvIdleReason::").count(),
+            1,
+            "and it must reach exactly ONE typed idle reason — the refusal settlement"
+        );
+        assert!(
+            yld.contains("RiscvIdleReason::QueueAdvanceNoIncoming")
+                && !yld.contains("RiscvIdleReason::FutexWaitNoIncoming")
+                && !yld.contains("RiscvIdleReason::BlockedIpcNoRunnable"),
+            "that reason must be the queue-advance refusal's OWN, never another class's name"
+        );
+        assert!(
+            yld.contains("RISCV_YIELD_DISPATCH_FAIL reason=no_incoming"),
+            "and a GENUINELY empty queue after a published Yield is still its own invariant              FAILURE, kept distinct from the refusal settlement"
         );
         // The bridge decides idle from the TYPED variant, and keeps genuine errors on the fatal
         // path. `current == None` is only an INVARIANT check inside the idle arm, never the
@@ -77521,9 +77757,31 @@ mod stage197b_riscv_typed_idle_outcome {
             .split("RISCV_POST_LOCK_DRAIN_DONE")
             .next()
             .unwrap();
+        // U9-DISPATCH-CPU1 §2 — re-derived. The claim was "the Yield drain must never idle", and
+        // the drain enforced it by RETURNING when it had nothing to run. That return is what
+        // sret'd through the outgoing caller's frame while that caller sat on a runqueue, so the
+        // claim has to be stated about the thing it was actually protecting: a Yield must never
+        // report the ABSENCE of work as a settled idle system, and must never reach for an
+        // `Err(Internal)` sentinel. Both hold. A refusal — the queue is non-empty and nothing in
+        // it is markable — is a third case the old drain could not express, and it settles
+        // through the typed landing under its own reason rather than through a false return.
         assert!(
-            !yld.contains("EnterKernelIdle") && !yld.contains("SyscallError::Internal"),
-            "the Yield drain must never idle nor use an Internal sentinel"
+            !yld.contains("SyscallError::Internal"),
+            "the Yield drain must never use an Internal sentinel"
+        );
+        assert!(
+            yld.contains("RISCV_YIELD_DISPATCH_FAIL reason=no_incoming"),
+            "an empty queue after a published Yield is still its own invariant FAILURE"
+        );
+        assert_eq!(
+            yld.matches("return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {")
+                .count(),
+            1,
+            "and the ONE idle landing it has is the refusal settlement, not a general escape"
+        );
+        assert!(
+            yld.contains("RiscvIdleReason::QueueAdvanceNoIncoming"),
+            "carrying the queue-advance reason, so a stall is never read as an idle system"
         );
         // The pre-lock split section (inside the wrapper, before the broad-lock phase) returns
         // ReturnToCurrent, never an idle outcome. Scope to the function body so the enum
@@ -122365,17 +122623,26 @@ mod stage199d_wa3a_transition_barriers {
             let end = body.find("\n    /// ").unwrap_or(body.len());
             &body[..end]
         };
+        // U9-DISPATCH-CPU1 §1 changed WHAT authenticating means. The ambient comparison
+        // `dispatch_cpu != cpu` asked whether the caller's CPU number matched a global field any
+        // CPU could rebind — which is why a correct drain on CPU A could be refused because CPU B
+        // took the broad lock. What replaced it is a two-part check of the caller's own minted
+        // `DispatchAuthority`: the trap window must be LIVE (checked outside rank 1, so a dead
+        // token cannot even take the lock), and the CPU it names must be an online scheduler CPU.
+        // The property is unchanged and strictly stronger: authenticate before any mutation.
         let authenticates_before_dequeue = |seam: &str| {
             let scoped = scope_of(seam);
             let guard = scoped
-                .find("if dispatch_cpu != cpu {")
-                .unwrap_or_else(|| panic!("{seam} must authenticate the CPU"));
+                .find("if !authority.is_live() {")
+                .or_else(|| scoped.find("if dispatch_cpu != cpu {"))
+                .unwrap_or_else(|| panic!("{seam} must authenticate before it mutates"));
             let mutate = scoped
-                .find("dispatch_next_selection_on(")
+                .find("dispatch_next_accepted_selection_on(")
+                .or_else(|| scoped.find("dispatch_next_selection_on("))
                 .unwrap_or_else(|| panic!("{seam} must dispatch"));
             assert!(
                 guard < mutate,
-                "{seam} must authenticate the CPU BEFORE it dequeues"
+                "{seam} must authenticate BEFORE it dequeues"
             );
         };
         // The one authoritative selection step (U9-QA §1) authenticates before it dequeues.
@@ -122390,7 +122657,8 @@ mod stage199d_wa3a_transition_barriers {
             let scoped = scope_of(seam);
             if scoped.contains("self.queue_advance_select_step_split(") {
                 assert!(
-                    !scoped.contains("dispatch_next_selection_on("),
+                    !scoped.contains("dispatch_next_selection_on(")
+                        && !scoped.contains("dispatch_next_accepted_selection_on("),
                     "{seam} delegates selection, so it must not also dequeue itself"
                 );
                 continue;
@@ -122444,16 +122712,56 @@ mod stage199d_wa3a_transition_barriers {
             ),
             "the torn-dispatch fatal must be divergent"
         );
+        // U9-DISPATCH-CPU1 §2: there are now TWO shapes of consumer, and the seal has to cover
+        // both or the guard becomes weaker than the tree it guards.
+        //
+        // A DIRECT consumer calls the mark seam itself and still matches all five outcomes
+        // inline — the unmigrated AArch64 direct-dispatch drain and the D2 recv/send drains.
+        //
+        // A DELEGATING consumer calls `queue_advance_acquire_incoming_split`, which performs the
+        // mark ONCE and matches all five there, narrowing them to the outcomes a drain can act
+        // on. That is not a collapse: `Torn` survives as its own `DispatchAcquire` variant and
+        // the drain still routes it to the divergent fatal, and `Contended` (the rolled-back
+        // refusal) is reported separately from `NoneAcceptable` and from `NoAuthority`. The
+        // migration REMOVED nine hand-written copies of the five-way match; it did not remove the
+        // match, and this guard now pins that the one remaining copy is exhaustive.
+        let runtime_owner = runtime
+            .split_once("pub(crate) fn queue_advance_acquire_incoming_split(")
+            .map(|(_, r)| r.split_once("\n    /// ").map(|(b, _)| b).unwrap_or(r))
+            .expect("the one acquire owner");
+        for arm in [
+            "DispatchMarkOutcome::Marked(token)",
+            "DispatchMarkOutcome::Idle =>",
+            "DispatchMarkOutcome::RefusedTorn =>",
+            "DispatchMarkOutcome::RefusedRolledBack =>",
+            "DispatchMarkOutcome::RefusedNoSchedulerChange =>",
+        ] {
+            assert!(
+                runtime_owner.contains(arm),
+                "the acquire owner must match `{arm}` — it is the ONE place the five-way match \
+                 now lives, so an omission there is an omission everywhere"
+            );
+        }
+        assert!(
+            runtime_owner.contains("DispatchAcquire::Torn {"),
+            "and `RefusedTorn` must survive narrowing as its own outcome, never be folded into a \
+             settlement the caller can ignore"
+        );
+
         for rel in ["src/arch/trap_entry.rs", "src/arch/riscv64/trap.rs"] {
             let src = production_source(rel);
             assert!(
                 !src.contains("may_resume"),
                 "{rel} must not collapse outcomes through `may_resume`"
             );
-            let consumers = src
+            let direct = src
                 .matches("d6_genuine_mark_running_via_task_seam(dispatch)")
                 .count();
-            assert!(consumers > 0, "{rel} must consume the mark seam");
+            let delegating = src.matches("queue_advance_acquire_incoming_split(").count();
+            assert!(
+                direct > 0 && delegating > 0,
+                "{rel} must have both shapes: {direct} direct, {delegating} delegating"
+            );
             for arm in [
                 "Mark::Marked(",
                 "Mark::Idle =>",
@@ -122463,14 +122771,22 @@ mod stage199d_wa3a_transition_barriers {
             ] {
                 assert_eq!(
                     src.matches(arm).count(),
-                    consumers,
-                    "{rel}: every one of the {consumers} consumers must match `{arm}`"
+                    direct,
+                    "{rel}: every one of the {direct} DIRECT consumers must match `{arm}`, and no \
+                     delegating one may re-open the match the owner already owns"
                 );
             }
             assert_eq!(
+                src.matches("DispatchAcquire::Torn { tid }").count(),
+                delegating,
+                "{rel}: every one of the {delegating} DELEGATING consumers must match the torn \
+                 outcome the owner handed it"
+            );
+            assert_eq!(
                 src.matches("dispatch_torn_fatal(").count(),
-                consumers,
-                "{rel}: every consumer must route RefusedTorn to the divergent fatal"
+                direct + delegating,
+                "{rel}: EVERY consumer of either shape must route a torn dispatch to the \
+                 divergent fatal"
             );
         }
     }
@@ -143714,11 +144030,32 @@ mod u9qa_split_dispatch_disposition {
             1,
             "one drain call site in the trap entry"
         );
+        // U9-DISPATCH-CPU1 §2/§3: the two QUEUE-ADVANCING FutexWait drains now reach the run
+        // queue through `queue_advance_acquire_incoming_split`, threading this class's own
+        // selection wrapper as the step so `QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK` still appears in
+        // a live log. The third site is the AArch64 DIRECT-dispatch drain, a different family
+        // that owns its own five-outcome match and was not migrated — its admission gate remains
+        // until separately justified. Three sites, unchanged in number; what changed is that two
+        // of them now settle through the one shared owner.
+        assert_eq!(
+            code.matches("|k, a| k.futex_wait_dispatch_step_mut(a),")
+                .count(),
+            2,
+            "the two queue-advancing FutexWait drains must delegate through the shared acquire"
+        );
         assert_eq!(
             code.matches("shared.futex_wait_dispatch_step_mut(trap_path.authority())")
                 .count(),
-            3,
-            "the three existing per-architecture FutexWait drain sites, unchanged in number"
+            1,
+            "and the un-migrated AArch64 direct-dispatch drain is the only remaining direct call"
+        );
+        assert_eq!(
+            code.matches("shared.queue_advance_acquire_incoming_split(")
+                .count(),
+            code.matches("|k, a| k.futex_wait_dispatch_step_mut(a),")
+                .count()
+                + code.matches("|k, a| k.yield_dispatch_step_mut(a),").count(),
+            "every acquire is one of those two classes — no third drain was introduced"
         );
     }
 
@@ -143801,12 +144138,18 @@ mod u9qa_split_dispatch_disposition {
             "a stale or unrelated stash must not alter RISC-V dispatch control flow"
         );
         // No second drain: the Stage 196E FutexWait drain remains the only one, entered once.
+        // U9-DISPATCH-CPU1 §2: it settles through the one shared acquire now, threading its own
+        // selection wrapper so the class telemetry survives. Still exactly one drain.
         assert_eq!(
             RISCV_TRAP
-                .matches("shared.futex_wait_dispatch_step_mut(trap_path.authority())")
+                .matches("|k, a| k.futex_wait_dispatch_step_mut(a),")
                 .count(),
             1,
             "the one existing RISC-V FutexWait drain settles it"
+        );
+        assert!(
+            !RISCV_TRAP.contains("shared.futex_wait_dispatch_step_mut(trap_path.authority())"),
+            "and it does not ALSO select directly — one selection per drain, not two"
         );
     }
 }
@@ -143949,8 +144292,16 @@ mod u9qa_one_queue_advance_owner {
         &after[..end]
     }
 
-    /// The shared step exists, takes rank 1 exactly once, and names its caller in the refusal
-    /// marker so a live `DISPATCH_STEP_REFUSED_CPU_MISMATCH` stays attributable to a site.
+    /// The shared step exists, takes rank 1 exactly once, and names its caller in every refusal
+    /// marker so a live refusal stays attributable to a site.
+    ///
+    /// U9-DISPATCH-CPU1 §1 changed WHICH refusals exist. The step no longer compares the caller's
+    /// CPU against the ambient `sched.current_cpu`, so `DISPATCH_STEP_REFUSED_CPU_MISMATCH` is
+    /// gone; what replaced it is a two-part authentication of the caller's minted authority —
+    /// `stale_window`, checked OUTSIDE rank 1 so a dead token cannot even take the lock, and
+    /// `cpu_offline`, checked inside it. Both are still site-attributed, which is the property
+    /// this guard was always about. The selection primitive changed too: the step calls the
+    /// ACCEPTANCE-FILTERED owner, so only a candidate the mark will take is ever dequeued.
     #[test]
     fn the_shared_step_takes_rank_one_once_and_is_site_attributed() {
         let step = body_of(RUNTIME, "pub(crate) fn queue_advance_select_step_split(");
@@ -143960,14 +144311,36 @@ mod u9qa_one_queue_advance_owner {
             "the shared selection step must take rank 1 exactly once"
         );
         assert!(
-            step.contains(
-                "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}"
-            ) && step.contains("site,"),
-            "the refusal marker must carry the CALLER's site, not a hard-coded one"
+            !step.contains("DISPATCH_STEP_REFUSED_CPU_MISMATCH"),
+            "the ambient CPU-mismatch refusal is the authority U9-DISPATCH-CPU1 §1 removed; a \
+             step that still emits it is still authenticating against the global binding"
+        );
+        for reason in ["stale_window", "cpu_offline"] {
+            assert!(
+                step.contains(&alloc::format!(
+                    "DISPATCH_STEP_REFUSED site={{}} requested={{}} reason={reason}"
+                )),
+                "the {reason} refusal must be reported by name"
+            );
+        }
+        assert!(
+            step.matches("site,").count() >= 3,
+            "every refusal AND the exhaustion report must carry the CALLER's site, not a \
+             hard-coded one"
+        );
+        let stale = step.find("reason=stale_window").expect("checked above");
+        let rank1 = step
+            .find("self.with_scheduler_split_mut")
+            .expect("the step takes rank 1");
+        assert!(
+            stale < rank1,
+            "the window check must sit OUTSIDE the scheduler acquisition: a stale authority must \
+             not even take rank 1"
         );
         assert!(
-            step.contains("dispatch_next_selection_on(dispatch_cpu)"),
-            "the shared step must call the authoritative scheduler selection primitive"
+            step.contains("dispatch_next_accepted_selection_on(cpu, |tid| {"),
+            "the shared step must call the ACCEPTANCE-FILTERED authoritative selection primitive, \
+             addressed by the authority's own CPU"
         );
     }
 
@@ -143993,9 +144366,10 @@ mod u9qa_one_queue_advance_owner {
         let futex = body_of(RUNTIME, "pub(crate) fn futex_wait_dispatch_step_mut(");
         assert!(
             futex.contains(
-                "self.queue_advance_select_step_split(cpu, \"futex_wait_dispatch_step_mut\")"
+                "self.queue_advance_select_step_split(authority, \"futex_wait_dispatch_step_mut\")"
             ),
-            "the FutexWait retirement drain must delegate selection to the shared step"
+            "the FutexWait retirement drain must delegate selection to the shared step, HANDING \
+             IT the authority its own trap minted — not a bare CpuId assembled in the adapter"
         );
         assert!(
             !futex.contains("dispatch_next_selection_on(")
@@ -144008,7 +144382,9 @@ mod u9qa_one_queue_advance_owner {
         // architectures. It selects through the same one owner.
         let yld = body_of(RUNTIME, "pub(crate) fn yield_dispatch_step_mut(");
         assert!(
-            yld.contains("self.queue_advance_select_step_split(cpu, \"yield_dispatch_step_mut\")"),
+            yld.contains(
+                "self.queue_advance_select_step_split(authority, \"yield_dispatch_step_mut\")"
+            ),
             "the Yield/timer preemption drain must delegate selection to the shared step"
         );
         assert!(
@@ -144019,7 +144395,7 @@ mod u9qa_one_queue_advance_owner {
         let commit = body_of(EXEC, "pub(crate) fn queue_advance_commit_split(");
         assert!(
             commit.contains(
-                "self.queue_advance_select_step_split(cpu, \"queue_advance_commit_split\")"
+                "self.queue_advance_select_step_split(authority, \"queue_advance_commit_split\")"
             ),
             "the U9-QA commit must delegate selection to the same shared step"
         );
@@ -144068,18 +144444,56 @@ mod u9qa_one_queue_advance_owner {
                 && admit.contains("QueueAdvanceRefusal::CpuNotAuthoritative"),
             "admission must pre-check the dispatch-CPU authentication"
         );
-        // And the commit still handles it explicitly rather than by a wildcard, mapping it to the
-        // only truthful outcome for a step that dequeued nothing.
+        // And the commit still handles every non-selection explicitly rather than by a wildcard,
+        // mapping each to the only truthful outcome for a step that dequeued nothing.
+        //
+        // U9-DISPATCH-CPU1 §1 replaced `RefusedCpuMismatch` — the ambient authority — with the
+        // authority refusals (`Refused { requested, reason }`) and split out the case that says
+        // something genuinely different: `NoneAcceptable`, where there IS runnable work and this
+        // CPU simply cannot take any of it. Both dequeued nothing, so both are still `TerminalIdle`
+        // and neither may be reported as a switch; but they must be matched SEPARATELY, because
+        // collapsing them would lose the distinction between "no authority" and "no acceptable
+        // work" in the marker a live log has to attribute a stall to.
         let commit = body_of(EXEC, "pub(crate) fn queue_advance_commit_split(");
-        let refused = commit
-            .find("CpuDispatch::RefusedCpuMismatch { .. } =>")
-            .expect("the commit must match the refusal explicitly");
-        let tail = &commit[refused..];
         assert!(
-            tail.starts_with(
-                "CpuDispatch::RefusedCpuMismatch { .. } => return QueueAdvanceOutcome::TerminalIdle,"
+            !commit.contains("RefusedCpuMismatch"),
+            "the ambient mismatch outcome is gone; a commit still naming it is still authenticating\
+             against the global binding"
+        );
+        for (arm, marker) in [
+            (
+                "CpuDispatch::Refused { requested, reason } => {",
+                "QUEUE_ADVANCE_COMMIT_REFUSED cpu={} reason={} dequeued=0",
             ),
-            "a step that dequeued nothing must yield TerminalIdle, never a fabricated switch"
+            (
+                "CpuDispatch::NoneAcceptable { examined } => {",
+                "QUEUE_ADVANCE_COMMIT_NONE_ACCEPTABLE cpu={} examined={} dequeued=0",
+            ),
+        ] {
+            let at = commit
+                .find(arm)
+                .unwrap_or_else(|| panic!("the commit must match `{arm}` explicitly"));
+            let tail = &commit[at..];
+            assert!(
+                tail.contains(marker),
+                "`{arm}` must report itself under its own marker"
+            );
+            let ret = tail
+                .find("return QueueAdvanceOutcome::TerminalIdle;")
+                .expect("a step that dequeued nothing must yield TerminalIdle");
+            let next_arm = tail[1..]
+                .find("CpuDispatch::")
+                .map(|o| o + 1)
+                .unwrap_or(tail.len());
+            assert!(
+                ret < next_arm,
+                "`{arm}` must return TerminalIdle within its OWN arm, never a fabricated switch"
+            );
+        }
+        assert!(
+            !commit.contains("CpuDispatch::Refused { .. } | CpuDispatch::NoneAcceptable")
+                && !commit.contains("_ => return QueueAdvanceOutcome::TerminalIdle"),
+            "and they must stay separately reported — a wildcard would hide which one stalled"
         );
     }
 
@@ -144136,7 +144550,10 @@ mod u9qa_one_queue_advance_owner {
         );
     }
 
-    /// Register `tid` with an INITIALIZED kernel context, so the switch-plan builder accepts it.
+    /// Register `tid` with an INITIALIZED kernel context, so the switch-plan builder accepts it —
+    /// and, since U9-DISPATCH-CPU1 §1, with a real incarnation, so the acceptance-filtered
+    /// selection will dequeue it at all. Production always has both: `spawn_thread_core` sets
+    /// `tcb.asid = parent.asid` and `status = Runnable` before the enqueue.
     fn resumable(state: &mut crate::kernel::boot::KernelState, tid: u64) {
         state
             .register_task_with_class(tid, TaskClass::App)
@@ -144148,6 +144565,7 @@ mod u9qa_one_queue_advance_owner {
                 }
             }
         });
+        super::give_task_an_incarnation(state, tid);
     }
 
     /// EMPIRICAL: a task enqueued after an EMPTY admission is still selected AND switched to — the
@@ -144263,6 +144681,7 @@ mod u9qa_one_queue_advance_owner {
         state
             .register_task_with_class(90001, TaskClass::App)
             .expect("reg");
+        super::give_task_an_incarnation(&mut state, 90001);
         state.enqueue_on_cpu(CpuId(0), 90001).expect("enq");
         let runnable_before = state.runnable_count_on_cpu(CpuId(0));
         let shared = SharedKernel::new(state);
@@ -146034,12 +146453,21 @@ mod u9ft3_transition {
     fn the_advance_uses_the_u9qa_selection_owner() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
+        // U9-DISPATCH-CPU1 §1: the step takes the trap's minted `DispatchAuthority` rather than a
+        // bare `CpuId`. That is the point of the change — a CpuId is a number anyone can build,
+        // and an authority is a proof that the caller is executing inside a live trap window on
+        // that CPU. The claim this guard makes is unchanged: ONE selection owner, delegated to.
         let step = RUNTIME_SRC
-            .split("pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {")
+            .split(
+                "pub(crate) fn futex_wait_dispatch_step_mut(&self, authority: DispatchAuthority) -> CpuDispatch {",
+            )
             .nth(1)
             .and_then(|s| s.split("\n    }").next())
             .expect("the drain selection step");
-        assert!(step.contains("queue_advance_select_step_split(cpu"));
+        assert!(
+            step.contains("self.queue_advance_select_step_split(authority,"),
+            "the drain must delegate to the one selection owner, handing it the authority"
+        );
         let b = body();
         for forbidden in [
             "queue_advance_commit_split",
@@ -163329,28 +163757,62 @@ mod u9residual1_terminal_admission {
         assert!(
             RUNTIME.contains(
                 "pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {\n        self.split_terminal_route_admitted(cpu)\n    }"
-            ) && RUNTIME.contains(
-                "pub(crate) fn split_terminal_route_admitted(&self, cpu: CpuId) -> bool {\n        self.split_terminal_route_admission(cpu).is_ok()\n    }"
             ),
             "the exit route must delegate to the shared admission, not keep a copy"
         );
+        // U9-DISPATCH-CPU1 §3: the admission takes a TOPOLOGY, because what a route must prove
+        // depends on what its DRAIN authenticates against. The exit route is unmigrated, so its
+        // alias names `AmbientBound` explicitly — the delivered conditions, unchanged. A route
+        // that wanted the weaker topology would have to say so at its own call site.
+        assert!(
+            RUNTIME.contains(
+                "pub(crate) fn split_terminal_route_admitted(&self, cpu: CpuId) -> bool {\n        self.split_terminal_route_admission(cpu, TerminalRouteTopology::AmbientBound)\n            .is_ok()\n    }"
+            ),
+            "the boolean alias must name the ambient topology, not inherit one by default"
+        );
+        // The two ROUTE-LOCAL conditions moved to one free function, so the broad Yield adapter —
+        // which has no `SharedKernel` — shares them instead of hand-copying them. Their ORDER is
+        // the property this guard has always been about, and it is unchanged across the two:
+        // bound, then drainer, then (only for an ambient route) the scheduler.
+        let local = RUNTIME
+            .split("pub(crate) fn terminal_route_admission_authority_bound(")
+            .nth(1)
+            .expect("the route-local admission");
+        let local = &local[..local.find("\n}").expect("its end")];
+        let bound = local
+            .find("if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {")
+            .expect("the bound check");
+        let drainer = local
+            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
+            .expect("the drainer check");
+        assert!(
+            bound < drainer,
+            "bound before drainer: each refusal must cost less than the next"
+        );
+        assert!(
+            !local.contains("with_scheduler_split_mut"),
+            "and the route-local half must take NO scheduler lock — it is what an authority-bound \
+             route pays, and it must stay free"
+        );
+
         let body = RUNTIME
             .split("pub(crate) fn split_terminal_route_admission(")
             .nth(1)
             .expect("the admission owner");
         let body = &body[..body.find("\n    }").expect("its end")];
-        let bound = body
-            .find("if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {")
-            .expect("the bound check");
-        let drainer = body
-            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
-            .expect("the drainer check");
+        let local_call = body
+            .find("terminal_route_admission_authority_bound(cpu)?;")
+            .expect("the shared route-local half");
+        let short_circuit = body
+            .find("if topology == TerminalRouteTopology::AuthorityBound {")
+            .expect("the topology short-circuit");
         let sched = body
             .find("self.with_scheduler_split_mut(")
             .expect("the topology read");
         assert!(
-            bound < drainer && drainer < sched,
-            "bound, then drainer, then scheduler: each refusal must cost less than the next"
+            local_call < short_circuit && short_circuit < sched,
+            "route-local first, then the topology decision, then the scheduler: an authority-bound \
+             route must never pay rank 1 for a condition its drain does not ask"
         );
         assert_eq!(
             body.matches("self.with_scheduler_split_mut(").count(),
@@ -164270,6 +164732,15 @@ mod u9yield2_family_edge {
             .join("\n")
     }
 
+    /// Comment-free AND layout-free: every run of whitespace collapses to one space, so a guard
+    /// states a call shape once and does not have to be reworded every time rustfmt rewraps it.
+    fn flat(src: &str) -> alloc::string::String {
+        code(src)
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ")
+    }
+
     // ── §1: the record ──────────────────────────────────────────────────────────────────────
 
     /// **The direct NR6/NR7 production term is ON for all three architectures.** This is the fact
@@ -164484,50 +164955,94 @@ mod u9yield2_family_edge {
 
     // ── §3: the RISC-V settlement, and the boundary ─────────────────────────────────────────
 
-    /// **Every RISC-V drain refusal settles its deferral before returning.** Nine exits across
-    /// three drains used to return with the cell still set; the cell outlives the trap, so the
-    /// next trap re-entered that drain against a stale outgoing identity and every later userspace
-    /// NR 0 was refused `DeferralHeld` — `colliding_deferral_pending_for` counts all three cells
-    /// on RISC-V.
+    /// **Every RISC-V drain refusal settles its deferral before returning — and U9-DISPATCH-CPU1
+    /// §2 corrected WHAT it returns.**
+    ///
+    /// U9-YIELD2 §3 found nine exits across three drains returning with the deferral cell still
+    /// set. The cell outlives the trap, so the next trap re-entered that drain against a stale
+    /// outgoing identity and every later userspace NR 0 was refused `DeferralHeld` —
+    /// `colliding_deferral_pending_for` counts all three cells on RISC-V. Clearing the cell was
+    /// necessary and remains asserted here.
+    ///
+    /// It was not sufficient. Those exits settled as `ReturnToCurrent`, and `RefusedRolledBack` is
+    /// why that is wrong: undoing the incoming dequeue puts that task BACK on the runqueue and
+    /// leaves NOTHING current, so "return to current" returns through a frame belonging to a task
+    /// that is simultaneously queued. D3 requires each outcome to be settled from its actual
+    /// post-state, so the guard now pins the whole corrected shape per drain:
+    ///
+    /// * the acquire is the one shared owner, attributed to this drain's own site;
+    /// * `Torn` retires the exact authority BEFORE the non-returning fatal (D2), so no abandoned
+    ///   window is left open for a later trap to save and restore;
+    /// * every other non-resumable outcome clears the cell, reports `settlement=kernel_idle` under
+    ///   the acquire's own reason, and lands on `EnterKernelIdle { QueueAdvanceNoIncoming }` —
+    ///   never on the `ReturnToCurrent` that the empty `current` slot contradicts.
     #[test]
     fn every_riscv_drain_refusal_settles_the_deferral_it_was_draining() {
         let cases = [
             (
                 "foundation",
-                "dispatch_torn_fatal(cpu, inc, \"riscv_queue_switch_foundation_dispatch\")",
+                "riscv_queue_switch_foundation_dispatch",
                 "riscv_queue_switch_foundation_clear(cpu_idx)",
+                "RISCV_QUEUE_SWITCH_FOUNDATION_SETTLED",
             ),
             (
                 "futex_wait",
-                "dispatch_torn_fatal(cpu, inc, \"riscv_futex_wait_dispatch\")",
+                "riscv_futex_wait_dispatch",
                 "futex_wait_dispatch_clear(cpu_idx)",
+                "RISCV_FUTEX_WAIT_DISPATCH_SETTLED",
             ),
             (
                 "yield",
-                "dispatch_torn_fatal(cpu, inc, \"riscv_yield_dispatch\")",
+                "riscv_yield_dispatch",
                 "yield_dispatch_clear(cpu_idx)",
+                "RISCV_YIELD_DISPATCH_SETTLED",
             ),
         ];
-        let c = code(RV_TRAP);
-        for (name, torn_anchor, clear) in cases {
-            let end = c
-                .find(torn_anchor)
-                .unwrap_or_else(|| panic!("{name}: drain not found"));
-            let start = c[..end]
-                .rfind("match shared.d6_genuine_mark_running_via_task_seam(dispatch)")
-                .unwrap_or_else(|| panic!("{name}: mark block not found"));
-            let block = &c[start..end];
-            let returns = block
-                .matches("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
-                .count();
-            let clears = block.matches(clear).count();
-            assert_eq!(
-                returns, 3,
-                "{name}: the three non-fatal refusal arms must still be the ones that return"
+        let c = flat(RV_TRAP);
+        for (name, site, clear, settled) in cases {
+            let acquire = c
+                .find(&alloc::format!(
+                    "shared.queue_advance_acquire_incoming_split( trap_path.authority(), \"{site}\","
+                ))
+                .unwrap_or_else(|| panic!("{name}: the drain must acquire through the one owner"));
+            let torn = c[acquire..]
+                .find(&alloc::format!("dispatch_torn_fatal(cpu, tid, \"{site}\")"))
+                .map(|o| acquire + o)
+                .unwrap_or_else(|| panic!("{name}: torn arm not found"));
+            let retire = acquire
+                + c[acquire..torn]
+                    .rfind("trap_path.retire();")
+                    .unwrap_or_else(|| {
+                        panic!("{name}: the exact authority must be retired before the torn fatal")
+                    });
+            assert!(
+                !c[retire..torn].contains("Ok("),
+                "{name}: nothing may return between the retirement and the fatal"
             );
-            assert_eq!(
-                clears, returns,
-                "{name}: every refusal that returns must settle {clear} first"
+
+            let settle = c[torn..]
+                .find(settled)
+                .map(|o| torn + o)
+                .unwrap_or_else(|| panic!("{name}: the refusal settlement marker is missing"));
+            let block = &c[torn..(settle + 400).min(c.len())];
+            assert!(
+                block.contains(clear),
+                "{name}: the refusal settlement must clear {clear} — the cell outlives the trap"
+            );
+            assert!(
+                block.contains("settlement=kernel_idle") && block.contains("acquired.marker()"),
+                "{name}: it must report the acquire's OWN reason, not a generic no_incoming"
+            );
+            assert!(
+                block.contains(
+                    "return Ok(RiscvTrapEntryOutcome::EnterKernelIdle { reason: RiscvIdleReason::QueueAdvanceNoIncoming, })"
+                ),
+                "{name}: a refusal settles as kernel idle under its own reason"
+            );
+            assert!(
+                !block.contains("ReturnToCurrent"),
+                "{name}: it must NOT settle as ReturnToCurrent — the route that published this \
+                 drain already cleared `current`, so there is no current frame to return through"
             );
         }
     }
@@ -164550,8 +165065,10 @@ mod u9yield2_family_edge {
         kernel.with(|state| {
             state.bring_up_cpu(AP).expect("a second dispatching CPU");
             state.register_task(9101).expect("register on the AP");
+            super::give_task_an_incarnation(state, 9101);
             state.enqueue_on_cpu(AP, 9101).expect("queued on the AP");
             state.register_task(9100).expect("register on the BSP");
+            super::give_task_an_incarnation(state, 9100);
             state.enqueue_on_cpu(BSP, 9100).expect("queued on the BSP");
             // CPU B takes the broad lock and rebinds the ambient field to itself — exactly the
             // event that used to invalidate A's in-flight window.
@@ -164595,6 +165112,7 @@ mod u9yield2_family_edge {
         let kernel = SharedKernel::new(crate::kernel::boot::Bootstrap::init().expect("init"));
         kernel.with(|state| {
             state.register_task(9200).expect("register");
+            super::give_task_an_incarnation(state, 9200);
             state.enqueue_on_cpu(BSP, 9200).expect("queued");
             state.set_current_cpu(BSP).expect("bound");
         });
@@ -164632,36 +165150,67 @@ mod u9yield2_family_edge {
         );
     }
 
-    /// **The admission asks the drain's question, and adds the one that makes the answer stable.**
-    /// `dispatch_cpu != cpu` is the drain's own precondition, asked early so the refusal is free;
-    /// `dispatching > 1` is what stops a second dispatcher rebinding `current_cpu` between the
-    /// admission and the drain. Neither is removable alone, which is why closing NR 0 under
-    /// `yarm.ap_user_dispatch=1` needs a per-CPU authoritative dispatch binding rather than a
-    /// change to this family.
+    /// **The admission asks the drain's question, and adds the one that makes the answer stable —
+    /// and U9-DISPATCH-CPU1 supplies the contract that retires the pair.**
+    ///
+    /// U9-YIELD2 §2 derived why the two ambient conditions were both load-bearing:
+    /// `dispatch_cpu != cpu` is the drain's own precondition, asked early so the refusal is free,
+    /// and `dispatching > 1` is what stopped a second dispatcher rebinding `current_cpu` between
+    /// the admission and the drain. Neither was removable alone, and the missing contract it named
+    /// was a *per-CPU authoritative dispatch binding*.
+    ///
+    /// U9-DISPATCH-CPU1 §1 mints exactly that binding, so this guard now pins both halves of the
+    /// resulting shape: the ambient pair survives verbatim for the routes that still publish
+    /// `AmbientBound` — other families' admission gates remain until individually justified — and
+    /// the `AuthorityBound` topology short-circuits **before** either condition is even evaluated,
+    /// because the drain it publishes into authenticates a trap window rather than the binding.
+    /// The selection owner correspondingly no longer reads the global field at all: an ambient
+    /// authentication left behind there would silently re-impose the refusal the topology claims
+    /// to have retired.
     #[test]
     fn the_admission_pairs_the_drains_precondition_with_its_stability_condition() {
         let admission = code(body_of(
             RUNTIME,
             "pub(crate) fn split_terminal_route_admission(",
-            1400,
+            2200,
         ));
         assert!(
             admission.contains("if dispatching > 1")
                 && admission.contains("if dispatch_cpu != cpu"),
-            "both conditions must be present and separately reported"
+            "both ambient conditions must still be present and separately reported for the \
+             AmbientBound routes that have not been individually migrated"
         );
+        let authority_short_circuit = admission
+            .find("if topology == TerminalRouteTopology::AuthorityBound")
+            .expect("the AuthorityBound topology must be named in the admission");
+        let ambient_pair = admission
+            .find("if dispatching > 1")
+            .expect("checked immediately above");
+        assert!(
+            authority_short_circuit < ambient_pair,
+            "the AuthorityBound short-circuit must precede the ambient pair — a route whose drain \
+             authenticates its own trap window must not be refused for the binding it does not read"
+        );
+        assert!(
+            admission[authority_short_circuit..ambient_pair].contains("return Ok(())"),
+            "and it must return admitted, not fall through into the conditions it retires"
+        );
+
         let owner = code(body_of(
             RUNTIME,
             "pub(crate) fn queue_advance_select_step_split(",
-            1400,
+            2400,
         ));
         assert!(
-            owner.contains("if dispatch_cpu != cpu"),
-            "the drain's selection owner must apply the same CPU authentication the admission does"
+            !owner.contains("sched.current_cpu"),
+            "the drain's selection owner must NOT read the single global binding: that read is the \
+             ambient authority U9-DISPATCH-CPU1 §1 removed, and leaving it would reinstate the \
+             cross-CPU refusal the AuthorityBound topology exists to close"
         );
         assert!(
-            owner.contains("let dispatch_cpu = sched.current_cpu;"),
-            "and it must read the single global binding — the fact the missing contract names"
+            owner.contains("authority.cpu()") && owner.contains("is_live()"),
+            "it authenticates the minted window instead — the CPU comes from the authority, and \
+             the window's liveness is what makes it a proof about THIS trap"
         );
     }
 }
