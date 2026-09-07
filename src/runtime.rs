@@ -554,6 +554,57 @@ impl DispatchAuthority {
     }
 }
 
+impl DispatchAuthority {
+    /// Test/hosted-only: authority for `cpu`'s CURRENT window, without opening a trap.
+    ///
+    /// Production code cannot reach this — the only production mint is
+    /// `TrapPathWindow::establish`, which `u9dispatchcpu1_authority` pins. Tests need it because
+    /// the forced interleavings drive the selection owner directly, with no architecture entry
+    /// underneath them.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn live_for_test(cpu: CpuId) -> Self {
+        let idx = cpu.0 as usize;
+        if idx >= crate::kernel::scheduler::MAX_CPUS {
+            return Self::none(cpu);
+        }
+        Self::mint(
+            cpu,
+            crate::kernel::boot::TRAP_DISPATCH_EPOCH[idx]
+                .load(core::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Test/hosted-only: an authority for `cpu` whose window has already closed.
+    ///
+    /// This is what §4's "wrong or stale authority mutates nothing" drives: it names a real,
+    /// online CPU and differs from a live one ONLY in its epoch.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn stale_for_test(cpu: CpuId) -> Self {
+        let idx = cpu.0 as usize;
+        if idx >= crate::kernel::scheduler::MAX_CPUS {
+            return Self::none(cpu);
+        }
+        // `u64::MAX` is the never-live sentinel and would be refused for the wrong reason, so a
+        // stale token is built by going BACKWARDS from the live epoch instead.
+        let live = crate::kernel::boot::TRAP_DISPATCH_EPOCH[idx]
+            .load(core::sync::atomic::Ordering::Acquire);
+        Self::mint(cpu, live.wrapping_sub(1) & (u64::MAX - 1))
+    }
+}
+
+/// U9-DISPATCH-CPU1 §3 — what a queue-advancing route's DRAIN authenticates against, and
+/// therefore what the route itself has to prove before publishing into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalRouteTopology {
+    /// The drain's selection authenticates against the ambient `sched.current_cpu`, so the route
+    /// must prove that binding is this CPU AND that no second dispatcher can rebind it in the
+    /// window. This is the delivered condition and every unmigrated family keeps it.
+    AmbientBound,
+    /// The drain's selection authenticates against the trap's own [`DispatchAuthority`], so the
+    /// route needs a drainer and nothing more.
+    AuthorityBound,
+}
+
 /// Why a selection step refused. **Every variant is produced strictly before any mutation**:
 /// nothing was dequeued, nothing became current, and no token can exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1338,7 +1389,8 @@ impl SharedKernel {
     ///
     /// Purely a read — a refusal mutates nothing, which is what lets every caller treat it as free.
     pub(crate) fn split_terminal_route_admitted(&self, cpu: CpuId) -> bool {
-        self.split_terminal_route_admission(cpu).is_ok()
+        self.split_terminal_route_admission(cpu, TerminalRouteTopology::AmbientBound)
+            .is_ok()
     }
 
     /// The same admission, reporting **which** condition refused.
@@ -1348,9 +1400,29 @@ impl SharedKernel {
     /// `no_trap_drainer` and `multi_cpu` as separate `YIELD_INLOCK_DISPATCH_FALLBACK` reasons — and
     /// a refusal that cannot be told apart in a log cannot be diagnosed. So the reason is typed at
     /// its source rather than reconstructed by each caller.
+    ///
+    /// # U9-DISPATCH-CPU1 §3 — the topology a route needs depends on what its DRAIN checks
+    ///
+    /// Conditions (1) and (2) are about this route: an out-of-range CPU has no cells, and without
+    /// a drainer the deferral is never consumed. Condition (3) was never about the route at all —
+    /// it was about the DRAIN, whose selection step authenticated against the ambient
+    /// `sched.current_cpu`. A route had to prove that binding was this CPU *and* that no second
+    /// dispatcher could rebind it before the drain ran.
+    ///
+    /// With the selection step now authenticated by the trap's own [`DispatchAuthority`], a drain
+    /// on that path no longer asks the ambient question, so a route that publishes into it no
+    /// longer has to answer it. `topology` names which of the two a caller is:
+    ///
+    /// * [`TerminalRouteTopology::AmbientBound`] — the delivered behaviour, unchanged, for every
+    ///   family whose gate has not been individually justified;
+    /// * [`TerminalRouteTopology::AuthorityBound`] — conditions (1) and (2) only.
+    ///
+    /// This is a parameter rather than a second function on purpose: one body, so the two
+    /// topologies cannot drift into disagreeing about what a drainer or a CPU range means.
     pub(crate) fn split_terminal_route_admission(
         &self,
         cpu: CpuId,
+        topology: TerminalRouteTopology,
     ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
         use crate::kernel::boot::TerminalAdmissionRefusal as R;
         let cpu_idx = cpu.0 as usize;
@@ -1361,6 +1433,13 @@ impl SharedKernel {
             .load(core::sync::atomic::Ordering::Relaxed)
         {
             return Err(R::NoTrapDrainer);
+        }
+        if topology == TerminalRouteTopology::AuthorityBound {
+            // The drain this route publishes into authenticates the trap window, not the ambient
+            // binding, and every scheduler operation between here and it addresses this CPU's own
+            // queue and current slot explicitly. There is nothing left for a second dispatcher to
+            // invalidate, so there is nothing left to refuse.
+            return Ok(());
         }
         let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
             let s = crate::kernel::boot::kernel_ref(&sched.scheduler);

@@ -54443,7 +54443,8 @@ mod stage168b_d2_recv_genuine_completion {
         // The trap-entry drain runs the queue-advancing dispatch via the seam.
         assert!(
             TRAP_ENTRY_SRC.contains("d2_recv_dispatch_is_deferred(cpu_idx)")
-                && TRAP_ENTRY_SRC.contains("shared.d2_recv_dispatch_step_mut(cpu)")
+                && TRAP_ENTRY_SRC
+                    .contains("shared.d2_recv_dispatch_step_mut(trap_path.authority())")
                 && TRAP_ENTRY_SRC.contains("D2_RECV_GENUINE_GLOBAL_DROPPED")
                 && TRAP_ENTRY_SRC.contains("D2_RECV_GENUINE_DISPATCH_ENTER")
                 && TRAP_ENTRY_SRC.contains("D2_RECV_GENUINE_DISPATCH_DONE"),
@@ -54460,7 +54461,7 @@ mod stage168b_d2_recv_genuine_completion {
             .find("let inner_result = inner_result?;")
             .expect("global-lock drop point");
         let drain_idx = TRAP_ENTRY_SRC
-            .find("shared.d2_recv_dispatch_step_mut(cpu)")
+            .find("shared.d2_recv_dispatch_step_mut(trap_path.authority())")
             .expect("recv dispatch drain");
         assert!(
             drain_idx > drop_idx,
@@ -54851,7 +54852,8 @@ mod stage169_d2_send_genuine {
         // Drain in trap entry runs after the global lock is dropped.
         assert!(
             TRAP_ENTRY_SRC.contains("d2_send_dispatch_is_deferred(cpu_idx)")
-                && TRAP_ENTRY_SRC.contains("shared.d2_send_dispatch_step_mut(cpu)")
+                && TRAP_ENTRY_SRC
+                    .contains("shared.d2_send_dispatch_step_mut(trap_path.authority())")
                 && TRAP_ENTRY_SRC.contains("D2_SEND_GENUINE_GLOBAL_DROPPED")
                 && TRAP_ENTRY_SRC.contains("D2_SEND_GENUINE_DISPATCH_DONE"),
             "trap entry must drain the deferred send dispatch out of the global lock"
@@ -54860,7 +54862,7 @@ mod stage169_d2_send_genuine {
             .find("let inner_result = inner_result?;")
             .expect("global-lock drop point");
         let drain_idx = TRAP_ENTRY_SRC
-            .find("shared.d2_send_dispatch_step_mut(cpu)")
+            .find("shared.d2_send_dispatch_step_mut(trap_path.authority())")
             .expect("send dispatch drain");
         assert!(
             drain_idx > drop_idx,
@@ -54988,7 +54990,8 @@ mod stage169_d2_send_genuine {
         // The recv orchestrator still defers via its own recv machinery.
         assert!(
             IPC_STATE_SRC.contains("d2_recv_dispatch_try_defer")
-                && TRAP_ENTRY_SRC.contains("shared.d2_recv_dispatch_step_mut(cpu)"),
+                && TRAP_ENTRY_SRC
+                    .contains("shared.d2_recv_dispatch_step_mut(trap_path.authority())"),
             "the Stage 168B recv path must remain intact"
         );
         // The send block orchestrator must not carry recv markers.
@@ -55133,7 +55136,9 @@ mod stage169_d2_send_genuine {
     /// Commit the same scheduler mutation the drains commit, and mint the same token.
     fn u3_mark(k: &SharedKernel) -> crate::runtime::DispatchMarkToken {
         k.with(|s| s.enqueue_task(U3_INCOMING).expect("enqueue"));
-        let dispatch = k.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = k.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         assert_eq!(dispatch.tid().map(|t| t.0), Some(U3_INCOMING));
         k.d6_genuine_mark_running_via_task_seam(dispatch)
             .token()
@@ -62884,7 +62889,7 @@ mod stage192a_queue_advancing_dispatch {
         assert!(
             TRAP_SRC.contains("futex_wait_was_deferred")
                 && TRAP_SRC.contains("shared.futex_wait_reverify_blocked(t)")
-                && TRAP_SRC.contains("shared.futex_wait_dispatch_step_mut(cpu)")
+                && TRAP_SRC.contains("shared.futex_wait_dispatch_step_mut(trap_path.authority())")
                 && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
                 && TRAP_SRC.contains("x86_post_lock_resume_marked_incoming("),
             "the trap-entry futex drain must reverify + dispatch-step + mark-running + restore"
@@ -62974,7 +62979,9 @@ mod stage192a_queue_advancing_dispatch {
         assert!(shared.futex_wait_reverify_blocked(blocked));
         // Queue-advancing dispatch: dequeues `next`, sets it current.
         let incoming = shared
-            .futex_wait_dispatch_step_mut(CpuId(0))
+            .futex_wait_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(CpuId(
+                0,
+            )))
             .tid()
             .map(|t| t.0);
         assert_eq!(
@@ -63033,7 +63040,9 @@ mod stage192a_queue_advancing_dispatch {
         // No other runnable ⇒ dispatch idles (the init-park case).
         assert_eq!(
             shared
-                .futex_wait_dispatch_step_mut(CpuId(0))
+                .futex_wait_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(
+                    CpuId(0)
+                ))
                 .tid()
                 .map(|t| t.0),
             None
@@ -63190,7 +63199,7 @@ mod stage192a_queue_advancing_dispatch {
     fn u3_futex_mark_outcomes_remain_explicit() {
         let src = u3_code_only(TRAP_SRC);
         let arms = src
-            .split("shared.futex_wait_dispatch_step_mut(cpu)")
+            .split("shared.futex_wait_dispatch_step_mut(trap_path.authority())")
             .nth(1)
             .expect("the futex mark site")
             .split("QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK")
@@ -63269,7 +63278,7 @@ mod stage192b_yield_queue_advancing_dispatch {
         assert!(
             TRAP_SRC.contains("yield_was_deferred")
                 && TRAP_SRC.contains("shared.yield_reverify_ready(cpu)")
-                && TRAP_SRC.contains("shared.yield_dispatch_step_mut(cpu)")
+                && TRAP_SRC.contains("shared.yield_dispatch_step_mut(trap_path.authority())")
                 && TRAP_SRC.contains("d6_genuine_mark_running_via_task_seam(dispatch)")
                 && TRAP_SRC.contains("x86_post_lock_resume_marked_incoming("),
             "the trap-entry yield drain must reverify + dispatch-step + mark-running + restore"
@@ -63363,7 +63372,10 @@ mod stage192b_yield_queue_advancing_dispatch {
         let shared = SharedKernel::new(state);
         // Reverify passes (current cleared) and the dispatch selects the FIFO head (other).
         assert!(shared.yield_reverify_ready(CpuId(0)));
-        let incoming = shared.yield_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0);
+        let incoming = shared
+            .yield_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(CpuId(0)))
+            .tid()
+            .map(|t| t.0);
         assert_eq!(incoming, Some(other), "dispatch selects the FIFO head");
         shared.with(|k| {
             assert_eq!(
@@ -63410,7 +63422,10 @@ mod stage192b_yield_queue_advancing_dispatch {
         assert_eq!(state.preempt_reenqueue_current_cpu(), Some(solo));
         let shared = SharedKernel::new(state);
         assert_eq!(
-            shared.yield_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
+            shared
+                .yield_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(CpuId(0)))
+                .tid()
+                .map(|t| t.0),
             Some(solo)
         );
         shared.with(|k| assert_eq!(k.current_tid_on_cpu(CpuId(0)), Some(solo)));
@@ -63567,7 +63582,7 @@ mod stage192b_yield_queue_advancing_dispatch {
     fn u3_yield_mark_outcomes_remain_explicit() {
         let src = u3_code_only(TRAP_SRC);
         let arms = src
-            .split("shared.yield_dispatch_step_mut(cpu)")
+            .split("shared.yield_dispatch_step_mut(trap_path.authority())")
             .nth(1)
             .expect("the yield mark site")
             .split("YIELD_DISPATCH_CURRENT_SET_OK")
@@ -76574,7 +76589,7 @@ mod stage196g_riscv_yield_default_on {
             "shared.yield_reverify_ready(cpu)",
             "RISCV_YIELD_DISPATCH_LOCK_DROPPED_OK cpu={}",
             "RISCV_YIELD_DISPATCH_REVERIFY_OK outgoing={}",
-            "shared.yield_dispatch_step_mut(cpu)",
+            "shared.yield_dispatch_step_mut(trap_path.authority())",
             "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
             "RISCV_YIELD_DISPATCH_CURRENT_SET_OK cpu={} incoming={}",
             "RISCV_YIELD_DISPATCH_RUNNING_OK incoming={}",
@@ -110576,7 +110591,11 @@ mod stage199d_aarch64_offlock_dispatch {
         );
         // Settlement happens anyway, and the dequeue legitimately selects that very caller.
         assert_eq!(
-            k.futex_wait_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
+            k.futex_wait_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(
+                CpuId(0)
+            ))
+            .tid()
+            .map(|t| t.0),
             Some(OUTGOING),
             "the woken caller is a normal dispatch candidate"
         );
@@ -110615,7 +110634,11 @@ mod stage199d_aarch64_offlock_dispatch {
         // The debt is still owed and still settleable: another task is runnable.
         k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
         assert_eq!(
-            k.futex_wait_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
+            k.futex_wait_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(
+                CpuId(0)
+            ))
+            .tid()
+            .map(|t| t.0),
             Some(INCOMING)
         );
         dd::reset();
@@ -110792,7 +110815,9 @@ mod stage199d_aarch64_offlock_dispatch {
         k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
 
         // Commit the scheduler mutation, exactly as the drain does.
-        let dispatch = k.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = k.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         let inc = dispatch.tid().map(|t| t.0).expect("dequeue");
         assert_eq!(inc, INCOMING);
         let token = k
@@ -110833,7 +110858,11 @@ mod stage199d_aarch64_offlock_dispatch {
         );
         // The task is back on the run queue — not lost.
         assert_eq!(
-            k.futex_wait_dispatch_step_mut(CpuId(0)).tid().map(|t| t.0),
+            k.futex_wait_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(
+                CpuId(0)
+            ))
+            .tid()
+            .map(|t| t.0),
             Some(INCOMING),
             "the rolled-back task must still be dispatchable"
         );
@@ -111003,7 +111032,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .nth(1)
             .and_then(|s| s.split("\n    // Stage 192A").next())
             .expect("the direct dispatch drain");
-        assert!(drain.contains("shared.futex_wait_dispatch_step_mut(cpu)"));
+        assert!(drain.contains("shared.futex_wait_dispatch_step_mut(trap_path.authority())"));
         assert!(drain.contains("d6_genuine_mark_running_via_task_seam(dispatch)"));
         assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch"));
         // The rollback uses the existing exact inverse of the dequeue, not a new primitive.
@@ -121605,7 +121634,9 @@ mod stage199d_wa3a_transition_barriers {
         });
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
         // Commit the rank-1 dequeue exactly as a drain does, then mark.
-        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         assert_eq!(dispatch.tid().map(|t| t.0), Some(BLOCKED));
         assert_eq!(
             kernel.d6_genuine_mark_running_via_task_seam(dispatch),
@@ -121680,7 +121711,9 @@ mod stage199d_wa3a_transition_barriers {
             );
         });
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
-        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         assert_eq!(
             dispatch,
             crate::runtime::CpuDispatch::Selected {
@@ -121778,7 +121811,9 @@ mod stage199d_wa3a_transition_barriers {
             );
         });
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
-        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         assert_eq!(
             dispatch,
             crate::runtime::CpuDispatch::Selected {
@@ -121815,7 +121850,9 @@ mod stage199d_wa3a_transition_barriers {
             s.bind_task_asid(OTHER, asid).expect("bind");
             s.enqueue_task(OTHER).expect("enqueue");
         });
-        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         let token = kernel
             .d6_genuine_mark_running_via_task_seam(dispatch)
             .token()
@@ -121844,7 +121881,9 @@ mod stage199d_wa3a_transition_barriers {
             s.register_task(BLOCKED).expect("register");
             s.enqueue_task(BLOCKED).expect("enqueue");
         });
-        let sel = bare.futex_wait_dispatch_step_mut(CpuId(0));
+        let sel = bare.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         let outcome = bare.d6_genuine_mark_running_via_task_seam(sel);
         assert_eq!(outcome.token(), None, "no ASID ⇒ no token");
         assert_ne!(
@@ -121935,7 +121974,9 @@ mod stage199d_wa3a_transition_barriers {
         );
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
 
-        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         assert_eq!(
             dispatch,
             crate::runtime::CpuDispatch::Selected {
@@ -121986,7 +122027,9 @@ mod stage199d_wa3a_transition_barriers {
         );
         let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
 
-        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         assert_eq!(
             dispatch,
             crate::runtime::CpuDispatch::Selected {
@@ -122127,7 +122170,9 @@ mod stage199d_wa3a_transition_barriers {
             s.dispatch_next_task().expect("dispatch");
         });
         // A REAL queue-neutral mark: current is set, non-idle, Running, with an exact ASID.
-        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(0));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
         let token = kernel
             .d6_genuine_mark_running_via_task_seam(dispatch)
             .token()
@@ -122186,13 +122231,19 @@ mod stage199d_wa3a_transition_barriers {
         let status_before = kernel.with(|s| s.task_status(OTHER));
         let current_before = kernel.current_tid_authoritative(CpuId(0));
 
-        // CPU 3 is NOT the authoritative dispatch CPU (which is CPU 0 here).
-        let dispatch = kernel.futex_wait_dispatch_step_mut(CpuId(3));
+        // U9-DISPATCH-CPU1 §1: re-derived, not deleted. This guard held the step to "a CPU that
+        // is not the one dispatching selects nothing, and mutates nothing". The FACT that makes
+        // CPU 3 wrong has changed — it is refused because it is not an ONLINE scheduler CPU, not
+        // because the ambient `sched.current_cpu` names someone else — but the property the guard
+        // exists for, zero mutation on refusal, is exactly the same and is still checked below.
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(3)),
+        );
         assert_eq!(
             dispatch,
-            crate::runtime::CpuDispatch::RefusedCpuMismatch {
+            crate::runtime::CpuDispatch::Refused {
                 requested: CpuId(3),
-                authoritative: CpuId(0)
+                reason: crate::runtime::DispatchAuthorityRefusal::CpuOffline,
             }
         );
         assert_eq!(dispatch.tid(), None, "nothing was selected");
@@ -128969,7 +129020,8 @@ mod u4_cross_arch_queue_advancing_dispatch {
             "the outgoing sender must still be Blocked(EndpointSend)"
         );
         // 2. THE one rank-1 dequeue.
-        let dispatch = k.d2_send_dispatch_step_mut(cpu);
+        let dispatch =
+            k.d2_send_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(cpu));
         assert_eq!(
             dispatch.tid().map(|t| t.0),
             Some(INCOMING),
@@ -143593,7 +143645,7 @@ mod u9qa_split_dispatch_disposition {
             "one drain call site in the trap entry"
         );
         assert_eq!(
-            code.matches("shared.futex_wait_dispatch_step_mut(cpu)")
+            code.matches("shared.futex_wait_dispatch_step_mut(trap_path.authority())")
                 .count(),
             3,
             "the three existing per-architecture FutexWait drain sites, unchanged in number"
@@ -143681,7 +143733,7 @@ mod u9qa_split_dispatch_disposition {
         // No second drain: the Stage 196E FutexWait drain remains the only one, entered once.
         assert_eq!(
             RISCV_TRAP
-                .matches("shared.futex_wait_dispatch_step_mut(cpu)")
+                .matches("shared.futex_wait_dispatch_step_mut(trap_path.authority())")
                 .count(),
             1,
             "the one existing RISC-V FutexWait drain settles it"
@@ -144054,7 +144106,11 @@ mod u9qa_one_queue_advance_owner {
         // The wake lands in the admit -> commit window.
         shared.with(|k| k.enqueue_on_cpu(CpuId(0), 90101).expect("wake enqueue"));
         // The commit is handed the EMPTY admission and must still select the woken task.
-        let outcome = shared.queue_advance_commit_split(CpuId(0), 90100, None);
+        let outcome = shared.queue_advance_commit_split(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+            90100,
+            None,
+        );
         assert!(
             matches!(
                 outcome,
@@ -144101,7 +144157,11 @@ mod u9qa_one_queue_advance_owner {
         let queued_before = state.runnable_count_on_cpu(CpuId(0));
         let shared = SharedKernel::new(state);
 
-        let outcome = shared.queue_advance_commit_split(CpuId(0), 90200, Some(90201));
+        let outcome = shared.queue_advance_commit_split(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+            90200,
+            Some(90201),
+        );
         assert_eq!(
             outcome,
             QueueAdvanceOutcome::TerminalIdle,
@@ -144137,16 +144197,22 @@ mod u9qa_one_queue_advance_owner {
         let runnable_before = state.runnable_count_on_cpu(CpuId(0));
         let shared = SharedKernel::new(state);
 
-        let refused = shared.queue_advance_select_step_split(CpuId(3), "test");
+        // U9-DISPATCH-CPU1 §1: same re-derivation as the FutexWait guard — CPU 3 is refused for
+        // being offline rather than for disagreeing with the ambient binding, and the invariant
+        // the guard protects (a refusal touches nothing) is unchanged.
+        let refused = shared.queue_advance_select_step_split(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(3)),
+            "test",
+        );
         assert!(
             matches!(
                 refused,
-                CpuDispatch::RefusedCpuMismatch {
+                CpuDispatch::Refused {
                     requested: CpuId(3),
-                    authoritative: CpuId(0)
+                    reason: crate::runtime::DispatchAuthorityRefusal::CpuOffline,
                 }
             ),
-            "a foreign CPU must be refused with both identities reported"
+            "a CPU with no runqueue must be refused, naming why"
         );
         assert_eq!(
             shared.with(|k| k.runnable_count_on_cpu(CpuId(0))),
@@ -144154,7 +144220,10 @@ mod u9qa_one_queue_advance_owner {
             "a refusal must leave the run queue untouched"
         );
 
-        let selected = shared.queue_advance_select_step_split(CpuId(0), "test");
+        let selected = shared.queue_advance_select_step_split(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+            "test",
+        );
         assert_eq!(
             selected.tid().map(|t| t.0),
             Some(90001),
@@ -164393,42 +164462,103 @@ mod u9yield2_family_edge {
         }
     }
 
-    /// **THE BOUNDARY, demonstrated rather than argued.** `queue_advance_select_step_split` is the
-    /// ONE selection owner every queue-advancing drain uses, and it refuses a CPU that is not the
-    /// bound `scheduler.current_cpu` — before any mutation, with `tid()` of `None`.
+    /// **THE BOUNDARY, REMOVED — and this is the guard that used to demonstrate it.**
     ///
-    /// For Yield "no incoming" is not idle: the caller has already been re-enqueued and `current`
-    /// already cleared, so all three drains call it an invariant failure and the CPU returns to
-    /// userspace having advanced its queue with nothing selected. That is what the admission's
-    /// `dispatch_cpu == cpu` condition prevents — and it is the drain's own precondition, not an
-    /// exclusion this family may relax.
+    /// U9-YIELD2 §3 pinned the defect here: `queue_advance_select_step_split` refused any CPU that
+    /// was not the bound `scheduler.current_cpu`, so a drain on CPU A whose window CPU B had
+    /// rebound selected nothing, on a queue A had already advanced. The guard asserted that
+    /// refusal, because it was true.
+    ///
+    /// U9-DISPATCH-CPU1 §1 makes it false, and the guard now holds the step to the OPPOSITE
+    /// property: with live authority for a genuinely online CPU, the selection is admitted **no
+    /// matter what the ambient binding says**, and it advances that CPU's own queue and no other.
+    /// This is the §4 interleaving stated as a unit test — A publishes, B rebinds the ambient
+    /// field, A still selects, and only on A.
     #[test]
-    fn the_queue_advance_selection_owner_refuses_a_cpu_it_is_not_bound_to() {
+    fn the_selection_owner_admits_its_own_cpu_whatever_the_ambient_binding_says() {
         let kernel = SharedKernel::new(crate::kernel::boot::Bootstrap::init().expect("init"));
         kernel.with(|state| {
             state.bring_up_cpu(AP).expect("a second dispatching CPU");
-            state.set_current_cpu(BSP).expect("bound to the BSP");
+            state.register_task(9101).expect("register on the AP");
+            state.enqueue_on_cpu(AP, 9101).expect("queued on the AP");
+            state.register_task(9100).expect("register on the BSP");
+            state.enqueue_on_cpu(BSP, 9100).expect("queued on the BSP");
+            // CPU B takes the broad lock and rebinds the ambient field to itself — exactly the
+            // event that used to invalidate A's in-flight window.
+            state
+                .set_current_cpu(BSP)
+                .expect("ambient bound to the BSP");
         });
-        let before = kernel.with(|state| state.runnable_count_on_cpu(AP));
-        let dispatch = kernel.queue_advance_select_step_split(AP, "u9yield2_boundary");
-        assert!(
-            matches!(
-                dispatch,
-                CpuDispatch::RefusedCpuMismatch {
-                    requested: AP,
-                    authoritative: BSP
-                }
-            ),
-            "the selection owner must refuse a CPU it is not bound to, naming both"
+        let ap_before = kernel.with(|state| state.runnable_count_on_cpu(AP));
+        let bsp_before = kernel.with(|state| state.runnable_count_on_cpu(BSP));
+
+        let dispatch = kernel.queue_advance_select_step_split(
+            crate::runtime::DispatchAuthority::live_for_test(AP),
+            "u9dispatchcpu1_ap",
         );
         assert!(
-            dispatch.tid().is_none(),
-            "a refused selection must carry no incoming task — which for Yield is the stranding"
+            matches!(dispatch, CpuDispatch::Selected { cpu, .. } if cpu == AP),
+            "the AP's own authority must be admitted while the ambient field names the BSP, got {dispatch:?}"
+        );
+        assert_eq!(
+            dispatch.tid().map(|t| t.0),
+            Some(9101),
+            "and it must select from the AP's OWN queue, never the bound CPU's"
         );
         assert_eq!(
             kernel.with(|state| state.runnable_count_on_cpu(AP)),
+            ap_before - 1,
+            "exactly one task left the AP's queue"
+        );
+        assert_eq!(
+            kernel.with(|state| state.runnable_count_on_cpu(BSP)),
+            bsp_before,
+            "and the BSP's queue — the ambient CPU's — was not touched at all"
+        );
+    }
+
+    /// **A stale authority mutates nothing.** The one-shot epoch is what makes an authority a
+    /// proof about THIS trap rather than about a CPU number: a token kept past its window names a
+    /// real, online CPU and still authorizes nothing.
+    #[test]
+    fn a_stale_authority_selects_nothing_and_mutates_nothing() {
+        let kernel = SharedKernel::new(crate::kernel::boot::Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.register_task(9200).expect("register");
+            state.enqueue_on_cpu(BSP, 9200).expect("queued");
+            state.set_current_cpu(BSP).expect("bound");
+        });
+        let before = kernel.with(|state| state.runnable_count_on_cpu(BSP));
+        let stale = crate::runtime::DispatchAuthority::stale_for_test(BSP);
+        assert!(!stale.is_live(), "the fixture must actually be stale");
+
+        let dispatch = kernel.queue_advance_select_step_split(stale, "u9dispatchcpu1_stale");
+        assert!(
+            matches!(
+                dispatch,
+                CpuDispatch::Refused {
+                    requested: BSP,
+                    reason: crate::runtime::DispatchAuthorityRefusal::StaleWindow,
+                }
+            ),
+            "a stale window must be refused BY NAME, got {dispatch:?}"
+        );
+        assert!(dispatch.tid().is_none(), "nothing was selected");
+        assert_eq!(
+            kernel.with(|state| state.runnable_count_on_cpu(BSP)),
             before,
-            "and it must refuse BEFORE any mutation: nothing dequeued"
+            "and nothing was dequeued — the refusal precedes every mutation"
+        );
+        // The live authority for the same CPU still works, so the refusal was about the WINDOW
+        // and not about the CPU.
+        let live = kernel.queue_advance_select_step_split(
+            crate::runtime::DispatchAuthority::live_for_test(BSP),
+            "u9dispatchcpu1_live",
+        );
+        assert_eq!(
+            live.tid().map(|t| t.0),
+            Some(9200),
+            "the live window selects"
         );
     }
 
