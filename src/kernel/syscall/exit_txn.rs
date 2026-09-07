@@ -251,10 +251,12 @@ fn settle_failed_claim<O: ExitOwners>(
     token: ClearedCurrentToken,
     cpu: CpuId,
     tid: u64,
-    asid: Option<Asid>,
     refusal: ExitRefusal,
 ) -> ExitFailure {
-    let _ = asid;
+    // `asid` is deliberately not a parameter. U9-EXIT3 passed it so the caller could ask
+    // `victim_is_drain_honourable` itself; U9-EXIT4 moved that admission inside the settlement, and
+    // the token already carries the exact `{tid, asid}` it cleared. Threading a second copy through
+    // here is how the two would drift.
     let token = match token.restore_current_exact(owners) {
         Ok(ClearedCurrentSettlement::Restored) => {
             // Restored: the task is current again and nothing is being advanced past, so the
@@ -441,14 +443,7 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
             if let Some(reservation) = death_reservation {
                 owners.release_server_death(reservation);
             }
-            return Err(settle_failed_claim(
-                owners,
-                token,
-                cpu,
-                tid,
-                preflight.asid,
-                refusal,
-            ));
+            return Err(settle_failed_claim(owners, token, cpu, tid, refusal));
         }
     };
 
