@@ -728,6 +728,17 @@ pub(crate) fn try_split_dispatch_into_frame(
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
+    // U9-RESIDUAL1 §3 — the FIFTH switching class, and the last one whose queue advance was
+    // already leaving the broad lock while its DECISION was not. Yield is tried here for the same
+    // reason the four above it are: the NR-only whitelist's contract is that every class on it may
+    // be early-returned through the caller's own frame, and a yielding task is re-enqueued behind
+    // whatever the drain selects. It answers `QueueAdvanceCommitted` so the EXISTING post-lock
+    // Yield drain — present and default-on on all three architectures since 192B/195G/196G —
+    // selects and applies the next context.
+    match try_split_yield_into_frame(shared, cpu, frame) {
+        SplitDispatchDisposition::NotHandled => {}
+        handled => return handled,
+    }
     match try_split_dispatch_nonswitching_into_frame(shared, cpu, frame) {
         None => SplitDispatchDisposition::NotHandled,
         Some(result) => SplitDispatchDisposition::Complete(result),
@@ -5297,4 +5308,111 @@ mod tests {
             "Stage 42+43 adds RecvSharedV3 (NR 30); stage32b invariant updated"
         );
     }
+}
+
+/// U9-RESIDUAL1 §3 — the syscall number this trap ACTUALLY carries, per architecture.
+///
+/// x86_64 and RISC-V decode the number into the frame at entry, so `frame.syscall_num()` is
+/// authoritative there. AArch64 does not: `pre_split_import_syscall_abi` imports the decoded ABI
+/// only for an allowlisted number, and an unlisted syscall leaves the frame reading `nr = 0`.
+///
+/// For every other split class that is harmless — their numbers are non-zero, so an unimported
+/// frame simply declines. **NR 0 is different**: 0 is Yield's own number, so on AArch64
+/// `frame.syscall_num() == 0` is true for a Yield *and* for every unlisted syscall, and a route
+/// gated on it alone would fire for `VmMap`, `IpcCall`, `IpcReply` and the rest.
+///
+/// So this reads the raw `x8` on AArch64 — the same register `pre_split_import_syscall_abi` peeks
+/// to make its own decision, and the authoritative source of the trapped number before any import.
+#[cfg(not(feature = "hosted-dev"))]
+fn trapped_syscall_nr(frame: &TrapFrame) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        frame.syscall_num()
+    }
+}
+
+/// U9-RESIDUAL1 §3 — service `Yield` (NR 0) off the broad lock, on all three architectures.
+///
+/// # What this adds, and what it does not
+///
+/// It adds no policy. The decision is `yield_txn::run_yield_transaction`, the same one
+/// `KernelState::yield_current` drives through `BroadYieldOwners`; this route drives it through
+/// `SharedYieldOwners`, whose methods take one domain lock each with the broad
+/// `SpinLock<KernelState>` released. Every gate, every ordering and every marker is that
+/// transaction's.
+///
+/// # Why declining is always safe here
+///
+/// Every `YieldDecline` is pre-mutation — the one step that can fail after a write rolls that write
+/// back through the named inverse — so `NotHandled` hands a byte-for-byte unchanged world to the
+/// broad path, which then runs the identical decision through the identical owners and produces the
+/// identical outcome. This is a fallback BEFORE consumption, never after: past the commit the
+/// caller is queued exactly once, `current` is empty, and the deferral is published.
+///
+/// # The two things this route owns
+///
+/// The telemetry increment (the broad path counts on entry; this route counts only what it commits,
+/// so a decline is counted exactly once by the broad path that then runs) and the syscall's own
+/// result, written into the outgoing frame before the drain switches away from it.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_yield_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    use crate::kernel::syscall::yield_txn;
+    use SplitDispatchDisposition as D;
+
+    if trapped_syscall_nr(frame) != crate::kernel::syscall::SYSCALL_YIELD_NR {
+        return D::NotHandled;
+    }
+    if (cpu.0 as usize) >= crate::kernel::scheduler::MAX_CPUS {
+        return D::NotHandled;
+    }
+    let mut owners = yield_txn::SharedYieldOwners { shared };
+    match yield_txn::run_yield_transaction(&mut owners, cpu) {
+        Ok(outcome) => {
+            // The publish-side vocabulary, in this architecture's exact delivered strings. The
+            // broad path never runs for a committed yield, so this is emitted once per NR 0 just
+            // as it always was.
+            yield_txn::log_yield_deferred(cpu, outcome.outgoing);
+            // Telemetry: the broad path's entry increment is not reached on this route, so the
+            // count is owed here. Exactly one per yield, either way.
+            shared.count_yield_split_mut();
+            crate::yarm_log!(
+                "YIELD_SPLIT_COMMITTED cpu={} tid={}",
+                cpu.0,
+                outcome.outgoing
+            );
+            // (7) The syscall's own result, into the OUTGOING frame, before the switch — the same
+            // `frame.set_ok(0, 0, 0)` `handle_yield` performs, at the same point relative to the
+            // deferral.
+            frame.set_ok(0, 0, 0);
+            D::QueueAdvanceCommitted
+        }
+        Err(decline) => {
+            // A DISTINCT marker from the in-lock fallback's. The broad path will now run the same
+            // decision and emit its own `*_INLOCK_DISPATCH_FALLBACK`, so reusing that string here
+            // would double-count it; this names the split attempt, which is a different event.
+            crate::yarm_log!(
+                "YIELD_SPLIT_REFUSED cpu={} reason={}",
+                cpu.0,
+                yield_txn::legacy_reason(decline)
+            );
+            D::NotHandled
+        }
+    }
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_yield_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
 }

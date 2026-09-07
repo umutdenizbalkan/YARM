@@ -73632,9 +73632,37 @@ mod stage195a_aarch64_debuglog_live {
             body.contains("SYSCALL_FUTEX_WAIT_NR"),
             "AArch64 imports FutexWait (NR 9) — the one switching pre-lock class"
         );
+        // U9-RESIDUAL1 §3: Yield (NR 0) IS now imported, for the reason this guard was written to
+        // withhold it — it has a pre-lock route. The selectivity claim this case owns is unchanged:
+        // the import is a whitelist, not a blanket import, and the way to check that is to show a
+        // syscall WITHOUT a pre-lock route is still excluded.
         assert!(
-            !body.contains("SYSCALL_YIELD_NR"),
-            "the import must stay a whitelist: Yield has no pre-lock route"
+            body.contains("SYSCALL_YIELD_NR"),
+            "AArch64 imports Yield (NR 0) — the fifth switching pre-lock class"
+        );
+        for absent in [
+            "SYSCALL_VM_MAP_NR",
+            "SYSCALL_VM_ANON_MAP_NR",
+            "SYSCALL_TRANSFER_RELEASE_NR",
+            "SYSCALL_RECV_SHARED_V3_NR",
+        ] {
+            assert!(
+                !body.contains(absent),
+                "the import must stay a whitelist: `{absent}` has no pre-lock route"
+            );
+        }
+        // NR 0 is the one entry for which the whitelist alone is not sufficient, because an
+        // UNLISTED syscall leaves the frame reading `nr = 0` — which is Yield's own number. The
+        // split route must therefore read the raw x8 rather than the frame's decoded number, or it
+        // would fire for every unlisted syscall on this architecture.
+        assert!(
+            SPLIT_SRC.contains("fn trapped_syscall_nr(frame: &TrapFrame) -> usize {")
+                && SPLIT_SRC.contains("frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8)")
+                && SPLIT_SRC.contains(
+                    "if trapped_syscall_nr(frame) != crate::kernel::syscall::SYSCALL_YIELD_NR {"
+                ),
+            "the split Yield route must gate on the raw trapped number, not the frame's decoded \
+             `nr`, which an unimported AArch64 frame reports as 0"
         );
     }
 
@@ -73822,15 +73850,16 @@ mod stage195c_aarch64_futex_wake_live {
             import.contains("SYSCALL_FUTEX_WAKE_NR"),
             "the AArch64 ABI gate must include FutexWake (NR 10) as of Stage 195C"
         );
-        // U9-QA §2 admitted FutexWait as the one SWITCHING class; Yield still has no pre-lock
-        // route and must stay out.
+        // U9-QA §2 admitted FutexWait as the first SWITCHING class; U9-RESIDUAL1 §3 admitted Yield
+        // as the fifth, once it had a pre-lock route — which is the condition this guard was
+        // written to hold it to, not a bar on the class itself.
         assert!(
             import.contains("SYSCALL_FUTEX_WAIT_NR"),
             "the AArch64 gate admits FutexWait (NR 9) as of U9-QA §2"
         );
         assert!(
-            !import.contains("SYSCALL_YIELD_NR"),
-            "the AArch64 gate must NOT enable queue-advancing Yield"
+            import.contains("SYSCALL_YIELD_NR"),
+            "the AArch64 gate admits Yield (NR 0) as of U9-RESIDUAL1 §3"
         );
     }
 
@@ -162074,6 +162103,12 @@ mod u9exit2_total_nr16_disposition {
             .split("fn try_split_exit_current_task(")
             .nth(1)
             .expect("the route");
+        // Bound the slice to THIS route. U9-RESIDUAL1 §3 added a second `QueueAdvanceCommitted`
+        // answerer to this file — the split Yield route — and an unbounded slice would count its
+        // arm as one of the exit route's.
+        let route = &route[..route
+            .find("\n/// U9-REAP1 §4 — NR 31")
+            .unwrap_or(route.len())];
         // Two: the success arm, and the post-clear ADVANCE arm — which is the same answer for
         // the same reason, reached because a competing owner rather than this transaction made the
         // victim terminal. Both are licensed by a live reservation.

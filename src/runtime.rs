@@ -1131,6 +1131,19 @@ impl SharedKernel {
     pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {
         self.split_terminal_route_admitted(cpu)
     }
+    /// U9-RESIDUAL1 §3 — count one yield, rank 3.
+    ///
+    /// The broad `yield_current` increments `scheduler_yield_calls` on entry, before it knows
+    /// whether it will defer, because it counts the in-lock yields too. The split route never
+    /// reaches that increment, so it owes the count for exactly the yields it commits — and a
+    /// declined split is counted by the broad path that then runs. One increment per NR 0 either
+    /// way; the counter's meaning is unchanged.
+    pub(crate) fn count_yield_split_mut(&self) {
+        self.with_ipc_split_mut(|ipc| {
+            ipc.telemetry.scheduler_yield_calls =
+                ipc.telemetry.scheduler_yield_calls.saturating_add(1);
+        });
+    }
 
     /// U9-RESIDUAL1 §1/§3 — **THE** topology admission for a split route that publishes a
     /// queue-advance deferral, and the only place its three conditions are decided.
