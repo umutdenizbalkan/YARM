@@ -240,12 +240,25 @@ pub(crate) trait ExitOwners: ClearedCurrentOwners {
 /// `exit_preflight_locked` at step (3) established `{TCB present, asid, !detached, Running}`;
 /// `claim_self_exit_locked` re-checks exactly those four; and steps (4)–(7) between them write no
 /// TCB — a read-only reverse-link probe, two per-CPU deferral cells, the rank-1 current slot, and
-/// the restart-token counter. A concurrent writer would need to run on this CPU (impossible: every
-/// architecture masks interrupts for the whole trap — x86_64 `IA32_FMASK = RFLAGS.IF`, AArch64
-/// hardware `DAIF` masking with no `daifclr` on the trap path, RISC-V hardware `sstatus.SIE` clear
-/// with the one re-enable confined to the terminal-idle tail) or on another dispatching CPU (there
-/// is exactly one). So `settle_failed_claim` is the typed capability for states that cannot occur,
-/// and §4 constructs them by injection in the hosted harness instead.
+/// the restart-token counter. A concurrent writer would need to run either on this CPU or on
+/// another dispatching one, and both are excluded — but **U9-RESIDUAL1 §1 corrects how**:
+///
+/// * *on this CPU* — impossible: every architecture masks interrupts for the whole trap. x86_64
+///   `IA32_FMASK = RFLAGS.IF`; AArch64 hardware `DAIF` masking with no `daifclr` on the trap path;
+///   RISC-V hardware `sstatus.SIE` clear with the one re-enable confined to the terminal-idle tail.
+///   Unchanged, and still a topology-independent fact.
+/// * *on another dispatching CPU* — U9-EXIT4 asserted "there is exactly one", citing a Stage-189B
+///   note that Stage 189C6 had already invalidated: the default-off `yarm.ap_user_dispatch` knob
+///   can clear an AP's wake-only bit, producing a second dispatcher. The correct ground is the
+///   ADMISSION, not the topology. `exit_route_admitted_split` refuses at step (1), before any
+///   mutation, unless `(online & !wake_only).count_ones() <= 1` **and** that one dispatcher is this
+///   CPU. So the transaction never opens a window in a multi-dispatcher configuration; it declines
+///   to start. And the topology it read cannot shift underneath it, because every writer of either
+///   bitmap takes the broad lock from the boot orchestrator's one-shot SMP bring-up, before
+///   userspace exists.
+///
+/// So `settle_failed_claim` is the typed capability for states that cannot occur, and §4
+/// constructs them by injection in the hosted harness instead.
 fn settle_failed_claim<O: ExitOwners>(
     owners: &mut O,
     token: ClearedCurrentToken,
@@ -324,11 +337,35 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
     // (1) Admission. No drainer, or not the authoritative dispatcher, means the deferral this
     // route depends on would never be consumed.
     //
-    // U9-EXIT2 §1: class B. `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` is set before any userspace
-    // task runs on that CPU; the dispatching-CPU count is 1 in every production configuration
-    // because the only site that clears an AP's wake-only bit is unreachable (Stage 189B, its own
-    // comment: "Unreachable in Stage 189B — trap_return_ready is never set"); and a wake-only AP
-    // dispatches no user task, so no userspace syscall can originate on one.
+    // U9-RESIDUAL1 §1 — this admission is the PROTECTION, not a formality.
+    //
+    // U9-EXIT2 §1 classified this refusal as unreachable "class B", on the ground that the
+    // dispatching-CPU count is 1 in every production configuration because the only site clearing
+    // an AP's wake-only bit is unreachable. **That ground was stale.** Stage 189C6 bound that
+    // site's `trap_return_ready` to the default-off `yarm.ap_user_dispatch` knob, so a second
+    // dispatching CPU IS producible in a production build.
+    //
+    // The refusal is therefore reclassified as REACHABLE, and nothing downstream depends on it
+    // being otherwise. `exit_route_admitted_split` re-derives the topology itself, from scheduler
+    // state, in one rank-1 acquisition, before this transaction mutates anything:
+    //
+    //   * `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` — this CPU is running a post-lock drainer, so
+    //     the deferral this route publishes will actually be consumed;
+    //   * `(online & !wake_only).count_ones() <= 1` — at most one CPU dispatches. Wake-only APs
+    //     are excluded from the count by construction: they are online for wake/accounting but
+    //     run no dispatcher, so they can neither originate this syscall nor race the settlement;
+    //   * `sched.current_cpu == cpu` — and that one dispatcher is *this* CPU.
+    //
+    // Refusing costs nothing: no reservation is taken, no cell is written and no TCB is touched,
+    // so `RouteNotAdmitted` is settled as `InvalidPreLock` exactly like any other pre-mutation
+    // refusal. Under `yarm.ap_user_dispatch=1` the count is 2, this route never admits, and the
+    // exit is answered by a typed refusal rather than by a transaction running on an assumption
+    // that no longer holds.
+    //
+    // The topology the admission reads cannot change while the window is open: every production
+    // writer of the online or wake-only bitmaps (`bring_up_cpu`, `mark_cpu_wake_only`) takes
+    // `&mut KernelState`, and all of them are reached only from the boot orchestrator's one-shot
+    // SMP bring-up, before any userspace task runs. See `u9residual1_terminal_admission`.
     if !owners.exit_route_admitted(cpu) {
         return Err(refuse(ExitRefusal::RouteNotAdmitted));
     }

@@ -14177,7 +14177,9 @@ path unchanged.
 `CLEARED_CURRENT_ADVANCE` counting one per boot is the ordinary successful exit: the success path
 settles its cleared slot through the same token, with the claim as authority. No boot took a
 restore, a fatal, or a post-clear failure — which is what the source classification predicts, since
-every competing owner needs a concurrency the single dispatching CPU does not provide.
+every competing owner needs a concurrency the admitted single-dispatcher topology does not provide.
+(U9-RESIDUAL1 §1 corrects the ground for that topology: it is enforced by the route's admission,
+not guaranteed by the platform.)
 
 **No live race is manufactured.** The competing-owner interleavings are hosted and deterministic;
 inventing timing in QEMU would prove nothing that the forced races do not prove better.
@@ -14227,8 +14229,12 @@ enqueued. What excludes them is not a gate but the absence of any agent that cou
   on synchronous exception entry and neither the AArch64 trap handler nor the shared bridge contains
   a `daifclr`. RISC-V hardware clears `sstatus.SIE` on trap entry and the single re-enable
   (`set_sstatus_sie`) is confined to `reestablish_idle_boundary`, the audited terminal-idle tail.
-* **there is one dispatching CPU**, as U9-EXIT2 §1 established, and it is executing this
-  transaction.
+* **at most one CPU dispatches, and it is this one** — but *not* for the reason U9-EXIT4 gave. It
+  cited U9-EXIT2 §1, which in turn cited a Stage-189B note in `try_enable_ap_user_dispatch`
+  claiming that site is unreachable. **That note was stale, and this record corrects it** — see
+  U9-RESIDUAL1 §1. The fact the row needs is supplied instead by the route's own ADMISSION,
+  `SharedKernel::exit_route_admitted_split`, which re-derives the topology from scheduler state
+  before any mutation and refuses otherwise.
 
 **The consequence is stronger than the question asked.** A claim refusal is itself
 production-impossible. `exit_preflight_locked` at step (3) reads `{present, asid, !detached,
@@ -14399,3 +14405,137 @@ caused by the exit work — is re-established here against the current base rath
 
 The census stays at 2/0/2. This stage retires no acquisition — it did not set out to; it closes the
 race surface of an acquisition already retired by U9-EXIT1.
+
+## U9-RESIDUAL1 — the terminal admission, corrected; and NR 0 selected
+
+### §1 — EXIT4's proof rested on a stale fact
+
+U9-EXIT2 §1 classified `ExitRefusal::RouteNotAdmitted` as **class B, mechanically impossible**, and
+U9-EXIT4 §1 built its post-clear census on the same ground. Both cited a note in
+`arch::x86_64::smp::try_enable_ap_user_dispatch`:
+
+> (Unreachable in Stage 189B — trap_return_ready is never set.)
+
+**The note had been false since Stage 189C6.** That stage wired the live AP dispatcher and bound the
+only caller's readiness to `trap_return_ready: ap_usermode_entry_ready(cpu)`, whose last conjunct is
+`ap_ring3_entry_path_ready()` — exactly `kernel::boot::ap_user_dispatch_enabled()`, the **default-off
+but real** `yarm.ap_user_dispatch` boot knob. Set the knob and the audited transition clears an AP's
+wake-only bit; the AP dispatches user tasks; the dispatching-CPU count is two. "One dispatcher" is a
+production **default**, not a platform invariant.
+
+#### What actually protects the route
+
+`SharedKernel::exit_route_admitted_split`, evaluated at step (1) of `run_exit_transaction` — before
+any reservation, cell write or TCB touch. It re-derives the topology itself:
+
+| check | source of truth | refuses when |
+|---|---|---|
+| an active post-lock drainer on this CPU | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` | the deferral this route publishes would never be consumed |
+| at most one dispatching CPU | `(online & !wake_only).count_ones()`, rank 1 | a second CPU could be selecting, faulting or exiting concurrently |
+| and that dispatcher is this CPU | `sched.current_cpu`, rank 1 | the drain that consumes the deferral runs elsewhere |
+
+Wake-only APs are excluded from the count **by construction** — `!wake_only` masks them out. They are
+online for wake and accounting but run no dispatcher, so they can neither originate a userspace
+syscall nor race a settlement. Both scheduler facts come from **one** rank-1 acquisition, so the
+count and the bound CPU cannot be torn against each other.
+
+The topology cannot shift under an admitted window: both bitmap writers (`bring_up_cpu`,
+`mark_cpu_wake_only`) take `&mut KernelState`, and every call site is on the boot orchestrator's
+one-shot SMP bring-up, which runs before any userspace task exists. The AP idle-loop hook
+(`yarm_x86_ap_user_dispatch_entry`) writes no topology at all.
+
+#### The classification defect this exposed, and its repair
+
+`RouteNotAdmitted` mapped to `ExitDisposition::ImpossibleState`, which answers userspace
+`SyscallError::Internal`. Under `yarm.ap_user_dispatch=1` that refusal is **reachable**, so a
+legitimate `exit()` would have been answered with a kernel-bug code for a topology the kernel was
+asked to create. It is reclassified to `InvalidPreLock` — joining `DeferredCapacity`, the other
+genuinely reachable pre-mutation refusal — which answers `WouldBlock`. Nothing was reserved, no cell
+was written, no TCB was touched, and the caller is still `Running` and still current, so "not now" is
+the true statement. **The refusal itself is unchanged; only its classification moved.**
+
+Corrections landed in five places: the two notes in `smp.rs` and `ap_dispatch.rs` that asserted the
+stale fact, the two consumers in `exit_txn.rs`, the U9-EXIT4 census in `tests.rs`, and this document.
+`u9residual1_terminal_admission` guards all of it, including a negative guard that the retired claim
+cannot return.
+
+### §2 — the residual matrix, recomputed at both terminal acquisitions
+
+The two production acquisitions are unchanged: `arch/trap_entry.rs:1010` (`shared.with_cpu`, x86_64 +
+AArch64) and `arch/riscv64/trap.rs:1038`. Census **2 / 0 / 2**.
+
+Twenty-two syscall numbers are exposed. Recomputed from source — the switching seam
+(`try_split_dispatch_into_frame`) and the NR-only gate (`classify_split_eligible_nr_only`), not from
+observed markers:
+
+| NR | syscall | admitted by | reachable refusal | authoritative owner | witness |
+|---|---|---|---|---|---|
+| 1 | IpcSend | switching seam | blocked-send envelope | `ipc_send_txn` | U6 live |
+| 2 | IpcRecv (blocking) | switching seam | none past publication | D2 recv drain | U9-RX4 live |
+| 2 | IpcRecv (queued plain) | NR gate | ineligible → broad | `try_split_ipc_recv_queued_plain` | Stage 32B |
+| 8 | ControlPlaneSetCnodeSlots | NR gate | typed cap errors | control-plane split | Stage 27 |
+| 9 | FutexWait | switching seam | none past publication | U9-QA drain | 192A live |
+| 10 | FutexWake | NR gate | invalid addr → broad | `try_split_futex_wake` | 191B live |
+| 11 | SpawnThread | NR gate | typed spawn errors | spawn transaction | U9-SPAWN1 |
+| 12 | Fork | NR gate | typed fork errors | fork transaction | U9-FORK1 |
+| 14 | VmBrk | NR gate | non-shrink → broad | `try_split_vm_brk_shrink` | Stage 114 |
+| 15 | DebugLog | NR gate | none | `try_split_debug_log` | 191A live |
+| 16 | ExitCurrentTask | switching seam | **`RouteNotAdmitted` (§1)**, `DeferredCapacity` | exit transaction | U9-EXIT1‑4 live |
+| 23 | SpawnProcess | NR gate | typed spawn errors | spawn transaction | U9-SPAWN-TXN3 |
+| 28 | CreateInitramfsFileSliceMo | NR gate | typed MO errors | MO transaction | U9-MO2 |
+| 29 | SpawnFromMemoryObject | NR gate | typed spawn errors | spawn transaction | U9-SPAWN-TXN3 |
+| 31 | ReapFaultedTask | NR gate | typed reap errors | reap transaction | U9-REAP1 live |
+| **0** | **Yield** | **— none —** | **—** | `KernelState::yield_current` | **see below** |
+| 3 | VmMap | — none — | — | broad VM handler | — |
+| 4 | TransferRelease | — none — | — | broad transfer handler | — |
+| 5 | IpcRecvTimeout | — none — | — | broad IPC handler | — |
+| 6 | IpcCall | — none — | — | broad IPC handler | — |
+| 7 | IpcReply | — none — | — | broad IPC handler | — |
+| 13 | VmAnonMap | — none — | — | broad VM handler | — |
+| 30 | RecvSharedV3 | — none — | — | broad IPC handler | — |
+
+Three outcome classes are kept distinct, because conflating them is how a family gets called closed
+early: **successful split handling** (the route serves the syscall and finalizes), **legitimate typed
+refusal** (the route answers a defensible error itself — NR 16's two, NR 8's cap errors), and **broad
+fallback** (`NotHandled`, pre-mutation, the unchanged broad handler serves it — NR 2 queued-plain, NR
+10 invalid-addr, NR 14 non-shrink).
+
+### §2 (cont.) — NR 0 selected, and why it qualifies
+
+Yield is the preference the directive names, and it meets both of its conditions.
+
+**Its complete production contract composes from existing owners.** `handle_yield` is
+`kernel.yield_current()?; frame.set_ok(0, 0, 0)`. `yield_current` is five steps, and every one has an
+off-lock owner already:
+
+| step | rank | owner | already off-lock as |
+|---|---|---|---|
+| read the outgoing current | 1 | `current_tid_on` | `current_tid_authoritative` |
+| count the yield | 3 | `ipc.telemetry.scheduler_yield_calls` | `with_ipc_split_mut` |
+| `Running → Runnable` | 2 | `apply_task_transition(PreemptOutgoing\|PreemptOutgoingIdle)` | `with_task_tcbs_split_mut` |
+| re-enqueue at tail + clear `current` | 1 | `preempt_reenqueue_only_on` | `with_scheduler_split_mut` |
+| publish the one-shot deferral | — | `yield_dispatch_try_defer` | a per-CPU cell, no lock |
+
+And the consumer already exists on **all three architectures**, default-on: the post-lock Yield drain
+at `trap_entry.rs:2106` (x86_64), `trap_entry.rs:1984` (AArch64) and `riscv64/trap.rs:1767`
+(RISC-V). The residual edge is not the dispatch — that already left the lock — it is that
+`yield_current` **runs the policy inside `with_cpu`** before deferring.
+
+`preempt_reenqueue_only` is additionally **exactly self-reversing**: on an enqueue failure it
+restores `current` and returns `None`, having changed nothing observable. That is the property the
+split route needs to make its own fallback free.
+
+**Existing profiles witness it on every architecture.** The exit-current-task oracle workload, at
+the delivered tree:
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| complete Yield deferral+drain cycles | 4096 | 4096 | 78 |
+| `*_INLOCK_DISPATCH_FALLBACK` | 0 | 0 | 0 |
+
+No new workload, selector or marker family is needed — the evidence is already produced by a
+qualifying gate that runs three times per architecture.
+
+**Not inferred from absent markers.** The `x86_64`/`AArch64` core smokes issue no NR 0 at all; had
+that been the only profile consulted, Yield would have looked closed on two architectures. The
+selection rests on the exit oracle, where it is richly witnessed.

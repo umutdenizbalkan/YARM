@@ -159594,6 +159594,17 @@ mod u9exit1_self_exit_transaction {
         }
     }
 
+    /// The settlement a genuinely REACHABLE pre-mutation refusal owes. Nothing was reserved, no
+    /// cell was written and no TCB was touched, so the caller is still `Running` and still current
+    /// — `WouldBlock` is the true answer, and `Internal` would be reporting a kernel bug for a
+    /// configuration the kernel was asked to create.
+    const fn invalid_pre_lock(refusal: ExitRefusal) -> ExitFailure {
+        ExitFailure {
+            refusal,
+            disposition: ExitDisposition::InvalidPreLock,
+        }
+    }
+
     /// One Running self on CPU 0, one sibling, one joiner blocked on the self.
     fn three_task_world() -> Harness {
         let mut joiner = tcb(3, 1, TaskStatus::Blocked(WaitReason::Join(ThreadId(1))));
@@ -159688,13 +159699,16 @@ mod u9exit1_self_exit_transaction {
 
     #[test]
     fn every_pre_claim_refusal_leaves_the_world_byte_for_byte_unchanged() {
-        // (a) no drainer on this CPU
+        // (a) the route is not admitted — no drainer, more than one dispatching CPU, or a CPU
+        // that is not the bound dispatcher. U9-RESIDUAL1 §1: this refusal is REACHABLE (the
+        // default-off `yarm.ap_user_dispatch` knob produces a second dispatcher), so it settles as
+        // `InvalidPreLock` — a typed "not now" — rather than as an impossible state.
         let mut h = three_task_world();
         h.inject = Inject::RouteNotAdmitted;
         let before = h.snapshot();
         assert_eq!(
             run_exit_transaction(&mut h, CPU, CODE).expect_err("must refuse"),
-            impossible(ExitRefusal::RouteNotAdmitted)
+            invalid_pre_lock(ExitRefusal::RouteNotAdmitted)
         );
         assert_eq!(h.snapshot(), before);
 
@@ -160543,15 +160557,25 @@ mod u9exit1_self_exit_transaction {
             !EXIT_CLAIM.contains("past_point_of_no_return: bool"),
             "the post-clear settlement must not be a classification of the refusal"
         );
-        // Class C has exactly one member, and it is the only refusal a correct userspace program
-        // can provoke: the deferred server-death queue was full.
+        // The REACHABLE pre-mutation refusals — the ones a correct system can actually provoke.
+        //
+        // U9-EXIT2 §1 recorded exactly one: `DeferredCapacity`, the full server-death queue.
+        // U9-RESIDUAL1 §1 found a second and moved it here. `RouteNotAdmitted` was classified
+        // impossible on the strength of a Stage-189B note claiming an AP can never dispatch;
+        // Stage 189C6 had already bound that site to the default-off `yarm.ap_user_dispatch` knob,
+        // and with the knob set the dispatching count is two and this admission refuses. Answering
+        // `Internal` for a legitimate `exit()` in a configuration the kernel was asked to create
+        // was reporting a kernel bug for a supported topology.
         let invalid: alloc::vec::Vec<_> = ALL
             .iter()
             .filter(|r| r.disposition() == ExitDisposition::InvalidPreLock)
             .collect();
-        assert_eq!(invalid, alloc::vec![&DeferredCapacity]);
+        assert_eq!(invalid, alloc::vec![&RouteNotAdmitted, &DeferredCapacity]);
         // Everything else pre-mutation is a state the §5 guards prove cannot exist.
-        for refusal in ALL.iter().filter(|r| **r != DeferredCapacity) {
+        for refusal in ALL
+            .iter()
+            .filter(|r| **r != DeferredCapacity && **r != RouteNotAdmitted)
+        {
             assert_eq!(refusal.disposition(), ExitDisposition::ImpossibleState);
         }
         // The wire names are distinct, so a live marker identifies exactly one arm.
@@ -161980,7 +162004,7 @@ mod u9exit2_total_nr16_disposition {
 /// | 1 | `TaskTransition::FaultRunningCurrent` — `fault_state::fault_current_task_with_fault`, `runtime::commit_terminal_fault_transition_shared` | `current_tid()` / `block_current_on_cpu_split`, both re-checked against the victim | **no** — the slot is empty, so both refuse before any write |
 /// | 2 | `TaskTransition::PreemptOutgoing`/`ContinueCurrent`/`DispatchIncoming` — `yield_current`, `yield_current_to`, the two dispatch owners | the outgoing `current_tid()`, or a TID dequeued from a run queue | **no** — empty current, and the victim is in no queue |
 /// | 3 | `apply_cross_cpu_wake_task` | an explicit TID from another CPU's wake | **no** — it transitions `Blocked(_)` only; a `Running` victim is skipped |
-/// | 4 | the explicit-TID writers — `restart_task`, `mark_task_dead`, `wake_tid_to_runnable_split`, `apply_split_sender_wake_plan_split` | a TID a *caller* supplies | **no** — every such caller must itself be executing on the single dispatching CPU, which is executing this transaction, and the window is not preemptible |
+/// | 4 | the explicit-TID writers — `restart_task`, `mark_task_dead`, `wake_tid_to_runnable_split`, `apply_split_sender_wake_plan_split` | a TID a *caller* supplies | **no** — every such caller must itself be executing on a dispatching CPU, the admission proved at most one exists and that it is this CPU, and the window is not preemptible |
 ///
 /// Row 4 is the only one that is not refused by a status or placement gate, and it is the one this
 /// module spends the most guards on. Two independent facts close it:
@@ -161993,8 +162017,18 @@ mod u9exit2_total_nr16_disposition {
 ///   the trap path contains no `daifclr`; RISC-V hardware clears `sstatus.SIE` on trap entry and the
 ///   single re-enable is confined to the audited terminal-idle boundary.
 ///
-/// Together with the single-dispatching-CPU fact U9-EXIT2 §1 established, no agent exists that
-/// could run row 4 while the window is open.
+/// * **at most one CPU dispatches, and it is this one.** U9-EXIT4 took this from U9-EXIT2 §1, which
+///   derived it from a Stage-189B note claiming the only site clearing an AP's wake-only bit is
+///   unreachable. **U9-RESIDUAL1 §1 corrects that**: Stage 189C6 bound that site to the default-off
+///   `yarm.ap_user_dispatch` knob, so a second dispatching CPU is producible in a production build
+///   and the topology is a default rather than an invariant. The fact this row actually needs is
+///   supplied by the route's own ADMISSION — `exit_route_admitted_split` re-derives
+///   `(online & !wake_only).count_ones() <= 1 && current_cpu == cpu` from scheduler state, in one
+///   rank-1 acquisition, before any mutation — and by the topology being frozen for the window's
+///   duration, since every writer of either bitmap runs under the broad lock from the boot
+///   orchestrator's one-shot SMP bring-up. Both are guarded in `u9residual1_terminal_admission`.
+///
+/// With all three, no agent exists that could run row 4 while the window is open.
 ///
 /// # The consequence
 ///
@@ -162702,6 +162736,524 @@ mod u9exit4_post_clear_totality {
         assert!(
             EXIT_TXN.contains("V::Terminal | V::Removed"),
             "the owner must admit exactly Terminal and Removed"
+        );
+    }
+}
+
+/// U9-RESIDUAL1 §1 — the terminal split route's admission owner, guarded directly.
+///
+/// # The claim this module retires
+///
+/// U9-EXIT2 §1 classified `ExitRefusal::RouteNotAdmitted` as unreachable "class B", and U9-EXIT4 §1
+/// built on it, both citing the note in `try_enable_ap_user_dispatch`:
+///
+/// > (Unreachable in Stage 189B — trap_return_ready is never set.)
+///
+/// **That note was stale.** Stage 189C6 wired the live AP dispatcher and bound the caller's
+/// `trap_return_ready` to `ap_usermode_entry_ready(cpu)`, whose last conjunct is
+/// `ap_ring3_entry_path_ready()` — exactly `kernel::boot::ap_user_dispatch_enabled()`, the
+/// **default-off but real** `yarm.ap_user_dispatch` boot knob. Set that knob and the audited
+/// transition clears an AP's wake-only bit, the AP dispatches user tasks, and the dispatching-CPU
+/// count is two. "One dispatcher" is a production *default*, not a platform invariant, and no
+/// subsystem may treat it as one.
+///
+/// # What actually protects the route
+///
+/// `SharedKernel::exit_route_admitted_split`, evaluated at step (1) of `run_exit_transaction` —
+/// before any reservation, any cell write and any TCB touch. It re-derives the topology itself:
+///
+/// | check | source of truth | refuses when |
+/// |---|---|---|
+/// | an active post-lock drainer on this CPU | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` | the deferral this route publishes would never be consumed |
+/// | at most one dispatching CPU | `(online & !wake_only).count_ones()` at rank 1 | a second CPU could be selecting, faulting or exiting concurrently |
+/// | and that dispatcher is this CPU | `sched.current_cpu` at rank 1 | the drain that consumes the deferral runs elsewhere |
+///
+/// Wake-only APs are excluded from the count *by construction*: `!wake_only` masks them out. They
+/// are online for wake and accounting but run no dispatcher, so they can neither originate a
+/// userspace syscall nor race a settlement.
+///
+/// # Why the window cannot be undermined after admission
+///
+/// The topology is read once, at rank 1, in ONE acquisition — so the count and the CPU cannot be
+/// torn against each other. And it cannot change afterwards: every production writer of either
+/// bitmap (`bring_up_cpu`, `mark_cpu_wake_only`) takes `&mut KernelState` — the broad lock — and
+/// every one of them is reached only from the boot orchestrator's one-shot SMP bring-up, which runs
+/// before any userspace task exists. A trap servicing a userspace syscall is therefore never
+/// concurrent with a topology change.
+#[cfg(test)]
+mod u9residual1_terminal_admission {
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const EXIT_TXN: &str = include_str!("../syscall/exit_txn.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const SCHEDULER_STATE: &str = include_str!("scheduler_state.rs");
+    const X86_BOOT_SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const A64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    const BSP: CpuId = CpuId(0);
+    const AP: CpuId = CpuId(1);
+
+    fn code_lines(src: &str) -> impl Iterator<Item = &str> {
+        src.lines().filter(|line| {
+            let t = line.trim_start();
+            !t.starts_with("//") && !t.starts_with("*") && !t.is_empty()
+        })
+    }
+
+    fn set_drainer(cpu: CpuId, active: bool) {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu.0 as usize]
+            .store(active, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn drainer(cpu: CpuId) -> bool {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu.0 as usize]
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` is a per-CPU **global**, not per-`SharedKernel` state.
+    /// Under `--test-threads=1` every test in this binary shares it, and a leaked `true` steers
+    /// later tests onto deferral paths whose drains only exist inside a real trap — which is a
+    /// hang, not a failure, and one that only reproduces in suite order. This guard makes each
+    /// test's manipulation exactly scoped.
+    struct DrainerFlags {
+        saved: [bool; 2],
+    }
+
+    impl DrainerFlags {
+        fn capture() -> Self {
+            Self {
+                saved: [drainer(BSP), drainer(AP)],
+            }
+        }
+    }
+
+    impl Drop for DrainerFlags {
+        fn drop(&mut self) {
+            set_drainer(BSP, self.saved[0]);
+            set_drainer(AP, self.saved[1]);
+        }
+    }
+
+    /// A kernel whose only dispatching CPU is the BSP, with this CPU's drainer armed — the exact
+    /// topology every delivered production boot runs in.
+    ///
+    /// The returned guard restores both drainer flags when it drops, so nothing leaks into the
+    /// rest of the suite.
+    fn sole_dispatcher() -> (SharedKernel, DrainerFlags) {
+        let flags = DrainerFlags::capture();
+        let kernel = SharedKernel::new(crate::kernel::boot::Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.set_current_cpu(BSP).expect("bind the BSP");
+        });
+        set_drainer(BSP, true);
+        set_drainer(AP, false);
+        (kernel, flags)
+    }
+
+    /// The scheduler facts the admission reads, so a refusal can be proved to have changed none.
+    fn topology_of(kernel: &SharedKernel) -> (u64, u64, u8) {
+        kernel.with(|state| {
+            (
+                state.online_cpu_bitmap(),
+                state.with_scheduler_state(|sched| {
+                    crate::kernel::boot::kernel_ref(&sched.scheduler).wake_only_bitmap()
+                }),
+                state.current_cpu().0,
+            )
+        })
+    }
+
+    // ── functional: what the admission admits, and what it refuses ──────────────────────────
+
+    /// **The delivered topology admits.** One online CPU, not wake-only, bound as `current_cpu`,
+    /// with its post-lock drainer armed.
+    #[test]
+    fn the_sole_dispatcher_on_its_own_cpu_is_admitted() {
+        let (kernel, _drainers) = sole_dispatcher();
+        assert!(
+            kernel.exit_route_admitted_split(BSP),
+            "the ordinary production topology must admit the split terminal route"
+        );
+    }
+
+    /// **A wake-only AP is not a dispatcher.** Bringing one online adds a bit to `online` but also
+    /// to `wake_only`, and the count is masked — so admission is unaffected. This is the case the
+    /// production SMP boot actually produces on all three architectures.
+    #[test]
+    fn a_wake_only_ap_is_excluded_from_the_dispatcher_count() {
+        let (kernel, _drainers) = sole_dispatcher();
+        kernel.with(|state| {
+            state.mark_cpu_wake_only(AP, true).expect("wake-only first");
+            state.bring_up_cpu(AP).expect("then online");
+        });
+        let (online, wake_only, _) = topology_of(&kernel);
+        assert_ne!(online & (1 << AP.0), 0, "the AP must be online");
+        assert_ne!(wake_only & (1 << AP.0), 0, "and it must be wake-only");
+        assert_eq!(
+            (online & !wake_only).count_ones(),
+            1,
+            "a wake-only AP must not raise the dispatching count"
+        );
+        assert!(
+            kernel.exit_route_admitted_split(BSP),
+            "an online wake-only AP must not disturb admission"
+        );
+    }
+
+    /// **A SECOND dispatching CPU refuses.** This is the configuration U9-EXIT2 §1 and U9-EXIT4 §1
+    /// declared impossible, and `yarm.ap_user_dispatch=1` produces it: the audited transition clears
+    /// the AP's wake-only bit and the count becomes two. The route must decline — and it does,
+    /// which is why the stale claim was harmless in fact even though it was wrong in reason.
+    #[test]
+    fn a_second_dispatching_cpu_refuses_admission() {
+        let (kernel, _drainers) = sole_dispatcher();
+        kernel.with(|state| {
+            state.mark_cpu_wake_only(AP, true).expect("wake-only first");
+            state.bring_up_cpu(AP).expect("then online");
+            // Exactly what `try_enable_ap_user_dispatch` does once every readiness bit holds.
+            state
+                .mark_cpu_wake_only(AP, false)
+                .expect("the audited transition clears wake-only");
+        });
+        let (online, wake_only, _) = topology_of(&kernel);
+        assert_eq!(
+            (online & !wake_only).count_ones(),
+            2,
+            "the knob must genuinely produce two dispatchers"
+        );
+        assert!(
+            !kernel.exit_route_admitted_split(BSP),
+            "two dispatchers must refuse the split terminal route, on the BSP..."
+        );
+        assert!(
+            !kernel.exit_route_admitted_split(AP),
+            "...and on the AP, which is not even the bound dispatch CPU"
+        );
+    }
+
+    /// **Admission names THIS CPU.** Even in a single-dispatcher topology, a CPU that is not the
+    /// scheduler's bound `current_cpu` is refused: the drain that consumes the deferral this route
+    /// publishes runs on the bound CPU, not the asking one.
+    #[test]
+    fn admission_requires_the_asking_cpu_to_be_the_bound_dispatcher() {
+        let (kernel, _drainers) = sole_dispatcher();
+        set_drainer(AP, true);
+        assert!(
+            !kernel.exit_route_admitted_split(AP),
+            "a CPU that is not `current_cpu` must be refused even with its drainer armed"
+        );
+        set_drainer(AP, false);
+    }
+
+    /// **No drainer, no admission** — and the check comes first, so a CPU with no post-lock drainer
+    /// is refused without the scheduler being consulted at all.
+    #[test]
+    fn no_active_drainer_refuses_admission() {
+        let (kernel, _drainers) = sole_dispatcher();
+        set_drainer(BSP, false);
+        assert!(
+            !kernel.exit_route_admitted_split(BSP),
+            "without an active post-lock drainer the published deferral would never be consumed"
+        );
+        set_drainer(BSP, true);
+    }
+
+    /// **Every refusal is free.** The admission is a pure read: across all three refusal shapes the
+    /// online bitmap, the wake-only bitmap and the bound dispatch CPU are byte-for-byte unchanged.
+    #[test]
+    fn a_refused_admission_mutates_no_scheduler_state() {
+        let (kernel, _drainers) = sole_dispatcher();
+        kernel.with(|state| {
+            state.mark_cpu_wake_only(AP, true).expect("wake-only");
+            state.bring_up_cpu(AP).expect("online");
+            state
+                .mark_cpu_wake_only(AP, false)
+                .expect("second dispatcher");
+        });
+        let before = topology_of(&kernel);
+        // (1) two dispatchers, (2) wrong CPU, (3) no drainer.
+        assert!(!kernel.exit_route_admitted_split(BSP));
+        assert!(!kernel.exit_route_admitted_split(AP));
+        set_drainer(BSP, false);
+        assert!(!kernel.exit_route_admitted_split(BSP));
+        set_drainer(BSP, true);
+        assert_eq!(
+            topology_of(&kernel),
+            before,
+            "an admission refusal must read the topology and change none of it"
+        );
+    }
+
+    /// **An out-of-range CPU is refused before any indexing.** The bound is checked against
+    /// `MAX_CPUS` first, so a bad CPU id can never index the per-CPU drainer array.
+    #[test]
+    fn an_out_of_range_cpu_is_refused_before_indexing() {
+        let (kernel, _drainers) = sole_dispatcher();
+        assert!(
+            !kernel.exit_route_admitted_split(CpuId(crate::kernel::scheduler::MAX_CPUS as u8)),
+            "a CPU id at or beyond MAX_CPUS must be refused"
+        );
+        assert!(!kernel.exit_route_admitted_split(CpuId(u8::MAX)));
+    }
+
+    // ── structural: the admission's shape, and the window's topology freeze ──────────────────
+
+    /// The admission's three checks, in the order that makes each refusal free.
+    #[test]
+    fn the_admission_checks_the_drainer_first_and_the_topology_in_one_acquisition() {
+        let body = RUNTIME
+            .split("pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {")
+            .nth(1)
+            .expect("the admission owner");
+        let body = &body[..body.find("\n    }").expect("its end")];
+        let bound = body
+            .find("if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {")
+            .expect("the bound check");
+        let drainer = body
+            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
+            .expect("the drainer check");
+        let sched = body
+            .find("self.with_scheduler_split_mut(")
+            .expect("the topology read");
+        assert!(
+            bound < drainer && drainer < sched,
+            "bound, then drainer, then scheduler: each refusal must cost less than the next"
+        );
+        assert_eq!(
+            body.matches("self.with_scheduler_split_mut(").count(),
+            1,
+            "the count and the bound CPU must come from ONE rank-1 acquisition, or they could be \
+             torn against each other"
+        );
+        // The dispatching count masks wake-only CPUs out, and the verdict is the exact conjunction.
+        assert!(
+            body.contains("(online & !s.wake_only_bitmap()).count_ones() as usize"),
+            "wake-only CPUs must be excluded from the dispatching count by construction"
+        );
+        assert!(
+            body.contains("dispatching <= 1 && dispatch_cpu == cpu"),
+            "the verdict is: at most one dispatcher, and it is this CPU"
+        );
+        // Nothing in the admission writes.
+        for line in code_lines(body) {
+            assert!(
+                !line.contains("= Some(")
+                    && !line.contains(".store(")
+                    && !line.contains("enqueue")
+                    && !line.contains("reserve"),
+                "the admission must be a pure read — a refusal that mutated would not be free: \
+                 {line}"
+            );
+        }
+    }
+
+    /// The transaction consults the admission FIRST, and returns before reserving anything.
+    #[test]
+    fn the_transaction_refuses_admission_before_any_reservation() {
+        let txn = EXIT_TXN
+            .split("pub(crate) fn run_exit_transaction<O: ExitOwners>(")
+            .nth(1)
+            .expect("the transaction");
+        let txn = &txn[..txn.find("// ═══").expect("the owner banner")];
+        let admit = txn
+            .find("if !owners.exit_route_admitted(cpu) {")
+            .expect("the admission");
+        // It is the first owner call in the body.
+        let first_owner = code_lines(&txn[..admit]).find(|line| line.contains("owners."));
+        assert!(
+            first_owner.is_none(),
+            "an owner ran before admission: {first_owner:?}"
+        );
+        // And nothing is reserved before it.
+        assert!(
+            txn.find("reserve_queue_advance").expect("the reservation") > admit,
+            "the queue-advance reservation must come after admission"
+        );
+        assert!(
+            txn.find("reserve_server_death").expect("the reservation") > admit,
+            "the server-death reservation must come after admission"
+        );
+        // `RouteNotAdmitted` settles as a pre-mutation refusal, like every other free one.
+        assert_eq!(
+            crate::kernel::boot::exit_claim::ExitRefusal::RouteNotAdmitted.disposition(),
+            crate::kernel::boot::exit_claim::ExitDisposition::InvalidPreLock,
+            "a refused admission owes no settlement — nothing was cleared"
+        );
+    }
+
+    /// **The topology cannot change while an admitted window is open.**
+    ///
+    /// Both bitmaps have exactly two production writers between them, both take `&mut KernelState`
+    /// (the broad lock), and every call site is on the one-shot SMP bring-up path that runs before
+    /// userspace exists. A userspace syscall trap is therefore never concurrent with one.
+    #[test]
+    fn the_topology_writers_are_boot_only_and_broad_locked() {
+        // (1) Both writers require `&mut KernelState`.
+        for (name, sig) in [
+            (
+                "bring_up_cpu",
+                "pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {",
+            ),
+            (
+                "mark_cpu_wake_only",
+                "pub fn mark_cpu_wake_only(&mut self, cpu: CpuId, wake_only: bool) -> Result<(), KernelError> {",
+            ),
+        ] {
+            assert!(
+                SCHEDULER_STATE.contains(sig),
+                "{name} must remain a `&mut KernelState` (broad-lock) owner"
+            );
+        }
+        // (2) Every production call site is on an SMP bring-up path. `smp.rs`'s extra
+        // `mark_cpu_wake_only(cpu, false)` is the audited AP-dispatch transition, itself reached
+        // only from the boot orchestrator's one-shot scaffold audit.
+        for (name, src, expected) in [
+            ("x86_64/smp.rs", X86_BOOT_SMP, 3usize),
+            ("aarch64/boot.rs", A64_BOOT, 2),
+            ("riscv64/boot.rs", RV_BOOT, 3),
+        ] {
+            let writes = code_lines(src)
+                .filter(|line| line.contains("mark_cpu_wake_only("))
+                .count();
+            assert_eq!(
+                writes, expected,
+                "{name}: unexpected number of wake-only writers; every one must be a bring-up or \
+                 the audited AP-dispatch transition"
+            );
+        }
+        // (3) The audited transition has exactly one caller, and it is the boot scaffold audit.
+        assert_eq!(
+            code_lines(SMP)
+                .filter(|line| line.contains("try_enable_ap_user_dispatch(kernel, cpu, readiness)"))
+                .count(),
+            1,
+            "the audited transition must have exactly one production caller"
+        );
+        let audit = SMP
+            .split("pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool) {")
+            .nth(1)
+            .expect("the scaffold audit");
+        assert!(
+            audit.contains("try_enable_ap_user_dispatch(kernel, cpu, readiness)"),
+            "and that caller is the boot scaffold audit"
+        );
+        // (4) The AP idle-loop hook writes no topology at all.
+        let hook = SMP
+            .split("pub extern \"C\" fn yarm_x86_ap_user_dispatch_entry() {")
+            .nth(1)
+            .expect("the AP dispatch hook");
+        let hook = &hook[..hook.find("\n}").expect("its end")];
+        for forbidden in ["mark_cpu_wake_only", "bring_up_cpu", "set_cpu_wake_only"] {
+            assert!(
+                !hook.contains(forbidden),
+                "the AP idle-loop hook must not change topology: {forbidden}"
+            );
+        }
+    }
+
+    /// **The dispatching-CPU predicate has one definition, copied verbatim.**
+    ///
+    /// Three owners ask "how many CPUs dispatch?" — the broad `KernelState::dispatching_cpu_count`,
+    /// the exit route's `exit_route_admitted_split`, and the canonical queue-advance admission
+    /// `queue_advance_admit_split`. If any of them drifted, a route could admit on a topology
+    /// another route would refuse, and the "at most one dispatcher" fact would mean different
+    /// things in different places. All three must compute the same masked count.
+    #[test]
+    fn every_dispatching_cpu_count_is_the_same_masked_expression() {
+        const EXEC_STATE: &str = include_str!("exec_state.rs");
+        // The broad owner.
+        let broad = SCHEDULER_STATE
+            .split("pub fn dispatching_cpu_count(&self) -> usize {")
+            .nth(1)
+            .expect("the broad count");
+        assert!(
+            broad.contains("let dispatching = online & !s.wake_only_bitmap();"),
+            "the broad count must mask wake-only CPUs out"
+        );
+        // The two split admissions, which read the count and the bound CPU together.
+        for (name, src) in [
+            ("exit_route_admitted_split", RUNTIME),
+            ("queue_advance_admit_split", EXEC_STATE),
+        ] {
+            let body = src
+                .split(if name == "exit_route_admitted_split" {
+                    "pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {"
+                } else {
+                    "pub(crate) fn queue_advance_admit_split("
+                })
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            assert!(
+                body.contains("(online & !s.wake_only_bitmap()).count_ones() as usize"),
+                "{name} must use the same masked count as the broad owner"
+            );
+            assert!(
+                body.contains("sched.current_cpu,"),
+                "{name} must read the bound dispatch CPU in the SAME acquisition as the count"
+            );
+        }
+        // And both split admissions refuse the same two topology shapes.
+        assert!(
+            RUNTIME.contains("dispatching <= 1 && dispatch_cpu == cpu"),
+            "the exit admission's verdict"
+        );
+        assert!(
+            EXEC_STATE.contains("if dispatching > 1 {")
+                && EXEC_STATE.contains("if dispatch_cpu != cpu {"),
+            "the queue-advance admission's two refusals"
+        );
+    }
+
+    /// **Negative — the stale unreachability claim must not come back.**
+    ///
+    /// It was wrong in two places and consumed in three more. Any source that reasons from "an AP
+    /// cannot dispatch" instead of from the admission is reasoning from a default.
+    #[test]
+    fn the_stale_stage_189b_unreachability_claim_is_gone() {
+        for (name, src) in [
+            ("x86_64/smp.rs", SMP),
+            ("x86_64/ap_dispatch.rs", AP_DISPATCH),
+            ("exit_txn.rs", EXIT_TXN),
+        ] {
+            for phrase in [
+                "Unreachable in Stage 189B",
+                "trap_return_ready is never set",
+                "always refuses and never clears wake-only",
+            ] {
+                // The phrases may be QUOTED while being corrected; what must not survive is a
+                // sentence ASSERTING them. A correction spans several lines, so the window around
+                // each occurrence is what carries the retraction — not necessarily its own line.
+                let lines: alloc::vec::Vec<&str> = src.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    if !line.contains(phrase) {
+                        continue;
+                    }
+                    let lo = i.saturating_sub(6);
+                    let hi = (i + 7).min(lines.len());
+                    let window = lines[lo..hi].join("\n");
+                    assert!(
+                        window.contains("U9-RESIDUAL1")
+                            || window.contains("stale")
+                            || window.contains("WRONG")
+                            || window.contains("no longer"),
+                        "{name} still asserts the retired claim `{phrase}` with no retraction \
+                         nearby: {line}"
+                    );
+                }
+            }
+        }
+        // The live gate is a knob, and the source says so where it matters.
+        assert!(
+            SMP.contains("crate::kernel::boot::ap_user_dispatch_enabled()"),
+            "the AP ring3 path readiness must remain the knob it is"
+        );
+        assert!(
+            SMP.contains("fn ap_ring3_entry_path_ready() -> bool {"),
+            "and it must stay a named predicate rather than an inlined constant"
         );
     }
 }

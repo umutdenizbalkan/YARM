@@ -160,9 +160,26 @@ impl ExitRefusal {
     /// only for the PRE-clear arms, and its one caller passes nothing.
     pub(crate) const fn disposition(self) -> ExitDisposition {
         match self {
-            Self::DeferredCapacity => ExitDisposition::InvalidPreLock,
-            Self::RouteNotAdmitted
-            | Self::NoCurrent
+            // U9-RESIDUAL1 §1 — `RouteNotAdmitted` moved here from `ImpossibleState`.
+            //
+            // U9-EXIT2 §1 classified it class B ("mechanically impossible") on the strength of a
+            // Stage-189B note claiming an AP can never become a dispatching CPU. Stage 189C6 had
+            // already invalidated that note: `try_enable_ap_user_dispatch`'s `trap_return_ready`
+            // is bound to the default-off `yarm.ap_user_dispatch` knob, and with it set the audited
+            // transition clears an AP's wake-only bit and the dispatching count becomes two. The
+            // admission then refuses — correctly, and before any mutation — so the refusal is
+            // REACHABLE in a production build.
+            //
+            // `ImpossibleState` answers userspace `SyscallError::Internal`. Returning that for a
+            // legitimate `exit()` in a supported (if experimental) configuration would be reporting
+            // a kernel bug for a topology the kernel itself was asked to create. It joins
+            // `DeferredCapacity` — the other genuinely reachable pre-mutation refusal — as
+            // `InvalidPreLock`, which answers `WouldBlock`: nothing was reserved, no cell was
+            // written, no TCB was touched, and the caller is still `Running` and still current, so
+            // "not now" is the true statement. The classification is the only thing that changes;
+            // the refusal itself, and every step that leads to it, is untouched.
+            Self::DeferredCapacity | Self::RouteNotAdmitted => ExitDisposition::InvalidPreLock,
+            Self::NoCurrent
             | Self::QueueAdvanceHeld
             | Self::TaskGone
             | Self::IdentityChanged
