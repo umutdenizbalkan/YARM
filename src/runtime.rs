@@ -566,6 +566,7 @@ impl DispatchAuthority {
     /// the forced interleavings drive the selection owner directly, with no architecture entry
     /// underneath them.
     #[cfg(any(test, feature = "hosted-dev"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn live_for_test(cpu: CpuId) -> Self {
         let idx = cpu.0 as usize;
         if idx >= crate::kernel::scheduler::MAX_CPUS {
@@ -587,6 +588,7 @@ impl DispatchAuthority {
     /// This is what §4's "wrong or stale authority mutates nothing" drives: it names a real,
     /// online CPU and differs from a live one ONLY in its epoch.
     #[cfg(any(test, feature = "hosted-dev"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stale_for_test(cpu: CpuId) -> Self {
         let idx = cpu.0 as usize;
         if idx >= crate::kernel::scheduler::MAX_CPUS {
@@ -1483,7 +1485,6 @@ impl SharedKernel {
             // invalidate, so there is nothing left to refuse.
             return Ok(());
         }
-        let cpu_idx = cpu.0 as usize;
         let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
             let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
             let online = s.online_cpu_bitmap();
