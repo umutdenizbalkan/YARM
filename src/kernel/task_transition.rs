@@ -229,6 +229,27 @@ pub(crate) fn apply_dispatch_transition(
     }
 }
 
+/// U9-DISPATCH-CPU1 §1 — read-only sibling of [`apply_dispatch_transition`], idle twin included.
+///
+/// [`task_transition_would_be_accepted`] answers for ONE transition; a dispatch mark also has an
+/// idle-only fallback, so asking only the primary question would reject the idle task and asking
+/// only the twin would admit an ordinary one. This mirrors the apply exactly, which is what lets
+/// the scheduler pick a candidate it KNOWS the mark will take — instead of dequeuing one, failing
+/// to mark it, and rolling the dequeue back.
+pub(crate) fn dispatch_transition_would_be_accepted(
+    tcbs: &[Option<ThreadControlBlock>],
+    tid: u64,
+    transition: TaskTransition,
+) -> bool {
+    if task_transition_would_be_accepted(tcbs, tid, None, transition).is_ok() {
+        return true;
+    }
+    match transition.idle_twin() {
+        Some(idle) => task_transition_would_be_accepted(tcbs, tid, None, idle).is_ok(),
+        None => false,
+    }
+}
+
 /// Read-only sibling of [`apply_task_transition`]: would the transition be accepted?
 ///
 /// Used where the authoritative scheduler mutation must be validated **before** it happens, so

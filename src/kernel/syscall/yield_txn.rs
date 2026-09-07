@@ -54,6 +54,31 @@
 //! There is no broad fallback *after* the publication, and none is needed: past the rank-1 step the
 //! caller is queued exactly once, `current` is empty, and the drain that consumes the deferral is
 //! the same one FutexWait and the terminal fault already share.
+//!
+//! # U9-YIELD2 §1 — NR 0 is NOT closed, and this file is where the honest statement belongs
+//!
+//! Every [`YieldDecline`] above makes `try_split_yield_into_frame` answer `NotHandled`, and
+//! `NotHandled` is an entry into the terminal broad dispatcher. U9-RESIDUAL1 §5 reported "no
+//! refusal occurred in nine qualifying boots" and was careful not to claim source totality; the
+//! matrix row it wrote nonetheless reads as a closed family, so it is corrected here.
+//!
+//! Of the six declines, four are unreachable for a **userspace** NR 0 by construction (`NoCurrent`,
+//! `DeferralHeld`, `RouteNotAdmitted::CpuOutOfRange` and `RouteNotAdmitted::NoTrapDrainer`), and
+//! two more are unreachable only on the single-dispatcher default. Two are genuinely reachable in
+//! supported configurations, and both are witnessed or constructible rather than inferred:
+//!
+//! * **`RouteNotAdmitted::MultiDispatcher`** under the default-off `yarm.ap_user_dispatch` knob.
+//!   Live at base: `YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu` in
+//!   `scripts/qemu-x86_64-ap-saved-return-smoke.sh`, on the AP, for a real userspace `Yield`.
+//! * **`ArchGateOff`** on x86_64 under `yarm.d6_switch_proof` / `yarm.d6_switch_a`, where
+//!   `d6_genuine_enabled()` is false — and where the Yield DRAIN in `arch/trap_entry.rs` is gated
+//!   off by the same two predicates, so no deferral could be consumed even if one were published.
+//!
+//! Neither can be closed by this route. The reason is not Yield's: it is that
+//! `SharedKernel::queue_advance_select_step_split` — the ONE selection owner every queue-advancing
+//! drain uses — authenticates `sched.current_cpu == cpu` before dequeuing, and `current_cpu` is a
+//! single global field that any CPU's `with_cpu` rebinds. See `doc/KERNEL_UNLOCKING.md`, U9-YIELD2
+//! §2/§3, for the derivation and the exact missing contract.
 
 use crate::kernel::scheduler::CpuId;
 
@@ -279,7 +304,18 @@ impl YieldOwners for SharedYieldOwners<'_> {
         &self,
         cpu: CpuId,
     ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
-        self.shared.split_terminal_route_admission(cpu)
+        // U9-DISPATCH-CPU1 §3: NR 0 is AUTHORITY-BOUND. Its drain — the post-lock Yield drain on
+        // all three architectures — now selects through `queue_advance_acquire_incoming_split`,
+        // which authenticates this trap's own `DispatchAuthority` rather than the ambient
+        // `sched.current_cpu`. So the two conditions that existed to keep that ambient binding
+        // stable, `MultiDispatcher` and `NotDispatchCpu`, no longer protect anything for this
+        // family and are not asked. The drainer condition is unchanged and still asked.
+        //
+        // Every other family keeps `AmbientBound` until its own gate is individually justified.
+        self.shared.split_terminal_route_admission(
+            cpu,
+            crate::runtime::TerminalRouteTopology::AuthorityBound,
+        )
     }
 
     fn reserve_yield_deferral(&mut self, cpu: CpuId, outgoing: u64) -> bool {
@@ -329,28 +365,26 @@ impl YieldOwners for BroadYieldOwners<'_> {
         &self,
         cpu: CpuId,
     ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
-        use crate::kernel::boot::TerminalAdmissionRefusal as R;
-        let cpu_idx = cpu.0 as usize;
-        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-            return Err(R::CpuOutOfRange);
-        }
-        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(R::NoTrapDrainer);
-        }
-        // The same conditions `split_terminal_route_admission` applies, read through the broad
-        // guard this caller already holds. `current_cpu == cpu` is trivially true here —
-        // `yield_current` derives `cpu` from `self.current_cpu()`, which IS the scheduler's bound
-        // dispatcher — so including it adds no condition the in-lock path did not already satisfy,
-        // and keeps the two adapters answering the same question.
-        if self.kernel.dispatching_cpu_count() > 1 {
-            return Err(R::MultiDispatcher);
-        }
-        if self.kernel.current_cpu() != cpu {
-            return Err(R::NotDispatchCpu);
-        }
-        Ok(())
+        // U9-DISPATCH-CPU1 §3: the broad adapter moves to AUTHORITY-BOUND with the split one, and
+        // it has to. The whole point of one transaction driven by two adapters is that the two
+        // routes cannot come to disagree about when a yield may be deferred; leaving the
+        // dispatching-CPU count here would have made the broad NR 0 refuse a topology the split
+        // NR 0 admits, which is precisely the drift U9-RESIDUAL1 §3 extracted this transaction to
+        // prevent.
+        //
+        // It is also correct on its own terms. The deferral this adapter publishes is consumed by
+        // the SAME post-lock drain — the broad `yield_current` runs inside a trap, so that trap's
+        // drain is what settles it — and that drain now authenticates the trap's own authority.
+        // The two conditions that were dropped, `MultiDispatcher` and `NotDispatchCpu`, existed
+        // only to keep the ambient binding stable for it.
+        //
+        // `current_cpu == cpu` was trivially true here anyway: `yield_current` derives `cpu` from
+        // `self.current_cpu()`, which IS the scheduler's bound dispatcher.
+        //
+        // This adapter holds a `&mut KernelState` and so cannot reach
+        // `SharedKernel::split_terminal_route_admission`; it calls the SAME route-local function
+        // that method calls, rather than keeping a hand-written copy of the two conditions.
+        crate::runtime::terminal_route_admission_authority_bound(cpu)
     }
 
     fn reserve_yield_deferral(&mut self, cpu: CpuId, outgoing: u64) -> bool {

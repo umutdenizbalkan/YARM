@@ -762,6 +762,68 @@ pub(crate) static GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE: [core::sync::atomic::Atomic
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
 
+/// U9-DISPATCH-CPU1 §1/§2 — the per-CPU **live dispatch window**.
+///
+/// `0` means "no window is open on this CPU"; any other value is the epoch of the window that IS
+/// open. `arch::trap_entry::TrapPathWindow` is the only writer: it opens a window on `establish`
+/// and RETIRES it on drop, which is the real trap boundary.
+///
+/// Retirement is what makes a [`crate::runtime::DispatchAuthority`] a statement about one trap
+/// rather than about a CPU number. Without it a retained copy stayed valid from the moment the
+/// trap returned until the next trap happened to open — a window in which the authority names a
+/// CPU that is running arbitrary code.
+///
+/// It is deliberately NOT a lock and NOT per-CPU scheduler state: it is a tag whose only reader is
+/// [`crate::runtime::DispatchAuthority::is_live`], so `doc/AI_AGENT_RULES.md` §14.4's prohibition
+/// on new per-CPU scheduler lock types is untouched.
+pub(crate) static TRAP_DISPATCH_WINDOW: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// The monotonically increasing source of window epochs. Never reused, so a retired epoch can
+/// never be mistaken for a later window's.
+static TRAP_DISPATCH_EPOCH_NEXT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+/// U9-DISPATCH-CPU1 §2/D2 — open a dispatch window on `cpu` and return `(epoch, displaced)`.
+///
+/// `displaced` is whatever window was open on this CPU, and for a correct run it is always `0`.
+/// **Nested entry into the shared trap wrapper is not supported on any architecture**: x86_64's
+/// `TRAP_DISPATCH_DEPTH` guard halts a re-entrant trap BEFORE it reaches the wrapper
+/// (`previous_depth != 0` → `log_decoded_fatal_trap` + `halt_forever`), and interrupts stay masked
+/// for the whole trap on all three, so no second entry can arrive on this CPU. A non-zero
+/// `displaced` therefore means the previous window was ABANDONED by a landing that diverged
+/// without retiring, and it is reported rather than saved.
+///
+/// It is deliberately not restored on close. Saving and restoring it would let a later trap REVIVE
+/// an abandoned authority: A opens 1 and diverges, B opens 2 saving 1, B returns and restores 1 —
+/// and A's long-dead token is live again. Retirement always goes to `0`.
+///
+/// The ONLY caller is `TrapPathWindow::establish`.
+pub(crate) fn open_trap_dispatch_window(cpu_idx: usize) -> (u64, u64) {
+    let epoch = TRAP_DISPATCH_EPOCH_NEXT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let displaced = TRAP_DISPATCH_WINDOW[cpu_idx].swap(epoch, core::sync::atomic::Ordering::AcqRel);
+    (epoch, displaced)
+}
+
+/// U9-DISPATCH-CPU1 §2/D2 — retire the window `epoch` on `cpu`.
+///
+/// Exact-epoch and idempotent: the store happens only if this CPU's live window is still `epoch`,
+/// so a repeat call does nothing and a stale retirement can never revoke a NEWER window. Returns
+/// whether this call performed the retirement.
+///
+/// Callers are `TrapPathWindow::retire` and `TrapPathWindow::drop`.
+pub(crate) fn close_trap_dispatch_window(cpu_idx: usize, epoch: u64) -> bool {
+    TRAP_DISPATCH_WINDOW[cpu_idx]
+        .compare_exchange(
+            epoch,
+            0,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 /// Stage 120: x86_64-only controlled one-shot unlocked `switch_frames` proof
 /// harness gate. This is diagnostic/smoke-only, default-off, single-CPU-only,
 /// and does not alter scheduler policy. VALIDATION: D6_CONTROLLED_SWITCH_PROOF_BEGIN
@@ -3524,12 +3586,21 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # DISABLED on every architecture — Stage 199D-WA1-GATE
+/// # ENABLED on all three architectures — and this heading used to say the opposite
 ///
-/// Ordinary `IpcCall`/`IpcReply` traffic on **every** architecture, x86_64 included, falls back
-/// to the legacy path. Admission and blocked-waiter acknowledgement publication both require an
-/// explicit proof/oracle selector; request/reply endpoint confinement is whatever those
-/// selectors authorize. The rationale is below the blocker history.
+/// U9-YIELD2 §1: the heading here read "**DISABLED on every architecture — Stage 199D-WA1-GATE**",
+/// followed by "ordinary `IpcCall`/`IpcReply` traffic on **every** architecture, x86_64 included,
+/// falls back to the legacy path". The WA1-GATE state it described was later reversed twice — by
+/// WA3C2 for x86_64 (recorded further down this comment) and by DIRECT3-CAP-FINAL for AArch64 and
+/// RISC-V — and the body below already says so, but the heading was never updated. The function
+/// returns `true` on all three architectures, so `ipccall_direct_admission_enabled()` and
+/// `ipccall_direct_publication_enabled()` short-circuit before any proof/oracle selector is read,
+/// and ordinary NR6/NR7 traffic IS admitted to the off-lock request/reply handlers on every
+/// ordinary boot.
+///
+/// Two consumers were reading the retired heading rather than the code: the split dispatcher's
+/// NR6/NR7 admission note and U9-RESIDUAL1 §2's residual matrix, which listed NR 6 and NR 7 as
+/// having "no split route". Both are corrected; see `doc/KERNEL_UNLOCKING.md`, U9-YIELD2 §1.
 ///
 /// ## Historical — the x86_64 production default (`0b5ec254`, since RECLASSIFIED)
 ///

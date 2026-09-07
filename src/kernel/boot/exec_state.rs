@@ -4044,10 +4044,11 @@ impl crate::runtime::SharedKernel {
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub(crate) fn queue_advance_commit_split(
         &self,
-        cpu: CpuId,
+        authority: crate::runtime::DispatchAuthority,
         outgoing_tid: u64,
         admitted: Option<u64>,
     ) -> QueueAdvanceOutcome {
+        let cpu = authority.cpu();
         use crate::kernel::scheduler::DispatchSelection;
         use crate::runtime::CpuDispatch;
         let cpu_idx = cpu.0 as usize;
@@ -4060,12 +4061,35 @@ impl crate::runtime::SharedKernel {
         // acquisitions, so a wake may enqueue between them; short-circuiting on `admitted == None`
         // would idle a CPU that had just become runnable — a lost wake. Deciding from the
         // authoritative dequeue instead means a task enqueued in that window is simply selected.
-        let dispatch = self.queue_advance_select_step_split(cpu, "queue_advance_commit_split");
+        let dispatch =
+            self.queue_advance_select_step_split(authority, "queue_advance_commit_split");
         let incoming = match dispatch {
-            // Admission already authenticated this CPU under the single-dispatcher gate, so a
-            // mismatch here is unreachable. It is still matched explicitly, and it dequeued
+            // U9-DISPATCH-CPU1 §1: the step now authenticates the caller's trap AUTHORITY rather
+            // than the ambient `sched.current_cpu`, and this caller holds the authority its own
+            // trap minted — so a refusal here means a stale window or an offline CPU, neither of
+            // which an in-trap caller can present. It is still matched explicitly, and it dequeued
             // NOTHING — so the truthful outcome is an idle CPU, never a fabricated switch.
-            CpuDispatch::RefusedCpuMismatch { .. } => return QueueAdvanceOutcome::TerminalIdle,
+            // U9-DISPATCH-CPU1 §1: every entry was examined and none could be marked `Running`.
+            // Nothing was dequeued, so — exactly as for a refusal — the truthful outcome is an
+            // idle CPU rather than a fabricated switch. It is matched separately from `Refused`
+            // because it says something different: there IS runnable work, this CPU just cannot
+            // take any of it right now.
+            CpuDispatch::NoneAcceptable { examined } => {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_COMMIT_NONE_ACCEPTABLE cpu={} examined={} dequeued=0",
+                    cpu.0,
+                    examined
+                );
+                return QueueAdvanceOutcome::TerminalIdle;
+            }
+            CpuDispatch::Refused { requested, reason } => {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_COMMIT_REFUSED cpu={} reason={} dequeued=0",
+                    requested.0,
+                    reason.marker()
+                );
+                return QueueAdvanceOutcome::TerminalIdle;
+            }
             CpuDispatch::Selected { selection, .. } => match selection {
                 DispatchSelection::Dequeued { tid } => tid.0,
                 // The caller did not clear the current slot, so nothing was dequeued.

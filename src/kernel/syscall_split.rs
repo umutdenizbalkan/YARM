@@ -2271,10 +2271,17 @@ fn try_split_dispatch_nonswitching_into_frame(
         return None;
     };
     // Stage 199D: IpcCall (NR 6) + IpcReply (NR 7) are not in the static NR-only whitelist,
-    // but they ARE admitted to the direct request/reply gates below. Since WA1-GATE that
-    // admission requires the explicit proof gate on EVERY architecture, x86_64 included — the
-    // production term is `false` everywhere — so every normal boot stays byte-identical to the
-    // legacy path.
+    // but they ARE admitted to the direct request/reply gates below.
+    //
+    // U9-YIELD2 §1 — the sentence that used to end this note was stale. It read "since WA1-GATE
+    // that admission requires the explicit proof gate on EVERY architecture, x86_64 included —
+    // the production term is `false` everywhere — so every normal boot stays byte-identical to
+    // the legacy path". `ipccall_direct_production_enabled()` is
+    // `cfg!(x86_64) || cfg!(aarch64) || cfg!(riscv64)`, so the production term is `true` on all
+    // three and `ipccall_direct_admission_enabled()` short-circuits before the proof gate is
+    // consulted. NR 6 and NR 7 are admitted here on EVERY ordinary boot; what they still do on a
+    // decline is fall back to the legacy broad handler, which is a residual arm, not an absent
+    // route.
     let direct_ipc_admitted = matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)
         && crate::kernel::boot::ipccall_direct_admission_enabled();
     if classify_split_eligible_nr_only(syscall).is_none() && !direct_ipc_admitted {
@@ -2374,10 +2381,14 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_futex_wake_into_frame(shared, cpu, frame);
     }
 
-    // Stage 199A2B2F (proof-gated, default-OFF): IpcCall (NR 6) direct request. Only
-    // attempted when the internal proof gate is armed; the helper snapshots the request
-    // off-lock and drives the accepted off-lock transaction. Off the gate — or for any
-    // case it cannot service — it returns `None`, so NR 6 stays on its existing path.
+    // Stage 199A2B2F: IpcCall (NR 6) direct request. The helper snapshots the request off-lock
+    // and drives the accepted off-lock transaction. For any case it cannot service it returns
+    // `None`, so NR 6 falls back to its existing broad path.
+    //
+    // U9-YIELD2 §1 — the "(proof-gated, default-OFF)" label that used to head this note is stale.
+    // `ipccall_direct_admission_enabled()` is `production || proof`, and the production term is
+    // `true` on all three architectures, so this gate is OPEN on every ordinary boot. NR 6's
+    // residual arm is the helper's `None`, not an unarmed gate.
     if matches!(syscall, Syscall::IpcCall)
         && crate::kernel::boot::ipccall_direct_admission_enabled()
     {
@@ -2386,12 +2397,14 @@ fn try_split_dispatch_nonswitching_into_frame(
         }
     }
 
-    // Stage 199A2B3 (proof-gated, default-OFF): IpcReply (NR 7) direct reply. Only
-    // attempted when the internal proof gate is armed; the helper snapshots the reply
-    // payload off-lock (owned) and drives the accepted off-lock reply transaction
-    // (reserve → caller-copy → exact-waiter claim → record Consumed → single enqueue).
-    // Off the gate — or for any case it cannot service — it returns `None`, so NR 7
-    // stays on its existing global-lock path.
+    // Stage 199A2B3: IpcReply (NR 7) direct reply. The helper snapshots the reply payload
+    // off-lock (owned) and drives the accepted off-lock reply transaction (reserve →
+    // caller-copy → exact-waiter claim → record Consumed → single enqueue). For any case it
+    // cannot service it returns `None`, so NR 7 falls back to its existing global-lock path.
+    //
+    // U9-YIELD2 §1 — the "(proof-gated, default-OFF)" label that used to head this note is stale
+    // for the same reason NR 6's is: admission short-circuits on the production term, which is
+    // `true` on all three architectures. The gate is open on every ordinary boot.
     if matches!(syscall, Syscall::IpcReply)
         && crate::kernel::boot::ipccall_direct_admission_enabled()
     {
@@ -2731,8 +2744,14 @@ fn try_split_futex_wake_into_frame(
     None
 }
 
-/// Stage 199A2B2F: x86 pre-lock NR6 direct-request snapshot publication + off-lock
-/// transaction drain (proof-gated). Runs ENTIRELY off the broad `KernelState` lock and
+/// Stage 199A2B2F: pre-lock NR6 direct-request snapshot publication + off-lock transaction drain.
+///
+/// U9-YIELD2 §1: this used to be labelled "x86 … (proof-gated)". Neither half holds. Admission is
+/// `ipccall_direct_admission_enabled()` = `production || proof`, and the production term is true on
+/// all three architectures, so the gate is open on every ordinary boot and the route is reached on
+/// x86_64, AArch64 and RISC-V alike.
+///
+/// Runs ENTIRELY off the broad `KernelState` lock and
 /// off any ranked lock during the source copy:
 ///   read args → capture caller `{tid,asid}` → validate `len<=128` → copy the request
 ///   payload through `copy_from_user_asid_split_read` (NO lock held) → build the owned
@@ -2874,8 +2893,12 @@ fn try_split_ipccall_direct_into_frame(
     None
 }
 
-/// Stage 199A2B3 (proof-gated, default-OFF): intercept `IpcReply` (NR 7) BEFORE the
-/// broad `KernelState` lock and drive the accepted off-lock direct-reply transaction.
+/// Stage 199A2B3: intercept `IpcReply` (NR 7) BEFORE the broad `KernelState` lock and drive the
+/// accepted off-lock direct-reply transaction.
+///
+/// U9-YIELD2 §1: the "(proof-gated, default-OFF)" label this carried is stale for the same reason
+/// NR 6's was — admission short-circuits on a production term that is true on all three
+/// architectures, so this route is reached on every ordinary boot.
 ///
 /// Part 1 — owned pre-lock reply snapshot. Order:
 ///   read args → capture replier `{tid,asid}` → validate `len<=128` → copy the reply
@@ -5254,8 +5277,17 @@ mod tests {
 
     #[test]
     fn stage32b_ipc_recv_timeout_nr_not_in_whitelist() {
-        // IpcRecvTimeout (NR 5) must NOT be split-eligible: it stays on the
-        // global-lock path (scheduler/deadline interaction).
+        // IpcRecvTimeout (NR 5) must NOT be on the NR-ONLY whitelist: that gate's contract is
+        // that everything on it is non-switching and may be early-returned through the caller's
+        // own frame, and a blocking timed receive may not.
+        //
+        // U9-YIELD2 §1 — this is NOT the statement "NR 5 has no pre-lock route", which is what
+        // the old comment here ("it stays on the global-lock path") said and what U9-RESIDUAL1
+        // §2's matrix copied. Stage 199G-B §2 gave NR 5 the SWITCHING route
+        // `try_split_blocking_ipc_recv_into_frame`, admitted on all three architectures, which
+        // runs BEFORE this gate. What stays broad is the non-blocking half of NR 5 — a receive
+        // that would not block, and every typed refusal — which is a residual arm, not an absent
+        // route.
         assert!(
             classify_split_eligible_nr_only(decode(
                 crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
@@ -5276,7 +5308,15 @@ mod tests {
 
     #[test]
     fn stage32b_ipc_send_call_reply_not_split_eligible() {
-        // The sender-side IPC syscalls stay default-deny.
+        // The sender-side IPC syscalls stay default-deny AT THE NR-ONLY GATE.
+        //
+        // U9-YIELD2 §1 — that is all this asserts, and the old one-line comment ("stay
+        // default-deny") read as though these three had no pre-lock route at all. All three do:
+        // NR 1 through `try_split_ipc_send_into_frame` (199G-C4, a switching class tried before
+        // this gate), NR 6 and NR 7 through the direct request/reply handlers, whose admission
+        // predicate `ipccall_direct_admission_enabled()` is `true` on all three architectures.
+        // They are absent from THIS whitelist because its contract is non-switching
+        // early-returnable classes, not because they are unrouted.
         for nr in [
             SYSCALL_IPC_SEND_NR,
             crate::kernel::syscall::SYSCALL_IPC_CALL_NR,

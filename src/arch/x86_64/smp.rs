@@ -3035,7 +3035,41 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
         cpu.0,
         first_tid
     );
-    let placed = kernel.dispatch_next_on_cpu(cpu).unwrap_or(0);
+    // U9-DISPATCH-CPU1 D4 — dispatch through the EXISTING mark-running owner.
+    //
+    // This was `kernel.dispatch_next_on_cpu(cpu)`, a bare rank-1 scheduler step: it installed the
+    // task as `current` and never applied the rank-2 `DispatchIncoming` transition. So the AP's
+    // first workload task entered ring 3 with a TCB that still said `Runnable` — the scheduler and
+    // the task table disagreeing about who is running, which is exactly the state the WA3A
+    // discipline exists to prevent, and which every other dispatch path in the tree avoids.
+    //
+    // It was directly load-bearing for NR 0: the yield transaction's rank-2 step is the exact
+    // `Running → Runnable` preemption, so the AP's yield refused `not_running` and fell into the
+    // broad dispatcher no matter what its admission said. `commit_dispatch_selection_in_lock` is
+    // the same owner the ordinary in-lock dispatch uses; it applies the exact transition, carries
+    // the idle twin, and undoes its own selection exactly on refusal.
+    let selection = kernel.on_dispatch_selection_on_cpu(cpu);
+    let placed = selection.tid().map(|t| t.0).unwrap_or(0);
+    if !kernel.commit_dispatch_selection_in_lock(selection, "ap_user_dispatch_first_entry") {
+        crate::yarm_log!(
+            "{} cpu={} tid={} err=mark_running_refused",
+            ap_dispatch::MARK_ADMIT_DENIED_WAKE_ONLY,
+            cpu.0,
+            first_tid
+        );
+        crate::yarm_log!(
+            "{} cpu={} result=admission_denied",
+            ap_dispatch::MARK_USER_DISPATCH_DONE,
+            cpu.0
+        );
+        return;
+    }
+    crate::yarm_log!(
+        "X86_AP_FIRST_ENTRY_RUNNING_OK cpu={} tid={} provenance={} result=ok",
+        cpu.0,
+        placed,
+        selection.marker()
+    );
     debug_assert_eq!(placed, first_tid);
     let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
     AP_DISPATCH_COUNT[idx].store(0, Ordering::Release);
