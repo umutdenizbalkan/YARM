@@ -4061,7 +4061,8 @@ impl crate::runtime::SharedKernel {
         // acquisitions, so a wake may enqueue between them; short-circuiting on `admitted == None`
         // would idle a CPU that had just become runnable — a lost wake. Deciding from the
         // authoritative dequeue instead means a task enqueued in that window is simply selected.
-        let dispatch = self.queue_advance_select_step_split(authority, "queue_advance_commit_split");
+        let dispatch =
+            self.queue_advance_select_step_split(authority, "queue_advance_commit_split");
         let incoming = match dispatch {
             // U9-DISPATCH-CPU1 §1: the step now authenticates the caller's trap AUTHORITY rather
             // than the ambient `sched.current_cpu`, and this caller holds the authority its own

@@ -1684,41 +1684,26 @@ pub fn handle_trap_entry_shared(
             })
             .unwrap_or(false);
         if reverify_ok {
-            // Queue-advancing dequeue (emits QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK).
-            let dispatch = shared.futex_wait_dispatch_step_mut(trap_path.authority());
-            // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
-            // with its own evidence. `RefusedTorn` is fatal — it may never fall through to a
-            // resume, an ordinary fallback dispatch, an idle halt or a return to userspace.
-            let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                Mark::Marked(token) => Some(token),
-                Mark::Idle => {
-                    crate::yarm_log!(
-                        "QUEUE_ADVANCING_DISPATCH_DECLINED cpu={} reason=idle",
-                        cpu.0
-                    );
-                    None
-                }
-                Mark::RefusedRolledBack => {
-                    crate::yarm_log!(
-                        "QUEUE_ADVANCING_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
-                        cpu.0
-                    );
-                    None
-                }
-                Mark::RefusedNoSchedulerChange => {
-                    crate::yarm_log!(
-                        "QUEUE_ADVANCING_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
-                        cpu.0
-                    );
-                    None
-                }
-                Mark::RefusedTorn => dispatch_torn_fatal(
-                    cpu,
-                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
-                    "futex_wait_queue_advancing_dispatch",
-                ),
-            };
-            if let Some(token) = marked {
+            // U9-DISPATCH-CPU1 §2: ONE acquire (emits QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK through
+            // the class step). Unlike Yield, `Idle` here is a GENUINE outcome — the waiter is
+            // blocked, so an empty runqueue really does mean this CPU has nothing to run — but the
+            // other three refusals are not idle and no longer share its settlement marker.
+            let acquired = shared.queue_advance_acquire_incoming_split(
+                trap_path.authority(),
+                "futex_wait_queue_advancing_dispatch",
+                |k, a| k.futex_wait_dispatch_step_mut(a),
+            );
+            if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                dispatch_torn_fatal(cpu, tid, "futex_wait_queue_advancing_dispatch");
+            }
+            if !matches!(acquired, crate::runtime::DispatchAcquire::Resumable(_)) {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCING_DISPATCH_DECLINED cpu={} reason={}",
+                    cpu.0,
+                    acquired.marker()
+                );
+            }
+            if let Some(token) = acquired.token() {
                 let inc = token.tid();
                 crate::yarm_log!(
                     "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu={} tid={}",
@@ -1781,6 +1766,14 @@ pub fn handle_trap_entry_shared(
                     outgoing.unwrap_or(u64::MAX),
                     "futex_wait",
                 );
+                // U9-DISPATCH-CPU1 §2: the settlement is the same one (this CPU idles, and the
+                // waiter stays blocked), but the REASON is now reported, so `incoming=idle` is no
+                // longer the only thing a log sees for four different outcomes.
+                crate::yarm_log!(
+                    "QUEUE_ADVANCING_DISPATCH_SETTLED cpu={} incoming=none reason={} settlement=terminal_idle",
+                    cpu.0,
+                    acquired.marker()
+                );
                 crate::yarm_log!("FUTEX_WAIT_SPLIT_DISPATCH_OK cpu={} incoming=idle", cpu.0);
                 crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_DONE result=ok");
                 crate::yarm_log!("FUTEX_WAIT_SPLIT_DONE result=blocked");
@@ -1833,43 +1826,27 @@ pub fn handle_trap_entry_shared(
                 if let Some(t) = outgoing {
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}", t);
                 }
-                // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
-                let dispatch = shared.futex_wait_dispatch_step_mut(trap_path.authority());
-                // Stage 199D-WA3A-R2-SEAL (item E): mark Running through the exact rank-2
-                // transition FIRST, then match all five outcomes explicitly. A refusal has
-                // already undone exactly what the selection did, so the drain resumes nothing
-                // and the unchanged clear/fallback tail below runs — except for `RefusedTorn`,
-                // which is fatal and never returns.
-                let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                    Mark::Marked(token) => Some(token),
-                    Mark::Idle => {
-                        crate::yarm_log!(
-                            "AARCH64_FUTEX_WAIT_DISPATCH_DECLINED cpu={} reason=idle",
-                            cpu.0
-                        );
-                        None
-                    }
-                    Mark::RefusedRolledBack => {
-                        crate::yarm_log!(
-                            "AARCH64_FUTEX_WAIT_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
-                            cpu.0
-                        );
-                        None
-                    }
-                    Mark::RefusedNoSchedulerChange => {
-                        crate::yarm_log!(
-                            "AARCH64_FUTEX_WAIT_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
-                            cpu.0
-                        );
-                        None
-                    }
-                    Mark::RefusedTorn => dispatch_torn_fatal(
-                        cpu,
-                        dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
-                        "aarch64_futex_wait_dispatch",
-                    ),
-                };
-                if let Some(token) = marked {
+                // U9-DISPATCH-CPU1 §2: ONE acquire; the class step keeps this drain's own
+                // dequeue vocabulary. The idle tail below is unchanged and remains a genuine
+                // success for `Idle` — the waiter is blocked, so an empty runqueue really does
+                // mean nothing to run — but the other refusals now carry their own reason into it
+                // instead of arriving indistinguishable from it.
+                let acquired = shared.queue_advance_acquire_incoming_split(
+                    trap_path.authority(),
+                    "aarch64_futex_wait_dispatch",
+                    |k, a| k.futex_wait_dispatch_step_mut(a),
+                );
+                if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                    dispatch_torn_fatal(cpu, tid, "aarch64_futex_wait_dispatch");
+                }
+                if !matches!(acquired, crate::runtime::DispatchAcquire::Resumable(_)) {
+                    crate::yarm_log!(
+                        "AARCH64_FUTEX_WAIT_DISPATCH_DECLINED cpu={} reason={}",
+                        cpu.0,
+                        acquired.marker()
+                    );
+                }
+                if let Some(token) = acquired.token() {
                     let inc = token.tid();
                     crate::yarm_log!(
                         "AARCH64_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} tid={}",
@@ -1924,6 +1901,14 @@ pub fn handle_trap_entry_shared(
                     // fabricated, and `idle_no_eret_loop()` is NEVER entered while holding
                     // `with_cpu` (the broad guard was dropped before this drain).
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu={}", cpu.0);
+                    // U9-DISPATCH-CPU1 §2: name WHICH outcome brought us here. `Idle` is the
+                    // documented success; the three refusals share the settlement but not the
+                    // claim.
+                    crate::yarm_log!(
+                        "AARCH64_FUTEX_WAIT_DISPATCH_SETTLED cpu={} incoming=none reason={} settlement=post_lock_idle",
+                        cpu.0,
+                        acquired.marker()
+                    );
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu={}", cpu.0);
                     crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
                     // Lock-dropped proof: reaching a lock-taking read here is only possible
@@ -2019,40 +2004,24 @@ pub fn handle_trap_entry_shared(
                 if let Some(t) = outgoing {
                     crate::yarm_log!("AARCH64_YIELD_DISPATCH_REVERIFY_OK tid={}", t);
                 }
-                // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
-                let dispatch = shared.yield_dispatch_step_mut(trap_path.authority());
-                // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly,
-                // each with its own evidence. `RefusedTorn` is fatal and never returns.
-                let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                    Mark::Marked(token) => Some(token),
-                    Mark::Idle => {
-                        crate::yarm_log!(
-                            "AARCH64_YIELD_DISPATCH_DECLINED cpu={} reason=idle",
-                            cpu.0
-                        );
-                        None
-                    }
-                    Mark::RefusedRolledBack => {
-                        crate::yarm_log!(
-                            "AARCH64_YIELD_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
-                            cpu.0
-                        );
-                        None
-                    }
-                    Mark::RefusedNoSchedulerChange => {
-                        crate::yarm_log!(
-                            "AARCH64_YIELD_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
-                            cpu.0
-                        );
-                        None
-                    }
-                    Mark::RefusedTorn => dispatch_torn_fatal(
-                        cpu,
-                        dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
-                        "aarch64_yield_dispatch",
-                    ),
-                };
-                if let Some(token) = marked {
+                // U9-DISPATCH-CPU1 §2: ONE acquire; see the x86_64 sibling for why every
+                // non-resumable outcome settles as idle rather than reporting `no_incoming`.
+                let acquired = shared.queue_advance_acquire_incoming_split(
+                    trap_path.authority(),
+                    "aarch64_yield_dispatch",
+                    |k, a| k.yield_dispatch_step_mut(a),
+                );
+                if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                    dispatch_torn_fatal(cpu, tid, "aarch64_yield_dispatch");
+                }
+                if !matches!(acquired, crate::runtime::DispatchAcquire::Resumable(_)) {
+                    crate::yarm_log!(
+                        "AARCH64_YIELD_DISPATCH_DECLINED cpu={} reason={}",
+                        cpu.0,
+                        acquired.marker()
+                    );
+                }
+                if let Some(token) = acquired.token() {
                     let inc = token.tid();
                     crate::yarm_log!(
                         "AARCH64_YIELD_DISPATCH_DEQUEUE_OK cpu={} tid={}",
@@ -2094,14 +2063,23 @@ pub fn handle_trap_entry_shared(
                     crate::yarm_log!("AARCH64_YIELD_DISPATCH_DONE result=ok");
                     crate::kernel::boot::maybe_log_yield_retired();
                 } else {
-                    // A published Yield deferral MUST have an incoming (the re-enqueued caller is
-                    // always a candidate). No incoming is a genuine failure — do NOT claim a
-                    // transition; clear the deferral. (This path must never fire.)
+                    // U9-DISPATCH-CPU1 §2 — the SETTLEMENT.
+                    //
+                    // The old text called this "a genuine failure … (This path must never fire.)"
+                    // and then RETURNED, leaving `current` empty and the caller queued, with the
+                    // vector epilogue about to `eret` through a frame that belongs to a task on a
+                    // runqueue. A path that must never fire still has to be settled correctly when
+                    // it does. The deferral is cleared exactly once and the CPU enters the
+                    // ESTABLISHED post-lock idle terminal — the same one the direct-dispatch drain
+                    // uses — which diverges rather than returning through the stale frame.
+                    let outgoing = outgoing.unwrap_or(u64::MAX);
                     crate::kernel::boot::yield_dispatch_clear(cpu_idx);
                     crate::yarm_log!(
-                        "AARCH64_YIELD_DISPATCH_FAIL reason=no_incoming cpu={}",
-                        cpu.0
+                        "AARCH64_YIELD_DISPATCH_SETTLED cpu={} incoming=none reason={} settlement=terminal_idle",
+                        cpu.0,
+                        acquired.marker()
                     );
+                    super::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(cpu, outgoing);
                 }
             } else {
                 // An in-lock fallback already dispatched — do NOT double-dispatch.
@@ -2130,36 +2108,27 @@ pub fn handle_trap_entry_shared(
         crate::yarm_log!("YIELD_DISPATCH_DEFER_BEGIN cpu={} drain=1", cpu.0);
         let reverify_ok = shared.yield_reverify_ready(cpu);
         if reverify_ok {
-            let dispatch = shared.yield_dispatch_step_mut(trap_path.authority());
-            // Stage 199D-WA3A-R2-SEAL (item E): all five outcomes are matched explicitly, each
-            // with its own evidence. `RefusedTorn` is fatal and never returns.
-            let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                Mark::Marked(token) => Some(token),
-                Mark::Idle => {
-                    crate::yarm_log!("YIELD_DISPATCH_DECLINED cpu={} reason=idle", cpu.0);
-                    None
-                }
-                Mark::RefusedRolledBack => {
-                    crate::yarm_log!(
-                        "YIELD_DISPATCH_DECLINED cpu={} reason=refused_dequeue_undone",
-                        cpu.0
-                    );
-                    None
-                }
-                Mark::RefusedNoSchedulerChange => {
-                    crate::yarm_log!(
-                        "YIELD_DISPATCH_DECLINED cpu={} reason=refused_scheduler_untouched",
-                        cpu.0
-                    );
-                    None
-                }
-                Mark::RefusedTorn => dispatch_torn_fatal(
-                    cpu,
-                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
-                    "yield_queue_advancing_dispatch",
-                ),
-            };
-            if let Some(token) = marked {
+            // U9-DISPATCH-CPU1 §2: ONE acquire, which settles the obligation instead of folding
+            // three different refusals into "no incoming". The caller was re-enqueued and
+            // `current` cleared by the publisher, so nothing is current here — every non-resumable
+            // outcome below therefore settles as idle, and each keeps its own name in the log so a
+            // refusal never wears idle's.
+            let acquired = shared.queue_advance_acquire_incoming_split(
+                trap_path.authority(),
+                "yield_queue_advancing_dispatch",
+                |k, a| k.yield_dispatch_step_mut(a),
+            );
+            if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                dispatch_torn_fatal(cpu, tid, "yield_queue_advancing_dispatch");
+            }
+            if !matches!(acquired, crate::runtime::DispatchAcquire::Resumable(_)) {
+                crate::yarm_log!(
+                    "YIELD_DISPATCH_DECLINED cpu={} reason={}",
+                    cpu.0,
+                    acquired.marker()
+                );
+            }
+            if let Some(token) = acquired.token() {
                 let inc = token.tid();
                 crate::yarm_log!("YIELD_DISPATCH_CURRENT_SET_OK cpu={} tid={}", cpu.0, inc);
                 // U3 (203C): same retirement as the FutexWait switch-success above and the two
@@ -2192,10 +2161,26 @@ pub fn handle_trap_entry_shared(
                 );
                 crate::kernel::boot::maybe_log_yield_retired();
             } else {
-                // Unreachable in practice (the re-enqueued caller is always a candidate),
-                // but handle idle defensively.
+                // U9-DISPATCH-CPU1 §2 — the SETTLEMENT, not a success report.
+                //
+                // This used to emit `YIELD_DISPATCH_DONE result=ok cpu=N incoming=idle` for all
+                // four non-resumable outcomes, which is exactly the "refusal masquerading as
+                // idle" this stage removes: `current` is empty and the yielding caller is sitting
+                // on the runqueue, so `incoming=idle` was neither true nor a success. The
+                // deferral is cleared exactly once, and the CPU takes the ESTABLISHED post-lock
+                // terminal-idle settlement — the same one the FutexWait drain uses — which is
+                // recoverable, because the periodic timer re-dispatches this CPU.
+                // The outgoing identity is read BEFORE the clear — the cell is the only carrier of
+                // it, and the settlement names it.
+                let outgoing =
+                    crate::kernel::boot::yield_dispatch_outgoing(cpu_idx).unwrap_or(u64::MAX);
                 crate::kernel::boot::yield_dispatch_clear(cpu_idx);
-                crate::yarm_log!("YIELD_DISPATCH_DONE result=ok cpu={} incoming=idle", cpu.0);
+                crate::arch::x86_64::trap::settle_post_lock_terminal_idle(cpu, outgoing, "yield");
+                crate::yarm_log!(
+                    "YIELD_DISPATCH_SETTLED cpu={} incoming=none reason={} settlement=terminal_idle",
+                    cpu.0,
+                    acquired.marker()
+                );
                 crate::kernel::boot::maybe_log_yield_retired();
             }
         } else {

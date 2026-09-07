@@ -2623,7 +2623,10 @@ impl SharedKernel {
             // The CPU must be an ONLINE scheduler CPU — the same predicate
             // `current_tid_authoritative` applies, and the reason `CpuOutOfRange` is no longer a
             // reachable selection refusal (an out-of-range CPU cannot mint a live authority).
-            if kernel_ref(&sched.scheduler).validate_online_cpu(cpu).is_err() {
+            if kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .is_err()
+            {
                 crate::yarm_log!(
                     "DISPATCH_STEP_REFUSED site={} requested={} reason=cpu_offline",
                     site,
@@ -2697,9 +2700,7 @@ impl SharedKernel {
         // The bound: every runnable entry gets at most one turn. Read once, before the loop, so a
         // concurrent wake cannot extend it.
         let budget = self
-            .with_scheduler_split_mut(|sched| {
-                kernel_ref(&sched.scheduler).runnable_count_on(cpu)
-            })
+            .with_scheduler_split_mut(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
             .max(1);
         let mut attempts = 0usize;
         while attempts < budget {

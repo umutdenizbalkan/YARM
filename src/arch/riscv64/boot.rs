@@ -999,6 +999,12 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
                 RiscvIdleReason::BlockedIpcNoRunnable => "BlockedIpcNoRunnable",
                 // Stage 200D-0D1: an accepted ExitCurrentTask left no runnable task.
                 RiscvIdleReason::ExitCurrentTaskNoRunnable => "ExitCurrentTaskNoRunnable",
+                // U9-DISPATCH-CPU1 §2: a queue-advancing drain's selection REFUSED, so nothing is
+                // current. Reported under its own name so it can never be read as one of the three
+                // workload outcomes above — and it passes the `current == None|Some(0)` invariant
+                // immediately above by construction, because every refusal that reaches here left
+                // the current slot exactly as the publisher cleared it.
+                RiscvIdleReason::QueueAdvanceNoIncoming => "QueueAdvanceNoIncoming",
             };
             crate::yarm_log!("RISCV_TYPED_IDLE_OUTCOME result=ok reason={}", reason_str);
             crate::yarm_log!(
