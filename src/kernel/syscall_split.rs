@@ -2744,8 +2744,14 @@ fn try_split_futex_wake_into_frame(
     None
 }
 
-/// Stage 199A2B2F: x86 pre-lock NR6 direct-request snapshot publication + off-lock
-/// transaction drain (proof-gated). Runs ENTIRELY off the broad `KernelState` lock and
+/// Stage 199A2B2F: pre-lock NR6 direct-request snapshot publication + off-lock transaction drain.
+///
+/// U9-YIELD2 §1: this used to be labelled "x86 … (proof-gated)". Neither half holds. Admission is
+/// `ipccall_direct_admission_enabled()` = `production || proof`, and the production term is true on
+/// all three architectures, so the gate is open on every ordinary boot and the route is reached on
+/// x86_64, AArch64 and RISC-V alike.
+///
+/// Runs ENTIRELY off the broad `KernelState` lock and
 /// off any ranked lock during the source copy:
 ///   read args → capture caller `{tid,asid}` → validate `len<=128` → copy the request
 ///   payload through `copy_from_user_asid_split_read` (NO lock held) → build the owned
@@ -2887,8 +2893,12 @@ fn try_split_ipccall_direct_into_frame(
     None
 }
 
-/// Stage 199A2B3 (proof-gated, default-OFF): intercept `IpcReply` (NR 7) BEFORE the
-/// broad `KernelState` lock and drive the accepted off-lock direct-reply transaction.
+/// Stage 199A2B3: intercept `IpcReply` (NR 7) BEFORE the broad `KernelState` lock and drive the
+/// accepted off-lock direct-reply transaction.
+///
+/// U9-YIELD2 §1: the "(proof-gated, default-OFF)" label this carried is stale for the same reason
+/// NR 6's was — admission short-circuits on a production term that is true on all three
+/// architectures, so this route is reached on every ordinary boot.
 ///
 /// Part 1 — owned pre-lock reply snapshot. Order:
 ///   read args → capture replier `{tid,asid}` → validate `len<=128` → copy the reply

@@ -86590,12 +86590,21 @@ mod stage199d_production_default_guards {
             .split("pub const fn ipccall_direct_production_enabled()")
             .next()
             .expect("doc bounded");
-        // WA1-GATE-DOC-SEAL: repointed. The heading now states the CURRENT contract, and the
-        // blocker history below it is explicitly labelled historical — the seven blockers are
-        // still recorded, which is what this guard exists to protect.
+        // WA1-GATE-DOC-SEAL, repointed a SECOND time — U9-YIELD2 §1.
+        //
+        // This guard used to require the heading "# DISABLED on every architecture — Stage
+        // 199D-WA1-GATE", and by requiring it, it kept the stale record alive after WA3C2 and
+        // DIRECT3-CAP-FINAL had re-enabled the production term on all three architectures. A guard
+        // that pins a retired contract does not protect the record; it becomes the record. So it
+        // now pins the CURRENT contract, and — because the point of this guard was never the
+        // heading — the blocker history below it, which is still what must not be lost.
         assert!(
-            doc.contains("# DISABLED on every architecture — Stage 199D-WA1-GATE"),
-            "the predicate says plainly that the production default is off"
+            doc.contains("# ENABLED on all three architectures"),
+            "the heading must state the contract the predicate actually implements"
+        );
+        assert!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            "…and it must agree with the predicate, on the architecture this suite builds for"
         );
         assert!(
             doc.contains(
@@ -118091,9 +118100,19 @@ mod stage199d_wa1_gate {
             }
         }
         // …and the current contract is stated positively.
+        //
+        // U9-YIELD2 §1: this line required the retired WA1-GATE heading, so the "do not describe
+        // the old default" guard was itself describing the old default. The banned-prose scan
+        // above is unchanged and still does its job — an x86_64-only claim would now UNDERSTATE a
+        // predicate that covers all three architectures — but the positive assertion below names
+        // the contract the predicate implements today.
         assert!(
-            MODRS.contains("# DISABLED on every architecture — Stage 199D-WA1-GATE"),
+            MODRS.contains("# ENABLED on all three architectures"),
             "the predicate heading must state the current contract"
+        );
+        assert!(
+            MODRS.contains("and this heading used to say the opposite"),
+            "…and must say so as a correction, so the reversal is legible rather than silent"
         );
     }
 
@@ -152204,10 +152223,26 @@ mod u9mo2_nr28_transaction_failure_injection {
     /// reach for the boot initrd itself — so hosted can exercise the real owner end to end.
     const BLOB_LEN: usize = 4 * PAGE_SIZE;
 
+    /// U9-YIELD2 §4 — PAGE-ALIGNED, deliberately.
+    ///
+    /// `initramfs_slice_object_geometry` rounds `[blob + offset, blob + offset + len)` out to the
+    /// pages that contain it, so every extent assertion in this module is a statement about the
+    /// blob's alignment as much as about the offset it is given. A `Box<[u8; N]>` is 1-byte
+    /// aligned, so `success_installs_exactly_one_borrowed_object_and_one_read_only_cap` — which
+    /// asserts that `PAGE_SIZE + 7 .. + 100` rounds to exactly ONE page — held only while the heap
+    /// happened to hand this fixture a page-aligned block. Adding an unrelated allocation earlier
+    /// in the suite moved it, the slice straddled a page boundary, and the test failed with
+    /// `left: 8192, right: 4096` for a reason that had nothing to do with the geometry owner.
+    ///
+    /// Aligning the fixture makes the offset the only variable, which is what the assertions were
+    /// always about.
+    #[repr(C, align(4096))]
+    struct Blob([u8; BLOB_LEN]);
+
     struct Fx {
         k: SharedKernel,
         cnode: CNodeId,
-        blob: alloc::boxed::Box<[u8; BLOB_LEN]>,
+        blob: alloc::boxed::Box<Blob>,
     }
 
     impl Fx {
@@ -152221,7 +152256,7 @@ mod u9mo2_nr28_transaction_failure_injection {
             Self {
                 k,
                 cnode,
-                blob: alloc::boxed::Box::new([0u8; BLOB_LEN]),
+                blob: alloc::boxed::Box::new(Blob([0u8; BLOB_LEN])),
             }
         }
         fn objects(&self) -> usize {
@@ -152252,7 +152287,7 @@ mod u9mo2_nr28_transaction_failure_injection {
             len: usize,
         ) -> Result<(u64, crate::kernel::capabilities::CapId), KernelError> {
             self.k
-                .create_initramfs_file_slice_mo_split(self.cnode, &self.blob[..], offset, len)
+                .create_initramfs_file_slice_mo_split(self.cnode, &self.blob.0[..], offset, len)
         }
     }
 
@@ -152309,7 +152344,7 @@ mod u9mo2_nr28_transaction_failure_injection {
         assert_eq!(len, PAGE_SIZE, "7 + 100 rounds up to exactly one page");
         assert_eq!(
             phys,
-            PhysAddr((fx.blob.as_ptr() as u64 + PAGE_SIZE as u64) & !(PAGE_SIZE as u64 - 1)),
+            PhysAddr((fx.blob.0.as_ptr() as u64 + PAGE_SIZE as u64) & !(PAGE_SIZE as u64 - 1)),
             "the object starts at the containing page"
         );
         // The minted cap is READ|MAP — never WRITE, for a file-backed slice.
@@ -152449,7 +152484,7 @@ mod u9mo2_nr28_transaction_failure_injection {
         let fx = Fx::new(8);
         let (o, c, f) = (fx.objects(), fx.caps(), fx.free_frames());
         let err =
-            fx.k.create_initramfs_file_slice_mo_split(CNodeId(0xDEAD), &fx.blob[..], 0, 64)
+            fx.k.create_initramfs_file_slice_mo_split(CNodeId(0xDEAD), &fx.blob.0[..], 0, 64)
                 .unwrap_err();
         assert_eq!(err, KernelError::TaskMissing);
         unchanged!(fx, o, c, f, "unprovisioned cspace");
@@ -152462,7 +152497,7 @@ mod u9mo2_nr28_transaction_failure_injection {
     fn the_kernel_still_serves_the_request_after_a_rolled_back_attempt() {
         let fx = Fx::new(8);
         assert_eq!(
-            fx.k.create_initramfs_file_slice_mo_split(CNodeId(0xDEAD), &fx.blob[..], 0, 64)
+            fx.k.create_initramfs_file_slice_mo_split(CNodeId(0xDEAD), &fx.blob.0[..], 0, 64)
                 .unwrap_err(),
             KernelError::TaskMissing
         );
@@ -152480,7 +152515,7 @@ mod u9mo2_nr28_transaction_failure_injection {
     fn the_broad_and_split_creators_agree_exactly() {
         let fx = Fx::new(8);
         let (broad_id, _c) =
-            fx.k.with(|s| s.create_initramfs_file_slice_mo(&fx.blob[..], PAGE_SIZE + 7, 100))
+            fx.k.with(|s| s.create_initramfs_file_slice_mo(&fx.blob.0[..], PAGE_SIZE + 7, 100))
                 .expect("broad");
         let (split_id, _c) = fx.run(PAGE_SIZE + 7, 100).expect("split");
         let shape = |id: u64| {
@@ -164020,6 +164055,411 @@ mod u9residual1_yield_family {
         assert!(
             TRAP_ENTRY.contains("SplitFinalizeReason::PublishedTransition"),
             "the shared bridge must keep committing the advanced PC through the finalizer"
+        );
+    }
+}
+
+/// U9-YIELD2 — the NR 0 family edge, the record it was recorded under, and the boundary.
+///
+/// Three groups, and they prove different kinds of thing. The first pins the corrections §1 made,
+/// including negative guards so a retired claim cannot come back. The second pins the §2
+/// derivation: which `YieldDecline` arms a userspace NR 0 can reach, each anchored on the source
+/// fact that decides it rather than on a marker count. The third is the boundary — a FUNCTIONAL
+/// demonstration that the one queue-advance selection owner refuses a CPU it is not bound to, so
+/// the admission conditions this family would have to relax are the drain's own precondition.
+mod u9yield2_family_edge {
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::{CpuDispatch, SharedKernel};
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+    const BOOT_MOD: &str = include_str!("mod.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const A64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    const BSP: CpuId = CpuId(0);
+    const AP: CpuId = CpuId(1);
+
+    /// The text of one item, from its signature to the next top-level `pub`/`fn` boundary — enough
+    /// to assert about ONE function's body rather than about the whole file.
+    fn body_of<'a>(src: &'a str, start: &str, len: usize) -> &'a str {
+        let at = src
+            .find(start)
+            .unwrap_or_else(|| panic!("anchor not found: {start}"));
+        let mut end = (at + len).min(src.len());
+        // These files are full of em dashes and arrows; a byte offset is not a char boundary.
+        while end < src.len() && !src.is_char_boundary(end) {
+            end += 1;
+        }
+        &src[at..end]
+    }
+
+    /// A retired claim may still APPEAR in the tree — quoted inside the note that retires it — but
+    /// it must never appear as an assertion again. Every occurrence has to sit within the
+    /// correction that names it.
+    fn only_as_a_quoted_correction(src: &str, phrase: &str, what: &str) {
+        let mut from = 0usize;
+        let mut seen = 0usize;
+        while let Some(rel) = src[from..].find(phrase) {
+            let at = from + rel;
+            let window = &src[at.saturating_sub(900)..at];
+            assert!(
+                window.contains("U9-YIELD2"),
+                "{what}: the retired claim reappears outside the correction that retires it"
+            );
+            seen += 1;
+            from = at + phrase.len();
+        }
+        assert!(
+            seen > 0,
+            "{what}: the retired claim must still be quoted by its correction, or the guard has \
+             nothing to hold — if the correction was reworded, reword this guard with it"
+        );
+    }
+
+    /// Comment-free view, so a guard cannot be satisfied by prose that merely mentions the thing.
+    fn code(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // ── §1: the record ──────────────────────────────────────────────────────────────────────
+
+    /// **The direct NR6/NR7 production term is ON for all three architectures.** This is the fact
+    /// U9-RESIDUAL1 §2's matrix contradicted when it listed NR 6 and NR 7 as having no split
+    /// route, and the fact `ipccall_direct_production_enabled`'s own heading contradicted.
+    #[test]
+    fn the_direct_nr6_nr7_production_default_is_on_for_all_three_architectures() {
+        assert!(
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            "the production term must be true on the architecture this suite builds for"
+        );
+        assert!(
+            crate::kernel::boot::ipccall_direct_admission_enabled(),
+            "so admission must short-circuit before any proof gate is consulted"
+        );
+        let body = code(body_of(
+            BOOT_MOD,
+            "pub const fn ipccall_direct_production_enabled()",
+            220,
+        ));
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                body.contains(arch),
+                "the production term must name {arch}; it is what makes NR6/NR7 admitted there"
+            );
+        }
+    }
+
+    /// **The retired WA1-GATE claims cannot come back.** Each of these sentences asserted, in a
+    /// place a later reader would treat as authoritative, that ordinary NR6/NR7 traffic is not
+    /// admitted. Every one of them was false when U9-RESIDUAL1 read it.
+    #[test]
+    fn no_source_still_claims_the_direct_path_is_disabled_everywhere() {
+        assert!(
+            !BOOT_MOD
+                .lines()
+                .any(|l| l.trim() == "/// # DISABLED on every architecture — Stage 199D-WA1-GATE"),
+            "the retired heading on ipccall_direct_production_enabled must not return"
+        );
+        only_as_a_quoted_correction(
+            BOOT_MOD,
+            "DISABLED on every architecture",
+            "ipccall_direct_production_enabled",
+        );
+        only_as_a_quoted_correction(
+            SPLIT,
+            "the production term is `false` everywhere",
+            "the split dispatcher's NR6/NR7 admission note",
+        );
+        assert!(
+            !SPLIT.contains("Stage 199A2B2F (proof-gated, default-OFF)"),
+            "NR 6's direct call site must not be labelled proof-gated again"
+        );
+        assert!(
+            !SPLIT.contains("Stage 199A2B3 (proof-gated, default-OFF)"),
+            "NR 7's direct call site must not be labelled proof-gated again"
+        );
+    }
+
+    /// **NR 5 has a pre-lock route, on all three architectures.** Absence from
+    /// `classify_split_eligible_nr_only` is absence from the NON-SWITCHING whitelist, which is a
+    /// different statement and the one U9-RESIDUAL1 §2 mistook for "no split route".
+    #[test]
+    fn nr5_has_a_switching_route_on_every_architecture() {
+        let route = code(body_of(
+            SPLIT,
+            "fn try_split_blocking_ipc_recv_into_frame",
+            9000,
+        ));
+        assert!(
+            route.contains("Ok(Syscall::IpcRecvTimeout) => true"),
+            "the blocking-recv route must admit NR 5 by decoding it"
+        );
+        assert!(
+            route.contains("if !recv_timeout && !cfg!(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))"),
+            "and the architecture exclusion must apply to NR 2 ONLY — NR 5 is admitted on all three"
+        );
+        assert!(
+            code(RV_TRAP).contains("SYSCALL_IPC_RECV_TIMEOUT_NR"),
+            "RISC-V's own ingress whitelist must list NR 5, or the shared route is unreachable there"
+        );
+        // And the NR-only gate still excludes it — which is a DIFFERENT statement, and the one
+        // its own test in `syscall_split` asserts. Its comment now says so.
+        assert!(
+            SPLIT.contains("what those assertions actually pin")
+                || SPLIT.contains("is NOT the statement \"NR 5 has no pre-lock route\""),
+            "the NR-gate test's comment must no longer read as 'NR 5 stays on the global-lock path'"
+        );
+    }
+
+    /// **NR 6 and NR 7 reach their direct handlers through the production predicate**, not a proof
+    /// gate — so their residual arm is the handler's own decline, not an unarmed selector.
+    #[test]
+    fn nr6_and_nr7_reach_their_handlers_through_the_production_predicate() {
+        let c = code(SPLIT);
+        assert!(
+            c.contains(
+                "matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_admission_enabled()"
+            ),
+            "the NR-gate bypass must be the canonical admission predicate"
+        );
+        assert!(
+            c.contains("if matches!(syscall, Syscall::IpcCall)")
+                && c.contains("if matches!(syscall, Syscall::IpcReply)"),
+            "and both direct handlers must still be reached from the dispatcher"
+        );
+    }
+
+    // ── §2: which decline arms a userspace NR 0 can reach ───────────────────────────────────
+
+    /// **The honest statement about NR 0.** Every decline answers `NotHandled`, and `NotHandled`
+    /// enters the terminal broad dispatcher. This guard exists so no future reading of
+    /// U9-RESIDUAL1 §5's marker table can be mistaken for source totality.
+    #[test]
+    fn every_yield_decline_still_falls_back_to_the_terminal_dispatcher() {
+        let route = code(body_of(SPLIT, "fn try_split_yield_into_frame", 2600));
+        assert!(
+            route.contains("Err(decline) => {") && route.contains("D::NotHandled"),
+            "the split Yield route's decline arm must be visible as a fallback, not hidden"
+        );
+        assert!(
+            YIELD_TXN.contains("U9-YIELD2 §1 — NR 0 is NOT closed"),
+            "the module that owns the policy must carry the honest statement"
+        );
+    }
+
+    /// **`NoTrapDrainer` is unreachable for a userspace NR 0**: both bridges open the
+    /// trap-path-active window before the split seam runs, so the admission's second condition is
+    /// already true by the time the route asks it.
+    #[test]
+    fn the_trap_path_window_opens_before_the_split_seam_on_both_bridges() {
+        for (name, src) in [("shared", TRAP_ENTRY), ("riscv64", RV_TRAP)] {
+            let c = code(src);
+            let establish = c
+                .find("TrapPathWindow::establish(cpu)")
+                .unwrap_or_else(|| panic!("{name}: no window established"));
+            let seam = c
+                .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+                .unwrap_or_else(|| panic!("{name}: no split seam"));
+            assert!(
+                establish < seam,
+                "{name}: the drainer window must be open before the split route asks about it"
+            );
+        }
+    }
+
+    /// **`CpuOutOfRange` is unreachable inside the route**: it bounds the CPU itself, before it
+    /// builds the owners that would ask the admission.
+    #[test]
+    fn the_yield_route_bounds_the_cpu_before_it_asks_the_admission() {
+        let route = code(body_of(SPLIT, "fn try_split_yield_into_frame", 2600));
+        let bound = route
+            .find(">= crate::kernel::scheduler::MAX_CPUS")
+            .expect("the route must bound the CPU");
+        let owners = route
+            .find("SharedYieldOwners")
+            .expect("the route must build the split owners");
+        assert!(
+            bound < owners,
+            "the CPU bound must precede the owners, or CpuOutOfRange would be reachable"
+        );
+    }
+
+    /// **`ArchGateOff` on AArch64 and RISC-V is unreachable for a userspace NR 0**: every AP on
+    /// those two architectures is marked wake-only BEFORE it is onlined, unconditionally and with
+    /// no knob, and their secondary loops never enter user mode. There is no userspace syscall
+    /// from a non-bootstrap CPU to refuse.
+    #[test]
+    fn aarch64_and_riscv_mark_every_ap_wake_only_before_onlining_it() {
+        for (name, src) in [("aarch64", A64_BOOT), ("riscv64", RV_BOOT)] {
+            let c = code(src);
+            let mark = c
+                .find("mark_cpu_wake_only(cpu, true)")
+                .unwrap_or_else(|| panic!("{name}: no wake-only mark"));
+            let online = c
+                .find("bring_up_cpu(cpu)")
+                .unwrap_or_else(|| panic!("{name}: no bring-up"));
+            assert!(
+                mark < online,
+                "{name}: an AP must be wake-only before it is online, or there is a placement window"
+            );
+            assert!(
+                !c.contains("ap_user_dispatch_enabled()"),
+                "{name}: no knob may clear an AP's wake-only bit on this architecture"
+            );
+        }
+    }
+
+    /// **`ArchGateOff` on x86_64 is the drain's own availability.** The Yield deferral gate and
+    /// the Yield DRAIN are switched by exactly the same two predicates, so under either D6-switch
+    /// diagnostic there is no consumer for a deferral — which is why refusing is correct there and
+    /// why removing that edge would mean giving a controlled switch proof a competing switch path.
+    #[test]
+    fn the_x86_yield_gate_and_the_x86_yield_drain_share_one_pair_of_predicates() {
+        let gate = code(body_of(BOOT_MOD, "pub(crate) fn d6_genuine_enabled()", 220));
+        assert!(
+            gate.contains("d6_controlled_switch_proof_enabled()") && gate.contains("d6_switch_a_enabled()"),
+            "the gate must be exactly the two D6-switch predicates"
+        );
+        let drain = code(body_of(
+            TRAP_ENTRY,
+            "Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): drain the deferred Yield",
+            1400,
+        ));
+        assert!(
+            drain.contains("!crate::kernel::boot::d6_controlled_switch_proof_enabled()")
+                && drain.contains("!crate::kernel::boot::d6_switch_a_enabled()"),
+            "and the drain must be gated on the same two, or the gate would not track its consumer"
+        );
+    }
+
+    // ── §3: the RISC-V settlement, and the boundary ─────────────────────────────────────────
+
+    /// **Every RISC-V drain refusal settles its deferral before returning.** Nine exits across
+    /// three drains used to return with the cell still set; the cell outlives the trap, so the
+    /// next trap re-entered that drain against a stale outgoing identity and every later userspace
+    /// NR 0 was refused `DeferralHeld` — `colliding_deferral_pending_for` counts all three cells
+    /// on RISC-V.
+    #[test]
+    fn every_riscv_drain_refusal_settles_the_deferral_it_was_draining() {
+        let cases = [
+            (
+                "foundation",
+                "dispatch_torn_fatal(cpu, inc, \"riscv_queue_switch_foundation_dispatch\")",
+                "riscv_queue_switch_foundation_clear(cpu_idx)",
+            ),
+            (
+                "futex_wait",
+                "dispatch_torn_fatal(cpu, inc, \"riscv_futex_wait_dispatch\")",
+                "futex_wait_dispatch_clear(cpu_idx)",
+            ),
+            (
+                "yield",
+                "dispatch_torn_fatal(cpu, inc, \"riscv_yield_dispatch\")",
+                "yield_dispatch_clear(cpu_idx)",
+            ),
+        ];
+        let c = code(RV_TRAP);
+        for (name, torn_anchor, clear) in cases {
+            let end = c
+                .find(torn_anchor)
+                .unwrap_or_else(|| panic!("{name}: drain not found"));
+            let start = c[..end]
+                .rfind("match shared.d6_genuine_mark_running_via_task_seam(dispatch)")
+                .unwrap_or_else(|| panic!("{name}: mark block not found"));
+            let block = &c[start..end];
+            let returns = block
+                .matches("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
+                .count();
+            let clears = block.matches(clear).count();
+            assert_eq!(
+                returns, 3,
+                "{name}: the three non-fatal refusal arms must still be the ones that return"
+            );
+            assert_eq!(
+                clears, returns,
+                "{name}: every refusal that returns must settle {clear} first"
+            );
+        }
+    }
+
+    /// **THE BOUNDARY, demonstrated rather than argued.** `queue_advance_select_step_split` is the
+    /// ONE selection owner every queue-advancing drain uses, and it refuses a CPU that is not the
+    /// bound `scheduler.current_cpu` — before any mutation, with `tid()` of `None`.
+    ///
+    /// For Yield "no incoming" is not idle: the caller has already been re-enqueued and `current`
+    /// already cleared, so all three drains call it an invariant failure and the CPU returns to
+    /// userspace having advanced its queue with nothing selected. That is what the admission's
+    /// `dispatch_cpu == cpu` condition prevents — and it is the drain's own precondition, not an
+    /// exclusion this family may relax.
+    #[test]
+    fn the_queue_advance_selection_owner_refuses_a_cpu_it_is_not_bound_to() {
+        let kernel = SharedKernel::new(crate::kernel::boot::Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.bring_up_cpu(AP).expect("a second dispatching CPU");
+            state.set_current_cpu(BSP).expect("bound to the BSP");
+        });
+        let before = kernel.with(|state| state.runnable_count_on_cpu(AP));
+        let dispatch = kernel.queue_advance_select_step_split(AP, "u9yield2_boundary");
+        assert!(
+            matches!(
+                dispatch,
+                CpuDispatch::RefusedCpuMismatch {
+                    requested: AP,
+                    authoritative: BSP
+                }
+            ),
+            "the selection owner must refuse a CPU it is not bound to, naming both"
+        );
+        assert!(
+            dispatch.tid().is_none(),
+            "a refused selection must carry no incoming task — which for Yield is the stranding"
+        );
+        assert_eq!(
+            kernel.with(|state| state.runnable_count_on_cpu(AP)),
+            before,
+            "and it must refuse BEFORE any mutation: nothing dequeued"
+        );
+    }
+
+    /// **The admission asks the drain's question, and adds the one that makes the answer stable.**
+    /// `dispatch_cpu != cpu` is the drain's own precondition, asked early so the refusal is free;
+    /// `dispatching > 1` is what stops a second dispatcher rebinding `current_cpu` between the
+    /// admission and the drain. Neither is removable alone, which is why closing NR 0 under
+    /// `yarm.ap_user_dispatch=1` needs a per-CPU authoritative dispatch binding rather than a
+    /// change to this family.
+    #[test]
+    fn the_admission_pairs_the_drains_precondition_with_its_stability_condition() {
+        let admission = code(body_of(
+            RUNTIME,
+            "pub(crate) fn split_terminal_route_admission(",
+            1400,
+        ));
+        assert!(
+            admission.contains("if dispatching > 1") && admission.contains("if dispatch_cpu != cpu"),
+            "both conditions must be present and separately reported"
+        );
+        let owner = code(body_of(
+            RUNTIME,
+            "pub(crate) fn queue_advance_select_step_split(",
+            1400,
+        ));
+        assert!(
+            owner.contains("if dispatch_cpu != cpu"),
+            "the drain's selection owner must apply the same CPU authentication the admission does"
+        );
+        assert!(
+            owner.contains("let dispatch_cpu = sched.current_cpu;"),
+            "and it must read the single global binding — the fact the missing contract names"
         );
     }
 }
