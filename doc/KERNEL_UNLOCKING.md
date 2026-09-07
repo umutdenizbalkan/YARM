@@ -14341,3 +14341,61 @@ additionally proves the replacement is neither restored, re-statused nor placed.
 | `a_claim_refusal_requires_a_tcb_write_the_window_forbids` | the consequence: `settle_failed_claim` is unreachable |
 | `the_fatal_is_reached_only_through_two_refused_settlements` | the divergence sits in the advance's refusal arm and nowhere else |
 | `the_drain_admits_exactly_terminal_and_removed` | broadening one predicate without the other is impossible |
+
+### §5 — live and gates
+
+Nine fresh exit-oracle boots at the delivered tree (three per architecture), all sealed against the
+exact commit and tree.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_BROAD_ENTER` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SPLIT_ENTER` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_CLAIM_RETIRED` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `CLEARED_CURRENT_ADVANCE` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `CLEARED_CURRENT_RESTORED` | 0 | 0 | 0 |
+| `CLEARED_CURRENT_RESTORE_REFUSED` | 0 | 0 | 0 |
+| `CLEARED_CURRENT_ADVANCE_REFUSED` (**new**) | 0 | 0 | 0 |
+| `CLEARED_CURRENT_FATAL` / `_TOKEN_DROPPED` | 0 | 0 | 0 |
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+
+Ordinary NR 16 keeps `broad=0` on all three. `CLEARED_CURRENT_ADVANCE` counting one per boot is the
+ordinary successful exit settling its cleared slot through the token with the claim as authority.
+
+`CLEARED_CURRENT_ADVANCE_REFUSED` is this stage's new marker and it counts zero, which is the
+expected result and is itself the §1 prediction restated: the admission now runs on **every** advance
+including the success path, so a non-zero count would mean either a claim whose `Exited(code)` write
+did not take or a duplicate deferral on a CPU holding its own reservation. Neither occurred in nine
+boots.
+
+| gate | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| core smoke | ok | ok | ok |
+| Fork/COW (`VM_COW=1`) | ok — 2 fork transactions, 4 COW write faults, 4 private-copy recoveries, parent+child isolation witnesses | ok | ok |
+| fault delivery (`FAULT_DELIVERY=1`) | ok — classify/build/invariant/completion markers all present | ok | ok |
+| REAP1 supervisor crash-restart | ok — `fault_observed=1 supervisor_notified=1 restart_observed=1 stale_reply_objects=0` | ok — same fields | ok — `attempts=4 stalled=3 faults=5 teardowns=4 reaps=4 distinct_targets=4`; the known upstream boot stall consumed three of the four bounded attempts, which is NOT counted as additional clean runs |
+| server-death | `result=ok` — `caller_wakes=1 peer_death_winners=1 exit_returns=0` | **fail, pre-existing** | **fail, pre-existing** |
+
+**The AArch64 and RISC-V server-death runners fail identically at base `c698c95`.** Both were
+re-run from a clean worktree at the base commit and produce the same `RUN_B expected exactly one
+captured reverse link, saw 0` and the same `result=fail` seal. Not a regression, and not repaired
+here — repairing it is the AArch64/RISC-V server-death cell's own work, not this stage's.
+
+**A correction to the U9-EXIT2 §5 record.** That record described these two runners as failing with
+`BOOT_FATAL_INITRAMFS_MISSING`, "having never reached userspace". They no longer do: at both
+`c698c95` and the delivered tree they boot through to `RUN_B` and fail on the reverse-link count
+instead. The earlier description is superseded; the conclusion it supported — pre-existing, not
+caused by the exit work — is re-established here against the current base rather than inherited.
+
+| static gate | result |
+|---|---|
+| hosted suite (`--test-threads=1`) | 5343 passed / 0 failed / 2 ignored (base: 5325) |
+| freestanding x86_64 / AArch64 / RISC-V | built ×3 |
+| `cargo clippy --lib --features hosted-dev` | 372 warnings, identical class-and-count set to base `c698c95` (diffed by class; zero classes added or removed) |
+| `rustfmt --edition 2024 --check` on every changed file | clean |
+| contract/doc enforcement | `[ok] contract-doc enforcement gate passed` |
+| broad-lock census | `with_cpu / with_broad / TOTAL = 2 / 0 / 2`, unchanged |
+| artifact residue | `git status --short` = 0; no build output tracked |
+
+The census stays at 2/0/2. This stage retires no acquisition — it did not set out to; it closes the
+race surface of an acquisition already retired by U9-EXIT1.
