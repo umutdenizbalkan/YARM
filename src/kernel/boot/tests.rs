@@ -164327,7 +164327,8 @@ mod u9yield2_family_edge {
     fn the_x86_yield_gate_and_the_x86_yield_drain_share_one_pair_of_predicates() {
         let gate = code(body_of(BOOT_MOD, "pub(crate) fn d6_genuine_enabled()", 220));
         assert!(
-            gate.contains("d6_controlled_switch_proof_enabled()") && gate.contains("d6_switch_a_enabled()"),
+            gate.contains("d6_controlled_switch_proof_enabled()")
+                && gate.contains("d6_switch_a_enabled()"),
             "the gate must be exactly the two D6-switch predicates"
         );
         let drain = code(body_of(
@@ -164445,7 +164446,8 @@ mod u9yield2_family_edge {
             1400,
         ));
         assert!(
-            admission.contains("if dispatching > 1") && admission.contains("if dispatch_cpu != cpu"),
+            admission.contains("if dispatching > 1")
+                && admission.contains("if dispatch_cpu != cpu"),
             "both conditions must be present and separately reported"
         );
         let owner = code(body_of(
