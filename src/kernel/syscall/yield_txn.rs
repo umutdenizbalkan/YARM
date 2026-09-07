@@ -87,19 +87,9 @@ pub(crate) enum YieldDecline {
     ReenqueueRefused,
 }
 
-impl YieldDecline {
-    /// A stable wire name, so a live log names the arm rather than "it did not happen".
-    pub(crate) const fn marker(self) -> &'static str {
-        match self {
-            Self::NoCurrent => "no_current",
-            Self::ArchGateOff => "arch_gate_off",
-            Self::DeferralHeld => "deferral_held",
-            Self::RouteNotAdmitted(why) => why.marker(),
-            Self::NotRunning => "not_running",
-            Self::ReenqueueRefused => "reenqueue_refused",
-        }
-    }
-}
+// A `YieldDecline` names itself through [`legacy_reason`], and only through it. Two spellings of
+// one vocabulary is how a live log comes to disagree with itself: the delivered in-lock blocks
+// already had reason strings, and `legacy_reason` is exactly those strings.
 
 /// Which `Running → Runnable` the rank-2 step actually applied — and therefore what its inverse
 /// must undo.
@@ -265,6 +255,12 @@ pub(crate) fn run_yield_transaction<O: YieldOwners>(
 
 /// The SPLIT owner. Each method takes exactly the one domain lock its answer needs, with the broad
 /// `SpinLock<KernelState>` already released.
+///
+/// Constructed only by `syscall_split::try_split_yield_into_frame`, which is stubbed out under
+/// `hosted-dev` — the hosted suite exercises the BROAD adapter and the transaction directly, and
+/// the split route is proven live. The allow is scoped to that build, so a dead construction in a
+/// production build would still be reported.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 pub(crate) struct SharedYieldOwners<'a> {
     pub(crate) shared: &'a crate::runtime::SharedKernel,
 }
