@@ -1277,6 +1277,7 @@ pub fn handle_riscv_trap_entry_shared(
             // GENUINE `Idle` selection is left to the established idle tail below, unchanged — so
             // a refusal never wears idle's name, and idle never loses its own.
             if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                trap_path.retire();
                 dispatch_torn_fatal(cpu, tid, "riscv_queue_switch_foundation_dispatch");
             }
             if !matches!(acquired, crate::runtime::DispatchAcquire::Idle)
@@ -1666,6 +1667,7 @@ pub fn handle_riscv_trap_entry_shared(
             // GENUINE `Idle` selection is left to the established idle tail below, unchanged — so
             // a refusal never wears idle's name, and idle never loses its own.
             if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                trap_path.retire();
                 dispatch_torn_fatal(cpu, tid, "riscv_futex_wait_dispatch");
             }
             if !matches!(acquired, crate::runtime::DispatchAcquire::Idle)
@@ -1849,6 +1851,7 @@ pub fn handle_riscv_trap_entry_shared(
             // GENUINE `Idle` selection is left to the established idle tail below, unchanged — so
             // a refusal never wears idle's name, and idle never loses its own.
             if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                trap_path.retire();
                 dispatch_torn_fatal(cpu, tid, "riscv_yield_dispatch");
             }
             if !matches!(acquired, crate::runtime::DispatchAcquire::Idle)

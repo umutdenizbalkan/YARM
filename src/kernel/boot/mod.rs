@@ -785,31 +785,39 @@ pub(crate) static TRAP_DISPATCH_WINDOW: [core::sync::atomic::AtomicU64;
 static TRAP_DISPATCH_EPOCH_NEXT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1);
 
-/// U9-DISPATCH-CPU1 §2 — open a dispatch window on `cpu` and return `(epoch, previous)`.
+/// U9-DISPATCH-CPU1 §2/D2 — open a dispatch window on `cpu` and return `(epoch, displaced)`.
 ///
-/// `previous` is whatever window was open on this CPU, which is `0` for an ordinary trap and the
-/// OUTER window's epoch for a nested entry. `close_trap_dispatch_window` restores it, so nesting
-/// is a stack rather than a clobber.
+/// `displaced` is whatever window was open on this CPU, and for a correct run it is always `0`.
+/// **Nested entry into the shared trap wrapper is not supported on any architecture**: x86_64's
+/// `TRAP_DISPATCH_DEPTH` guard halts a re-entrant trap BEFORE it reaches the wrapper
+/// (`previous_depth != 0` → `log_decoded_fatal_trap` + `halt_forever`), and interrupts stay masked
+/// for the whole trap on all three, so no second entry can arrive on this CPU. A non-zero
+/// `displaced` therefore means the previous window was ABANDONED by a landing that diverged
+/// without retiring, and it is reported rather than saved.
+///
+/// It is deliberately not restored on close. Saving and restoring it would let a later trap REVIVE
+/// an abandoned authority: A opens 1 and diverges, B opens 2 saving 1, B returns and restores 1 —
+/// and A's long-dead token is live again. Retirement always goes to `0`.
 ///
 /// The ONLY caller is `TrapPathWindow::establish`.
 pub(crate) fn open_trap_dispatch_window(cpu_idx: usize) -> (u64, u64) {
     let epoch = TRAP_DISPATCH_EPOCH_NEXT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    let previous = TRAP_DISPATCH_WINDOW[cpu_idx].swap(epoch, core::sync::atomic::Ordering::AcqRel);
-    (epoch, previous)
+    let displaced = TRAP_DISPATCH_WINDOW[cpu_idx].swap(epoch, core::sync::atomic::Ordering::AcqRel);
+    (epoch, displaced)
 }
 
-/// U9-DISPATCH-CPU1 §2 — retire the window `epoch` on `cpu`, restoring `previous`.
+/// U9-DISPATCH-CPU1 §2/D2 — retire the window `epoch` on `cpu`.
 ///
-/// Exact-epoch: the store happens only if this CPU's live window is still `epoch`. A window that
-/// has already been superseded — by a nested entry that has not yet returned — is left alone, so
-/// retirement can never revoke a NEWER window. Returns whether this call performed the retirement.
+/// Exact-epoch and idempotent: the store happens only if this CPU's live window is still `epoch`,
+/// so a repeat call does nothing and a stale retirement can never revoke a NEWER window. Returns
+/// whether this call performed the retirement.
 ///
-/// The ONLY caller is `TrapPathWindow::drop`.
-pub(crate) fn close_trap_dispatch_window(cpu_idx: usize, epoch: u64, previous: u64) -> bool {
+/// Callers are `TrapPathWindow::retire` and `TrapPathWindow::drop`.
+pub(crate) fn close_trap_dispatch_window(cpu_idx: usize, epoch: u64) -> bool {
     TRAP_DISPATCH_WINDOW[cpu_idx]
         .compare_exchange(
             epoch,
-            previous,
+            0,
             core::sync::atomic::Ordering::AcqRel,
             core::sync::atomic::Ordering::Acquire,
         )

@@ -486,9 +486,15 @@ impl PriorityScheduler {
                     // mutated for it; keep scanning rather than claiming a dequeue.
                     continue;
                 }
-                if !self.membership_tracking_exhausted {
-                    self.membership_remove(tid);
-                }
+                // U9-DISPATCH-CPU1 D1 — the selected task's membership is RETAINED, exactly as
+                // `dispatch_next_selection` retains it.
+                //
+                // Membership tracks BOTH queued and current tasks: it is what makes
+                // `enqueue_with_priority` answer `AlreadyQueued` for a task that already holds a
+                // slot. Removing it here — which an earlier form of this scan did — would have let
+                // a task that is CURRENT be enqueued a second time, i.e. duplicate placement of a
+                // running task, with the duplicate‑check silently weakened rather than removed.
+                // The only membership this step drops is the OUTGOING IDLE's, below.
                 if let Some(current) = idle_current
                     && !self.membership_tracking_exhausted
                 {

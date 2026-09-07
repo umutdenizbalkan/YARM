@@ -557,37 +557,65 @@ fn drain_switch_plan_stash(
 pub(crate) struct TrapPathWindow {
     cpu_idx: usize,
     authority: crate::runtime::DispatchAuthority,
-    /// U9-DISPATCH-CPU1 §2: the epoch this window opened, and whatever window it displaced. A
-    /// nested entry displaces its outer window and restores it on the way out, so nesting is a
-    /// stack rather than a clobber.
+    /// U9-DISPATCH-CPU1 §2/D2: the epoch this window opened.
     epoch: u64,
-    previous_epoch: u64,
+    /// Has the dispatch authority been retired yet? Separate from `settled`, because the
+    /// publication window and the authority end at DIFFERENT points: publication closes before the
+    /// drains, the authority only after them.
+    retired: core::cell::Cell<bool>,
     settled: core::cell::Cell<bool>,
 }
 
 impl TrapPathWindow {
     pub(crate) fn establish(cpu: CpuId) -> Self {
         let cpu_idx = cpu.0 as usize;
-        let (authority, epoch, previous_epoch) = if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        let (authority, epoch) = if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
             crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
                 .store(true, core::sync::atomic::Ordering::Relaxed);
             // Open BEFORE any authority is handed out, so an authority minted for an earlier trap
             // on this CPU is already retired by the time this one can be used.
-            let (epoch, previous) = crate::kernel::boot::open_trap_dispatch_window(cpu_idx);
-            (
-                crate::runtime::DispatchAuthority::mint(cpu, epoch),
-                epoch,
-                previous,
-            )
+            let (epoch, displaced) = crate::kernel::boot::open_trap_dispatch_window(cpu_idx);
+            if displaced != 0 {
+                // Nested entry is not supported on any architecture (x86_64 halts a re-entrant
+                // trap before it reaches this wrapper, and interrupts stay masked throughout on
+                // all three), so this means a landing diverged without retiring. Report it; the
+                // displaced epoch is NOT saved, because restoring it later would revive an
+                // authority whose trap is long gone.
+                crate::yarm_log!(
+                    "TRAP_DISPATCH_WINDOW_ABANDONED cpu={} displaced={} opened={}",
+                    cpu.0,
+                    displaced,
+                    epoch
+                );
+            }
+            (crate::runtime::DispatchAuthority::mint(cpu, epoch), epoch)
         } else {
-            (crate::runtime::DispatchAuthority::none(cpu), 0, 0)
+            (crate::runtime::DispatchAuthority::none(cpu), 0)
         };
         Self {
             cpu_idx,
             authority,
             epoch,
-            previous_epoch,
+            retired: core::cell::Cell::new(false),
             settled: core::cell::Cell::new(false),
+        }
+    }
+
+    /// U9-DISPATCH-CPU1 D2 — retire this trap's dispatch authority.
+    ///
+    /// Idempotent and exact-epoch, so calling it before a non-returning landing and again from
+    /// `Drop` retires exactly once, and a call that no longer owns the window does nothing.
+    ///
+    /// **Every landing that does not return must call this first.** `Drop` covers the returning
+    /// paths; the idle terminals and the fatal paths never unwind, and for the idle terminals in
+    /// particular the CPU goes on to accept interrupts and dispatch other work — an authority left
+    /// live across that transfer of ownership would name a CPU running something else entirely.
+    pub(crate) fn retire(&self) {
+        if self.retired.replace(true) {
+            return;
+        }
+        if self.cpu_idx < crate::kernel::scheduler::MAX_CPUS && self.epoch != 0 {
+            crate::kernel::boot::close_trap_dispatch_window(self.cpu_idx, self.epoch);
         }
     }
 
@@ -618,18 +646,12 @@ impl Drop for TrapPathWindow {
     /// drains are done, which is exactly here.
     ///
     /// Diverging landings — the idle terminals and the fatal paths — never unwind, so they never
-    /// reach this. That is sound rather than a gap: none of them returns to the trapped context,
-    /// so a retained authority has no caller left to use it, and the next `establish` on this CPU
-    /// displaces the window anyway.
+    /// reach this. They call [`Self::retire`] explicitly instead: "no caller remains" is not a
+    /// retirement, because an idle terminal hands the CPU on to interrupts and further dispatch
+    /// while the abandoned window would still read as live.
     fn drop(&mut self) {
         self.settle();
-        if self.cpu_idx < crate::kernel::scheduler::MAX_CPUS && self.epoch != 0 {
-            crate::kernel::boot::close_trap_dispatch_window(
-                self.cpu_idx,
-                self.epoch,
-                self.previous_epoch,
-            );
-        }
+        self.retire();
     }
 }
 
@@ -1559,6 +1581,8 @@ pub fn handle_trap_entry_shared(
                             );
                             // The established idle primitive, broad guard already dropped.
                             // Never returns.
+                            // U9-DISPATCH-CPU1 D2: retire before the non-returning transfer.
+                            trap_path.retire();
                             super::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(
                                 cpu,
                                 work.outgoing_tid,
@@ -1721,6 +1745,7 @@ pub fn handle_trap_entry_shared(
                 |k, a| k.futex_wait_dispatch_step_mut(a),
             );
             if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                trap_path.retire();
                 dispatch_torn_fatal(cpu, tid, "futex_wait_queue_advancing_dispatch");
             }
             if !matches!(acquired, crate::runtime::DispatchAcquire::Resumable(_)) {
@@ -1864,6 +1889,7 @@ pub fn handle_trap_entry_shared(
                     |k, a| k.futex_wait_dispatch_step_mut(a),
                 );
                 if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                    trap_path.retire();
                     dispatch_torn_fatal(cpu, tid, "aarch64_futex_wait_dispatch");
                 }
                 if !matches!(acquired, crate::runtime::DispatchAcquire::Resumable(_)) {
@@ -1990,6 +2016,12 @@ pub fn handle_trap_entry_shared(
                             current_none as u32
                         );
                     }
+                    // U9-DISPATCH-CPU1 D2: retire the dispatch authority BEFORE the ownership
+                    // transfer. This landing never returns, so `Drop` will not run — and the CPU
+                    // does not stop here: it takes interrupts and dispatches other work from the
+                    // idle loop. An authority left live across that would name a CPU running
+                    // something else entirely.
+                    trap_path.retire();
                     // Enter the real BSP idle loop OUTSIDE `with_cpu` (emits
                     // AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED, then a `wfi` loop). Never returns.
                     super::aarch64::trap::enter_post_lock_idle(cpu);
@@ -2039,6 +2071,7 @@ pub fn handle_trap_entry_shared(
                     |k, a| k.yield_dispatch_step_mut(a),
                 );
                 if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                    trap_path.retire();
                     dispatch_torn_fatal(cpu, tid, "aarch64_yield_dispatch");
                 }
                 if !matches!(acquired, crate::runtime::DispatchAcquire::Resumable(_)) {
@@ -2106,6 +2139,8 @@ pub fn handle_trap_entry_shared(
                         cpu.0,
                         acquired.marker()
                     );
+                    // U9-DISPATCH-CPU1 D2: retire before the non-returning ownership transfer.
+                    trap_path.retire();
                     super::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(cpu, outgoing);
                 }
             } else {
@@ -2146,6 +2181,7 @@ pub fn handle_trap_entry_shared(
                 |k, a| k.yield_dispatch_step_mut(a),
             );
             if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                trap_path.retire();
                 dispatch_torn_fatal(cpu, tid, "yield_queue_advancing_dispatch");
             }
             if !matches!(acquired, crate::runtime::DispatchAcquire::Resumable(_)) {

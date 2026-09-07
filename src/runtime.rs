@@ -578,7 +578,7 @@ impl DispatchAuthority {
         if open != 0 {
             return Self::mint(cpu, open);
         }
-        let (epoch, _previous) = crate::kernel::boot::open_trap_dispatch_window(idx);
+        let (epoch, _displaced) = crate::kernel::boot::open_trap_dispatch_window(idx);
         Self::mint(cpu, epoch)
     }
 
@@ -594,8 +594,8 @@ impl DispatchAuthority {
         }
         // A genuinely RETIRED window: open one and close it, exactly as a returning trap does.
         // Building it by arithmetic would test a number, not the lifetime.
-        let (epoch, previous) = crate::kernel::boot::open_trap_dispatch_window(idx);
-        let retired = crate::kernel::boot::close_trap_dispatch_window(idx, epoch, previous);
+        let (epoch, _displaced) = crate::kernel::boot::open_trap_dispatch_window(idx);
+        let retired = crate::kernel::boot::close_trap_dispatch_window(idx, epoch);
         debug_assert!(retired, "the fixture must own the window it retires");
         Self::mint(cpu, epoch)
     }
