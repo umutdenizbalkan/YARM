@@ -159071,7 +159071,8 @@ mod u9reap1_reap_transaction {
 mod u9exit1_self_exit_transaction {
     use super::*;
     use crate::kernel::boot::cleared_current::{
-        ClearedCurrentOwners, ClearedCurrentSettlement, ClearedCurrentToken, RestoreRefusal,
+        AdvanceRefusal, ClearedCurrentOwners, ClearedCurrentSettlement, ClearedCurrentToken,
+        RestoreRefusal,
     };
     use crate::kernel::boot::exit_claim::{
         ExitClaim, ExitDisposition, ExitDrainVerdict, ExitFailure, ExitPreflight, ExitRefusal,
@@ -160712,6 +160713,12 @@ mod u9exit1_self_exit_transaction {
 
     /// **A `Runnable` victim that a restart also re-queued** is not restored even though it is
     /// present and ours: `tid_placed_anywhere` is what refuses it, and it is checked on EVERY CPU.
+    ///
+    /// U9-EXIT4 §2 extends this to the OTHER settlement. Under U9-EXIT3 the token would happily
+    /// publish an advance past this victim — the caller was expected to have asked
+    /// `victim_is_drain_honourable` first — so a caller that forgot got a deferral the drain
+    /// answers `Contradicted` to. The admission now lives inside `publish_queue_advance`, so the
+    /// same requeued victim is refused there too, and the token comes back rather than a settlement.
     #[test]
     fn a_requeued_victim_is_never_restored_even_while_present() {
         // The slot is genuinely cleared, and then a restart re-queues the victim.
@@ -160726,16 +160733,50 @@ mod u9exit1_self_exit_transaction {
         h.sched
             .enqueue_on(CPU, ThreadId(1))
             .expect("a restart re-queues the victim");
+        let before = h.snapshot();
         let refused = token
             .restore_current_exact(&mut h)
             .expect_err("must refuse");
         assert_eq!(refused.1, RestoreRefusal::PlacedElsewhere);
         assert_eq!(h.current_of(0), None, "and nothing was written");
-        // Settle the token so the harness does not diverge on drop.
-        refused.0.publish_queue_advance(
-            &mut h,
-            crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+        // U9-EXIT4 §2: the advance refuses this exact state by itself, with the token handed back.
+        let refused = refused
+            .0
+            .publish_queue_advance(
+                &mut h,
+                crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+            )
+            .expect_err("a requeued victim is not drain-honourable");
+        assert_eq!(refused.1, AdvanceRefusal::DrainWouldRefuse);
+        assert_eq!(
+            h.exit_deferral[0], None,
+            "a refused advance publishes nothing"
         );
+        assert_eq!(
+            h.snapshot(),
+            before,
+            "and neither refusal mutated anything at all"
+        );
+        // Settle the token so the harness does not diverge on drop. The victim becoming terminal
+        // is what makes the SAME settlement succeed, which is the property under test stated the
+        // other way round: the admission tracks the victim's state, not the caller's intent.
+        h.tcbs
+            .iter_mut()
+            .flatten()
+            .find(|t| t.tid.0 == 1)
+            .expect("the victim")
+            .status = TaskStatus::Exited(0);
+        assert_eq!(
+            refused
+                .0
+                .publish_queue_advance(
+                    &mut h,
+                    crate::kernel::boot::cleared_current::AdvanceAuthority::VictimNonResumable,
+                )
+                .expect("a terminal victim is drain-honourable"),
+            ClearedCurrentSettlement::AdvanceCommitted
+        );
+        assert_eq!(h.exit_deferral[0], Some((1, Some(Asid(201)))));
     }
 
     /// The compare-and-clear is the whole repair for `VictimChanged`: it mutates NOTHING when the
@@ -160826,26 +160867,132 @@ mod u9exit1_self_exit_transaction {
         );
         assert!(CLEARED_CURRENT.contains("impl Drop for ClearedCurrentToken {"));
         assert!(CLEARED_CURRENT.contains("panic!(\"cleared current slot left unsettled\")"));
-        // Exactly three consuming exits, each taking `self` by value.
+        // Exactly three consuming exits, each taking `self` by value. `mut self` is still by
+        // value — U9-EXIT4 §3 needs the binding mutable so `settle` can mark the token rather
+        // than `mem::forget` it — so the guard pins the by-value receiver without pinning the
+        // mutability, and separately forbids every by-reference form.
         for consumer in [
-            "pub(crate) fn restore_current_exact<O: ClearedCurrentOwners>(\n        self,",
-            "pub(crate) fn publish_queue_advance<O: ClearedCurrentOwners>(\n        self,",
-            "pub(crate) fn fatal(self, reason: &'static str) -> ! {",
+            "pub(crate) fn restore_current_exact<O: ClearedCurrentOwners>(\n        mut self,",
+            "pub(crate) fn publish_queue_advance<O: ClearedCurrentOwners>(\n        mut self,",
+            "pub(crate) fn fatal(mut self, reason: &'static str) -> ! {",
         ] {
             assert!(
                 CLEARED_CURRENT.contains(consumer),
                 "missing consuming settlement: {consumer}"
             );
         }
-        // And the private `consume` is the only way past `Drop`, so a fourth exit cannot be added
-        // without going through it.
+        // Scoped to the token's own inherent impl: the `ClearedCurrentOwners` trait in the same
+        // file legitimately takes `&mut self`, and it carries no obligation.
+        let token_impl = CLEARED_CURRENT
+            .split("impl ClearedCurrentToken {")
+            .nth(1)
+            .expect("the token's inherent impl")
+            .split("\n/// What licenses a queue advance")
+            .next()
+            .expect("its end");
+        assert!(
+            !token_impl.contains("pub(crate) fn restore_current_exact(&")
+                && !token_impl.contains("(&self,")
+                && !token_impl.contains("(&mut self,"),
+            "a settlement that borrows would leave the obligation alive after it returned"
+        );
+        // Exactly four methods on the token: the private `settle` and the three settlements.
         assert_eq!(
-            CLEARED_CURRENT.matches("core::mem::forget(self)").count(),
+            token_impl.matches("    fn ").count()
+                + token_impl.matches("    pub(crate) fn ").count(),
+            4,
+            "the token has exactly one private helper (`settle`) and three settlements, \
+             so a fourth exit cannot be added without this guard noticing"
+        );
+        // U9-EXIT4 §3: the private `settle` is the only way past `Drop`, and it is a FLAG rather
+        // than an abandonment primitive — see `the_token_is_never_abandoned_through_a_forget_primitive`.
+        assert_eq!(
+            CLEARED_CURRENT.matches("fn settle(&mut self)").count(),
             1,
-            "one place suppresses Drop, and it is the shared consume"
+            "one place defuses Drop, and it is the shared settle"
+        );
+        assert_eq!(
+            CLEARED_CURRENT.matches("self.settled = true;").count(),
+            1,
+            "and it is the only writer of the flag"
         );
         // Three call sites: one per settlement, and no other.
-        assert_eq!(CLEARED_CURRENT.matches("self.consume()").count(), 3);
+        assert_eq!(CLEARED_CURRENT.matches("self.settle()").count(), 3);
+    }
+
+    /// U9-EXIT4 §3 — the token cannot be abandoned through `mem::forget`, `ManuallyDrop` or any
+    /// equivalent, ANYWHERE in the kernel.
+    ///
+    /// U9-EXIT3's private `consume` defused the drop bomb with `core::mem::forget(self)`. That was
+    /// correct, but it made the property unprovable by inspection: a reader could not distinguish
+    /// the one sanctioned forget from a second one smuggled into the same module, and a caller
+    /// outside the module could always have written `mem::forget(token)` itself — the type is
+    /// `pub(crate)`, and forgetting is safe Rust.
+    ///
+    /// The bomb is now conditional on a private flag no other module can set, so abandonment
+    /// primitives are not merely discouraged: there is no reason for one to exist, and this guard
+    /// says so across every production source file that can name the type.
+    #[test]
+    fn the_token_is_never_abandoned_through_a_forget_primitive() {
+        /// Only CODE lines count. Both files below discuss these primitives in prose — this guard
+        /// exists because U9-EXIT3 used one — and a doc comment naming a hazard is the opposite of
+        /// committing it.
+        fn code_lines(src: &str) -> impl Iterator<Item = &str> {
+            src.lines().filter(|line| {
+                let t = line.trim_start();
+                !t.starts_with("//") && !t.starts_with("*") && !t.is_empty()
+            })
+        }
+        // (1) The module that owns the token executes no abandonment primitive at all.
+        for primitive in [
+            "mem::forget",
+            "ManuallyDrop",
+            "ptr::read",
+            "ptr::write",
+            "transmute",
+            "Box::leak",
+        ] {
+            for line in code_lines(CLEARED_CURRENT) {
+                assert!(
+                    !line.contains(primitive),
+                    "`{primitive}` must not appear in the token's own module: the drop bomb is \
+                     defused by the private `settled` flag, so nothing here needs one — {line}"
+                );
+            }
+        }
+        // (2) Nor does any production file that can name the token. `tests.rs` is excluded on
+        // purpose — this file IS the guard, and it quotes the primitives above verbatim.
+        for (name, src) in [
+            ("exit_txn.rs", EXIT_TXN),
+            ("exit_claim.rs", EXIT_CLAIM),
+            ("syscall_split.rs", SPLIT),
+            ("runtime.rs", RUNTIME),
+        ] {
+            for primitive in ["mem::forget", "ManuallyDrop"] {
+                for line in code_lines(src) {
+                    if !line.contains(primitive) {
+                        continue;
+                    }
+                    assert!(
+                        !line.contains("ClearedCurrentToken") && !line.contains("token"),
+                        "{name} abandons a cleared-current obligation: {line}"
+                    );
+                }
+            }
+        }
+        // (3) The flag itself is private and is initialised unsettled at the ONE mint.
+        assert!(
+            CLEARED_CURRENT.contains("    settled: bool,"),
+            "the flag must be a private field, not a pub(crate) one"
+        );
+        assert!(
+            CLEARED_CURRENT.contains("settled: false,"),
+            "a freshly minted token must start as an unsettled obligation"
+        );
+        assert!(
+            CLEARED_CURRENT.contains("if self.settled {\n            return;\n        }"),
+            "Drop must be a no-op for a settled token and a divergence otherwise"
+        );
     }
 
     /// A `Complete` disposition after the clear is reachable ONLY through a completed restore.

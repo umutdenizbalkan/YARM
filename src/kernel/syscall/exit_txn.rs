@@ -223,6 +223,29 @@ pub(crate) trait ExitOwners: ClearedCurrentOwners {
 /// * **anything else** — a `Runnable` requeue or a `Faulted` victim would be advanced past by a
 ///   drain that then REFUSES the reverify, leaving the CPU with an empty current slot and no
 ///   selection. That cannot be settled, so it diverges.
+///
+/// # U9-EXIT4 §2 — the admission moved into the settlement
+///
+/// U9-EXIT3 asked `victim_is_drain_honourable` here and then called an infallible
+/// `publish_queue_advance`. The check now lives inside the settlement, which returns the token when
+/// the drain would refuse (see [`AdvanceRefusal`]). Two things follow. The gate can no longer be
+/// forgotten by a future caller — skipping it yields the obligation back, not an advance. And the
+/// divergence below is reached only through a *refused* settlement rather than through a caller's
+/// own predicate, so the state that reaches it is stated by the token: not restorable AND not
+/// drain-honourable.
+///
+/// # U9-EXIT4 §1 — and why nothing production can reach any of it
+///
+/// This whole function is post-claim-refusal, and a claim refusal is itself production-impossible.
+/// `exit_preflight_locked` at step (3) established `{TCB present, asid, !detached, Running}`;
+/// `claim_self_exit_locked` re-checks exactly those four; and steps (4)–(7) between them write no
+/// TCB — a read-only reverse-link probe, two per-CPU deferral cells, the rank-1 current slot, and
+/// the restart-token counter. A concurrent writer would need to run on this CPU (impossible: every
+/// architecture masks interrupts for the whole trap — x86_64 `IA32_FMASK = RFLAGS.IF`, AArch64
+/// hardware `DAIF` masking with no `daifclr` on the trap path, RISC-V hardware `sstatus.SIE` clear
+/// with the one re-enable confined to the terminal-idle tail) or on another dispatching CPU (there
+/// is exactly one). So `settle_failed_claim` is the typed capability for states that cannot occur,
+/// and §4 constructs them by injection in the hosted harness instead.
 fn settle_failed_claim<O: ExitOwners>(
     owners: &mut O,
     token: ClearedCurrentToken,
@@ -231,6 +254,7 @@ fn settle_failed_claim<O: ExitOwners>(
     asid: Option<Asid>,
     refusal: ExitRefusal,
 ) -> ExitFailure {
+    let _ = asid;
     let token = match token.restore_current_exact(owners) {
         Ok(ClearedCurrentSettlement::Restored) => {
             // Restored: the task is current again and nothing is being advanced past, so the
@@ -256,15 +280,26 @@ fn settle_failed_claim<O: ExitOwners>(
             token
         }
     };
-    if owners.victim_is_drain_honourable(tid, asid) {
-        let settlement = token.publish_queue_advance(owners, AdvanceAuthority::VictimNonResumable);
-        debug_assert_eq!(settlement, ClearedCurrentSettlement::AdvanceCommitted);
-        return ExitFailure {
+    match token.publish_queue_advance(owners, AdvanceAuthority::VictimNonResumable) {
+        Ok(ClearedCurrentSettlement::AdvanceCommitted) => ExitFailure {
             refusal,
             disposition: ExitDisposition::PostClearAdvance,
-        };
+        },
+        Ok(ClearedCurrentSettlement::Restored) => {
+            // `publish_queue_advance` never produces this; matched rather than wildcarded so a
+            // variant whose meaning would be wrong here cannot be silently absorbed.
+            unreachable!("an advance settles as AdvanceCommitted or returns the token")
+        }
+        Err((token, why)) => {
+            crate::yarm_log!(
+                "CLEARED_CURRENT_ADVANCE_REFUSED cpu={} tid={} reason={}",
+                cpu.0,
+                tid,
+                why.marker()
+            );
+            token.fatal("post_clear_victim_neither_restorable_nor_drain_honourable")
+        }
     }
-    token.fatal("post_clear_victim_neither_restorable_nor_drain_honourable")
 }
 
 /// U9-EXIT2 §1/§4 — every failure carries the settlement it owes, and none of them is "the broad
@@ -423,7 +458,25 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
     //
     // `AdvanceAuthority::Claimed` is what makes it legal: the claim is unforgeable, so this arm is
     // unreachable on any path where the exit did not happen.
-    let settlement = token.publish_queue_advance(owners, AdvanceAuthority::Claimed(&claim));
+    //
+    // U9-EXIT4 §2: the settlement now runs the drain's own admission before publishing, and the
+    // claim two lines above is exactly what makes it pass — `apply_self_exit_writes_locked` wrote
+    // `Exited(code)`, which `exit_drain_verdict_locked` answers `Terminal` for. A refusal here would
+    // therefore mean the claim's own write did not take, or that a deferral was already published
+    // on a CPU whose reservation this transaction holds. Neither has a continuation: the victim is
+    // terminal and off the CPU, and the entering frame belongs to a task that has already exited.
+    let settlement = match token.publish_queue_advance(owners, AdvanceAuthority::Claimed(&claim)) {
+        Ok(settlement) => settlement,
+        Err((token, why)) => {
+            crate::yarm_log!(
+                "CLEARED_CURRENT_ADVANCE_REFUSED cpu={} tid={} reason={} phase=post_claim",
+                cpu.0,
+                tid,
+                why.marker()
+            );
+            token.fatal("claimed_victim_refused_the_reserved_advance")
+        }
+    };
     debug_assert_eq!(settlement, ClearedCurrentSettlement::AdvanceCommitted);
 
     let mut outcome = ExitOutcome {
