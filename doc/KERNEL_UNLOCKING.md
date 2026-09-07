@@ -14816,8 +14816,8 @@ default-off knob says nothing about unreachability.
 | outcome | exact producer | supported configuration that reaches it | userspace NR 0? | mutation at the point of decline | canonical broad behaviour | settlement it requires |
 |---|---|---|---|---|---|---|
 | `NoCurrent` | `SharedKernel::current_tid_authoritative(cpu)` → `None` (CPU not online, or `current_tid_on(cpu)` empty) | every dispatch path that reaches ring 3 sets the per-CPU `current` slot in the same transaction that selects the task (`commit_dispatch_selection_in_lock`, `enqueue_then_dispatch_on_cpu_split`, `d6_genuine_mark_running_via_task_seam`) | **no** — and this is checked, not assumed: in the AP profile the AP's userspace `Yield` passed this test and refused at the admission instead, so `current[1]` was set even for a plan-driven fresh ring-3 entry | none | silent (`Err(NoCurrent) => {}`); the owed transition is skipped; `on_preempt_current_cpu_selection` then dispatches the FIFO head if the queue is non-empty | a real dispatch — this arm is where the internal callers live |
-| `ArchGateOff` (x86_64) | `!d6_genuine_enabled()` = `d6_controlled_switch_proof_enabled() \|\| d6_switch_a_enabled()` | `yarm.d6_switch_proof=1` / `yarm.d6_switch_a=1` (profiles `d6-switch-proof`, `d6-switch-a`) | **yes, by construction** — the gate is off for every NR 0 under either knob. Not witnessed: the x86_64 core smoke under `D6_SWITCH_A=1` issues zero NR 0 (`YIELD_SPLIT_COMMITTED = 0` **and** `YIELD_SPLIT_REFUSED = 0`), which is a workload fact, not a source fact | none | log `YIELD_INLOCK_DISPATCH_FALLBACK reason=d6_genuine_off`; owed `PreemptOutgoing`; in-lock select + switch | **the drain the deferral would need does not exist in this mode.** `arch/trap_entry.rs` gates the Yield drain on exactly `!d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()` — the same two predicates — so the gate *is* the drain's own availability. Refusing here is correct; removing the edge would mean giving a diagnostic that exists to own the switch path a switch path it must not have |
-| `ArchGateOff` (AArch64, RISC-V) | `!is_bootstrap_cpu(cpu)` | — | **no.** Every AArch64 and RISC-V AP is marked wake-only *before* it is onlined, unconditionally and with no knob (`arch/aarch64/boot.rs`, `arch/riscv64/boot.rs`), and the secondary loops only drain cross-CPU work and `wfe`/`wfi` — they never enter user mode, so no userspace syscall can originate there | none | as above | reachable only from an internal `yield_current` running on an AP |
+| `ArchGateOff` (x86_64) | `!d6_genuine_enabled()` = `d6_controlled_switch_proof_enabled() \|\| d6_switch_a_enabled()` | `yarm.d6_switch_proof=1` / `yarm.d6_switch_a=1` (profiles `d6-switch-proof`, `d6-switch-a`) | **yes, by construction** — `d6_genuine_enabled()` is `false` under either knob, so EVERY NR 0 takes this arm; the construction proof is the predicate itself, and no marker count is needed to establish a claim of REACHABILITY (§4's construction requirement is for claims of the opposite). No workload witnesses it because the two profiles that arm these knobs run the x86_64 core smoke, which issues no NR 0 at all — the same blind spot §2 of U9-RESIDUAL1 recorded | none | log `YIELD_INLOCK_DISPATCH_FALLBACK reason=d6_genuine_off`; owed `PreemptOutgoing`; in-lock select + switch | **the drain the deferral would need does not exist in this mode.** `arch/trap_entry.rs` gates the Yield drain on exactly `!d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()` — the same two predicates — so the gate *is* the drain's own availability. Refusing here is correct; removing the edge would mean giving a diagnostic that exists to own the switch path a switch path it must not have |
+| `ArchGateOff` (AArch64, RISC-V) | `!is_bootstrap_cpu(cpu)` | — | **no.** Every AArch64 and RISC-V AP is marked wake-only *before* it is onlined, unconditionally and with no knob (`arch/aarch64/boot.rs`, `arch/riscv64/boot.rs`), and the secondary loops only drain cross-CPU work and `wfe`/`wfi` — they never enter user mode, so no userspace syscall can originate there | none | as above | reachable only from an internal `yield_current` running on an AP. **One caveat, stated rather than glossed:** `riscv64/boot.rs`'s readback-mismatch arm clears wake-only *after* a successful `bring_up_cpu`, so a RISC-V AP whose three topology writes did not all read back is left online and NOT wake-only — `dispatching = 2`. It still hosts no user task, so it produces no userspace NR 0 of its own; what it would do is make the BSP's NR 0 take the `MultiDispatcher` arm below. It is a defensive path reached only when a scheduler write silently failed, and it is logged (`RISCV_SCHEDULER_SMP_ONLINE_FAIL reason=readback_mismatch`) |
 | `DeferralHeld` | `colliding_deferral_pending_for(cpu)` — the Yield cell on every architecture, plus the FutexWait and 196D foundation cells on RISC-V — or a lost reservation race at step (4) | a drain that returns without clearing the cell it was draining | **it was, on RISC-V** — see §3. Otherwise no: each cell is published inside a trap and cleared by that trap's own drain on every arm, so a fresh trap finds all three clear | none | log `reason=already_deferred`; owed `PreemptOutgoing`; in-lock select + switch | clearing the cell on the exits that leaked it (done, §3) |
 | `RouteNotAdmitted::CpuOutOfRange` | `cpu.0 as usize >= MAX_CPUS` | — | **no** — `try_split_yield_into_frame` applies the identical bound itself, before constructing the owners | none | n/a | none |
 | `RouteNotAdmitted::NoTrapDrainer` | `!GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` | — | **no** — `TrapPathWindow::establish(cpu)` is the first statement of both bridges (`arch/trap_entry.rs`, `arch/riscv64/trap.rs`) and runs before the split seam on all three architectures | none | log `reason=no_trap_drainer`; in-lock select + switch | none |
@@ -14915,4 +14915,60 @@ in §3.
 reachable production terminal-dispatch fallback on any architecture; it does have one, and the
 directive is explicit that a partial family closure must not be delivered as a closure. Census
 delta is **0** and the census is unchanged at **2 / 0 / 2**.
+
+
+### §5 — the qualification matrix, at `wip/u9-yield2` head `1f7f579` / tree `0673ce3`
+
+Every live artifact below was produced at that exact tree; the AArch64 exit seals name it
+(`sha=1f7f579e… tree=0673ce3a…`), which is what makes them exact-tree artifacts rather than
+inherited ones.
+
+| gate | result |
+|---|---|
+| hosted suite (`cargo test --lib --features hosted-dev -- --test-threads=1`) | **5378 passed / 0 failed / 2 ignored** (base `7d3edd9`: 5366; +12 `u9yield2_family_edge` guards) |
+| freestanding x86_64 / AArch64 / RISC-V | built ×3 |
+| `cargo clippy --lib --features hosted-dev` | **371 warnings, identical class set AND counts** to base `7d3edd9`; both measured in fresh, separate `CARGO_TARGET_DIR`s so the comparison is not a cached replay |
+| `rustfmt --edition 2024 --check` on all 5 changed `.rs` files | clean (`cargo fmt --all` still OOMs on the ~164k-line `tests.rs`; formatted individually) |
+| contract/doc enforcement | `[ok] contract-doc enforcement gate passed` |
+| exit-current-task oracle ×3 per architecture | x86_64 ok ok ok · AArch64 ok ok ok · RISC-V ok ok ok |
+| core smoke | x86_64 ok · AArch64 ok · RISC-V ok |
+| **AP saved-return profile** (`QEMU_SMP=2`, `yarm.ap_user_dispatch=1`) | `STAGE_199_X86_AP_SAVED_RETURN_SEAL … result=ok` |
+| broad-lock census | `with_cpu / with_broad / TOTAL = 2 / 0 / 2`, **unchanged** |
+| artifact residue | `git status --short` = 0, untracked = 0 |
+
+**The Yield numbers, and what they measure.**
+
+| | x86_64 ×3 | AArch64 ×3 | RISC-V ×3 |
+|---|---|---|---|
+| `YIELD_SPLIT_COMMITTED` | 4096 / 4096 / 4096 | 4096 / 4096 / 4096 | 64 / 64 / 64 |
+| `YIELD_SPLIT_REFUSED` | 0 | 0 | 0 |
+| `*_YIELD_INLOCK_DISPATCH_FALLBACK` | 0 | 0 | 0 |
+| `EXIT_TASK_BROAD_ENTER` | 0 | 0 | 0 |
+| `RISCV_DISPATCH_DECLINED` | — | — | 0 / 0 / 0 |
+
+Identical to U9-RESIDUAL1's numbers, and they measure the **single-dispatcher default only**. The
+three core smokes issue `YIELD_SPLIT_COMMITTED = 0` and `YIELD_SPLIT_REFUSED = 0` on all three
+architectures — they contain no NR 0 at all — so they are not a Yield witness in either direction.
+
+`RISCV_DISPATCH_DECLINED = 0` across all three RISC-V boots is the honest reading of §3's repair:
+the nine drain arms it settles are **never taken in production**, so the fix changes no observed
+behaviour. That is what makes it a source-totality repair rather than a bug fix, and it is also why
+the leak survived this long — a deferral cell left set by a branch nothing takes looks exactly like
+a deferral cell that is always clear.
+
+**The edge, reproduced at HEAD.** The AP profile still shows, unchanged from base:
+
+```
+YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu            × 1
+YIELD_INLOCK_DISPATCH_FALLBACK reason=multi_cpu       × 1
+STAGE_199_X86_AP_SAVED_RETURN_SEAL … result=ok
+```
+
+The refusal is still there and the profile still seals. Both facts matter: the first is the edge
+this mission was asked to remove, and the second is the evidence that nothing about that supported
+configuration was disturbed while failing to remove it.
+
+**CENSUS-DELTA: 0.** **Family-edge reduction: none claimed.** One userspace-reachable decline arm
+(`DeferralHeld`, on RISC-V) was removed; `MultiDispatcher` and x86_64 `ArchGateOff` remain. NR 0 is
+**not** closed, this work is **not** delivered to `main`, and **U9 remains OPEN**.
 
