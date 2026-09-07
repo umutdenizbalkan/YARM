@@ -83,6 +83,44 @@ impl DispatchSelection {
     }
 }
 
+/// U9-DISPATCH-CPU1 §1 — what an ACCEPTANCE-FILTERED dispatch step found.
+///
+/// The plain [`DispatchSelection`] cannot express the difference that matters to a post-lock
+/// drain: "there is nothing to run" and "there are things to run and none of them can actually be
+/// marked `Running`" are different facts with different settlements, and both used to arrive as
+/// `Idle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptedSelection {
+    /// A candidate the predicate ACCEPTED was removed from its exact queue position and installed
+    /// as `current` — or the existing `current` was continued.
+    Selected(DispatchSelection),
+    /// There were no runqueue entries at all on this CPU. Idling is justified.
+    Empty,
+    /// Every runqueue entry was examined and the predicate rejected each one. `examined` is the
+    /// count, so "exhausted" is a measurement of what was tried rather than an inference from a
+    /// retry budget. Nothing was dequeued and no entry moved.
+    NoneAcceptable { examined: usize },
+}
+
+impl AcceptedSelection {
+    /// The selection, when one was made.
+    pub fn selection(self) -> Option<DispatchSelection> {
+        match self {
+            Self::Selected(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// A short stable name for markers.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Selected(s) => s.marker(),
+            Self::Empty => "empty",
+            Self::NoneAcceptable { .. } => "none_acceptable",
+        }
+    }
+}
+
 impl RingQueue {
     const fn new() -> Self {
         Self {
@@ -388,6 +426,84 @@ impl PriorityScheduler {
                 DispatchSelection::Dequeued { tid: next.tid }
             }
             None => DispatchSelection::Idle,
+        }
+    }
+
+    /// U9-DISPATCH-CPU1 §1 — [`Self::dispatch_next_selection`], but it only dequeues a candidate
+    /// the caller's `accept` predicate admits.
+    ///
+    /// # Why this exists, and why it is not a second selection policy
+    ///
+    /// The order is unchanged: `ContinuedCurrent` first when a non-idle `current` is set, then
+    /// High → Normal → Low, FIFO within each. What changes is that a rejected entry is SKIPPED in
+    /// place rather than dequeued and rolled back.
+    ///
+    /// The rollback form could not make bounded progress. `preempt_reenqueue_only` returns a
+    /// refused task to the tail of ITS OWN priority queue, so a refused `High` task is picked
+    /// again ahead of every `Normal` one: a budget of "N attempts" spends all N rotating within
+    /// `High` and never examines `Normal` at all. "At most N attempts" is not "every candidate
+    /// tried", which is the claim a drain needs before it may report that nothing is runnable.
+    ///
+    /// Skipping in place gives that claim directly, and gives it for free: no entry is removed
+    /// unless it is the one being dispatched, so nothing is reprioritised, nothing is duplicated,
+    /// membership tracking sees exactly one removal, and a rejected task keeps its exact FIFO
+    /// position for the next dispatch.
+    ///
+    /// `accept` is consulted under the caller's rank-1 acquisition and is expected to read the
+    /// task table (rank 2) — the canonical ascending direction.
+    pub fn dispatch_next_accepted_selection(
+        &mut self,
+        mut accept: impl FnMut(ThreadId) -> bool,
+    ) -> AcceptedSelection {
+        // Exactly the `dispatch_next_selection` preamble: a non-idle `current` continues, and an
+        // idle `current` with runnable work falls through to the scan.
+        let idle_current = match self.current {
+            Some(current) if current.tid.0 == 0 && self.runnable_count() > 0 => Some(current),
+            Some(current) => {
+                return AcceptedSelection::Selected(DispatchSelection::ContinuedCurrent {
+                    tid: current.tid,
+                });
+            }
+            None => None,
+        };
+        let mut examined = 0usize;
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            let qi = Self::priority_index(priority);
+            // Snapshot the entries in FIFO order first: `accept` may take another lock, so it must
+            // not be called while indexing a queue this loop is about to mutate.
+            let mut candidates = [ThreadId(0); MAX_RUN_QUEUE];
+            let len = self.queues[qi].len;
+            for (i, slot) in candidates.iter_mut().enumerate().take(len) {
+                *slot = self.queues[qi].tids[RingQueue::index(self.queues[qi].head + i)];
+            }
+            for &tid in candidates.iter().take(len) {
+                examined += 1;
+                if !accept(tid) {
+                    continue;
+                }
+                if !self.queues[qi].remove_tid(tid) {
+                    // The entry vanished between the snapshot and the removal. Nothing was
+                    // mutated for it; keep scanning rather than claiming a dequeue.
+                    continue;
+                }
+                if !self.membership_tracking_exhausted {
+                    self.membership_remove(tid);
+                }
+                if let Some(current) = idle_current
+                    && !self.membership_tracking_exhausted
+                {
+                    // The idle task leaves `current`; drop its membership exactly as
+                    // `dispatch_next_selection` does, so it can be re-enqueued later.
+                    self.membership_remove(current.tid);
+                }
+                self.current = Some(ScheduledTask { tid, priority });
+                return AcceptedSelection::Selected(DispatchSelection::Dequeued { tid });
+            }
+        }
+        if examined == 0 {
+            AcceptedSelection::Empty
+        } else {
+            AcceptedSelection::NoneAcceptable { examined }
         }
     }
 
@@ -829,6 +945,21 @@ impl SmpScheduler {
             return DispatchSelection::Idle;
         };
         self.schedulers[idx].dispatch_next_selection()
+    }
+
+    /// U9-DISPATCH-CPU1 §1 — [`PriorityScheduler::dispatch_next_accepted_selection`] on one CPU.
+    ///
+    /// An offline CPU yields `Empty`: it has no runqueue, so there is nothing to examine and
+    /// nothing to claim was exhausted.
+    pub fn dispatch_next_accepted_selection_on(
+        &mut self,
+        cpu: CpuId,
+        accept: impl FnMut(ThreadId) -> bool,
+    ) -> AcceptedSelection {
+        let Ok(idx) = self.check_online_cpu(cpu) else {
+            return AcceptedSelection::Empty;
+        };
+        self.schedulers[idx].dispatch_next_accepted_selection(accept)
     }
 
     /// Provenance-preserving form of [`Self::on_preempt_on`].

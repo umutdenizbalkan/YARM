@@ -527,11 +527,10 @@ impl DispatchAuthority {
     }
 
     /// An authority that is never live — for a CPU index outside `MAX_CPUS`.
+    ///
+    /// Epoch `0` is the "no window open" value, so this can never match a live window.
     pub(crate) const fn none(cpu: CpuId) -> Self {
-        Self {
-            cpu,
-            epoch: u64::MAX,
-        }
+        Self { cpu, epoch: 0 }
     }
 
     /// The CPU this authority is for. There is no setter: the value is fixed at the mint.
@@ -541,14 +540,19 @@ impl DispatchAuthority {
 
     /// Is this still the live window for its CPU?
     ///
-    /// False for a stale authority (its trap has ended and a later trap bumped the epoch) and for
-    /// the out-of-range [`Self::none`]. A false answer authorizes nothing, and every caller
-    /// refuses before touching the scheduler.
+    /// U9-DISPATCH-CPU1 §2: false the moment the trap that minted it RETIRES its window — not
+    /// merely once some later trap opens one. `TrapPathWindow::drop` restores this CPU's window
+    /// cell at the real trap boundary, so a retained copy is dead immediately after the return,
+    /// which is the interval in which it would otherwise have named a CPU running arbitrary code.
+    ///
+    /// Also false for the out-of-range [`Self::none`], whose epoch is the reserved
+    /// "no window open" value. A false answer authorizes nothing, and every caller refuses before
+    /// touching the scheduler.
     pub(crate) fn is_live(self) -> bool {
         let idx = self.cpu.0 as usize;
         idx < crate::kernel::scheduler::MAX_CPUS
-            && self.epoch != u64::MAX
-            && crate::kernel::boot::TRAP_DISPATCH_EPOCH[idx]
+            && self.epoch != 0
+            && crate::kernel::boot::TRAP_DISPATCH_WINDOW[idx]
                 .load(core::sync::atomic::Ordering::Acquire)
                 == self.epoch
     }
@@ -567,11 +571,15 @@ impl DispatchAuthority {
         if idx >= crate::kernel::scheduler::MAX_CPUS {
             return Self::none(cpu);
         }
-        Self::mint(
-            cpu,
-            crate::kernel::boot::TRAP_DISPATCH_EPOCH[idx]
-                .load(core::sync::atomic::Ordering::Acquire),
-        )
+        // Open a real window if none is open, so the fixture is live by the same rule production
+        // is — never by a special case inside `is_live`.
+        let open = crate::kernel::boot::TRAP_DISPATCH_WINDOW[idx]
+            .load(core::sync::atomic::Ordering::Acquire);
+        if open != 0 {
+            return Self::mint(cpu, open);
+        }
+        let (epoch, _previous) = crate::kernel::boot::open_trap_dispatch_window(idx);
+        Self::mint(cpu, epoch)
     }
 
     /// Test/hosted-only: an authority for `cpu` whose window has already closed.
@@ -584,11 +592,12 @@ impl DispatchAuthority {
         if idx >= crate::kernel::scheduler::MAX_CPUS {
             return Self::none(cpu);
         }
-        // `u64::MAX` is the never-live sentinel and would be refused for the wrong reason, so a
-        // stale token is built by going BACKWARDS from the live epoch instead.
-        let live = crate::kernel::boot::TRAP_DISPATCH_EPOCH[idx]
-            .load(core::sync::atomic::Ordering::Acquire);
-        Self::mint(cpu, live.wrapping_sub(1) & (u64::MAX - 1))
+        // A genuinely RETIRED window: open one and close it, exactly as a returning trap does.
+        // Building it by arithmetic would test a number, not the lifetime.
+        let (epoch, previous) = crate::kernel::boot::open_trap_dispatch_window(idx);
+        let retired = crate::kernel::boot::close_trap_dispatch_window(idx, epoch, previous);
+        debug_assert!(retired, "the fixture must own the window it retires");
+        Self::mint(cpu, epoch)
     }
 }
 
@@ -643,6 +652,11 @@ pub(crate) enum CpuDispatch {
         requested: CpuId,
         reason: DispatchAuthorityRefusal,
     },
+    /// U9-DISPATCH-CPU1 §1 — every runqueue entry on this CPU was examined and none could be
+    /// marked `Running`. Distinct from `Selected(Idle)`, which means the queue was EMPTY: these
+    /// are different facts about the CPU and they license different settlements. Nothing was
+    /// dequeued and no entry changed position.
+    NoneAcceptable { examined: usize },
 }
 
 impl CpuDispatch {
@@ -650,7 +664,7 @@ impl CpuDispatch {
     pub(crate) fn tid(self) -> Option<crate::kernel::ipc::ThreadId> {
         match self {
             Self::Selected { selection, .. } => selection.tid(),
-            Self::Refused { .. } => None,
+            Self::Refused { .. } | Self::NoneAcceptable { .. } => None,
         }
     }
 
@@ -659,6 +673,7 @@ impl CpuDispatch {
         match self {
             Self::Selected { selection, .. } => selection.marker(),
             Self::Refused { .. } => "refused_no_authority",
+            Self::NoneAcceptable { .. } => "none_acceptable",
         }
     }
 }
@@ -974,9 +989,13 @@ pub(crate) enum DispatchAcquire {
     NoAuthority { reason: DispatchAuthorityRefusal },
     /// A mark refused without touching the scheduler. Nothing was mutated.
     SchedulerUntouched,
-    /// Every runnable candidate was tried and none could be marked `Running`. The queue is NOT
-    /// empty — this must never be reported as idle.
-    Exhausted { attempts: usize },
+    /// Every runqueue entry was EXAMINED and none could be marked `Running`. The queue is NOT
+    /// empty — this must never be reported as idle — and `examined` is the measured count, so the
+    /// claim is about what was tried rather than about a retry budget that ran out.
+    NoneAcceptable { examined: usize },
+    /// An accepted candidate stopped being markable between the acceptance read and the mark. The
+    /// exact dequeue was undone; nothing is left half-done and nothing is current.
+    Contended,
     /// The scheduler and the task table disagree about who is running. Fatal at the call site.
     Torn { tid: u64 },
 }
@@ -997,7 +1016,8 @@ impl DispatchAcquire {
             Self::Idle => "idle",
             Self::NoAuthority { reason } => reason.marker(),
             Self::SchedulerUntouched => "scheduler_untouched",
-            Self::Exhausted { .. } => "no_runnable_candidate",
+            Self::NoneAcceptable { .. } => "none_acceptable",
+            Self::Contended => "contended",
             Self::Torn { .. } => "torn",
         }
     }
@@ -2075,6 +2095,16 @@ impl SharedKernel {
                 );
                 return DispatchMarkOutcome::RefusedNoSchedulerChange;
             }
+            CpuDispatch::NoneAcceptable { examined } => {
+                // The selection examined every entry and dequeued none, so there is nothing to
+                // mark and nothing to undo. Callers that reach the mark with this in hand are
+                // asking about a selection that never happened.
+                crate::yarm_log!(
+                    "DISPATCH_MARK_REFUSED cpu=none provenance=none_acceptable examined={} scheduler_mutation=none",
+                    examined
+                );
+                return DispatchMarkOutcome::RefusedNoSchedulerChange;
+            }
         };
         // Stage 199D-WA3A-R1: the transition is chosen by PROVENANCE, produced inside the
         // scheduler mutation — never reconstructed from TID equality or `Option::is_some`.
@@ -2717,8 +2747,47 @@ impl SharedKernel {
                 };
             }
             // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
-            let selection = kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu);
-            CpuDispatch::Selected { cpu, selection }
+            //
+            // U9-DISPATCH-CPU1 §1: and the candidate is ACCEPTANCE-FILTERED. `accept` asks the
+            // read-only sibling of the very transition the mark will apply, so the scheduler
+            // dequeues only a task the mark will take — instead of dequeuing the head, failing to
+            // mark it and rolling the dequeue back. Rank 1 is held across the rank-2 read, which
+            // is the canonical ascending direction.
+            let selection =
+                kernel_mut(&mut sched.scheduler).dispatch_next_accepted_selection_on(cpu, |tid| {
+                    self.with_task_tcbs_split_mut(|tcbs| {
+                        crate::kernel::task_transition::dispatch_transition_would_be_accepted(
+                            tcbs,
+                            tid.0,
+                            crate::kernel::task_transition::TaskTransition::DispatchIncoming,
+                        ) && MarkedIncarnation::resolve(
+                            tid.0,
+                            tcbs.iter()
+                                .flatten()
+                                .find(|t| t.tid.0 == tid.0)
+                                .and_then(|t| t.asid),
+                        )
+                        .is_some()
+                    })
+                });
+            match selection {
+                crate::kernel::scheduler::AcceptedSelection::Selected(selection) => {
+                    CpuDispatch::Selected { cpu, selection }
+                }
+                crate::kernel::scheduler::AcceptedSelection::Empty => CpuDispatch::Selected {
+                    cpu,
+                    selection: crate::kernel::scheduler::DispatchSelection::Idle,
+                },
+                crate::kernel::scheduler::AcceptedSelection::NoneAcceptable { examined } => {
+                    crate::yarm_log!(
+                        "DISPATCH_STEP_NONE_ACCEPTABLE site={} cpu={} examined={}",
+                        site,
+                        cpu.0,
+                        examined
+                    );
+                    CpuDispatch::NoneAcceptable { examined }
+                }
+            }
         })
     }
 
@@ -2769,6 +2838,32 @@ impl SharedKernel {
     /// shared step directly here would have silently zeroed `YIELD_DISPATCH_DEQUEUE_OK`,
     /// `QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK` and their per-architecture siblings, every one of
     /// which a live oracle matches.
+    ///
+    /// # There is no retry, and that is the point
+    ///
+    /// An earlier form of this owner retried after a failed mark, bounded by `runnable_count`.
+    /// That bound was unsound: `preempt_reenqueue_only` returns a refused task to the tail of ITS
+    /// OWN priority queue, so a refused `High` task is selected again ahead of every `Normal` one
+    /// and a budget of N attempts is spent rotating within `High`. "At most N attempts" never
+    /// established "every candidate was tried", which is precisely the claim a drain needs before
+    /// it may act as though nothing is runnable.
+    ///
+    /// The selection step now filters by acceptance instead, so only a candidate the mark will
+    /// take is ever dequeued: one pass, every entry examined in priority/FIFO order, rejected
+    /// entries skipped IN PLACE. Nothing is reprioritised, nothing is duplicated, and
+    /// [`DispatchAcquire::NoneAcceptable`] carries the number of entries actually examined —
+    /// exhaustion is measured, not inferred.
+    ///
+    /// A mark can still refuse after an accepted selection, because the acceptance read and the
+    /// mark are two rank-2 acquisitions. That window is reported as
+    /// [`DispatchAcquire::Contended`] rather than retried: the exact dequeue is undone by the
+    /// existing inverse, so the world is byte-for-byte as it was found, and the caller settles it
+    /// like any other non-resumable outcome.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     pub(crate) fn queue_advance_acquire_incoming_split(
         &self,
         authority: DispatchAuthority,
@@ -2776,53 +2871,44 @@ impl SharedKernel {
         step: impl Fn(&Self, DispatchAuthority) -> CpuDispatch,
     ) -> DispatchAcquire {
         let cpu = authority.cpu();
-        // The bound: every runnable entry gets at most one turn. Read once, before the loop, so a
-        // concurrent wake cannot extend it.
-        let budget = self
-            .with_scheduler_split_mut(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
-            .max(1);
-        let mut attempts = 0usize;
-        while attempts < budget {
-            attempts += 1;
-            let dispatch = step(self, authority);
-            if let CpuDispatch::Refused { reason, .. } = dispatch {
-                // Nothing was dequeued and nothing became current — on ANY attempt, including a
-                // later one, because the refusal is taken before the mutation.
+        let dispatch = step(self, authority);
+        match dispatch {
+            CpuDispatch::Refused { reason, .. } => {
+                // Nothing was examined, nothing was dequeued, nothing became current.
                 return DispatchAcquire::NoAuthority { reason };
             }
-            match self.d6_genuine_mark_running_via_task_seam(dispatch) {
-                DispatchMarkOutcome::Marked(token) => return DispatchAcquire::Resumable(token),
-                DispatchMarkOutcome::Idle => return DispatchAcquire::Idle,
-                DispatchMarkOutcome::RefusedTorn => {
-                    return DispatchAcquire::Torn {
-                        tid: dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
-                    };
-                }
-                // The exact dequeue was undone; the candidate is back at the tail. Try the next.
-                DispatchMarkOutcome::RefusedRolledBack => {
-                    crate::yarm_log!(
-                        "QUEUE_ADVANCE_ACQUIRE_RETRY site={} cpu={} attempt={} budget={} reason=dequeue_undone",
-                        site,
-                        cpu.0,
-                        attempts,
-                        budget
-                    );
-                }
-                // Nothing at all was touched. With `current` empty a `ContinuedCurrent` selection
-                // is unreachable, so this is the queue-neutral refusal; retrying would re-run an
-                // identical no-op, so it is reported rather than looped on.
-                DispatchMarkOutcome::RefusedNoSchedulerChange => {
-                    return DispatchAcquire::SchedulerUntouched;
-                }
+            CpuDispatch::NoneAcceptable { examined } => {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_ACQUIRE_NONE_ACCEPTABLE site={} cpu={} examined={} dequeued=0",
+                    site,
+                    cpu.0,
+                    examined
+                );
+                return DispatchAcquire::NoneAcceptable { examined };
             }
+            CpuDispatch::Selected { .. } => {}
         }
-        crate::yarm_log!(
-            "QUEUE_ADVANCE_ACQUIRE_EXHAUSTED site={} cpu={} attempts={} result=no_runnable_candidate",
-            site,
-            cpu.0,
-            attempts
-        );
-        DispatchAcquire::Exhausted { attempts }
+        match self.d6_genuine_mark_running_via_task_seam(dispatch) {
+            DispatchMarkOutcome::Marked(token) => DispatchAcquire::Resumable(token),
+            DispatchMarkOutcome::Idle => DispatchAcquire::Idle,
+            DispatchMarkOutcome::RefusedTorn => DispatchAcquire::Torn {
+                tid: dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+            },
+            // The accepted candidate stopped being markable between the acceptance read and the
+            // mark. The exact dequeue has been undone by `undo_dispatch_selection`, so nothing is
+            // left half-done; this is reported rather than retried.
+            DispatchMarkOutcome::RefusedRolledBack => {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_ACQUIRE_CONTENDED site={} cpu={} tid={} rolled_back=1",
+                    site,
+                    cpu.0,
+                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX)
+                );
+                DispatchAcquire::Contended
+            }
+            // Nothing at all was touched.
+            DispatchMarkOutcome::RefusedNoSchedulerChange => DispatchAcquire::SchedulerUntouched,
+        }
     }
 
     /// Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): the authoritative queue-advancing

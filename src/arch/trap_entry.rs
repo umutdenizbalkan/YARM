@@ -557,27 +557,36 @@ fn drain_switch_plan_stash(
 pub(crate) struct TrapPathWindow {
     cpu_idx: usize,
     authority: crate::runtime::DispatchAuthority,
+    /// U9-DISPATCH-CPU1 §2: the epoch this window opened, and whatever window it displaced. A
+    /// nested entry displaces its outer window and restores it on the way out, so nesting is a
+    /// stack rather than a clobber.
+    epoch: u64,
+    previous_epoch: u64,
     settled: core::cell::Cell<bool>,
 }
 
 impl TrapPathWindow {
     pub(crate) fn establish(cpu: CpuId) -> Self {
         let cpu_idx = cpu.0 as usize;
-        let authority = if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        let (authority, epoch, previous_epoch) = if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
             crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
                 .store(true, core::sync::atomic::Ordering::Relaxed);
-            // Bump BEFORE any authority is handed out, so an authority minted for an earlier trap
-            // on this CPU is already stale by the time this one can be used.
-            crate::runtime::DispatchAuthority::mint(
-                cpu,
-                crate::kernel::boot::open_trap_dispatch_window(cpu_idx),
+            // Open BEFORE any authority is handed out, so an authority minted for an earlier trap
+            // on this CPU is already retired by the time this one can be used.
+            let (epoch, previous) = crate::kernel::boot::open_trap_dispatch_window(cpu_idx);
+            (
+                crate::runtime::DispatchAuthority::mint(cpu, epoch),
+                epoch,
+                previous,
             )
         } else {
-            crate::runtime::DispatchAuthority::none(cpu)
+            (crate::runtime::DispatchAuthority::none(cpu), 0, 0)
         };
         Self {
             cpu_idx,
             authority,
+            epoch,
+            previous_epoch,
             settled: core::cell::Cell::new(false),
         }
     }
@@ -601,8 +610,26 @@ impl TrapPathWindow {
 }
 
 impl Drop for TrapPathWindow {
+    /// U9-DISPATCH-CPU1 §2 — the trap boundary, and the two DIFFERENT things that end here.
+    ///
+    /// `settle` closes the PUBLICATION window ("a drainer will consume what this trap publishes")
+    /// and is called explicitly before the drains, because the drains contain landings that
+    /// diverge. Retiring the DISPATCH AUTHORITY is the opposite: it must happen only once the
+    /// drains are done, which is exactly here.
+    ///
+    /// Diverging landings — the idle terminals and the fatal paths — never unwind, so they never
+    /// reach this. That is sound rather than a gap: none of them returns to the trapped context,
+    /// so a retained authority has no caller left to use it, and the next `establish` on this CPU
+    /// displaces the window anyway.
     fn drop(&mut self) {
         self.settle();
+        if self.cpu_idx < crate::kernel::scheduler::MAX_CPUS && self.epoch != 0 {
+            crate::kernel::boot::close_trap_dispatch_window(
+                self.cpu_idx,
+                self.epoch,
+                self.previous_epoch,
+            );
+        }
     }
 }
 

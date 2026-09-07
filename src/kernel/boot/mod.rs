@@ -762,26 +762,58 @@ pub(crate) static GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE: [core::sync::atomic::Atomic
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
 
-/// U9-DISPATCH-CPU1 §1 — the per-CPU trap-window counter that makes a
-/// [`crate::runtime::DispatchAuthority`] one-shot.
+/// U9-DISPATCH-CPU1 §1/§2 — the per-CPU **live dispatch window**.
 ///
-/// Bumped by `arch::trap_entry::TrapPathWindow::establish` — the single place a trap window opens
-/// — so an authority minted for an earlier trap on the same CPU no longer matches and authorizes
-/// nothing. It is deliberately NOT a lock and NOT per-CPU scheduler state: it is a monotonically
-/// increasing tag whose only reader is [`crate::runtime::DispatchAuthority::is_live`], so
-/// `doc/AI_AGENT_RULES.md` §14.4's prohibition on new per-CPU scheduler lock types is untouched.
+/// `0` means "no window is open on this CPU"; any other value is the epoch of the window that IS
+/// open. `arch::trap_entry::TrapPathWindow` is the only writer: it opens a window on `establish`
+/// and RETIRES it on drop, which is the real trap boundary.
 ///
-/// Starts at 0, and `u64::MAX` is reserved as the never-live sentinel for an out-of-range CPU, so
-/// the first minted epoch is 1 and no live authority can ever collide with the sentinel.
-pub(crate) static TRAP_DISPATCH_EPOCH: [core::sync::atomic::AtomicU64;
+/// Retirement is what makes a [`crate::runtime::DispatchAuthority`] a statement about one trap
+/// rather than about a CPU number. Without it a retained copy stayed valid from the moment the
+/// trap returned until the next trap happened to open — a window in which the authority names a
+/// CPU that is running arbitrary code.
+///
+/// It is deliberately NOT a lock and NOT per-CPU scheduler state: it is a tag whose only reader is
+/// [`crate::runtime::DispatchAuthority::is_live`], so `doc/AI_AGENT_RULES.md` §14.4's prohibition
+/// on new per-CPU scheduler lock types is untouched.
+pub(crate) static TRAP_DISPATCH_WINDOW: [core::sync::atomic::AtomicU64;
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
 
-/// U9-DISPATCH-CPU1 §1 — open a new trap window on `cpu` and return its epoch.
+/// The monotonically increasing source of window epochs. Never reused, so a retired epoch can
+/// never be mistaken for a later window's.
+static TRAP_DISPATCH_EPOCH_NEXT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+/// U9-DISPATCH-CPU1 §2 — open a dispatch window on `cpu` and return `(epoch, previous)`.
+///
+/// `previous` is whatever window was open on this CPU, which is `0` for an ordinary trap and the
+/// OUTER window's epoch for a nested entry. `close_trap_dispatch_window` restores it, so nesting
+/// is a stack rather than a clobber.
 ///
 /// The ONLY caller is `TrapPathWindow::establish`.
-pub(crate) fn open_trap_dispatch_window(cpu_idx: usize) -> u64 {
-    TRAP_DISPATCH_EPOCH[cpu_idx].fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1
+pub(crate) fn open_trap_dispatch_window(cpu_idx: usize) -> (u64, u64) {
+    let epoch = TRAP_DISPATCH_EPOCH_NEXT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let previous = TRAP_DISPATCH_WINDOW[cpu_idx].swap(epoch, core::sync::atomic::Ordering::AcqRel);
+    (epoch, previous)
+}
+
+/// U9-DISPATCH-CPU1 §2 — retire the window `epoch` on `cpu`, restoring `previous`.
+///
+/// Exact-epoch: the store happens only if this CPU's live window is still `epoch`. A window that
+/// has already been superseded — by a nested entry that has not yet returned — is left alone, so
+/// retirement can never revoke a NEWER window. Returns whether this call performed the retirement.
+///
+/// The ONLY caller is `TrapPathWindow::drop`.
+pub(crate) fn close_trap_dispatch_window(cpu_idx: usize, epoch: u64, previous: u64) -> bool {
+    TRAP_DISPATCH_WINDOW[cpu_idx]
+        .compare_exchange(
+            epoch,
+            previous,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
 }
 
 /// Stage 120: x86_64-only controlled one-shot unlocked `switch_frames` proof

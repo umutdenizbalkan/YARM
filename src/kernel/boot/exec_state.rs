@@ -4069,6 +4069,19 @@ impl crate::runtime::SharedKernel {
             // trap minted — so a refusal here means a stale window or an offline CPU, neither of
             // which an in-trap caller can present. It is still matched explicitly, and it dequeued
             // NOTHING — so the truthful outcome is an idle CPU, never a fabricated switch.
+            // U9-DISPATCH-CPU1 §1: every entry was examined and none could be marked `Running`.
+            // Nothing was dequeued, so — exactly as for a refusal — the truthful outcome is an
+            // idle CPU rather than a fabricated switch. It is matched separately from `Refused`
+            // because it says something different: there IS runnable work, this CPU just cannot
+            // take any of it right now.
+            CpuDispatch::NoneAcceptable { examined } => {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_COMMIT_NONE_ACCEPTABLE cpu={} examined={} dequeued=0",
+                    cpu.0,
+                    examined
+                );
+                return QueueAdvanceOutcome::TerminalIdle;
+            }
             CpuDispatch::Refused { requested, reason } => {
                 crate::yarm_log!(
                     "QUEUE_ADVANCE_COMMIT_REFUSED cpu={} reason={} dequeued=0",
