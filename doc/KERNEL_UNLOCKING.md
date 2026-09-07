@@ -14185,3 +14185,159 @@ inventing timing in QEMU would prove nothing that the forced races do not prove 
 
 
 
+
+## U9-EXIT4 — the post-clear races, removed or proven unreachable
+
+U9-EXIT3 delivered a linear settlement token and, with it, two states it declared unsettleable: a
+victim a **restart** had made `Runnable`, and a victim a **terminal fault** had made `Faulted`. Both
+diverged. This stage asks the question EXIT3 did not: *can a production writer produce either of
+those states while the window is open?*
+
+### §1 — the post-clear writer census
+
+The window opens at step (7) of `run_exit_transaction`, where `clear_current_exact` empties
+`current[cpu]`, and closes at the settlement. Inside it the victim is current nowhere and queued
+nowhere, while its trap frame is still live on the stack.
+
+Every production writer able to move a `Running` task falls into one of four rows. Each row's
+reachability is a **source fact**, and each is guarded in
+`kernel::boot::tests::u9exit4_post_clear_totality` so the derivation cannot silently rot.
+
+| # | writer | rank / lock | how the victim is named | placement required | post-clear reachable |
+|---|---|---|---|---|---|
+| 1 | `TaskTransition::FaultRunningCurrent` — `fault_state::fault_current_task_with_fault`, `runtime::commit_terminal_fault_transition_shared` | 2 (validate) then 1 (clear) then 2 (write) | `current_tid()`; `block_current_cpu()` / `block_current_on_cpu_split(cpu)`, re-checked against the validated TID | must be this CPU's `current` | **no** — the slot is empty, so the broad owner refuses `TaskMissing` and the split owner refuses `RefusedVictimChanged`, both before any write |
+| 2 | `TaskTransition::PreemptOutgoing` / `PreemptOutgoingIdle` — `exec_state::yield_current`, `yield_current_to` | 2 | the outgoing `current_tid()`, inside `if let Some(tid)` | must be this CPU's `current` | **no** — an empty slot skips the transition entirely |
+| 2 | `TaskTransition::DispatchIncoming` / `ContinueCurrent` — `scheduler_state`, `runtime` dispatch owners | 1 (select) then 2 (mark) | a typed `DispatchSelection`, i.e. a TID dequeued from a run queue or already current | must be queued or current | **no** — the victim is in no queue and is nobody's current |
+| 3 | `scheduler_state::apply_cross_cpu_wake_task` | 2 | an explicit TID from another CPU's wake | none | **no** — it transitions `Blocked(_)` only, writes a status exactly once inside that arm, and takes a `Skipped*` arm for every other status including `Running` |
+| 4 | `restart_state::restart_task`, `restart_state::mark_task_dead`, `runtime::wake_tid_to_runnable_split`, `runtime::apply_split_sender_wake_plan_split` | 2 (+1 to enqueue) | an explicit TID a **caller** supplies | none | **no** — see below |
+
+Row 4 is the only one no status or placement gate stops. `restart_task` writes `Runnable` from any
+status without consulting `task_transition`, and the two wakes accept `Blocked | Runnable | Running`
+as the previous status — so a `Running` victim that is not this CPU's current *would* be written and
+enqueued. What excludes them is not a gate but the absence of any agent that could call them:
+
+* **the window calls nothing that wakes.** Between the clear and the claim, `run_exit_transaction`
+  makes exactly one owner call — `mint_restart_token`, the restart domain's counter. It enqueues
+  nothing, wakes nothing and dispatches nothing. (The two `release_*` calls in the same region sit
+  on the `clear_current_exact` **refusal** arm, where the compare-and-clear mutated nothing and no
+  window was ever opened.)
+* **the window is not preemptible, on any architecture.** x86_64 programs `IA32_FMASK` with exactly
+  `RFLAGS.IF`, on the BSP and on every AP that services a ring-3 `syscall`, so a userspace NR 16
+  enters with interrupts off and no `sti` appears on the trap path. AArch64 masks `DAIF` in hardware
+  on synchronous exception entry and neither the AArch64 trap handler nor the shared bridge contains
+  a `daifclr`. RISC-V hardware clears `sstatus.SIE` on trap entry and the single re-enable
+  (`set_sstatus_sie`) is confined to `reestablish_idle_boundary`, the audited terminal-idle tail.
+* **there is one dispatching CPU**, as U9-EXIT2 §1 established, and it is executing this
+  transaction.
+
+**The consequence is stronger than the question asked.** A claim refusal is itself
+production-impossible. `exit_preflight_locked` at step (3) reads `{present, asid, !detached,
+status}`; `claim_self_exit_locked` re-checks exactly those four; and steps (4)–(7) between them
+write no TCB — a read-only reverse-link probe, two per-CPU deferral cells, the rank-1 current slot,
+and the restart counter. So `settle_failed_claim` is entered only if a writer ran in a window that
+admits none.
+
+**Reported honestly:** this is a proof of *unreachability*, not of *removal*. The `Runnable` and
+`Faulted` settlements EXIT3 called unsettleable are still unsettleable — and this stage does not
+invent one. Making either safe would need two things that do not exist and that §2 forbids adding: a
+way to write the live entering frame back into the victim's TCB before advancing (the outgoing
+capture is deliberately *suppressed* by the exit cell, because an exiting task is never resumed), and
+a broadened drain verdict that admits a non-terminal outgoing task. That is precisely the "genuinely
+new subsystem" §1 says to stop and report rather than build. Because the states cannot occur, the
+retained divergence is a settlement for a **source-proven-impossible** state rather than for a
+legitimate restart or fault race, which is what §2 permits a fatal settlement to be.
+
+### §2 — the drain's admission moved into the settlement
+
+EXIT3 left two safety properties as caller conventions. They are now properties of the token.
+
+**Before.** `publish_queue_advance` was infallible: it published whatever it was handed and ignored
+the cell's return value. `settle_failed_claim` was expected to have asked `victim_is_drain_honourable`
+first, and to diverge itself when the answer was no. So *"cannot publish an advance the drain will
+refuse"* was true of one call site rather than of the type, and the caller's predicate could drift
+from the drain's — a fatal taken on a race the drain would in fact have honoured.
+
+**After.** Both gates run inside the settlement, in order, and both are read-only until the
+publication:
+
+1. the victim must be exactly what `exit_reverify_ok` honours — `Terminal` or `Removed`. A
+   `Runnable`/requeued or `Faulted` victim answers `Contradicted`, and the settlement refuses with
+   `AdvanceRefusal::DrainWouldRefuse`;
+2. the per-CPU cell must actually accept the publication; a duplicate refuses with
+   `AdvanceRefusal::AlreadyPublished` rather than overwriting.
+
+Either refusal hands the **token back**, so a caller that skips the check does not get an advance —
+it gets its obligation returned and must still settle it. `AdvanceAuthority` now states *who*
+licensed the advance and never substitutes for *whether* the drain will take it, including on the
+`Claimed` path, where the claim's own `Exited(code)` write is what makes gate (1) pass.
+
+The success path is tightened by the same change: a refusal there would mean the claim's own write
+did not take, or that a deferral was already published on a CPU whose reservation this transaction
+holds. Neither has a continuation, so it diverges.
+
+| post-clear state | settlement | authority | reachable in production |
+|---|---|---|---|
+| unchanged `Running`, ours, placed nowhere | `restore_current_exact` → `Complete(Err)` | the restore's own three proofs | no (needs a `DetachedThread` refusal, impossible since EXIT2 §2) |
+| `Exited(_)` / `Dead` (reap, duplicate exit) | `publish_queue_advance` → `QueueAdvanceCommitted` | `VictimNonResumable` + `Terminal` | no |
+| TCB removed (joined, reaped through) | `publish_queue_advance` | `VictimNonResumable` + `Removed` | no |
+| replacement at the same numeric TID | `publish_queue_advance` naming the **old** incarnation | `VictimNonResumable` + `Removed` | no |
+| this transaction's own claim | `publish_queue_advance` | `Claimed(&claim)` + `Terminal` | **yes** — the ordinary successful exit |
+| `Runnable` / requeued by restart | refused by both; diverges | — | no (§1 row 4) |
+| `Faulted` | refused by both; diverges | — | no (§1 row 1) |
+
+### §3 — what "linear" was made to mean
+
+| property | EXIT3 | EXIT4 |
+|---|---|---|
+| non-`Clone`, non-`Copy`, private fields, no public constructor, `#[must_use]` | yes | unchanged |
+| cannot be abandoned through `mem::forget` / `ManuallyDrop` | **no** — the private `consume` used `core::mem::forget(self)`, so the property was unprovable by inspection and an external forget was plain safe Rust | the bomb is conditional on a private `settled` flag no other module can set, and no `mem::forget`, `ManuallyDrop`, `ptr::read`, `ptr::write`, `transmute` or `Box::leak` appears in the token's module or in any production file that names it |
+| cannot reach `Drop`/`fatal` while a lock is held | unstated | guarded: neither `run_exit_transaction` nor `settle_failed_claim` nor the token's module contains an acquisition; each owner is one acquisition that returns its answer |
+| cannot produce `Complete` after the clear without exact restoration | guarded | guarded, plus `PostClearAdvance` is proved unable to answer `Complete` at all |
+| cannot publish an advance the drain will refuse | caller convention | a property of the settlement (§2) |
+
+### §4 — the forced interleavings
+
+The window is opened by hand and held open across three observations, so each row states what
+**both** settlements answer rather than only the one the transaction happened to take. Every refusal
+is compared against the full harness snapshot — each TCB's `{tid, asid, pid, status, restart token,
+detach state}`, every CPU's current slot, and `tid_present_anywhere` per task — so a refusal is
+observationally identical to never having been called.
+
+| competing transition | restore | advance |
+|---|---|---|
+| nothing raced | `Restored` | — |
+| restart, requeued | `not_running` | `drain_would_refuse` |
+| restart, enqueue not yet landed | `not_running` | `drain_would_refuse` |
+| placement landed while still `Running` | `placed_elsewhere` | `drain_would_refuse` |
+| terminal fault | `not_running` | `drain_would_refuse` |
+| reap (`Dead`) | `incarnation_gone` | `AdvanceCommitted` |
+| duplicate exit (`Exited(9)`) | `incarnation_gone` | `AdvanceCommitted` |
+| removal (TCB gone) | `incarnation_gone` | `AdvanceCommitted` |
+| TID reuse under a fresh ASID | `incarnation_gone` | `AdvanceCommitted`, naming the **old** incarnation |
+
+Rows whose settlements both refuse are then settled by making the victim terminal — the only thing
+that changes the answer, which is the property stated the other way round: the admission tracks the
+victim's state, not the caller's intent, and no amount of retrying moves it. The TID-reuse row
+additionally proves the replacement is neither restored, re-statused nor placed.
+
+| guard | property |
+|---|---|
+| `every_competing_transition_settles_the_cleared_slot_by_identity` | the nine-row table above, compared by identity |
+| `the_caller_side_drain_predicate_and_the_infallible_advance_are_rejected` | **negative** — EXIT3's fatal-on-legitimate-race shape: the advance is fallible, consults the drain before publishing, settles nothing until it passes; no decider keeps a second copy of the predicate; every call site handles the refusal |
+| `the_old_unconditional_clear_and_post_clear_complete_are_rejected` | **negative** — EXIT2's clear-then-`Complete` shape (unchanged from EXIT3) |
+| `the_token_is_never_abandoned_through_a_forget_primitive` | no abandonment primitive in the token's module or in any production file naming it |
+| `a_settlement_never_runs_under_a_held_lock` | no acquisition in the transaction body or the token module; each owner is one acquisition |
+| `an_advance_disposition_never_resumes_the_entering_frame` | `PostClearRestored` → `Complete(Err)`, `PostClearAdvance` → `QueueAdvanceCommitted`, neither able to answer the other |
+| `faulted_is_written_only_through_the_typed_running_transition` | §1 row 1 |
+| `a_fault_can_only_claim_the_cpus_current_task` | §1 row 1 |
+| `a_preempt_can_only_move_the_cpus_outgoing_current_task` | §1 row 2 |
+| `a_dispatch_can_only_move_a_task_the_scheduler_selected` | §1 row 2 |
+| `a_cross_cpu_wake_skips_a_running_victim` | §1 row 3 |
+| `the_post_clear_window_contains_no_wake_and_no_tcb_write` | §1 row 4 |
+| `the_restart_writer_is_driven_only_by_a_kernel_ipc_handler` | §1 row 4 |
+| `the_x86_syscall_window_runs_with_interrupts_masked` | §1 row 4 |
+| `the_aarch64_trap_window_runs_with_interrupts_masked` | §1 row 4 |
+| `the_riscv_trap_window_runs_with_interrupts_masked` | §1 row 4 |
+| `a_claim_refusal_requires_a_tcb_write_the_window_forbids` | the consequence: `settle_failed_claim` is unreachable |
+| `the_fatal_is_reached_only_through_two_refused_settlements` | the divergence sits in the advance's refusal arm and nowhere else |
+| `the_drain_admits_exactly_terminal_and_removed` | broadening one predicate without the other is impossible |
