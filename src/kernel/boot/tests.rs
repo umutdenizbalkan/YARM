@@ -40103,6 +40103,8 @@ mod stage145_vm_module_extraction {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const VM_SRC: &str = include_str!("../syscall/vm.rs");
+    /// U9-VM-ENTRY1: the policy half of the VM module family.
+    const VM_TXN_SRC: &str = include_str!("../syscall/vm_txn.rs");
 
     // 1. vm.rs must exist and declare the three pub(super) handlers.
     #[test]
@@ -40121,33 +40123,58 @@ mod stage145_vm_module_extraction {
         );
     }
 
-    // 2. vm_map_page_flags, validate_anon_map_args, rollback_anon_map must live in vm.rs only.
+    // 2. The VM helpers live in the VM module family, never in the parent `syscall.rs`.
     #[test]
     fn stage145_vm_helpers_live_in_vm_module() {
+        // U9-VM-ENTRY1 re-derivation. Stage 145's claim is the DECOMPOSITION: the parent
+        // `syscall.rs` owns no VM mapping policy, and each helper has exactly one home. That claim
+        // is unchanged and is now one level stronger — the policy moved out of `vm.rs` too, into
+        // `vm_txn.rs`, where the broad and split adapters both drive it. So the three helpers are
+        // asserted against the VM module FAMILY rather than against `vm.rs` alone, and each is
+        // pinned to the successor that actually owns its job:
+        //
+        //   vm_map_page_flags + validate_anon_map_args -> `validate_map_args`, one function,
+        //     because prot decoding and (addr, len) validation are one validation step with one
+        //     error precedence;
+        //   rollback_anon_map -> `release_frames` (the capability half) and `undo_installed_locked`
+        //     (the VM half), which is the split Stage 145 could not make: compensation for
+        //     resources and compensation for mappings have different owners and different
+        //     exclusivity proofs.
         assert!(
-            VM_SRC.contains("fn vm_map_page_flags("),
-            "vm.rs must contain vm_map_page_flags"
+            VM_TXN_SRC.contains("fn validate_map_args("),
+            "the validation helper must live in the VM module family"
         );
         assert!(
-            VM_SRC.contains("fn validate_anon_map_args("),
-            "vm.rs must contain validate_anon_map_args"
+            VM_TXN_SRC.contains("fn release_frames<"),
+            "the resource half of the rollback must live in the VM module family"
         );
         assert!(
-            VM_SRC.contains("fn rollback_anon_map("),
-            "vm.rs must contain rollback_anon_map"
+            VM_SRC.contains("fn undo_installed_locked("),
+            "the mapping half of the rollback must live in the VM module family"
         );
-        // These private helpers must not remain in the parent syscall.rs.
+        // The whole point of Stage 145, unchanged: none of it may sit in the parent.
+        for absent in [
+            "fn vm_map_page_flags(",
+            "fn validate_anon_map_args(",
+            "fn rollback_anon_map(",
+            "fn validate_map_args(",
+            "fn release_frames<",
+            "fn undo_installed_locked(",
+        ] {
+            assert!(
+                !SYSCALL_SRC.contains(absent),
+                "syscall.rs must NOT contain `{absent}` — it belongs to the VM module family"
+            );
+        }
+        // And exactly one home each: a helper that exists in both files is the duplication this
+        // case was written to prevent.
         assert!(
-            !SYSCALL_SRC.contains("fn vm_map_page_flags("),
-            "syscall.rs must NOT contain vm_map_page_flags (moved to vm.rs)"
+            !VM_SRC.contains("fn validate_map_args("),
+            "the validation helper must have ONE home"
         );
         assert!(
-            !SYSCALL_SRC.contains("fn validate_anon_map_args("),
-            "syscall.rs must NOT contain validate_anon_map_args (moved to vm.rs)"
-        );
-        assert!(
-            !SYSCALL_SRC.contains("fn rollback_anon_map("),
-            "syscall.rs must NOT contain rollback_anon_map (moved to vm.rs)"
+            !VM_TXN_SRC.contains("fn undo_installed_locked("),
+            "the mapping-rollback helper must have ONE home"
         );
     }
 
@@ -40192,17 +40219,32 @@ mod stage145_vm_module_extraction {
         );
     }
 
-    // 6. vm.rs must import round_up_page and validate_user_region from super (syscall.rs).
+    // 6. The VM module family REUSES the shared helpers rather than restating them.
     #[test]
     fn stage145_vm_imports_helpers_from_super() {
+        // U9-VM-ENTRY1 re-derivation. The claim is reuse, not the import syntax: `round_up_page`
+        // and `validate_user_region` have one implementation, in the syscall namespace, and the VM
+        // code calls it. What moved is WHICH file calls them — validation is now the transaction's,
+        // so both live in `vm_txn.rs`, which reaches them through the same namespace `vm.rs` used.
         assert!(
-            VM_SRC.contains("round_up_page") && VM_SRC.contains("super::"),
-            "vm.rs must import round_up_page from super"
+            VM_TXN_SRC.contains("round_up_page"),
+            "the VM transaction must reuse round_up_page"
         );
         assert!(
-            VM_SRC.contains("validate_user_region") && VM_SRC.contains("super::"),
-            "vm.rs must import validate_user_region from super"
+            VM_TXN_SRC.contains("validate_user_region"),
+            "the VM transaction must reuse validate_user_region"
         );
+        assert!(
+            VM_TXN_SRC.contains("crate::kernel::syscall::"),
+            "and must reach them through the syscall namespace, not a private copy"
+        );
+        // Neither may be reimplemented anywhere in the family.
+        for src in [VM_SRC, VM_TXN_SRC] {
+            assert!(
+                !src.contains("fn round_up_page(") && !src.contains("fn validate_user_region("),
+                "the shared helpers must not be reimplemented in the VM module family"
+            );
+        }
     }
 
     // 7. VM syscall numbers unchanged.

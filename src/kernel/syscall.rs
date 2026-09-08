@@ -335,6 +335,8 @@ pub(crate) mod spawn_image_txn;
 pub(crate) mod spawn_txn;
 // U9-RESIDUAL1 §3: THE cooperative-yield policy, over owners, with a broad and a split adapter.
 mod vm;
+/// U9-VM-ENTRY1 — the one mapping/brk policy both the broad and the split adapters drive.
+pub(crate) mod vm_txn;
 pub(crate) mod yield_txn;
 
 // Stage 149: [S] shared helper re-exports so sibling modules and external

@@ -256,6 +256,25 @@ impl KernelState {
     /// If `targets == 0` (no remote CPU has the ASID loaded), this function
     /// returns immediately without acquiring the ipc lock. TLB shootdown is not
     /// needed. In single-CPU (hosted-dev), this is always the path taken.
+    /// U9-VM-ENTRY1 — the required-ACK shootdown for ONE virtual address whose PTE has already
+    /// been overwritten, with no unmap of its own.
+    ///
+    /// `map_page` replaces, and the delivered `map_user_page_in_asid_raw_locked` reclaimed the
+    /// frame it displaced with no shootdown between the overwrite and the reclaim. Under the
+    /// global lock no other CPU could enter the kernel to observe that, but a remote CPU's TLB
+    /// could still hold the old translation while the frame was handed back to the allocator.
+    ///
+    /// The mapping transaction routes every displaced-frame reclaim through this, so the reclaim
+    /// waits for the acknowledgement it always owed. Nothing else changes: with no remote target
+    /// the delegate returns immediately, which is every uniprocessor profile.
+    pub(crate) fn shootdown_replaced_mapping(
+        &mut self,
+        asid: Asid,
+        virt: VirtAddr,
+    ) -> Result<(), KernelError> {
+        self.request_live_asid_shootdown(asid, virt)
+    }
+
     fn request_live_asid_shootdown(
         &mut self,
         asid: Asid,
