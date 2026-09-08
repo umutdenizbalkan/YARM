@@ -12,7 +12,7 @@ use crate::kernel::capabilities::{CapId, CapObject};
 //
 // One method per domain acquisition, driving the SAME `vm_txn` policy the broad handlers drive.
 // Three of its methods delegate to the very same rank-local bodies the broad adapter uses
-// (`install_range_locked`, `settle_installed_locked`, `release_provisional_frame_cap_locked`), so
+// (`install_range_locked`, `note_inserted_locked`, `release_provisional_frame_cap_locked`), so
 // two routes cannot disagree about installation, accounting or exclusivity — they are not two
 // implementations of one contract, they are one implementation reached through two acquisitions.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -125,13 +125,25 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         })
     }
 
-    fn settle_installed(
+    fn note_inserted(&mut self, installed: &[crate::kernel::syscall::vm_txn::InstalledPage]) {
+        self.shared.with_memory_split_mut(|memory| {
+            crate::kernel::syscall::vm::note_inserted_locked(memory, installed);
+        });
+    }
+
+    fn unnote_inserted(&mut self, installed: &[crate::kernel::syscall::vm_txn::InstalledPage]) {
+        self.shared.with_memory_split_mut(|memory| {
+            crate::kernel::syscall::vm::unnote_inserted_locked(memory, installed);
+        });
+    }
+
+    fn settle_displaced(
         &mut self,
         asid: crate::kernel::vm::Asid,
         installed: &[crate::kernel::syscall::vm_txn::InstalledPage],
     ) {
         self.shared.with_memory_split_mut(|memory| {
-            crate::kernel::syscall::vm::settle_installed_locked(memory, asid, installed);
+            crate::kernel::syscall::vm::settle_displaced_locked(memory, asid, installed);
         });
     }
 

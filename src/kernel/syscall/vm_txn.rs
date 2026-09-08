@@ -187,9 +187,27 @@ pub(crate) trait VmMapOwners {
         out: &mut [InstalledPage],
     ) -> Result<usize, (usize, KernelError)>;
 
-    /// rank 6 — account the pages that stayed installed: `map_refcount++` for each inserted frame,
-    /// `map_refcount--` plus COW clear for each displaced one.
-    fn settle_installed(&mut self, asid: Asid, installed: &[InstalledPage]);
+    /// rank 6 — take the MAP reference on every frame this run installed (`map_refcount++`).
+    ///
+    /// Deliberately BEFORE the mint. `reclaim_memory_object_if_unreferenced` frees an object only
+    /// when `cap_refcount`, `map_refcount` and `pin_refcount` are all zero, so taking the map
+    /// reference before any capability naming the object is published makes it structurally
+    /// impossible for a capability-side revoke to reclaim backing this transaction has already
+    /// mapped. The protection is an invariant of the phase order, not an argument about which
+    /// actors happen to exist.
+    fn note_inserted(&mut self, installed: &[InstalledPage]);
+
+    /// rank 6 — the exact inverse of [`Self::note_inserted`], for the mint-phase rollback. Run
+    /// AFTER the mappings are removed, so a frame is never reclaimable while its PTE is live.
+    fn unnote_inserted(&mut self, installed: &[InstalledPage]);
+
+    /// rank 6 — the accounting the DISPLACED pages owe, run only once the run has committed:
+    /// COW clear plus `map_refcount--` for each mapping this run replaced.
+    ///
+    /// Separated from [`Self::note_inserted`] because it is not reversible — `clear_cow_page`
+    /// destroys a mark this transaction cannot restore — so it must not run on any path that can
+    /// still put the displaced mappings back.
+    fn settle_displaced(&mut self, asid: Asid, installed: &[InstalledPage]);
 
     /// NO LOCK — complete the required TLB shootdown for `virt` in `asid`. Returns `false` when a
     /// remote acknowledgement was not obtained, in which case the caller must skip the reclaim.
@@ -363,9 +381,11 @@ fn release_frames<O: VmMapOwners>(
 /// | phase | on failure |
 /// |---|---|
 /// | validate, resolve target, guard page | nothing acquired, nothing installed |
-/// | R: acquire every frame | release exactly the frames acquired so far |
-/// | I: install the whole range under ONE VM acquisition | that acquisition restores every page it displaced, then release every frame |
-/// | S: account, shoot down, reclaim displaced frames | — the transaction has committed |
+/// | R: acquire every frame and its object, NO capability | release exactly the objects acquired so far |
+/// | I: install the whole range under ONE VM acquisition | that acquisition restores every page it displaced, then release every object |
+/// | S1: take the map reference on every inserted frame | (cannot fail) |
+/// | M: mint the caller's capabilities, LAST | remove the mappings, drop the map references, release the caps minted so far, release the rest of the objects |
+/// | S2: account, shoot down and reclaim displaced frames | — the transaction has committed |
 ///
 /// Returns the `(addr, map_len)` the caller's result lanes carry.
 pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
@@ -475,6 +495,14 @@ fn run_one_map_run<O: VmMapOwners>(
     debug_assert_eq!(count, pages);
     owners.note(VmTxnEvent::Installed { count });
 
+    // ── Phase S1: take the MAP reference on every frame just installed, BEFORE any capability
+    // naming it exists. An object is reclaimed only when cap, map and pin references are all
+    // zero, so from this point a capability-side revoke cannot free backing this transaction has
+    // mapped — no matter what a sibling does with the slot the next phase publishes. Only the
+    // inserted side is accounted here: the displaced side is not reversible and belongs after the
+    // run commits.
+    owners.note_inserted(&installed[..count]);
+
     // ── Phase M: the mint, LAST. This is the only phase in which a provisional capability
     // exists, and it is placed here deliberately.
     //
@@ -500,10 +528,17 @@ fn run_one_map_run<O: VmMapOwners>(
                 }
             }
             Err(e) => {
-                // Undo in reverse dependency order: the mappings first (one acquisition,
-                // restoring what each displaced), then the capabilities this phase minted, then
-                // the objects that never got one.
+                // Undo in reverse dependency order, and in the order that never leaves a frame
+                // reclaimable while its PTE is live:
+                //   1. remove the mappings (ONE acquisition, restoring what each displaced),
+                //   2. only then drop the map references phase S1 took,
+                //   3. then the capabilities this phase minted — each one's release is what makes
+                //      its object unreferenced, and by now it is genuinely unmapped,
+                //   4. then the objects that never got a capability at all.
+                // Between (1) and (2) a frame is over-counted rather than under-counted, which is
+                // the safe direction: nothing can be reclaimed early.
                 owners.undo_installed_range(asid, &installed[..count]);
+                owners.unnote_inserted(&installed[..count]);
                 let (released, retained) = release_frames(owners, cnode, &frames[..i]);
                 for (object_id, _) in objects.iter().take(pages).skip(i) {
                     owners.release_unminted_object(*object_id);
@@ -518,9 +553,9 @@ fn run_one_map_run<O: VmMapOwners>(
         }
     }
 
-    // ── Phase S: the run has committed. Account it, then retire whatever it displaced —
-    // shootdown BEFORE reclaim, with no domain lock held across the wait.
-    owners.settle_installed(asid, &installed[..count]);
+    // ── Phase S2: the run has committed. Account what it displaced, then retire it — shootdown
+    // BEFORE reclaim, with no domain lock held across the wait.
+    owners.settle_displaced(asid, &installed[..count]);
     for page in &installed[..count] {
         if let Some(old) = page.replaced {
             if owners.complete_shootdown(asid, page.virt) {

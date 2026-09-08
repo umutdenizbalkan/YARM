@@ -335,7 +335,7 @@ pub(crate) mod spawn_image_txn;
 pub(crate) mod spawn_txn;
 // U9-RESIDUAL1 §3: THE cooperative-yield policy, over owners, with a broad and a split adapter.
 /// U9-VM-ENTRY1: `pub(crate)` so the split adapter can reach the rank-local bodies
-/// (`install_range_locked`, `settle_installed_locked`, `release_provisional_cap_locked`) rather
+/// (`install_range_locked`, `note_inserted_locked`, `release_provisional_frame_cap_locked`) rather
 /// than restate them — one implementation of each, reached through two acquisitions.
 pub(crate) mod vm;
 /// U9-VM-ENTRY1 — the SPLIT adapter driving the same policy off the broad lock.

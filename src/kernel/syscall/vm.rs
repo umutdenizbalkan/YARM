@@ -96,9 +96,21 @@ impl VmMapOwners for BroadVmOwners<'_> {
         })
     }
 
-    fn settle_installed(&mut self, asid: Asid, installed: &[InstalledPage]) {
+    fn note_inserted(&mut self, installed: &[InstalledPage]) {
         self.kernel.with_memory_state_mut(|memory| {
-            settle_installed_locked(memory, asid, installed);
+            note_inserted_locked(memory, installed);
+        });
+    }
+
+    fn unnote_inserted(&mut self, installed: &[InstalledPage]) {
+        self.kernel.with_memory_state_mut(|memory| {
+            unnote_inserted_locked(memory, installed);
+        });
+    }
+
+    fn settle_displaced(&mut self, asid: Asid, installed: &[InstalledPage]) {
+        self.kernel.with_memory_state_mut(|memory| {
+            settle_displaced_locked(memory, asid, installed);
         });
     }
 
@@ -272,10 +284,41 @@ pub(crate) fn undo_installed_locked(
     }
 }
 
-/// rank 6: the accounting a committed run owes. `map_refcount++` for every frame installed;
-/// `map_refcount--` plus the COW clear for every frame displaced. Reclaim of a displaced frame is
-/// deliberately NOT here — it happens only after that page's shootdown completes.
-pub(crate) fn settle_installed_locked(
+/// rank 6: take the MAP reference on every frame this run installed.
+///
+/// Called BEFORE the mint. `reclaim_memory_object_if_unreferenced_locked` frees an object only
+/// when its cap, map and pin refcounts are ALL zero, so once this has run the object cannot be
+/// reclaimed through the capability domain at all — which is precisely what makes "a sibling
+/// revoking the provisional cap cannot free mapped backing" an invariant of the phase order
+/// rather than a claim about which actors exist.
+pub(crate) fn note_inserted_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    installed: &[InstalledPage],
+) {
+    for page in installed {
+        KernelState::note_mapping_inserted_locked(memory, page.inserted);
+    }
+}
+
+/// rank 6: the exact inverse of [`note_inserted_locked`], for the mint-phase rollback. Run only
+/// after the PTEs are gone, so a frame is never reclaimable while it is still mapped.
+pub(crate) fn unnote_inserted_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    installed: &[InstalledPage],
+) {
+    for page in installed {
+        KernelState::note_mapping_removed_locked(memory, page.inserted);
+    }
+}
+
+/// rank 6: the accounting a COMMITTED run owes for what it displaced — the COW clear and
+/// `map_refcount--` for every mapping it replaced. Reclaim of a displaced frame is deliberately
+/// NOT here: it happens only after that page's shootdown completes.
+///
+/// Kept apart from [`note_inserted_locked`] because it is not reversible: `clear_cow_page_locked`
+/// destroys a mark this transaction cannot restore, so it must not run on any path that can still
+/// put the displaced mappings back.
+pub(crate) fn settle_displaced_locked(
     memory: &mut crate::kernel::boot::MemorySubsystem,
     asid: Asid,
     installed: &[InstalledPage],
@@ -285,7 +328,6 @@ pub(crate) fn settle_installed_locked(
             KernelState::clear_cow_page_locked(memory, asid, page.virt);
             KernelState::note_mapping_removed_locked(memory, old.phys);
         }
-        KernelState::note_mapping_inserted_locked(memory, page.inserted);
     }
 }
 
