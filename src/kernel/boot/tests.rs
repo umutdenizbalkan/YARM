@@ -73869,12 +73869,25 @@ mod stage195a_aarch64_debuglog_live {
             body.contains("SYSCALL_YIELD_NR"),
             "AArch64 imports Yield (NR 0) — the fifth switching pre-lock class"
         );
-        for absent in [
+        // U9-VM-ENTRY1 §3: NR 3, NR 13 and NR 14 ARE now imported, for the reason this guard was
+        // written to withhold them — all three have a pre-lock route, and an unlisted NR keeps
+        // `nr = 0` so the dispatcher declines it and the family keeps its terminal broad edge
+        // here no matter what the route admits. They were this case's stand-in for "a syscall
+        // with no pre-lock route", so the stand-in moves rather than the claim.
+        for present in [
             "SYSCALL_VM_MAP_NR",
             "SYSCALL_VM_ANON_MAP_NR",
-            "SYSCALL_TRANSFER_RELEASE_NR",
-            "SYSCALL_RECV_SHARED_V3_NR",
+            "SYSCALL_VM_BRK_NR",
         ] {
+            assert!(
+                body.contains(present),
+                "AArch64 imports `{present}` — it has a TOTAL pre-lock route"
+            );
+        }
+        // The selectivity claim this case owns is unchanged, and is checked against syscalls that
+        // genuinely still have no pre-lock route: NR 4 and NR 30 are the IPC/transfer residual the
+        // next roadmap package covers.
+        for absent in ["SYSCALL_TRANSFER_RELEASE_NR", "SYSCALL_RECV_SHARED_V3_NR"] {
             assert!(
                 !body.contains(absent),
                 "the import must stay a whitelist: `{absent}` has no pre-lock route"
@@ -169478,5 +169491,383 @@ mod u9vment1_ownership_cases {
             .expect("spawn")
             .join()
             .expect("join");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// U9-VM-ENTRY1 §4 — the three-NR × three-architecture SOURCE reachability matrix.
+//
+// One row per NR, one cell per architecture, plus the shared cells every architecture goes
+// through. Each cell asserts the SOURCE fact that makes the route reachable there, and the
+// absence of a path back to either terminal broad dispatcher after the family is recognized.
+//
+// Route markers alone would not prove any of this, which is why nothing below reads one: the
+// cells read the ingress gates, the shared dispatcher and the routes themselves. Live execution
+// is reported separately — a source cell says a fall-through cannot happen, never that a syscall
+// ran.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod u9vment1_reachability_matrix {
+    use std::string::String;
+    use std::vec::Vec;
+
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TXN: &str = include_str!("../syscall/vm_txn.rs");
+    const VM: &str = include_str!("../syscall/vm.rs");
+    const VM_SPLIT: &str = include_str!("../syscall/vm_split.rs");
+
+    /// Every NR in this mission, with the constant each ingress gate names it by and the route
+    /// that owns it.
+    const FAMILIES: [(&str, &str, &str); 3] = [
+        (
+            "NR 3 VmMap",
+            "SYSCALL_VM_MAP_NR",
+            "try_split_vm_map_into_frame",
+        ),
+        (
+            "NR 13 VmAnonMap",
+            "SYSCALL_VM_ANON_MAP_NR",
+            "try_split_vm_anon_map_into_frame",
+        ),
+        (
+            "NR 14 VmBrk",
+            "SYSCALL_VM_BRK_NR",
+            "try_split_vm_brk_into_frame",
+        ),
+    ];
+
+    /// The body of `name`, from its signature up to the next item at the same nesting depth.
+    fn body_of<'a>(src: &'a str, name: &str, terminator: &str) -> &'a str {
+        src.split(name)
+            .nth(1)
+            .and_then(|rest| rest.split(terminator).next())
+            .unwrap_or_else(|| panic!("could not isolate `{name}`"))
+    }
+
+    /// `src` with every comment line removed, so a cell cannot be satisfied by prose that merely
+    /// MENTIONS the seam it is asserting about.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // ── Column: x86_64 ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_x86_64_column_every_nr_reaches_the_shared_dispatcher_unconditionally() {
+        // x86_64 enters through the shared `trap_entry` syscall branch. Its only pre-dispatch
+        // gate is `pre_split_import_syscall_abi`, which on every non-AArch64 target is an empty
+        // function — so no NR can be filtered out before the dispatcher sees it.
+        assert!(
+            TRAP_ENTRY.contains("#[cfg(not(target_arch = \"aarch64\"))]\nfn pre_split_import_syscall_abi(_frame: &mut TrapFrame) {}"),
+            "on x86_64 the ABI import is a no-op, so the dispatcher sees every syscall number"
+        );
+        let branch = code_only(body_of(
+            TRAP_ENTRY,
+            "if !post_work_committed && matches!(decode_trap_context(context), TrapEvent::Syscall)",
+            "\n    if !queue_advance_committed",
+        ));
+        assert!(
+            branch.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "the shared syscall branch calls the split dispatcher"
+        );
+        assert!(
+            branch.contains("SplitDispatchDisposition::Complete(result)"),
+            "and it consumes the `Complete` disposition all three of these NRs answer with"
+        );
+    }
+
+    // ── Column: AArch64 ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_aarch64_column_import_admits_all_three_and_agrees_with_the_return_path() {
+        // AArch64 shares the same branch, but reaches the dispatcher only for an NR whose ABI
+        // this function imports; an unlisted NR keeps `nr = 0` in the frame and is declined.
+        let import = code_only(body_of(
+            TRAP_ENTRY,
+            "fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {",
+            "\n#[cfg(not(target_arch = \"aarch64\"))]",
+        ));
+        for (label, nr_const, _) in FAMILIES {
+            assert!(
+                import.contains(&std::format!(
+                    "raw_nr == crate::kernel::syscall::{nr_const}"
+                )),
+                "{label} must be on the AArch64 ABI import list, or it keeps its terminal broad \
+                 edge on this architecture no matter what its route admits"
+            );
+        }
+        // Import and return handling agree: all three answer `Complete`, and the `Complete` arm
+        // reaches the finalizer with `CompletedInThisTrap`, which commits unconditionally rather
+        // than consulting the per-class published-transition list.
+        let finalize = code_only(body_of(
+            TRAP_ENTRY,
+            "fn finalize_split_handled_syscall(\n    shared: &crate::runtime::SharedKernel,",
+            "\n#[cfg(not(target_arch = \"aarch64\"))]",
+        ));
+        assert!(
+            finalize.contains("if matches!(reason, SplitFinalizeReason::CompletedInThisTrap) {")
+                && finalize.contains(
+                    "split_finalize_handled_syscall(shared, cpu, entering, frame);\n        return;"
+                ),
+            "a syscall completed in this trap must have its result exported and its SVC advanced \
+             unconditionally — the defect this arm exists to prevent is exactly a class that is \
+             imported and routed but never finalized"
+        );
+        let complete_arm = code_only(body_of(
+            TRAP_ENTRY,
+            "if let SplitDispatchDisposition::Complete(result) = disposition {",
+            "\n            }\n        }",
+        ));
+        assert!(
+            complete_arm.contains("SplitFinalizeReason::CompletedInThisTrap"),
+            "the `Complete` arm must finalize with the reason that always commits"
+        );
+    }
+
+    // ── Column: RISC-V ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_riscv_column_eligibility_admits_all_three_and_actually_invokes_the_route() {
+        let gate = code_only(body_of(
+            RISCV_TRAP,
+            "let split_eligible =",
+            "\n    if split_eligible {",
+        ));
+        for (label, nr_const, _) in FAMILIES {
+            assert!(
+                gate.contains(&std::format!("nr == crate::kernel::syscall::{nr_const}")),
+                "{label} must be on the RISC-V eligibility list"
+            );
+        }
+        // Eligibility is not enough on its own: the gate must actually call the dispatcher.
+        let admitted = code_only(body_of(
+            RISCV_TRAP,
+            "\n    if split_eligible {",
+            "\n    // Not split-eligible",
+        ));
+        assert!(
+            admitted.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "the RISC-V eligibility gate must invoke the shared dispatcher, not merely admit"
+        );
+    }
+
+    // ── Shared cells: the dispatcher and the three routes ───────────────────────────────────
+
+    #[test]
+    fn matrix_shared_dispatcher_admits_all_three_and_routes_each_to_a_total_owner() {
+        let classifier = code_only(body_of(SPLIT, "fn classify_split_eligible_nr_only(", "\n}"));
+        for (label, _, _) in FAMILIES {
+            let variant = match label {
+                "NR 3 VmMap" => "Syscall::VmMap => Some(syscall)",
+                "NR 13 VmAnonMap" => "Syscall::VmAnonMap => Some(syscall)",
+                _ => "Syscall::VmBrk => Some(syscall)",
+            };
+            assert!(
+                classifier.contains(variant),
+                "{label} must pass the shared NR-only eligibility gate"
+            );
+        }
+        let dispatcher = code_only(body_of(
+            SPLIT,
+            "fn try_split_dispatch_nonswitching_into_frame(",
+            "\n/// U9-SPAWN1 SP-2",
+        ));
+        for (label, _, route) in FAMILIES {
+            assert!(
+                dispatcher.contains(&std::format!("return {route}(shared, cpu, frame);")),
+                "{label} must be routed to `{route}` and RETURNED, so no later arm and no \
+                 fall-through can reach the terminal broad acquisition for it"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_each_route_is_total_after_its_nr_gate() {
+        for (label, _, route) in FAMILIES {
+            let body = code_only(body_of(
+                SPLIT,
+                &std::format!("pub(crate) fn {route}("),
+                "\n}\n",
+            ));
+            // The NR gate itself is the ONLY place a `None` may be produced: an undecodable
+            // number and a different syscall. Everything after it is `Some(..)`.
+            let gate_end = body
+                .find("return None;")
+                .expect("the NR gate declines a different syscall")
+                + "return None;".len();
+            let after_gate = &body[gate_end..];
+            assert_eq!(
+                after_gate.matches("None").count(),
+                0,
+                "{label}: `{route}` must never answer `None` after recognizing its NR — a family \
+                 with a reachable broad fallback is not closed, and after a frame is taken or a \
+                 page installed a `None` would hand a partially executed transaction to a \
+                 dispatcher that knows nothing about it"
+            );
+            assert_eq!(
+                body.matches(".ok()?").count(),
+                1,
+                "{label}: the only `?` is the decode in the NR gate"
+            );
+            // Errors go back as errors, not as declines.
+            assert!(
+                after_gate.contains("Err(e) => Err(TrapHandleError::Syscall(e))")
+                    || after_gate.contains("Err(e) => return Some(Err(e))")
+                    || after_gate.contains("Err(e) => Err(e)"),
+                "{label}: an ordinary refusal must be returned as this syscall's error"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_error_and_refusal_branches_stay_inside_the_route() {
+        // Every refusal the transaction can produce is a `SyscallError`, and the routes convert
+        // each into `TrapHandleError::Syscall`. None of them is `WouldBlock` or `Unsupported`,
+        // and none is a fatal: the ABI the broad handlers implement is preserved exactly.
+        let txn = code_only(&TXN);
+        assert!(
+            !txn.contains("SyscallError::WouldBlock")
+                && !txn.contains("SyscallError::Unsupported")
+                && !txn.contains("panic!")
+                && !txn.contains("unreachable!"),
+            "no supported behaviour may be replaced with WouldBlock, Unsupported or a fatal to \
+             manufacture closure"
+        );
+        // The refusal vocabulary is the delivered one.
+        for expected in [
+            "SyscallError::InvalidArgs",
+            "KernelError::TaskMissing",
+            "KernelError::UserMemoryFault",
+        ] {
+            assert!(
+                txn.contains(expected),
+                "the transaction must still be able to produce `{expected}`"
+            );
+        }
+        // `WrongObject` is the NR 3 authority refusal, and it is produced identically by BOTH
+        // adapters' capability resolvers — the one place the two NRs differ.
+        for (label, src) in [("broad", VM), ("split", VM_SPLIT)] {
+            assert!(
+                code_only(src).contains("_ => Err(KernelError::WrongObject)"),
+                "the {label} adapter must still refuse a non-address-space capability with \
+                 `WrongObject`"
+            );
+        }
+    }
+
+    // ── Row: NR 14, every shape ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_nr14_row_services_every_brk_shape_on_every_architecture() {
+        let classify = code_only(body_of(TXN, "pub(crate) fn classify_brk(", "\n}\n"));
+        for shape in [
+            "BrkShape::Query",
+            "BrkShape::Growth",
+            "BrkShape::NoOp",
+            "BrkShape::ShrinkUnmapping",
+            "BrkShape::ShrinkWithinPage",
+        ] {
+            assert!(
+                classify.contains(shape),
+                "`classify_brk` must produce `{shape}`"
+            );
+        }
+        let run = code_only(body_of(
+            TXN,
+            "pub(crate) fn run_vm_brk_transaction<O: VmBrkOwners>(",
+            "\n}\n",
+        ));
+        // Exactly ONE shape does any unmapping; every other shape is serviced by the same body
+        // rather than declined, which is what makes "all five shapes, at any CPU count" true.
+        assert!(
+            run.contains("if let BrkShape::ShrinkUnmapping {"),
+            "only the page-crossing shrink unmaps"
+        );
+        assert!(
+            !run.contains("return None") && !run.contains("NotHandled"),
+            "no shape may decline — the transaction is total for NR 14"
+        );
+        // The topology restriction is gone, and gone by reaching a better owner rather than by
+        // ignoring the constraint that produced it.
+        let split_unmap = code_only(body_of(
+            VM_SPLIT,
+            "fn unmap_brk_range(",
+            "\n    fn note_brk",
+        ));
+        assert!(
+            split_unmap.contains("unmap_range_two_phase_split(asid, start, len)"),
+            "the split shrink must reach the two-phase unmap owner — rank 5, then the shootdown \
+             with NO lock held, then rank 6 — which is what removed the one-CPU ceiling"
+        );
+        assert!(
+            !split_unmap.contains("cpus_online") && !split_unmap.contains("online_cpu"),
+            "and it must not reintroduce a CPU-count condition"
+        );
+    }
+
+    // ── The two policies exist once ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_one_implementation_of_each_policy_reached_through_two_acquisitions() {
+        // Neither adapter restates the policy…
+        for (label, src) in [("broad", VM), ("split", VM_SPLIT)] {
+            let code = code_only(src);
+            for owned_by_the_transaction in [
+                "fn validate_map_args(",
+                "fn classify_brk(",
+                "fn guard_page_refuses(",
+                "fn release_frames<",
+                "fn run_one_map_run",
+            ] {
+                assert!(
+                    !code.contains(owned_by_the_transaction),
+                    "the {label} adapter must not restate `{owned_by_the_transaction}`"
+                );
+            }
+        }
+        // …and both reach the SAME rank-local bodies for installation, accounting and exclusivity.
+        let split = code_only(&VM_SPLIT);
+        let broad = code_only(&VM);
+        for shared_body in [
+            "install_range_locked(",
+            "undo_installed_locked(",
+            "note_inserted_locked(",
+            "unnote_inserted_locked(",
+            "settle_displaced_locked(",
+            "release_provisional_frame_cap_locked(",
+        ] {
+            assert!(
+                broad.contains(shared_body) && split.contains(shared_body),
+                "`{shared_body}` must be reached by BOTH adapters — one implementation, two \
+                 acquisitions"
+            );
+            assert_eq!(
+                split
+                    .matches(&std::format!("fn {}", shared_body.trim_end_matches('(')))
+                    .count(),
+                0,
+                "and the split adapter must not define its own `{shared_body}`"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_superseded_runtime_acquisition_adapter_is_gone() {
+        // The delivered split route for NR 14 was a shrink-only specialization gated on CPU
+        // count. It is removed rather than left caller-free beside its replacement.
+        assert!(
+            !SPLIT.contains("try_split_vm_brk_shrink_into_frame"),
+            "the superseded shrink-only NR 14 adapter must be gone, not merely bypassed"
+        );
+        assert!(
+            !VM_SPLIT.contains("fn acquire_anonymous_frame_split(")
+                && !SPLIT.contains("acquire_anonymous_frame_split"),
+            "the mint-early frame acquirer the mint-last order superseded must be gone too"
+        );
     }
 }

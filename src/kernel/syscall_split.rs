@@ -5,8 +5,10 @@
 //! Stage 29: live-wired for `ControlPlaneSetCnodeSlots` (NR 8) via
 //! [`try_split_dispatch_into_frame`].
 //! Stage 32B: live-wired for `IpcRecv` (NR 2), kernel-task queued-plain case only.
-//! Stage 114: live-wired for `VmBrk` (NR 14), page-crossing-shrink case only, via
-//! [`try_split_vm_brk_shrink_into_frame`].
+//! Stage 114: live-wired for `VmBrk` (NR 14), page-crossing-shrink case only.
+//! U9-VM-ENTRY1: NR 3, NR 13 and NR 14 are live-wired WHOLE, through the one mapping/brk
+//! transaction, via [`try_split_vm_map_into_frame`], [`try_split_vm_anon_map_into_frame`] and
+//! [`try_split_vm_brk_into_frame`]. Stage 114's shrink-only adapter is gone.
 //!
 //! This module hosts the minimal, **whitelist-only** mechanism that classifies
 //! a decoded `Syscall` as eligible for *split-dispatch* — i.e. servicing it via
@@ -95,15 +97,13 @@ pub(crate) enum SplitEligibleSyscall {
     IpcRecvKernelTask,
     // Add others ONLY when the per-domain helper is proven safe.
     //
-    // Stage 114: `Syscall::VmBrk` (NR 14) is intentionally NOT added here.
-    // Like `IpcRecv`, its split eligibility cannot be decided from the
-    // syscall number + raw args alone (group-leader status, brk bounds,
-    // page-crossing, and online-CPU count all require domain reads), but
-    // unlike `IpcRecv` there is no need for an enum variant: it is
-    // special-cased directly in `try_split_dispatch_into_frame` (mirroring
-    // the `Syscall::IpcRecv` special case below) and routed straight to
-    // `try_split_vm_brk_shrink_into_frame`, never through
-    // `classify_split_eligible` / `try_split_dispatch`.
+    // Stage 114: `Syscall::VmBrk` (NR 14) is intentionally NOT added here, and U9-VM-ENTRY1
+    // keeps it that way. Stage 114 could not decide NR 14's eligibility from the syscall number
+    // and raw args alone (group-leader status, brk bounds, page-crossing and the online-CPU
+    // count all needed domain reads). U9-VM-ENTRY1 removed that question rather than answering
+    // it: the route is TOTAL, so there is nothing left to classify. It is special-cased directly
+    // in `try_split_dispatch_into_frame` — as NR 3 and NR 13 are — and routed straight to
+    // `try_split_vm_brk_into_frame`, never through `classify_split_eligible`.
 }
 
 /// Classify a decoded syscall + raw args into a split-eligible descriptor.

@@ -2849,6 +2849,25 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // here is still required: it is what puts the decoded ABI in the frame so the committed
         // syscall result lands in the right lane, exactly as it does for FutexWait.
         || raw_nr == crate::kernel::syscall::SYSCALL_YIELD_NR
+        // U9-VM-ENTRY1 §3: VmMap (NR 3), VmAnonMap (NR 13) and VmBrk (NR 14). Listed for the
+        // same reason as the classes above — their routes are architecture-neutral but reachable
+        // here only for a listed NR, and an unlisted one keeps `nr = 0` so the dispatcher
+        // declines and the family keeps its terminal broad edge on this architecture no matter
+        // what the route admits.
+        //
+        // Import and return handling agree for all three. Each route answers `Complete(_)` — it
+        // neither blocks, switches nor defers: the mapping or the break is done when the route
+        // returns, the caller is still current, and its result lane is written into its own
+        // frame. `Complete` reaches `finalize_split_handled_syscall` with
+        // `SplitFinalizeReason::CompletedInThisTrap`, which commits unconditionally, so no
+        // per-class entry in that gate's published-transition list is owed or wanted.
+        //
+        // Their arguments are within the set the ABI import already carries: NR 3 takes four
+        // (address-space cap, address, length, prot), NR 13 three (address, length, prot) and
+        // NR 14 one (the requested break).
+        || raw_nr == crate::kernel::syscall::SYSCALL_VM_MAP_NR
+        || raw_nr == crate::kernel::syscall::SYSCALL_VM_ANON_MAP_NR
+        || raw_nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply
