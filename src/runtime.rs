@@ -301,6 +301,14 @@ pub(crate) enum OwnerRevalidation {
 pub(crate) struct OwnerRevalidationSelection {
     pub(crate) cpu: CpuId,
     pub(crate) tid: u64,
+    /// U9-DISPATCH-CPU3 §3 — the PROVENANCE the mark needs.
+    ///
+    /// The selection used to be a bare TID, which throws away the one fact
+    /// `d6_genuine_mark_running_via_task_seam` requires: whether the step DEQUEUED an entry or
+    /// continued the existing `current`. That is the same information D4 had to restore at the AP's
+    /// first entry, for the same reason — a dispatch that enters userspace must mark its task
+    /// `Running`, and the exact transition depends on how the task was selected.
+    pub(crate) selection: crate::kernel::scheduler::DispatchSelection,
 }
 
 /// U3 (canonical 203C) — everything the arch restore needs, read in ONE rank-2 acquisition.
@@ -1859,6 +1867,68 @@ impl SharedKernel {
         // failure, never a silent return into ring 3 on the previous task's frame.
         let snapshot = self.owner_revalidation_snapshot_split(next);
         if let Some(snapshot) = snapshot {
+            // U9-DISPATCH-CPU3 §3 — MARK IT RUNNING, before any frame is written.
+            //
+            // This owner selects a task, loads its saved user context into the trap frame and
+            // reports `Replacement(next)`, on which the x86_64 trap tail `iretq`s into ring 3. It
+            // did all of that without ever moving the task's status: the task entered userspace
+            // still `Runnable`, so the scheduler and the task table disagreed about what was
+            // running on this CPU for the whole of its timeslice. The next `PreemptOutgoing`
+            // (`Running -> Runnable`) would then refuse, because its `expected_from` is `Running`.
+            //
+            // This is the SAME defect U9-DISPATCH-CPU1 D4 repaired at the AP's first userspace
+            // entry, on the second path that reaches userspace without the broad dispatcher — and
+            // it is repaired the same way, through the same owners: the provenance-preserving
+            // selection above, and the one rank-2 mark seam here. No new transition, no second
+            // policy; `d6_genuine_mark_running_via_task_seam` owns all five outcomes and its
+            // refusals are the ones this caller already handles.
+            //
+            // A refusal takes the EXISTING restore-failure path below, which clears `current` and
+            // undoes the queue advance exactly — the same settlement an unrestorable snapshot
+            // takes, because "cannot be marked" and "cannot be restored" have the same remedy:
+            // do not return through a frame this CPU has no right to.
+            // The STATUS transition only. Deliberately `apply_dispatch_transition` rather than
+            // `d6_genuine_mark_running_via_task_seam`: the seam also requires an exact
+            // incarnation, and whether an incarnation is a precondition of BROAD dispatch is a
+            // separate question with a separate answer (U9-DISPATCH-CPU3 §1/§2 — it is not, and
+            // the AArch64 userspace boundary is where that is enforced). Folding both changes into
+            // one would re-litigate a settled contract while repairing a different defect. This is
+            // the SAME transition, through the SAME owner, that
+            // `commit_dispatch_selection_in_lock` applies for `dispatch_next_task`; the provenance
+            // chooses between `DispatchIncoming` and `ContinueCurrent` exactly as it does there.
+            let transition = match selection.selection {
+                crate::kernel::scheduler::DispatchSelection::Dequeued { .. } => {
+                    Some(crate::kernel::task_transition::TaskTransition::DispatchIncoming)
+                }
+                crate::kernel::scheduler::DispatchSelection::ContinuedCurrent { .. } => {
+                    Some(crate::kernel::task_transition::TaskTransition::ContinueCurrent)
+                }
+                crate::kernel::scheduler::DispatchSelection::Idle => None,
+            };
+            if let Some(transition) = transition {
+                let marked = self.with_task_tcbs_split_mut(|tcbs| {
+                    crate::kernel::task_transition::apply_dispatch_transition(
+                        tcbs, next, transition,
+                    )
+                    .map_err(|refusal| {
+                        crate::kernel::task_transition::log_transition_refusal(
+                            "owner_revalidation",
+                            next,
+                            transition,
+                            refusal,
+                        )
+                    })
+                    .is_ok()
+                });
+                if !marked {
+                    crate::yarm_log!(
+                        "EXIT_TASK_OWNER_REVALIDATE_MARK_REFUSED arch=x86_64 cpu={} tid={}",
+                        selection.cpu.0,
+                        next
+                    );
+                    return self.owner_revalidation_rollback_split(selection, true);
+                }
+            }
             // (6) No lock held: frame, FS base, per-CPU TLS record, pre-IRET CR3 invariant.
             crate::arch::x86_64::trap::x86_apply_owner_revalidation_restore(
                 self, cpu, next, snapshot, frame,
@@ -1882,8 +1952,17 @@ impl SharedKernel {
         self.with_scheduler_split_mut(|sched| {
             kernel_ref(&sched.scheduler).validate_online_cpu(cpu).ok()?;
             sched.current_cpu = cpu;
-            let tid = kernel_mut(&mut sched.scheduler).dispatch_next_on(cpu)?;
-            Some(OwnerRevalidationSelection { cpu, tid: tid.0 })
+            // U9-DISPATCH-CPU3 §3: the provenance-preserving form. `dispatch_next_on` returns a
+            // bare TID; this returns WHICH kind of selection was made, which is what lets the
+            // caller mark the task `Running` through the one existing seam instead of entering
+            // userspace with the scheduler and the task table disagreeing about its status.
+            let selection = kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu);
+            let tid = selection.tid()?.0;
+            Some(OwnerRevalidationSelection {
+                cpu,
+                tid,
+                selection,
+            })
         })
     }
 
@@ -1940,7 +2019,7 @@ impl SharedKernel {
         use crate::kernel::task::TaskClass;
 
         const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
-        let OwnerRevalidationSelection { cpu, tid } = selection;
+        let OwnerRevalidationSelection { cpu, tid, .. } = selection;
         self.with_scheduler_split_mut(|sched| {
             let cleared = kernel_mut(&mut sched.scheduler)
                 .block_current_on(cpu)
