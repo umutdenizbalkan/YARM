@@ -15218,3 +15218,228 @@ duplicate entries, zero duplicate continuations and zero wrong-CPU continuations
   callsite and republishes the census from the guard's own scanner. The rest of the sentence
   stands: this stage removed an
   *authority* mismatch, not a broad-lock acquisition, and claims no census reduction.
+
+---
+
+## U9-DISPATCH-CPU2 — remove the broad-lock regression, and establish refusal recovery
+
+**Base:** `origin/main = 26c1c44` (U9-DISPATCH-CPU1). The delivered AP Yield migration is
+preserved unchanged. **U9 remains OPEN.**
+
+### §1 — The census contradiction, reproduced before editing
+
+At `26c1c44`, `src/arch/riscv64/boot.rs:1021` read the queue-advance idle diagnostic's
+`runnable_queued=` field like this:
+
+```rust
+let queued = shared.with(|k| k.runnable_count_on_cpu(cpu));
+```
+
+`SharedKernel::with` takes `self.state.lock()` — the whole-`KernelState` guard. That is a **broad
+acquisition**, and the fact that the closure reads only one scheduler field does not make it
+narrow. It added a production `SharedKernel::with` callsite to a tree whose audited broad-`with`
+total is **zero**, for a log line. The delivery record that shipped it said the census was
+unchanged. That claim was false.
+
+**The existing scanner already detected it.** Run against the exact delivered source, two of the
+seven `tests/broad_lock_census_guard.rs` cases fail and name the site:
+
+```
+NEW  src/arch/riscv64/boot.rs: found 1 (not in the census)
+broad `with` total drifted (after subtracting 1 thread_local false positive)
+  left: 1   right: 0
+```
+
+**Why qualification reported green: the integration suite was never run.** Not a wrong tree, not
+stale output. The U9-DISPATCH-CPU1 qualification ran `cargo test --lib --features hosted-dev`, and
+`--lib` builds **only the library target**; its own log shows exactly one binary — `Running
+unittests src/lib.rs` — and no `tests/*.rs` target is compiled at all. The other gate,
+`scripts/check-contract-doc-enforcement.sh`, runs three narrow `cargo test -q <name>` filters
+(`trap_router_maps_syscall`, `proc_v2_golden_vector_is_stable`, `vfs_v1_golden_vector_is_stable`),
+none of them a census test.
+
+There is a second half to the failure, and it is the more instructive one. The census figure in
+that record was not produced by the guard's scanner at all — it was asserted from an ad-hoc
+`grep -rn "\.with_cpu(" src/arch/` run by hand. That method cannot see a `SharedKernel::with`
+callsite even in principle, and it never counted the `state.lock()` form either. **A measurement
+substituted for the owner of that measurement will agree with itself and with nothing else.**
+
+**The repair.** The number was never the problem, so it is preserved exactly — same explicit `cpu`,
+same `Scheduler::runnable_count_on`, same meaning. What changes is the domain it is read in:
+
+```rust
+let queued = shared.runnable_count_on_cpu_split_read(cpu);
+```
+
+`runnable_count_on_cpu_split_read` is the existing rank-1 scheduler seam, where every other reader
+of that field already lives. The CPU is a **parameter**, not `sched.current_cpu`: an idle landing
+reports its own queue, and reading the ambient binding would print another CPU's backlog under this
+CPU's name — the same ambient-authority confusion U9-DISPATCH-CPU1 §1 removed from the selection
+owner. The diagnostic was not weakened, renamed, excluded from the scanner, or traded away.
+
+**All acquisition forms, recomputed with the guard's own scanner and file set:**
+
+| form | `26c1c44` (delivered) | here | audited |
+|---|---|---|---|
+| `with_cpu` | 2 | **2** | 2 |
+| `with_broad` (`SharedKernel::with`) | 2 — 1 production + 1 `thread_local` false positive | **1** — the false positive only | 0 + 1 FP |
+| raw `.state.lock()` | 3 | **3** | 3 |
+| `AUDITED_ACQUISITION_TOTAL` (`with_cpu + with_broad`) | — | **2** | 2 |
+
+The three `state.lock()` sites are the **bodies** of `SharedKernel::lock`/`with`/`with_cpu` — the
+implementations every callsite goes through, not callsites — which is why the audited acquisition
+total excludes them. All 7 census cases pass. The false claims in the U9-DISPATCH-CPU1 record above
+are struck through in place rather than deleted, so the correction is legible next to what it
+corrects.
+
+**A second guard, broken by the same stage and by the same blind spot.**
+`tests/riscv64_timer_plic_scope::timer_is_armed_at_the_boot_safe_point_not_at_idle` also fails at
+`26c1c44`. U9-DISPATCH-CPU1 added a comment that *quotes* `RISCV_KERNEL_IDLE_WAITING_FOR_IO` while
+explaining why that line is no longer emitted for a refusal. The guard slices
+`.split(MARKER).nth(1)`, so the quotation silently retargeted the slice onto the gap **between** the
+comment and the real marker — which contains neither the re-establish call nor the halt. Prose is
+allowed to quote a marker; a guard is not allowed to be defeated by prose, so the anchor now drops
+comment lines before locating the marker, exactly as the in-tree `code()` helpers do.
+
+### §2 — The recovery contract, from executable paths
+
+U9-DISPATCH-CPU1 D3 proved that rejected entries stay queued, in order. That is a statement about
+**placement**, not about **progress**, and `recovery=next_dispatch_on_this_cpu` named no owner and
+no event. Traced through the real code, the chain is:
+
+```
+settled refusal
+  → wfi/hlt, IRQs as the trap left them, current == None, no frame restored
+     (RISC-V additionally re-enables sstatus.SIE at the idle boundary, so the halt is
+      genuinely wake-capable rather than a masked spin)
+  → timer IRQ → try_split_timer_dispatch
+       • NON-preempting tick → ticks, acks, re-arms, PostWorkCommitted
+                             → dispatches NOTHING, returns to the idle loop
+       • preempting tick     → NotHandled → the broad arm
+  → Trap::TimerInterrupt, whose only dispatch action is `if should_preempt { yield_current() }`
+  → yield_current with current == None: the yield transaction declines NoCurrent, no
+    Running→Runnable transition is owed, and it falls through to
+    on_preempt_current_cpu_selection()
+  → PriorityScheduler::on_preempt_selection skips its re-enqueue block (no current) and calls
+    dispatch_next_selection() — the plain head dequeue
+  → commit_dispatch_selection_in_lock applies the exact Runnable→Running mark,
+    rolling the dequeue back through preempt_reenqueue_only_on if it refuses
+  → the ordinary in-lock architectural restore → userspace
+```
+
+So recovery **exists**, it **does** mark `Running`, and it reaches userspace. Seven cases in
+`u9dispatchcpu2_recovery` establish this by **driving the real owners**, not by reading them:
+an idle CPU with ordinary queued work dispatches it and marks it `Running`; the task leaves the
+queue exactly once; and priority and FIFO order behind it are untouched.
+
+**The recovery event is a *preempting* tick, not any tick.** A non-preempting tick reaches
+`PostWorkCommitted`, which sets the broad-dispatch skip and dispatches nothing. A record that said
+"the timer will re-dispatch" would have been true only for a subset of ticks.
+
+**Two findings the trace produced.**
+
+**(1) Recovery is not the acceptance-filtered owner.** It calls `dispatch_next_selection()`, which
+dequeues the head of the highest non-empty priority queue whether or not that head can be marked.
+`dequeue_highest` scans High → Normal → Low, and a rollback returns a refusal to the tail of **its
+own** priority queue.
+
+**(2) The two admission points diverge.** They gate the same run queues and do not ask the same
+question:
+
+| | status transition | exact incarnation |
+|---|---|---|
+| off-lock acceptance filter (`queue_advance_select_step_split`) | required | **required** |
+| in-lock commit (`commit_dispatch_selection_in_lock`) | required | *not required* |
+
+So a `Runnable` queued task with no ASID is `NoneAcceptable` to a drain — which settles the CPU
+idle — and perfectly dispatchable to the timer one quantum later, which finds
+`task_asid(tid) == None`, **skips** the address-space switch, and marks it `Running` anyway. The
+drain fails closed; recovery fails open; same queue, same CPU, one quantum apart.
+
+**Reachability, settled rather than assumed.** No writer produces that state:
+`spawn_thread_core` binds the ASID and sets `Runnable` **before** the enqueue; `unbind_task_asid` —
+the only writer that clears an ASID — has **no production caller at all**; and `DispatchIncoming`
+requires `Runnable`, while the `Exited`/`Dead`/`Faulted` writers act on the *current* task or on one
+already withdrawn from its queue. The acceptance filter is therefore a **fail-closed guard on a
+state nothing produces**. The divergence is a latent contradiction, not a live stall: **no eligible
+work is stranded**, and the "permanently invalid entries must not strand eligible work" condition
+is satisfied because there are no such entries to strand it.
+
+### §3 — The boundary, measured rather than asserted
+
+The obvious repair is to ask the same `MarkedIncarnation::resolve` question at
+`commit_dispatch_selection_in_lock`, before the status write, letting a refusal take the exact
+inverse a status refusal already takes. **It was implemented and measured, and it is not minimal:**
+168 hosted cases fail, at three sites —
+
+| site | refusals |
+|---|---|
+| `dispatch_next_task` | 272 |
+| `yield_current` | 58 |
+| `yield_current_to` | 8 |
+
+Those are not stale fixtures. `dispatch_next_task` is the kernel's ordinary in-lock dispatcher, and
+what the failures show is that the broad path's dispatch contract **deliberately does not require an
+incarnation**: `yield_current` reads `task_asid(tid)` and treats `None` as "no address space to
+switch to", not as a refusal.
+
+So the boundary is exact: **the two admission points cannot be reconciled at the commit without
+first deciding whether an incarnation is a dispatch precondition on the broad path at all.** That
+decision governs `dispatch_next_task` and is not this stage's to make on the strength of a state no
+writer produces. The change is reverted. The divergence is left as an **executable measurement**
+(`recovery_dispatches_a_candidate_the_drain_refused_as_unmarkable`,
+`the_two_admission_points_differ_only_in_the_incarnation_rule`,
+`the_unmarkable_state_has_no_production_writer`) so the next stage inherits a number rather than a
+suspicion — and so that a stage which does change the contract has to edit those cases deliberately.
+
+### §4 — Qualification, on the frozen tree `sha=f850ae3 tree=67919cb`
+
+| gate | result |
+|---|---|
+| **`broad_lock_census_guard`** (the omitted suite) | **7/7 pass** (2 failed at base) |
+| every integration target (`cargo test --tests`) | all pass except one pre-existing, see residual |
+| hosted `cargo test --lib --features hosted-dev` | **5402 passed / 0 failed / 2 ignored** (base 5395) |
+| contract-doc enforcement | pass |
+| three freestanding builds (x86_64 / AArch64 / RISC-V) | pass |
+| `rustfmt --edition 2024 --check`, changed files | clean |
+| clippy vs. fresh-target-dir base at `26c1c44` | **byte-identical class set; 0 errors both sides** |
+| exit-current-task oracle ×3 per architecture | **9/9 `result=ok`**, every seal carrying `tree=67919cb` |
+| **AP saved-return smoke ×3** | **3/3 sealed**, `duplicate_entries=0 wrong_cpu_continuations=0` |
+| three core smokes | pass |
+| broad-lock census | **`with_cpu`/`with_broad`/`state_lock` = 2 / 0 / 3**, acquisition total **2** |
+
+**The AP acceptance criterion, reproduced three times.** Successful split Yield with correct
+stack/register continuation and **zero** broad Yield fallback:
+
+```
+committed=1  refused=0  broad_fallback=0  ap_entry=1  resumed=1     (×3)
+STAGE_199_X86_AP_SAVED_RETURN_SEAL … duplicate_continuations=0 wrong_cpu_continuations=0 result=ok
+```
+
+**Three-architecture Yield/exit evidence retained**, unchanged from base:
+
+| | x86_64 ×3 | AArch64 ×3 | RISC-V ×3 |
+|---|---|---|---|
+| `YIELD_SPLIT_COMMITTED` | 4096 | 4096 | 64 |
+| `YIELD_SPLIT_REFUSED` | 0 | 0 | 0 |
+| `*_YIELD_INLOCK_DISPATCH_FALLBACK` | 0 | 0 | 0 |
+| `RISCV_KERNEL_IDLE_QUEUE_ADVANCE_REFUSED` | — | — | 0 |
+| `TRAP_DISPATCH_WINDOW_ABANDONED` | 0 | 0 | 0 |
+
+D1 membership, D2 explicit retirement and D4 AP first-entry `Running` behaviour are untouched and
+still covered by their own cases.
+
+### Residual, reported separately
+
+* **`server_dies_runner_scope` fails 2 of 10** — `required_marker_chain_is_ordered_and_complete`
+  and `required_chain_is_scoped_to_the_witnessed_transaction`, both missing
+  `EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG}`. Re-run at a freshly built `26c1c44`: **the same
+  2 fail, identically**. Pre-existing, a different family (the server-dies runner's marker chain),
+  and not touched here. It is red and will stay red until someone owns it.
+* **The admission divergence** stands, with its boundary stated in §3 and its reachability at zero.
+* **Family restrictions unchanged.** x86_64 `ArchGateOff` remains a preserved diagnostic; `d2_recv`,
+  `d2_send`, `futex_wait` and the AArch64 direct-dispatch drain still publish `AmbientBound`; six
+  direct consumers of the mark seam remain, each matching all five outcomes inline. **No family was
+  migrated in this stage**, as instructed — the correction was completed first.
+* **CENSUS-DELTA vs `26c1c44`: −1 production broad `with`.** Against the audited totals the census
+  is now *in agreement* rather than merely *claimed* to be.
